@@ -834,6 +834,16 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
                 return {"action": "continue", "message": message.strip()}
         return None
 
+    if event == "pre_llm_call":
+        result: Dict[str, Any] = {}
+        context = data.get("context")
+        if isinstance(context, str) and context.strip():
+            result["context"] = context
+        reasoning_config = data.get("reasoning_config")
+        if isinstance(reasoning_config, dict):
+            result["reasoning_config"] = reasoning_config
+        return result or None
+
     context = data.get("context")
     if isinstance(context, str) and context.strip():
         return {"context": context}

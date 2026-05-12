@@ -8033,6 +8033,13 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
 
+    def _current_reasoning_config(self) -> dict | None:
+        """Return this turn's reasoning override or the configured fallback."""
+        turn_config = getattr(self, "_turn_reasoning_config", None)
+        if isinstance(turn_config, dict):
+            return turn_config
+        return self.reasoning_config
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -9690,6 +9697,7 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    self._turn_reasoning_config = None
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
