@@ -342,6 +342,19 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_build_api_kwargs_codex_uses_turn_reasoning_override(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.reasoning_config = {"enabled": True, "effort": "low"}
+    agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
+
+    kwargs = agent._build_api_kwargs(
+        [{"role": "user", "content": "hello"}]
+    )
+
+    assert kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
+
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(

@@ -1969,22 +1969,13 @@ def _consume_ephemeral_reasoning_off(agent) -> bool:
 
 
 def _reasoning_config_for_wire(agent):
-    """``agent.reasoning_config`` with the one-shot reasoning-off override applied.
-
-    Once the route has answered a disable with "reasoning is mandatory"
-    (``agent._reasoning_disable_rejected``), every disable — configured or
-    the one-shot continuation override — is dropped for the rest of the
-    session: the request goes out without a reasoning config and the route
-    applies its own default.
-    """
-    cfg = agent.reasoning_config
+    """Effective per-turn reasoning config with one-shot and route constraints."""
+    cfg = agent._current_reasoning_config()
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_disable_rejected", False):
-        # The route rejects disables. Resend exactly what the session has
-        # been sending — the user's own config — so the retry lands on the
-        # same provider cache key as every prior request. Only a config that
-        # is itself a disable is dropped (omitted → route default), and that
-        # session has never sent anything else, so nothing warm is lost.
+        # The route rejects disables. Resend the effective non-disable config
+        # so hooks still control this turn without retrying an unsupported
+        # reasoning-off request.
         if isinstance(cfg, dict) and (
             cfg.get("enabled") is False or cfg.get("effort") == "none"
         ):
@@ -3196,6 +3187,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    reasoning_config = agent._current_reasoning_config()
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (hermes chat -Q, oneshot, background
@@ -3350,8 +3342,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if _is_lmstudio_summary else None
         )
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
-            if agent.reasoning_config is not None:
-                summary_extra_body["reasoning"] = agent.reasoning_config
+            if reasoning_config is not None:
+                summary_extra_body["reasoning"] = reasoning_config
             else:
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
@@ -3394,7 +3386,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         provider_preferences=provider_preferences or None,
                         model=agent.model,
                         base_url=agent.base_url,
-                        reasoning_config=agent.reasoning_config,
+                        reasoning_config=reasoning_config,
                     )
             except Exception:
                 pass
@@ -3438,7 +3430,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     messages=api_messages,
                     tools=None,
                     max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
+                    reasoning_config=reasoning_config,
                     is_oauth=agent._is_anthropic_oauth,
                     preserve_dots=agent._anthropic_preserve_dots(),
                     base_url=getattr(agent, "_anthropic_base_url", None),
@@ -3491,7 +3483,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     tools=None,
                     is_oauth=agent._is_anthropic_oauth,
                     max_tokens=agent.max_tokens,
-                    reasoning_config=agent.reasoning_config,
+                    reasoning_config=reasoning_config,
                     preserve_dots=agent._anthropic_preserve_dots(),
                     base_url=getattr(agent, "_anthropic_base_url", None),
                 )

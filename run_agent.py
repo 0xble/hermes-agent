@@ -8278,6 +8278,13 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
 
+    def _current_reasoning_config(self) -> dict | None:
+        """Return this turn's reasoning override or the configured fallback."""
+        turn_config = getattr(self, "_turn_reasoning_config", None)
+        if isinstance(turn_config, dict):
+            return turn_config
+        return self.reasoning_config
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -9990,13 +9997,14 @@ class AIAgent:
                         reset_conversation_context(token)
                     if affinity_token is not None:
                         reset_affinity_scope(affinity_token)
-                    # Balance the note_turn_started above — every exit path
-                    # lands here, so the idle queue's live-turn count cannot
-                    # leak upward and starve deferred reviews.
+                    # Balance the note_turn_started above. Every exit path lands
+                    # here, so the idle queue's live-turn count cannot leak
+                    # upward and starve deferred reviews.
                     try:
                         _review_queue.note_turn_finished()
                     except Exception:
                         pass
+                    self._turn_reasoning_config = None
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
