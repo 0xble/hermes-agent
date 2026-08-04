@@ -10954,6 +10954,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return shared_db
 
     @staticmethod
+    def _resolve_shared_session_db(session_store):
+        """Return the ONE synchronous ``SessionDB`` this runner should own.
+
+        The runner used to construct its own ``SessionDB()`` beside the one
+        ``SessionStore`` had already opened, so a single gateway process held
+        two writer connections to ``state.db`` and two independent per-thread
+        reader pools — double the descriptors and double the concurrency
+        surface for no behavioral gain.
+
+        Normally this returns the store's existing instance. When the store
+        could not initialize one (its own degradation path, e.g. NFS locking
+        errors), a replacement is opened *and stored back on the store*, so
+        ownership stays single even in the degraded case and shutdown has one
+        object to close.
+        """
+        from hermes_state import SessionDB
+
+        shared_db = getattr(session_store, "_db", None)
+        if shared_db is None:
+            shared_db = SessionDB()
+            try:
+                session_store._db = shared_db
+            except Exception:  # pragma: no cover - exotic store objects
+                logger.debug(
+                    "Could not store the replacement SessionDB back on the "
+                    "session store; shutdown will still close it via the "
+                    "runner handle.",
+                    exc_info=True,
+                )
+        return shared_db
+
+    @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
         # noqa: SLF001 — intentional private access; runs off the event loop.
