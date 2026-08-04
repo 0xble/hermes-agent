@@ -2620,7 +2620,29 @@ class AIAgent:
                 self._compression_adoption_failed = True
                 logger.warning("Session DB append_message failed: %s", e)
                 return False
-            logger.warning("Session DB append_message failed: %s", e)
+
+            # This failure destroys the user's turn (it triggers the
+            # deliberate ``session_persistence_failed`` stop below), so retain
+            # enough metadata to diagnose SQLite and SessionDB ownership
+            # failures without logging message content, SQL values, history,
+            # credentials, or the full database path.
+            _thread = threading.current_thread()
+            logger.warning(
+                "Session DB append_message failed: %s: %s "
+                "(sqlite_errorcode=%s sqlite_errorname=%s "
+                "thread=%s/%s session_db=0x%x)",
+                type(e).__name__,
+                e,
+                getattr(e, "sqlite_errorcode", None),
+                getattr(e, "sqlite_errorname", None),
+                _thread.name,
+                _thread.ident,
+                id(self._session_db),
+                exc_info=True,
+            )
+            # Deliberately NO retry. SQLite can commit and then raise during a
+            # later operation, so a retry without a durable idempotency key can
+            # duplicate transcript rows.
             return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
@@ -6842,13 +6864,22 @@ class AIAgent:
         *,
         status_code: Optional[int],
         has_retried_429: bool,
+        alternate_credential_attempted: bool = False,
         classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
         billing_unverified: bool = False,
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(self, status_code=status_code, has_retried_429=has_retried_429, classified_reason=classified_reason, error_context=error_context, billing_unverified=billing_unverified)
+        return recover_with_credential_pool(
+            self,
+            status_code=status_code,
+            has_retried_429=has_retried_429,
+            alternate_credential_attempted=alternate_credential_attempted,
+            classified_reason=classified_reason,
+            error_context=error_context,
+            billing_unverified=billing_unverified,
+        )
 
     def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""
@@ -6994,6 +7025,8 @@ class AIAgent:
     def _extract_codex_interim_visible_parts(
         self,
         assistant_msg: Dict[str, Any],
+        *,
+        respect_display_setting: bool = True,
     ) -> List[str]:
         """Extract visible Codex commentary as one string per message item.
 
@@ -7003,7 +7036,7 @@ class AIAgent:
         commentary through the interim assistant callback before tool calls run.
         ``phase=analysis`` remains hidden because it is provider scratchpad.
         """
-        if not getattr(self, "show_commentary", True):
+        if respect_display_setting and not getattr(self, "show_commentary", True):
             # display.show_commentary=false — commentary stays on the
             # reasoning channel (pre-commentary-channel behavior).
             return []
@@ -7109,7 +7142,20 @@ class AIAgent:
         """
         if not isinstance(assistant_msg, dict):
             return
-        commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+        is_clarify_turn = self._assistant_message_calls_tool(
+            assistant_msg, "clarify"
+        )
+        cb = getattr(self, "interim_assistant_callback", None)
+        if cb is None and is_clarify_turn:
+            # A clarify prompt is not self-explanatory when the model placed
+            # its decision brief immediately before the tool call. Quiet chat
+            # profiles may hide ordinary interim narration, but must still see
+            # this decision-critical context.
+            cb = getattr(self, "clarify_context_callback", None)
+        commentary_parts = self._extract_codex_interim_visible_parts(
+            assistant_msg,
+            respect_display_setting=not is_clarify_turn,
+        )
         undelivered_parts: List[str] = []
         pending_keys: set[str] = set()
         for part in commentary_parts:
@@ -7150,7 +7196,6 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_interim_message plugin hook enqueue failed", exc_info=True)
-        cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
         try:
@@ -7162,6 +7207,17 @@ class AIAgent:
                 self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+
+    @classmethod
+    def _assistant_message_calls_tool(
+        cls, assistant_msg: Dict[str, Any], tool_name: str
+    ) -> bool:
+        """Return whether a persisted assistant turn invokes ``tool_name``."""
+        expected = str(tool_name or "")
+        return bool(expected) and any(
+            cls._get_tool_call_name_static(tool_call) == expected
+            for tool_call in assistant_msg.get("tool_calls") or []
+        )
 
     def _ensure_stream_writer_state(self) -> None:
         """Lazily create the single-writer guard fields (#65991).

@@ -7942,7 +7942,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         failure after recording that recoverable state so ``__init__`` can
         record ``_session_db_init_error`` for the #88235 broadcast.
         """
-        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path
+        from hermes_state import AsyncSessionDB, _default_db_path
         from gateway.session_db_recovery import RecoverableHandleCache
 
         path = Path(_default_db_path())
@@ -7984,7 +7984,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # unavailability the store is already reporting.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(SessionDB())
+                # SessionStore owns one SessionDB per active profile scope.
+                # Reuse it rather than opening a second writer and reader pool.
+                return AsyncSessionDB(
+                    self._resolve_shared_session_db(self.session_store)
+                )
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -10858,6 +10862,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 exc_info=True,
             )
             return True
+
+    @staticmethod
+    def _resolve_shared_session_db(session_store):
+        """Return SessionStore's synchronous DB for the active profile scope.
+
+        SessionStore owns and caches one handle per resolved profile path.
+        Session search wraps that exact handle instead of opening a second
+        writer and reader pool. If the store deliberately degraded to JSONL
+        for this path, preserve that failure rather than pinning a replacement
+        across every multiplexed profile.
+        """
+        shared_db = getattr(session_store, "_db", None)
+        if shared_db is None:
+            raise RuntimeError(
+                "SessionStore has no SQLite handle for the active profile scope"
+            )
+        return shared_db
 
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
@@ -16524,11 +16545,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the new gateway tries to open the same file.
             # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
             # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+            # These are now normally the SAME object (the runner reuses
+            # SessionStore's instance), so deduplicate by identity: close() is
+            # idempotent, but calling it twice logs a spurious second
+            # TRUNCATE-checkpoint failure on an already-closed connection and
+            # obscures real shutdown errors.
             _self_db = getattr(self, "_session_db", None)
             _self_db = getattr(_self_db, "_db", _self_db)
+            _seen_db_ids: set = set()
             for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
                 if _db is None or not hasattr(_db, "close"):
                     continue
+                if id(_db) in _seen_db_ids:
+                    continue
+                _seen_db_ids.add(id(_db))
                 try:
                     _db.close()
                 except Exception as _e:

@@ -7106,3 +7106,82 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+
+
+# ---------------------------------------------------------------------------
+# Transcript persistence failure diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _flush_failure_record(agent, caplog, exc):
+    """Drive one failing flush and return its single warning record."""
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.session_id = "session-diag"
+    agent._last_flushed_db_idx = 0
+    agent._db_flush_scan_prefix = None
+    agent._session_db.append_messages_batch.side_effect = exc
+
+    messages = [{"role": "user", "content": "SUPER-SECRET-TRANSCRIPT-BODY"}]
+    with caplog.at_level(logging.WARNING, logger=run_agent.logger.name):
+        result = agent._flush_messages_to_session_db(messages, [])
+
+    assert result is False, "a failed transcript write must stay fail-closed"
+    records = [
+        r for r in caplog.records
+        if "Session DB append_message failed" in r.getMessage()
+    ]
+    assert len(records) == 1, f"expected exactly one warning, got {len(records)}"
+    return records[0]
+
+
+def test_persistence_failure_logs_sqlite_diagnostics(agent, caplog):
+    """The warning carries exception type, SQLite code/name, thread and db identity."""
+    import sqlite3
+
+    exc = sqlite3.OperationalError("database is locked")
+    # Synthesize the attributes CPython attaches on real SQLite errors so the
+    # test does not depend on which statement raised.
+    exc.sqlite_errorcode = 5
+    exc.sqlite_errorname = "SQLITE_BUSY"
+
+    record = _flush_failure_record(agent, caplog, exc)
+    message = record.getMessage()
+
+    assert "OperationalError" in message
+    assert "sqlite_errorcode=5" in message
+    assert "sqlite_errorname=SQLITE_BUSY" in message
+    assert f"thread={threading.current_thread().name}" in message
+    assert f"session_db=0x{id(agent._session_db):x}" in message
+    assert record.exc_info is not None, "stack trace must be attached"
+
+
+def test_persistence_failure_diagnostics_survive_missing_sqlite_attrs(agent, caplog):
+    """A non-SQLite exception still logs cleanly, with None for the SQLite fields."""
+    record = _flush_failure_record(agent, caplog, RuntimeError("boom"))
+    message = record.getMessage()
+
+    assert "RuntimeError" in message
+    assert "sqlite_errorcode=None" in message
+    assert "sqlite_errorname=None" in message
+
+
+def test_persistence_failure_log_omits_transcript_and_paths(agent, caplog):
+    """Diagnostics are metadata only — no message content, no full db path."""
+    import sqlite3
+
+    record = _flush_failure_record(agent, caplog, sqlite3.DatabaseError("malformed"))
+    message = record.getMessage()
+
+    assert "SUPER-SECRET-TRANSCRIPT-BODY" not in message
+    assert "state.db" not in message
+    assert "/Users/" not in message and "/home/" not in message
+
+
+def test_persistence_failure_does_not_retry_the_write(agent, caplog):
+    """append_messages_batch is attempted exactly once when it raises."""
+    import sqlite3
+
+    _flush_failure_record(agent, caplog, sqlite3.OperationalError("database is locked"))
+    assert agent._session_db.append_messages_batch.call_count == 1
