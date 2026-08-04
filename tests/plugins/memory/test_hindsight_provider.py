@@ -434,6 +434,10 @@ class TestPostSetup:
             "HINDSIGHT_API_LLM_API_KEY=sk-local-test\n"
             "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
             "HINDSIGHT_API_LOG_LEVEL=info\n"
+            # Local patch: a retain that hit fact-extraction errors must
+            # surface as a failed operation rather than completing silently
+            # with zero facts (see _build_embedded_profile_env).
+            "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS=true\n"
             "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=300\n"
         )
 
@@ -1645,9 +1649,6 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         assert len(calls) == 1  # attempted exactly once, init still completed
         assert any("runtime installs are disabled" in r.getMessage()
                    for r in caplog.records)
-
-
-
 class TestMultiplexBackgroundScope:
     """Under multiplex_profiles get_secret fails closed on an unscoped thread;
     the writer / daemon-start threads are spawned from a scoped context and
@@ -1710,3 +1711,41 @@ class TestMultiplexBackgroundScope:
                 t.join(timeout=5)
         assert created == ["p1-secret"]
         assert "Daemon started successfully" in (home / "logs" / "hindsight-embed.log").read_text()
+# ---------------------------------------------------------------------------
+# Explicit shared scope — [[]] (#74933)
+# ---------------------------------------------------------------------------
+
+
+class TestSharedObservationScope:
+    """[[]] is Hindsight's documented equivalent of the "shared" scope. The
+    normalizer used to drop the empty inner list, silently reverting the
+    config to Hindsight's "combined" default — which fragments observations
+    by volatile session:<id> lineage tags (#74933)."""
+
+    def test_empty_inner_list_is_preserved(self):
+        assert _normalize_observation_scopes([[]]) == [[]]
+
+    def test_json_string_form_is_preserved(self):
+        assert _normalize_observation_scopes("[[]]") == [[]]
+
+    def test_mixed_scopes_keep_the_shared_pass(self):
+        assert _normalize_observation_scopes([["scope:private"], []]) == [
+            ["scope:private"],
+            [],
+        ]
+
+    def test_whitespace_only_inner_list_is_still_dropped(self):
+        assert _normalize_observation_scopes([["   "]]) is None
+
+    def test_flat_empty_list_still_means_unconfigured(self):
+        assert _normalize_observation_scopes([]) is None
+
+    def test_provider_config_preserves_shared_scope(self, provider_with_config):
+        p = provider_with_config(observation_scopes=[[]])
+        assert p._observation_scopes == [[]]
+
+    def test_retain_passes_shared_scope_to_client(self, provider_with_config):
+        p = provider_with_config(observation_scopes=[[]])
+        p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["observation_scopes"] == [[]]
