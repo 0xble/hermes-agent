@@ -32,6 +32,7 @@ import threading
 import time
 import uuid
 import weakref
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -2811,207 +2812,187 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
 
 
 def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
-    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
-    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    bytes exactly for forensics / manual restore. WAL, SHM and rollback-journal
-    sidecars are copied too when present. Returns ``(backup_path, None)`` on success or
-    ``(None, reason)`` on failure — callers on the repair path treat a
-    refused backup as a HARD STOP (see #69603). Repair strategies run on a
-    scratch snapshot, but the forensic bundle remains the recovery path when
-    corruption defeats them.
-
-    Refuses when a connection to this database is still live in the process:
-    reading the file would ``close()`` a descriptor for it and cancel that
-    connection's POSIX advisory locks (see ``hermes_cli.sqlite_safe_read``).
-    The repair path can be entered by one SessionDB while the gateway holds
-    others, so this is a real possibility rather than a theoretical one.
-    """
+    """Atomically copy a malformed DB before repair, or return a hard-stop reason."""
     import datetime
     import shutil
 
     try:
-        from hermes_cli.sqlite_safe_read import has_live_connection
+        from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
     except ImportError:
-        has_live_connection = None  # type: ignore[assignment]
-
-    if has_live_connection is not None and has_live_connection(db_path):
-        reason = (
-            f"a connection to {db_path} is still open in this process; "
-            "raw-copying it would cancel that connection's POSIX advisory "
-            "locks. Close all SessionDB handles first."
-        )
-        logger.error("Refusing to raw-copy %s for backup: %s", db_path, reason)
-        return None, reason
+        LiveConnectionError = None  # type: ignore[assignment]
+        offline_file_access = None  # type: ignore[assignment]
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
-    # Same-second collision (two distinct damaged states within one second)
-    # must not silently overwrite the earlier forensic copy.
     seq = 1
     while backup_path.exists():
         backup_path = db_path.with_name(
             f"{db_path.name}.malformed-backup-{stamp}_{seq}"
         )
         seq += 1
-    try:
-        # Sweep staging debris from an earlier interrupted pass (kill mid-copy)
-        # BEFORE the dedupe below. A leftover staging file is a byte-identical
-        # copy of the damaged DB, so its fingerprint MATCHES and the dedupe
-        # would otherwise hand it back as a legitimate forensic backup.
-        # Matches sidecar staging names (``.backup-staging-<stamp>-wal``) too.
-        # The second pattern is the pre-merge ``.incomplete`` spelling, swept so
-        # a host that ran that build does not keep prefix-matching debris that
-        # sorts NEWEST and survives prune forever.
-        for pattern in (
-            f"{db_path.name}.backup-staging-*",
-            f"{db_path.name}.malformed-backup-*.incomplete*",
-        ):
-            for old in db_path.parent.glob(pattern):
-                try:
-                    old.unlink(missing_ok=True)
-                except OSError:  # pragma: no cover - best effort
-                    pass
-        # Dedupe (#86747): a repair loop used to copy the SAME damaged bytes
-        # on every restart — ~900MB a pass, 89GB over 11 days in the
-        # reporting install. If the newest existing backup is byte-identical to
-        # the current recovery image, reuse it.
-        #
-        # Matching on mtime made this dedupe miss exactly when it mattered
-        # most: the malformed-SCHEMA class still accepts writes, so live
-        # writers and the in-place repair strategies move mtime between
-        # passes and every pass wrote another full-size copy (2.3GB in 20
-        # minutes).
-        #
-        # Use ``_backup_content_identity`` (whole file + sidecars), NOT the
-        # repair-epoch ``_db_fingerprint``. They are different equivalence
-        # relations: the fingerprint masks commit counters and samples only
-        # head/tail so an ordinary interior-page write does not re-key the
-        # repair budget — but that same write DOES change the recovery image,
-        # and deduping on the fingerprint would hand back a stale backup that
-        # predates the write. A forensic copy must prove byte identity, so it
-        # pays the O(n) read (cheaper than the O(n) write it avoids on a hit).
-        try:
-            # Only hash the source when there is actually a candidate to dedupe
-            # against — on the common first-corruption pass there is no prior
-            # backup, and hashing the (possibly multi-GB) source then would be
-            # pure waste right before the copy reads it again anyway.
-            existing_backups = _existing_malformed_backups(db_path)[:1]
-            if existing_backups:
-                src_id = _backup_content_identity(db_path)
-                for existing in existing_backups:
-                    if src_id is not None and _backup_content_identity(existing) == src_id:
-                        logger.info(
-                            "Reusing existing forensic backup %s (identical to the "
-                            "damaged DB).", existing,
-                        )
-                        return existing, None
-        except OSError:
-            pass
-        # Disk guard: this is a full raw copy of a possibly multi-GB DB plus
-        # its sidecars. On a host whose volume is already nearly full — which
-        # a preceding repair loop may itself have caused — taking it can
-        # finish off the disk and take down every process on the machine.
-        # Refuse while there is still room to refuse in.
-        try:
-            need = db_path.stat().st_size
-            for suffix in _DB_SIDECAR_SUFFIXES:
-                sidecar = db_path.with_name(db_path.name + suffix)
-                if sidecar.exists():
-                    need += sidecar.stat().st_size
-            usage = shutil.disk_usage(db_path.parent)
-            headroom = _repair_backup_headroom_bytes(usage.total)
-            if usage.free - need < headroom:
-                reason = (
-                    f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; "
-                    f"copying the damaged DB needs {need / 1e9:.2f}GB and must "
-                    f"leave {headroom / 1e9:.2f}GB headroom. Free disk space, "
-                    f"then retry (or recover manually with `sqlite3 {db_path} "
-                    '".recover"`).'
-                )
-                logger.error("Refusing forensic backup of %s: %s", db_path, reason)
-                return None, reason
-        except OSError as exc:
-            # Fail CLOSED. This guard exists for the nearly-full volume, which
-            # is exactly where stat()/disk_usage() is most likely to fail — and
-            # proceeding would take the multi-GB copy that finishes off the
-            # disk. A refused backup is a HARD STOP (#69603), so repair simply
-            # does not run until a human frees space, which is the safe side.
-            reason = (
-                f"could not determine free space on {db_path.parent} ({exc}); "
-                "refusing the forensic copy rather than risk filling the "
-                f"volume. Free disk space, then retry (or recover manually "
-                f'with `sqlite3 {db_path} ".recover"`).'
-            )
-            logger.error("Refusing forensic backup of %s: %s", db_path, reason)
-            return None, reason
-        # Copy to a staging name OUTSIDE the ``.malformed-backup-`` prefix, then
-        # rename into place only once every copy has succeeded. The prefix
-        # matters: ``_existing_malformed_backups`` matches on
-        # ``startswith(f"{db}.malformed-backup-")`` and excludes only ``-wal``/
-        # ``-shm`` suffixes, so a staging name derived from the backup name (e.g.
-        # ``…malformed-backup-<stamp>.incomplete``) still counts as a backup —
-        # it sorts NEWEST (``.incomplete`` > the bare stamp), so prune's
-        # keep-3-newest slice retained partials and deleted intact copies, and
-        # the dedupe could hand a partial back as the official ``backup_path``,
-        # passing the #69603 hard-stop gate with no real forensic copy on disk.
-        staging = db_path.with_name(f"{db_path.name}.backup-staging-{stamp}")
-        # (staging_src, final_dst) pairs. ORDER MATTERS for publication: the
-        # main-DB backup name is the bundle's commit marker —
-        # ``_existing_malformed_backups`` matches ``{db}.malformed-backup-*``
-        # and excludes only the ``-wal``/``-shm``/``-journal`` suffixes, so the
-        # main file appearing is what makes the bundle "count". Sidecars are
-        # therefore staged/published FIRST and the main DB LAST, so a failure
-        # partway through never leaves a countable main backup standing over a
-        # missing sidecar (an incomplete recovery image that would pass the
-        # #69603 hard stop and dedupe as legitimate on the next pass).
-        staged_sidecars: "List[Tuple[Path, Path, Path]]" = []
-        for suffix in _DB_SIDECAR_SUFFIXES:
+
+    def _bundle_marker(path: Path) -> Path:
+        return path.with_name("." + path.name + ".complete")
+
+    def _copy_all() -> Path:
+        import hashlib
+        import json
+        import os
+        import uuid
+
+        def _sha256(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        required = []
+        for suffix in ("-wal", "-shm"):
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
-                side_staging = staging.with_name(staging.name + suffix)
-                side_dst = backup_path.with_name(backup_path.name + suffix)
-                staged_sidecars.append((sidecar, side_staging, side_dst))
-        main_pair = (staging, backup_path)
-        published: "List[Path]" = []
-        all_staging_srcs = [staging] + [s for _src, s, _d in staged_sidecars]
+                required.append((sidecar, backup_path.with_name(backup_path.name + suffix)))
+        pairs = [(db_path, backup_path), *required]
+        source_snapshot = {
+            source.name: (source.stat().st_size, source.stat().st_mtime_ns, _sha256(source))
+            for source, _ in pairs
+        }
+        marker = _bundle_marker(backup_path)
+        token = uuid.uuid4().hex
+        temporary = [
+            (source, target.with_name(f".{target.name}.tmp-{token}"))
+            for source, target in pairs
+        ]
+        marker_tmp = marker.with_name(f".{marker.name}.tmp-{token}")
+        published = []
         try:
-            shutil.copy2(db_path, staging)
-            for sidecar, side_staging, _side_dst in staged_sidecars:
-                shutil.copy2(sidecar, side_staging)
-            # Publish sidecars first, main DB LAST (the commit marker), so a
-            # mid-publish failure never leaves a countable-but-incomplete bundle.
-            publish_order = [
-                (s, d) for _src, s, d in staged_sidecars
-            ] + [main_pair]
-            for src, dst in publish_order:
-                os.replace(src, dst)
-                published.append(dst)
-        except Exception:
-            # Roll back BOTH unpublished staging files AND anything already
-            # promoted — the old code unlinked only staging srcs, so a failure
-            # after the main os.replace left the official backup_path on disk.
-            for src in all_staging_srcs:
-                try:
-                    src.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            for dst in published:
-                try:
-                    dst.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            for source, target in temporary:
+                shutil.copy2(source, target)
+                with target.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            current_snapshot = {
+                source.name: (source.stat().st_size, source.stat().st_mtime_ns, _sha256(source))
+                for source, _ in pairs
+            }
+            if current_snapshot != source_snapshot:
+                raise RuntimeError("database bundle changed while being copied")
+            for _, target in temporary:
+                final = next(
+                    final for _, final in pairs
+                    if final.name == target.name.split(".tmp-")[0].lstrip(".")
+                )
+                os.replace(target, final)
+                published.append(final)
+            directory_fd = os.open(str(db_path.parent), os.O_RDONLY)
             try:
-                staging.unlink(missing_ok=True)
-            except OSError:
-                pass
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            final_snapshot = {
+                source.name: (source.stat().st_size, source.stat().st_mtime_ns, _sha256(source))
+                for source, _ in pairs
+            }
+            if final_snapshot != source_snapshot:
+                raise RuntimeError("database bundle changed before marker publication")
+            metadata = {
+                "files": {
+                    final.name: {
+                        "source": source.name,
+                        "source_sha256": source_snapshot[source.name][2],
+                        "backup_sha256": _sha256(final),
+                        "size": final.stat().st_size,
+                    }
+                    for source, final in pairs
+                }
+            }
+            marker_tmp.write_text(json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8")
+            with marker_tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(marker_tmp, marker)
+            directory_fd = os.open(str(db_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return backup_path
+        except Exception:
+            for _, target in temporary:
+                target.unlink(missing_ok=True)
+            marker_tmp.unlink(missing_ok=True)
+            for target in published:
+                target.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
             raise
-        # Retention cap (#86747): keep only the newest few forensic copies.
+
+    def _guarded_copy() -> tuple[Path, None]:
+        try:
+            src_stat = db_path.stat()
+            for existing in _existing_malformed_backups(db_path)[:1]:
+                marker = _bundle_marker(existing)
+                if not marker.is_file():
+                    continue
+                import hashlib
+                import json
+                metadata = json.loads(marker.read_text(encoding="utf-8"))
+                files = metadata.get("files")
+                if not isinstance(files, dict):
+                    continue
+                complete = True
+                current_sources = {
+                    db_path.name: db_path,
+                    **{
+                        db_path.name + suffix: db_path.with_name(db_path.name + suffix)
+                        for suffix in ("-wal", "-shm")
+                        if db_path.with_name(db_path.name + suffix).exists()
+                    },
+                }
+                for name, entry in files.items():
+                    target = existing.with_name(name)
+                    source = current_sources.get(str(entry.get("source") or ""))
+                    if not target.is_file() or source is None or not source.is_file():
+                        complete = False
+                        break
+                    def _digest(path: Path) -> str:
+                        digest = hashlib.sha256()
+                        with path.open("rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        return digest.hexdigest()
+                    if (
+                        _digest(source) != entry.get("source_sha256")
+                        or _digest(target) != entry.get("backup_sha256")
+                    ):
+                        complete = False
+                        break
+                if complete and set(files) == {
+                    existing.name,
+                    *[existing.name + suffix for suffix in ("-wal", "-shm")
+                      if db_path.with_name(db_path.name + suffix).exists()],
+                }:
+                    logger.info("Reusing existing forensic backup %s.", existing)
+                    return existing, None
+        except OSError:
+            pass
+        result = _copy_all()
         _prune_malformed_backups(db_path)
-        return backup_path, None
+        return result, None
+
+    try:
+        if offline_file_access is None:
+            return _guarded_copy()
+        with offline_file_access(db_path, what="back up"):
+            return _guarded_copy()
+    except LiveConnectionError if LiveConnectionError is not None else ():  # type: ignore[misc]
+        reason = (
+            f"a connection to {db_path} is still open in this process; "
+            "raw-copying it would cancel that connection's POSIX advisory locks. "
+            "Close all SessionDB handles first."
+        )
+        logger.error("Refusing to raw-copy %s for backup: %s", db_path, reason)
+        return None, reason
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None, f"backup copy failed: {exc}"
-
 
 def preflight_db_writability(
     db_path: Path,
@@ -10525,6 +10506,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             row = cursor.fetchone()
         return row["title"] if row else None
 
+    def list_recent_session_titles(
+        self,
+        *,
+        exclude_session_id: Optional[str] = None,
+        limit: int = 24,
+    ) -> List[str]:
+        """Return recent distinct titles for advisory generation-time avoidance.
+
+        Transactional uniqueness remains authoritative. This bounded read only
+        improves title quality before the write and deliberately returns title
+        strings rather than prior conversation content.
+        """
+        bounded_limit = max(1, min(int(limit), 100))
+        sql = (
+            "SELECT title FROM sessions "
+            "WHERE title IS NOT NULL AND TRIM(title) != ''"
+        )
+        params: List[Any] = []
+        if exclude_session_id:
+            sql += " AND id != ?"
+            params.append(str(exclude_session_id))
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(bounded_limit)
+        with self._read_ctx() as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        seen = set()
+        titles = []
+        for row in rows:
+            title = str(row["title"] if isinstance(row, sqlite3.Row) else row[0]).strip()
+            key = unicodedata.normalize("NFKC", title).casefold()
+            key = re.sub(r"\s+", " ", key).rstrip(".!,;:")
+            if title and key not in seen:
+                seen.add(key)
+                titles.append(title)
+        return titles
+
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""
         with self._read_ctx() as conn:
@@ -15134,6 +15153,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           v1 — initial shape (no ON DELETE CASCADE on session_id FK)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
+          v3 — durable topic-icon ownership and per-chat recent-selection state.
         """
         def _do(conn):
             conn.executescript(
@@ -15168,6 +15188,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
                 CREATE INDEX IF NOT EXISTS idx_telegram_dm_topic_bindings_user
                 ON telegram_dm_topic_bindings(user_id, chat_id);
+
+                CREATE TABLE IF NOT EXISTS telegram_topic_icon_state (
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    custom_emoji_id TEXT,
+                    ownership TEXT NOT NULL CHECK (
+                        ownership IN ('auto', 'manual', 'default')
+                    ),
+                    observed_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, thread_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_topic_icon_history (
+                    chat_id TEXT NOT NULL,
+                    custom_emoji_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    selected_at REAL NOT NULL,
+                    PRIMARY KEY (chat_id, custom_emoji_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_telegram_topic_icon_history_recent
+                ON telegram_topic_icon_history(chat_id, selected_at DESC);
                 """
             )
 
@@ -15218,7 +15260,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "2"),
+                ("telegram_dm_topic_schema_version", "3"),
             )
         self._execute_write(_do)
 
@@ -15362,6 +15404,168 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError:
                 return []
         return [dict(row) for row in rows]
+
+    def get_telegram_topic_icon_state(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return durable observed icon ownership without creating tables."""
+        with self._read_ctx() as conn:
+            if conn is None:
+                return None
+            try:
+                row = conn.execute(
+                    "SELECT * FROM telegram_topic_icon_state "
+                    "WHERE chat_id = ? AND thread_id = ?",
+                    (str(chat_id), str(thread_id)),
+                ).fetchone()
+            except (AttributeError, sqlite3.OperationalError):
+                return None
+        return dict(row) if row else None
+
+    def record_telegram_topic_icon_observation(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+        custom_emoji_id: Optional[str],
+    ) -> str:
+        """Persist an observed Telegram icon as auto, manual, or default.
+
+        A matching previously auto-assigned ID remains auto-owned. Any other
+        observed custom icon is manual and therefore protected. An empty ID is
+        Telegram's default letter bubble.
+        """
+        self.apply_telegram_topic_migration()
+        chat_id = str(chat_id)
+        thread_id = str(thread_id)
+        icon_id = str(custom_emoji_id or "").strip() or None
+        ownership_result = {"value": "default"}
+
+        def _do(conn):
+            current = conn.execute(
+                "SELECT custom_emoji_id, ownership FROM telegram_topic_icon_state "
+                "WHERE chat_id = ? AND thread_id = ?",
+                (chat_id, thread_id),
+            ).fetchone()
+            ownership = "default"
+            if icon_id:
+                same_auto = (
+                    current is not None
+                    and str(current["ownership"]) == "auto"
+                    and str(current["custom_emoji_id"] or "") == icon_id
+                )
+                ownership = "auto" if same_auto else "manual"
+            ownership_result["value"] = ownership
+            conn.execute(
+                """
+                INSERT INTO telegram_topic_icon_state (
+                    chat_id, thread_id, custom_emoji_id, ownership, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    custom_emoji_id = excluded.custom_emoji_id,
+                    ownership = excluded.ownership,
+                    observed_at = excluded.observed_at
+                """,
+                (chat_id, thread_id, icon_id, ownership, time.time()),
+            )
+
+        self._execute_write(_do)
+        return ownership_result["value"]
+
+    def list_recent_telegram_topic_icons(
+        self,
+        *,
+        chat_id: str,
+        limit: int = 24,
+    ) -> List[Dict[str, Any]]:
+        """Return durable least-recently-used icon history for one chat."""
+        bounded_limit = max(1, min(int(limit), 100))
+        with self._read_ctx() as conn:
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    "SELECT custom_emoji_id, emoji, selected_at "
+                    "FROM telegram_topic_icon_history WHERE chat_id = ? "
+                    "ORDER BY selected_at DESC LIMIT ?",
+                    (str(chat_id), bounded_limit),
+                ).fetchall()
+            except (AttributeError, sqlite3.OperationalError):
+                return []
+        return [dict(row) for row in rows]
+
+    def record_telegram_topic_icon_selection(
+        self,
+        *,
+        chat_id: str,
+        custom_emoji_id: str,
+        emoji: str,
+        limit: int = 24,
+    ) -> None:
+        """Record a selected icon and prune history to a bounded per-chat LRU."""
+        self.apply_telegram_topic_migration()
+        chat_id = str(chat_id)
+        icon_id = str(custom_emoji_id).strip()
+        emoji = str(emoji).strip()
+        if not icon_id or not emoji:
+            return
+        bounded_limit = max(1, min(int(limit), 100))
+
+        def _do(conn):
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO telegram_topic_icon_history (
+                    chat_id, custom_emoji_id, emoji, selected_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(chat_id, custom_emoji_id) DO UPDATE SET
+                    emoji = excluded.emoji,
+                    selected_at = excluded.selected_at
+                """,
+                (chat_id, icon_id, emoji, now),
+            )
+            conn.execute(
+                "DELETE FROM telegram_topic_icon_history "
+                "WHERE chat_id = ? AND custom_emoji_id NOT IN ("
+                "  SELECT custom_emoji_id FROM telegram_topic_icon_history "
+                "  WHERE chat_id = ? ORDER BY selected_at DESC LIMIT ?"
+                ")",
+                (chat_id, chat_id, bounded_limit),
+            )
+
+        self._execute_write(_do)
+
+    def mark_telegram_topic_icon_auto(
+        self,
+        *,
+        chat_id: str,
+        thread_id: str,
+        custom_emoji_id: str,
+    ) -> None:
+        """Persist ownership only after Telegram accepted the automatic edit."""
+        self.apply_telegram_topic_migration()
+        icon_id = str(custom_emoji_id).strip()
+        if not icon_id:
+            return
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO telegram_topic_icon_state (
+                    chat_id, thread_id, custom_emoji_id, ownership, observed_at
+                ) VALUES (?, ?, ?, 'auto', ?)
+                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    custom_emoji_id = excluded.custom_emoji_id,
+                    ownership = 'auto',
+                    observed_at = excluded.observed_at
+                """,
+                (str(chat_id), str(thread_id), icon_id, time.time()),
+            )
+
+        self._execute_write(_do)
 
     def get_telegram_topic_binding_by_session(
         self,

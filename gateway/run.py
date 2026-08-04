@@ -5239,6 +5239,37 @@ class TurnRunner:
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+        # Telegram rate-limits per CHAT, but this consumer runs per SESSION.
+        # DM topics all share one chat_id, so N concurrent sessions each
+        # honoured the 1.5s interval independently and the aggregate edit
+        # rate scaled with session count (10 sessions ⇒ ~6.7 edits/s against
+        # a ~1 msg/s per-chat limit) until Telegram issued a flood penalty.
+        # Share one throttle clock across every session in the chat so the
+        # interval bounds the CHAT's edit rate, not each session's. Busy
+        # chats update each bubble less often; that is the intended trade
+        # against a multi-hour ban. getattr() keeps unit-test runners that
+        # build a bare runner object working.
+        _edit_clock = getattr(self._runner, "_progress_edit_clock", None)
+        _edit_clock_key = "%s:%s" % (
+            getattr(ctx.source.platform, "value", ctx.source.platform),
+            ctx.source.chat_id,
+        )
+
+        def _edit_gate_elapsed(now: float) -> float:
+            """Seconds since the last edit anywhere in this chat."""
+            _shared = _edit_clock.get(_edit_clock_key, 0.0) if _edit_clock is not None else 0.0
+            return now - max(_last_edit_ts, _shared)
+
+        def _stamp_edit_clock(now: float) -> float:
+            if _edit_clock is not None:
+                _edit_clock[_edit_clock_key] = now
+                # Opportunistic trim: drop chats whose last edit is far older
+                # than the throttle window. Bounded work, no background task.
+                if len(_edit_clock) > 64:
+                    _cutoff = now - 300.0
+                    for _k in [k for k, v in _edit_clock.items() if v < _cutoff]:
+                        _edit_clock.pop(_k, None)
+            return now
 
         _progress_len_fn = (
             adapter.message_len_fn
@@ -5428,7 +5459,7 @@ class TurnRunner:
                     progress_lines.append(msg)
 
                 if await _roll_progress_overflow_if_needed():
-                    _last_edit_ts = time.monotonic()
+                    _last_edit_ts = _stamp_edit_clock(time.monotonic())
                     await asyncio.sleep(0.3)
                     if ctx._run_still_current():
                         await adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
@@ -5439,13 +5470,23 @@ class TurnRunner:
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
                 _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
+                _remaining = _PROGRESS_EDIT_INTERVAL - _edit_gate_elapsed(_now)
                 if _remaining > 0:
                     # Wait out the throttle interval, then loop back to
                     # drain any additional queued messages before sending
                     # a single batched edit.
                     await asyncio.sleep(_remaining)
                     continue
+
+                # Claim the slot BEFORE the API call, not after it. The edit
+                # below is an await of ~100-300ms; stamping only on completion
+                # leaves that whole window open, and every other session in
+                # this chat that reaches the gate inside it reads a stale
+                # clock and edits too. Claiming up front makes the shared
+                # clock an actual rate limiter rather than a mostly-advisory
+                # one. A slot spent on an edit that then fails or is skipped
+                # is the safe direction to err.
+                _last_edit_ts = _stamp_edit_clock(_now)
 
                 if not ctx._run_still_current():
                     return
@@ -5468,16 +5509,39 @@ class TurnRunner:
                             )
                             continue
                         if "flood" in _err or "retry after" in _err:
-                            # Flood control hit — backoff but keep editing.
-                            # Only disable edits for non-recoverable errors.
+                            # Flood control hit. The previous behaviour was
+                            # to fall back to a brand-new
+                            # ``adapter.send()`` here — but that send is
+                            # exactly the kind of burst that triggered the
+                            # penalty in the first place, and re-firing it
+                            # during the penalty window keeps the timer
+                            # pinned at "Retry in 7000+ seconds". Instead,
+                            # drop this tick's update, leave the progress
+                            # message and ``progress_lines`` intact, and
+                            # let the next tick try the edit again once the
+                            # per-chat send cooldown (added in
+                            # ``plugins/platforms/telegram/adapter.py``)
+                            # releases the chat. The user will see a
+                            # short stale-bubble window; that's strictly
+                            # better than escalating the Telegram penalty
+                            # by minutes.
                             logger.info(
-                                "[%s] Progress edit flood control, backing off",
+                                "[%s] Progress edit flood control — skipping "
+                                "fallback send (would re-trigger penalty); "
+                                "will retry edit on next tick",
                                 adapter.name,
                             )
-                            _last_edit_ts = time.monotonic()
-                        else:
-                            can_edit = False
-                        _flood_result = await adapter.send(
+                            _last_edit_ts = _stamp_edit_clock(time.monotonic())
+                            continue
+                        can_edit = False
+                        # Non-flood permanent failure (message deleted,
+                        # permission revoked, etc.) — fall back to a fresh
+                        # message bubble so the user still sees the
+                        # progress line. This branch intentionally keeps
+                        # the legacy send() fallback because the failure
+                        # mode here is local, not a Telegram rate-limit
+                        # signal.
+                        _perm_result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=msg,
                             reply_to=ctx._progress_reply_to,
@@ -5485,10 +5549,10 @@ class TurnRunner:
                         )
                         if (
                             ctx._cleanup_progress
-                            and getattr(_flood_result, "success", False)
-                            and getattr(_flood_result, "message_id", None)
+                            and getattr(_perm_result, "success", False)
+                            and getattr(_perm_result, "message_id", None)
                         ):
-                            ctx._cleanup_msg_ids.append(str(_flood_result.message_id))
+                            ctx._cleanup_msg_ids.append(str(_perm_result.message_id))
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
@@ -5512,7 +5576,7 @@ class TurnRunner:
                         if ctx._cleanup_progress:
                             ctx._cleanup_msg_ids.append(str(result.message_id))
 
-                _last_edit_ts = time.monotonic()
+                _last_edit_ts = _stamp_edit_clock(time.monotonic())
 
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
@@ -6386,7 +6450,14 @@ class TurnRunner:
         #   off     — no chat notification (still logged to stdout)
         #   on      — generic "💾 Memory updated" (default)
         #   verbose — content preview: "💾 Memory ➕ Hermes Repo..."
-        _mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
+        # Resolved per-platform first (display.platforms.<p>.memory_notifications),
+        # then the global display.memory_notifications (#59364 narrow backport).
+        from gateway.display_config import resolve_display_setting
+        _mem_notif = resolve_display_setting(
+            ctx.user_config,
+            _platform_config_key(ctx.source.platform),
+            "memory_notifications",
+        )
         if isinstance(_mem_notif, bool):
             _mem_notif = "on" if _mem_notif else "off"
         agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
@@ -7548,6 +7619,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # self._session_state(key) (get-or-create) or
         # self._peek_session_state(key) (read-only).
         self._sessions: Dict[str, SessionState] = {}
+        # Shared progress-edit throttle clock, keyed "platform:chat_id".
+        # The progress consumer is per-session but Telegram rate-limits per
+        # chat, and DM topics all share one chat_id — so without a shared
+        # clock N concurrent sessions multiply the edit rate by N and trip
+        # flood control. Values are bare monotonic floats; the dict is
+        # trimmed opportunistically in send_progress_messages so a
+        # long-lived gateway can't accumulate an entry per chat forever.
+        self._progress_edit_clock: Dict[str, float] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The

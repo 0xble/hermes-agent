@@ -150,6 +150,7 @@ from gateway.platforms.base import (
 )
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1211,6 +1212,23 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
     except Exception:
         return text
+
+
+def _is_api_interrupt_sentinel(result: Dict[str, Any], text: Any) -> bool:
+    """Return whether *text* is Hermes' internal API-wait interrupt status."""
+    return (
+        bool(result.get("interrupted"))
+        and isinstance(text, str)
+        and text.strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
+    )
+
+
+def _api_final_response_text(result: Dict[str, Any]) -> str:
+    """Return user-facing text while keeping interrupt sentinels as metadata."""
+    text = result.get("final_response", "") or ""
+    if _is_api_interrupt_sentinel(result, text):
+        return ""
+    return _resolve_media_to_data_urls(text)
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
@@ -4686,7 +4704,9 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
+        completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+        interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -4712,6 +4732,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
+                "completed": completed,
+                "interrupted": interrupted,
                 "usage": usage,
                 "runtime": runtime,
             },
@@ -4858,8 +4880,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+                completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+                interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+                partial = bool(result.get("partial")) if isinstance(result, dict) else False
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
@@ -4882,9 +4907,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
-                    "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    "completed": completed,
+                    "partial": partial,
+                    "interrupted": interrupted,
                     "runtime": effective_runtime,
                 }))
                 # A steer accepted after the final assistant response is drained
@@ -4895,7 +4920,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
-                    "completed": True,
+                    "completed": completed,
+                    "interrupted": interrupted,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
@@ -7101,6 +7127,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") not in {"assistant", "tool"}:
+                continue
+            if msg.get("role") == "assistant" and _is_api_interrupt_sentinel(result, msg.get("content")):
                 continue
             # _message_response projects compaction scaffolding itself and
             # marks pure handoffs display_kind == "hidden"; classifying here

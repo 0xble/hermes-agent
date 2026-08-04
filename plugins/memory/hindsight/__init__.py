@@ -510,6 +510,10 @@ def _normalize_observation_scopes(value: Any) -> Any:
       * ``None`` — nothing configured; Hindsight applies its ``combined`` default.
       * a keyword string — ``"per_tag"`` / ``"combined"`` / ``"all_combinations"``.
       * ``list[list[str]]`` — custom scopes, one inner list per consolidation pass.
+        An explicit empty inner list (``[[]]``) is Hindsight's documented
+        equivalent of the ``shared`` scope — one global consolidation pass that
+        ignores volatile per-session tags — and is preserved, not discarded
+        (#74933).
 
     Accepts a keyword string, a JSON-encoded list, a flat list of tags (treated as
     a single scope), or a list of tag-lists. Anything unrecognized yields ``None``
@@ -540,8 +544,14 @@ def _normalize_observation_scopes(value: Any) -> Any:
         scopes: list[list[str]] = []
         for entry in value:
             if isinstance(entry, (list, tuple)):
+                # Keep explicitly-empty inner lists: [[]] is Hindsight's
+                # documented equivalent of the "shared" scope. Dropping it
+                # silently reverted the config to the "combined" default,
+                # fragmenting observations by session tag (#74933). Inner
+                # lists that only become empty after stripping whitespace
+                # tags are still malformed and still dropped.
                 inner = [str(tag).strip() for tag in entry if str(tag).strip()]
-                if inner:
+                if inner or not entry:
                     scopes.append(inner)
             elif isinstance(entry, str) and entry.strip():
                 scopes.append([entry.strip()])
@@ -609,6 +619,11 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         "HINDSIGHT_API_LLM_API_KEY": str(current_key or ""),
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
+        # A retain that hit fact-extraction errors must surface as a failed
+        # operation, not complete silently with zero facts: the control-plane
+        # collectors treat "completed with no units" as a legitimately-empty
+        # document and advance source cursors on it.
+        "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS": "true",
     }
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
@@ -1818,10 +1833,32 @@ class HindsightMemoryProvider(MemoryProvider):
                     profile_env = _embedded_profile_env_path(self._config)
                     expected_env = _build_embedded_profile_env(self._config)
                     saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    # Drift means a managed key changed, not that the file has
+                    # keys we didn't write: the daemon manager re-persists extra
+                    # keys (e.g. HINDSIGHT_API_PORT) into the profile env after
+                    # every start, so strict equality restarted the daemon on
+                    # every session init, killing in-flight retain/recall work.
+                    # An API key that resolves empty here means the secret store
+                    # had no answer in this process — that is not drift either,
+                    # and must never overwrite a real key already in the file.
+                    managed_env = {
+                        key: value
+                        for key, value in expected_env.items()
+                        if not (key == "HINDSIGHT_API_LLM_API_KEY" and not value)
+                    }
+                    config_changed = any(
+                        saved.get(key) != value for key, value in managed_env.items()
+                    )
 
                     if config_changed:
-                        profile_env = _materialize_embedded_profile_env(self._config)
+                        preserved_key = (
+                            expected_env.get("HINDSIGHT_API_LLM_API_KEY")
+                            or saved.get("HINDSIGHT_API_LLM_API_KEY")
+                            or None
+                        )
+                        profile_env = _materialize_embedded_profile_env(
+                            self._config, llm_api_key=preserved_key
+                        )
                         if client._manager.is_running(profile):
                             with open(log_path, "a", encoding="utf-8") as f:
                                 f.write("\n=== Config changed, restarting daemon ===\n")
