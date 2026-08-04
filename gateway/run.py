@@ -11240,6 +11240,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
 
     @staticmethod
+    def _resolve_shared_session_db(session_store):
+        """Return SessionStore's synchronous DB for the active profile scope.
+
+        SessionStore owns and caches one handle per resolved profile path.
+        Session search wraps that exact handle instead of opening a second
+        writer and reader pool. If the store deliberately degraded to JSONL
+        for this path, preserve that failure rather than pinning a replacement
+        across every multiplexed profile.
+        """
+        shared_db = getattr(session_store, "_db", None)
+        if shared_db is None:
+            raise RuntimeError(
+                "SessionStore has no SQLite handle for the active profile scope"
+            )
+        return shared_db
+
+    @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
         # noqa: SLF001 — intentional private access; runs off the event loop.
@@ -17086,11 +17103,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the new gateway tries to open the same file.
                 # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
                 # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+                # These are normally the same object because the runner reuses
+                # SessionStore's instance. Deduplicate by identity so one
+                # shutdown does not checkpoint an already-closed connection.
                 _self_db = getattr(self, "_session_db", None)
                 _self_db = getattr(_self_db, "_db", _self_db)
+                _seen_db_ids: set[int] = set()
                 for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
                     if _db is None or not hasattr(_db, "close"):
                         continue
+                    if id(_db) in _seen_db_ids:
+                        continue
+                    _seen_db_ids.add(id(_db))
                     try:
                         _db.close()
                     except Exception as _e:
