@@ -108,6 +108,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-084 | Active | `fix(gateway): bound per-chat typing indicator traffic` | Bound the typing indicator's per-CHAT API rate across concurrent sessions and quiesce it during a flood window. |
 | HERMES-085 | Active | `fix(gateway): defer flood-controlled delivery obligations` | Treat a platform flood rejection as a timed deferral rather than a terminal delivery failure. |
 | HERMES-086 | Active | `fix(gateway): preserve queued-turn cleanup callbacks` | Keep each completed turn's temporary progress cleanup when a queued follow-up starts before the prior delivery task unwinds. |
+| HERMES-087 | Active | `fix(skills): stop duplicating root skill names` | Classify root-level skills under `general` so the prompt does not suggest invalid self-qualified lookups. |
 
 ## Fork-only administrative subject exemptions
 
@@ -154,6 +155,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-087 — Stop duplicating root skill names
+
+- **Independent hypothesis (2026-08-31):** The live skill index rendered a root-level `research/SKILL.md` as both category and skill, then attached the unrelated bundled `research/DESCRIPTION.md`; this prompted an invalid `skill_view("research:research")` before the correct bare lookup. `_build_snapshot_entry()` used `parts[0]` as the category for a two-part root path even though `_get_category_from_path()` and its tests classify root skills as uncategorized and the banner groups them under `general`.
+- **Summary:** Classify only genuinely nested skill paths by their parent hierarchy, place root-level skills under `general`, and advance the skill-prompt snapshot version so cached self-qualified entries are rebuilt. Categorized and plugin-qualified skills retain their existing behavior.
+- **Surfaces:** `agent/prompt_builder.py`; `tests/agent/test_prompt_builder.py`; this record.
+- **Upstream tracking:** No dedicated issue found as of 2026-08-31. Open issue #74929 concerns broader skill-invocation enforcement but does not identify this path-classification defect.
+- **Upstream PR:** Open draft PR #81338 is the direct source of this implementation and snapshot migration; open PR #26467 implements the same category correction but does not invalidate version-2 snapshots. Preserve contributor authorship from #81338.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/tools/test_skills_tool.py tests/test_plugin_skills.py -q`; coverage must prove a version-2 root-skill snapshot rebuilds under `general`, the skill name is not repeated as a category, ordinary top-level and categorized lookup contracts remain aligned, and plugin-qualified skills still resolve.
+- **Expected published commit identity:** Stable subject `fix(skills): stop duplicating root skill names`; source, regressions, snapshot migration, and this record ship together.
+- **Rollback:** Revert only `fix(skills): stop duplicating root skill names`, restore snapshot version 2 and the prior root-path category expression, remove the focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required; a later prompt rebuild recreates the prior index.
+- **Retirement:** Retire after a released upstream version classifies root-level skills under `general`, invalidates stale self-qualified snapshots, and passes equivalent root, nested, and plugin-qualified regressions. Remove the fork implementation and duplicate test rather than retaining parallel behavior.
 
 ### HERMES-086 — Preserve queued-turn cleanup callbacks
 
