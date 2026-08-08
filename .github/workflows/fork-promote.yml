@@ -2,11 +2,11 @@ name: Fork promotion
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["Fork candidate"]
     types: [completed]
 
 permissions:
-  actions: write
+  actions: read
   contents: write
   issues: write
 
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   promote-candidate:
     if: >-
-      github.event.workflow_run.name == 'CI' &&
+      github.event.workflow_run.name == 'Fork candidate' &&
       startsWith(github.event.workflow_run.head_branch, 'automation/candidate/') &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest
@@ -36,7 +36,6 @@ jobs:
 
       - name: Promote exact verified SHA
         run: |
-          # shellcheck disable=SC2016
           set -euo pipefail
           base_sha=${HEAD_BRANCH##*/}
           if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -53,8 +52,7 @@ jobs:
           fi
 
           if [ "$RESULT" != success ]; then
-            body=$(printf "Candidate \`%s\` did not pass the fork verification workflow.\n\n- Expected fork main: \`%s\`\n- Result: \`%s\`\n- Run: %s\n\n\`main\` was not changed." "$HEAD_SHA" "$base_sha" "$RESULT" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
-            # shellcheck disable=SC2016
+            body=$(printf "Candidate \`%s\` did not pass fork verification.\n\n- Expected fork main: \`%s\`\n- Result: \`%s\`\n- Run: %s\n\n\`main\` was not changed." "$HEAD_SHA" "$base_sha" "$RESULT" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
             issue=$(gh issue list --state open --search '"Fork maintenance blocked" in:title' --json number --jq ".[0].number // empty")
             if [ -n "$issue" ]; then
               gh issue comment "$issue" --body "$body"
@@ -66,7 +64,6 @@ jobs:
 
           if [ "$remote_main" != "$base_sha" ]; then
             body=$(printf "Verified candidate \`%s\` was not promoted because fork \`main\` changed during verification.\n\n- Expected: \`%s\`\n- Actual: \`%s\`\n- Run: %s" "$HEAD_SHA" "$base_sha" "$remote_main" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
-            # shellcheck disable=SC2016
             issue=$(gh issue list --state open --search '"Fork maintenance blocked" in:title' --json number --jq ".[0].number // empty")
             if [ -n "$issue" ]; then
               gh issue comment "$issue" --body "$body"
@@ -78,9 +75,7 @@ jobs:
 
           git push --force-with-lease="refs/heads/main:$base_sha" origin "$HEAD_SHA:refs/heads/main"
           git push --force-with-lease="refs/heads/$HEAD_BRANCH:$HEAD_SHA" origin ":refs/heads/$HEAD_BRANCH"
-          gh workflow run ci.yml --ref main
 
-          # shellcheck disable=SC2016
           issue=$(gh issue list --state open --search '"Fork maintenance blocked" in:title' --json number --jq ".[0].number // empty")
           if [ -n "$issue" ]; then
             gh issue close "$issue" --comment "Fork candidate $HEAD_SHA passed verification and was promoted to main."
@@ -89,37 +84,3 @@ jobs:
           remote_main_after=$(git ls-remote --heads origin refs/heads/main | cut -f1)
           test "$remote_main_after" = "$HEAD_SHA"
           echo "Promoted verified fork candidate $HEAD_SHA" >> "$GITHUB_STEP_SUMMARY"
-
-  record-main-health:
-    if: >-
-      github.event.workflow_run.name == 'CI' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ github.token }}
-      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-      RESULT: ${{ github.event.workflow_run.conclusion }}
-    steps:
-      - name: Record post-promotion CI health
-        run: |
-          # shellcheck disable=SC2016
-          set -euo pipefail
-          title="Fork main CI failed"
-          # shellcheck disable=SC2016
-          issue=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq ".[0].number // empty")
-          if [ "$RESULT" = success ]; then
-            if [ -n "$issue" ]; then
-              gh issue close "$issue" --comment "CI passed for main at $HEAD_SHA."
-            fi
-            exit 0
-          fi
-
-          body=$(printf "Fork \`main\` failed its complete post-promotion CI.\n\n- SHA: \`%s\`\n- Result: \`%s\`\n- Run: %s" "$HEAD_SHA" "$RESULT" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
-          if [ -n "$issue" ]; then
-            gh issue comment "$issue" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body" --label "bug" || gh issue create --title "$title" --body "$body"
-          fi
-          exit 1
