@@ -1,0 +1,109 @@
+name: Fork sync
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  prepare-candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out maintained main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Rebase patches onto current upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2016,SC2129
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --prune upstream main
+
+          base_sha=$(git rev-parse HEAD)
+          upstream_sha=$(git rev-parse upstream/main)
+          {
+            echo "base_sha=$base_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            {
+              echo "candidate_sha=$base_sha"
+              echo "changed=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "Fork already contains upstream $upstream_sha" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! rebase_output=$(git rebase upstream/main 2>&1); then
+            git rebase --abort || true
+            printf '%s\n' "$rebase_output"
+            body=$(printf "Automated fork synchronization could not rebase the maintained patch stack.\n\n- Fork base: \`%s\`\n- Upstream: \`%s\`\n- Run: %s\n\nNo candidate was published and \`main\` was not changed." "$base_sha" "$upstream_sha" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+            # shellcheck disable=SC2016
+            issue=$(gh issue list --state open --search '"Fork maintenance blocked" in:title' --json number --jq ".[0].number // empty")
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "$body"
+            else
+              gh issue create --title "Fork maintenance blocked" --body "$body" --label "bug" || gh issue create --title "Fork maintenance blocked" --body "$body"
+            fi
+            exit 1
+          fi
+
+          for subject in \
+            "chore(local): carry Brian-owned working-tree patches into the fork" \
+            "fix(state): serialize public reads, bound readers, one gateway SessionDB"
+          do
+            count=0
+            while IFS= read -r actual_subject; do
+              if [ "$actual_subject" = "$subject" ]; then
+                count=$((count + 1))
+              fi
+            done < <(git log --format=%s upstream/main..HEAD)
+            if [ "$count" -ne 1 ]; then
+              echo "Required maintained patch missing or duplicated: $subject" >&2
+              exit 1
+            fi
+          done
+
+          candidate_sha=$(git rev-parse HEAD)
+          candidate_branch="automation/candidate/$base_sha"
+          remote_candidate=""
+          read -r remote_candidate _ < <(git ls-remote --heads origin "refs/heads/$candidate_branch") || true
+          if [ -n "$remote_candidate" ]; then
+            lease="--force-with-lease=refs/heads/$candidate_branch:$remote_candidate"
+          else
+            lease="--force-with-lease=refs/heads/$candidate_branch:"
+          fi
+          git push "$lease" origin "HEAD:refs/heads/$candidate_branch"
+          gh workflow run ci.yml --ref "$candidate_branch"
+
+          {
+            echo "candidate_sha=$candidate_sha"
+            echo "candidate_branch=$candidate_branch"
+            echo "changed=true"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Published candidate \`$candidate_sha\`"
+            echo
+            echo "Upstream base: \`$upstream_sha\`"
+            echo
+            echo "Expected fork main: \`$base_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
