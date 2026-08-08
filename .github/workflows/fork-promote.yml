@@ -18,6 +18,7 @@ jobs:
   promote-candidate:
     if: >-
       github.event.workflow_run.name == 'Fork candidate' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
       startsWith(github.event.workflow_run.head_branch, 'automation/candidate/') &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest

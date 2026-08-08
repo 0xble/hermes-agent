@@ -1,9 +1,6 @@
 name: Fork candidate
 
 on:
-  push:
-    branches:
-      - "automation/candidate/**"
   workflow_dispatch:
 
 permissions:
