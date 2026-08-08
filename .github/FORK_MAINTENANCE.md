@@ -20,7 +20,7 @@ The first commit preserves previously reviewed runtime fixes that have not all l
 3. Refuses a conflict, missing patch, or duplicated patch.
 4. Publishes the result to `automation/candidate/<current-main-sha>` without changing `main`.
 
-The repository's complete `CI` workflow runs on the candidate. `Fork promotion` advances `main` only when the exact candidate SHA passes and the current `main` SHA still matches the lease encoded in the candidate branch. The candidate branch is deleted after promotion. GitHub suppresses recursive workflow triggers for pushes made with `GITHUB_TOKEN`, so the sync and promotion workflows explicitly dispatch candidate verification and post-promotion CI. The same complete CI then runs again on the promoted `main` SHA as an independent check.
+`Fork candidate` runs the complete canonical Python suite and lint workflow on the candidate. `Fork promotion` advances `main` only when the exact candidate SHA passes and the current `main` SHA still matches the lease encoded in the candidate branch. The candidate branch is deleted after promotion. GitHub suppresses recursive workflow triggers for pushes made with `GITHUB_TOKEN`, so `Fork sync` explicitly dispatches candidate verification after publishing the branch.
 
 Failures open or update a private GitHub issue rather than guessing a conflict resolution or deploying a failed candidate.
 

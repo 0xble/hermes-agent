@@ -93,7 +93,7 @@ jobs:
             lease="--force-with-lease=refs/heads/$candidate_branch:"
           fi
           git push "$lease" origin "HEAD:refs/heads/$candidate_branch"
-          gh workflow run ci.yml --ref "$candidate_branch"
+          gh workflow run fork-candidate.yml --ref "$candidate_branch"
 
           {
             echo "candidate_sha=$candidate_sha"
