@@ -60,7 +60,10 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.config import PlatformConfig
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import (
+    TelegramAdapter,
+    _TelegramSendCooldownExceeded,
+)
 
 
 def _make_adapter() -> TelegramAdapter:
@@ -427,6 +430,36 @@ async def test_cancelled_send_releases_chat_lock():
 
 
 @pytest.mark.asyncio
+async def test_retry_after_reenters_shared_gate_without_direct_sleep(monkeypatch):
+    adapter = _make_adapter()
+    adapter._send_cooldown_max_wait = 5.0
+    sleeps: list[float] = []
+
+    class Flooded(Exception):
+        retry_after = 2.0
+
+    adapter._run_send_call = AsyncMock(
+        side_effect=[
+            Flooded("Retry after 2"),
+            SimpleNamespace(message_id=42),
+        ]
+    )
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        fake_sleep,
+    )
+    result = await adapter.send("flood-chat", "hello", metadata={"notify": True})
+
+    assert result.success is True
+    assert sleeps == []
+    assert adapter._run_send_call.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_extreme_server_retry_after_never_sleeps_inline(monkeypatch):
     adapter = _make_adapter()
     adapter._send_cooldown_max_wait = 5.0
@@ -468,6 +501,115 @@ async def test_idle_cooldown_state_map_is_bounded():
     assert len(adapter._send_cooldown_locks) <= 2
     assert len(adapter._send_cooldown_until) <= 2
     assert adapter._send_cooldown_users == {}
+
+
+@pytest.mark.asyncio
+async def test_lock_queue_and_cooldown_share_max_wait_budget():
+    adapter = _make_adapter()
+    adapter._send_cooldown_max_wait = 0.05
+    adapter._send_cooldown_seconds = 0.0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_send():
+        started.set()
+        await release.wait()
+        return "first"
+
+    first = asyncio.create_task(
+        adapter._run_send_call("bounded-chat", blocked_send)
+    )
+    await started.wait()
+
+    with pytest.raises(_TelegramSendCooldownExceeded):
+        await adapter._run_send_call(
+            "bounded-chat",
+            AsyncMock(return_value="second"),
+        )
+
+    release.set()
+    assert await first == "first"
+    assert adapter._send_cooldown_users == {}
+
+
+@pytest.mark.asyncio
+async def test_pre_send_connect_timeout_does_not_stamp_cooldown():
+    adapter = _make_adapter()
+    adapter._send_cooldown_seconds = 1.1
+    send_fn = AsyncMock(side_effect=Exception("connect timeout"))
+
+    with pytest.raises(Exception, match="connect timeout"):
+        await adapter._run_send_call("connect-chat", send_fn)
+
+    assert "connect-chat" not in adapter._send_cooldown_until
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "kwargs"),
+    [
+        ("send_update_prompt", {"chat_id": "1", "prompt": "Proceed?"}),
+        (
+            "send_exec_approval",
+            {"chat_id": "1", "command": "pwd", "session_key": "s"},
+        ),
+        (
+            "send_slash_confirm",
+            {
+                "chat_id": "1",
+                "title": "Confirm",
+                "message": "Proceed?",
+                "session_key": "s",
+                "confirm_id": "c",
+            },
+        ),
+        (
+            "send_clarify",
+            {
+                "chat_id": "1",
+                "question": "Choose",
+                "choices": ["A"],
+                "clarify_id": "c",
+                "session_key": "s",
+            },
+        ),
+        (
+            "send_model_picker",
+            {
+                "chat_id": "1",
+                "providers": [],
+                "current_model": "m",
+                "current_provider": "p",
+                "session_key": "s",
+                "on_model_selected": AsyncMock(),
+            },
+        ),
+        (
+            "send_choice_picker",
+            {
+                "chat_id": "1",
+                "title": "Choose",
+                "choices": [{"value": "a", "label": "A"}],
+                "session_key": "s",
+                "on_choice_selected": AsyncMock(),
+            },
+        ),
+    ],
+)
+async def test_control_boundaries_preserve_cooldown_retry_metadata(
+    method_name,
+    kwargs,
+):
+    adapter = _make_adapter()
+    adapter._send_message_with_thread_fallback = AsyncMock(
+        side_effect=_TelegramSendCooldownExceeded(9.0)
+    )
+
+    result = await getattr(adapter, method_name)(**kwargs)
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.retry_after == 5.0
 
 
 def test_retry_after_accepts_ptb_timedelta_mode():
