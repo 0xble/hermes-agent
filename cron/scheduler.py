@@ -532,29 +532,34 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
-def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
-    """Toolsets a cron-spawned agent must never receive.
+def _resolve_cron_disabled_toolsets(job: Any, cfg: Optional[dict] = None) -> list[str]:
+    """Resolve policy- and configuration-denied cron toolsets.
 
-    Two toolsets are always disabled in cron context regardless of config:
-      - ``messaging`` — interactive, needs a live gateway session
-      - ``clarify`` — interactive, blocks waiting for user input
+    ``clarify`` is always disabled. ``cronjob`` is denied unless
+    ``cron.allow_agent_scheduling`` opts in. ``messaging`` is denied unless the
+    job sets ``allow_messaging=true``. ``memory`` is denied unless the job
+    explicitly names it in ``enabled_toolsets``; even then cron keeps
+    ``skip_memory=True`` so only the local file-backed store is available, not
+    an external memory provider. User-level ``agent.disabled_toolsets`` is
+    layered on top and cannot be bypassed by a job allowlist.
 
-    ``cronjob`` is policy-denied by default (loop prevention, not a security
-    boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
-    in config.yaml drops it from the base denylist so cron-spawned agents may
-    manage the user's cron table. The gate only removes the built-in policy
-    denial — it never overrides the user denylist below.
-
-    User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
-    so per-job ``enabled_toolsets`` cannot bypass policy that applies to
-    ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
-    past config.yaml's denylist).
+    The one-argument form is retained for callers that only need the global
+    policy calculation.
     """
+    if cfg is None:
+        cfg = job or {}
+        job = {}
     cron_cfg = (cfg or {}).get("cron") or {}
-    if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify"]
-    else:
-        disabled = ["cronjob", "messaging", "clarify"]
+    disabled = []
+    if not cron_cfg.get("allow_agent_scheduling"):
+        disabled.append("cronjob")
+
+    explicit_toolsets = job.get("enabled_toolsets") or []
+    if not job.get("allow_messaging"):
+        disabled.append("messaging")
+    disabled.append("clarify")
+    if "memory" not in explicit_toolsets:
+        disabled.append("memory")
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -618,10 +623,16 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        resolved = _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        if job.get("allow_messaging") and "messaging" not in resolved:
+            resolved.append("messaging")
+        return resolved
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        resolved = sorted(_get_platform_tools(cfg or {}, "cron"))
+        if job.get("allow_messaging") and "messaging" not in resolved:
+            resolved.append("messaging")
+        return resolved
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
@@ -754,6 +765,9 @@ def _is_cron_silence_response(text: str) -> bool:
 
     Delegates to the shared autonomous-lane matcher in
     :mod:`gateway.response_filters` (also used by the webhook adapter).
+    Explicit job-scoped outbound messages already sent during the run do
+    not change this matcher; they suppress only the scheduler's leftover
+    automatic delivery of ``[SILENT]``.
     """
     from gateway.response_filters import is_autonomous_silence_response
 
@@ -4702,17 +4716,33 @@ def _build_job_prompt(
 
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    from cron.outbound import job_allows_messaging
+
+    if job_allows_messaging(job):
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: You may send multiple native messages with "
+            "send_message. Each call needs a unique message_key and "
+            "target='origin'. The scheduler sends through this Hermes "
+            "profile's adapter identity only. Do not use a shell, "
+            "provider CLI, or any other account. After those native "
+            "sends, respond with exactly \"[SILENT]\" so the scheduler "
+            "does not add a duplicate summary. If there is nothing to "
+            "send, respond with exactly \"[SILENT]\". Never combine "
+            "[SILENT] with leftover content.]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -5845,6 +5875,9 @@ def run_job(
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_ALLOW_MESSAGING",
+        "HERMES_CRON_JOB_ID",
+        "HERMES_CRON_RUN_ID",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
@@ -5924,6 +5957,14 @@ def run_job(
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
             )
+
+        from cron.outbound import job_allows_messaging
+
+        _VAR_MAP["HERMES_CRON_JOB_ID"].set(str(job_id or ""))
+        _VAR_MAP["HERMES_CRON_RUN_ID"].set(str(uuid.uuid4()))
+        _VAR_MAP["HERMES_CRON_ALLOW_MESSAGING"].set(
+            "1" if job_allows_messaging(job) and delivery_target else ""
+        )
 
         # Model resolution precedence: per-job override > cron.model (the
         # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
@@ -6445,7 +6486,7 @@ def run_job(
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
             enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            disabled_toolsets=_resolve_cron_disabled_toolsets(job, _cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project

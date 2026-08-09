@@ -15,6 +15,7 @@ from cron.scheduler import (
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
+    _resolve_cron_disabled_toolsets,
     _resolve_delivery_target,
     _resolve_origin,
     _send_media_via_adapter,
@@ -632,15 +633,14 @@ class TestRunJobSessionPersistence:
             yield fake_db, mock_agent_cls
 
 
-    def test_run_job_memory_enabled_in_cron(self, tmp_path):
-        """Cron agents get memory like any other agent run.
+    def test_run_job_memory_toolset_disabled_in_cron(self, tmp_path):
+        """Memory stays disabled unless a job opts in explicitly.
 
-        skip_memory=False and the memory toolset is not policy-denied, so
-        MEMORY.md/USER.md load and the memory tool follows normal toolset
-        resolution.
+        Cron agents are constructed with skip_memory=True. Jobs that do not
+        explicitly request the memory toolset must not receive it.
         """
         job = {
-            "id": "memory-enabled-job",
+            "id": "memory-hide-job",
             "name": "test",
             "prompt": "hello",
         }
@@ -648,13 +648,18 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" not in (kwargs["disabled_toolsets"] or []), (
-            "memory toolset must not be policy-denied in cron"
+        assert "memory" in (kwargs["disabled_toolsets"] or []), (
+            "memory toolset should be disabled in cron to match skip_memory=True"
         )
 
-    def test_run_job_keeps_per_job_memory_toolset(self, tmp_path):
-        """A per-job enabled_toolsets naming memory keeps it."""
+    def test_run_job_explicit_memory_toolset_is_local_only(self, tmp_path):
+        """Explicit memory opt-in exposes the built-in store without providers.
+
+        ``skip_memory=True`` remains load-bearing: AIAgent creates the
+        file-backed store because memory was explicitly requested, while
+        leaving its external MemoryManager disabled. The behavioral store and
+        provider assertions live in test_skip_memory_store_65429.py.
+        """
         job = {
             "id": "memory-toolset-job",
             "name": "test",
@@ -665,10 +670,16 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" in (kwargs["enabled_toolsets"] or [])
-        assert "file" in (kwargs["enabled_toolsets"] or [])
+        assert kwargs["skip_memory"] is True
+        assert kwargs["enabled_toolsets"] == ["memory", "file"]
         assert "memory" not in kwargs["disabled_toolsets"]
+
+    def test_explicit_memory_cannot_bypass_profile_denylist(self):
+        disabled = _resolve_cron_disabled_toolsets(
+            {"enabled_toolsets": ["memory", "terminal"]},
+            {"agent": {"disabled_toolsets": ["memory"]}},
+        )
+        assert "memory" in disabled
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
