@@ -47,6 +47,13 @@ class TestCronCommandLifecycle:
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
 
+    def test_top_level_handler_propagates_failure_status(self, monkeypatch):
+        from hermes_cli.main import cmd_cron
+
+        monkeypatch.setattr(cron_cli, "cron_command", lambda _args: 1)
+
+        assert cmd_cron(Namespace()) == 1
+
     def test_create_edit_and_list_timezone(self, tmp_cron_dir, capsys, monkeypatch):
         monkeypatch.setattr(
             "cron.jobs._hermes_now",
