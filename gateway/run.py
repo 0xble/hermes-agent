@@ -2975,6 +2975,12 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
 # and before the scheduler can run (#81451).
 _GATEWAY_TERMINAL_CWD = os.environ.get("TERMINAL_CWD", "").strip()
 
+# Immutable gateway baseline. Cron jobs temporarily mutate process-global
+# TERMINAL_CWD for legacy tool consumers, so interactive turns must never read
+# that variable live. This snapshot is taken after config/placeholder resolution
+# and before the scheduler can run (#81451).
+_GATEWAY_TERMINAL_CWD = os.environ.get("TERMINAL_CWD", "").strip()
+
 from gateway.config import (
     ChannelOverride,
     Platform,
