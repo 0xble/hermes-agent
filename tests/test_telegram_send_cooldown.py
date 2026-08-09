@@ -1,30 +1,15 @@
-"""TelegramAdapter per-chat send-cooldown gate.
+"""TelegramAdapter atomic per-chat Bot API send reservations.
 
-Cross-cutting rate-limiter for outbound ``send()`` calls. Telegram's
-Bot API enforces ~1 msg/sec/chat in private DMs and a global ~30
-msg/sec budget across all chats for bots. A single user turn
-historically fans out 3-5 sends from independent code paths
-(status callbacks, progress bubbles, streaming previews, final
-answer) and they were fired in parallel — a burst pattern that
-crosses Telegram's threshold and triggers a flood-control penalty
-that escalates into multi-thousand-second back-offs.
-
-The fix is a per-chat minimum-gap gate in ``send()`` so the
-cumulative send rate stays under the threshold regardless of how
-many components fire concurrently. These tests pin the gate's
-behaviour:
-
-  - successful sends stamp the cooldown so the next send to the
-    same chat waits for ``_send_cooldown_seconds``
-  - a different chat has an independent cooldown
-  - the wait is bounded by ``_send_cooldown_max_wait`` so a
-    7000-second Telegram penalty doesn't stall the chat path
-  - a send that arrives just after the cooldown expires goes
-    through without an extra delay
+Tests pin concurrency, chunking, independent chats, RetryAfter propagation,
+bounded waits, and representative media routing through the shared reservation
+primitive.
 """
+import asyncio
+from datetime import timedelta
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -247,3 +232,246 @@ async def test_oversized_wait_returns_retryable_error(monkeypatch):
     assert "flood_control" in (result.error or "")
     # No Bot API call should have been made.
     assert adapter._bot.send_message.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rich_sends_reserve_distinct_slots(monkeypatch):
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"rich_messages": True})
+    )
+    sleeps: list[float] = []
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class RichBot:
+        calls = 0
+
+        async def do_api_request(self, endpoint, api_kwargs):
+            assert endpoint == "sendRichMessage"
+            self.calls += 1
+            if self.calls == 1:
+                first_entered.set()
+                await release_first.wait()
+            return SimpleNamespace(message_id=self.calls)
+
+    adapter._bot = RichBot()
+    adapter._send_cooldown_seconds = 0.25
+    adapter._send_cooldown_max_wait = 1.0
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        await original_sleep(0)
+
+    original_sleep = asyncio.sleep
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        fake_sleep,
+    )
+    content = "| A | B |\n|---|---|\n| 1 | 2 |"
+    first = asyncio.create_task(adapter.send("42", content, metadata={"notify": True}))
+    await first_entered.wait()
+    second = asyncio.create_task(adapter.send("42", content, metadata={"notify": True}))
+    await original_sleep(0)
+    release_first.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.success and second_result.success
+    assert adapter._bot.calls == 2
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_each_message_chunk_reserves_its_own_slot(monkeypatch):
+    adapter = _make_adapter()
+    adapter._send_cooldown_seconds = 0.2
+    adapter._send_cooldown_max_wait = 5.0
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        fake_sleep,
+    )
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 200)
+    result = await adapter.send("chunk-chat", content)
+
+    assert result.success
+    assert adapter._bot.send_message.await_count == 2
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_shared_with_already_waiting_sender():
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"rich_messages": True})
+    )
+
+    class Flooded(Exception):
+        retry_after = 7.0
+
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class FloodBot:
+        calls = 0
+
+        async def do_api_request(self, endpoint, api_kwargs):
+            self.calls += 1
+            first_entered.set()
+            await release_first.wait()
+            raise Flooded("Retry after 7")
+
+    adapter._bot = FloodBot()
+    adapter._send_cooldown_seconds = 0.1
+    adapter._send_cooldown_max_wait = 5.0
+    content = "| A | B |\n|---|---|\n| 1 | 2 |"
+
+    first_task = asyncio.create_task(
+        adapter.send("flood-chat", content, metadata={"notify": True})
+    )
+    await first_entered.wait()
+    second_task = asyncio.create_task(
+        adapter.send("flood-chat", content, metadata={"notify": True})
+    )
+    await asyncio.sleep(0)
+    release_first.set()
+    first, second = await asyncio.gather(first_task, second_task)
+
+    assert first.success is False
+    assert first.retry_after == 5.0
+    assert second.success is False
+    assert second.retryable is True
+    assert second.retry_after == 5.0
+    assert adapter._bot.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_native_media_helper_uses_same_atomic_reservation(monkeypatch):
+    adapter = _make_adapter()
+    adapter._send_cooldown_seconds = 0.2
+    adapter._send_cooldown_max_wait = 1.0
+    sleeps: list[float] = []
+    send_fn = AsyncMock(return_value=SimpleNamespace(message_id=1))
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        fake_sleep,
+    )
+    kwargs = {"chat_id": 91, "photo": b"image"}
+    await adapter._send_with_dm_topic_reply_anchor_retry(
+        send_fn, kwargs, None, None, "photo"
+    )
+    await adapter._send_with_dm_topic_reply_anchor_retry(
+        send_fn, kwargs, None, None, "photo"
+    )
+
+    assert send_fn.await_count == 2
+    assert len(sleeps) == 1
+    assert sleeps[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_native_media_retry_after_is_retryable_not_fallback():
+    adapter = _make_adapter()
+
+    class Flooded(Exception):
+        retry_after = 4.0
+
+    send_fn = AsyncMock(side_effect=Flooded("Retry after 4"))
+    with pytest.raises(Exception) as raised:
+        await adapter._send_with_dm_topic_reply_anchor_retry(
+            send_fn,
+            {"chat_id": 91, "photo": b"image"},
+            None,
+            None,
+            "photo",
+        )
+
+    assert raised.value.__class__.__name__ == "_TelegramSendCooldownExceeded"
+    assert getattr(raised.value, "retry_after", None) == 4.0
+    assert send_fn.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_send_releases_chat_lock():
+    adapter = _make_adapter()
+    adapter._send_cooldown_seconds = 0.0
+    adapter._send_cooldown_max_wait = 5.0
+    started = asyncio.Event()
+
+    async def blocked_send():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(
+        adapter._run_send_call("cancel-chat", blocked_send)
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert adapter._send_cooldown_locks["cancel-chat"].locked() is False
+    result = await adapter._run_send_call(
+        "cancel-chat",
+        AsyncMock(return_value="ok"),
+    )
+    assert result == "ok"
+
+
+@pytest.mark.asyncio
+async def test_extreme_server_retry_after_never_sleeps_inline(monkeypatch):
+    adapter = _make_adapter()
+    adapter._send_cooldown_max_wait = 5.0
+    sleeps: list[float] = []
+
+    class Flooded(Exception):
+        retry_after = 7000.0
+
+    bot = adapter._bot
+    assert bot is not None
+    bot.send_message.side_effect = Flooded("Retry after 7000")
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.asyncio.sleep",
+        fake_sleep,
+    )
+    result = await adapter.send("flood-chat", "hello", metadata={"notify": True})
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.retry_after == 5.0
+    assert sleeps == []
+    assert bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_idle_cooldown_state_map_is_bounded():
+    adapter = _make_adapter()
+    adapter._send_cooldown_users = {}
+    adapter._send_cooldown_state_max = 2
+    adapter._send_cooldown_seconds = 0.0
+
+    for chat_id in ("one", "two", "three"):
+        await adapter._run_send_call(chat_id, AsyncMock(return_value="ok"))
+
+    assert len(adapter._send_cooldown_locks) <= 2
+    assert len(adapter._send_cooldown_until) <= 2
+    assert adapter._send_cooldown_users == {}
+
+
+def test_retry_after_accepts_ptb_timedelta_mode():
+    error = Exception("flood control")
+    error.retry_after = timedelta(seconds=7)  # type: ignore[attr-defined]
+
+    assert TelegramAdapter._telegram_retry_after(error) == 7.0
