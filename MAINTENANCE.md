@@ -27,7 +27,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-009 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Fail Hindsight retains on extraction errors. |
 | HERMES-010 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Avoid destructive Hindsight daemon restarts and empty-key overwrite. |
 | HERMES-011 | Active | `fix(state): serialize public reads, bound readers, one gateway SessionDB` | SessionDB concurrency, reader lifecycle, and gateway ownership. |
-| HERMES-012 | Active | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest` | Fail-closed upstream rebase, candidate verification, exact-SHA promotion, and manifest enforcement. |
+| HERMES-012 | Retired | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest`; `chore(fork): retire GitHub sync workflows` | Historical GitHub Actions synchronization pipeline, replaced by the `maintain-hermes-fork` Hermes cron. |
 | HERMES-013 | Active | `feat(cron): support per-job timezones` | Explicit IANA timezone pins for individual cron jobs. |
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 
@@ -123,14 +123,13 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `pytest -q tests/test_sessiondb_cross_thread_safety.py tests/gateway/test_runner_session_db_fd_budget.py tests/run_agent/test_run_agent.py -k 'persistence or sqlite or session_db or reader or writer'`.
 - **Rollback:** Revert the stable-subject commit in a follow-up change, resolving against current upstream rather than rewriting history. Preserve any later unrelated edits in the three shared source files. Before promotion, verify upstream covers all public-read serialization, the hard reader budget and reclamation, cross-thread drain, single gateway DB ownership, disabled/otherwise-safe statement caching, sanitized diagnostics, and no duplicate-prone retry.
 
-### HERMES-012 — Verify and promote rebased fork candidates automatically
+### HERMES-012 — Retired GitHub Actions fork synchronization pipeline
 
-- **Summary:** Daily and manual Actions fetch upstream, rebase the private stack, fail closed on conflicts or missing patches, publish a temporary candidate, run Python tests and lint, and promote the exact verified SHA only if `main` still matches its lease.
-- **Surfaces:** `.github/workflows/fork-sync.yml`; `.github/workflows/fork-candidate.yml`; `.github/workflows/fork-promote.yml`; this file.
-- **Upstream tracking:** This is fork-owner release machinery, not an upstream product defect. Retire only if an official fork synchronization facility satisfies the same fail-closed, test-before-promotion, exact-SHA, and stale-candidate protections.
-- **Known blocker:** The 2026-08-08 failed sync left `main` unchanged but GitHub rejected issue creation with `Resource not accessible by integration`; visible failure alerting must be repaired before this patch is considered fully operational.
-- **Regression:** Validate workflow syntax; manually dispatch `Fork sync`; prove a candidate runs `Fork candidate`; prove successful exact-SHA promotion and candidate deletion; separately prove a conflict or failed gate leaves `main` unchanged and produces a visible alert.
-- **Rollback:** Preserve this maintenance manifest. Disable scheduled dispatch first, confirm no candidate/promotion run is active, then remove the three private workflows in a follow-up commit and delete stale `automation/candidate/*` branches. Do not delete the workflows while a candidate is eligible for promotion. Verify the official replacement read-backs the promoted SHA and fails closed before enabling it.
+- **Summary:** The former three-workflow GitHub Actions pipeline fetched upstream, rebased the private stack, tested a temporary candidate, and promoted an exact SHA. It was retired because the `maintain-hermes-fork` Hermes cron now owns the same responsibility without a second scheduler or GitHub-owned promotion path.
+- **Surfaces:** Historical commits named in the index above; this lifecycle record. The active replacement is the external Hermes cron named `maintain-hermes-fork`, not repository code.
+- **Upstream tracking:** This was fork-owner release machinery rather than an upstream product defect. The replacement remains Brian-owned and must continue to fail closed, test before publication, use an exact recorded lease, and keep runtime deployment separate.
+- **Regression:** Verify the live scheduler has exactly one enabled `maintain-hermes-fork` job; its prompt requires an isolated clone, this manifest, affected patch regressions, canonical tests and lint, independent review, exact-SHA force-with-lease, remote readback, and no runtime deployment. Verify the three retired workflow files and stale `automation/candidate/*` branches are absent.
+- **Rollback:** Do not restore the retired workflows. If the cron is defective, pause it before its next run, leave fork `main` unchanged, repair or replace the single cron owner, and prove a manual isolated reconciliation plus remote readback before resuming it.
 
 ### HERMES-013 — Pin cron wall-clock schedules to per-job IANA timezones
 
@@ -154,15 +153,15 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 2. Add a provisional record here before implementation, including ID, summary, expected stable commit subject, upstream search, regression, retirement condition, and rollback procedure.
 3. Implement and verify the patch.
 4. Update the record with final surfaces, tests, and the published commit identity.
-5. Verify the manifest row is `Active`; `.github/workflows/fork-sync.yml` derives the required-subject set from this index and rejects unregistered fork-only code commits.
+5. Verify the manifest row is `Active`; the `maintain-hermes-fork` cron validates this index, its records, active stable subjects, and fork-only patch coverage before publication.
 6. Ship the code and manifest together. A source patch without a complete record is not publishable.
 7. On every upstream rebase, inspect patch equivalence; never resolve a conflict by retaining both private and upstream implementations.
 
 ## Automatic synchronization
 
-`Fork sync` runs daily and can also be dispatched manually. It fetches `NousResearch/hermes-agent:main`, rebases the maintained stack, validates this manifest's index, records, required fields, active stable subjects, and fork-only code-commit coverage, then publishes a candidate without changing `main`. `Fork candidate` runs the canonical Python suite and lint. `Fork promotion` advances `main` only when the exact candidate passes and the previous `main` still matches the encoded lease. GitHub suppresses recursive workflow triggers for `GITHUB_TOKEN` pushes, so candidate verification is dispatched explicitly.
+The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, rebases the maintained stack, compares conflicts against patch contracts, runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
 
-Failures must leave `main` unchanged and create or update a visible `Fork maintenance blocked` alert. Failure to produce that alert is itself a maintenance defect.
+The cron never pushes to Nous Research, never deploys or restarts a runtime, and never guesses through an ambiguous conflict. Failures must abort the isolated rebase, leave fork `main` unchanged, and deliver the exact blocker in the cron result.
 
 ## Invariants
 
@@ -178,7 +177,7 @@ Failures must leave `main` unchanged and create or update a visible `Fork mainte
 
 When synchronization is blocked:
 
-1. Inspect the failed Actions run and the `Fork maintenance blocked` alert.
+1. Inspect the failed `maintain-hermes-fork` cron run and its delivered blocker.
 2. Reproduce from `/Users/brianle/Repos/hermes-agent`.
 3. Fetch `upstream/main` and rebase maintained `main` locally.
 4. Resolve only after comparing current upstream behavior with every affected patch record above.
