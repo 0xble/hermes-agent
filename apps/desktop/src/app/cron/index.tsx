@@ -564,6 +564,7 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
           schedule: values.schedule,
           name: values.name || undefined,
           deliver: values.deliver || DEFAULT_DELIVER,
+          ...(values.timezone.trim() ? { timezone: values.timezone.trim() } : {}),
           ...(values.model.trim() ? { model: values.model.trim(), provider: values.provider.trim() || undefined } : {})
         })
       )
@@ -822,6 +823,10 @@ function CronJobDetail({
             { label: c.last.replace(/:$/, ''), value: formatTime(job.last_run_at) },
             { label: c.next.replace(/:$/, ''), value: formatTime(job.next_run_at) },
             { label: c.deliverLabel, value: c.deliveryLabels[deliver] ?? deliver },
+            {
+              label: c.timezoneLabel,
+              value: job.timezone ? `${job.timezone} (${c.explicit})` : c.timezoneInherited
+            },
             ...(modelOverride ? [{ label: c.modelLabel, value: modelOverride }] : [])
           ]}
         />
@@ -1037,6 +1042,7 @@ function CronEditorDialog({
   const [schedule, setSchedule] = useState('')
   const [schedulePreset, setSchedulePreset] = useState('daily')
   const [deliver, setDeliver] = useState(DEFAULT_DELIVER)
+  const [timezone, setTimezone] = useState('')
   // Per-job model override, encoded as `${providerSlug}:${model}` (split on the
   // first ':' when saving). MODEL_DEFAULT_VALUE = follow the global default.
   const [modelChoice, setModelChoice] = useState(MODEL_DEFAULT_VALUE)
@@ -1093,6 +1099,7 @@ function CronEditorDialog({
     setSchedule(initial ? jobScheduleExpr(initial) : (SCHEDULE_OPTIONS[0].expr ?? ''))
     setSchedulePreset(initial ? scheduleOptionForExpr(jobScheduleExpr(initial)).value : 'daily')
     setDeliver(initial ? jobDeliver(initial) : DEFAULT_DELIVER)
+    setTimezone(initial?.timezone ?? '')
     setModelChoice(initial && jobModel(initial) ? `${jobProvider(initial)}:${jobModel(initial)}` : MODEL_DEFAULT_VALUE)
     setSlotValues({})
     setTemplateChoice(editor.mode === 'create' ? (editor.blueprintKey ?? CUSTOM_TEMPLATE) : CUSTOM_TEMPLATE)
@@ -1175,7 +1182,8 @@ function CronEditorDialog({
         name: name.trim(),
         prompt: prompt.trim(),
         provider: overrideProvider,
-        schedule: schedule.trim()
+        schedule: schedule.trim(),
+        timezone
       })
     } catch (err) {
       setError(err instanceof Error ? err.message : c.failedSave)
@@ -1334,6 +1342,17 @@ function CronEditorDialog({
               </Field>
             </div>
 
+            <Field htmlFor="cron-timezone" label={c.timezoneLabel} optional optionalLabel={c.optional}>
+              <Input
+                className="font-mono"
+                id="cron-timezone"
+                onChange={event => setTimezone(event.target.value)}
+                placeholder={c.timezonePlaceholder}
+                value={timezone}
+              />
+              <FieldHint>{c.timezoneHint}</FieldHint>
+            </Field>
+
             {!scriptOnlyJob && (
               <Field htmlFor="cron-model" label={c.modelLabel} optional optionalLabel={c.optional}>
                 <Select onValueChange={setModelChoice} value={modelChoice}>
@@ -1424,6 +1443,7 @@ interface EditorValues {
   /** Provider slug for the model override ('' = none). */
   provider: string
   schedule: string
+  timezone: string
 }
 
 interface ScheduleOption {

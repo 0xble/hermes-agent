@@ -1880,6 +1880,11 @@ export interface Translations {
     promptLabel: string
     promptPlaceholder: string
     frequencyLabel: string
+    timezoneLabel: string
+    timezonePlaceholder: string
+    timezoneHint: string
+    timezoneInherited: string
+    explicit: string
     deliverLabel: string
     deliverNeedsHomeChannel: string
     modelLabel: string

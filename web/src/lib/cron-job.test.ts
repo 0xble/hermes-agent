@@ -26,6 +26,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     continuity: false,
     enabled_toolsets: [],
     workdir: "",
+    timezone: "",
     ...overrides,
   };
 }
@@ -47,6 +48,7 @@ describe("buildCronJobPayload", () => {
         base_url: "https://example.invalid/v1/",
         enabled_toolsets: ["web", ""],
         context_from: "upstream-a\nupstream-b",
+        timezone: " America/New_York ",
       }),
     );
 
@@ -54,6 +56,7 @@ describe("buildCronJobPayload", () => {
       base_url: "https://example.invalid/v1",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      timezone: "America/New_York",
     });
   });
 
@@ -86,6 +89,7 @@ describe("buildCronJobPayload", () => {
       context_from: null,
       enabled_toolsets: null,
       workdir: null,
+      timezone: null,
     });
   });
 });
@@ -114,6 +118,7 @@ describe("cronJobFormFromJob", () => {
       schedule_display: "every 1h",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      timezone: "America/New_York",
     };
 
     expect(cronJobFormFromJob(job)).toMatchObject({
@@ -121,6 +126,7 @@ describe("cronJobFormFromJob", () => {
       context_from: "upstream-a\nupstream-b",
       continuity: false,
       enabled_toolsets: ["web"],
+      timezone: "America/New_York",
     });
   });
 

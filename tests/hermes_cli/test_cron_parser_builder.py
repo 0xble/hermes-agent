@@ -41,6 +41,21 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_create_and_edit_accept_timezone():
+    parser = _build()
+    created = parser.parse_args(
+        ["cron", "create", "0 9 * * *", "brief", "--timezone", "America/New_York"]
+    )
+    edited = parser.parse_args(
+        ["cron", "edit", "j", "--timezone", "America/Los_Angeles"]
+    )
+    cleared = parser.parse_args(["cron", "edit", "j", "--timezone", ""])
+
+    assert created.timezone == "America/New_York"
+    assert edited.timezone == "America/Los_Angeles"
+    assert cleared.timezone == ""
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

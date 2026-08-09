@@ -2253,6 +2253,7 @@ export interface CronJobMutation {
   context_from?: string[] | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  timezone?: string | null;
 }
 
 export interface CronJob {
@@ -2278,6 +2279,7 @@ export interface CronJob {
   context_from?: string[] | string | null;
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
+  timezone?: string | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_status?: string | null;
