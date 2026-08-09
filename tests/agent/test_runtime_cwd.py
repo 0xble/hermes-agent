@@ -10,6 +10,7 @@ from agent.runtime_cwd import (
     clear_session_cwd,
     resolve_agent_cwd,
     resolve_context_cwd,
+    resolve_tool_cwd,
     set_session_cwd,
 )
 
@@ -68,14 +69,18 @@ class TestSessionCwdOverride:
             rt._SESSION_CWD.reset(token)
 
 
-    def test_clear_session_cwd_restores_terminal_cwd(self, monkeypatch, tmp_path):
+    def test_clear_session_cwd_suppresses_foreign_terminal_cwd(
+        self, monkeypatch, tmp_path
+    ):
         other = tmp_path / "other"
         other.mkdir()
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         token = set_session_cwd(str(other))
         try:
             clear_session_cwd()
-            assert resolve_agent_cwd() == tmp_path
+            assert resolve_context_cwd() is None
+            assert resolve_tool_cwd() == ""
+            assert resolve_agent_cwd() == Path(os.getcwd())
         finally:
             rt._SESSION_CWD.reset(token)
 

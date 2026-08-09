@@ -1648,7 +1648,9 @@ def _safe_getcwd() -> str:
     try:
         return os.getcwd()
     except (FileNotFoundError, PermissionError):
-        return _tenv("TERMINAL_CWD") or os.path.expanduser("~")
+        from agent.runtime_cwd import resolve_tool_cwd
+
+        return _tenv() or os.path.expanduser("~")
 
 
 # Path prefixes that identify a *host* working directory which cannot exist
@@ -1850,7 +1852,10 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = _tenv("TERMINAL_CWD", default_cwd)
+    from agent.runtime_cwd import resolve_tool_cwd
+
+    resolved_cwd = _tenv()
+    cwd = resolved_cwd or default_cwd
     from hermes_cli.config import _is_ssh_remote_tilde_cwd
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)

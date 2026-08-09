@@ -3110,6 +3110,12 @@ if not _configured_cwd or _configured_cwd in CWD_PLACEHOLDERS:
     else:
         os.environ["TERMINAL_CWD"] = _resolved_cwd
 
+# Immutable gateway baseline. Cron jobs temporarily mutate process-global
+# TERMINAL_CWD for legacy tool consumers, so interactive turns must never read
+# that variable live. This snapshot is taken after config/placeholder resolution
+# and before the scheduler can run (#81451).
+_GATEWAY_TERMINAL_CWD = os.environ.get("TERMINAL_CWD", "").strip()
+
 from gateway.config import (
     ChannelOverride,
     Platform,
@@ -7639,6 +7645,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
+        self._gateway_terminal_cwd = _GATEWAY_TERMINAL_CWD
         # When multiplex_profiles is on, load under the default profile secret
         # scope so bot tokens in that profile's .env resolve the same way
         # secondary profiles do (#64674). Explicit config= injection (tests)
@@ -23515,7 +23522,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
+                from agent.runtime_cwd import resolve_tool_cwd
                 from gateway.runtime_footer import build_footer_line as _bfl
+
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
@@ -27697,6 +27706,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=_GATEWAY_TERMINAL_CWD,
             async_delivery=_async_delivery,
             cron_session="",
         )

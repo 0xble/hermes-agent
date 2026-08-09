@@ -3453,6 +3453,15 @@ class GatewaySlashCommandsMixin:
             )
             return t("gateway.voice.help", toggle=toggle_line, channels=channels)
 
+    def _gateway_command_cwd(self) -> str:
+        """Return the immutable gateway cwd for pre-session commands."""
+        cwd = getattr(self, "_gateway_terminal_cwd", None)
+        if cwd is None:
+            from agent.runtime_cwd import resolve_tool_cwd
+
+            cwd = resolve_tool_cwd()
+        return cwd or str(Path.home())
+
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
         from gateway.run import _checkpoint_agent_kwargs, _load_gateway_config
@@ -3470,9 +3479,7 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_kwargs["checkpoint_max_file_size_mb"],
         )
 
-        from tools.terminal_scope import terminal_env as _tenv
-
-        cwd = _tenv("TERMINAL_CWD", str(Path.home()))
+        cwd = self._gateway_command_cwd()
         arg = event.get_command_args().strip()
 
         # --all / --force: classic full restore, overwriting user edits too.
@@ -3566,9 +3573,7 @@ class GatewaySlashCommandsMixin:
             elif low == "session":
                 mode = "session"
 
-        from tools.terminal_scope import terminal_env as _tenv
-
-        cwd = _tenv("TERMINAL_CWD", str(Path.home()))
+        cwd = self._gateway_command_cwd()
 
         if mode == "session":
             return await self._gateway_session_diff(cwd, stat_only)
