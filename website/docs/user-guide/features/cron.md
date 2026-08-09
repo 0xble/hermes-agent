@@ -941,6 +941,17 @@ cronjob(action="create", name="refresh-user-profile",
 
 A profile-level `agent.disabled_toolsets` entry for `memory` still wins and blocks the tool even when a job requests it.
 
+Persistent built-in memory is disabled for cron jobs by default. A job can opt in by explicitly including `"memory"` in `enabled_toolsets`. The cron agent can then read and write `MEMORY.md` and `USER.md`, but external memory providers remain disabled for that isolated run, so those writes are not mirrored to Hindsight, Honcho, or another provider:
+
+```text
+cronjob(action="create", name="refresh-user-profile",
+        schedule="0 3 * * *",
+        enabled_toolsets=["memory", "terminal"],
+        prompt="Reconcile the approved local user-profile projection.")
+```
+
+A profile-level `agent.disabled_toolsets` entry for `memory` still wins and blocks the tool even when a job requests it.
+
 ### Skipping the agent entirely: `wakeAgent`
 
 If your cron job attaches a pre-check script (via `script=`), the script can decide at runtime whether Hermes should even invoke the agent. Emit a final stdout line of the form:
