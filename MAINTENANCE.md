@@ -19,7 +19,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-001 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Serialize malformed `state.db` repair and invalidate stale schemas. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Make raw SQLite backup and quarantine connection-safe. |
 | HERMES-003 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Raise the file-descriptor soft limit safely. |
-| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends` | Enforce a per-chat Telegram send cooldown. |
+| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics` | Enforce a per-chat Telegram send cooldown. |
 | HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Share the progress-edit throttle per chat. |
 | HERMES-006 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Resolve memory notifications per platform. |
 | HERMES-007 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Keep interrupt sentinels out of API assistant text. |
@@ -61,7 +61,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-004 — Enforce a per-chat Telegram send cooldown
 
-- **Summary:** Inside `TelegramAdapter`, atomically reserves a bounded per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock, excessive waits return a bounded retryable flood-control result, and idle chat state is pruned. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
+- **Summary:** Inside `TelegramAdapter`, atomically reserves a per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock; lock acquisition plus cooldown waiting share a bounded budget; control boundaries preserve retry metadata; positively identified pre-send connection/pool timeouts do not consume a slot; and idle chat state is pruned. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/test_telegram_send_cooldown.py`.
 - **Upstream tracking:** Related upstream pull request `#66722` remains open and unmerged.
 - **Regression:** `pytest -q tests/test_telegram_send_cooldown.py`.

@@ -5447,7 +5447,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if locks is None:
             locks = {}
             self._send_cooldown_locks = locks
-        return locks.setdefault(chat_key, asyncio.Lock())
+        lock = locks.get(chat_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[chat_key] = lock
+        return lock
 
     def _prune_send_cooldown_state(self) -> None:
         """Bound idle per-chat state without evicting active or queued senders."""
@@ -5496,42 +5500,54 @@ class TelegramAdapter(BasePlatformAdapter):
         if users is not None:
             users[chat_key] = users.get(chat_key, 0) + 1
 
+        max_wait = float(getattr(self, "_send_cooldown_max_wait", 5.0))
+        deadline = time.monotonic() + max_wait
+        acquired = False
         try:
-            async with lock:
-                now = time.monotonic()
-                wait = max(0.0, float(cooldowns.get(chat_key, 0.0) or 0.0) - now)
-                max_wait = float(getattr(self, "_send_cooldown_max_wait", 5.0))
-                if wait > max_wait:
-                    logger.warning(
-                        "[%s] send cooldown for chat %s exceeds max wait "
-                        "(%.1fs > %.1fs); yielding with retryable error",
-                        self.name,
-                        chat_key,
-                        wait,
-                        max_wait,
-                    )
-                    raise _TelegramSendCooldownExceeded(wait)
-                if wait > 0:
-                    logger.debug(
-                        "[%s] send cooldown for chat %s: sleeping %.2fs",
-                        self.name,
-                        chat_key,
-                        wait,
-                    )
-                    await asyncio.sleep(wait)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=max_wait)
+            except asyncio.TimeoutError as error:
+                raise _TelegramSendCooldownExceeded(max_wait) from error
+            acquired = True
 
-                started_at = time.monotonic()
-                try:
-                    return await send_fn(*args, **kwargs)
-                except Exception as error:
-                    retry_after = self._telegram_retry_after(error)
-                    if retry_after is not None:
-                        cooldowns[chat_key] = max(
-                            float(cooldowns.get(chat_key, 0.0) or 0.0),
-                            time.monotonic() + retry_after,
-                        )
-                    raise
-                finally:
+            now = time.monotonic()
+            remaining_budget = max(0.0, deadline - now)
+            wait = max(0.0, float(cooldowns.get(chat_key, 0.0) or 0.0) - now)
+            if wait > remaining_budget:
+                logger.warning(
+                    "[%s] send cooldown for chat %s exceeds remaining wait "
+                    "budget (%.1fs > %.1fs); yielding with retryable error",
+                    self.name,
+                    chat_key,
+                    wait,
+                    remaining_budget,
+                )
+                raise _TelegramSendCooldownExceeded(wait)
+            if wait > 0:
+                logger.debug(
+                    "[%s] send cooldown for chat %s: sleeping %.2fs",
+                    self.name,
+                    chat_key,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+
+            started_at = time.monotonic()
+            stamp_gap = True
+            try:
+                return await send_fn(*args, **kwargs)
+            except Exception as error:
+                retry_after = self._telegram_retry_after(error)
+                if retry_after is not None:
+                    cooldowns[chat_key] = max(
+                        float(cooldowns.get(chat_key, 0.0) or 0.0),
+                        time.monotonic() + retry_after,
+                    )
+                elif self._looks_like_connect_timeout(error) or self._looks_like_pool_timeout(error):
+                    stamp_gap = False
+                raise
+            finally:
+                if stamp_gap:
                     gap = max(
                         0.0,
                         float(getattr(self, "_send_cooldown_seconds", 1.1)),
@@ -5541,6 +5557,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         started_at + gap,
                     )
         finally:
+            if acquired:
+                lock.release()
             if users is not None:
                 remaining = users.get(chat_key, 1) - 1
                 if remaining > 0:
@@ -5577,19 +5595,32 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return min(max(0.001, float(retry_after)), max_wait)
 
-    def _send_retry_after_overflow(
+    def _send_retry_after_outcome(
         self,
         error: Exception,
-        retry_after: float,
-    ) -> Optional[SendResult]:
-        if retry_after <= float(getattr(self, "_send_cooldown_max_wait", 5.0)):
-            return None
-        return SendResult(
-            success=False,
-            error=_redact_telegram_error_text(error),
-            retryable=True,
-            retry_after=self._bounded_send_retry_after(retry_after),
+        attempt: int,
+    ):
+        retry_after = self._telegram_retry_after(error)
+        if retry_after is None:
+            return False, None
+        overflow = retry_after > float(
+            getattr(self, "_send_cooldown_max_wait", 5.0)
         )
+        if overflow or attempt >= 2:
+            return True, SendResult(
+                success=False,
+                error=_redact_telegram_error_text(error),
+                retryable=True,
+                retry_after=self._bounded_send_retry_after(retry_after),
+            )
+        logger.warning(
+            "[%s] Telegram flood control on send (attempt %d/3); "
+            "retrying through the shared per-chat gate: %s",
+            self.name,
+            attempt + 1,
+            _redact_telegram_error_text(error),
+        )
+        return True, None
 
     def _send_cooldown_failure(
         self,
@@ -5780,27 +5811,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     except _TelegramSendCooldownExceeded as cooldown_error:
                         return self._send_cooldown_failure(cooldown_error)
                     except _NetErr as send_err:
-                        retry_after = self._telegram_retry_after(send_err)
-                        if retry_after is not None:
-                            overflow = self._send_retry_after_overflow(
-                                send_err,
-                                retry_after,
-                            )
-                            if overflow is not None:
-                                return overflow
-                            if _send_attempt < 2:
-                                safe_send_error = _redact_telegram_error_text(send_err)
-                                logger.warning(
-                                    "[%s] Telegram flood control on send "
-                                    "(attempt %d/3), retrying in %.1fs: %s",
-                                    self.name,
-                                    _send_attempt + 1,
-                                    retry_after,
-                                    safe_send_error,
-                                )
-                                await asyncio.sleep(retry_after)
-                                continue
-                            raise
+                        handled, retry_result = self._send_retry_after_outcome(
+                            send_err,
+                            _send_attempt,
+                        )
+                        if handled:
+                            if retry_result is not None:
+                                return retry_result
+                            continue
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle
@@ -5903,24 +5921,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             raise
                     except Exception as send_err:
-                        retry_after = self._telegram_retry_after(send_err)
-                        if retry_after is not None:
-                            overflow = self._send_retry_after_overflow(
-                                send_err,
-                                retry_after,
-                            )
-                            if overflow is not None:
-                                return overflow
-                            if _send_attempt < 2:
-                                logger.warning(
-                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
-                                    self.name,
-                                    _send_attempt + 1,
-                                    wait,
-                                    safe_send_error,
-                                )
-                                await asyncio.sleep(wait)
-                                continue
+                        handled, retry_result = self._send_retry_after_outcome(
+                            send_err,
+                            _send_attempt,
+                        )
+                        if handled:
+                            if retry_result is not None:
+                                return retry_result
+                            continue
                         raise
                 message_ids.append(str(msg.message_id))
 
@@ -6684,6 +6692,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_update_prompt failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -6770,6 +6780,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._approval_state[approval_id] = session_key
 
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_exec_approval failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -6818,6 +6830,8 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._slash_confirm_state[confirm_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -6900,6 +6914,8 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
             self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -6972,6 +6988,8 @@ class TelegramAdapter(BasePlatformAdapter):
             }
 
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_model_picker failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
@@ -7037,6 +7055,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "on_choice_selected": on_choice_selected,
             }
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning("[%s] send_choice_picker failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
