@@ -43,6 +43,8 @@ export interface CronEditorSaveValues {
   /** Provider for the model override ('' = none). Always paired with model. */
   provider: string
   schedule: string
+  /** IANA timezone pin ('' = inherit the profile timezone). */
+  timezone: string
 }
 
 export function parseCronDeliveryTargets(value: string): string[] {
@@ -73,7 +75,8 @@ export function cronEditorUpdates(values: CronEditorSaveValues, options: { scrip
   const updates: CronJobUpdates = {
     deliver: values.deliver,
     name: values.name,
-    schedule: values.schedule.trim()
+    schedule: values.schedule.trim(),
+    timezone: values.timezone.trim() || null
   }
 
   const trimmedPrompt = values.prompt.trim()

@@ -19,3 +19,11 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_exposes_optional_iana_timezone():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    timezone = CRONJOB_SCHEMA["parameters"]["properties"]["timezone"]
+    assert timezone["type"] == "string"
+    assert "IANA" in timezone["description"]
+    assert "empty string" in timezone["description"]
+

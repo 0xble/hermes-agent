@@ -84,6 +84,64 @@ def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     assert "past and cannot be scheduled" in result["error"]
 
 
+def test_cronjob_tool_timezone_create_update_list_round_trip(cron_env, monkeypatch):
+    from tools.cronjob_tools import cronjob
+
+    monkeypatch.setattr(
+        "cron.jobs._hermes_now",
+        lambda: datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+    )
+    created = json.loads(
+        cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="0 9 * * *",
+            timezone="America/New_York",
+        )
+    )
+    assert created["success"] is True
+    assert created["job"]["timezone"] == "America/New_York"
+    assert created["job"]["timezone_source"] == "explicit"
+
+    updated = json.loads(
+        cronjob(
+            action="update",
+            job_id=created["job_id"],
+            timezone="America/Los_Angeles",
+        )
+    )
+    assert updated["success"] is True
+    assert updated["job"]["timezone"] == "America/Los_Angeles"
+
+    listed = json.loads(cronjob(action="list"))
+    assert listed["jobs"][0]["timezone"] == "America/Los_Angeles"
+    assert listed["jobs"][0]["timezone_source"] == "explicit"
+
+    cleared = json.loads(
+        cronjob(action="update", job_id=created["job_id"], timezone="")
+    )
+    assert cleared["success"] is True
+    assert cleared["job"]["timezone"] is None
+    assert cleared["job"]["timezone_source"] == "profile"
+
+
+def test_cronjob_tool_rejects_invalid_timezone_before_persistence(cron_env):
+    from cron.jobs import load_jobs
+    from tools.cronjob_tools import cronjob
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="0 9 * * *",
+            timezone="Mars/Olympus_Mons",
+        )
+    )
+    assert result["success"] is False
+    assert "Invalid IANA timezone" in result["error"]
+    assert load_jobs() == []
+
+
 class TestRunJobScript:
     """Test the _run_job_script() function."""
 

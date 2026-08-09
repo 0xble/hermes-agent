@@ -866,6 +866,7 @@ export interface CronJob {
   schedule_display?: null | string
   script?: null | string
   state?: null | string
+  timezone?: null | string
 }
 
 export interface CronJobCreatePayload {
@@ -875,6 +876,7 @@ export interface CronJobCreatePayload {
   prompt: string
   provider?: string
   schedule: string
+  timezone?: string
 }
 
 export interface CronJobSchedule {
@@ -891,6 +893,7 @@ export interface CronJobUpdates {
   prompt?: string
   provider?: null | string
   schedule?: string
+  timezone?: null | string
 }
 
 // A cron delivery target from GET /api/cron/delivery-targets — the single

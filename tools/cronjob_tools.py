@@ -764,6 +764,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
+        "timezone": job.get("timezone"),
+        "timezone_source": "explicit" if job.get("timezone") else "profile",
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
         "next_run_at": job.get("next_run_at"),
@@ -1482,6 +1484,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    timezone: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1598,6 +1601,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    timezone=timezone,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1933,6 +1937,10 @@ def cronjob(
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
+            if timezone is not None:
+                # Empty string is the explicit clear operation; core update_job
+                # validates non-empty IANA identifiers before persistence.
+                updates["timezone"] = timezone
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
@@ -1976,6 +1984,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "type": "string",
                 "description": "REQUIRED for create. Schedule forms: (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'."
+            },
+            "timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone for cron wall-clock expressions (for example, America/New_York). Omit to inherit the profile timezone. On update, pass an empty string to clear the explicit pin. Intervals and ISO one-shots keep their elapsed/absolute semantics."
             },
             "name": {
                 "type": "string",
@@ -2097,6 +2109,7 @@ def _cronjob_handler(args, **kw):
         attach_to_session=args.get("attach_to_session"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
+        timezone=args.get("timezone"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )

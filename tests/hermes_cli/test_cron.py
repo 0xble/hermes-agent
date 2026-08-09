@@ -2,6 +2,7 @@
 
 import argparse
 from argparse import Namespace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -45,6 +46,88 @@ class TestCronCommandLifecycle:
         assert updated["model"] == "new-model"
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
+
+    def test_create_edit_and_list_timezone(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: datetime(2026, 1, 1, 12, tzinfo=timezone.utc),
+        )
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="0 9 * * *",
+                prompt="Daily brief",
+                name="Brief",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                model=None,
+                model_provider=None,
+                no_agent=False,
+                monitor_script=None,
+                monitor_url=None,
+                timezone="America/New_York",
+            )
+        )
+        job = list_jobs()[0]
+        assert job["timezone"] == "America/New_York"
+
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                model=None,
+                model_provider=None,
+                no_agent=None,
+                monitor_script=None,
+                monitor_url=None,
+                timezone="America/Los_Angeles",
+            )
+        )
+        assert get_job(job["id"])["timezone"] == "America/Los_Angeles"
+
+        cron_command(Namespace(cron_command="list", all=True))
+        out = capsys.readouterr().out
+        assert "America/Los_Angeles (explicit)" in out
+
+    def test_cli_invalid_timezone_does_not_persist(self, tmp_cron_dir, capsys):
+        rc = cron_cli.cron_create(
+            SimpleNamespace(
+                schedule="0 9 * * *",
+                prompt="Daily brief",
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                model=None,
+                model_provider=None,
+                no_agent=False,
+                monitor_script=None,
+                monitor_url=None,
+                timezone="Mars/Olympus_Mons",
+            )
+        )
+        assert rc == 1
+        assert list_jobs(include_disabled=True) == []
+        assert "Invalid IANA timezone" in capsys.readouterr().out
 
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(

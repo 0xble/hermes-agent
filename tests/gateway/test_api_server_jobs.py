@@ -184,6 +184,22 @@ class TestCreateJob:
                 data = await resp.json()
                 assert "5000" in data["error"] or "Prompt" in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_create_job_validation_error_is_bad_request(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", side_effect=ValueError("Invalid IANA timezone")
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                    "timezone": "Not/AZone",
+                })
+                assert resp.status == 400
+                assert "Invalid IANA timezone" in (await resp.json())["error"]
+
 
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
@@ -240,6 +256,20 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_validation_error_is_bad_request(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", side_effect=ValueError("Invalid IANA timezone")
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"timezone": "Not/AZone"},
+                )
+                assert resp.status == 400
+                assert "Invalid IANA timezone" in (await resp.json())["error"]
 
 
 # ---------------------------------------------------------------------------

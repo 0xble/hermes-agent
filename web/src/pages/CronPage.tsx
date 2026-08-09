@@ -148,6 +148,7 @@ function emptyCronJobForm(): CronJobEditorState {
     continuity: false,
     enabled_toolsets: [],
     workdir: "",
+    timezone: "",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
 }
@@ -290,6 +291,19 @@ function CronAdvancedFields({
             onChange={(e) => update("workdir", e.target.value)}
             placeholder="/absolute/project/path"
           />
+        </div>
+
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-timezone`}>Timezone</Label>
+          <Input
+            id={`${idPrefix}-timezone`}
+            value={form.timezone}
+            onChange={(e) => update("timezone", e.target.value)}
+            placeholder="Profile timezone (inherited)"
+          />
+          <p className="text-xs text-muted-foreground">
+            Optional IANA zone for cron wall-clock schedules, such as America/New_York.
+          </p>
         </div>
 
         <label className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -1147,6 +1161,9 @@ export default function CronPage() {
                       {getJobScheduleDisplay(job, scheduleDescribeStrings)}
                     </span>
                     <span>repeat: {getRepeatDisplay(job)}</span>
+                    <span>
+                      timezone: {job.timezone ? `${job.timezone} (explicit)` : "profile (inherited)"}
+                    </span>
                     <span>
                       {t.cron.last}: {formatTime(job.last_run_at)}
                     </span>

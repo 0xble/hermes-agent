@@ -63,20 +63,21 @@ describe('cronEditorUpdates', () => {
   it('omits prompt when saving a script-only job with an empty prompt', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'local', model: '', name: 'Weekly', prompt: '', provider: '', schedule: '0 9 * * 1' },
+        { deliver: 'local', model: '', name: 'Weekly', prompt: '', provider: '', schedule: '0 9 * * 1', timezone: '' },
         { scriptOnlyJob: true }
       )
     ).toEqual({
       deliver: 'local',
       name: 'Weekly',
-      schedule: '0 9 * * 1'
+      schedule: '0 9 * * 1',
+      timezone: null
     })
   })
 
   it('includes prompt when the user typed one on a script-only job', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1' },
+        { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1', timezone: '' },
         { scriptOnlyJob: true }
       ).prompt
     ).toBe('note')
@@ -90,18 +91,20 @@ describe('cronEditorUpdates', () => {
         name: 'Daily',
         prompt: 'go',
         provider: 'anthropic',
-        schedule: '0 9 * * *'
+        schedule: '0 9 * * *',
+        timezone: 'America/New_York'
       },
       { scriptOnlyJob: false }
     )
 
     expect(updates.model).toBe('claude-sonnet-4')
     expect(updates.provider).toBe('anthropic')
+    expect(updates.timezone).toBe('America/New_York')
   })
 
   it('clears a previous pin when the override is reset to default', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: '', name: 'Daily', prompt: 'go', provider: '', schedule: '0 9 * * *' },
+      { deliver: 'local', model: '', name: 'Daily', prompt: 'go', provider: '', schedule: '0 9 * * *', timezone: '' },
       { scriptOnlyJob: false }
     )
 
@@ -111,7 +114,7 @@ describe('cronEditorUpdates', () => {
 
   it('never touches model fields on script-only jobs', () => {
     const updates = cronEditorUpdates(
-      { deliver: 'local', model: 'x', name: 'Weekly', prompt: '', provider: 'y', schedule: '0 9 * * 1' },
+      { deliver: 'local', model: 'x', name: 'Weekly', prompt: '', provider: 'y', schedule: '0 9 * * 1', timezone: '' },
       { scriptOnlyJob: true }
     )
 

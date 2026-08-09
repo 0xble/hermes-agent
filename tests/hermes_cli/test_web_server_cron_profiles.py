@@ -968,6 +968,40 @@ async def test_dashboard_cron_rejects_missing_context_from(isolated_profiles):
     assert "missing-job-id" in update_exc.value.detail
 
 
+@pytest.mark.asyncio
+async def test_dashboard_cron_timezone_create_update_and_validation(isolated_profiles):
+    from hermes_cli import web_server
+
+    created = await web_server.create_cron_job(
+        web_server.CronJobCreate(
+            prompt="Daily brief",
+            schedule="0 9 * * *",
+            timezone="America/New_York",
+        ),
+        profile="worker_alpha",
+    )
+    assert created["timezone"] == "America/New_York"
+
+    updated = await web_server.update_cron_job(
+        created["id"],
+        web_server.CronJobUpdate(
+            updates={"timezone": "America/Los_Angeles"}
+        ),
+        profile="worker_alpha",
+    )
+    assert updated["timezone"] == "America/Los_Angeles"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await web_server.update_cron_job(
+            created["id"],
+            web_server.CronJobUpdate(
+                updates={"timezone": "Mars/Olympus_Mons"}
+            ),
+            profile="worker_alpha",
+        )
+    assert exc_info.value.status_code == 400
+    assert "Invalid IANA timezone" in exc_info.value.detail
+
 
 
 

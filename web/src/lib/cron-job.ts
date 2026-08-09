@@ -15,6 +15,7 @@ export interface CronJobFormState {
   continuity: boolean;
   enabled_toolsets: string[];
   workdir: string;
+  timezone: string;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -64,6 +65,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    timezone: optionalText(form.timezone),
   };
 }
 
@@ -100,5 +102,6 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     continuity,
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    timezone: asString(job.timezone),
   };
 }
