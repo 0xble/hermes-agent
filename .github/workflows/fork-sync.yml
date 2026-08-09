@@ -67,9 +67,9 @@ jobs:
             exit 1
           fi
 
-          # .github/FORK_MAINTENANCE.md is the single patch registry. Validate
-          # its record shape, require every active stable subject exactly once,
-          # and reject fork-only code commits that are absent from the registry.
+          # MAINTENANCE.md is the single patch registry. Validate its record
+          # shape, require every active stable subject exactly once, and reject
+          # fork-only code commits that are absent from the registry.
           python - upstream/main HEAD <<'PY'
           from collections import Counter
           from pathlib import Path
@@ -78,7 +78,7 @@ jobs:
           import sys
 
           base, head = sys.argv[1:]
-          manifest = Path(".github/FORK_MAINTENANCE.md").read_text()
+          manifest = Path("MAINTENANCE.md").read_text()
           index = manifest.split("## Maintained patch index", 1)[1].split(
               "## Patch records", 1
           )[0]
