@@ -67,21 +67,98 @@ jobs:
             exit 1
           fi
 
-          for subject in \
-            "chore(local): carry Brian-owned working-tree patches into the fork" \
-            "fix(state): serialize public reads, bound readers, one gateway SessionDB"
-          do
-            count=0
-            while IFS= read -r actual_subject; do
-              if [ "$actual_subject" = "$subject" ]; then
-                count=$((count + 1))
-              fi
-            done < <(git log --format=%s upstream/main..HEAD)
-            if [ "$count" -ne 1 ]; then
-              echo "Required maintained patch missing or duplicated: $subject" >&2
-              exit 1
-            fi
-          done
+          # .github/FORK_MAINTENANCE.md is the single patch registry. Validate
+          # its record shape, require every active stable subject exactly once,
+          # and reject fork-only code commits that are absent from the registry.
+          python - upstream/main HEAD <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          base, head = sys.argv[1:]
+          manifest = Path(".github/FORK_MAINTENANCE.md").read_text()
+          index = manifest.split("## Maintained patch index", 1)[1].split(
+              "## Patch records", 1
+          )[0]
+          rows = []
+          for line in index.splitlines():
+              if not line.startswith("| HERMES-"):
+                  continue
+              cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+              patch_id, status, subject_cell = cells[:3]
+              subjects = re.findall(r"`([^`]+)`", subject_cell)
+              if status not in {"Active", "Retired"} or not subjects:
+                  raise SystemExit(f"Invalid manifest row: {line}")
+              rows.append((patch_id, status, subjects))
+
+          record_ids = re.findall(r"(?m)^### (HERMES-\d{3})\b", manifest)
+          index_ids = [patch_id for patch_id, _, _ in rows]
+          if len(index_ids) != len(set(index_ids)):
+              raise SystemExit(f"Duplicate manifest patch ID: {index_ids!r}")
+          if Counter(index_ids) != Counter(record_ids):
+              raise SystemExit(
+                  "Manifest index/record mismatch: "
+                  f"index={index_ids!r} records={record_ids!r}"
+              )
+
+          for patch_id in record_ids:
+              body = manifest.split(f"### {patch_id}", 1)[1].split("\n### ", 1)[0]
+              for field in (
+                  "**Summary:**",
+                  "**Surfaces:**",
+                  "**Upstream tracking:**",
+                  "**Regression:**",
+                  "**Rollback:**",
+              ):
+                  if field not in body:
+                      raise SystemExit(f"{patch_id} is missing {field}")
+
+          active_subjects = list(
+              dict.fromkeys(
+                  subject
+                  for _, status, subjects in rows
+                  if status == "Active"
+                  for subject in subjects
+              )
+          )
+          known_subjects = {
+              subject for _, _, subjects in rows for subject in subjects
+          }
+          log = subprocess.check_output(
+              ["git", "log", "--format=%H%x09%s", f"{base}..{head}"],
+              text=True,
+          ).splitlines()
+          subject_counts = Counter(line.split("\t", 1)[1] for line in log)
+          for subject in active_subjects:
+              count = subject_counts[subject]
+              if count != 1:
+                  raise SystemExit(
+                      f"Active maintained subject must appear exactly once: "
+                      f"{subject!r} count={count}"
+                  )
+
+          code_suffixes = {
+              ".c", ".cc", ".cpp", ".cs", ".css", ".go", ".h", ".hpp",
+              ".html", ".java", ".js", ".json", ".jsx", ".kt", ".kts",
+              ".php", ".py", ".rb", ".rs", ".scss", ".sh", ".sql",
+              ".svelte", ".swift", ".toml", ".ts", ".tsx", ".vue", ".yaml",
+              ".yml",
+          }
+          for line in log:
+              commit, subject = line.split("\t", 1)
+              paths = subprocess.check_output(
+                  ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit],
+                  text=True,
+              ).splitlines()
+              if any(Path(path).suffix in code_suffixes for path in paths):
+                  if subject not in known_subjects:
+                      raise SystemExit(
+                          f"Fork-only code commit is missing from the manifest: "
+                          f"{commit} {subject}"
+                      )
+          PY
 
           candidate_sha=$(git rev-parse HEAD)
           candidate_branch="automation/candidate/$base_sha"
