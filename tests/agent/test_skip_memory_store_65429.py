@@ -74,7 +74,7 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
 
     # Provider sync/prefetch must remain skipped: skip_memory still gates the
     # external memory provider block.
-    assert agent._memory_manager is None, (
+    assert getattr(agent, "_memory_manager") is None, (
         "skip_memory=True must still skip the external memory provider"
     )
 
@@ -86,7 +86,7 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
         action="add",
         target="memory",
         content="User prefers concise answers.",
-        store=agent._memory_store,
+        store=getattr(agent, "_memory_store"),
     )
     result = json.loads(raw)
     assert result.get("success") is True, (
@@ -99,6 +99,22 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
     assert "User prefers concise answers." in memory_md.read_text()
+
+    user_raw = memory_tool(
+        action="add",
+        target="user",
+        content="Current location (cron-managed): Test City | Etc/UTC",
+        store=getattr(agent, "_memory_store"),
+    )
+    user_result = json.loads(user_raw)
+    assert user_result.get("success") is True, (
+        "local-only cron memory must support USER.md writes, got: "
+        f"{user_raw}"
+    )
+    user_md = tmp_path / "hm" / "memories" / "USER.md"
+    assert user_md.exists()
+    assert "Current location (cron-managed): Test City | Etc/UTC" in user_md.read_text()
+    assert getattr(agent, "_memory_manager") is None
 
 
 def test_skip_memory_disabled_toolset_does_not_load_store(monkeypatch, tmp_path):
