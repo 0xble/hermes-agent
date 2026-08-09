@@ -50,20 +50,46 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
-def _session_cwd_override() -> str:
+def _session_cwd_state() -> tuple[bool, str]:
+    """Return whether this context is bound and its normalized cwd value.
+
+    An explicitly empty value is meaningful: gateway/session teardown uses it
+    to suppress process-global fallbacks that may belong to another concurrent
+    execution context.  Collapsing ``_UNSET`` and ``""`` is what allowed a
+    workdir cron's temporary ``TERMINAL_CWD`` to leak into a new gateway turn.
+    """
     value = _SESSION_CWD.get()
     if value is _UNSET:
-        return ""
-    return str(value).strip()
+        return False, ""
+    return True, str(value or "").strip()
+
+
+def _session_cwd_override() -> str:
+    return _session_cwd_state()[1]
+
+
+def resolve_tool_cwd() -> str:
+    """Return the cwd for prompt and tool consumers in this execution context.
+
+    A bound session value wins even when it is explicitly empty.  Only
+    unbound CLI/one-shot contexts may fall back to process-global
+    ``TERMINAL_CWD``.
+    """
+    bound, override = _session_cwd_state()
+    if bound:
+        return override
+    return os.environ.get("TERMINAL_CWD", "").strip()
 
 
 def resolve_agent_cwd() -> Path:
-    override = _session_cwd_override()
-    if override:
-        p = Path(override).expanduser()
-        if p.is_dir():
-            return p
-        logger.warning("configured working directory does not exist: %s", override)
+    bound, override = _session_cwd_state()
+    if bound:
+        if override:
+            p = Path(override).expanduser()
+            if p.is_dir():
+                return p
+            logger.warning("configured working directory does not exist: %s", override)
+        return Path(os.getcwd())
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         p = Path(raw).expanduser()
@@ -82,13 +108,14 @@ def resolve_context_cwd() -> Path | None:
     # source tree itself, which is a legitimate workspace when the user is
     # developing Hermes (per-surface policy for fallback-picked directories
     # lives in build_context_files_prompt; see #64590).
-    override = _session_cwd_override()
-    if override:
-        p = Path(override).expanduser()
-        if not p.is_dir():
-            logger.warning("configured working directory does not exist: %s", override)
-        else:
-            return p
+    bound, override = _session_cwd_state()
+    if bound:
+        if override:
+            p = Path(override).expanduser()
+            if not p.is_dir():
+                logger.warning("configured working directory does not exist: %s", override)
+            else:
+                return p
         return None
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:

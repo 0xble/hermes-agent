@@ -1529,6 +1529,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
+        from agent.runtime_cwd import resolve_tool_cwd
+
+        # Freeze the gateway baseline before an in-process workdir cron can
+        # temporarily replace process-global TERMINAL_CWD (#81451).
+        self._gateway_cwd = resolve_tool_cwd()
         extra = config.extra or {}
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
@@ -7244,8 +7249,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
-    @staticmethod
     def _bind_api_server_session(
+        self,
         *,
         chat_id: str = "",
         session_key: str = "",
@@ -7277,6 +7282,7 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
+            cwd=self._gateway_cwd,
             async_delivery=False,
             cron_session="",
         )

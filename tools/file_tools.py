@@ -256,7 +256,9 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    from agent.runtime_cwd import resolve_tool_cwd
+
+    return _sentinel_free_abs_cwd(resolve_tool_cwd())
 
 
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:

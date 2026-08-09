@@ -1640,7 +1640,9 @@ def _default_docker_workspace_host_roots(session_key: str = "") -> List[Path]:
         "yes",
         "on",
     }:
-        cwd = os.getenv("TERMINAL_CWD") or os.getcwd()
+        from agent.runtime_cwd import resolve_tool_cwd
+
+        cwd = resolve_tool_cwd() or os.getcwd()
         try:
             host = Path(os.path.expanduser(cwd)).resolve(strict=False)
         except (OSError, RuntimeError, ValueError):

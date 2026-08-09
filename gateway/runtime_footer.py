@@ -138,7 +138,8 @@ def format_runtime_footer(
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
         elif field == "cwd":
-            rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
+            raw_cwd = cwd if cwd is not None else os.environ.get("TERMINAL_CWD", "")
+            rel = _home_relative_cwd(raw_cwd)
             if rel:
                 parts.append(rel)
         # Unknown field names are silently ignored.

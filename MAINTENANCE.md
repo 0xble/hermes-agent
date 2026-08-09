@@ -30,6 +30,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-012 | Retired | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest`; `chore(fork): retire GitHub sync workflows` | Historical GitHub Actions synchronization pipeline, replaced by the `maintain-hermes-fork` Hermes cron. |
 | HERMES-013 | Active | `feat(cron): support per-job timezones` | Explicit IANA timezone pins for individual cron jobs. |
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
+| HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -146,6 +147,14 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** Current `upstream/main` still calls `cron_command(args)` without returning its result. Retire when a released upstream dispatcher propagates cron failures through an equivalent process-status contract.
 - **Regression:** `source venv/bin/activate && python -m pytest -q tests/hermes_cli/test_cron.py -k top_level_handler_propagates_failure_status`.
 - **Rollback:** Once the released upstream dispatcher owns the same exit-status contract, remove the private `return` change and delete only `test_top_level_handler_propagates_failure_status` if upstream provides equivalent coverage. Run `tests/hermes_cli/test_cron.py`, invoke a deliberately failing read-only cron CLI operation, and verify its nonzero process status before promotion.
+
+### HERMES-015 — Isolate gateway sessions from workdir cron cwd state
+
+- **Summary:** Captures the gateway's configured cwd before cron execution begins, binds it into every interactive gateway turn, and makes prompt and tool cwd resolution prefer that session-scoped value over the mutable process-global `TERMINAL_CWD`. This prevents a concurrently running workdir cron from injecting its repository instructions or routing an unrelated gateway tool call into its project.
+- **Surfaces:** `agent/runtime_cwd.py`; `gateway/run.py`; `gateway/slash_commands.py`; `gateway/runtime_footer.py`; `gateway/platforms/api_server.py`; `gateway/platforms/base.py`; cwd consumers in agent/tool modules; `tests/gateway/test_gateway_cron_cwd_isolation.py`.
+- **Upstream tracking:** Issue `#81451`; PR `#81516` covers only sessions bound before the cron mutation and does not reproduce the observed cron-first ordering. PR `#61976` is directionally related but broader and not merge-ready.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_gateway_cron_cwd_isolation.py tests/gateway/test_async_delivery_capability.py tests/agent/test_runtime_cwd.py tests/cron/test_cron_workdir.py tests/cron/test_terminal_cwd_lock.py tests/tools/test_file_tools_cwd_resolution.py tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py`.
+- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated edits. Remove only HERMES-015's gateway baseline capture, ContextVar-aware cwd consumer changes, and dedicated regression. Before retirement, prove released upstream behavior under the cron-first ordering: hold a workdir cron in repository B, start a gateway session whose configured cwd is A, verify A's prompt/context/file/terminal/code-exec/delegation paths, and prove B's `AGENTS.md` never enters the gateway session.
 
 ## Adding or changing a patch
 
