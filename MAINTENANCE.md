@@ -27,7 +27,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-009 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Fail Hindsight retains on extraction errors. |
 | HERMES-010 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Avoid destructive Hindsight daemon restarts and empty-key overwrite. |
 | HERMES-011 | Active | `fix(state): serialize public reads, bound readers, one gateway SessionDB` | SessionDB concurrency, reader lifecycle, and gateway ownership. |
-| HERMES-012 | Active | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest` | Fail-closed upstream rebase, candidate verification, exact-SHA promotion, and manifest enforcement. |
+| HERMES-012 | Active | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest` | Fail-closed upstream rebase, candidate verification, exact-SHA promotion, and manifest enforcement. |
 | HERMES-013 | Active | `feat(cron): support per-job timezones` | Explicit IANA timezone pins for individual cron jobs. |
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 
