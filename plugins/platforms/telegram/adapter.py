@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import html as _html
 import re
@@ -214,6 +215,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
+from agent.retry_utils import parse_retry_after_seconds
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -601,6 +603,14 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+class _TelegramSendCooldownExceeded(Exception):
+    """A per-chat send reservation would exceed the configured wait bound."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = max(0.0, float(retry_after))
+        super().__init__(f"flood_control:{self.retry_after:.0f}")
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -678,8 +688,6 @@ class TelegramAdapter(BasePlatformAdapter):
         Guarantees the returned value is a finite number usable directly in
         ``asyncio.sleep()`` and similar APIs that reject NaN / Inf.
         """
-        import math
-
         raw = os.getenv(name)
         try:
             value = float(raw) if raw is not None else float(default)
@@ -762,6 +770,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # feeling responsive (status bubbles lag by at most ~1s, well below
         # the user-visible threshold for "did anything happen?").
         self._send_cooldown_until: Dict[str, float] = {}
+        self._send_cooldown_locks: Dict[str, asyncio.Lock] = {}
+        self._send_cooldown_users: Dict[str, int] = {}
+        self._send_cooldown_state_max = 4096
         self._send_cooldown_seconds: float = self._coerce_float_extra(
             "send_cooldown_seconds",
             1.1,
@@ -1829,9 +1840,13 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
+        chat_id = send_kwargs.get("chat_id")
         try:
-            return await send_fn(**send_kwargs)
+            return await self._run_send_call(chat_id, send_fn, **send_kwargs)
         except Exception as send_err:
+            retry_after = self._telegram_retry_after(send_err)
+            if retry_after is not None:
+                raise _TelegramSendCooldownExceeded(retry_after) from send_err
             if not self._should_retry_without_dm_topic_reply_anchor(
                 send_err,
                 metadata,
@@ -1851,7 +1866,7 @@ class TelegramAdapter(BasePlatformAdapter):
             retry_kwargs["reply_to_message_id"] = None
             retry_kwargs.pop("message_thread_id", None)
             retry_kwargs.pop("direct_messages_topic_id", None)
-            return await send_fn(**retry_kwargs)
+            return await self._run_send_call(chat_id, send_fn, **retry_kwargs)
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -2310,11 +2325,17 @@ class TelegramAdapter(BasePlatformAdapter):
             # Take the raw Bot API result (dict under real PTB). Passing
             # return_type=Message would make PTB deserialize a Bot API 10.1
             # response shape it does not fully model yet; a post-delivery parse
-            # error must not be mistaken for a sendable failure.
-            msg = await self._bot.do_api_request(
-                "sendRichMessage", api_kwargs=payload
+            # failure must never trigger a legacy resend / duplicate message.
+            msg = await self._run_send_call(
+                chat_id,
+                self._bot.do_api_request,
+                "sendRichMessage",
+                api_kwargs=payload,
             )
+        except _TelegramSendCooldownExceeded as exc:
+            return self._send_cooldown_failure(exc)
         except Exception as exc:
+            retry_after = self._telegram_retry_after(exc)
             if self._is_rich_fallback_error(exc):
                 if self._is_rich_capability_error(exc):
                     # Endpoint missing (old PTB/server) — latch rich off so
@@ -2335,15 +2356,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None
             is_timeout = (_TimedOut and isinstance(exc, _TimedOut)) or "timed out" in err_str
             is_connect_timeout = self._looks_like_connect_timeout(exc)
-            # Extract server-requested retry_after for flood control so the
-            # base retry layer honors Telegram's backoff instead of its own
-            # short exponential schedule.
-            _retry_after = getattr(exc, "retry_after", None)
-            if _retry_after is None:
-                import re as _re
-                _m = _re.search(r"retry\s+(?:in\s+)?(\d+)", err_str, _re.IGNORECASE)
-                if _m:
-                    _retry_after = float(_m.group(1))
+            # Publish server-requested retry_after into the shared per-chat
+            # reservation state so every concurrent sender honors Telegram's
+            # deadline, not only this request's retry layer.
             safe_error = _redact_telegram_error_text(exc)
             logger.warning(
                 "[%s] sendRichMessage transient failure (no legacy resend): %s",
@@ -2353,7 +2368,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 success=False,
                 error=safe_error,
                 retryable=(is_connect_timeout or not is_timeout),
-                retry_after=_retry_after,
+                retry_after=(
+                    self._bounded_send_retry_after(retry_after)
+                    if retry_after is not None
+                    else None
+                ),
             )
 
         message_id = None
@@ -4163,7 +4182,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Send a seed message so the topic is visible in Telegram's client.
                     # Empty topics are hidden by the client UI until they contain a message.
                     try:
-                        await self._bot.send_message(
+                        await self._run_send_call(
+                            chat_id,
+                            self._bot.send_message,
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_thread_id=thread_id,
                             text=f"\U0001f4cc {topic_name}",
@@ -5418,6 +5439,169 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    def _send_cooldown_lock(self, chat_key: str) -> Optional[asyncio.Lock]:
+        """Return the adapter-local lock that serializes reservations for a chat."""
+        if getattr(self, "_send_cooldown_until", None) is None:
+            return None
+        locks = getattr(self, "_send_cooldown_locks", None)
+        if locks is None:
+            locks = {}
+            self._send_cooldown_locks = locks
+        return locks.setdefault(chat_key, asyncio.Lock())
+
+    def _prune_send_cooldown_state(self) -> None:
+        """Bound idle per-chat state without evicting active or queued senders."""
+        locks = getattr(self, "_send_cooldown_locks", None)
+        cooldowns = getattr(self, "_send_cooldown_until", None)
+        users = getattr(self, "_send_cooldown_users", None)
+        if locks is None or cooldowns is None or users is None:
+            return
+        limit = max(1, int(getattr(self, "_send_cooldown_state_max", 4096)))
+        if len(locks) <= limit:
+            return
+        now = time.monotonic()
+        for chat_key, lock in tuple(locks.items()):
+            if len(locks) <= limit:
+                break
+            if users.get(chat_key, 0) or lock.locked():
+                continue
+            if float(cooldowns.get(chat_key, 0.0) or 0.0) > now:
+                continue
+            if locks.get(chat_key) is lock:
+                locks.pop(chat_key, None)
+                cooldowns.pop(chat_key, None)
+                users.pop(chat_key, None)
+
+    async def _run_send_call(
+        self,
+        cooldown_chat_id: Any,
+        send_fn: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Run one outbound Bot API send under the chat's atomic gate.
+
+        The lock stays held through the API call. A concurrent sender cannot
+        commit to a stale wake-up time before this request publishes a
+        ``RetryAfter`` deadline.
+        """
+        cooldowns = getattr(self, "_send_cooldown_until", None)
+        if cooldowns is None:
+            return await send_fn(*args, **kwargs)
+        chat_key = str(cooldown_chat_id)
+        lock = self._send_cooldown_lock(chat_key)
+        if lock is None:
+            return await send_fn(*args, **kwargs)
+        users = getattr(self, "_send_cooldown_users", None)
+        if users is not None:
+            users[chat_key] = users.get(chat_key, 0) + 1
+
+        try:
+            async with lock:
+                now = time.monotonic()
+                wait = max(0.0, float(cooldowns.get(chat_key, 0.0) or 0.0) - now)
+                max_wait = float(getattr(self, "_send_cooldown_max_wait", 5.0))
+                if wait > max_wait:
+                    logger.warning(
+                        "[%s] send cooldown for chat %s exceeds max wait "
+                        "(%.1fs > %.1fs); yielding with retryable error",
+                        self.name,
+                        chat_key,
+                        wait,
+                        max_wait,
+                    )
+                    raise _TelegramSendCooldownExceeded(wait)
+                if wait > 0:
+                    logger.debug(
+                        "[%s] send cooldown for chat %s: sleeping %.2fs",
+                        self.name,
+                        chat_key,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+
+                started_at = time.monotonic()
+                try:
+                    return await send_fn(*args, **kwargs)
+                except Exception as error:
+                    retry_after = self._telegram_retry_after(error)
+                    if retry_after is not None:
+                        cooldowns[chat_key] = max(
+                            float(cooldowns.get(chat_key, 0.0) or 0.0),
+                            time.monotonic() + retry_after,
+                        )
+                    raise
+                finally:
+                    gap = max(
+                        0.0,
+                        float(getattr(self, "_send_cooldown_seconds", 1.1)),
+                    )
+                    cooldowns[chat_key] = max(
+                        float(cooldowns.get(chat_key, 0.0) or 0.0),
+                        started_at + gap,
+                    )
+        finally:
+            if users is not None:
+                remaining = users.get(chat_key, 1) - 1
+                if remaining > 0:
+                    users[chat_key] = remaining
+                else:
+                    users.pop(chat_key, None)
+            self._prune_send_cooldown_state()
+
+    @staticmethod
+    def _telegram_retry_after(error: Exception) -> Optional[float]:
+        value: Any = getattr(error, "retry_after", None)
+        if value is None:
+            match = re.search(
+                r"retry\s+(?:after|in)\s+(\d+(?:\.\d+)?)",
+                str(error),
+                re.IGNORECASE,
+            )
+            value = match.group(1) if match else None
+        total_seconds = getattr(value, "total_seconds", None)
+        if callable(total_seconds):
+            try:
+                value = total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        parsed = parse_retry_after_seconds(value)
+        if parsed is None or not math.isfinite(parsed):
+            return None
+        return parsed
+
+    def _bounded_send_retry_after(self, retry_after: float) -> float:
+        max_wait = max(
+            0.001,
+            float(getattr(self, "_send_cooldown_max_wait", 5.0)),
+        )
+        return min(max(0.001, float(retry_after)), max_wait)
+
+    def _send_retry_after_overflow(
+        self,
+        error: Exception,
+        retry_after: float,
+    ) -> Optional[SendResult]:
+        if retry_after <= float(getattr(self, "_send_cooldown_max_wait", 5.0)):
+            return None
+        return SendResult(
+            success=False,
+            error=_redact_telegram_error_text(error),
+            retryable=True,
+            retry_after=self._bounded_send_retry_after(retry_after),
+        )
+
+    def _send_cooldown_failure(
+        self,
+        error: _TelegramSendCooldownExceeded,
+    ) -> SendResult:
+        return SendResult(
+            success=False,
+            error=str(error),
+            retryable=True,
+            retry_after=self._bounded_send_retry_after(error.retry_after),
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -5450,50 +5634,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
 
-        # Per-chat send cooldown. Telegram's Bot API enforces ~1 msg/sec/chat
-        # in private DMs and a ~30 msg/sec global budget across all chats for
-        # bots. A single user turn historically fans out 3-5 sends from
-        # independent code paths (status callbacks fired via
-        # safe_schedule_threadsafe, progress bubbles from the progress-queue
-        # consumer, streaming previews from the stream consumer, the final
-        # answer, photo batches). Even though each path does its own
-        # retry-after handling, the burst pattern crosses Telegram's
-        # threshold and triggers a flood-control penalty that escalates
-        # into multi-thousand-second back-offs ("Retry in 7019 seconds").
-        # This gate serialises every outbound send per-chat with a small
-        # minimum gap, so the cumulative rate stays under the threshold
-        # regardless of how many components fire concurrently.
-        #
-        # The wait is bounded by ``_send_cooldown_max_wait``: a 7000-second
-        # Telegram penalty shouldn't stall the chat path for two hours.
-        # When the bounded wait would be exceeded, we return a non-fatal
-        # flood_control-style error so upstream retries can back off too,
-        # instead of silently dropping the message.
-        # getattr() — tests build adapters via object.__new__() (no __init__).
-        _cooldown_until_map = getattr(self, "_send_cooldown_until", None)
-        if _cooldown_until_map is not None:
-            _now_mono = time.monotonic()
-            _chat_key = str(chat_id)
-            _until = _cooldown_until_map.get(_chat_key, 0.0)
-            if _until > _now_mono:
-                _wait = _until - _now_mono
-                _max_wait = getattr(self, "_send_cooldown_max_wait", 5.0)
-                if _wait > _max_wait:
-                    logger.warning(
-                        "[%s] send cooldown for chat %s exceeds max wait (%.1fs > %.1fs); "
-                        "yielding with retryable error so upstream can back off",
-                        self.name, _chat_key, _wait, _max_wait,
-                    )
-                    return SendResult(
-                        success=False,
-                        error=f"flood_control:{_wait:.0f}",
-                        retryable=True,
-                    )
-                logger.debug(
-                    "[%s] send cooldown for chat %s: sleeping %.2fs",
-                    self.name, _chat_key, _wait,
-                )
-                await asyncio.sleep(_wait)
+        # The cooldown is reserved immediately before each Bot API send below,
+        # not once for the whole high-level operation. This keeps rich sends,
+        # every chunk, retries, and fallbacks on the same atomic per-chat clock.
 
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -5505,17 +5648,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
-                        # Stamp the cooldown on the rich fast-path too so the
-                        # next non-rich send (or another rich one) honours
-                        # the per-chat gate. Without this, the rich path
-                        # would bypass the limiter entirely and a
-                        # rich→markdown sequence would race.
-                        _cooldown_until_map = getattr(self, "_send_cooldown_until", None)
-                        if _cooldown_until_map is not None:
-                            _cooldown_until_map[str(chat_id)] = (
-                                time.monotonic()
-                                + getattr(self, "_send_cooldown_seconds", 1.1)
-                            )
                         # Re-trigger typing like the legacy success path does,
                         # but ONLY for intermediate sends. On the final reply
                         # (metadata["notify"]) the gateway has already torn down
@@ -5566,17 +5698,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
-                # Stamp the per-chat cooldown immediately before the Bot API
-                # call so subsequent chunks / sends queue behind this one
-                # for ``_send_cooldown_seconds``. Updating here (rather than
-                # at the top of the gate) means a Telegram retry-after wait
-                # we did NOT spend — i.e. the previous send's actual
-                # wall-clock cost — is what gets credited.
-                _cooldown_until_map = getattr(self, "_send_cooldown_until", None)
-                if _cooldown_until_map is not None:
-                    _cooldown_until_map[str(chat_id)] = (
-                        time.monotonic() + getattr(self, "_send_cooldown_seconds", 1.1)
-                    )
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
@@ -5622,9 +5743,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = None
                 for _send_attempt in range(3):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
+                        # Try Markdown first, fall back to plain text if it fails.
+                        # Every attempt reserves separately because even a
+                        # rejected Bot API request consumes the chat's budget.
                         try:
-                            msg = await self._bot.send_message(
+                            msg = await self._run_send_call(
+                                chat_id,
+                                self._bot.send_message,
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
@@ -5638,7 +5763,9 @@ class TelegramAdapter(BasePlatformAdapter):
                             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
-                                msg = await self._bot.send_message(
+                                msg = await self._run_send_call(
+                                    chat_id,
+                                    self._bot.send_message,
                                     chat_id=normalize_telegram_chat_id(chat_id),
                                     text=plain_chunk,
                                     parse_mode=None,
@@ -5650,7 +5777,30 @@ class TelegramAdapter(BasePlatformAdapter):
                             else:
                                 raise
                         break  # success
+                    except _TelegramSendCooldownExceeded as cooldown_error:
+                        return self._send_cooldown_failure(cooldown_error)
                     except _NetErr as send_err:
+                        retry_after = self._telegram_retry_after(send_err)
+                        if retry_after is not None:
+                            overflow = self._send_retry_after_overflow(
+                                send_err,
+                                retry_after,
+                            )
+                            if overflow is not None:
+                                return overflow
+                            if _send_attempt < 2:
+                                safe_send_error = _redact_telegram_error_text(send_err)
+                                logger.warning(
+                                    "[%s] Telegram flood control on send "
+                                    "(attempt %d/3), retrying in %.1fs: %s",
+                                    self.name,
+                                    _send_attempt + 1,
+                                    retry_after,
+                                    safe_send_error,
+                                )
+                                await asyncio.sleep(retry_after)
+                                continue
+                            raise
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle
@@ -5753,27 +5903,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             raise
                     except Exception as send_err:
-                        retry_after = getattr(send_err, "retry_after", None)
-                        if retry_after is not None or "retry after" in str(send_err).lower():
-                            wait = float(retry_after) if retry_after is not None else 1.0
-                            safe_send_error = _redact_telegram_error_text(send_err)
-                            # Mirror the edit path: a RetryAfter past a few
-                            # seconds is not something to hold this coroutine
-                            # open for. Sleeping the server value verbatim
-                            # pinned send() for 97 minutes in production and
-                            # froze inbound on every platform when it ran on
-                            # the gateway boot path (#91969).
-                            if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
-                                logger.warning(
-                                    "[%s] Telegram flood control on send "
-                                    "(retry_after=%.1fs > %.0fs); failing closed "
-                                    "instead of sleeping: %s",
-                                    self.name,
-                                    wait,
-                                    _FLOOD_INLINE_WAIT_CAP_SECS,
-                                    safe_send_error,
-                                )
-                                return _flood_cap_result(wait)
+                        retry_after = self._telegram_retry_after(send_err)
+                        if retry_after is not None:
+                            overflow = self._send_retry_after_overflow(
+                                send_err,
+                                retry_after,
+                            )
+                            if overflow is not None:
+                                return overflow
                             if _send_attempt < 2:
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
@@ -6203,7 +6340,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         # the raw chunk (raw ** / ``` markers would render
                         # literally); streaming previews stay raw.
                         text = _strip_mdv2(chunk) if finalize else chunk
-                    sent_msg = await self._bot.send_message(
+                    sent_msg = await self._run_send_call(
+                        chat_id,
+                        self._bot.send_message,
                         chat_id=normalize_telegram_chat_id(chat_id),
                         text=text,
                         parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -6213,7 +6352,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         **self._notification_kwargs(metadata),
                     )
                     break
+                except _TelegramSendCooldownExceeded as cooldown_error:
+                    return self._send_cooldown_failure(cooldown_error)
                 except Exception as send_err:
+                    retry_after = self._telegram_retry_after(send_err)
+                    if retry_after is not None:
+                        return SendResult(
+                            success=False,
+                            error=_redact_telegram_error_text(send_err),
+                            retryable=True,
+                            retry_after=self._bounded_send_retry_after(retry_after),
+                        )
                     if "reply message not found" in str(send_err).lower():
                         # Drop the reply anchor and try again.  Private DM
                         # topic fallback needs the anchor and topic id together;
@@ -6226,7 +6375,9 @@ class TelegramAdapter(BasePlatformAdapter):
                             )
                         )
                         try:
-                            sent_msg = await self._bot.send_message(
+                            sent_msg = await self._run_send_call(
+                                chat_id,
+                                self._bot.send_message,
                                 chat_id=normalize_telegram_chat_id(chat_id),
                                 text=_strip_mdv2(chunk) if finalize else chunk,
                                 **retry_thread_kwargs,
@@ -6461,9 +6612,13 @@ class TelegramAdapter(BasePlatformAdapter):
             raise RuntimeError("Not connected")
 
         message_thread_id = kwargs.get("message_thread_id")
+        chat_id = kwargs.get("chat_id")
         try:
-            return await self._bot.send_message(**kwargs)
+            return await self._run_send_call(chat_id, self._bot.send_message, **kwargs)
         except Exception as send_err:
+            retry_after = self._telegram_retry_after(send_err)
+            if retry_after is not None:
+                raise _TelegramSendCooldownExceeded(retry_after) from send_err
             if (
                 message_thread_id is not None
                 and self._is_bad_request_error(send_err)
@@ -6483,7 +6638,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
-                return await self._bot.send_message(**retry_kwargs)
+                return await self._run_send_call(
+                    chat_id,
+                    self._bot.send_message,
+                    **retry_kwargs,
+                )
             raise
 
     async def send_update_prompt(
@@ -8195,6 +8354,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
@@ -8329,6 +8490,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+            except _TelegramSendCooldownExceeded:
+                raise
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -8390,6 +8553,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: image_file.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             error_str = str(e)
             # Dimension-related errors are the expected case for valid image
@@ -8488,6 +8653,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: f.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send document: %s",
@@ -8539,6 +8706,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     reset_media=lambda: f.seek(0),
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send video: %s",
@@ -8594,6 +8763,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "URL photo",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s",
@@ -8637,6 +8808,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     "uploaded photo",
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
+            except _TelegramSendCooldownExceeded as cooldown_error:
+                return self._send_cooldown_failure(cooldown_error)
             except Exception as e2:
                 logger.error(
                     "[%s] File upload send_photo also failed: %s",
@@ -8685,6 +8858,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "animation",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s",

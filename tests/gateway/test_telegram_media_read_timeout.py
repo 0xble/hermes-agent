@@ -24,7 +24,13 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # This suite verifies Telegram media timeout plumbing, not DNS policy.
+    # Keep it deterministic on hosts where example.com resolves through a
+    # private test-network address.
+    import tools.url_safety as url_safety
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._metadata_thread_id = lambda metadata: None

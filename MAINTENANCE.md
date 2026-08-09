@@ -19,7 +19,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-001 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Serialize malformed `state.db` repair and invalidate stale schemas. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Make raw SQLite backup and quarantine connection-safe. |
 | HERMES-003 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Raise the file-descriptor soft limit safely. |
-| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Enforce a per-chat Telegram send cooldown. |
+| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends` | Enforce a per-chat Telegram send cooldown. |
 | HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Share the progress-edit throttle per chat. |
 | HERMES-006 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Resolve memory notifications per platform. |
 | HERMES-007 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Keep interrupt sentinels out of API assistant text. |
@@ -61,11 +61,11 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-004 — Enforce a per-chat Telegram send cooldown
 
-- **Summary:** Applies a bounded per-chat minimum gap to every Telegram send path, including rich messages and chunked sends, and returns a retryable flood-control result instead of waiting for an extreme penalty.
+- **Summary:** Inside `TelegramAdapter`, atomically reserves a bounded per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock, excessive waits return a bounded retryable flood-control result, and idle chat state is pruned. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/test_telegram_send_cooldown.py`.
-- **Upstream tracking:** Related upstream issue `#66722`.
+- **Upstream tracking:** Related upstream pull request `#66722` remains open and unmerged.
 - **Regression:** `pytest -q tests/test_telegram_send_cooldown.py`.
-- **Rollback:** Remove `_send_cooldown_until`, `_send_cooldown_seconds`, `_send_cooldown_max_wait`, and the cooldown/stamping blocks in `send()`, then remove the dedicated test. Verify the upstream sender globally coordinates concurrent paths per chat and bounds excessive waits before deploying the removal.
+- **Rollback:** Remove `_TelegramSendCooldownExceeded`, the per-chat cooldown state maps and bound, `_send_cooldown_seconds`, `_send_cooldown_max_wait`, the atomic send helper and its call sites, then remove the dedicated test. Verify the upstream adapter atomically coordinates concurrent rich, chunked, fallback, control, and media calls per chat, shares `RetryAfter` deadlines, bounds excessive waits, and prunes idle state before deploying the removal.
 
 ### HERMES-005 — Share the progress-edit throttle per chat
 
