@@ -4,6 +4,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -246,6 +247,38 @@ def test_pyproject_pins_are_internally_consistent():
         "pyproject.toml exact-pins the same package to different versions "
         "across [project.dependencies] / extras: " + str(conflicts)
     )
+
+
+def test_hindsight_client_pin_is_consistent_across_managed_surfaces():
+    """Every Hermes-managed Hindsight install path must use one exact pin."""
+    pyproject = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    pyproject_specs = pyproject["project"]["optional-dependencies"]["hindsight"]
+    lazy_specs = _lazy_deps_by_feature()["memory.hindsight"]
+    plugin = yaml.safe_load(
+        (REPO_ROOT / "plugins/memory/hindsight/plugin.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    plugin_specs = plugin["pip_dependencies"]
+
+    provider_source = (
+        REPO_ROOT / "plugins/memory/hindsight/__init__.py"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r'^_PINNED_CLIENT_VERSION\s*=\s*["\']([^"\']+)["\']',
+        provider_source,
+        re.MULTILINE,
+    )
+    assert match, "provider is missing _PINNED_CLIENT_VERSION"
+    version = match.group(1)
+    requirement = f"hindsight-client=={version}"
+
+    assert pyproject_specs == [requirement]
+    assert lazy_specs == [requirement]
+    assert plugin_specs == [requirement]
+    assert _locked_versions("hindsight-client") == {version}
 
 
 def test_build_system_requires_exempt_from_exclude_newer():
