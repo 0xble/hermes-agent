@@ -23,6 +23,7 @@ import re
 import threading
 import unicodedata
 from contextvars import copy_context
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from agent.auxiliary_client import call_llm
@@ -91,13 +92,22 @@ _TITLE_PROMPT_TEMPLATE = (
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
-    'Good: {"title": "Fix mobile login"}\n'
-    'Good: {"title": "Postgres pool exhaustion"}\n'
-    'Good: {"title": "Friendly greeting"}\n'
+    "__EXAMPLES__"
     'Too vague: {"title": "Code changes"}\n'
     'Too long: {"title": "Investigate and fix the issue where the login button '
     'does not respond on mobile devices"}\n\n'
     'Reply with JSON only: {"title": "..."}'
+)
+
+_TITLE_EXAMPLES_SENTENCE_CASE = (
+    'Good: {"title": "Fix mobile login"}\n'
+    'Good: {"title": "Postgres pool exhaustion"}\n'
+    'Good: {"title": "Friendly greeting"}\n'
+)
+_TITLE_EXAMPLES_TITLE_CASE = (
+    'Good: {"title": "Fix Mobile Login"}\n'
+    'Good: {"title": "Postgres Pool Exhaustion"}\n'
+    'Good: {"title": "Friendly Greeting"}\n'
 )
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
@@ -161,6 +171,16 @@ _MACHINE_PREFIXES = (
 )
 
 
+@dataclass(frozen=True)
+class _TitlePreferences:
+    min_words: int
+    max_words: int
+    max_characters: int
+    case_style: str
+    name_aliases: dict[str, str]
+    instructions: str
+
+
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
     try:
@@ -175,7 +195,7 @@ def _title_language() -> str:
         return ""
 
 
-def _title_preferences() -> tuple[int, int, int, dict[str, str], str]:
+def _title_preferences() -> _TitlePreferences:
     """Return validated title-shaping preferences.
 
     Defaults preserve Hermes' pre-patch 3-7 word / 80 character contract.
@@ -195,6 +215,7 @@ def _title_preferences() -> tuple[int, int, int, dict[str, str], str]:
         min_words = int(title_config.get("min_words", default_min_words))
         max_words = int(title_config.get("max_words", default_max_words))
         max_characters = int(title_config.get("max_characters", default_max_characters))
+        case_style = str(title_config.get("case_style", "sentence_case")).strip().lower()
         raw_aliases = title_config.get("name_aliases", {})
         aliases = (
             {
@@ -208,20 +229,30 @@ def _title_preferences() -> tuple[int, int, int, dict[str, str], str]:
         max_words = max(1, min(max_words, 12))
         min_words = max(1, min(min_words, max_words))
         max_characters = max(12, min(max_characters, 100))
+        if case_style not in {"sentence_case", "title_case"}:
+            case_style = "sentence_case"
         aliases = {
             alias: canonical
             for alias, canonical in list(aliases.items())[:64]
             if len(canonical) <= max_characters
         }
         instructions = str(title_config.get("instructions", "") or "").strip()[:1000]
-        return min_words, max_words, max_characters, aliases, instructions
+        return _TitlePreferences(
+            min_words=min_words,
+            max_words=max_words,
+            max_characters=max_characters,
+            case_style=case_style,
+            name_aliases=aliases,
+            instructions=instructions,
+        )
     except Exception:
-        return (
-            default_min_words,
-            default_max_words,
-            default_max_characters,
-            {},
-            "",
+        return _TitlePreferences(
+            min_words=default_min_words,
+            max_words=default_max_words,
+            max_characters=default_max_characters,
+            case_style="sentence_case",
+            name_aliases={},
+            instructions="",
         )
 
 
@@ -240,11 +271,7 @@ def _canonical_name_for_message(
 def _build_title_prompt(
     *,
     language: str,
-    min_words: int,
-    max_words: int,
-    max_characters: int,
-    name_aliases: dict[str, str],
-    instructions: str = "",
+    preferences: _TitlePreferences,
     avoid_titles: Optional[list[str]] = None,
 ) -> str:
     """Build the structured-output title prompt from user preferences."""
@@ -253,23 +280,35 @@ def _build_title_prompt(
         if language
         else _LANGUAGE_RULE_MATCH_USER
     )
+    case_rule = (
+        "use Title Case (capitalize the principal words)"
+        if preferences.case_style == "title_case"
+        else "use sentence case (capitalize only the first word and proper nouns)"
+    )
     length_rule = (
-        f"- Prefer {min_words}-{max_words} words and at most {max_characters} characters; "
-        "use sentence case (capitalize only the first word and proper nouns)."
+        f"- Prefer {preferences.min_words}-{preferences.max_words} words and at most "
+        f"{preferences.max_characters} characters; {case_rule}."
     )
     alias_rule = ""
-    if name_aliases:
-        aliases_json = json.dumps(name_aliases, ensure_ascii=False, sort_keys=True)
+    if preferences.name_aliases:
+        aliases_json = json.dumps(
+            preferences.name_aliases, ensure_ascii=False, sort_keys=True
+        )
         alias_rule = (
             "- Use these case-insensitive canonical name replacements when the "
             f"opening message contains an alias: {aliases_json}.\n"
         )
     instructions_rule = ""
-    if instructions:
+    if preferences.instructions:
         instructions_rule = (
             "- Follow these trusted operator instructions when they do not conflict "
-            f"with the hard rules above: {instructions}\n"
+            f"with the hard rules above: {preferences.instructions}\n"
         )
+    examples = (
+        _TITLE_EXAMPLES_TITLE_CASE
+        if preferences.case_style == "title_case"
+        else _TITLE_EXAMPLES_SENTENCE_CASE
+    )
     bounded_avoid = [
         str(title).strip()[:100]
         for title in (avoid_titles or [])
@@ -292,6 +331,7 @@ def _build_title_prompt(
         .replace("__ALIAS_RULE__", alias_rule)
         .replace("__INSTRUCTIONS_RULE__", instructions_rule)
         .replace("__AVOID_TITLES_RULE__", avoid_rule)
+        .replace("__EXAMPLES__", examples)
     )
 
 
@@ -572,16 +612,10 @@ def generate_title(
         return None
 
     language = _title_language()
-    min_words, max_words, max_characters, name_aliases, instructions = (
-        _title_preferences()
-    )
+    preferences = _title_preferences()
     prompt = _build_title_prompt(
         language=language,
-        min_words=min_words,
-        max_words=max_words,
-        max_characters=max_characters,
-        name_aliases=name_aliases,
-        instructions=instructions,
+        preferences=preferences,
         avoid_titles=avoid_titles,
     )
 
@@ -621,7 +655,7 @@ def generate_title(
             )
             title = None
         canonical_name = _canonical_name_for_message(
-            summarized_user_message, name_aliases
+            summarized_user_message, preferences.name_aliases
         )
         if canonical_name:
             # Preserve the operator's canonical name without collapsing every
@@ -629,12 +663,14 @@ def generate_title(
             # alias the model used; otherwise prefix the missing name.
             replaced = False
             if title:
-                exact_title_alias = name_aliases.get(title.casefold())
+                exact_title_alias = preferences.name_aliases.get(title.casefold())
                 if exact_title_alias is not None:
                     title = canonical_name
                     replaced = True
                 for alias, canonical in sorted(
-                    name_aliases.items(), key=lambda item: len(item[0]), reverse=True
+                    preferences.name_aliases.items(),
+                    key=lambda item: len(item[0]),
+                    reverse=True,
                 ):
                     if replaced:
                         break
@@ -649,7 +685,9 @@ def generate_title(
                 title = f"{canonical_name} {title}"
             elif not title:
                 title = canonical_name
-        return _clean_title(title or "", max_characters, max_words)
+        return _clean_title(
+            title or "", preferences.max_characters, preferences.max_words
+        )
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -851,17 +889,17 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
         if not dedupe:
             raise
 
-    _, max_words, max_characters, _, _ = _title_preferences()
+    preferences = _title_preferences()
     for number in range(2, 10_000):
         suffix = f"#{number}"
-        if max_words <= 1:
-            stem = _truncate_title(title, max_characters - len(suffix))
+        if preferences.max_words <= 1:
+            stem = _truncate_title(title, preferences.max_characters - len(suffix))
             candidate = f"{stem}{suffix}"
         else:
             stem = _clean_title(
                 title,
-                max_characters=max_characters - len(suffix) - 1,
-                max_words=max_words - 1,
+                max_characters=preferences.max_characters - len(suffix) - 1,
+                max_words=preferences.max_words - 1,
             )
             if not stem:
                 stem = "Session"

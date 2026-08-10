@@ -817,13 +817,14 @@ auxiliary:
     min_words: 2
     max_words: 2
     max_characters: 24
+    case_style: title_case
     instructions: "Use concrete noun phrases"
     name_aliases:
       project atlas: ProjectAtlas
       atlas app: ProjectAtlas
 ```
 
-`name_aliases` is case-insensitive and keeps personal project vocabulary in user config rather than Hermes source code. When an alias appears in the opening message, Hermes deterministically canonicalizes the generated title without collapsing every conversation to the bare project name. Configured word and character maxima are always enforced. Hermes also supplies a bounded list of recent session titles to the model, retries one real collision with explicit exclusions, and keeps the transactional unique-title check as the final authority.
+`case_style` accepts `sentence_case` (the default) or `title_case` and changes the title model's prompt without rewriting proper names after generation. `name_aliases` is case-insensitive and keeps personal project vocabulary in user config rather than Hermes source code. When an alias appears in the opening message, Hermes deterministically canonicalizes the generated title without collapsing every conversation to the bare project name. Configured word and character maxima are always enforced. Hermes also supplies a bounded list of recent session titles to the model, retries one real collision with explicit exclusions, and keeps the transactional unique-title check as the final authority.
 
 Telegram can also choose a semantically matching **full-size topic icon** instead of leaving the default colored bubble. This is opt-in because it makes one additional lightweight title-generation call when a new topic is named:
 

@@ -179,6 +179,7 @@ class TestGenerateTitle:
         assert "same language as the user's message" in prompt
         assert "3-7 words" in prompt
         assert "80 characters" in prompt
+        assert "use sentence case" in prompt
         assert "named project" in prompt
         assert "Fixing" in prompt
         assert "Do not include emoji" in prompt
@@ -211,6 +212,31 @@ class TestGenerateTitle:
         assert "24 characters" in prompt
         assert '\"project atlas\": \"ProjectAtlas\"' in prompt
         assert '\"atlas app\": \"ProjectAtlas\"' in prompt
+
+    def test_title_case_prompt_is_configurable(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Prepare LPG Huddle"}'
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "case_style": "title_case",
+                    "max_characters": 30,
+                }
+            }
+        }
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
+            assert generate_title("prepare LPG huddle with James") == "Prepare LPG Huddle"
+
+        prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "30 characters" in prompt
+        assert "use Title Case" in prompt
+        assert 'Good: {"title": "Fix Mobile Login"}' in prompt
+        assert 'Good: {"title": "Fix mobile login"}' not in prompt
 
     def test_name_aliases_match_whole_terms_not_substrings(self):
         response = MagicMock()
