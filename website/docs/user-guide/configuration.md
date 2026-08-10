@@ -1374,6 +1374,7 @@ auxiliary:
     min_words: 3
     max_words: 7
     max_characters: 80
+    case_style: "sentence_case" # "sentence_case" or "title_case"
     instructions: ""           # optional trusted operator guidance; hard limits still win
     name_aliases: {}           # case-insensitive alias -> canonical display name
 

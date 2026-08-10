@@ -47,6 +47,7 @@ def test_title_generation_present_in_default_config():
     assert tg["min_words"] == 3
     assert tg["max_words"] == 7
     assert tg["max_characters"] == 80
+    assert tg["case_style"] == "sentence_case"
     assert tg["instructions"] == ""
     assert tg["name_aliases"] == {}
 

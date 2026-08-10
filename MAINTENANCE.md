@@ -32,7 +32,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
-| HERMES-017 | Active | `feat(titles): configure concise distinct session titles` | Make title shape configurable while preserving durable, race-safe uniqueness. |
+| HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): configure session title casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
 | HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames` | Select live Telegram topic icons without repeating recent choices or overwriting manual icons. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
@@ -169,8 +169,8 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-017 — Configure concise, distinct session titles
 
-- **Summary:** Adds validated title-generation limits, operator instructions, and canonical name aliases; deterministically enforces configured word/character caps; warns the title model away from recent session titles; and preserves the database's transactional uniqueness authority with one bounded distinct-title retry before the existing numbered fallback. Compression continuations retain their intentional lineage naming.
-- **Surfaces:** `agent/title_generator.py`; `hermes_cli/config_defaults.py`; `hermes_state.py`; `website/docs/user-guide/configuration.md`; focused title, state, and auxiliary-config tests.
+- **Summary:** Adds validated title-generation limits, sentence-case or title-case prompt selection, operator instructions, and canonical name aliases; deterministically enforces configured word/character caps; warns the title model away from recent session titles; and preserves the database's transactional uniqueness authority with one bounded distinct-title retry before the existing numbered fallback. Compression continuations retain their intentional lineage naming.
+- **Surfaces:** `agent/title_generator.py`; `hermes_cli/config_defaults.py`; `hermes_state.py`; `cli-config.yaml.example`; `website/docs/user-guide/configuration.md`; `website/docs/user-guide/messaging/telegram.md`; focused title, state, and auxiliary-config tests.
 - **Upstream tracking:** Cherry-picks the title commit from open PR `#66353`, then hardens it with backward-compatible defaults, operator instructions, deterministic word enforcement, normalized recent-title avoidance, and bounded collision retry. Retire only after released upstream satisfies that complete contract.
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/test_hermes_state.py tests/hermes_cli/test_aux_config.py -q` plus a clean-profile end-to-end title-generation probe proving configured limits and collision handling.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated title/session changes. Remove only HERMES-017 configuration fields, prompt construction, deterministic normalization, recent-title query, bounded retry, and focused tests. Restore affected profiles to upstream-supported title configuration before promotion, then prove released upstream still preserves manual-title precedence, exact transactional uniqueness, compression lineage, and configured title shape.

@@ -1267,6 +1267,7 @@ DEFAULT_CONFIG = {
             "min_words": 3,
             "max_words": 7,
             "max_characters": 80,
+            "case_style": "sentence_case",
             "instructions": "",
             # Case-insensitive aliases mapped to canonical display names.
             "name_aliases": {},
