@@ -32,6 +32,8 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
+| HERMES-017 | Active | `feat(titles): configure concise distinct session titles` | Make title shape configurable while preserving durable, race-safe uniqueness. |
+| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames` | Select live Telegram topic icons without repeating recent choices or overwriting manual icons. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -164,6 +166,22 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** Issue `#82726`. Retire after an upstream release preserves or explicitly rejects flat MoA configuration at the complete `load_config()` boundary instead of silently substituting built-in models.
 - **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_moa_config.py tests/hermes_cli/test_config.py tests/hermes_cli/test_config_loader_e2e.py tests/hermes_cli/test_config_validation.py tests/hermes_cli/test_config_read_guard.py -q` plus an isolated flat-config resolution probe using non-default model identifiers.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later config-loader changes, remove only the flat-MoA regression, and restore affected profiles to named `moa.presets.default` configuration before promotion. Do not return a runtime to flat configuration until released upstream behavior passes the same end-to-end resolution probe.
+
+### HERMES-017 — Configure concise, distinct session titles
+
+- **Summary:** Adds validated title-generation limits, operator instructions, and canonical name aliases; deterministically enforces configured word/character caps; warns the title model away from recent session titles; and preserves the database's transactional uniqueness authority with one bounded distinct-title retry before the existing numbered fallback. Compression continuations retain their intentional lineage naming.
+- **Surfaces:** `agent/title_generator.py`; `hermes_cli/config_defaults.py`; `hermes_state.py`; `website/docs/user-guide/configuration.md`; focused title, state, and auxiliary-config tests.
+- **Upstream tracking:** Cherry-picks the title commit from open PR `#66353`, then hardens it with backward-compatible defaults, operator instructions, deterministic word enforcement, normalized recent-title avoidance, and bounded collision retry. Retire only after released upstream satisfies that complete contract.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/test_hermes_state.py tests/hermes_cli/test_aux_config.py -q` plus a clean-profile end-to-end title-generation probe proving configured limits and collision handling.
+- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated title/session changes. Remove only HERMES-017 configuration fields, prompt construction, deterministic normalization, recent-title query, bounded retry, and focused tests. Restore affected profiles to upstream-supported title configuration before promotion, then prove released upstream still preserves manual-title precedence, exact transactional uniqueness, compression lineage, and configured title shape.
+
+### HERMES-018 — Select diverse semantic Telegram topic icons
+
+- **Summary:** Opt-in semantic native Telegram topic icons resolve against the live allowed sticker set, honor exact emoji overrides, preserve observed manual choices, validate bindings immediately before mutation, and avoid recently selected icons with durable per-chat least-recently-used history. Icon failure never blocks session-title persistence or topic renaming.
+- **Surfaces:** `agent/title_generator.py`; `gateway/run.py`; `hermes_state.py`; `plugins/platforms/telegram/adapter.py`; `website/docs/user-guide/messaging/telegram.md`; focused state, selector, adapter, and gateway tests.
+- **Upstream tracking:** Cherry-picks the icon commit from open PR `#66353`, then replaces process-local-only ownership/diversity with durable `state.db` state and deterministic least-recent reuse. PR `#35737` hardcodes one account's icon IDs and couples Telegram metadata to the generic title callback. Retire only after released upstream uses a live allowlist, preserves manual ownership across restarts, rechecks topic/session authority, and degrades without losing titles.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary before activation.
+- **Rollback:** Disable `gateway.platforms.telegram.extra.auto_topic_icons` in every affected profile, verify title-only topic renaming, then revert the stable-subject patch in a follow-up commit while preserving unrelated Telegram/state changes. Remove only HERMES-018's derived state, selector, adapter methods, docs, and tests after released upstream passes the same live-set, restart, manual-preservation, race, and failure-degradation contract.
 
 ## Adding or changing a patch
 

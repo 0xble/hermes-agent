@@ -12,6 +12,7 @@ from agent.title_generator import (
     auto_title_session,
     maybe_auto_title,
     _title_language,
+    _truncate_title,
 )
 from hermes_state import SessionDB
 
@@ -32,6 +33,13 @@ class TestGenerateTitle:
         with patch("hermes_cli.config.load_config", side_effect=RuntimeError("bad config")), \
          patch("hermes_cli.config.load_config_readonly", side_effect=RuntimeError("bad config")):
             assert _title_language() == ""
+
+    def test_character_truncation_does_not_split_emoji_grapheme(self):
+        family = "👨‍👩‍👧‍👦"
+        title = _truncate_title(f"AB{family}CD", 10)
+
+        assert title == "AB..."
+        assert not title.removesuffix("...").endswith("\u200d")
 
     def test_default_timeout_delegates_to_auxiliary_config(self):
         captured_kwargs = {}
@@ -91,7 +99,7 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=mock_response):
             title = generate_title("question")
             assert title is not None
-            assert len(title) == 40
+            assert len(title) == 80
             assert title.endswith("...")
 
     def test_rejects_answer_shaped_output(self):
@@ -169,7 +177,8 @@ class TestGenerateTitle:
 
         prompt = llm.call_args.kwargs["messages"][0]["content"]
         assert "same language as the user's message" in prompt
-        assert "1-3 words" in prompt
+        assert "3-7 words" in prompt
+        assert "80 characters" in prompt
         assert "named project" in prompt
         assert "Fixing" in prompt
         assert "Do not include emoji" in prompt
@@ -195,10 +204,10 @@ class TestGenerateTitle:
             patch("hermes_cli.config.load_config_readonly", return_value=config),
             patch("agent.title_generator.call_llm", return_value=response) as llm,
         ):
-            assert generate_title("Update the ATLAS APP") == "ProjectAtlas"
+            assert generate_title("Update the ATLAS APP") == "ProjectAtlas Planning"
 
         prompt = llm.call_args.kwargs["messages"][0]["content"]
-        assert "1-2 words" in prompt
+        assert "2-2 words" in prompt
         assert "24 characters" in prompt
         assert '\"project atlas\": \"ProjectAtlas\"' in prompt
         assert '\"atlas app\": \"ProjectAtlas\"' in prompt
@@ -241,7 +250,7 @@ class TestGenerateTitle:
 
         assert title == "ProjectAtlas"
 
-    def test_canonical_alias_outranks_character_preference(self):
+    def test_character_limit_outranks_invalid_overlong_alias(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "Atlas"}'
@@ -260,7 +269,7 @@ class TestGenerateTitle:
         ):
             title = generate_title("Open the atlas app")
 
-        assert title == "ProjectAtlasLongName"
+        assert title == "Atlas"
 
     def test_name_alias_after_prompt_snippet_is_still_enforced(self):
         response = MagicMock()
@@ -278,7 +287,7 @@ class TestGenerateTitle:
         ):
             title = generate_title("x" * 1100 + " atlas app")
 
-        assert title == "ProjectAtlas"
+        assert title == "ProjectAtlas Planning flow"
 
     def test_name_aliases_ignore_hidden_skill_scaffolding(self):
         response = MagicMock()
@@ -323,6 +332,52 @@ class TestGenerateTitle:
         assert title is not None
         assert len(title) == 24
         assert title.endswith("...")
+
+    def test_configured_word_limit_is_enforced_after_generation(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = (
+            '{"title": "one two three four five"}'
+        )
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "min_words": 1,
+                    "max_words": 3,
+                    "max_characters": 80,
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response),
+        ):
+            assert generate_title("question") == "one two three"
+
+    def test_operator_instructions_and_recent_titles_are_bounded_prompt_context(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Distinct title"}'
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "instructions": "Prefer concrete noun phrases",
+                }
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
+            generate_title(
+                "question",
+                avoid_titles=[f"Existing {index}" for index in range(40)],
+            )
+        prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "Prefer concrete noun phrases" in prompt
+        assert "Existing 0" in prompt
+        assert "Existing 23" in prompt
+        assert "Existing 24" not in prompt
 
 
 class TestChooseTopicIcon:
@@ -409,7 +464,7 @@ class TestChooseTopicIcon:
                 recent_emojis=["👮‍♂️"],
             ) == "⚡️"
 
-    def test_falls_back_to_top_ranked_candidate_when_all_were_recent(self):
+    def test_falls_back_to_least_recent_candidate_when_reuse_is_unavoidable(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "💻 🤖"
@@ -420,7 +475,7 @@ class TestChooseTopicIcon:
                 "debug the agent",
                 ["💻", "🤖"],
                 recent_emojis=["💻", "🤖"],
-            ) == "💻"
+            ) == "🤖"
 
     def test_rejects_response_without_an_allowed_candidate(self):
         mock_response = MagicMock()
@@ -672,13 +727,20 @@ class TestMaybeAutoTitle:
         assert db.get_session_title("sess-1") == "Existing name"
         mock_auto.assert_not_called()
 
-    def test_instant_title_declines_a_name_collision(self, tmp_path):
-        """A colliding derived title is skipped, not scanned into 'hi #2'.
+    def test_does_not_spawn_second_title_worker_at_second_turn_prologue(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        db.set_session_title("sess-1", "Existing name")
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(db, "sess-1", "second request", history)
+        mock_auto.assert_not_called()
 
-        Common openers collide constantly, and the lineage scan that resolves
-        the collision runs inline on the turn. The model's title lands moments
-        later, so the session is named either way.
-        """
+    def test_instant_title_declines_a_name_collision(self, tmp_path):
+        """A colliding derived title is skipped, not scanned into 'hi #2'."""
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="taken", source="cli")
         db.set_session_title("taken", "hi")
@@ -749,8 +811,12 @@ class TestAutoTitleDuplicateHandling:
         db = MagicMock()
         db.get_session_title_source.return_value = None
         # Atomic write path: collision raises ValueError, retry persists.
-        db.set_auto_title.side_effect = [ValueError("in use"), True]
-        db.get_next_title_in_lineage.return_value = "Debugging Import Error #2"
+        db.set_auto_title.side_effect = [
+            ValueError("in use"),
+            ValueError("still in use"),
+            True,
+        ]
+
         with patch(
             "agent.title_generator.generate_title",
             return_value="Debugging Import Error",
@@ -762,13 +828,40 @@ class TestAutoTitleDuplicateHandling:
                 "hi",
                 title_callback=lambda title, _source: seen.append(title),
             )
-        db.get_next_title_in_lineage.assert_called_once_with("Debugging Import Error")
         assert db.set_auto_title.call_args_list[-1][0] == (
             "sess-1",
             "Debugging Import Error #2",
         )
         # callback fires with the actually-persisted (deduped) title
         assert seen == ["Debugging Import Error #2"]
+
+    def test_collision_variant_respects_configured_hard_limits(self, tmp_path):
+        from agent.title_generator import _persist_session_title
+
+        db = SessionDB(tmp_path / "state.db")
+        original = "A" * 24
+        db.create_session("taken", "cli")
+        db.set_session_title("taken", original)
+        db.create_session("sess-1", "cli")
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "max_words": 3,
+                    "max_characters": 24,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            persisted = _persist_session_title(
+                db, "sess-1", original, source="llm"
+            )
+
+        assert persisted is not None
+        assert len(persisted) <= 24
+        assert len(persisted.split()) <= 3
+        assert persisted.endswith("#2")
 
 
 

@@ -373,6 +373,20 @@ def test_topic_creation_icon_state_distinguishes_default_manual_and_unknown():
     assert adapter.dm_topic_custom_icon_state("111", "43") is True
 
 
+def test_topic_icon_observer_receives_service_event_state_immediately():
+    adapter = _make_adapter()
+    observer = MagicMock()
+    adapter.set_dm_topic_icon_observer(observer)
+
+    adapter._remember_dm_topic_creation_icon("111", "42", "manual-id")
+    adapter._remember_dm_topic_creation_icon("111", "43", None)
+
+    assert [item.args for item in observer.call_args_list] == [
+        ("111", "42", "manual-id"),
+        ("111", "43", None),
+    ]
+
+
 # ── _build_message_event: auto_skill binding ──
 
 

@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from contextvars import copy_context
 from typing import Any, Callable, Optional
 
@@ -82,6 +83,8 @@ _TITLE_PROMPT_TEMPLATE = (
     "- Avoid generic leading labels such as Fixing, Update, or Analysis when a specific subject is available.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
     "__ALIAS_RULE__"
+    "__INSTRUCTIONS_RULE__"
+    "__AVOID_TITLES_RULE__"
     "- Drop filler words: the, this, my, a, an.\n"
     "- Do not include emoji.\n"
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
@@ -172,16 +175,24 @@ def _title_language() -> str:
         return ""
 
 
-def _title_preferences() -> tuple[int, int, dict[str, str]]:
-    """Return compact-title limits and user-defined canonical aliases."""
-    default_max_words = 3
-    default_max_characters = 40
+def _title_preferences() -> tuple[int, int, int, dict[str, str], str]:
+    """Return validated title-shaping preferences.
+
+    Defaults preserve Hermes' pre-patch 3-7 word / 80 character contract.
+    ``min_words`` guides the model; both maxima are enforced after generation.
+    Operator instructions are bounded so config cannot create an unbounded
+    auxiliary prompt.
+    """
+    default_min_words = 3
+    default_max_words = 7
+    default_max_characters = 80
     try:
         from hermes_cli.config import load_config_readonly
 
         title_config = ((load_config_readonly() or {}).get("auxiliary") or {}).get(
             "title_generation", {}
         )
+        min_words = int(title_config.get("min_words", default_min_words))
         max_words = int(title_config.get("max_words", default_max_words))
         max_characters = int(title_config.get("max_characters", default_max_characters))
         raw_aliases = title_config.get("name_aliases", {})
@@ -194,9 +205,24 @@ def _title_preferences() -> tuple[int, int, dict[str, str]]:
             if isinstance(raw_aliases, dict)
             else {}
         )
-        return max(1, min(max_words, 12)), max(12, min(max_characters, 120)), aliases
+        max_words = max(1, min(max_words, 12))
+        min_words = max(1, min(min_words, max_words))
+        max_characters = max(12, min(max_characters, 100))
+        aliases = {
+            alias: canonical
+            for alias, canonical in list(aliases.items())[:64]
+            if len(canonical) <= max_characters
+        }
+        instructions = str(title_config.get("instructions", "") or "").strip()[:1000]
+        return min_words, max_words, max_characters, aliases, instructions
     except Exception:
-        return default_max_words, default_max_characters, {}
+        return (
+            default_min_words,
+            default_max_words,
+            default_max_characters,
+            {},
+            "",
+        )
 
 
 def _canonical_name_for_message(
@@ -214,9 +240,12 @@ def _canonical_name_for_message(
 def _build_title_prompt(
     *,
     language: str,
+    min_words: int,
     max_words: int,
     max_characters: int,
     name_aliases: dict[str, str],
+    instructions: str = "",
+    avoid_titles: Optional[list[str]] = None,
 ) -> str:
     """Build the structured-output title prompt from user preferences."""
     language_rule = (
@@ -225,7 +254,7 @@ def _build_title_prompt(
         else _LANGUAGE_RULE_MATCH_USER
     )
     length_rule = (
-        f"- Prefer 1-{max_words} words and at most {max_characters} characters; "
+        f"- Prefer {min_words}-{max_words} words and at most {max_characters} characters; "
         "use sentence case (capitalize only the first word and proper nouns)."
     )
     alias_rule = ""
@@ -235,6 +264,25 @@ def _build_title_prompt(
             "- Use these case-insensitive canonical name replacements when the "
             f"opening message contains an alias: {aliases_json}.\n"
         )
+    instructions_rule = ""
+    if instructions:
+        instructions_rule = (
+            "- Follow these trusted operator instructions when they do not conflict "
+            f"with the hard rules above: {instructions}\n"
+        )
+    bounded_avoid = [
+        str(title).strip()[:100]
+        for title in (avoid_titles or [])
+        if str(title).strip()
+    ][:24]
+    avoid_rule = ""
+    if bounded_avoid:
+        avoid_rule = (
+            "- Do not reuse or trivially restate these existing session titles. "
+            "Choose wording that captures what is distinctive about this request: "
+            + json.dumps(bounded_avoid, ensure_ascii=False)
+            + ".\n"
+        )
     # Placeholder substitution, not str.format: the prompt embeds literal JSON
     # braces as few-shot examples, which format() would try to interpolate.
     return (
@@ -242,6 +290,8 @@ def _build_title_prompt(
         .replace("__LANGUAGE_RULE__", language_rule)
         .replace("__LENGTH_RULE__", length_rule)
         .replace("__ALIAS_RULE__", alias_rule)
+        .replace("__INSTRUCTIONS_RULE__", instructions_rule)
+        .replace("__AVOID_TITLES_RULE__", avoid_rule)
     )
 
 
@@ -401,8 +451,58 @@ def _extract_title_text(content: str) -> str:
     return raw.strip("\"'").strip()
 
 
-def _clean_title(text: str, max_characters: int = 80) -> Optional[str]:
-    """Normalize a model-produced title, or None when nothing usable remains."""
+def _title_comparison_key(title: str) -> str:
+    """Normalize superficial differences for advisory title diversity."""
+    normalized = unicodedata.normalize("NFKC", str(title or "")).casefold()
+    return re.sub(r"\s+", " ", normalized).strip().rstrip(".!,;:")
+
+
+def _truncate_title(title: str, max_characters: int) -> str:
+    """Truncate to a codepoint budget without splitting a grapheme cluster."""
+    if len(title) <= max_characters:
+        return title
+    budget = max(1, max_characters - 3)
+    clusters: list[str] = []
+    for char in title:
+        codepoint = ord(char)
+        is_variation = 0xFE00 <= codepoint <= 0xFE0F
+        is_modifier = 0x1F3FB <= codepoint <= 0x1F3FF
+        is_regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        if not clusters:
+            clusters.append(char)
+            continue
+        previous = clusters[-1]
+        previous_is_single_regional = (
+            len(previous) == 1 and 0x1F1E6 <= ord(previous) <= 0x1F1FF
+        )
+        if (
+            unicodedata.combining(char)
+            or is_variation
+            or is_modifier
+            or char == "\u200d"
+            or previous.endswith("\u200d")
+            or (is_regional and previous_is_single_regional)
+        ):
+            clusters[-1] += char
+        else:
+            clusters.append(char)
+
+    kept: list[str] = []
+    used = 0
+    for cluster in clusters:
+        if used + len(cluster) > budget:
+            break
+        kept.append(cluster)
+        used += len(cluster)
+    return "".join(kept).rstrip() + "..."
+
+
+def _clean_title(
+    text: str,
+    max_characters: int = 80,
+    max_words: Optional[int] = None,
+) -> Optional[str]:
+    """Normalize and hard-limit a model-produced title."""
     title = " ".join((text or "").split())
     title = title.strip("\"'").strip()
     if title.lower().startswith("title:"):
@@ -411,9 +511,13 @@ def _clean_title(text: str, max_characters: int = 80) -> Optional[str]:
     title = title.rstrip(".!,;:")
     if not title:
         return None
+    if max_words is not None:
+        words = title.split()
+        if len(words) > max_words:
+            title = " ".join(words[:max_words]).rstrip(" ,.;:—-")
     if len(title) > max_characters:
-        title = title[: max_characters - 3].rstrip() + "..."
-    return title
+        title = _truncate_title(title, max_characters)
+    return title or None
 
 
 def generate_title(
@@ -422,6 +526,7 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    avoid_titles: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Generate a session title from the user's opening message.
 
@@ -467,12 +572,17 @@ def generate_title(
         return None
 
     language = _title_language()
-    max_words, max_characters, name_aliases = _title_preferences()
+    min_words, max_words, max_characters, name_aliases, instructions = (
+        _title_preferences()
+    )
     prompt = _build_title_prompt(
         language=language,
+        min_words=min_words,
         max_words=max_words,
         max_characters=max_characters,
         name_aliases=name_aliases,
+        instructions=instructions,
+        avoid_titles=avoid_titles,
     )
 
     messages = [
@@ -493,7 +603,13 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
         content = response.choices[0].message.content or ""
-        title = _clean_title(_extract_title_text(content), max_characters)
+        # Normalize model chatter first, then apply aliases, then enforce the
+        # configured limits exactly once so ellipsis handling is stable.
+        title = _clean_title(
+            _extract_title_text(content),
+            100,
+            None,
+        )
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
         # the user's message instead. Reject it rather than storing an
@@ -507,9 +623,33 @@ def generate_title(
         canonical_name = _canonical_name_for_message(
             summarized_user_message, name_aliases
         )
-        # Canonical names are explicit user config and intentionally outrank the
-        # generic character preference.
-        return canonical_name or title
+        if canonical_name:
+            # Preserve the operator's canonical name without collapsing every
+            # project conversation to that bare name. First canonicalize any
+            # alias the model used; otherwise prefix the missing name.
+            replaced = False
+            if title:
+                exact_title_alias = name_aliases.get(title.casefold())
+                if exact_title_alias is not None:
+                    title = canonical_name
+                    replaced = True
+                for alias, canonical in sorted(
+                    name_aliases.items(), key=lambda item: len(item[0]), reverse=True
+                ):
+                    if replaced:
+                        break
+                    if canonical != canonical_name:
+                        continue
+                    pattern = re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)", re.IGNORECASE)
+                    title, count = pattern.subn(canonical_name, title)
+                    if count:
+                        replaced = True
+                        break
+            if title and not replaced and canonical_name.casefold() not in title.casefold():
+                title = f"{canonical_name} {title}"
+            elif not title:
+                title = canonical_name
+        return _clean_title(title or "", max_characters, max_words)
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -530,6 +670,7 @@ def choose_topic_icon(
     timeout: float = 30.0,
     *,
     recent_emojis: Optional[list[str]] = None,
+    instructions: str = "",
 ) -> Optional[str]:
     """Choose a varied semantic Telegram topic emoji from a live allowlist.
 
@@ -585,6 +726,12 @@ def choose_topic_icon(
                 + json.dumps(recent, ensure_ascii=False)
                 + ". Avoid repeating them unless one is unmistakably the best semantic fit."
             )
+    bounded_instructions = str(instructions or "").strip()[:1000]
+    if bounded_instructions:
+        prompt += (
+            " Follow these trusted operator instructions when they do not conflict "
+            f"with the allowed-list and semantic-fit rules: {bounded_instructions}"
+        )
     messages = [
         {"role": "system", "content": prompt},
         {
@@ -637,9 +784,19 @@ def choose_topic_icon(
         if not candidates:
             return None
 
-        return next(
+        fresh_candidate = next(
             (emoji for emoji in candidates if _emoji_key(emoji) not in recent_keys),
-            candidates[0],
+            None,
+        )
+        if fresh_candidate is not None:
+            return fresh_candidate
+        # ``recent`` is newest -> oldest. When reuse is unavoidable, choose
+        # the least-recent semantically ranked candidate instead of restarting
+        # a hot-icon streak.
+        recent_rank = {_emoji_key(emoji): index for index, emoji in enumerate(recent)}
+        return max(
+            candidates,
+            key=lambda emoji: recent_rank.get(_emoji_key(emoji), -1),
         )
     except Exception:
         logger.debug("Telegram topic icon selection failed", exc_info=True)
@@ -653,7 +810,8 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     transaction) so a manual ``/title`` set while generation was in flight is
     never overwritten. ``ValueError`` means the name is taken by an unrelated
     session (the unique-title index); rather than leave the session untitled
-    (#50537), append a ``#N`` suffix via ``get_next_title_in_lineage``.
+    (#50537), append a bounded ``#N`` suffix that still honors configured
+    word/character limits.
 
     ``dedupe=False`` re-raises that collision instead. The derived title is the
     one write on the turn's critical path, and it is also the one that collides
@@ -690,13 +848,30 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     try:
         return _set(title)
     except ValueError:
-        next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
-        if not dedupe or next_title_fn is None:
+        if not dedupe:
             raise
-        deduped = next_title_fn(title)
-        if not deduped or deduped == title:
-            raise
-        return _set(deduped)
+
+    _, max_words, max_characters, _, _ = _title_preferences()
+    for number in range(2, 10_000):
+        suffix = f"#{number}"
+        if max_words <= 1:
+            stem = _truncate_title(title, max_characters - len(suffix))
+            candidate = f"{stem}{suffix}"
+        else:
+            stem = _clean_title(
+                title,
+                max_characters=max_characters - len(suffix) - 1,
+                max_words=max_words - 1,
+            )
+            if not stem:
+                stem = "Session"
+            candidate = f"{stem} {suffix}"
+        try:
+            persisted = _set(candidate)
+        except ValueError:
+            continue
+        return persisted
+    raise ValueError(f"unable to allocate a unique title for session {session_id}")
 
 
 def apply_instant_title(
@@ -829,11 +1004,22 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
+    recent_titles: list[str] = []
+    recent_fn = getattr(session_db, "list_recent_session_titles", None)
+    if callable(recent_fn):
+        try:
+            loaded_titles = recent_fn(exclude_session_id=session_id, limit=24)
+            if isinstance(loaded_titles, list):
+                recent_titles = [str(item) for item in loaded_titles if str(item).strip()]
+        except Exception:
+            logger.debug("Failed to load recent titles for diversity", exc_info=True)
+
     title = generate_title(
         user_message,
         failure_callback=failure_callback,
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
+        avoid_titles=recent_titles,
     )
     source = "llm"
     if not title:
@@ -848,7 +1034,46 @@ def _auto_title_session(
             return
 
     try:
-        persisted = _persist_session_title(session_db, session_id, title, source=source)
+        if source == "llm":
+            try:
+                # Let a real collision trigger one bounded quality retry before
+                # falling back to the durable numbered lineage mechanism.
+                persisted = _persist_session_title(
+                    session_db,
+                    session_id,
+                    title,
+                    source=source,
+                    dedupe=False,
+                )
+            except ValueError:
+                retry_title = generate_title(
+                    user_message,
+                    failure_callback=None,
+                    main_runtime=main_runtime,
+                    runtime_validator=runtime_validator,
+                    avoid_titles=(recent_titles + [title])[-24:],
+                )
+                if (
+                    retry_title
+                    and _title_comparison_key(retry_title)
+                    != _title_comparison_key(title)
+                ):
+                    title = retry_title
+                persisted = _persist_session_title(
+                    session_db,
+                    session_id,
+                    title,
+                    source=source,
+                    dedupe=True,
+                )
+        else:
+            persisted = _persist_session_title(
+                session_db,
+                session_id,
+                title,
+                source=source,
+                dedupe=True,
+            )
         if persisted is None:
             return
         logger.debug("Auto-generated session title: %s", persisted)
@@ -938,7 +1163,7 @@ def maybe_auto_title(
     # nothing reconsidered it. The title alone would never title at all on a
     # store too old to report one.
     user_msg_count = sum(1 for m in (conversation_history or []) if _is_real_user_turn(m))
-    if user_msg_count > 1 and not _session_is_untitled(session_db, session_id):
+    if user_msg_count >= 1 and not _session_is_untitled(session_db, session_id):
         return
 
     if not is_titleable_user_message(user_message):
