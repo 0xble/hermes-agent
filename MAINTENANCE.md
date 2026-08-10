@@ -187,10 +187,10 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 ### HERMES-019 — Ignore hidden Slack thread-parent metadata updates
 
 - **Summary:** Drops hidden `message_changed` events when Slack changed only thread-reply bookkeeping on an existing parent. This prevents a cold process cache from normalizing the old parent into a phantom user turn while preserving genuine visible edits and newly added mentions.
-- **Surfaces:** `plugins/platforms/slack/adapter.py`; focused `message_changed` coverage in `tests/gateway/test_slack.py`.
+- **Surfaces:** `plugins/platforms/slack/adapter.py`; sanitized cold-restart incident and focused `message_changed` coverage in `tests/gateway/test_slack.py`.
 - **Upstream tracking:** Open PR `#73450` identifies the same live replay path but is intentionally not cherry-picked because its broad classifier and test expansion are disproportionate to this patch contract. Retire when a released upstream implementation rejects equivalent hidden metadata-only parent updates with a cold cache while preserving visible edits.
-- **Regression:** `scripts/run_tests.sh tests/gateway/test_slack.py -k 'hidden_thread_parent or message_edit_with_new_mention' -q`.
-- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Slack adapter changes. Remove only the hidden parent-update classifier and its focused tests after released upstream passes the cold-cache metadata-only replay, visible edit, attachment removal, malformed snapshot, and edited-in mention cases.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_slack.py -k 'hidden_thread_parent or sanitized_lpg or message_edit_with_new_mention' -q`. The incident regression asserts the parent reaches neither routing nor persistence, cannot interrupt the active reply, and emits no busy acknowledgement.
+- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Slack adapter changes. Remove only the hidden parent-update classifier and its focused tests after released upstream passes the cold-cache metadata-only replay, visible text/block/file/attachment changes, malformed and partial snapshots, and edited-in mention cases.
 
 ## Adding or changing a patch
 

@@ -2326,14 +2326,39 @@ class TestHiddenThreadParentUpdates:
         }
 
     @pytest.mark.asyncio
-    async def test_hidden_thread_parent_reply_metadata_update_ignored_with_cold_cache(
+    async def test_sanitized_lpg_cold_restart_update_cannot_route_store_or_interrupt(
         self, adapter
     ):
+        """The incident parent update must stop before any gateway side effect."""
+        adapter._processed_message_ts.clear()
+        event = self._event(
+            current={
+                "text": (
+                    "Following up on our huddle: please post the enrichment "
+                    "testing results here."
+                )
+            }
+        )
+        event["previous_message"]["text"] = event["message"]["text"]
+
+        session_store = MagicMock()
+        active_agent = MagicMock()
+        busy_ack = AsyncMock()
+
+        async def gateway_boundary(message_event):
+            session_store.append_message("active-slack-thread", "user", message_event.text)
+            active_agent.interrupt(message_event.text)
+            await busy_ack()
+
+        adapter.handle_message = AsyncMock(side_effect=gateway_boundary)
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+        session_store.append_message.assert_not_called()
+        active_agent.interrupt.assert_not_called()
+        busy_ack.assert_not_awaited()
         assert adapter._processed_message_ts == {}
-
-        await adapter._handle_slack_message(self._event())
-
-        adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_hidden_thread_parent_update_with_text_edit_processed(self, adapter):
@@ -2357,18 +2382,28 @@ class TestHiddenThreadParentUpdates:
         assert adapter.handle_message.await_args.args[0].text == "old thread parent"
 
     @pytest.mark.asyncio
-    async def test_hidden_thread_parent_update_with_attachment_removal_processed(
-        self, adapter
+    @pytest.mark.parametrize(
+        ("field", "visible_value"),
+        [
+            ("attachments", [{"text": "visible attachment"}]),
+            ("blocks", [{"type": "section", "text": {"type": "mrkdwn", "text": "visible block"}}]),
+            ("files", [{"id": "F_SANITIZED", "name": "visible.txt"}]),
+        ],
+    )
+    async def test_hidden_thread_parent_update_with_visible_payload_removal_processed(
+        self, adapter, field, visible_value
     ):
         event = self._event()
-        event["previous_message"]["attachments"] = [{"text": "visible attachment"}]
+        event["previous_message"][field] = visible_value
 
         await adapter._handle_slack_message(event)
 
         adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("previous", ["malformed", {}])
+    @pytest.mark.parametrize(
+        "previous", ["malformed", {}, {"ts": "1234567890.000001"}]
+    )
     async def test_hidden_thread_parent_update_with_malformed_snapshot_ignored(
         self, adapter, previous
     ):
