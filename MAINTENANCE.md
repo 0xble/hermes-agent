@@ -34,6 +34,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
 | HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): configure session title casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
 | HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames` | Select live Telegram topic icons without repeating recent choices or overwriting manual icons. |
+| HERMES-019 | Active | `fix(slack): ignore hidden thread-parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -182,6 +183,14 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** Cherry-picks the icon commit from open PR `#66353`, then replaces process-local-only ownership/diversity with durable `state.db` state and deterministic least-recent reuse. PR `#35737` hardcodes one account's icon IDs and couples Telegram metadata to the generic title callback. Retire only after released upstream uses a live allowlist, preserves manual ownership across restarts, rechecks topic/session authority, and degrades without losing titles.
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary before activation.
 - **Rollback:** Disable `gateway.platforms.telegram.extra.auto_topic_icons` in every affected profile, verify title-only topic renaming, then revert the stable-subject patch in a follow-up commit while preserving unrelated Telegram/state changes. Remove only HERMES-018's derived state, selector, adapter methods, docs, and tests after released upstream passes the same live-set, restart, manual-preservation, race, and failure-degradation contract.
+
+### HERMES-019 — Ignore hidden Slack thread-parent metadata updates
+
+- **Summary:** Drops hidden `message_changed` events when Slack changed only thread-reply bookkeeping on an existing parent. This prevents a cold process cache from normalizing the old parent into a phantom user turn while preserving genuine visible edits and newly added mentions.
+- **Surfaces:** `plugins/platforms/slack/adapter.py`; focused `message_changed` coverage in `tests/gateway/test_slack.py`.
+- **Upstream tracking:** Open PR `#73450` identifies the same live replay path but is intentionally not cherry-picked because its broad classifier and test expansion are disproportionate to this patch contract. Retire when a released upstream implementation rejects equivalent hidden metadata-only parent updates with a cold cache while preserving visible edits.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_slack.py -k 'hidden_thread_parent or message_edit_with_new_mention' -q`.
+- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Slack adapter changes. Remove only the hidden parent-update classifier and its focused tests after released upstream passes the cold-cache metadata-only replay, visible edit, attachment removal, malformed snapshot, and edited-in mention cases.
 
 ## Adding or changing a patch
 

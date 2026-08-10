@@ -2284,6 +2284,116 @@ class TestMessageRouting:
         assert msg_event.message_id == "1234567890.000001"
 
 
+class TestHiddenThreadParentUpdates:
+    @staticmethod
+    def _event(*, current=None, previous=None):
+        parent = {
+            "type": "message",
+            "user": "U_USER",
+            "text": "old thread parent",
+            "ts": "1234567890.000001",
+            "reply_count": 2,
+            "latest_reply": "1234567899.000002",
+            "replies": [
+                {"user": "U_USER", "ts": "1234567899.000001"},
+                {"user": "U_USER", "ts": "1234567899.000002"},
+            ],
+        }
+        if current:
+            parent.update(current)
+        prior = {
+            "type": "message",
+            "user": "U_USER",
+            "text": "old thread parent",
+            "ts": "1234567890.000001",
+            "reply_count": 1,
+            "latest_reply": "1234567899.000001",
+            "replies": [{"user": "U_USER", "ts": "1234567899.000001"}],
+        }
+        if previous is not None:
+            prior = previous
+        return {
+            "type": "message",
+            "subtype": "message_changed",
+            "hidden": True,
+            "channel": "D123",
+            "channel_type": "im",
+            "team": "T123",
+            "ts": "1234567899.000003",
+            "event_ts": "1234567899.000003",
+            "message": parent,
+            "previous_message": prior,
+        }
+
+    @pytest.mark.asyncio
+    async def test_hidden_thread_parent_reply_metadata_update_ignored_with_cold_cache(
+        self, adapter
+    ):
+        assert adapter._processed_message_ts == {}
+
+        await adapter._handle_slack_message(self._event())
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_hidden_thread_parent_update_with_text_edit_processed(self, adapter):
+        await adapter._handle_slack_message(
+            self._event(current={"text": "edited thread parent"})
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text == "edited thread parent"
+
+    @pytest.mark.asyncio
+    async def test_hidden_thread_parent_update_with_new_mention_processed(self, adapter):
+        adapter.config.extra["require_mention"] = True
+        event = self._event(current={"text": "<@U_BOT> old thread parent"})
+        event["channel"] = "C123"
+        event["channel_type"] = "channel"
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text == "old thread parent"
+
+    @pytest.mark.asyncio
+    async def test_hidden_thread_parent_update_with_attachment_removal_processed(
+        self, adapter
+    ):
+        event = self._event()
+        event["previous_message"]["attachments"] = [{"text": "visible attachment"}]
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("previous", ["malformed", {}])
+    async def test_hidden_thread_parent_update_with_malformed_snapshot_ignored(
+        self, adapter, previous
+    ):
+        await adapter._handle_slack_message(self._event(previous=previous))
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_hidden_thread_parent_update_with_explicit_edit_and_malformed_snapshot_processed(
+        self, adapter
+    ):
+        await adapter._handle_slack_message(
+            self._event(
+                current={
+                    "text": "edited thread parent",
+                    "edited": {"user": "U_USER", "ts": "1234567899.000003"},
+                },
+                previous="malformed",
+            )
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text == "edited thread parent"
+
+
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus
 # ---------------------------------------------------------------------------
