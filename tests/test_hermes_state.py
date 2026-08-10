@@ -1698,8 +1698,65 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "2"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
         db.close()
+
+    def test_telegram_topic_icon_state_preserves_manual_and_auto_ownership(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        assert db.record_telegram_topic_icon_observation(
+            chat_id="208214988",
+            thread_id="42",
+            custom_emoji_id="manual-id",
+        ) == "manual"
+        state = db.get_telegram_topic_icon_state(
+            chat_id="208214988", thread_id="42"
+        )
+        assert state is not None
+        assert state["ownership"] == "manual"
+
+        db.mark_telegram_topic_icon_auto(
+            chat_id="208214988",
+            thread_id="43",
+            custom_emoji_id="auto-id",
+        )
+        assert db.record_telegram_topic_icon_observation(
+            chat_id="208214988",
+            thread_id="43",
+            custom_emoji_id="auto-id",
+        ) == "auto"
+        assert db.record_telegram_topic_icon_observation(
+            chat_id="208214988",
+            thread_id="43",
+            custom_emoji_id="replacement-id",
+        ) == "manual"
+        db.close()
+
+    def test_telegram_topic_icon_history_is_durable_bounded_lru(self, tmp_path):
+        path = tmp_path / "state.db"
+        db = SessionDB(db_path=path)
+        for index in range(4):
+            db.record_telegram_topic_icon_selection(
+                chat_id="208214988",
+                custom_emoji_id=f"id-{index}",
+                emoji=f"emoji-{index}",
+                limit=3,
+            )
+        assert [
+            row["emoji"]
+            for row in db.list_recent_telegram_topic_icons(
+                chat_id="208214988", limit=12
+            )
+        ] == ["emoji-3", "emoji-2", "emoji-1"]
+        db.close()
+
+        reopened = SessionDB(db_path=path)
+        assert [
+            row["emoji"]
+            for row in reopened.list_recent_telegram_topic_icons(
+                chat_id="208214988", limit=12
+            )
+        ] == ["emoji-3", "emoji-2", "emoji-1"]
+        reopened.close()
 
 
 
@@ -2197,6 +2254,20 @@ class TestTitleUniqueness:
         db.set_session_title("s1", "my project")
         with pytest.raises(ValueError, match="already in use"):
             db.set_session_title("s2", "my project")
+
+    def test_recent_titles_are_normalized_deduped_and_excludable(self, db):
+        db.create_session("s1", "cli")
+        db.create_session("s2", "cli")
+        db.create_session("s3", "cli")
+        db.set_session_title("s1", "Hermes titles")
+        db.set_session_title("s2", "Different topic")
+        db.set_session_title("s3", "Current session")
+
+        titles = db.list_recent_session_titles(
+            exclude_session_id="s3", limit=24
+        )
+        assert "Current session" not in titles
+        assert set(titles) == {"Hermes titles", "Different topic"}
 
 
     def test_null_titles_not_unique(self, db):

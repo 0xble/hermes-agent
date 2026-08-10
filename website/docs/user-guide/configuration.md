@@ -1369,7 +1369,13 @@ auxiliary:
     base_url: ""
     api_key: ""
     timeout: 30
+    # max_concurrency: 2       # Optional: cap simultaneous title-generation calls
     language: ""
+    min_words: 3
+    max_words: 7
+    max_characters: 80
+    instructions: ""           # optional trusted operator guidance; hard limits still win
+    name_aliases: {}           # case-insensitive alias -> canonical display name
 
   # Skills hub — skill matching and search
   skills_hub:
@@ -1386,15 +1392,6 @@ auxiliary:
     base_url: ""
     api_key: ""
     timeout: 30
-
-  # Auto-generated short session titles after the first exchange
-  title_generation:
-    provider: "auto"
-    model: ""
-    base_url: ""
-    api_key: ""
-    timeout: 30
-    # max_concurrency: 2       # Optional: cap simultaneous title-generation calls
 
   # Kanban triage specifier — `hermes kanban specify <id>` (or the
   # dashboard's ✨ Specify button on Triage-column cards) uses this

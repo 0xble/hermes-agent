@@ -14026,6 +14026,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            self._install_telegram_topic_icon_observer(adapter)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -15843,6 +15844,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
+                    self._install_telegram_topic_icon_observer(adapter)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -16979,6 +16981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _set_owner = getattr(adapter, "set_owner_profile", None)
         if callable(_set_owner):
             _set_owner(profile_name)
+        self._install_telegram_topic_icon_observer(adapter)
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )
@@ -25263,6 +25266,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         fallback_extra = getattr(platform_cfg, "extra", None) or {}
         return fallback_extra if isinstance(fallback_extra, dict) else {}
 
+    def _install_telegram_topic_icon_observer(self, adapter=None) -> None:
+        """Wire Telegram service updates to durable icon ownership state."""
+        if adapter is None:
+            adapter = getattr(self, "adapters", {}).get(Platform.TELEGRAM)
+        if getattr(adapter, "platform", None) != Platform.TELEGRAM:
+            return
+        setter = getattr(adapter, "set_dm_topic_icon_observer", None)
+        if callable(setter):
+            setter(self._queue_telegram_topic_icon_observation)
+
+    def _queue_telegram_topic_icon_observation(
+        self,
+        chat_id: str,
+        thread_id: str,
+        custom_emoji_id: Optional[str],
+    ) -> None:
+        """Persist a service-event icon observation without blocking PTB."""
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+
+        async def _persist() -> None:
+            try:
+                await session_db.record_telegram_topic_icon_observation(
+                    chat_id=str(chat_id),
+                    thread_id=str(thread_id),
+                    custom_emoji_id=custom_emoji_id,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist Telegram topic icon observation",
+                    exc_info=True,
+                )
+
+        try:
+            asyncio.get_running_loop().create_task(_persist())
+        except RuntimeError:
+            logger.debug("No event loop available for Telegram icon observation")
+
+    async def _telegram_topic_icon_ownership(
+        self,
+        adapter,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Merge live adapter observation with durable auto/manual ownership."""
+        if not source.chat_id or not source.thread_id:
+            return None
+        chat_id = str(source.chat_id)
+        thread_id = str(source.thread_id)
+        session_db = getattr(self, "_session_db", None)
+
+        observation = None
+        observation_fn = getattr(type(adapter), "dm_topic_custom_icon_observation", None)
+        if callable(observation_fn):
+            try:
+                observation = observation_fn(adapter, chat_id, thread_id)
+            except Exception:
+                logger.debug("Failed to inspect Telegram topic icon observation", exc_info=True)
+
+        if observation is not None:
+            if session_db is not None:
+                try:
+                    return await session_db.record_telegram_topic_icon_observation(
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        custom_emoji_id=observation,
+                    )
+                except Exception:
+                    logger.debug("Failed to persist Telegram topic icon observation", exc_info=True)
+            return "manual" if str(observation).strip() else "default"
+
+        if session_db is not None:
+            try:
+                state = await session_db.get_telegram_topic_icon_state(
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                )
+                if isinstance(state, dict):
+                    ownership = str(state.get("ownership") or "").strip()
+                    if ownership in {"auto", "manual", "default"}:
+                        return ownership
+            except Exception:
+                logger.debug("Failed to read durable Telegram topic icon state", exc_info=True)
+
+        # Backward-compatible fallback for adapters without ID observations.
+        legacy_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
+        if callable(legacy_fn):
+            try:
+                legacy = legacy_fn(chat_id, thread_id)
+                if legacy is True:
+                    return "manual"
+                if legacy is False:
+                    return "default"
+            except Exception:
+                logger.debug("Failed to inspect legacy Telegram topic icon state", exc_info=True)
+        return None
+
     async def _select_telegram_topic_icon_id_unlocked(
         self,
         adapter,
@@ -25280,20 +25380,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=True,
         )
         if preserve_manual:
-            state_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
-            if not callable(state_fn):
-                return None
-            try:
-                state = state_fn(str(source.chat_id), str(source.thread_id))
-            except Exception:
-                logger.debug("Failed to inspect Telegram topic icon state", exc_info=True)
-                return None
-            # True = the gateway observed a user-selected custom icon.
-            # False = it observed the default icon. None is also eligible here:
-            # Telegram DM topics often arrive without a forum_topic_created
-            # service message, and treating that as manual was the reason new
-            # topics kept the default letter bubble.
-            if state is True:
+            ownership = await self._telegram_topic_icon_ownership(adapter, source)
+            if ownership == "manual":
                 return None
 
         options_fn = getattr(adapter, "get_forum_topic_icon_options", None)
@@ -25341,11 +25429,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history_key = str(source.chat_id)
         if history_key in history_store:
             history_store.move_to_end(history_key)
-        recent_icons = [
-            emoji
+        memory_recent = [
+            normalized_icons[_emoji_key(emoji)][0]
             for emoji in history_store.get(history_key, [])
             if _emoji_key(emoji) in normalized_icons
         ][-_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT:]
+        # Selection receives newest -> oldest so unavoidable reuse can choose
+        # the least-recent valid candidate deterministically.
+        recent_icons = list(reversed(memory_recent))
+        session_db = getattr(self, "_session_db", None)
+        if session_db is not None:
+            try:
+                durable_rows = await session_db.list_recent_telegram_topic_icons(
+                    chat_id=history_key,
+                    limit=_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                )
+                durable_icons = [
+                    str(row.get("emoji") or "").strip()
+                    for row in durable_rows
+                    if isinstance(row, dict)
+                    and _emoji_key(str(row.get("emoji") or "").strip())
+                    in normalized_icons
+                ]
+                recent_icons = list(
+                    dict.fromkeys(durable_icons + recent_icons)
+                )[:_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT]
+            except Exception:
+                logger.debug("Failed to load durable Telegram icon history", exc_info=True)
 
         selected_emoji = None
         selected_id = None
@@ -25382,34 +25492,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if selected_id is None:
             from agent.title_generator import choose_topic_icon
 
+            choose_kwargs: dict[str, Any] = {"recent_emojis": recent_icons}
+            icon_instructions = str(extra.get("topic_icon_instructions") or "").strip()
+            if icon_instructions:
+                choose_kwargs["instructions"] = icon_instructions
             selected_emoji = await asyncio.to_thread(
                 choose_topic_icon,
                 title,
                 user_message,
                 list(icon_ids),
-                recent_emojis=recent_icons,
+                **choose_kwargs,
             )
             selected_id = icon_ids.get(selected_emoji or "")
         if selected_id and preserve_manual:
             # The auxiliary choice can take a few seconds. Recheck after it
             # returns so an icon the user selected meanwhile still wins.
-            latest_state_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
-            if not callable(latest_state_fn):
-                return None
-            try:
-                if latest_state_fn(str(source.chat_id), str(source.thread_id)) is True:
-                    return None
-            except Exception:
-                logger.debug("Failed to recheck Telegram topic icon state", exc_info=True)
+            latest_ownership = await self._telegram_topic_icon_ownership(adapter, source)
+            if latest_ownership == "manual":
                 return None
         if selected_id and selected_emoji:
             history_store[history_key] = (
-                [emoji for emoji in recent_icons if emoji != selected_emoji]
+                [emoji for emoji in memory_recent if emoji != selected_emoji]
                 + [selected_emoji]
             )[-_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT:]
             history_store.move_to_end(history_key)
             while len(history_store) > _TELEGRAM_TOPIC_ICON_CHAT_CACHE_LIMIT:
                 history_store.popitem(last=False)
+            if session_db is not None:
+                try:
+                    await session_db.record_telegram_topic_icon_selection(
+                        chat_id=history_key,
+                        custom_emoji_id=selected_id,
+                        emoji=selected_emoji,
+                        limit=_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                    )
+                except Exception:
+                    logger.debug("Failed to persist Telegram icon history", exc_info=True)
             logger.info(
                 "Selected Telegram topic icon %s for chat %s thread_id=%s title=%r",
                 selected_emoji,
@@ -25534,21 +25652,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 default=True,
             )
             if preserve_manual:
-                final_state_fn = getattr(adapter, "dm_topic_custom_icon_state", None)
-                if not callable(final_state_fn):
+                final_ownership = await self._telegram_topic_icon_ownership(
+                    adapter, source
+                )
+                if final_ownership == "manual":
                     icon_custom_emoji_id = None
-                else:
-                    try:
-                        if final_state_fn(
-                            str(source.chat_id), str(source.thread_id)
-                        ) is True:
-                            icon_custom_emoji_id = None
-                    except Exception:
-                        logger.debug(
-                            "Failed final Telegram topic icon state check",
-                            exc_info=True,
-                        )
-                        icon_custom_emoji_id = None
+
+        async def _mark_auto_icon() -> None:
+            if not icon_custom_emoji_id or session_db is None:
+                return
+            try:
+                await session_db.mark_telegram_topic_icon_auto(
+                    chat_id=str(source.chat_id),
+                    thread_id=str(source.thread_id),
+                    custom_emoji_id=icon_custom_emoji_id,
+                )
+            except Exception:
+                logger.debug("Failed to persist automatic Telegram icon ownership", exc_info=True)
+
         rename_topic = getattr(adapter, "rename_dm_topic", None)
         try:
             if rename_topic is not None:
@@ -25562,6 +25683,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await rename_topic(
                     **rename_kwargs,
                 )
+                await _mark_auto_icon()
                 return
 
             bot = getattr(adapter, "_bot", None)
@@ -25592,6 +25714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await edit_forum_topic(
                     **edit_kwargs,
                 )
+            await _mark_auto_icon()
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 

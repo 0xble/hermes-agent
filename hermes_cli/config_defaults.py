@@ -1261,10 +1261,13 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
-            # Compact title preferences. max_words guides the model; the
-            # character budget is also enforced after generation.
-            "max_words": 3,
-            "max_characters": 40,
+            # Title-shaping preferences. The word range guides the model; both
+            # maxima are enforced after generation. Defaults preserve the
+            # historical 3-7 word / 80 character behavior.
+            "min_words": 3,
+            "max_words": 7,
+            "max_characters": 80,
+            "instructions": "",
             # Case-insensitive aliases mapped to canonical display names.
             "name_aliases": {},
         },
