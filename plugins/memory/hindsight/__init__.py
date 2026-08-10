@@ -46,6 +46,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from packaging.version import InvalidVersion, Version
+
 from agent.secret_scope import get_secret
 
 from agent.memory_provider import MemoryProvider, RecallStatus
@@ -77,8 +79,11 @@ class _RecallResult:
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
-# Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+# Keep in sync with pyproject.toml, tools/lazy_deps.py ("memory.hindsight"),
+# plugin.yaml, and uv.lock. Hermes intentionally exact-pins managed SDKs so
+# eager, lazy, setup, and runtime-repair installs converge on reviewed bytes.
+_PINNED_CLIENT_VERSION = "0.9.1"
+_CLIENT_REQUIREMENT = f"hindsight-client=={_PINNED_CLIENT_VERSION}"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -107,6 +112,16 @@ _PROVIDER_DEFAULT_MODELS = {
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
+
+
+def _client_version_supported(actual: str | None) -> bool:
+    """Return whether *actual* matches the reviewed client pin exactly."""
+    if not actual:
+        return False
+    try:
+        return Version(actual) == Version(_PINNED_CLIENT_VERSION)
+    except InvalidVersion:
+        return False
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
@@ -1014,10 +1029,12 @@ class HindsightMemoryProvider(MemoryProvider):
         env_writes: dict = {}
 
         # Step 2: Install/upgrade deps for selected mode
-        cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
+        cloud_dep = _CLIENT_REQUIREMENT
         local_dep = "hindsight-all"
         if mode == "local_embedded":
-            deps_to_install = [local_dep]
+            # hindsight-all allows a broad client range, so constrain the
+            # client in the same solve instead of accepting transitive drift.
+            deps_to_install = [local_dep, _CLIENT_REQUIREMENT]
         elif mode == "local_external":
             deps_to_install = [cloud_dep]
         else:
@@ -1706,6 +1723,56 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    def _ensure_supported_client(self) -> None:
+        """Best-effort convergence on the reviewed Hindsight client pin.
+
+        Setup, lazy install, and runtime repair must resolve the same client
+        version. Route repair through lazy_deps so sealed deployments use their
+        durable dependency target instead of trying to mutate the base image.
+        """
+        try:
+            from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+            try:
+                installed = pkg_version("hindsight-client")
+            except PackageNotFoundError:
+                installed = None
+        except Exception:
+            return
+
+        if _client_version_supported(installed):
+            return
+
+        logger.warning(
+            "hindsight-client %s does not match %s; attempting to reinstall...",
+            installed or "not installed",
+            _CLIENT_REQUIREMENT,
+        )
+        try:
+            from tools.lazy_deps import install_specs
+
+            outcome = install_specs([_CLIENT_REQUIREMENT], timeout=120)
+            if outcome.ok:
+                logger.info("hindsight-client converged on %s", _CLIENT_REQUIREMENT)
+            elif outcome.blocked:
+                logger.warning(
+                    "Client repair unavailable: %s. Run: uv pip install '%s'",
+                    outcome.reason,
+                    _CLIENT_REQUIREMENT,
+                )
+            else:
+                logger.warning(
+                    "Client repair failed: %s. Run: uv pip install '%s'",
+                    (outcome.stderr or "").strip() or "install error",
+                    _CLIENT_REQUIREMENT,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Client repair failed: %s. Run: uv pip install '%s'",
+                exc,
+                _CLIENT_REQUIREMENT,
+            )
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1723,28 +1790,7 @@ class HindsightMemoryProvider(MemoryProvider):
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
 
-        # Check client version and auto-upgrade if needed
-        try:
-            from importlib.metadata import version as pkg_version
-            from packaging.version import Version
-            installed = pkg_version("hindsight-client")
-            if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                               installed, _MIN_CLIENT_VERSION)
-                # Environment-aware install: sealed hosted venvs redirect to the
-                # durable data-volume target instead of /opt/hermes (NS-605).
-                from tools.lazy_deps import install_specs
-                outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
-                if outcome.ok:
-                    logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                elif outcome.blocked:
-                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   outcome.reason, _MIN_CLIENT_VERSION)
-                else:
-                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
-        except Exception:
-            pass  # packaging not available or other issue — proceed anyway
+        self._ensure_supported_client()
 
         self._config = _load_config()
         self._platform = str(kwargs.get("platform") or "").strip()
