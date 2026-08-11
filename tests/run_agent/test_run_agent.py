@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -162,8 +165,22 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     agent._session_json_enabled = False
 
     message = {"role": "user", "content": "exactly once"}
-    normal = threading.Thread(target=lambda: agent._persist_session([message], []))
-    direct = threading.Thread(target=lambda: agent._flush_messages_to_session_db([message], []))
+    errors = []
+
+    def run_in_thread(callback):
+        try:
+            callback()
+        except BaseException as exc:  # make worker failures fail the test
+            errors.append(exc)
+
+    normal = threading.Thread(
+        target=run_in_thread,
+        args=(lambda: agent._persist_session([message], []),),
+    )
+    direct = threading.Thread(
+        target=run_in_thread,
+        args=(lambda: agent._flush_messages_to_session_db([message], []),),
+    )
     normal.start()
     assert db.entered.wait(timeout=5)
     direct.start()
@@ -176,6 +193,7 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
 
     assert not normal.is_alive()
     assert not direct.is_alive()
+    assert errors == []
     assert db.rows == ["exactly once"]
 
 

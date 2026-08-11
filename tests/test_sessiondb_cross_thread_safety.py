@@ -14,12 +14,10 @@ contract under test is a property of actual connection objects, and they use
 barriers/events rather than sleeps so the overlap is deterministic.
 """
 
-import sqlite3
 import threading
 
 import pytest
 
-import hermes_state
 from hermes_state import SessionDB
 
 
@@ -173,74 +171,3 @@ def test_wal_reads_do_not_wait_on_writer_lock(db):
 
     reader.join(timeout=10)
     assert result["value"] is None or isinstance(result["value"], dict)
-
-
-# ── Connection construction flags ──
-
-
-def test_writer_and_readers_disable_statement_cache(tmp_path, monkeypatch):
-    """Both writer and reader connections open with cached_statements=0.
-
-    Defensive hardening against prepared-statement cache defects in the
-    CPython/SQLite pair; it does not change SQL semantics.
-    """
-    seen = []
-    real_connect = hermes_state._connect_tracked_db
-
-    def spy(*args, **kwargs):
-        seen.append(kwargs)
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(hermes_state, "_connect_tracked_db", spy)
-
-    database = SessionDB(tmp_path / "state.db")
-    try:
-        database.create_session("s1", source="test")
-        if not database._wal_active:
-            pytest.skip("host SQLite did not enable WAL")
-        # Force a reader open on this thread.
-        assert database._get_read_conn() is not None
-    finally:
-        database.close()
-
-    assert seen, "no tracked connections were opened"
-    assert all(
-        kw.get("cached_statements") == 0 for kw in seen
-    ), f"connection opened with a statement cache: {seen}"
-
-
-def test_read_connections_are_cross_thread_closable(tmp_path):
-    """Readers open with check_same_thread=False so the owner can close them.
-
-    close() runs on the owning thread but must drain readers created by worker
-    threads; with the sqlite3 default those close() calls raise and were
-    silently suppressed, leaking descriptors.
-    """
-    database = SessionDB(tmp_path / "state.db")
-    database.create_session("s1", source="test")
-    if not database._wal_active:
-        database.close()
-        pytest.skip("host SQLite did not enable WAL")
-
-    worker_conn = {}
-    opened = threading.Event()
-
-    def worker():
-        database.get_handoff_state("s1")
-        worker_conn["conn"] = database._get_read_conn()
-        opened.set()
-
-    t = threading.Thread(target=worker)
-    t.start()
-    assert opened.wait(timeout=10)
-    t.join(timeout=10)
-
-    conn = worker_conn["conn"]
-    assert conn is not None
-    # Closing another thread's reader from this thread must not raise.
-    conn.execute("SELECT 1").fetchone()
-    database.close()
-
-    with pytest.raises(sqlite3.ProgrammingError):
-        conn.execute("SELECT 1")
-    assert database._read_conns == set()

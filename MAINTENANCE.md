@@ -26,7 +26,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | --- | --- | --- | --- |
 | HERMES-001 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Serialize malformed `state.db` repair and invalidate stale schemas. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Make raw SQLite backup and quarantine connection-safe. |
-| HERMES-003 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Raise the file-descriptor soft limit safely. |
+| HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
 | HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics` | Enforce a per-chat Telegram send cooldown. |
 | HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Share the progress-edit throttle per chat. |
 | HERMES-006 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Resolve memory notifications per platform. |
@@ -40,9 +40,9 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
-| HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): configure session title casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
+| HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): support configurable casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
 | HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
-| HERMES-019 | Active | `fix(slack): ignore hidden thread-parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
+| HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -64,13 +64,13 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `pytest -q tests/test_raw_copy_offline_guard.py`.
 - **Rollback:** Remove the `_copy_all`/`offline_file_access` guarded backup path in `hermes_state.py` and `_backup_corrupt_db_locked` guarded quarantine path in `hermes_cli/kanban_db.py`, then remove `tests/test_raw_copy_offline_guard.py`. Preserve HERMES-001 and all unrelated database-repair behavior. Verify the upstream replacement with the same live-connection race cases before deleting the private test.
 
-### HERMES-003 — Raise the file-descriptor soft limit safely
+### HERMES-003 — Retired fixed file-descriptor soft-limit floor
 
-- **Summary:** Best-effort raises `RLIMIT_NOFILE` to 8192 before CLI dispatch, never lowering an existing limit or exceeding a finite hard limit. It protects launchd-started gateways from the default 256-descriptor ceiling.
-- **Surfaces:** `hermes_cli/main.py`; `tests/test_fd_soft_limit.py`.
-- **Upstream tracking:** Related upstream issues were recorded as `#36899` and `#75269`.
-- **Regression:** `pytest -q tests/test_fd_soft_limit.py` plus a fresh-process supervisor acceptance check of the gateway's effective soft limit.
-- **Rollback:** Remove `_RLIMIT_NOFILE_TARGET`, `_raise_fd_soft_limit`, and the call at the start of `main()`, then remove `tests/test_fd_soft_limit.py`. Before promotion, prove upstream or supervisor configuration produces an adequate effective limit after a generated service reinstall; do not retire this merely because reader leaks improved.
+- **Summary:** The private pre-dispatch helper that best-effort raised `RLIMIT_NOFILE` to a fixed 8192 has been removed. Upstream now owns the complete contract through profile-aware `runtime.nofile_soft_limit`, a shared `apply_nofile_soft_limit()` helper for gateway and dashboard/serve entrypoints, and matching generated-service limits. The upstream implementation preserves the private safety properties: POSIX-only, best-effort, never lowers an existing limit, and clamps to a finite hard limit.
+- **Surfaces:** Historical private surfaces were `hermes_cli/main.py` and `tests/test_fd_soft_limit.py`. The active replacement is upstream `hermes_cli/resource_limits.py`, its gateway/dashboard call sites, configuration, service generators, and upstream tests.
+- **Upstream tracking:** Replaced by released upstream commits `87aedbe7b`, `0472c31aa`, `373631bea`, and `acb7547da` (including the configurable process and service-manager limit contract). Related historical issues were `#36899` and `#75269`.
+- **Regression:** Upstream resource-limit tests plus the repository's canonical suite. Runtime supervisor acceptance remains part of a separately authorized deployment, not fork synchronization.
+- **Rollback:** Do not restore the private helper or test. If the upstream replacement regresses, fix or backport the upstream `runtime.nofile_soft_limit` path as one coherent contract; do not layer a second pre-dispatch limit implementation over it.
 
 ### HERMES-004 — Enforce a per-chat Telegram send cooldown
 
@@ -130,11 +130,11 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-011 — Serialize SessionDB reads, bound readers, and share one gateway database
 
-- **Summary:** Routes public reads through `_read_ctx`, caps per-thread WAL readers, reclaims dead-thread readers, allows cross-thread close, disables SQLite statement caching defensively, makes `GatewayRunner` reuse `SessionStore`'s database, and emits sanitized persistence diagnostics without unsafe retries.
+- **Summary:** Routes the remaining unsafe public reads through `_read_ctx`, makes `GatewayRunner` reuse `SessionStore`'s database, and emits sanitized persistence diagnostics without unsafe retries. Upstream now owns the pooled-reader lifecycle and hard peak-connection permit; the private per-thread reader budget/reclamation implementation was removed during reconciliation rather than retained beside it.
 - **Surfaces:** `hermes_state.py`; `gateway/run.py`; `run_agent.py`; `tests/test_sessiondb_cross_thread_safety.py`; `tests/gateway/test_runner_session_db_fd_budget.py`; persistence diagnostics in `tests/run_agent/test_run_agent.py`.
-- **Upstream tracking:** Combines the relevant contracts from upstream PRs `#73803` and `#78287`; deliberately excludes the fallback spool from `#78552`.
+- **Upstream tracking:** The remaining private behavior combines the public-read, single-owner, and diagnostics contracts from upstream PRs `#73803` and `#78287`; deliberately excludes the fallback spool from `#78552`. Released upstream commits `87aedbe7b` and `0472c31aa` now provide the pooled reader lifecycle and hard peak budget.
 - **Regression:** `pytest -q tests/test_sessiondb_cross_thread_safety.py tests/gateway/test_runner_session_db_fd_budget.py tests/run_agent/test_run_agent.py -k 'persistence or sqlite or session_db or reader or writer'`.
-- **Rollback:** Revert the stable-subject commit in a follow-up change, resolving against current upstream rather than rewriting history. Preserve any later unrelated edits in the three shared source files. Before promotion, verify upstream covers all public-read serialization, the hard reader budget and reclamation, cross-thread drain, single gateway DB ownership, disabled/otherwise-safe statement caching, sanitized diagnostics, and no duplicate-prone retry.
+- **Rollback:** Remove only the remaining private public-read routing, shared gateway database ownership, and sanitized diagnostics in a follow-up change while preserving upstream's pooled-reader implementation and later unrelated edits. Before retirement, verify upstream covers all public-read serialization, single gateway DB ownership, sanitized diagnostics, and no duplicate-prone retry; upstream already owns the hard peak reader budget and cross-thread pooled drain.
 
 ### HERMES-012 — Retired GitHub Actions fork synchronization pipeline
 
