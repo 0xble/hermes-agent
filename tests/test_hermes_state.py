@@ -1758,6 +1758,21 @@ class TestSchemaInit:
         ] == ["emoji-3", "emoji-2", "emoji-1"]
         reopened.close()
 
+    def test_telegram_topic_icon_history_defaults_to_twenty_four_choices(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        for index in range(28):
+            db.record_telegram_topic_icon_selection(
+                chat_id="208214988",
+                custom_emoji_id=f"id-{index}",
+                emoji=f"emoji-{index}",
+            )
+
+        assert [
+            row["emoji"]
+            for row in db.list_recent_telegram_topic_icons(chat_id="208214988")
+        ] == [f"emoji-{index}" for index in range(27, 3, -1)]
+        db.close()
+
 
 
 

@@ -1218,15 +1218,12 @@ async def test_auto_topic_icon_lock_cache_recovers_after_concurrent_pressure():
 
 
 @pytest.mark.asyncio
-async def test_auto_topic_icon_history_keeps_only_twelve_recent_unique_choices():
+async def test_auto_topic_icon_history_keeps_only_twenty_four_recent_unique_choices():
     runner = _make_runner()
     adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
     runner.config.platforms[Platform.TELEGRAM].extra["auto_topic_icons"] = True
     adapter.dm_topic_custom_icon_state.return_value = False
-    emojis = [
-        "📰", "💡", "⚡️", "🎙", "🔝", "🗣", "🆒",
-        "❗️", "📝", "📆", "📁", "🔎", "📣", "🔥",
-    ]
+    emojis = [f"emoji-{index}" for index in range(28)]
     adapter.get_forum_topic_icon_options.return_value = [
         {"emoji": emoji, "custom_emoji_id": f"icon-{index}"}
         for index, emoji in enumerate(emojis)
@@ -1246,9 +1243,9 @@ async def test_auto_topic_icon_history_keeps_only_twelve_recent_unique_choices()
             )
             assert selected_id == f"icon-{index}"
 
-    assert runner._telegram_topic_icon_history["208214988"] == emojis[-12:]
+    assert runner._telegram_topic_icon_history["208214988"] == emojis[-24:]
     assert choose.call_args_list[-1].kwargs["recent_emojis"] == list(
-        reversed(emojis[1:13])
+        reversed(emojis[3:27])
     )
 
 
