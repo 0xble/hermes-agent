@@ -6024,6 +6024,48 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        def _clarify_context_cb(text: str, *, already_streamed: bool = False) -> None:
+            """Deliver a clarify decision brief even when generic interims are off."""
+            if (
+                already_streamed
+                or not ctx._run_still_current()
+                or not ctx._status_adapter
+                or not str(text or "").strip()
+            ):
+                return
+            fut = safe_schedule_threadsafe(
+                ctx._status_adapter.send(
+                    ctx._status_chat_id,
+                    text,
+                    metadata=ctx._status_thread_metadata,
+                ),
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="clarify context delivery scheduling error",
+            )
+            if fut is None:
+                return
+            try:
+                # The prompt is sent from a separate blocking callback. Wait
+                # here so the normal explanatory message is visible first.
+                result = fut.result(timeout=15)
+                if not getattr(result, "success", False):
+                    logger.warning(
+                        "Clarify context delivery failed before prompt: %s",
+                        getattr(result, "error", "unknown adapter failure"),
+                    )
+            except TimeoutError:
+                fut.cancel()
+                logger.warning(
+                    "Clarify context delivery timed out before prompt",
+                    exc_info=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Clarify context delivery failed before prompt",
+                    exc_info=True,
+                )
+
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
         # Per-platform skip_context_files — messaging platforms can opt out
@@ -6345,6 +6387,9 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+        agent.clarify_context_callback = (
+            None if _want_interim_messages else _clarify_context_cb
+        )
         agent.status_callback = ctx._status_callback_sync
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
