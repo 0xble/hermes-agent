@@ -3591,14 +3591,18 @@ class SessionStore:
         return len(removed_keys)
 
     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark recently-active sessions as resumable after an unexpected exit.
+        """Mark recently-active unfinished sessions after an unexpected exit.
 
         Called on gateway startup after a crash or fast restart to preserve
         in-flight sessions instead of destroying their conversation history
         (#7536).  Only marks sessions updated within *max_age_seconds* to
-        avoid touching long-idle sessions.  Sets ``resume_pending=True`` so
-        the next incoming message on the same session_key auto-resumes from
-        the existing transcript.
+        avoid touching long-idle sessions.  When a durable transcript is
+        available, an ``assistant/stop`` tail proves the last turn completed
+        before the crash, so the legacy recency fallback skips that entry.
+        Entries with no transcript remain eligible because older Hermes
+        versions and first-turn crashes may refresh routing metadata before
+        persisting a message.  Eligible entries are resumed during startup or
+        when the next message arrives.
 
         Entries already flagged ``resume_pending=True`` are skipped.  Entries
         explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
@@ -3611,6 +3615,50 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(seconds=max_age_seconds)
+        # Snapshot candidates under the routing lock, then perform SessionDB
+        # reads outside it.  Compression can leave an entry keyed to a completed
+        # parent while the interrupted turn lives in its child, so resolve the
+        # durable tip before inspecting the transcript tail.
+        with self._lock:
+            self._ensure_loaded_locked()
+            candidates = [
+                (entry.session_key, entry.session_id)
+                for entry in self._entries.values()
+                if not entry.resume_pending
+                and not entry.suspended
+                and entry.updated_at >= cutoff
+            ]
+
+        completed_candidates: set[tuple[str, str]] = set()
+        if self._db is not None:
+            for session_key, session_id in candidates:
+                transcript_session_id = (
+                    self._compression_tip_for_session_id(session_id) or session_id
+                )
+                try:
+                    latest = self._db.get_messages(
+                        transcript_session_id,
+                        limit=1,
+                        latest=True,
+                    )
+                except Exception as exc:
+                    # Recovery must fail safe. A transcript read error is not
+                    # proof that the interrupted work finished.
+                    logger.warning(
+                        "Legacy recovery transcript check failed for %s; "
+                        "keeping session eligible: %s",
+                        transcript_session_id,
+                        exc,
+                    )
+                    continue
+                if (
+                    latest
+                    and latest[-1].get("role") == "assistant"
+                    and latest[-1].get("finish_reason") == "stop"
+                    and not latest[-1].get("tool_calls")
+                ):
+                    completed_candidates.add((session_key, session_id))
+
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
@@ -3618,6 +3666,8 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
+                    if (entry.session_key, entry.session_id) in completed_candidates:
+                        continue
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()

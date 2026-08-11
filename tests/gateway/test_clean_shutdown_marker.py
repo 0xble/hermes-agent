@@ -51,6 +51,128 @@ class TestSuspendRecentlyActive:
         assert refreshed.resume_pending
         assert refreshed.session_id == entry.session_id  # same session preserved
 
+    def test_skips_recent_session_with_terminal_assistant_transcript(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="completed")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.append_message(
+            entry.session_id,
+            role="assistant",
+            content="Completed before the crash.",
+            finish_reason="stop",
+        )
+
+        assert store.suspend_recently_active() == 0
+        assert not store._entries[entry.session_key].resume_pending
+
+    def test_keeps_recent_session_when_latest_transcript_row_is_user(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="mid-model-turn")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.append_message(entry.session_id, role="user", content="Continue work")
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_keeps_recent_session_when_latest_transcript_row_is_tool(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="mid-tool-loop")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.append_message(
+            entry.session_id,
+            role="tool",
+            content="tool result",
+            tool_call_id="call-1",
+            tool_name="example",
+        )
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_keeps_assistant_stop_with_pending_tool_calls(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="pending-tool-call")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.append_message(
+            entry.session_id,
+            role="assistant",
+            content="",
+            finish_reason="stop",
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "example", "arguments": "{}"},
+                }
+            ],
+        )
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_keeps_nonterminal_assistant_transcript(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="verification-pending")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.append_message(
+            entry.session_id,
+            role="assistant",
+            content="Candidate pending verification.",
+            finish_reason="verification_required",
+        )
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_transcript_read_failure_fails_safe(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="read-failure")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        store._db.get_messages = MagicMock(side_effect=OSError("database unavailable"))
+
+        assert store.suspend_recently_active() == 1
+        store._db.get_messages.assert_called_once()
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_json_only_fallback_remains_eligible(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="json-only")
+        entry = store.get_or_create_session(source)
+        store._db = None
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
+    def test_checks_compression_tip_before_suppressing_recovery(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="compressed-mid-turn")
+        entry = store.get_or_create_session(source)
+        assert store._db is not None
+        parent_id = entry.session_id
+        child_id = f"{parent_id}_child"
+        store._db.append_message(
+            parent_id,
+            role="assistant",
+            content="Previous turn completed.",
+            finish_reason="stop",
+        )
+        store._db.publish_compression_child(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            source="telegram",
+            messages=[{"role": "user", "content": "Interrupted turn"}],
+            require_compression_lease=False,
+        )
+
+        assert store.suspend_recently_active() == 1
+        assert store._entries[entry.session_key].resume_pending
+
 
 # ---------------------------------------------------------------------------
 # Clean shutdown marker integration
