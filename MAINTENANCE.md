@@ -33,7 +33,7 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
 | HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): configure session title casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
-| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames` | Select live Telegram topic icons without repeating recent choices or overwriting manual icons. |
+| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
 | HERMES-019 | Active | `fix(slack): ignore hidden thread-parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
@@ -178,7 +178,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-018 — Select diverse semantic Telegram topic icons
 
-- **Summary:** Opt-in semantic native Telegram topic icons resolve against the live allowed sticker set, honor exact emoji overrides, preserve observed manual choices, validate bindings immediately before mutation, and avoid recently selected icons with durable per-chat least-recently-used history. Icon failure never blocks session-title persistence or topic renaming.
+- **Summary:** Opt-in semantic native Telegram topic icons resolve against the live allowed sticker set, honor exact emoji overrides, preserve observed manual choices, validate bindings immediately before mutation, and avoid the 24 most recently selected icons with durable per-chat least-recently-used history. Icon failure never blocks session-title persistence or topic renaming.
 - **Surfaces:** `agent/title_generator.py`; `gateway/run.py`; `hermes_state.py`; `plugins/platforms/telegram/adapter.py`; `website/docs/user-guide/messaging/telegram.md`; focused state, selector, adapter, and gateway tests.
 - **Upstream tracking:** Cherry-picks the icon commit from open PR `#66353`, then replaces process-local-only ownership/diversity with durable `state.db` state and deterministic least-recent reuse. PR `#35737` hardcodes one account's icon IDs and couples Telegram metadata to the generic title callback. Retire only after released upstream uses a live allowlist, preserves manual ownership across restarts, rechecks topic/session authority, and degrades without losing titles.
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary before activation.

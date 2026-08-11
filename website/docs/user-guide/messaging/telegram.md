@@ -840,7 +840,7 @@ gateway:
           ProjectAtlas: "🔭"
 ```
 
-Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 12 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
+Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 24 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
 
 `topic_icon_overrides` is optional and uses ordinary emoji characters as portable selectors rather than hard-coded Telegram IDs. An exact override always wins, which is useful when a recurring project should keep a recognizable signature icon.
 
