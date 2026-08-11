@@ -185,6 +185,22 @@ class TestClarifySchema:
         # schema no longer advertises it.
         assert "question" not in params["properties"]
 
+    def test_schema_requires_explanation_before_contextual_prompt(self):
+        description = CLARIFY_SCHEMA["description"]
+
+        assert "EXPLAIN FIRST" in description
+        assert "normal assistant prose" in description
+        assert "same turn" in description
+        assert "answer it normally before calling `clarify` again" in description
+
+    def test_question_field_keeps_context_in_preceding_assistant_message(self):
+        question_description = CLARIFY_SCHEMA["parameters"]["properties"][
+            "questions"
+        ]["items"]["properties"]["question"]["description"]
+
+        assert "Decision context and explanation" in question_description
+        assert "normal assistant prose" in question_description
+
 
 class TestClarifyToolMultiSelect:
     """Tests for multi_select (checkbox) support added to clarify_tool."""

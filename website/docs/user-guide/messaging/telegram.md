@@ -1330,12 +1330,16 @@ Reply "yes"/"y" to approve or "no"/"n" to deny.
 
 When the agent calls the `clarify` tool — to ask which approach you prefer, get post-task feedback, or check before a non-trivial decision — Telegram renders the question with **inline keyboard buttons**:
 
+> The dashboard choices depend on deployment constraints. Next.js matches the
+> existing stack and is the recommended default; Remix has simpler nested data
+> loading, while Astro is best only if most pages are static.
+>
 > ❓ Which framework should I use for the dashboard?
 >
 > [1. Next.js] [2. Remix] [3. Astro]
 > [✏️ Other (type answer)]
 
-Tap a button to answer, or tap **Other** to type a free-form response (the next message you send becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
+For decisions that depend on context, Hermes sends the explanation and recommendation as a normal message first, then presents the concise interactive prompt. Tap a button to answer, or tap **Other** to type a free-form response (the next message you send becomes the answer). Open-ended `clarify` calls (no preset choices) skip the buttons and just capture your next message.
 
 Configure the response timeout via `agent.clarify_timeout` in `~/.hermes/config.yaml` (default `600` seconds). If you don't respond within the timeout, the agent unblocks with a sentinel message and adapts rather than hanging.
 

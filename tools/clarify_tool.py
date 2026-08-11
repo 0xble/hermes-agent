@@ -457,6 +457,14 @@ CLARIFY_SCHEMA = {
         "timed_out=true if the user stopped part-way). Prefer deciding "
         "low-stakes questions yourself; don't use this for dangerous-command "
         "confirmation (the terminal tool handles that)."
+        " EXPLAIN FIRST: when the decision depends on context, findings, "
+        "terminology, trade-offs, or a recommendation the user has not "
+        "already seen, send that explanation as normal assistant prose, "
+        "then call `clarify` in the same turn with only the concise "
+        "decision question and self-contained choices; do not compress "
+        "it into the question or choice labels. If a typed response asks "
+        "a question or corrects the premise, answer it normally before "
+        "calling `clarify` again."
     ),
     "parameters": {
         "type": "object",
@@ -474,7 +482,16 @@ CLARIFY_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "question": {"type": "string"},
+                        "question": {
+                            "type": "string",
+                            "description": (
+                                "The question itself, and ONLY the "
+                                "question. Decision context and "
+                                "explanation belong in normal assistant "
+                                "prose sent before this tool call, not "
+                                "in this field."
+                            ),
+                        },
                         "choices": {
                             "type": "array",
                             "items": {"type": "string"},
