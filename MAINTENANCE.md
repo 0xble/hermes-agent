@@ -12,6 +12,14 @@ Record the removal commit's stable subject on the `Retired` row so fork-only cod
 
 Stable commit subjects survive rebases and are the manifest keys. Resolve the current SHA from the fetched fork history instead of persisting a value that the next upstream rebase will invalidate.
 
+## Plugin overlap and retirement
+
+Every upstream reconciliation must inventory the plugins currently installed or enabled across the maintained Hermes profiles and compare the problem each plugin solves with newly released upstream behavior. Use the live profile-aware Hermes plugin/configuration surfaces and the canonical source owner for each plugin; do not rely on a stale list copied into this file. Inspect released behavior and tests, not issue titles, open pull requests, or feature names.
+
+When released upstream provides a native solution that significantly overlaps with a plugin and satisfies the plugin's actual problem contract, prefer the native solution and **completely retire the plugin**. Do not keep both implementations, leave the plugin disabled, preserve a compatibility shim, retain plugin-owned hooks or schedules, or keep duplicate tests “just in case.” Verify the native replacement against the plugin's real regressions in an isolated candidate, then during the separately authorized runtime promotion disable and uninstall the plugin from every affected profile, delete any Brian-owned canonical plugin source that is no longer used, remove plugin-owned configuration, skills, dependencies, schedules, and generated copies, and prove only the native path remains active. Git history is the rollback record.
+
+If upstream covers only part of the plugin contract, keep the plugin only for the remaining gap, narrow it where practical, and document the residual behavior. Fork synchronization does not itself mutate an active runtime: when retirement requires profile, canonical-source, or runtime changes outside this repository, report the exact retirement work and treat native replacement as incomplete until the separate promotion removes the plugin and verifies the live result.
+
 ## Maintained patch index
 
 | ID | Status | Stable commit subject | Purpose |
@@ -204,9 +212,9 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ## Automatic synchronization
 
-The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, rebases the maintained stack, compares conflicts against patch contracts, runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
+The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, inventories the currently installed and enabled plugins from the live maintained profiles, rebases the maintained stack, compares conflicts against patch contracts, and checks newly released upstream behavior for native replacements of both fork patches and plugin-owned problem contracts. It runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
 
-The cron never pushes to Nous Research, never deploys or restarts a runtime, and never guesses through an ambiguous conflict. Failures must abort the isolated rebase, leave fork `main` unchanged, and deliver the exact blocker in the cron result.
+The cron never pushes to Nous Research, never deploys, uninstalls plugins, edits plugin canonical-source repositories, or restarts a runtime, and never guesses through an ambiguous conflict. If a native replacement qualifies, its result must identify every affected profile and canonical owner plus the separate promotion and complete-uninstall work required by “Plugin overlap and retirement.” Failures must abort the isolated rebase, leave fork `main` unchanged, and deliver the exact blocker in the cron result.
 
 ## Invariants
 
@@ -216,6 +224,7 @@ The cron never pushes to Nous Research, never deploys or restarts a runtime, and
 - Runtime promotion remains separate, with its own backup, canary, and rollback proof.
 - A runtime rollback never rewrites the fork or changes another runtime.
 - Patch retirement is behavioral: a clean Git apply/revert or matching commit message is not proof of upstream equivalence.
+- Plugin retirement is also behavioral: a native replacement is not complete until its contract passes and the overlapping plugin, canonical source, configuration, dependencies, schedules, skills, and generated copies are removed from every affected profile during promotion.
 - This manifest must describe every active Brian-owned patch; stale, missing, or non-actionable records block publication.
 
 ## Manual recovery
