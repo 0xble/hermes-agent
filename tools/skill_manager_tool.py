@@ -485,6 +485,53 @@ def _background_review_read_before_write_guard(
     }
 
 
+def _background_review_create_allowed() -> bool:
+    """Return whether autonomous review forks may create new skills.
+
+    Updates to existing curator-managed skills remain independent of this
+    setting.  The default preserves historical behavior for installations
+    that have not opted into the narrower policy.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        value = cfg_get(
+            load_config_readonly(),
+            "skills",
+            "background_review_allow_create",
+            default=True,
+        )
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off"}
+        return bool(value)
+    except Exception:
+        # Configuration failures must not silently broaden a safety policy.
+        return False
+
+
+def _background_review_create_guard(action: str, name: str) -> Optional[Dict[str, Any]]:
+    """Refuse only new-skill creation by autonomous review forks when disabled."""
+    if action != "create":
+        return None
+    try:
+        from tools.skill_provenance import is_background_review
+        if not is_background_review():
+            return None
+    except Exception:
+        return None
+    if _background_review_create_allowed():
+        return None
+    return {
+        "success": False,
+        "error": (
+            "Refusing background curator create for skill "
+            f"'{name}': new skill creation is disabled by "
+            "skills.background_review_allow_create. Existing skill updates "
+            "remain allowed."
+        ),
+    }
+
+
 def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, Any]]:
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
@@ -1655,6 +1702,9 @@ def _skill_manage_batch(
                 "skill's other ops.",
                 success=False,
             )
+        create_guard = _background_review_create_guard(act, nm)
+        if create_guard is not None:
+            return json.dumps(create_guard, ensure_ascii=False)
         preflight = _background_review_preflight(act, nm)
         if preflight is not None:
             return json.dumps(preflight, ensure_ascii=False)
@@ -1926,6 +1976,11 @@ def skill_manage(
             operations, default_name=name or None,
             task_id=task_id, session_id=session_id,
         )
+
+    create_guard = _background_review_create_guard(action, name)
+    if create_guard is not None:
+        return json.dumps(create_guard, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

@@ -1021,6 +1021,11 @@ skills:
   # Set to 0 to disable.
   creation_nudge_interval: 15
 
+  # Background self-improvement may update existing curator-managed skills.
+  # Set false to prevent that autonomous reviewer from creating new skills;
+  # foreground skill_manage(create) remains unaffected.
+  background_review_allow_create: true
+
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})
   # and resolved to an absolute path.  External dirs are read-only: skill

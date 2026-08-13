@@ -43,10 +43,19 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): support configurable casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
 | HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
 | HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
+| HERMES-020 | Active | `fix(skills): limit background review creation` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-020 — Limit background review skill creation
+
+- **Summary:** Adds `skills.background_review_allow_create`, enforced at the `skill_manage` runtime boundary for the `background_review` origin only. `false` blocks `create` while preserving foreground creation and background updates to existing skills.
+- **Surfaces:** `tools/skill_manager_tool.py`; `cli-config.yaml.example`; `tests/tools/test_skill_manager_tool.py`.
+- **Upstream tracking:** Local fork behavior; no released upstream setting currently provides this selective policy.
+- **Regression:** `pytest -q tests/tools/test_skill_manager_tool.py`.
+- **Rollback:** Remove the create guard, its focused test, the example setting, and this manifest entry in one follow-up commit. Preserve the existing background ownership and read-before-write guards.
 
 ### HERMES-001 — Serialize malformed `state.db` repair and invalidate stale schemas
 
