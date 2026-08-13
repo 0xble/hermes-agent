@@ -511,6 +511,92 @@ class TestSkillManageDispatcher:
         bump_patch.assert_not_called()
 
 
+    def test_background_review_create_can_be_disabled_without_blocking_updates(self, tmp_path):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="existing", content=VALID_SKILL_CONTENT)
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with _skill_dir(tmp_path), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"skills": {"background_review_allow_create": False}},
+            ), patch(
+                "tools.skill_manager_tool._background_review_write_guard",
+                return_value=None,
+            ), patch(
+                "tools.skill_manager_tool._background_review_read_before_write_guard",
+                return_value=None,
+            ):
+                blocked = json.loads(skill_manage(
+                    action="create",
+                    name="new-skill",
+                    content=VALID_SKILL_CONTENT,
+                ))
+                updated = json.loads(skill_manage(
+                    action="patch",
+                    name="existing",
+                    old_string="Step 1: Do the thing.",
+                    new_string="Step 1: Do the thing safely.",
+                ))
+        finally:
+            reset_current_write_origin(token)
+
+        assert blocked["success"] is False
+        assert "background_review_allow_create" in blocked["error"]
+        assert updated["success"] is True
+        assert not (tmp_path / "new-skill").exists()
+        assert "safely" in (tmp_path / "existing" / "SKILL.md").read_text()
+
+    @pytest.mark.parametrize("value", [True, "true", "1", "yes", "on"])
+    def test_background_review_create_allowed_for_truthy_config(self, value):
+        from tools.skill_manager_tool import _background_review_create_allowed
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"background_review_allow_create": value}},
+        ):
+            assert _background_review_create_allowed() is True
+
+    def test_background_review_create_allowed_when_config_absent(self):
+        from tools.skill_manager_tool import _background_review_create_allowed
+
+        with patch("hermes_cli.config.load_config_readonly", return_value={}):
+            assert _background_review_create_allowed() is True
+
+    @pytest.mark.parametrize("value", [False, "false", "0", "no", "off"])
+    def test_background_review_create_blocked_for_false_config(self, value):
+        from tools.skill_manager_tool import _background_review_create_allowed
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"background_review_allow_create": value}},
+        ):
+            assert _background_review_create_allowed() is False
+
+    def test_background_review_create_config_failure_fails_closed(self):
+        from tools.skill_manager_tool import _background_review_create_allowed
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=RuntimeError("unreadable config"),
+        ):
+            assert _background_review_create_allowed() is False
+
+    def test_foreground_create_ignores_background_create_policy(self, tmp_path):
+        with _skill_dir(tmp_path), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"background_review_allow_create": False}},
+        ):
+            result = json.loads(skill_manage(
+                action="create", name="foreground-skill", content=VALID_SKILL_CONTENT
+            ))
+        assert result["success"] is True
+
     def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path):
         from tools.skill_provenance import (
             BACKGROUND_REVIEW,
