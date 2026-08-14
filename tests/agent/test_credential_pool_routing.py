@@ -15,6 +15,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # 1. CLI _resolve_turn_agent_config includes credential_pool
@@ -370,7 +372,8 @@ class TestFailureAttribution:
     failing key's error/reset time onto it until the whole pool went offline.
     """
 
-    def _make_pool(self, tmp_path, monkeypatch, entries):
+    def _make_pool(self, tmp_path, monkeypatch, entries, provider="anthropic"):
+        
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -390,12 +393,12 @@ class TestFailureAttribution:
             lambda provider: False,
         )
         (hermes_home / "auth.json").write_text(
-            json.dumps({"version": 1, "credential_pool": {"anthropic": entries}}),
+            json.dumps({"version": 1, "credential_pool": {provider: entries}}),
             encoding="utf-8",
         )
         from agent.credential_pool import load_pool
 
-        pool = load_pool("anthropic")
+        pool = load_pool(provider)
         assert [entry.id for entry in pool.entries()] == [
             entry["id"] for entry in entries
         ], "pool fixture leaked host credentials into the test pool"
@@ -413,9 +416,9 @@ class TestFailureAttribution:
         entry.update(overrides)
         return entry
 
-    def _agent(self, pool, failing_key, credential_id=None):
+    def _agent(self, pool, failing_key, credential_id=None, provider="anthropic"):
         return SimpleNamespace(
-            provider="anthropic",
+            provider=provider,
             api_key=failing_key,
             _credential_pool=pool,
             _credential_pool_entry_id=credential_id,
@@ -499,8 +502,13 @@ class TestFailureAttribution:
         pool = self._make_pool(
             tmp_path, monkeypatch,
             [self._entry(0, "pool-runtime-key")],
+            provider="test-isolated-provider",
         )
-        agent = self._agent(pool, failing_key="wrapper-runtime-key")
+        agent = self._agent(
+            pool,
+            failing_key="wrapper-runtime-key",
+            provider="test-isolated-provider",
+        )
         agent._is_entitlement_failure = MagicMock(return_value=False)
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
@@ -562,4 +570,165 @@ class TestFailureAttribution:
 
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
+
+    @pytest.mark.parametrize(
+        "reason_name",
+        ["overloaded", "server_error", "timeout"],
+    )
+    def test_transient_provider_failure_tries_one_alternate_without_exhausting(
+        self, tmp_path, monkeypatch, reason_name
+    ):
+        """Transient upstream failures should try one alternate account before
+        provider fallback without marking either credential exhausted."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a")
+        agent.provider = "openai-codex"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered, has_retried = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=getattr(FailoverReason, reason_name),
+        )
+
+        assert recovered is True
+        assert has_retried is False
+        assert agent._swap_credential.call_args[0][0].id == "cred-1"
+        assert all(status != "exhausted" for status in self._statuses(pool).values())
+
+    def test_provider_overload_uses_each_alternate_once(self, tmp_path, monkeypatch):
+        """The same overloaded turn must not cycle through more than one
+        same-provider account before the caller escalates to fallback."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [
+                self._entry(0, "key-a"),
+                self._entry(1, "key-b"),
+                self._entry(2, "key-c"),
+            ],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a")
+        agent.provider = "openai-codex"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        first, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.overloaded,
+        )
+        second, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            alternate_credential_attempted=True,
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert first is True
+        assert second is False
+        assert agent._swap_credential.call_count == 1
+
+    def test_transient_alternate_does_not_consume_first_429_retry(
+        self, tmp_path, monkeypatch
+    ):
+        """The alternate-account budget and same-account 429 retry budget are
+        independent when failure classes change within one API-call attempt."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a")
+        agent.provider = "openai-codex"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        alternate_recovered, has_retried_429 = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            alternate_credential_attempted=False,
+            classified_reason=FailoverReason.timeout,
+        )
+        rate_limit_recovered, has_retried_429 = recover_with_credential_pool(
+            agent,
+            status_code=429,
+            has_retried_429=has_retried_429,
+            alternate_credential_attempted=True,
+            classified_reason=FailoverReason.rate_limit,
+        )
+
+        assert alternate_recovered is True
+        assert rate_limit_recovered is False
+        assert has_retried_429 is True
+        assert agent._swap_credential.call_count == 1
+
+    def test_single_credential_overload_falls_through(self, tmp_path, monkeypatch):
+        """A one-account pool cannot recover overload by account rotation."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a")
+        agent.provider = "openai-codex"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered, has_retried = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is False
+        assert has_retried is False
+        agent._swap_credential.assert_not_called()
+
+    def test_upstream_aggregator_rate_limit_still_bypasses_account_rotation(
+        self, tmp_path, monkeypatch
+    ):
+        """Aggregator-upstream 429s must continue to bypass same-provider
+        account rotation because the credential is healthy."""
+        from agent.error_classifier import FailoverReason
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a")
+        agent.provider = "openai-codex"
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        recovered, has_retried = recover_with_credential_pool(
+            agent,
+            status_code=429,
+            has_retried_429=False,
+            classified_reason=FailoverReason.upstream_rate_limit,
+            error_context={"upstream_provider": "DeepSeek"},
+        )
+
+        assert recovered is False
+        assert has_retried is False
+        agent._swap_credential.assert_not_called()
 
