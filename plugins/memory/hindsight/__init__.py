@@ -42,6 +42,7 @@ import threading
 import time
 
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -52,6 +53,10 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from plugins.memory.hindsight.source_retention import (
+    SourceCandidate,
+    discover_source_candidates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -838,6 +843,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._pending_retain_ops: set[str] = set()
         self._pending_retain_ops_lock = threading.Lock()
         self._retain_ops_bank_id = ""
+        # Source retains use stable (document_id, content_hash) keys so the
+        # same file/page/transcript is never submitted twice by one provider
+        # lifecycle. Operation IDs are mapped back to candidates for readback
+        # verification once Hindsight reports completion.
+        self._source_retain_keys: set[tuple[str, str]] = set()
+        self._source_retain_keys_lock = threading.Lock()
+        self._source_ledger: dict[tuple[str, str], dict[str, Any]] = {}
+        self._source_retain_ops: dict[str, SourceCandidate] = {}
+        self._source_retain_verified: set[tuple[str, str]] = set()
         # Seconds between get_operation_status polls while waiting for server-
         # side retain completion. Each poll is a server round trip, so this is
         # deliberately coarser than the 0.05s local queue-drain poll: ~20 calls
@@ -1340,8 +1354,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._sync_thread = thread
         thread.start()
 
-    def _track_retain_ops(self, retain_response, bank_id: str) -> None:
-        """Record server-side async operation id(s) from an aretain_batch reply.
+    def _track_retain_ops(
+        self,
+        retain_response,
+        bank_id: str,
+        *,
+        source_candidates: list[SourceCandidate] | None = None,
+    ) -> None:
+        """Record server-side async operation IDs and source verification targets.
 
         Async retains return ``operation_id`` / ``operation_ids`` that stay
         ``pending`` on the server until the write is durable and recall-visible.
@@ -1356,13 +1376,70 @@ class HindsightMemoryProvider(MemoryProvider):
         if multiple:
             ids.extend(str(op) for op in multiple if op)
         if not ids:
-            # Server didn't hand back an op id (older API, or it completed
-            # synchronously). Nothing to poll — local queue drain is the only
-            # available signal in that case.
+            if source_candidates:
+                candidate = source_candidates[0]
+                self._source_ledger[candidate.automatic_key] = {
+                    "candidate": candidate,
+                    "status": "accepted",
+                    "operation_ids": [],
+                }
             return
         self._retain_ops_bank_id = bank_id
         with self._pending_retain_ops_lock:
             self._pending_retain_ops.update(ids)
+        if source_candidates:
+            candidate = source_candidates[0]
+            self._source_ledger[candidate.automatic_key] = {
+                "candidate": candidate,
+                "status": "accepted",
+                "operation_ids": ids,
+            }
+            # A batch response may not preserve one child operation ID per
+            # source. Mapping the caller-visible ID to the first candidate still
+            # gives us a document existence check; the content hash and stable
+            # document ID remain the deduplication authority.
+            for op_id in ids:
+                self._source_retain_ops[op_id] = candidate
+
+    def _verify_source_candidate(self, bank_id: str, candidate: SourceCandidate) -> bool:
+        """Confirm a source document exists after its async retain completes."""
+        try:
+            document = self._run_hindsight_operation(
+                lambda client: client.documents.get_document(
+                    bank_id=bank_id,
+                    document_id=candidate.source_id,
+                )
+            )
+        except Exception as exc:
+            logger.debug(
+                "Hindsight source readback failed for %s: %s",
+                candidate.source_id,
+                exc,
+            )
+            return False
+        document_id = str(getattr(document, "id", "") or "")
+        if document_id and document_id != candidate.source_id:
+            logger.warning(
+                "Hindsight source readback returned unexpected document %s for %s",
+                document_id,
+                candidate.source_id,
+            )
+            return False
+        metadata = getattr(document, "document_metadata", None) or {}
+        stored_hash = str(metadata.get("content_hash") or "") if isinstance(metadata, dict) else ""
+        if stored_hash and stored_hash != candidate.content_hash:
+            logger.warning(
+                "Hindsight source readback hash mismatch for %s",
+                candidate.source_id,
+            )
+            return False
+        self._source_retain_verified.add(candidate.automatic_key)
+        self._source_ledger[candidate.automatic_key] = {
+            "candidate": candidate,
+            "status": "completed",
+        }
+        logger.debug("Hindsight source readback verified: %s", candidate.source_id)
+        return True
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
         """Return True when a server-side async retain op is done (or gone).
@@ -1374,6 +1451,13 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         from hindsight_client_api.exceptions import NotFoundException
 
+        candidate = self._source_retain_ops.get(op_id)
+
+        def _verify_if_source() -> bool:
+            if candidate is None:
+                return True
+            return self._verify_source_candidate(bank_id, candidate)
+
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(
@@ -1381,12 +1465,25 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
             )
         except NotFoundException:
-            return True
+            verified = _verify_if_source()
+            if verified:
+                self._source_retain_ops.pop(op_id, None)
+            return verified
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         status = str(getattr(resp, "status", "") or "").lower()
-        return status in {"completed", "failed"}
+        if status == "completed":
+            verified = _verify_if_source()
+            if verified:
+                self._source_retain_ops.pop(op_id, None)
+            return verified
+        if status == "failed":
+            self._source_retain_ops.pop(op_id, None)
+            if candidate is not None:
+                self._source_candidate_failed(candidate)
+            return True
+        return False
 
     def _wait_for_retains_drained(self, timeout: float) -> bool:
         """Block up to *timeout* seconds for the just-completed turn's retain to
@@ -1549,9 +1646,17 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _run_hindsight_operation(self, operation):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
-        client = self._get_client()
+        async def _invoke():
+            # The Hindsight client owns an aiohttp transport. Instantiate it
+            # inside the shared event loop; constructing it on the caller
+            # thread and first using it here binds the transport to the wrong
+            # loop on current hindsight-client releases.
+            client = self._get_client()
+            self._client = client
+            return await operation(client)
+
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(_invoke())
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1560,9 +1665,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 exc,
             )
             self._client = None
-            client = self._get_client()
-            self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(_invoke())
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -2114,7 +2217,105 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["observation_scopes"] = self._observation_scopes
         return kwargs
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def _source_candidate_already_submitted(self, candidate: SourceCandidate) -> bool:
+        key = candidate.automatic_key
+        with self._source_retain_keys_lock:
+            entry = self._source_ledger.get(key)
+            if entry and entry["status"] in {"queued", "accepted", "completed"}:
+                return True
+            self._source_retain_keys.add(key)
+            self._source_ledger[key] = {"candidate": candidate, "status": "queued"}
+        return False
+
+    def _source_candidate_failed(self, candidate: SourceCandidate) -> None:
+        with self._source_retain_keys_lock:
+            self._source_retain_keys.discard(candidate.automatic_key)
+            self._source_ledger[candidate.automatic_key] = {
+                "candidate": candidate,
+                "status": "failed",
+            }
+
+    def _retain_source_candidate(self, candidate: SourceCandidate, bank_id: str) -> None:
+        """Submit one automatically discovered source and track its durability."""
+        if self._source_candidate_already_submitted(candidate):
+            logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
+            return
+        try:
+            if candidate.file_path:
+                file_metadata = {
+                    "context": candidate.context,
+                    "document_id": candidate.source_id,
+                    "tags": list(candidate.tags),
+                    "metadata": candidate.metadata,
+                }
+                file_bytes = Path(candidate.file_path).read_bytes()
+                response = self._run_hindsight_operation(
+                    lambda client: client._files_api.file_retain(
+                        bank_id=bank_id,
+                        files=[(os.path.basename(candidate.file_path), file_bytes)],
+                        request=json.dumps({"files_metadata": [file_metadata]}),
+                        _request_timeout=self._timeout,
+                    )
+                )
+            else:
+                item = self._build_retain_kwargs(
+                    candidate.content,
+                    context=candidate.context,
+                    document_id=candidate.source_id,
+                    metadata=candidate.metadata,
+                    tags=list(candidate.tags),
+                )
+                item.pop("bank_id", None)
+                item.pop("retain_async", None)
+                response = self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=bank_id,
+                        items=[item],
+                        document_id=candidate.source_id,
+                        retain_async=True,
+                    )
+                )
+            self._track_retain_ops(
+                response,
+                bank_id,
+                source_candidates=[candidate],
+            )
+            logger.info(
+                "Hindsight source retain accepted: type=%s, id=%s, shape=%s, hash=%s",
+                candidate.source_type,
+                candidate.source_id,
+                candidate.source_shape,
+                candidate.content_hash[:16],
+            )
+        except Exception:
+            self._source_candidate_failed(candidate)
+            raise
+
+    def _retain_source_candidates(
+        self,
+        candidates: list[SourceCandidate],
+        bank_id: str,
+    ) -> None:
+        for candidate in candidates:
+            try:
+                self._retain_source_candidate(candidate, bank_id)
+            except Exception as exc:
+                logger.warning(
+                    "Hindsight source retain failed: type=%s, id=%s, error=%s",
+                    candidate.source_type,
+                    candidate.source_id,
+                    exc,
+                    exc_info=True,
+                )
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
         The actual aretain_batch runs on a single long-lived writer thread
@@ -2131,6 +2332,21 @@ class HindsightMemoryProvider(MemoryProvider):
 
         if session_id:
             self._session_id = str(session_id).strip()
+
+        source_candidates = discover_source_candidates(
+            messages,
+            session_id=self._session_id,
+        ) if messages else []
+        if source_candidates:
+            source_bank_id = self._bank_id
+            self._ensure_writer()
+            self._register_atexit()
+            self._retain_queue.put(
+                lambda candidates=source_candidates, bank_id=source_bank_id: self._retain_source_candidates(
+                    candidates,
+                    bank_id,
+                )
+            )
 
         turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
