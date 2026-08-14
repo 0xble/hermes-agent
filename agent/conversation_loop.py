@@ -4631,6 +4631,7 @@ def run_conversation(
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success
+                _retry.alternate_credential_attempted = False
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -5020,11 +5021,18 @@ def run_conversation(
                 recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
                     status_code=status_code,
                     has_retried_429=_retry.has_retried_429,
+                    alternate_credential_attempted=_retry.alternate_credential_attempted,
                     classified_reason=classified.reason,
                     error_context=error_context,
                     billing_unverified=classified.billing_unverified,
                 )
                 if recovered_with_pool:
+                    if classified.reason in {
+                        FailoverReason.overloaded,
+                        FailoverReason.server_error,
+                        FailoverReason.timeout,
+                    }:
+                        _retry.alternate_credential_attempted = True
                     continue
 
                 # Image-too-large recovery: shrink oversized native image

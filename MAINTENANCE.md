@@ -44,6 +44,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
 | HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
 | HERMES-020 | Active | `fix(skills): limit background review creation` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
+| HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback` | Try one alternate same-provider account for recoverable upstream failures before activating the fallback model. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -56,6 +57,15 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** Local fork behavior; no released upstream setting currently provides this selective policy.
 - **Regression:** `pytest -q tests/tools/test_skill_manager_tool.py`.
 - **Rollback:** Remove the create guard, its focused test, the example setting, and this manifest entry in one follow-up commit. Preserve the existing background ownership and read-before-write guards.
+
+### HERMES-021 — Try alternate same-provider credentials before provider fallback
+
+- **Summary:** Adds a bounded alternate-credential attempt in the credential-pool recovery path. Codex timeout, server-error, and provider-overload failures may swap to one different available pool entry without marking the failing account exhausted; existing rate-limit and billing paths continue to exhaust and rotate accounts, while authentication failures and upstream-aggregator 429s retain their existing refresh/fallback behavior. This prevents a transient Codex backend failure from jumping directly to a lower-quality fallback provider while a configured same-provider account remains healthy.
+- **Surfaces:** `agent/agent_runtime_helpers.py`; `agent/conversation_loop.py`; `agent/turn_retry_state.py`; `run_agent.py`; `tests/agent/test_credential_pool_routing.py`; `tests/agent/test_turn_retry_state.py`.
+- **Upstream tracking:** Issue `#22916` asks for same-provider profile rotation before provider fallback but remains open without implementation. PRs `#24539` and `#11034` instead eagerly activate fallback for overloaded providers; PR `#84128` extends same-account Codex backoff. None provides one alternate same-provider account attempt before provider fallback.
+- **Regression:** `pytest -q tests/agent/test_credential_pool_routing.py -k 'alternate or rate_limit or billing or auth'`.
+- **Rollback:** Remove the alternate-entry selector and the overload/transport branch from `recover_with_credential_pool`, then remove only the HERMES-021 focused tests. Preserve rate-limit retry semantics, billing rotation, auth refresh behavior, and upstream-aggregator fallback bypass.
+- **Retirement:** Retire after a released upstream implementation provides configurable same-provider account rotation before provider fallback for rate-limit and transient provider-overload failures and passes equivalent focused tests.
 
 ### HERMES-001 — Serialize malformed `state.db` repair and invalidate stale schemas
 

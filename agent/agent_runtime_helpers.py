@@ -47,6 +47,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider,
     resolve_runtime_pool_key,
 )
+from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -1088,11 +1089,45 @@ def sync_credential_pool_entry_id(agent) -> None:
         agent._credential_pool_entry_id = None
 
 
+def _select_alternate_credential(agent) -> Optional[Any]:
+    """Return one available same-provider credential different from the one
+    that just failed.
+
+    This deliberately does not mark the failed entry exhausted. The caller
+    uses this only for transient provider failures where the account may be
+    healthy and bounds the attempt to one alternate per retry sequence.
+    """
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return None
+    # This policy is intentionally scoped to the multi-account Codex
+    # subscription pool. Other providers have different credential semantics
+    # and retain their existing recovery behavior until they opt in.
+    if (getattr(agent, "provider", "") or "").strip().lower() != "openai-codex":
+        return None
+    current_id = getattr(agent, "_credential_pool_entry_id", None)
+    current_key = getattr(agent, "api_key", None)
+    try:
+        entries = pool.entries()
+    except Exception:
+        return None
+    for entry in entries:
+        if current_id and entry.id == current_id:
+            continue
+        if current_key and entry.runtime_api_key == current_key:
+            continue
+        if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}:
+            continue
+        return entry
+    return None
+
+
 def recover_with_credential_pool(
     agent,
     *,
     status_code: Optional[int],
     has_retried_429: bool,
+    alternate_credential_attempted: bool = False,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
     billing_unverified: bool = False,
@@ -1231,6 +1266,31 @@ def recover_with_credential_pool(
                 "credential rotation, deferring to fallback chain"
             )
         return False, has_retried_429
+
+    if effective_reason in {
+        FailoverReason.overloaded,
+        FailoverReason.server_error,
+        FailoverReason.timeout,
+    }:
+        # A transient failure may be isolated to one account's backend route.
+        # Try one other configured account before the provider fallback, but do
+        # not quarantine either account: these errors do not prove a bad
+        # credential. A dedicated per-turn guard bounds this to one alternate
+        # attempt without changing the existing first-429 retry semantics.
+        if alternate_credential_attempted:
+            return False, has_retried_429
+        alternate = _select_alternate_credential(agent)
+        if alternate is None:
+            return False, has_retried_429
+        _ra().logger.info(
+            "Transient %s on provider=%s — trying alternate credential %s "
+            "before provider fallback",
+            effective_reason.value,
+            getattr(agent, "provider", None),
+            getattr(alternate, "label", None) or getattr(alternate, "id", "?")[:8],
+        )
+        agent._swap_credential(alternate)
+        return True, has_retried_429
 
     if effective_reason == FailoverReason.billing:
         rotate_status = status_code if status_code is not None else 402
