@@ -5788,15 +5788,11 @@ class TurnRunner:
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
             if self._runner._is_telegram_topic_lane(source):
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm"
-                    and self._runner._schedule_telegram_topic_title_rename(
-                        source,
-                        session_id,
-                        title,
-                        user_message=getattr(ctx, "message", "") or "",
-                    )
-                )
+                # Telegram topics are named after the first completed response,
+                # not during the turn prologue. The response-aware path below
+                # supplies the opening request plus the assistant's final answer
+                # to both title and icon selection.
+                setattr(agent, "_defer_topic_title_until_response", True)
             elif self._runner._is_discord_auto_thread_lane(source) or (
                 self._runner._is_relay_discord_channel_lane(source)
             ):
@@ -7360,13 +7356,18 @@ class TurnRunner:
                     unique_tags.insert(0, "[[audio_as_voice]]")
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
-        # Auto-titling runs at TURN START (agent/turn_context.py) from the
-        # user's message alone, so it no longer waits on final_response — a
-        # failed or interrupted turn still gets a titled session. The
-        # platform-specific thread-rename callbacks are attached to the agent
-        # as `_on_session_title` before the run starts (see
-        # _attach_session_title_callback), because the titler now fires from
-        # inside the turn prologue rather than from here.
+        self._runner._schedule_telegram_topic_title_after_response(
+            ctx.source,
+            str(ctx.session_id or ""),
+            str(ctx.message or ""),
+            str(final_response or ""),
+            ctx.agent_holder[0],
+            result,
+        )
+
+        # Auto-titling for Telegram topics runs after a successful response so
+        # the title and icon can use both the opening request and the completed
+        # assistant answer. Other surfaces retain their existing title path.
 
         return {
             "final_response": final_response,
@@ -25778,6 +25779,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    def _schedule_telegram_topic_title_after_response(
+        self,
+        source: SessionSource,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        agent: Any,
+        result: dict,
+    ) -> None:
+        """Generate a Telegram topic title after a successful assistant turn.
+
+        The title generator remains best-effort and runs in its own background
+        thread. Telegram receives the opening request plus the final assistant
+        response, rather than progress text or intermediate tool output.
+        """
+        if (
+            source.platform != Platform.TELEGRAM
+            or not self._is_telegram_topic_lane(source)
+            or not session_id
+            or not str(assistant_response or "").strip()
+        ):
+            return
+        if not isinstance(result, dict):
+            return
+        if (
+            result.get("failed")
+            or result.get("interrupted")
+            or result.get("partial")
+            or result.get("completed") is False
+        ):
+            return
+
+        response_text = str(assistant_response).strip()
+        opening_text = str(user_message or "").strip()
+        if not opening_text or len(response_text) < 20:
+            return
+        combined_context = (
+            f"User request:\n{opening_text}\n\n"
+            f"Completed assistant response:\n{response_text}"
+        )[:4000]
+
+        try:
+            from agent.title_generator import maybe_auto_title
+
+            runtime = {
+                "model": getattr(agent, "model", None),
+                "provider": getattr(agent, "provider", None),
+                "base_url": getattr(agent, "base_url", None),
+                "api_key": getattr(agent, "api_key", None),
+                "api_mode": getattr(agent, "api_mode", None),
+            }
+            maybe_auto_title(
+                getattr(agent, "_session_db", None),
+                session_id,
+                combined_context,
+                failure_callback=getattr(agent, "_title_failure_callback", None),
+                main_runtime=runtime,
+                title_callback=lambda title, title_source: self._schedule_telegram_topic_title_rename(
+                    source,
+                    session_id,
+                    title,
+                    user_message=combined_context,
+                ) if title_source in {"llm", "derived"} else None,
+                runtime_validator=lambda: True,
+            )
+        except Exception:
+            logger.debug(
+                "Response-aware Telegram topic title generation failed",
+                exc_info=True,
+            )
 
     def _schedule_telegram_topic_title_rename(
         self,

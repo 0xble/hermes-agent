@@ -278,6 +278,13 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     if str(getattr(agent, "platform", "") or "").lower() in _UNTITLED_PLATFORMS:
         return
 
+    # Telegram topic names are intentionally generated after the first
+    # successful assistant response. The response often disambiguates the
+    # user's opening request, and the gateway supplies the combined context
+    # through its post-response topic-title path.
+    if getattr(agent, "_defer_topic_title_until_response", False):
+        return
+
     try:
         from agent.message_content import flatten_message_text
         from agent.title_generator import maybe_auto_title
