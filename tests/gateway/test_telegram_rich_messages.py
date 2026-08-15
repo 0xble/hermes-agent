@@ -85,6 +85,32 @@ def _rich_api_kwargs(adapter):
     return call.kwargs["api_kwargs"]
 
 
+def test_rich_mode_defaults_to_auto_when_unset():
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    assert adapter._rich_message_mode == "auto"
+    assert adapter._needs_rich_rendering("Plain prose") is False
+
+
+def test_rich_mode_always_routes_plain_prose_to_rich():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._rich_message_mode == "always"
+    assert adapter._needs_rich_rendering("Plain prose") is True
+
+
+def test_rich_mode_boolean_compatibility():
+    assert _make_adapter(extra={"rich_messages": True})._rich_message_mode == "auto"
+    assert _make_adapter(extra={"rich_messages": False})._rich_message_mode == "never"
+
+
+@pytest.mark.asyncio
+async def test_always_mode_sends_plain_prose_as_rich():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    result = await adapter.send("12345", "Plain prose")
+    assert result.success is True
+    assert adapter._bot.do_api_request.await_count == 1
+    assert adapter._bot.do_api_request.call_args.args[0] == "sendRichMessage"
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
@@ -344,8 +370,8 @@ async def test_notification_silent_by_default():
 
 
 @pytest.mark.asyncio
-async def test_table_only_uses_legacy_with_default_config():
-    """Default config (rich_messages unset → False) keeps tables on legacy path."""
+async def test_table_only_uses_auto_rich_routing_by_default():
+    """Unset rich_messages uses adaptive mode, so tables use Rich Messages."""
     config = PlatformConfig(enabled=True, token="fake-token")
     adapter = TelegramAdapter(config)
     bot = MagicMock()
@@ -357,8 +383,8 @@ async def test_table_only_uses_legacy_with_default_config():
     result = await adapter.send("12345", TABLE_ONLY_CONTENT)
 
     assert result.success is True
-    bot.do_api_request.assert_not_called()
-    bot.send_message.assert_awaited()
+    bot.do_api_request.assert_awaited()
+    bot.send_message.assert_not_called()
 
 
 # ── Streaming drafts: sendRichMessageDraft ─────────────────────────────

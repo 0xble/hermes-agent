@@ -334,6 +334,23 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary proving an eligible topic receives an allowed icon when model selection fails.
 - **Rollback:** To roll back only the 2026-08-15 hardening, remove the deterministic fallback and warning reason while preserving live allowlist resolution, manual ownership, durable history, binding revalidation, and title-independent degradation. For full HERMES-018 retirement, disable `gateway.platforms.telegram.extra.auto_topic_icons` in every affected profile, verify title-only renaming, then remove the remaining selector, state, adapter, docs, and focused tests only after released upstream passes the complete contract.
 
+### HERMES-021 — Add configurable Telegram Rich Message routing modes
+
+- **Summary:** Adds `rich_messages: auto|always|never` to Telegram configuration. `auto` is the default adaptive route, `always` attempts Rich Messages for every final response that passes capability, client-risk, and size guards, and `never` forces legacy MarkdownV2. Existing booleans remain compatible: `true` maps to `auto`, `false` to `never`. Rich draft previews remain separately controlled by `rich_drafts`.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `hermes_cli/config_defaults.py`; `agent/system_prompt.py`; `cli-config.yaml.example`; Telegram messaging documentation; Rich Message tests.
+- **Regression:** `uv run pytest -q tests/gateway/test_telegram_rich_messages.py tests/agent/test_system_prompt.py tests/gateway/test_config.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_visual_spacing.py` — 117 passed. `git diff --check` passed.
+- **Activation:** The active personal profile now has `gateway.platforms.telegram.extra.rich_drafts: true`. The running gateway could not self-restart; an external `hermes gateway restart` is still required. The new `always` mode is not active until the patched Hermes runtime is published and activated.
+- **Rollback:** Set `rich_drafts: false`; set `rich_messages: true` or `auto` for adaptive routing; or revert the patch and restart externally. Do not force-push over the current fork/remote divergence.
+
+### HERMES-020 — Add visible paragraph spacing to Telegram text delivery
+
+- **Summary:** At the Telegram transport boundary, expands existing Markdown paragraph boundaries with an explicit non-breaking-space line so headings, prose sections, and action blocks remain visually separated on narrow clients. The normalization is idempotent, leaves single-line lists unchanged, and protects fenced code blocks and native pipe tables.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_visual_spacing.py`.
+- **Upstream tracking:** Independent 2026-08-15 reproduction from Telegram screenshots showed ordinary Markdown blank lines rendering too tightly between report sections. The fix belongs at the channel renderer because cron agents expose `platform="cron"` before the scheduler selects a Telegram destination. No equivalent upstream implementation was identified in the maintained source during this change.
+- **Upstream PR:** None after checked 2026-08-15.
+- **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_text_batching.py tests/gateway/test_text_batching.py tests/gateway/test_telegram_error_redaction.py tests/gateway/test_dm_topics.py` plus live Telegram readback of a representative multi-section report confirming visible spacing and no duplicate delivery.
+- **Rollback:** Revert the stable-subject patch and its focused test, then verify ordinary Telegram Markdown delivery, rich-message tables/task lists, fenced code, chunking, and error fallback through the listed regressions. Runtime promotion remains separate from fork publication.
+
 ### HERMES-019 — Ignore hidden Slack thread-parent metadata updates
 
 - **Summary:** Drops hidden `message_changed` events when Slack changed only thread-reply bookkeeping on an existing parent. This prevents a cold process cache from normalizing the old parent into a phantom user turn while preserving genuine visible edits and newly added mentions.
