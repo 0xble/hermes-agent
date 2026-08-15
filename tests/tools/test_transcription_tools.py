@@ -409,6 +409,7 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._should_force_faster_whisper_cpu", return_value=True), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
              patch("tools.transcription_tools._load_stt_config", return_value=fake_config):
@@ -1173,7 +1174,7 @@ class TestTranscribeCredentialReadGuard:
         from agent.file_safety import get_read_block_error
 
         env_file = tmp_path / ".env"
-        env_file.write_text("OPENAI_API_KEY=sk-secret\n")
+        env_file.write_text("OPENAI_API_KEY=sk-secret\n", encoding="utf-8")
 
         expected = get_read_block_error(str(env_file))
         assert expected, "test setup: a .env file should be read-blocked"
@@ -1207,7 +1208,7 @@ class TestRunCommandSttIdleTimeout:
                 "import sys, time",
                 "for idx in range(4):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                "    time.sleep(0.2)",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1215,7 +1216,9 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            # Leave enough startup headroom for loaded local-CI hosts while
+            # keeping total runtime (0.8s) above this idle timeout.
+            timeout=0.5,
         )
 
         assert result.returncode == 0

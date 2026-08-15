@@ -12,6 +12,7 @@ and ``package-lock.json`` changed together.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -31,7 +32,16 @@ pytestmark = pytest.mark.skipif(
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "-c",
+            f"core.excludesFile={os.devnull}",
+            *args,
+        ],
         cwd=cwd,
         check=check,
         capture_output=True,
@@ -40,14 +50,14 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def _extract_install_sh_function(name: str) -> str:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(rf"{name}\(\) \{{.*?\n\}}", text, re.DOTALL)
     assert match is not None, f"{name}() not found in install.sh"
     return match.group(0)
 
 
 def _extract_install_sh_autostash_block() -> str:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     match = re.search(
         r'local autostash_ref="".*?\n            fi\n',
         text,
@@ -64,12 +74,16 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     repo = tmp_path / "hermes-agent"
     repo.mkdir()
     _git(repo, "init")
-    (repo / "package.json").write_text('{"dependencies":{"a":"1"}}\n')
-    (repo / "package-lock.json").write_text('{"lock":"old"}\n')
+    (repo / "package.json").write_text(
+        '{"dependencies":{"a":"1"}}\n', encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text('{"lock":"old"}\n', encoding="utf-8")
     _git(repo, "add", "package.json", "package-lock.json")
     _git(repo, "commit", "-m", "init")
 
-    (repo / "package-lock.json").write_text('{"lock":"runtime-churn"}\n')
+    (repo / "package-lock.json").write_text(
+        '{"lock":"runtime-churn"}\n', encoding="utf-8"
+    )
 
     script = (
         "set -e\n"
@@ -88,11 +102,11 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     assert res.returncode == 0, res.stderr
     assert "Discarded npm lockfile churn (1 file(s))" in res.stdout
     assert _git(repo, "stash", "list").stdout.strip() == ""
-    assert (repo / "package-lock.json").read_text() == '{"lock":"old"}\n'
+    assert (repo / "package-lock.json").read_text(encoding="utf-8") == '{"lock":"old"}\n'
 
 
 def test_install_sh_discards_lockfile_churn_before_status_probe() -> None:
-    text = INSTALL_SH.read_text()
+    text = INSTALL_SH.read_text(encoding="utf-8")
     idx_cleanup = text.index('discard_update_lockfile_churn "$INSTALL_DIR"')
     idx_status = text.index('if [ -n "$(git status --porcelain)" ]')
     idx_stash = text.index("git stash push --include-untracked")
@@ -100,7 +114,7 @@ def test_install_sh_discards_lockfile_churn_before_status_probe() -> None:
 
 
 def test_install_ps1_discards_lockfile_churn_before_status_probe() -> None:
-    text = INSTALL_PS1.read_text()
+    text = INSTALL_PS1.read_text(encoding="utf-8")
     assert "function Discard-LockfileChurn" in text
     idx_cleanup = text.index("Discard-LockfileChurn $InstallDir")
     idx_status = text.index(

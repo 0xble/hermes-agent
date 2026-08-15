@@ -19,6 +19,7 @@ from tools.approval import detect_dangerous_command, detect_hardline_command
         (["rg", "--pre-glob", "--pre", "needle"], "needle\n", 0, "needle\n"),
     ],
 )
+@pytest.mark.linux_only
 def test_real_read_tool_binaries_confirm_option_ownership(
     argv, stdin, expected_returncode, expected_output
 ):
@@ -26,7 +27,14 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     if shutil.which(argv[0]) is None:
         pytest.skip(f"{argv[0]} is not installed")
 
-    completed = subprocess.run(argv, input=stdin, text=True, capture_output=True)
+    completed = subprocess.run(
+        argv,
+        input=stdin,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
 
     assert completed.returncode == expected_returncode
     assert completed.stdout == expected_output
@@ -43,6 +51,7 @@ def test_real_read_tool_binaries_confirm_option_ownership(
         ("man", ["-P", "-payload-marker", "ls"], None, True),
     ],
 )
+@pytest.mark.linux_only
 def test_real_binaries_execute_leading_dash_program_payload(
     tmp_path, tool, args, stdin, needs_tty
 ):
@@ -52,10 +61,12 @@ def test_real_binaries_execute_leading_dash_program_payload(
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
-    payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
+    payload.write_text(
+        "#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n", encoding="utf-8"
+    )
     payload.chmod(0o755)
     input_file = tmp_path / "input.txt"
-    input_file.write_text("needle\n")
+    input_file.write_text("needle\n", encoding="utf-8")
     resolved_args = [arg.format(input=str(input_file)) for arg in args]
     input_text = (
         "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
@@ -72,9 +83,18 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
-    subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
+    subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        env=env,
+        timeout=20,
+    )
 
-    assert marker.read_text() == "executed"
+    assert marker.read_text(encoding="utf-8") == "executed"
 
 
 @pytest.mark.parametrize(

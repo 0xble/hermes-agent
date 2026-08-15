@@ -52,10 +52,23 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-026 | Active | `feat(memory): retain source material automatically`; `fix(memory): gate raw attachment retention`; `fix(memory): gate generic file extraction retention`; `fix(memory): constrain retained attachment paths`; `fix(memory): revalidate attachment bytes before upload` | Preserve source evidence while requiring explicit opt-in before retaining raw attachments or generic file reads. |
 | HERMES-027 | Active | `fix: harden gateway runtime boundaries`; `fix(gateway): recover unacknowledged terminal responses` | Resume recent sessions after an unexpected exit unless outbound delivery is durably acknowledged. |
 | HERMES-028 | Active | `fix: harden gateway runtime boundaries`; `fix(terminal): avoid remote Python lifecycle dependency`; `fix(terminal): skip known remote shell binaries` | Inspect referenced remote scripts through the POSIX shell contract without requiring Python. |
+| HERMES-029 | Active | `fix(media): honor provider retry delays for downloads` | Make idempotent image/audio URL-cache GETs honor bounded provider retry timing. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-029 — Provider-directed retries for idempotent media downloads
+
+- **Independent hypothesis (2026-08-15):** `cache_image_from_url` and `cache_audio_from_url` currently retry every HTTP status at or above 429 and every `httpx.TimeoutException` after fixed 1.5s/3s delays. A 429/503 carrying `Retry-After` can therefore be retried before the provider permits, while permanent 5xx statuses and ambiguous read timeouts are retried unnecessarily. The correction belongs in one shared internal URL-cache GET helper: retry only 429/502/503/504 plus connection establishment failures, parse both Retry-After delta-seconds and HTTP-date through the existing shared parser, choose a bounded exponential delay with jitter that is never earlier than the provider deadline, and fail closed when retries or the cumulative wait budget are exhausted. Image/audio validation, SSRF redirect checks, byte caps, and outbound send behavior remain unchanged.
+- **Summary:** Shares bounded retry policy across idempotent image and audio URL-cache GETs. Provider Retry-After seconds or HTTP-date is a minimum delay; excessive delays fail/defer instead of sleeping past the media-download budget. Only 429/502/503/504, connect errors, and connect timeouts retry. Permanent HTTP failures and post-connect/read failures fail closed. Retry logs sanitize signed URLs.
+- **Surfaces:** `gateway/platforms/base.py`; `tests/gateway/test_media_download_retry.py`.
+- **Upstream tracking:** No equivalent implementation was found on current official `main` (`30c469b15313711d47c45e7175d6ef5c8437f1ed`) after source/history and issue/PR/commit searches for the two cache helper symbols plus Retry-After on 2026-08-15. Upstream already supplies the shared seconds/HTTP-date parser in `agent.retry_utils`, which this patch reuses.
+- **Upstream PR:** None after checked 2026-08-15.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_media_download_retry.py tests/gateway/test_platform_base.py -q`.
+- **Rollback:** Remove `_download_media_from_url` and its media retry constants/helpers, restore the separate image/audio request loops, and remove `tests/gateway/test_media_download_retry.py`. Preserve SSRF validation, redirect hooks, streaming byte limits, cache validation, and all outbound platform retry semantics.
+- **Retirement:** Retire after released upstream shares equivalent image/audio URL-cache GET retry behavior that honors delta/date Retry-After as a minimum, bounds cumulative waiting, retries only the same safe statuses/transports, sanitizes logs, and passes the focused regression.
+
 
 ### HERMES-028 — Inspect remote scripts without a Python dependency
 
