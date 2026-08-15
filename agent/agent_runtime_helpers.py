@@ -47,7 +47,7 @@ from agent.credential_pool import (
     credential_pool_matches_provider,
     resolve_runtime_pool_key,
 )
-from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, credential_pool_matches_provider
+from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -1107,19 +1107,21 @@ def _select_alternate_credential(agent) -> Optional[Any]:
         return None
     current_id = getattr(agent, "_credential_pool_entry_id", None)
     current_key = getattr(agent, "api_key", None)
+    if current_key:
+        try:
+            key_matched_id = pool.entry_id_for_api_key(current_key)
+            if key_matched_id:
+                current_id = key_matched_id
+        except Exception:
+            logger.debug("Could not rebind alternate selection by API key", exc_info=True)
     try:
-        entries = pool.entries()
+        return pool.select_alternate(
+            exclude_id=current_id,
+            exclude_runtime_key=current_key,
+        )
     except Exception:
+        logger.debug("Could not select alternate credential", exc_info=True)
         return None
-    for entry in entries:
-        if current_id and entry.id == current_id:
-            continue
-        if current_key and entry.runtime_api_key == current_key:
-            continue
-        if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}:
-            continue
-        return entry
-    return None
 
 
 def recover_with_credential_pool(
@@ -1248,6 +1250,25 @@ def recover_with_credential_pool(
         elif status_code in {401, 403}:
             effective_reason = FailoverReason.auth
 
+    # Once an alternate request fails, close its observability span before
+    # any second-stage recovery (rate-limit rotation, auth refresh, fallback,
+    # etc.) changes the active route. Otherwise a later success can be
+    # misattributed to the original transient rotation.
+    if alternate_credential_attempted:
+        rotation = getattr(agent, "_last_credential_rotation", None)
+        if rotation:
+            _ra().logger.info(
+                "credential_request_outcome event=failure provider=%s "
+                "entry=%s rotated=true rotation_reason=%s "
+                "from_entry=%s failure_reason=%s",
+                getattr(agent, "provider", None),
+                getattr(agent, "_credential_pool_entry_id", None) or "unknown",
+                rotation.get("reason") or "unknown",
+                rotation.get("from_entry") or "unknown",
+                effective_reason.value if effective_reason is not None else "unknown",
+            )
+            agent._last_credential_rotation = None
+
     if effective_reason == FailoverReason.upstream_rate_limit:
         # An upstream provider (e.g. DeepSeek behind OpenRouter) is
         # rate-limiting the aggregator's traffic — the user's credential is
@@ -1273,23 +1294,55 @@ def recover_with_credential_pool(
         FailoverReason.timeout,
     }:
         # A transient failure may be isolated to one account's backend route.
-        # Try one other configured account before the provider fallback, but do
-        # not quarantine either account: these errors do not prove a bad
-        # credential. A dedicated per-turn guard bounds this to one alternate
-        # attempt without changing the existing first-429 retry semantics.
+        # Cool the account that actually failed even when its stored pool ID is
+        # missing or stale; API-key attribution is the same fallback used by
+        # durable exhaustion paths.
+        failed_credential_id = _credential_id
+        try:
+            key_matched_id = pool.entry_id_for_api_key(_api_key_hint)
+            if key_matched_id:
+                failed_credential_id = key_matched_id
+        except Exception:
+            logger.debug(
+                "Could not attribute transient failure to a pool entry",
+                exc_info=True,
+            )
+        if failed_credential_id:
+            try:
+                pool.soft_cooldown(
+                    failed_credential_id,
+                    reason=effective_reason.value,
+                )
+            except Exception:
+                logger.debug(
+                    "Could not apply transient credential soft cooldown",
+                    exc_info=True,
+                )
+
+        # Try one other configured account before provider fallback. A dedicated
+        # per-turn guard bounds this to one alternate without changing the
+        # existing first-429 retry semantics. The cooldown above still records
+        # a failed alternate so nearby requests prefer a third healthy account.
         if alternate_credential_attempted:
             return False, has_retried_429
         alternate = _select_alternate_credential(agent)
         if alternate is None:
             return False, has_retried_429
+        _rotation_context = {
+            "from_entry": failed_credential_id,
+            "to_entry": getattr(alternate, "id", None),
+            "reason": effective_reason.value,
+        }
         _ra().logger.info(
-            "Transient %s on provider=%s — trying alternate credential %s "
-            "before provider fallback",
+            "credential_rotation event=attempt reason=%s provider=%s "
+            "from_entry=%s to_entry=%s before_provider_fallback=true",
             effective_reason.value,
             getattr(agent, "provider", None),
-            getattr(alternate, "label", None) or getattr(alternate, "id", "?")[:8],
+            failed_credential_id or "unknown",
+            getattr(alternate, "id", "?") or "unknown",
         )
         agent._swap_credential(alternate)
+        agent._last_credential_rotation = _rotation_context
         return True, has_retried_429
 
     if effective_reason == FailoverReason.billing:

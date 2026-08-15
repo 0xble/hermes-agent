@@ -428,6 +428,117 @@ class TestFailureAttribution:
     def _statuses(self, pool):
         return {e.id: e.last_status for e in pool.entries()}
 
+    def test_soft_cooldown_steers_normal_selection_without_exhausting(self, tmp_path, monkeypatch):
+        """Transient routing state prefers another account but is not durable health."""
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+
+        pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+        selected = pool.select()
+
+        assert selected is not None
+        assert selected.id == "cred-1"
+        assert self._statuses(pool)["cred-0"] in (None, "ok")
+        assert "cred-0" in pool.soft_cooldown_ids()
+
+    def test_soft_cooldown_is_shared_across_pool_instances(self, tmp_path, monkeypatch):
+        """Nearby agents in one process observe the same profile-scoped steering."""
+        entries = [self._entry(0, "key-a"), self._entry(1, "key-b")]
+        first_pool = self._make_pool(
+            tmp_path, monkeypatch, entries, provider="openai-codex"
+        )
+        first_pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+
+        from agent.credential_pool import load_pool
+
+        second_pool = load_pool("openai-codex")
+        selected = second_pool.select()
+
+        assert selected is not None
+        assert selected.id == "cred-1"
+
+    def test_soft_cooldown_expiry_restores_fill_first(self, tmp_path, monkeypatch):
+        """Expired runtime-only cooldowns restore the configured strategy."""
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+
+        pool.soft_cooldown("cred-0", reason="timeout", duration=0)
+
+        selected = pool.select()
+        assert selected is not None
+        assert selected.id == "cred-0"
+        assert pool.soft_cooldown_ids() == set()
+
+    def test_alternate_selection_prefers_non_cooled_third_account(self, tmp_path, monkeypatch):
+        """A second transient failure uses C before reusing cooled A."""
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [
+                self._entry(0, "key-a"),
+                self._entry(1, "key-b"),
+                self._entry(2, "key-c"),
+            ],
+            provider="openai-codex",
+        )
+        pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+        pool.soft_cooldown("cred-1", reason="timeout", duration=60)
+        agent = self._agent(
+            pool, failing_key="key-b", credential_id="cred-1", provider="openai-codex"
+        )
+
+        from agent.agent_runtime_helpers import _select_alternate_credential
+
+        alternate = _select_alternate_credential(agent)
+        assert alternate is not None
+        assert alternate.id == "cred-2"
+
+    def test_all_soft_cooled_accounts_still_allow_emergency_alternate(self, tmp_path, monkeypatch):
+        """Soft cooldowns never eliminate the only available alternate."""
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+        pool.soft_cooldown("cred-1", reason="timeout", duration=60)
+        agent = self._agent(
+            pool, failing_key="key-a", credential_id="cred-0", provider="openai-codex"
+        )
+
+        from agent.agent_runtime_helpers import _select_alternate_credential
+
+        alternate = _select_alternate_credential(agent)
+        assert alternate is not None
+        assert alternate.id == "cred-1"
+
+    def test_soft_cooldown_applies_to_lease_selection(self, tmp_path, monkeypatch):
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+
+        assert pool.acquire_lease() == "cred-1"
+
+    def test_soft_cooldown_applies_to_peek(self, tmp_path, monkeypatch):
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        assert pool.select() is not None
+        pool.soft_cooldown("cred-0", reason="overloaded", duration=60)
+
+        peeked = pool.peek()
+        assert peeked is not None
+        assert peeked.id == "cred-1"
 
 
     def test_pre_exhausted_check_uses_failing_key(self, tmp_path, monkeypatch):
@@ -602,7 +713,42 @@ class TestFailureAttribution:
         assert recovered is True
         assert has_retried is False
         assert agent._swap_credential.call_args[0][0].id == "cred-1"
+        assert "cred-0" in pool.soft_cooldown_ids()
+        assert agent._last_credential_rotation == {
+            "from_entry": "cred-0",
+            "to_entry": "cred-1",
+            "reason": reason_name,
+        }
         assert all(status != "exhausted" for status in self._statuses(pool).values())
+
+    def test_transient_failure_prefers_api_key_over_stale_entry_id(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        agent = self._agent(
+            pool,
+            failing_key="key-b",
+            credential_id="cred-0",
+            provider="openai-codex",
+        )
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is True
+        assert pool.soft_cooldown_ids() == {"cred-1"}
+        assert agent._swap_credential.call_args[0][0].id == "cred-0"
 
     def test_provider_overload_uses_each_alternate_once(self, tmp_path, monkeypatch):
         """The same overloaded turn must not cycle through more than one
@@ -640,6 +786,49 @@ class TestFailureAttribution:
         assert first is True
         assert second is False
         assert agent._swap_credential.call_count == 1
+        assert agent._last_credential_rotation is None
+
+    def test_failed_alternate_is_cooled_before_provider_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        pool = self._make_pool(
+            tmp_path,
+            monkeypatch,
+            [
+                self._entry(0, "key-a"),
+                self._entry(1, "key-b"),
+                self._entry(2, "key-c"),
+            ],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a", provider="openai-codex")
+
+        first, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            classified_reason=FailoverReason.overloaded,
+        )
+        assert first is True
+
+        agent.api_key = "key-b"
+        agent._credential_pool_entry_id = "cred-1"
+        second, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            alternate_credential_attempted=True,
+            classified_reason=FailoverReason.timeout,
+        )
+
+        assert second is False
+        assert {"cred-0", "cred-1"} <= pool.soft_cooldown_ids()
+        selected = pool.select()
+        assert selected is not None
+        assert selected.id == "cred-2"
 
     def test_transient_alternate_does_not_consume_first_429_retry(
         self, tmp_path, monkeypatch

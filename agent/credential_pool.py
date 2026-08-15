@@ -46,6 +46,13 @@ from hermes_cli.auth import (
 logger = logging.getLogger(__name__)
 
 
+# Runtime-only steering shared by every CredentialPool loaded in this process.
+# The auth-store path keeps named profiles isolated while allowing separately
+# loaded pools for one profile/provider to observe the same brief cooldown.
+_SOFT_COOLDOWNS: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_SOFT_COOLDOWNS_LOCK = threading.Lock()
+
+
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
 
@@ -75,6 +82,11 @@ STATUS_EXHAUSTED = "exhausted"
 # write-side sync (e.g. ``_save_codex_tokens`` after a fresh device-code
 # login) rewrites the tokens.
 STATUS_DEAD = "dead"
+
+# Transient overloads should briefly steer new selections away from the
+# failing account without changing its durable health state. This is runtime
+# state only; it intentionally disappears on process restart.
+SOFT_COOLDOWN_SECONDS = 60.0
 
 # OAuth error reasons that indicate the credential is permanently invalid
 # server-side and cannot be recovered by retry/refresh.  Sourced from
@@ -747,6 +759,7 @@ class CredentialPool:
         # loop runs unbounded and non-interruptible.  Reset whenever a real
         # entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        self._soft_cooldown_scope = str(auth_mod._auth_file_path().resolve(strict=False))
 
     def has_credentials(self) -> bool:
         with self._lock:
@@ -801,6 +814,52 @@ class CredentialPool:
     def entries(self) -> List[PooledCredential]:
         with self._lock:
             return list(self._entries)
+
+    def _get_soft_cooldown_scope(self) -> str:
+        scope = getattr(self, "_soft_cooldown_scope", None)
+        if not scope:
+            scope = str(auth_mod._auth_file_path().resolve(strict=False))
+            self._soft_cooldown_scope = scope
+        return scope
+
+    def soft_cooldown(self, entry_id: Optional[str], *, reason: str,
+                      duration: float = SOFT_COOLDOWN_SECONDS) -> Optional[float]:
+        """Temporarily prefer other entries without exhausting this one."""
+        if not isinstance(entry_id, str) or not entry_id:
+            return None
+        until = time.monotonic() + max(0.0, float(duration))
+        key = (self._get_soft_cooldown_scope(), self.provider, entry_id)
+        with _SOFT_COOLDOWNS_LOCK:
+            _SOFT_COOLDOWNS[key] = (until, str(reason or "transient"))
+        return until
+
+    def soft_cooldown_ids(self) -> Set[str]:
+        """Return currently cooled entry IDs, pruning expired runtime state."""
+        now = time.monotonic()
+        prefix = (self._get_soft_cooldown_scope(), self.provider)
+        with _SOFT_COOLDOWNS_LOCK:
+            expired = [
+                key
+                for key, (until, _reason) in _SOFT_COOLDOWNS.items()
+                if until <= now
+            ]
+            for key in expired:
+                _SOFT_COOLDOWNS.pop(key, None)
+            return {
+                entry_id
+                for (scope, provider, entry_id) in _SOFT_COOLDOWNS
+                if (scope, provider) == prefix
+            }
+
+    def _prefer_not_soft_cooled(
+        self, entries: List[PooledCredential],
+    ) -> List[PooledCredential]:
+        """Prefer entries outside transient cooldown; never empty a usable set."""
+        cooled_ids = self.soft_cooldown_ids()
+        if not cooled_ids:
+            return entries
+        preferred = [entry for entry in entries if entry.id not in cooled_ids]
+        return preferred or entries
 
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
@@ -2146,6 +2205,30 @@ class CredentialPool:
                 self._unmatched_rotation_streak = 0
         return entry
 
+    def select_alternate(
+        self,
+        *,
+        exclude_id: Optional[str] = None,
+        exclude_runtime_key: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """Select a usable alternate without changing durable credential health."""
+        with self._lock:
+            available, _pending = self._available_entries(
+                clear_expired=True,
+                refresh=False,
+            )
+            eligible = [
+                entry
+                for entry in available
+                if (not exclude_id or entry.id != exclude_id)
+                and (
+                    not exclude_runtime_key
+                    or entry.runtime_api_key != exclude_runtime_key
+                )
+            ]
+            candidates = self._prefer_not_soft_cooled(eligible)
+            return candidates[0] if candidates else None
+
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
@@ -2360,6 +2443,8 @@ class CredentialPool:
             self._log_no_available_entries()
             return None, pending_refresh
 
+        available = self._prefer_not_soft_cooled(available)
+
         # A successful selection means the pool recovered; re-arm the throttle
         # so a later re-exhaustion logs immediately rather than being silenced
         # by a window opened during the previous empty stretch.
@@ -2395,11 +2480,12 @@ class CredentialPool:
         # Single lock acquisition for the whole read; call the unlocked
         # helpers so we don't re-enter the non-reentrant ``self._lock``.
         with self._lock:
-            current = self._current_unlocked()
-            if current is not None:
-                return current
             available, _pending = self._available_entries()
-            return available[0] if available else None
+            candidates = self._prefer_not_soft_cooled(available)
+            current = self._current_unlocked()
+            if current is not None and any(entry.id == current.id for entry in candidates):
+                return current
+            return candidates[0] if candidates else None
 
     def mark_exhausted_and_rotate(
         self,
@@ -2606,6 +2692,7 @@ class CredentialPool:
             if not available:
                 return None, pending_refresh
 
+            available = self._prefer_not_soft_cooled(available)
             below_cap = [
                 entry for entry in available
                 if self._active_leases.get(entry.id, 0) < self._max_concurrent

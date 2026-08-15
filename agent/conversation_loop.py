@@ -4629,6 +4629,36 @@ def run_conversation(
                             f"{cached:,}/{prompt:,} tokens "
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
+                    _rotation = getattr(agent, "_last_credential_rotation", None)
+                    if _rotation and agent.provider == "openai-codex":
+                        logger.info(
+                            "credential_request_outcome event=success provider=%s "
+                            "entry=%s rotated=true rotation_reason=%s "
+                            "from_entry=%s cache_read_tokens=%d cache_write_tokens=%d "
+                            "prompt_tokens=%d latency_ms=%d",
+                            agent.provider,
+                            getattr(agent, "_credential_pool_entry_id", None) or "unknown",
+                            _rotation.get("reason") or "unknown",
+                            _rotation.get("from_entry") or "unknown",
+                            cached or 0,
+                            written or 0,
+                            prompt or 0,
+                            int(max(0.0, time.time() - api_start_time) * 1000),
+                        )
+                        agent._last_credential_rotation = None
+                _rotation_without_usage = getattr(agent, "_last_credential_rotation", None)
+                if _rotation_without_usage and agent.provider == "openai-codex":
+                    logger.info(
+                        "credential_request_outcome event=success provider=%s "
+                        "entry=%s rotated=true rotation_reason=%s "
+                        "from_entry=%s cache_usage=unreported latency_ms=%d",
+                        agent.provider,
+                        getattr(agent, "_credential_pool_entry_id", None) or "unknown",
+                        _rotation_without_usage.get("reason") or "unknown",
+                        _rotation_without_usage.get("from_entry") or "unknown",
+                        int(max(0.0, time.time() - api_start_time) * 1000),
+                    )
+                    agent._last_credential_rotation = None
                 
                 _retry.has_retried_429 = False  # Reset on success
                 _retry.alternate_credential_attempted = False
