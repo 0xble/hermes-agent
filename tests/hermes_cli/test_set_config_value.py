@@ -518,6 +518,17 @@ class TestSchemaValidation:
         assert saved["desktop"]["macos_signing_identity"] == "Hermes Local Signing"
         assert "not a recognized config key" not in capsys.readouterr().out
 
+    def test_background_review_creation_policy_is_accepted(
+        self, _isolated_hermes_home, capsys
+    ):
+        """The self-improvement creation policy is a recognized boolean key."""
+        set_config_value("skills.background_review_allow_create", "false")
+        captured = capsys.readouterr()
+        assert "not a recognized config key" not in captured.out
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["skills"]["background_review_allow_create"] is False
+
 
 
     def test_force_suppresses_notice(self, _isolated_hermes_home, capsys):
@@ -546,6 +557,7 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "skills.background_review_allow_create",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key

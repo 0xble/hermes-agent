@@ -499,7 +499,7 @@ def _background_review_create_allowed() -> bool:
             load_config_readonly(),
             "skills",
             "background_review_allow_create",
-            default=True,
+            default=False,
         )
         if isinstance(value, str):
             return value.strip().lower() not in {"false", "0", "no", "off"}

@@ -2327,6 +2327,10 @@ DEFAULT_CONFIG = {
         # highlighted in red. On by default because it is a no-op
         # without the binary installed.
         "tier1_advisory": True,
+        # Autonomous self-improvement may update existing skills, but new skill
+        # creation is opt-in. Keep the default fail-closed; foreground
+        # skill_manage(create) remains user-directed and unaffected.
+        "background_review_allow_create": False,
         # Approval gate for skill_manage (create/edit/patch/write_file/delete/
         # remove_file), applied to BOTH foreground agent turns and the
         # background self-improvement review fork.

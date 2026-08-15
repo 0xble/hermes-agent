@@ -566,7 +566,7 @@ class TestSkillManageDispatcher:
         from tools.skill_manager_tool import _background_review_create_allowed
 
         with patch("hermes_cli.config.load_config_readonly", return_value={}):
-            assert _background_review_create_allowed() is True
+            assert _background_review_create_allowed() is False
 
     @pytest.mark.parametrize("value", [False, "false", "0", "no", "off"])
     def test_background_review_create_blocked_for_false_config(self, value):
@@ -607,6 +607,7 @@ class TestSkillManageDispatcher:
         token = set_current_write_origin(BACKGROUND_REVIEW)
         try:
             with _skill_dir(tmp_path), \
+                 patch("hermes_cli.config.load_config_readonly", return_value={"skills": {"background_review_allow_create": True}}), \
                  patch("tools.skill_usage.is_protected_builtin", return_value=False), \
                  patch("tools.skill_usage.is_hub_installed", return_value=False), \
                  patch("tools.skill_usage.is_bundled",
