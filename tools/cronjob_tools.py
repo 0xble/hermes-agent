@@ -943,7 +943,7 @@ def _execute_job_now(
     job_id = job["id"]
     claimed_job = None
     try:
-        # At-most-once claim: bail without running if a tick/other fire owns it.
+        # At-most-once claim returns the exact owner-bearing snapshot.
         claimed_job = claim_job_for_fire(job_id, return_job=True)
         if not isinstance(claimed_job, dict):
             # claim_job_for_fire returns False for paused/disabled/missing
@@ -1264,11 +1264,9 @@ def _try_dispatch_background_run(
         return None
 
     # ---- synchronous claim (same semantics as _execute_job_now) ----
+    claimed_job = None
     try:
-        # Best-effort early dedupe so a mid-run job reports in THIS tool
-        # response instead of as a delayed error completion event. The
-        # authoritative (atomic) check is try_register_running_job inside
-        # _run_claimed_job on the worker.
+        # Synchronously take the owner-bearing snapshot before dispatch.
         try:
             from cron.scheduler import get_running_job_ids
 
