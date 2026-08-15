@@ -17,6 +17,7 @@ user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -705,6 +706,112 @@ def generate_title(
         return None
 
 
+_TOPIC_ICON_TERMS = {
+    "🚀": "launch ship deploy release startup",
+    "📊": "chart data metrics analytics report table finance financial",
+    "📈": "chart growth increase metrics analytics finance financial revenue",
+    "📉": "chart decline decrease metrics analytics finance financial loss",
+    "💳": "credit debit card payment billing finance financial",
+    "💰": "money finance financial revenue profit savings cash",
+    "💸": "money spend payment cost expense reimbursement finance financial",
+    "🪙": "coin money finance financial currency",
+    "💱": "currency exchange money finance financial",
+    "💻": "computer software code developer engineering system",
+    "🛠": "tool tools debug repair fix build maintenance engineering",
+    "🧪": "test experiment laboratory validation verify",
+    "🔎": "search inspect investigate audit review verify",
+    "💡": "idea design proposal strategy insight",
+    "📁": "folder file document archive storage",
+    "📝": "memo note write draft document",
+    "📰": "news article report update",
+    "✅": "check complete verify success done",
+    "⚡": "fast power performance speed automation",
+    "🪪": "identity identification account credential access",
+    "✈": "flight travel plane trip",
+    "🧳": "travel luggage trip vacation",
+    "🎟": "ticket event admission reservation booking",
+    "🛃": "customs border travel immigration",
+    "🗣": "speech conversation interview meeting communication",
+}
+
+
+def _emoji_key(value: str) -> str:
+    return value.replace("\ufe0e", "").replace("\ufe0f", "")
+
+
+def _semantic_tokens(value: str) -> set[str]:
+    return {
+        token.casefold()
+        for token in re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", value or ""))
+        if token
+    }
+
+
+def _emoji_semantic_tokens(emoji: str) -> set[str]:
+    key = _emoji_key(emoji)
+    names = " ".join(
+        unicodedata.name(char, "")
+        for char in key
+        if char != "\u200d" and not (0x1F3FB <= ord(char) <= 0x1F3FF)
+    )
+    return _semantic_tokens(f"{names} {_TOPIC_ICON_TERMS.get(key, '')}")
+
+
+def choose_topic_icon_deterministic(
+    title: str,
+    user_message: str,
+    allowed_emojis: list[str],
+    *,
+    recent_emojis: Optional[list[str]] = None,
+) -> Optional[str]:
+    """Choose one allowed icon without a model, preferring meaning then rotation."""
+    allowed = list(
+        dict.fromkeys(str(emoji).strip() for emoji in allowed_emojis if str(emoji).strip())
+    )
+    if not allowed:
+        return None
+
+    recent = [_emoji_key(str(emoji).strip()) for emoji in (recent_emojis or [])]
+    recent_rank = {emoji: index for index, emoji in enumerate(recent)}
+    fresh = [emoji for emoji in allowed if _emoji_key(emoji) not in recent_rank]
+    pool = fresh or allowed
+    context = _semantic_tokens(f"{title} {user_message}")
+
+    def semantic_score(emoji: str) -> int:
+        return len(context & _emoji_semantic_tokens(emoji))
+
+    best_score = max(semantic_score(emoji) for emoji in pool)
+    best = [emoji for emoji in pool if semantic_score(emoji) == best_score]
+    if best_score:
+        # When every icon is already in history, prefer the least-recent icon
+        # among equally relevant choices. Stable glyph ordering breaks ties.
+        return min(
+            best,
+            key=lambda emoji: (
+                -recent_rank.get(_emoji_key(emoji), -1),
+                _emoji_key(emoji),
+            ),
+        )
+
+    if not fresh:
+        # With a saturated history, zero semantic overlap still must not restart
+        # a hot-icon streak. The history is newest -> oldest.
+        return min(
+            best,
+            key=lambda emoji: (
+                -recent_rank.get(_emoji_key(emoji), -1),
+                _emoji_key(emoji),
+            ),
+        )
+
+    # Unicode names and the bounded synonym table cannot describe every custom
+    # Telegram sticker. Spread no-overlap topics reproducibly across the fresh
+    # set rather than always collapsing to the first Bot API option.
+    stable_pool = sorted(best, key=_emoji_key)
+    digest = hashlib.sha256(f"{title}\n{user_message}".encode("utf-8")).digest()
+    return stable_pool[int.from_bytes(digest[:8], "big") % len(stable_pool)]
+
+
 def choose_topic_icon(
     title: str,
     user_message: str,
@@ -726,9 +833,6 @@ def choose_topic_icon(
     )
     if not allowed:
         return None
-
-    def _emoji_key(value: str) -> str:
-        return value.replace("\ufe0e", "").replace("\ufe0f", "")
 
     allowed_by_key = {_emoji_key(emoji): emoji for emoji in allowed}
     recent = list(
@@ -824,7 +928,18 @@ def choose_topic_icon(
             if emoji not in candidates:
                 candidates.append(emoji)
         if not candidates:
-            return None
+            selected = choose_topic_icon_deterministic(
+                title,
+                user_message,
+                selection_pool,
+                recent_emojis=recent,
+            )
+            logger.warning(
+                "Telegram topic icon model output contained no allowed candidate; "
+                "using deterministic fallback %s",
+                selected,
+            )
+            return selected
 
         fresh_candidate = next(
             (emoji for emoji in candidates if _emoji_key(emoji) not in recent_keys),
@@ -840,9 +955,20 @@ def choose_topic_icon(
             candidates,
             key=lambda emoji: recent_rank.get(_emoji_key(emoji), -1),
         )
-    except Exception:
-        logger.debug("Telegram topic icon selection failed", exc_info=True)
-        return None
+    except Exception as exc:
+        selected = choose_topic_icon_deterministic(
+            title,
+            user_message,
+            selection_pool,
+            recent_emojis=recent,
+        )
+        logger.warning(
+            "Telegram topic icon model selection failed (%s); using deterministic fallback %s",
+            type(exc).__name__,
+            selected,
+        )
+        logger.debug("Telegram topic icon selection failure", exc_info=True)
+        return selected
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):

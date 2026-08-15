@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from agent.title_generator import (
     generate_title,
     choose_topic_icon,
+    choose_topic_icon_deterministic,
     auto_title_session,
     maybe_auto_title,
     _title_language,
@@ -476,7 +477,9 @@ class TestChooseTopicIcon:
         assert "used recently" in prompt
         assert "🚀" in prompt
 
-    def test_excludes_recent_icons_from_large_candidate_pool(self):
+    def test_model_returning_excluded_recent_icon_uses_fresh_semantic_fallback(
+        self, caplog
+    ):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "💻"
@@ -487,7 +490,8 @@ class TestChooseTopicIcon:
                 "debug the agent",
                 ["💻", "🎨", "🧪", "🔭", "🛠️"],
                 recent_emojis=["💻"],
-            ) is None
+            ) == "🛠️"
+        assert "contained no allowed candidate" in caplog.text
 
     def test_compound_emoji_wins_over_overlapping_component(self):
         mock_response = MagicMock()
@@ -520,13 +524,47 @@ class TestChooseTopicIcon:
                 recent_emojis=["💻", "🤖"],
             ) == "🤖"
 
-    def test_rejects_response_without_an_allowed_candidate(self):
+    def test_response_without_allowed_candidate_uses_semantic_fallback(self, caplog):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "🛸"
 
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            assert choose_topic_icon("Launch", "ship it", ["🚀", "📊"]) is None
+            assert choose_topic_icon("Launch", "ship it", ["🚀", "📊"]) == "🚀"
+        assert "contained no allowed candidate" in caplog.text
+
+    def test_model_failure_uses_deterministic_fallback(self, caplog):
+        with patch("agent.title_generator.call_llm", side_effect=TimeoutError("slow")):
+            assert choose_topic_icon(
+                "Financial Tables",
+                "verify finance data",
+                ["🚀", "📊"],
+            ) == "📊"
+        assert "model selection failed (TimeoutError)" in caplog.text
+
+    def test_deterministic_fallback_excludes_recent_icons(self):
+        assert choose_topic_icon_deterministic(
+            "Financial Tables",
+            "verify finance data",
+            ["📊", "🧪"],
+            recent_emojis=["📊"],
+        ) == "🧪"
+
+    def test_deterministic_fallback_reuses_least_recent_relevant_icon(self):
+        assert choose_topic_icon_deterministic(
+            "Financial Review",
+            "finance",
+            ["📊", "📈"],
+            recent_emojis=["📊", "📈"],
+        ) == "📈"
+
+    def test_deterministic_fallback_reuses_least_recent_icon_without_overlap(self):
+        assert choose_topic_icon_deterministic(
+            "Gardening Plans",
+            "plant tomatoes",
+            ["🚀", "📊"],
+            recent_emojis=["🚀", "📊"],
+        ) == "📊"
 
     def test_skips_without_allowed_icons(self):
         with patch("agent.title_generator.call_llm") as llm:
