@@ -5744,13 +5744,11 @@ class TurnRunner:
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
             if self._runner._is_telegram_topic_lane(source):
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm"
-                    and self._runner._schedule_telegram_topic_title_rename(
-                        source, session_id, title,
-                        user_message=getattr(ctx, "message", "") or "",
-                    )
-                )
+                # Telegram topics are named after the first completed response,
+                # not during the turn prologue. The response-aware path below
+                # supplies the opening request plus the assistant's final answer
+                # to both title and icon selection.
+                setattr(agent, "_defer_topic_title_until_response", True)
             elif self._runner._is_discord_auto_thread_lane(source) or (
                 self._runner._is_relay_discord_channel_lane(source)
             ):
