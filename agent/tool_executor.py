@@ -572,6 +572,7 @@ def _run_tool_activity_heartbeat(
     """
 
     try:
+        agent._touch_activity(label)
         while not stop_event.wait(interval):
             agent._touch_activity(label)
     except Exception:

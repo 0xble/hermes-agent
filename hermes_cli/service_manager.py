@@ -714,7 +714,7 @@ class S6ServiceManager:
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _render_finish_script() -> str:
+    def _render_finish_script(encoding: str = "utf-8") -> str:
         """Generate the finish script for a profile-gateway s6 service.
 
         When the gateway exits with EX_CONFIG (78) — a fatal
