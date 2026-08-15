@@ -504,6 +504,55 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     re.MULTILINE,
 )
 
+# A normal Markdown blank line is visually too subtle in some Telegram
+# clients, especially on narrow screens. Keep the source structure intact,
+# but add an explicit non-breaking-space line between prose blocks so the
+# transport has a reliably visible spacer. Code fences and pipe tables are
+# protected because their internal whitespace is syntax, not presentation.
+_TELEGRAM_SPACING_PROTECTED_REGION_RE = _RICH_PROTECTED_REGION_RE
+_TELEGRAM_VISUAL_SPACER = "\u00a0"
+
+
+def _telegram_add_visual_paragraph_spacing(text: str) -> str:
+    """Make existing paragraph boundaries visibly distinct in Telegram.
+
+    This is deliberately a renderer-level normalization, not a generic
+    whitespace rewrite. It only expands existing blank-line boundaries,
+    leaves single-line lists alone, is idempotent, and never changes fenced
+    code or native pipe-table blocks.
+    """
+    if not text or "\n\n" not in text:
+        return text
+
+    def normalize_prose(prose: str) -> str:
+        # Mask canonical spacer boundaries before normalizing ordinary blank
+        # lines; otherwise the second newline pair in our own output would be
+        # mistaken for a new paragraph on the next invocation.
+        placeholder = "\x00TELEGRAM_SPACER\x00"
+        masked = re.sub(
+            rf"\n{{2,}}{re.escape(_TELEGRAM_VISUAL_SPACER)}\n+",
+            placeholder,
+            prose,
+        )
+        normalized = re.sub(
+            r"\n{2,}",
+            f"\n\n{_TELEGRAM_VISUAL_SPACER}\n\n",
+            masked,
+        )
+        return normalized.replace(
+            placeholder,
+            f"\n\n{_TELEGRAM_VISUAL_SPACER}\n\n",
+        )
+
+    out: list[str] = []
+    position = 0
+    for match in _TELEGRAM_SPACING_PROTECTED_REGION_RE.finditer(text):
+        out.append(normalize_prose(text[position : match.start()]))
+        out.append(match.group(0))
+        position = match.end()
+    out.append(normalize_prose(text[position:]))
+    return "".join(out)
+
 
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
@@ -714,17 +763,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
-        # Bot API 10.1 Rich Messages: render constructs the legacy MarkdownV2
-        # path degrades (tables → bullet lists, task lists, <details>, block
-        # math) via sendRichMessage / editMessageText's rich_message param using
-        # the raw agent markdown. Disabled by default so Telegram messages stay
-        # easy to copy as plain text; users can opt in for richer rendering on
-        # clients that accept but render rich messages poorly via
-        # platforms.telegram.extra.rich_messages: true.  Keep this opt-in:
-        # current Telegram clients can make rich messages difficult to copy
-        # as plain text, which is worse than degraded table/task-list rendering
-        # for command snippets and mobile handoffs.
-        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        # Bot API 10.1 Rich Messages: ``auto`` preserves Hermes' adaptive
+        # routing, ``always`` sends every eligible final response through the
+        # rich endpoint, and ``never`` keeps legacy MarkdownV2. Boolean values
+        # remain backward-compatible: true=auto, false=never.
+        self._rich_message_mode: str = self._coerce_rich_message_mode()
+        self._rich_messages_enabled: bool = self._rich_message_mode != "never"
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
@@ -1973,6 +2017,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 return True
         return False
 
+    def _coerce_rich_message_mode(self) -> str:
+        """Normalize the Telegram Rich Message routing mode.
+
+        ``auto`` is the default adaptive behavior. Existing boolean config is
+        intentionally preserved: true means auto and false means never.
+        Unknown values fail closed to auto rather than disabling the feature
+        unexpectedly after a config typo.
+        """
+        value = self.config.extra.get("rich_messages") if getattr(self.config, "extra", None) else None
+        if value is None:
+            return "auto"
+        if isinstance(value, bool):
+            return "auto" if value else "never"
+        if isinstance(value, (int, float)):
+            return "auto" if value else "never"
+        normalized = str(value).strip().lower()
+        if normalized in {"always", "on", "true", "1", "yes"}:
+            return "always" if normalized == "always" else "auto"
+        if normalized in {"never", "off", "false", "0", "no"}:
+            return "never"
+        if normalized == "auto":
+            return "auto"
+        logger.warning("Unknown Telegram rich_messages mode %r; using auto", value)
+        return "auto"
+
     def _coerce_bool_extra(self, key: str, default: bool = False) -> bool:
         value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
         if value is None:
@@ -2095,17 +2164,11 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(content and self._RICH_CJK_RE.search(content))
 
     def _needs_rich_rendering(self, content: str) -> bool:
-        """Return True for markdown constructs that the legacy path degrades.
-
-        Keep ordinary replies on the pre-rich MarkdownV2 path so Telegram
-        clients render a consistent font weight/spacing. The rich endpoint is
-        reserved for constructs where raw markdown materially improves output:
-        pipe tables (MarkdownV2 has no table syntax and rewrites them into
-        bullet lists), GFM task lists, collapsible ``<details>`` blocks, and
-        block math.  Adapted from #45995 (@YonganZhang).
-        """
+        """Return whether this content should use the configured rich mode."""
         if not content:
             return False
+        if getattr(self, "_rich_message_mode", "auto") == "always":
+            return True
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
@@ -5764,6 +5827,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
+
+        # Apply Telegram-only visual spacing at the final transport boundary.
+        # Cron agents use platform="cron" upstream, so a pre-delivery output
+        # guard cannot reliably infer that the destination is Telegram.
+        content = _telegram_add_visual_paragraph_spacing(content)
 
         # The cooldown is reserved immediately before each Bot API send below,
         # not once for the whole high-level operation. This keeps rich sends,
