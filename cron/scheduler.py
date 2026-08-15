@@ -5961,7 +5961,13 @@ def run_job(
         from cron.outbound import job_allows_messaging
 
         _VAR_MAP["HERMES_CRON_JOB_ID"].set(str(job_id or ""))
-        _VAR_MAP["HERMES_CRON_RUN_ID"].set(str(uuid.uuid4()))
+        claim = job.get("fire_claim")
+        durable_run_id = (
+            str(claim.get("run_id") or "").strip()
+            if isinstance(claim, dict)
+            else ""
+        )
+        _VAR_MAP["HERMES_CRON_RUN_ID"].set(durable_run_id or str(uuid.uuid4()))
         _VAR_MAP["HERMES_CRON_ALLOW_MESSAGING"].set(
             "1" if job_allows_messaging(job) and delivery_target else ""
         )

@@ -3607,7 +3607,16 @@ def _claim_job_for_fire_locked(
             # stale lease, and the previous runner must not heartbeat the new
             # claim merely because hostname + PID are unchanged.
             owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-            job["fire_claim"] = {"at": now.isoformat(), "by": owner}
+            prior_run_id = (
+                str(existing.get("run_id") or "").strip()
+                if isinstance(existing, dict)
+                else ""
+            )
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": owner,
+                "run_id": prior_run_id or str(uuid.uuid4()),
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = _compute_next_run_for_job(job, now.isoformat())
