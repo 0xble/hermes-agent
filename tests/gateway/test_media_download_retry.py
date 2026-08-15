@@ -31,8 +31,9 @@ def _make_http_status_error(status_code: int) -> httpx.HTTPStatusError:
     )
 
 
-def _make_timeout_error() -> httpx.TimeoutException:
-    return httpx.TimeoutException("timed out")
+def _make_timeout_error() -> httpx.ConnectTimeout:
+    request = httpx.Request("GET", "http://example.com/media")
+    return httpx.ConnectTimeout("timed out", request=request)
 
 
 def _make_stream_response(content: bytes = b"\xff\xd8\xff fake media"):
