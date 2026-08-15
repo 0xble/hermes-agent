@@ -4557,6 +4557,35 @@ def _is_overload_error(
         return False
 
 
+def _transient_credential_retry_reason(
+    exc: Exception,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> Optional[str]:
+    """Return the bounded same-provider retry reason, if any."""
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        classified = classify_api_error(
+            exc,
+            provider=provider or "",
+            model=model or "",
+        )
+        if classified.reason in {
+            FailoverReason.overloaded,
+            FailoverReason.server_error,
+            FailoverReason.timeout,
+        }:
+            return classified.reason.value
+    except Exception:
+        logger.debug(
+            "Auxiliary transient credential classification failed",
+            exc_info=True,
+        )
+    return None
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -5071,6 +5100,44 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
             _evict_cached_clients(normalized)
             return True
     return False
+
+
+def _select_transient_aux_alternate(
+    provider: str,
+    *,
+    failed_api_key: str,
+    reason: str,
+) -> Optional[Tuple[str, Optional[str], str]]:
+    """Select one alternate runtime credential without rotating pool state."""
+    normalized = _normalize_aux_provider(provider)
+    try:
+        pool = load_pool(normalized)
+    except Exception as load_exc:
+        logger.debug(
+            "Auxiliary client: could not load pool for %s transient recovery: %s",
+            normalized,
+            load_exc,
+        )
+        return None
+    if not pool or not pool.has_credentials():
+        return None
+
+    failed_id = pool.entry_id_for_api_key(failed_api_key or None)
+    alternate = pool.select_alternate(
+        exclude_id=failed_id,
+        exclude_runtime_key=failed_api_key or None,
+    )
+    if alternate is None:
+        return None
+    alternate_key = str(getattr(alternate, "runtime_api_key", "") or "").strip()
+    if not alternate_key or alternate_key == failed_api_key:
+        return None
+
+    if failed_id:
+        pool.soft_cooldown(failed_id, reason=reason)
+    alternate_base = getattr(alternate, "runtime_base_url", None)
+    alternate_label = str(getattr(alternate, "label", "") or alternate.id)
+    return alternate_key, alternate_base, alternate_label
 
 
 def _retry_same_provider_sync(
@@ -10669,6 +10736,48 @@ def _call_llm_impl(
                     else:
                         raise
 
+        transient_reason = _transient_credential_retry_reason(
+            first_err,
+            provider=pool_provider or resolved_provider or "",
+            model=final_model or "",
+        )
+        if pool_provider and transient_reason:
+            alternate = _select_transient_aux_alternate(
+                pool_provider,
+                failed_api_key=_client_api_key,
+                reason=transient_reason,
+            )
+            if alternate is not None:
+                alternate_key, alternate_base, alternate_label = alternate
+                logger.info(
+                    "Auxiliary %s: transient %s on %s; trying alternate credential %s",
+                    task or "call",
+                    transient_reason,
+                    pool_provider,
+                    alternate_label,
+                )
+                try:
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=pool_provider,
+                        resolved_model=resolved_model or final_model,
+                        resolved_base_url=alternate_base or resolved_base_url,
+                        resolved_api_key=alternate_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        extra_headers=extra_headers,
+                    )
+                except Exception as alternate_err:
+                    first_err = alternate_err
+
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
         # try alternative providers instead of giving up.  This handles the
@@ -10699,11 +10808,11 @@ def _call_llm_impl(
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
-            or _is_overload_error(
+            or _transient_credential_retry_reason(
                 first_err,
                 provider=resolved_provider or "",
                 model=final_model or "",
-            )
+            ) is not None
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -10727,11 +10836,11 @@ def _call_llm_impl(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
-            or _is_overload_error(
+            or _transient_credential_retry_reason(
                 first_err,
                 provider=resolved_provider or "",
                 model=final_model or "",
-            )
+            ) is not None
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -11466,6 +11575,46 @@ async def _async_call_llm_impl(
                     else:
                         raise
 
+        transient_reason = _transient_credential_retry_reason(
+            first_err,
+            provider=pool_provider or resolved_provider or "",
+            model=final_model or "",
+        )
+        if pool_provider and transient_reason:
+            alternate = _select_transient_aux_alternate(
+                pool_provider,
+                failed_api_key=_client_api_key,
+                reason=transient_reason,
+            )
+            if alternate is not None:
+                alternate_key, alternate_base, alternate_label = alternate
+                logger.info(
+                    "Auxiliary %s (async): transient %s on %s; trying alternate credential %s",
+                    task or "call",
+                    transient_reason,
+                    pool_provider,
+                    alternate_label,
+                )
+                try:
+                    return await _retry_same_provider_async(
+                        task=task,
+                        resolved_provider=pool_provider,
+                        resolved_model=resolved_model or final_model,
+                        resolved_base_url=alternate_base or resolved_base_url,
+                        resolved_api_key=alternate_key,
+                        resolved_api_mode=resolved_api_mode,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                    )
+                except Exception as alternate_err:
+                    first_err = alternate_err
+
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         # Auth error fallback (#21165): a 401 that survived the refresh path
         # falls back in auto mode just like the sync call_llm() path. Auth is
@@ -11476,11 +11625,11 @@ async def _async_call_llm_impl(
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
-            or _is_overload_error(
+            or _transient_credential_retry_reason(
                 first_err,
                 provider=resolved_provider or "",
                 model=final_model or "",
-            )
+            ) is not None
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -11496,11 +11645,11 @@ async def _async_call_llm_impl(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
-            or _is_overload_error(
+            or _transient_credential_retry_reason(
                 first_err,
                 provider=resolved_provider or "",
                 model=final_model or "",
-            )
+            ) is not None
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )

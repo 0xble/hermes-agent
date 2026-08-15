@@ -2014,6 +2014,188 @@ def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+class _StatusError(Exception):
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TestAuxiliaryTransientCredentialRetry:
+    """Transient provider failures try one isolated pool credential first."""
+
+    @staticmethod
+    def _overload():
+        return RuntimeError("Our servers are currently overloaded. Please try again later.")
+
+    @staticmethod
+    def _route_patches(client):
+        return (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openai-codex", "gpt-5.6-terra", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "gpt-5.6-terra"),
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (RuntimeError("Our servers are currently overloaded"), "overloaded"),
+            (_StatusError("provider failed", status_code=500), "server_error"),
+            (TimeoutError("request timed out"), "timeout"),
+        ],
+    )
+    def test_retry_reasons_are_bounded_to_transient_provider_failures(
+        self, error, expected
+    ):
+        from agent.auxiliary_client import _transient_credential_retry_reason
+
+        assert _transient_credential_retry_reason(
+            error,
+            provider="test-provider",
+            model="test-model",
+        ) == expected
+
+    def test_selector_soft_cools_failed_entry_without_exhausting(self):
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.entry_id_for_api_key.return_value = "entry-a"
+        pool.select_alternate.return_value = SimpleNamespace(
+            id="entry-b",
+            label="account-b",
+            runtime_api_key="alternate-token",
+            runtime_base_url="https://provider.example/v1",
+        )
+
+        with patch("agent.auxiliary_client.load_pool", return_value=pool):
+            from agent.auxiliary_client import _select_transient_aux_alternate
+
+            selected = _select_transient_aux_alternate(
+                "test-provider",
+                failed_api_key="primary-token",
+                reason="overloaded",
+            )
+
+        assert selected == (
+            "alternate-token",
+            "https://provider.example/v1",
+            "account-b",
+        )
+        pool.select_alternate.assert_called_once_with(
+            exclude_id="entry-a",
+            exclude_runtime_key="primary-token",
+        )
+        pool.soft_cooldown.assert_called_once_with("entry-a", reason="overloaded")
+        pool.mark_exhausted_and_rotate.assert_not_called()
+
+    def test_sync_overload_uses_one_alternate_credential(self):
+        primary = MagicMock()
+        primary.api_key = "primary-token"
+        primary.base_url = "https://chatgpt.com/backend-api/codex/"
+        primary.chat.completions.create.side_effect = self._overload()
+
+        p1, p2 = self._route_patches(primary)
+        with (
+            p1,
+            p2,
+            patch(
+                "agent.auxiliary_client._select_transient_aux_alternate",
+                return_value=("alternate-token", "https://chatgpt.com/backend-api/codex/", "account-b"),
+                create=True,
+            ) as select_alt,
+            patch(
+                "agent.auxiliary_client._retry_same_provider_sync",
+                return_value={"alternate": True},
+            ) as retry_alt,
+            patch("agent.auxiliary_client._try_configured_fallback_chain") as fallback,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result == {"alternate": True}
+        select_alt.assert_called_once_with(
+            "openai-codex",
+            failed_api_key="primary-token",
+            reason="overloaded",
+        )
+        assert retry_alt.call_args.kwargs["resolved_api_key"] == "alternate-token"
+        fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_overload_uses_one_alternate_credential(self):
+        primary = MagicMock()
+        primary.api_key = "primary-token"
+        primary.base_url = "https://chatgpt.com/backend-api/codex/"
+        primary.chat.completions.create = AsyncMock(side_effect=self._overload())
+
+        p1, p2 = self._route_patches(primary)
+        with (
+            p1,
+            p2,
+            patch(
+                "agent.auxiliary_client._select_transient_aux_alternate",
+                return_value=("alternate-token", "https://chatgpt.com/backend-api/codex/", "account-b"),
+                create=True,
+            ),
+            patch(
+                "agent.auxiliary_client._retry_same_provider_async",
+                AsyncMock(return_value={"alternate": True}),
+            ) as retry_alt,
+            patch("agent.auxiliary_client._try_configured_fallback_chain") as fallback,
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result == {"alternate": True}
+        assert retry_alt.call_args.kwargs["resolved_api_key"] == "alternate-token"
+        fallback.assert_not_called()
+
+    def test_failed_alternate_continues_to_model_fallback(self):
+        primary = MagicMock()
+        primary.api_key = "primary-token"
+        primary.base_url = "https://chatgpt.com/backend-api/codex/"
+        primary.chat.completions.create.side_effect = self._overload()
+        fallback_client = MagicMock()
+
+        p1, p2 = self._route_patches(primary)
+        with (
+            p1,
+            p2,
+            patch(
+                "agent.auxiliary_client._select_transient_aux_alternate",
+                return_value=("alternate-token", "https://chatgpt.com/backend-api/codex/", "account-b"),
+                create=True,
+            ),
+            patch(
+                "agent.auxiliary_client._retry_same_provider_sync",
+                side_effect=self._overload(),
+            ) as retry_alt,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fallback_client, "gemini-3.7-flash", "fallback_chain[0](google)"),
+            ) as fallback,
+            patch(
+                "agent.auxiliary_client._call_fallback_candidate_sync",
+                return_value={"fallback": True},
+            ),
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert result == {"fallback": True}
+        retry_alt.assert_called_once()
+        assert fallback.call_args.kwargs["reason"] == "provider overloaded"
+
+
 class TestAuxiliaryOverloadFallback:
     """Provider overload is a capacity failure for auxiliary routing."""
 
@@ -2045,6 +2227,10 @@ class TestAuxiliaryOverloadFallback:
             p1,
             p2,
             patch(
+                "agent.auxiliary_client._select_transient_aux_alternate",
+                return_value=None,
+            ),
+            patch(
                 "agent.auxiliary_client._try_configured_fallback_chain",
                 return_value=(fallback, "gemini-3.7-flash", "fallback_chain[0](google)"),
             ) as configured,
@@ -2073,6 +2259,10 @@ class TestAuxiliaryOverloadFallback:
         with (
             p1,
             p2,
+            patch(
+                "agent.auxiliary_client._select_transient_aux_alternate",
+                return_value=None,
+            ),
             patch(
                 "agent.auxiliary_client._try_configured_fallback_chain",
                 return_value=(fallback, "gemini-3.7-flash", "fallback_chain[0](google)"),

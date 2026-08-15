@@ -47,10 +47,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback`; `fix(agent): generalize transient alternate credential recovery` | Try one alternate compatible same-provider credential for recoverable upstream failures before activating the fallback model. |
 | HERMES-022 | Active | `feat(cron): job-scoped native outbound messages` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, adapter identity, and idempotent multi-message delivery. |
 | HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
+| HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-024 — Retry auxiliary transient failure on one alternate credential
+
+- **Summary:** For classified provider overload, server-error, and timeout failures, sync and async auxiliary calls select one distinct healthy runtime credential from the matching provider pool before model/provider fallback. The retry binds that credential to an isolated auxiliary client, leaves the main conversation route and pool cursor unchanged, applies only a short soft cooldown to the failed entry, and never marks either credential exhausted for a transient failure.
+- **Surfaces:** `agent/auxiliary_client.py`; `tests/agent/test_auxiliary_client.py`.
+- **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryTransientCredentialRetry or AuxiliaryOverloadFallback'`.
+- **Rollback:** Remove `_transient_credential_retry_reason`, `_select_transient_aux_alternate`, the sync/async alternate retry blocks, and the HERMES-024 focused tests. Preserve HERMES-023 overload fallback and all durable auth, billing, and rate-limit rotation behavior.
+- **Retirement:** Retire after released upstream provides provider-neutral, non-exhausting, bounded same-provider credential alternation for equivalent auxiliary transient failures before model/provider fallback.
 
 ### HERMES-023 — Route auxiliary provider overload through fallback
 
