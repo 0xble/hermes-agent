@@ -211,8 +211,9 @@ class TestOutboundLedger:
             )
 
     def test_classify_unconfirmed_result_is_ambiguous(self):
-        classified = classify_send_result({"ok": True})
-        assert classified["status"] == "ambiguous"
+        assert classify_send_result({"ok": True})["status"] == "ambiguous"
+        assert classify_send_result({"error": "timeout"})["status"] == "ambiguous"
+        assert classify_send_result({"error": "no socket", "delivery_stage": "pre_send"})["status"] == "failed"
 
 
 class TestSendGate:
