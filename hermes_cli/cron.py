@@ -809,6 +809,7 @@ def cron_create(args):
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         timezone=getattr(args, "timezone", None),
+        allow_messaging=getattr(args, "allow_messaging", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -890,6 +891,7 @@ def cron_edit(args):
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
         timezone=getattr(args, "timezone", None),
+        allow_messaging=getattr(args, "allow_messaging", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

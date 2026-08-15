@@ -27,3 +27,12 @@ def test_cronjob_schema_exposes_optional_iana_timezone():
     assert "IANA" in timezone["description"]
     assert "empty string" in timezone["description"]
 
+
+def test_cronjob_schema_exposes_allow_messaging_opt_in():
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    field = CRONJOB_SCHEMA["parameters"]["properties"]["allow_messaging"]
+    assert field["type"] == "boolean"
+    assert "origin" in field["description"]
+    assert "[SILENT]" in field["description"]
+

@@ -1536,6 +1536,7 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
     timezone: Optional[str] = None,
+    allow_messaging: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
 ) -> str:
@@ -1662,6 +1663,7 @@ def cronjob(
                         _normalize_deliver_param(failure_deliver)
                     ),
                     timezone=timezone,
+                    allow_messaging=bool(allow_messaging),
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1973,6 +1975,8 @@ def cronjob(
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
+            if allow_messaging is not None:
+                updates["allow_messaging"] = bool(allow_messaging)
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
@@ -2110,6 +2114,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "items": {"type": "string"},
                 "description": "Optional toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\"]) — cuts token overhead. Infer from the prompt. Omit for all default tools. On update, [] clears."
             },
+            "allow_messaging": {
+                "type": "boolean",
+                "description": "When true, this cron job may send multiple native messages through send_message to its bound origin only. Default false. After those sends, return [SILENT] so the scheduler does not add a duplicate summary."
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute existing path to run the job from: injects that directory's AGENTS.md/context files and anchors terminal/file tools there. On update, '' clears."
@@ -2188,6 +2196,7 @@ def _cronjob_handler(args, **kw):
         monitor_script=_mon_script,
         monitor_url=_mon_url,
         timezone=args.get("timezone"),
+        allow_messaging=args.get("allow_messaging"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     )
