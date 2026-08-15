@@ -153,7 +153,7 @@ def claim_or_reuse(
                     f"message_key '{message_key}' was already used in this run "
                     "with a different body or target."
                 )
-            if record["status"] == "failed":
+            if record["status"] in {"failed", "queued"}:
                 conn.execute(
                     """UPDATE outbound_messages
                        SET status='queued', error=NULL, updated_at=?
@@ -190,6 +190,22 @@ def claim_or_reuse(
             (job_id, run_id, message_key),
         ).fetchone()
     return {"action": "claim", "record": dict(row)}
+
+
+def begin_send(*, job_id: str, run_id: str, message_key: str) -> Dict[str, Any]:
+    """Atomically fence transport start; retries reuse an ambiguous send."""
+    with _transaction() as conn:
+        changed = conn.execute(
+            "UPDATE outbound_messages SET status='ambiguous', error='send started; result not recorded', updated_at=? WHERE job_id=? AND run_id=? AND message_key=? AND status='queued'",
+            (_hermes_now().isoformat(), job_id, run_id, message_key),
+        ).rowcount
+        row = conn.execute(
+            "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+            (job_id, run_id, message_key),
+        ).fetchone()
+    if not row:
+        raise LookupError("outbound message record disappeared")
+    return {"action": "send" if changed else "reuse", "record": dict(row)}
 
 
 def mark_result(

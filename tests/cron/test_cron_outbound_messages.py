@@ -178,6 +178,14 @@ class TestOutboundLedger:
         assert retried["action"] == "claim"
         assert retried["record"]["status"] == "queued"
         assert retried["record"]["error"] is None
+        assert claim_or_reuse(**params)["action"] == "claim"
+        started = cron_outbound.begin_send(job_id="job-1", run_id="run-1",
+                                           message_key="automatic-action:retry")
+        assert started["action"] == "send"
+        blocked = cron_outbound.begin_send(job_id="job-1", run_id="run-1",
+                                           message_key="automatic-action:retry")
+        assert blocked["action"] == "reuse"
+        assert blocked["record"]["status"] == "ambiguous"
 
     def test_same_key_different_body_fails_closed(self, tmp_outbound):
         claim_or_reuse(

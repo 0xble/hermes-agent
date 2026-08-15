@@ -880,6 +880,12 @@ def _maybe_handle_cron_outbound(args):
     if claim["action"] == "reuse":
         return cron_outbound.dumps(cron_outbound.reuse_payload(claim["record"]))
 
+    started = cron_outbound.begin_send(
+        job_id=job_id, run_id=run_id, message_key=message_key
+    )
+    if started["action"] == "reuse":
+        return cron_outbound.dumps(cron_outbound.reuse_payload(started["record"]))
+
     try:
         from gateway.session_context import get_session_env
 
