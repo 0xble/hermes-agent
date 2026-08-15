@@ -5851,10 +5851,22 @@ def run_job(
         )
         _job_workdir = None
 
+    # Native cron messages are restricted to the adapter identity of the
+    # profile that owns the scheduled job. Bind that identity before the agent
+    # runs; leaving it empty makes send_message fail closed even for an opted-in
+    # job with a valid origin.
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        _job_profile = get_active_profile_name() or "default"
+    except Exception:
+        _job_profile = "default"
+
     _ctx_tokens = set_session_vars(
         platform="",
         chat_id="",
         chat_name="",
+        profile=_job_profile,
         # A cron job cannot receive a completion after its turn ends. We clear the
         # HERMES_SESSION_* routing keys just below, so an async delegation's
         # completion event carries session_key="" — _enrich_async_delegation_routing

@@ -154,6 +154,38 @@ class TestSessionDbInitTimeout:
         assert final_response == "ok"
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
 
+    def test_run_job_binds_active_profile_for_native_messages(self, tmp_path):
+        """The scheduler supplies the trusted profile required by send_message."""
+        from gateway.session_context import get_session_env
+
+        job = {"id": "profile-bound", "name": "test", "prompt": "hello"}
+        observed = {}
+
+        def run_conversation(*_args, **_kwargs):
+            observed["profile"] = get_session_env("HERMES_SESSION_PROFILE", "")
+            return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="secondary"), \
+             patch("hermes_state.SessionDB"), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value=_RUNTIME,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = run_conversation
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, _error = run_job(job)
+
+        assert success is True
+        assert final_response == "ok"
+        assert observed["profile"] == "secondary"
+
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still
         bounds the call (mirrors HERMES_CRON_TIMEOUT's own fallback)."""
