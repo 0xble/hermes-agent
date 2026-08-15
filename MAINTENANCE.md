@@ -49,10 +49,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
 | HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
 | HERMES-025 | Active | `fix(compression): report aborted compaction accurately` | Emit committed, aborted, or deferred terminal outcomes instead of unconditional success. |
+| HERMES-026 | Active | `feat(memory): retain source material automatically`; `fix(memory): gate raw attachment retention` | Preserve source evidence while requiring explicit opt-in before reading or uploading raw attachment bytes. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-026 — Retain source evidence without implicit raw attachment upload
+
+- **Summary:** Automatically retains substantive source-like pasted text, complete supported tool extractions, and durable text artifacts with stable provenance and readback verification. Raw file attachments cross a stronger trust boundary: discovery does not open, hash, or upload their bytes unless the Hindsight provider has the explicit boolean `retain_attachments: true`; the default is false.
+- **Surfaces:** `plugins/memory/hindsight/__init__.py`; `plugins/memory/hindsight/source_retention.py`; `tests/plugins/memory/test_source_retention.py`; `tests/plugins/memory/test_source_retention_canary.py`.
+- **Upstream tracking:** Local fork behavior; no released upstream equivalent or privacy-gated source-retention contract has been identified.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/plugins/memory/test_source_retention.py tests/plugins/memory/test_source_retention_canary.py`.
+- **Rollback:** Remove automatic source discovery, source-ledger/readback tracking, and HERMES-026 tests together. Preserve ordinary conversation retain, HERMES-008 observation scopes, HERMES-009 extraction-error handling, and HERMES-010 embedded-daemon safety.
+- **Retirement:** Retire after released upstream preserves equivalent source provenance and durability while keeping raw attachment reads/uploads default-off behind an explicit trust-boundary opt-in.
 
 ### HERMES-025 — Outcome-aware compaction lifecycle
 
