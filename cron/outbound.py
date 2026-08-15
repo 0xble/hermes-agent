@@ -148,69 +148,53 @@ def get_record(job_id: str, run_id: str, message_key: str) -> Optional[Dict[str,
 
 
 def claim_or_reuse(
-    *,
-    job_id: str,
-    run_id: str,
-    message_key: str,
-    target: str,
-    body: str,
-    platform: str,
-    chat_id: str,
-    thread_id: Optional[str],
+    *, job_id: str, run_id: str, message_key: str, target: str, body: str,
+    platform: str, chat_id: str, thread_id: Optional[str],
+    expected_fire_owner: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Atomically claim a send or return a previous terminal/in-flight record."""
-    now = _hermes_now().isoformat()
-    body_hash = hash_body(body)
-    with _transaction() as conn:
-        existing = conn.execute(
-            "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
-            (job_id, run_id, message_key),
-        ).fetchone()
-        if existing:
-            record = dict(existing)
-            if record["body_hash"] != body_hash or record["target"] != target:
-                raise ValueError(
-                    f"message_key '{message_key}' was already used in this run "
-                    "with a different body or target."
-                )
-            if record["status"] in {"failed", "queued"}:
-                conn.execute(
-                    """UPDATE outbound_messages
-                       SET status='queued', error=NULL, updated_at=?
-                       WHERE job_id=? AND run_id=? AND message_key=?""",
-                    (now, job_id, run_id, message_key),
-                )
-                row = conn.execute(
-                    "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
-                    (job_id, run_id, message_key),
-                ).fetchone()
-                return {"action": "claim", "record": dict(row)}
-            return {"action": "reuse", "record": record}
-        conn.execute(
-            """INSERT INTO outbound_messages (
-                   job_id, run_id, message_key, target, body_hash, status,
-                   platform, chat_id, thread_id, transport_message_id, error,
-                   created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, NULL, NULL, ?, ?)""",
-            (
-                job_id,
-                run_id,
-                message_key,
-                target,
-                body_hash,
-                platform,
-                chat_id,
-                thread_id,
-                now,
-                now,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
-            (job_id, run_id, message_key),
-        ).fetchone()
-    return {"action": "claim", "record": dict(row)}
-
+    """Claim a send only while the durable fire owner is held."""
+    from cron.jobs import fire_claim_fence
+    fence = (
+        fire_claim_fence(job_id, expected_owner=expected_fire_owner)
+        if expected_fire_owner else contextlib.nullcontext(True)
+    )
+    with fence as owns_claim:
+        if not owns_claim:
+            raise PermissionError("cron fire claim ownership lost before outbound claim")
+        now = _hermes_now().isoformat()
+        body_hash = hash_body(body)
+        with _transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+                (job_id, run_id, message_key),
+            ).fetchone()
+            if existing:
+                record = dict(existing)
+                if record["body_hash"] != body_hash or record["target"] != target:
+                    raise ValueError(
+                        f"message_key '{message_key}' was already used in this run with a different body or target."
+                    )
+                if record["status"] in {"failed", "queued"}:
+                    conn.execute(
+                        "UPDATE outbound_messages SET status='queued', error=NULL, updated_at=? WHERE job_id=? AND run_id=? AND message_key=?",
+                        (now, job_id, run_id, message_key),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+                        (job_id, run_id, message_key),
+                    ).fetchone()
+                    return {"action": "claim", "record": dict(row)}
+                return {"action": "reuse", "record": record}
+            conn.execute(
+                """INSERT INTO outbound_messages (job_id, run_id, message_key, target, body_hash, status, platform, chat_id, thread_id, transport_message_id, error, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, NULL, NULL, ?, ?)""",
+                (job_id, run_id, message_key, target, body_hash, platform, chat_id, thread_id, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+                (job_id, run_id, message_key),
+            ).fetchone()
+        return {"action": "claim", "record": dict(row)}
 
 def begin_send(
     *, job_id: str, run_id: str, message_key: str, expected_fire_owner: Optional[str] = None

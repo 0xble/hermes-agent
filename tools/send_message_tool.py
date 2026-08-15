@@ -892,6 +892,7 @@ def _maybe_handle_cron_outbound(args):
             platform=origin["platform"],
             chat_id=str(origin["chat_id"]),
             thread_id=origin.get("thread_id"),
+            expected_fire_owner=fire_owner,
         )
     except ValueError as exc:
         return json.dumps(_error(str(exc)))
