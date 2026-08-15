@@ -683,23 +683,26 @@ class TestFailureAttribution:
         assert failed.failure_reason != "billing"
 
     @pytest.mark.parametrize(
+        "provider",
+        ["openai-codex", "test-isolated-provider"],
+    )
+    @pytest.mark.parametrize(
         "reason_name",
         ["overloaded", "server_error", "timeout"],
     )
     def test_transient_provider_failure_tries_one_alternate_without_exhausting(
-        self, tmp_path, monkeypatch, reason_name
+        self, tmp_path, monkeypatch, provider, reason_name
     ):
-        """Transient upstream failures should try one alternate account before
+        """Any matching provider pool should try one alternate credential before
         provider fallback without marking either credential exhausted."""
         from agent.error_classifier import FailoverReason
 
         pool = self._make_pool(
             tmp_path, monkeypatch,
             [self._entry(0, "key-a"), self._entry(1, "key-b")],
-            provider="openai-codex",
+            provider=provider,
         )
-        agent = self._agent(pool, failing_key="key-a")
-        agent.provider = "openai-codex"
+        agent = self._agent(pool, failing_key="key-a", provider=provider)
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
