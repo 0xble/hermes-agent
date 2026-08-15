@@ -4,10 +4,14 @@ import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from plugins.memory.hindsight import HindsightMemoryProvider
-from plugins.memory.hindsight.source_retention import SourceCandidate, discover_source_candidates
+from plugins.memory.hindsight.source_retention import (
+    SourceCandidate,
+    discover_source_candidates,
+    read_verified_source_file,
+)
 
 
 def _tool_turn(name, arguments, result, call_id="call-1"):
@@ -146,7 +150,10 @@ def test_attachment_bytes_require_explicit_opt_in(tmp_path, monkeypatch):
     )
     assert len(candidates) == 1
     assert candidates[0].file_path == str(path.resolve())
-    assert reads == 1
+    assert reads == 0
+    assert read_verified_source_file(candidates[0], (tmp_path,)) == b"private source bytes"
+    path.write_bytes(b"replaced after discovery")
+    assert read_verified_source_file(candidates[0], (tmp_path,)) is None
 
 
 def _source_candidate(tmp_path):
@@ -183,8 +190,10 @@ def test_automatic_source_retain_is_deduplicated_and_tracked(tmp_path):
     )
     candidate = _source_candidate(tmp_path)
 
-    provider._retain_source_candidate(candidate, "test-bank")
-    provider._retain_source_candidate(candidate, "test-bank")
+    with patch("plugins.memory.hindsight.read_verified_source_file",
+               return_value=b"source material"):
+        provider._retain_source_candidate(candidate, "test-bank")
+        provider._retain_source_candidate(candidate, "test-bank")
 
     provider._run_hindsight_operation.assert_called_once()
     assert provider._source_retain_ops["source-op-1"] == candidate
@@ -198,7 +207,9 @@ def test_automatic_source_retain_fails_soft_and_allows_bounded_retry(tmp_path):
     )
     candidate = _source_candidate(tmp_path)
 
-    provider._retain_source_candidates([candidate], "test-bank")
+    with patch("plugins.memory.hindsight.read_verified_source_file",
+               return_value=b"source material"):
+        provider._retain_source_candidates([candidate], "test-bank")
 
     assert candidate.automatic_key not in provider._source_retain_keys
     provider._run_hindsight_operation.assert_called_once()
