@@ -1890,6 +1890,11 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert [(str(path), shell) for path, shell in refs] == [
             ("/remote/workspace/job.sh", True)
         ]
+        writable = list(_iter_referenced_shell_scripts(
+            "/opt/homebrew/bin/bash /remote/workspace/job.sh", remote=True))
+        assert [str(path) for path, _ in writable] == [
+            "/opt/homebrew/bin/bash", "/remote/workspace/job.sh"
+        ]
 
     def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
