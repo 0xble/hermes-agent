@@ -2803,7 +2803,16 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
     for stale in _existing_malformed_backups(db_path)[keep:]:
         for victim in (
             stale,
+<<<<<<< HEAD
             *(stale.with_name(stale.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
+||||||| parent of c7c71476f9 (fix(review): commit complete malformed backup bundles)
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+=======
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+            stale.with_name("." + stale.name + ".complete"),
+>>>>>>> c7c71476f9 (fix(review): commit complete malformed backup bundles)
         ):
             try:
                 victim.unlink(missing_ok=True)
