@@ -7621,6 +7621,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Last title scheduled per Telegram topic/session. Auto-title callbacks
+        # are best-effort and may race across turn and response lanes; identical
+        # callbacks must not spend another Telegram mutation.
+        self._telegram_topic_last_scheduled_titles: Dict[tuple[str, str, str], str] = {}
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -25863,6 +25867,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if self._telegram_topic_auto_rename_disabled(source):
             return
+
+        # ``User request:`` is the wrapper heading used when response-aware
+        # context is passed to the title generator. It is not a topic title and
+        # must never be sent to Telegram as an intermediate mutation.
+        topic_name = self._sanitize_telegram_topic_title(title)
+        if topic_name.casefold() in {"user request", "user request:"}:
+            logger.debug(
+                "Skipping placeholder Telegram topic title chat=%s thread_id=%s",
+                source.chat_id,
+                source.thread_id,
+            )
+            return
+
+        key = (str(source.chat_id or ""), str(source.thread_id or ""), str(session_id or ""))
+        if key[0] and key[1]:
+            previous = self._telegram_topic_last_scheduled_titles.get(key)
+            if previous == topic_name:
+                logger.debug(
+                    "Skipping duplicate Telegram topic title chat=%s thread_id=%s title=%r",
+                    source.chat_id,
+                    source.thread_id,
+                    topic_name,
+                )
+                return
+            self._telegram_topic_last_scheduled_titles[key] = topic_name
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

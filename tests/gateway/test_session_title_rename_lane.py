@@ -15,6 +15,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner, TurnRunner
+from gateway.session import SessionSource
 
 
 def _attach(lane):
@@ -109,3 +110,60 @@ def test_telegram_topic_title_is_deferred_until_response():
     assert agent._defer_topic_title_until_response is True
     assert not hasattr(agent, "_on_session_title")
     assert renames == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_topic_skips_placeholder_rename(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._telegram_topic_last_scheduled_titles = {}
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._telegram_topic_auto_rename_disabled = lambda source: False
+    runner._sanitize_telegram_topic_title = lambda title: title.strip()
+    runner._gateway_loop = None
+    scheduled = []
+
+    def capture(coro, loop, **kwargs):
+        coro.close()
+        scheduled.append(True)
+        return None
+
+    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+
+    runner._schedule_telegram_topic_title_rename(source, "session-1", "User request:")
+
+    assert scheduled == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_topic_deduplicates_same_title_request(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    runner._telegram_topic_last_scheduled_titles = {}
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._telegram_topic_auto_rename_disabled = lambda source: False
+    runner._sanitize_telegram_topic_title = lambda title: title.strip()
+    runner._gateway_loop = None
+    scheduled = []
+
+    def capture(coro, loop, **kwargs):
+        coro.close()
+        scheduled.append(True)
+        return None
+
+    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+
+    runner._schedule_telegram_topic_title_rename(source, "session-1", "Real title")
+    runner._schedule_telegram_topic_title_rename(source, "session-1", "Real title")
+
+    assert scheduled == [True]
