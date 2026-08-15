@@ -305,14 +305,28 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
     monkeypatch.setattr("agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP())
 
     client = GeminiNativeClient(api_key="AIza-test", base_url="https://generativelanguage.googleapis.com/v1beta")
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+        "additionalProperties": False,
+    }
     response = client.chat.completions.create(
         model="gemini-2.5-flash",
         messages=[{"role": "user", "content": "Hello"}],
+        extra_body={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "session_title", "schema": schema},
+            }
+        },
     )
 
     assert recorded["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     assert recorded["headers"]["x-goog-api-key"] == "AIza-test"
     assert "Authorization" not in recorded["headers"]
+    assert recorded["json"]["generationConfig"]["responseMimeType"] == "application/json"
+    assert recorded["json"]["generationConfig"]["responseJsonSchema"] == schema
     assert response.choices[0].message.content == "hello"
 
 

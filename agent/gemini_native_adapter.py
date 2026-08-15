@@ -656,6 +656,23 @@ def _effective_gemini_max_output_tokens(
         return max(requested, GEMINI_DEFAULT_MAX_OUTPUT_TOKENS)
     return requested
 
+def _normalize_response_format(
+    response_format: Any,
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Translate OpenAI structured-output config to Gemini generationConfig."""
+    if not isinstance(response_format, dict):
+        return None, None
+    format_type = str(response_format.get("type") or "").strip().lower()
+    if format_type == "json_object":
+        return "application/json", None
+    if format_type != "json_schema":
+        return None, None
+    schema_config = response_format.get("json_schema")
+    if not isinstance(schema_config, dict):
+        return "application/json", None
+    schema = schema_config.get("schema")
+    return "application/json", schema if isinstance(schema, dict) else None
+
 
 def build_gemini_request(
     *,
@@ -667,6 +684,7 @@ def build_gemini_request(
     top_p: Optional[float] = None,
     stop: Any = None,
     thinking_config: Any = None,
+    response_format: Any = None,
     model: str = "",
 ) -> Dict[str, Any]:
     version = _gemini_major_version(model)
@@ -701,6 +719,11 @@ def build_gemini_request(
     normalized_thinking = _normalize_thinking_config(thinking_config)
     if normalized_thinking:
         generation_config["thinkingConfig"] = normalized_thinking
+    response_mime_type, response_json_schema = _normalize_response_format(response_format)
+    if response_mime_type:
+        generation_config["responseMimeType"] = response_mime_type
+    if response_json_schema:
+        generation_config["responseJsonSchema"] = response_json_schema
     if generation_config:
         request["generationConfig"] = generation_config
 
@@ -1177,6 +1200,7 @@ class GeminiNativeClient:
         max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
         stop: Any = None,
+        response_format: Optional[Dict[str, Any]] = None,
         extra_body: Optional[Dict[str, Any]] = None,
         timeout: Any = None,
         **_: Any,
@@ -1184,6 +1208,8 @@ class GeminiNativeClient:
         thinking_config = None
         if isinstance(extra_body, dict):
             thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
+            if response_format is None:
+                response_format = extra_body.get("response_format")
 
         request = build_gemini_request(
             messages=messages or [],
@@ -1195,6 +1221,7 @@ class GeminiNativeClient:
             stop=stop,
             thinking_config=thinking_config,
             model=model,
+            response_format=response_format,
         )
 
         model = bare_gemini_model_id(model)
