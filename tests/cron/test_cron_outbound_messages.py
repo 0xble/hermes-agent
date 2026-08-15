@@ -218,8 +218,19 @@ class TestOutboundLedger:
 
 class TestSendGate:
     def _bind_cron(self, monkeypatch, *, allow=True):
+        from contextlib import nullcontext
         from gateway.session_context import _VAR_MAP
+        import cron.jobs
 
+        _VAR_MAP["HERMES_CRON_FIRE_OWNER"].set("owner-1")
+        _VAR_MAP["HERMES_SESSION_PROFILE"].set("default")
+        monkeypatch.setattr(
+            cron.jobs,
+            "fire_claim_fence",
+            lambda *args, **kwargs: nullcontext(True),
+        )
+        import cron.outbound
+        monkeypatch.setattr(cron.outbound, "live_fire_claim_matches", lambda *args: True)
         _VAR_MAP["HERMES_CRON_SESSION"].set("1")
         _VAR_MAP["HERMES_CRON_ALLOW_MESSAGING"].set("1" if allow else "")
         _VAR_MAP["HERMES_CRON_JOB_ID"].set("job-1")
