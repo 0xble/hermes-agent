@@ -900,20 +900,28 @@ def _maybe_handle_cron_outbound(args):
         return cron_outbound.dumps(cron_outbound.reuse_payload(claim["record"]))
 
     started = cron_outbound.begin_send(
-        job_id=job_id, run_id=run_id, message_key=message_key
+        job_id=job_id,
+        run_id=run_id,
+        message_key=message_key,
+        expected_fire_owner=fire_owner,
     )
     if started["action"] == "reuse":
         return cron_outbound.dumps(cron_outbound.reuse_payload(started["record"]))
 
     try:
-        raw = _handle_send({
-            "target": (
-                f"{origin['platform']}:{origin['chat_id']}"
-                + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
-            ),
-            "message": message,
-            "_profile": profile,
-        })
+        from cron.jobs import fire_claim_fence
+
+        with fire_claim_fence(job_id, expected_owner=fire_owner) as owns_claim:
+            if not owns_claim:
+                raise PermissionError("cron fire claim ownership lost before transport")
+            raw = _handle_send({
+                "target": (
+                    f"{origin['platform']}:{origin['chat_id']}"
+                    + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
+                ),
+                "message": message,
+                "_profile": profile,
+            })
     except Exception as exc:
         record = cron_outbound.mark_result(
             job_id=job_id,
@@ -921,6 +929,7 @@ def _maybe_handle_cron_outbound(args):
             message_key=message_key,
             status="ambiguous",
             error=f"send engine raised {type(exc).__name__}",
+            expected_fire_owner=fire_owner,
         )
         return cron_outbound.dumps(cron_outbound.success_payload(record))
     try:
@@ -935,6 +944,7 @@ def _maybe_handle_cron_outbound(args):
         status=classified["status"],
         transport_message_id=classified.get("transport_message_id"),
         error=classified.get("error"),
+        expected_fire_owner=fire_owner,
     )
     payload = cron_outbound.success_payload(record)
     if classified.get("error") and not payload.get("error"):

@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import threading
+import contextlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
@@ -211,21 +212,31 @@ def claim_or_reuse(
     return {"action": "claim", "record": dict(row)}
 
 
-def begin_send(*, job_id: str, run_id: str, message_key: str) -> Dict[str, Any]:
-    """Atomically fence transport start; retries reuse an ambiguous send."""
-    with _transaction() as conn:
-        changed = conn.execute(
-            "UPDATE outbound_messages SET status='ambiguous', error='send started; result not recorded', updated_at=? WHERE job_id=? AND run_id=? AND message_key=? AND status='queued'",
-            (_hermes_now().isoformat(), job_id, run_id, message_key),
-        ).rowcount
-        row = conn.execute(
-            "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
-            (job_id, run_id, message_key),
-        ).fetchone()
+def begin_send(
+    *, job_id: str, run_id: str, message_key: str, expected_fire_owner: Optional[str] = None
+) -> Dict[str, Any]:
+    """Fence transport start against the durable fire owner."""
+    from cron.jobs import fire_claim_fence
+
+    if expected_fire_owner:
+        fence = fire_claim_fence(job_id, expected_owner=expected_fire_owner)
+    else:
+        fence = contextlib.nullcontext(True)
+    with fence as owns_claim:
+        if not owns_claim:
+            raise PermissionError("cron fire claim ownership lost before send start")
+        with _transaction() as conn:
+            changed = conn.execute(
+                "UPDATE outbound_messages SET status='ambiguous', error='send started; result not recorded', updated_at=? WHERE job_id=? AND run_id=? AND message_key=? AND status='queued'",
+                (_hermes_now().isoformat(), job_id, run_id, message_key),
+            ).rowcount
+            row = conn.execute(
+                "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+                (job_id, run_id, message_key),
+            ).fetchone()
     if not row:
         raise LookupError("outbound message record disappeared")
     return {"action": "send" if changed else "reuse", "record": dict(row)}
-
 
 def mark_result(
     *,
@@ -235,9 +246,23 @@ def mark_result(
     status: str,
     transport_message_id: Optional[str] = None,
     error: Optional[str] = None,
+    expected_fire_owner: Optional[str] = None,
 ) -> Dict[str, Any]:
     if status not in {"sent", "verified", "ambiguous", "failed"}:
         raise ValueError(f"unsupported outbound status: {status}")
+    if expected_fire_owner:
+        from cron.jobs import fire_claim_fence
+        with fire_claim_fence(job_id, expected_owner=expected_fire_owner) as owns_claim:
+            if not owns_claim:
+                raise PermissionError("cron fire claim ownership lost before result")
+            return mark_result(
+                job_id=job_id,
+                run_id=run_id,
+                message_key=message_key,
+                status=status,
+                transport_message_id=transport_message_id,
+                error=error,
+            )
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         conn.execute(
