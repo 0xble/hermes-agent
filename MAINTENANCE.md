@@ -66,7 +66,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-024 — Retry auxiliary transient failure on one alternate credential
 
-- **Summary:** For classified provider overload, server-error, and timeout failures, sync and async auxiliary calls select one distinct healthy runtime credential from the matching provider pool before model/provider fallback. The retry binds that credential to an isolated auxiliary client, leaves the main conversation route and pool cursor unchanged, applies only a short soft cooldown to the failed entry, and never marks either credential exhausted for a transient failure.
+- **Summary:** For classified provider overload, server-error, and timeout failures, sync and async auxiliary calls select one distinct healthy runtime credential from the matching provider pool only when the failed runtime credential is exactly attributable. The retry binds that credential to an isolated auxiliary client, leaves the main conversation route and pool cursor unchanged, applies only a short soft cooldown to the failed entry, and never marks either credential exhausted for a transient failure.
 - **Surfaces:** `agent/auxiliary_client.py`; `tests/agent/test_auxiliary_client.py`.
 - **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
 - **Upstream PR:** None.

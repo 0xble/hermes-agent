@@ -5110,6 +5110,11 @@ def _select_transient_aux_alternate(
 ) -> Optional[Tuple[str, Optional[str], str]]:
     """Select one alternate runtime credential without rotating pool state."""
     normalized = _normalize_aux_provider(provider)
+    # Alternation is safe only when the exact credential that failed is known.
+    # Without this guard, select_alternate() can return the currently serving
+    # entry and repeat the request against the same overloaded account.
+    if not isinstance(failed_api_key, str) or not failed_api_key:
+        return None
     try:
         pool = load_pool(normalized)
     except Exception as load_exc:
@@ -10681,7 +10686,10 @@ def _call_llm_impl(
         # the correct pool entry even when another process rotated the pool
         # between this call and recovery (which leaves current()=None and makes
         # _select_unlocked() return the NEXT key by mistake).
-        _client_api_key = str(getattr(client, "api_key", "") or "")
+        _client_key_value = getattr(client, "api_key", "")
+        _client_api_key = (
+            _client_key_value if isinstance(_client_key_value, str) else ""
+        )
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint
@@ -11527,7 +11535,10 @@ async def _async_call_llm_impl(
 
         # ── Same-provider credential-pool recovery (mirrors sync) ─────
         pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=main_runtime)
-        _client_api_key = str(getattr(client, "api_key", "") or "")
+        _client_key_value = getattr(client, "api_key", "")
+        _client_api_key = (
+            _client_key_value if isinstance(_client_key_value, str) else ""
+        )
         if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
             recovery_err = first_err
             # Skip the extra retry for clear payment/quota errors — the endpoint

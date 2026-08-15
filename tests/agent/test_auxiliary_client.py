@@ -319,9 +319,9 @@ class TestMoaAggregatorSharedResolution:
         import yaml
 
         home = self._write_moa_config(tmp_path, monkeypatch)
-        cfg = yaml.safe_load((home / "config.yaml").read_text())
+        cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
         cfg["auxiliary"] = {"title_generation": {"provider": "moa", "model": "opus-gpt"}}
-        (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+        (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
@@ -2058,6 +2058,25 @@ class TestAuxiliaryTransientCredentialRetry:
             provider="test-provider",
             model="test-model",
         ) == expected
+
+    def test_selector_requires_exact_failed_credential_identity(self):
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+
+        with patch("agent.auxiliary_client.load_pool", return_value=pool):
+            from agent.auxiliary_client import _select_transient_aux_alternate
+
+            selected = _select_transient_aux_alternate(
+                "test-provider",
+                failed_api_key="",
+                reason="overloaded",
+            )
+
+        assert selected is None
+        pool.entry_id_for_api_key.assert_not_called()
+        pool.select_alternate.assert_not_called()
+        pool.soft_cooldown.assert_not_called()
+        pool.mark_exhausted_and_rotate.assert_not_called()
 
     def test_selector_soft_cools_failed_entry_without_exhausting(self):
         pool = MagicMock()
