@@ -4536,6 +4536,27 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_overload_error(
+    exc: Exception,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> bool:
+    """Classify status-less provider overloads with the shared classifier."""
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        classified = classify_api_error(
+            exc,
+            provider=provider or "",
+            model=model or "",
+        )
+        return classified.reason == FailoverReason.overloaded
+    except Exception:
+        logger.debug("Auxiliary overload classification failed", exc_info=True)
+        return False
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """Detect a request timeout — the full-budget stall, distinct from a fast
     connection drop.
@@ -10678,6 +10699,11 @@ def _call_llm_impl(
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            )
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -10701,6 +10727,11 @@ def _call_llm_impl(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            )
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -10718,6 +10749,12 @@ def _call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            ):
+                reason = "provider overloaded"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
@@ -11439,6 +11476,11 @@ async def _async_call_llm_impl(
             or _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            )
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -11454,6 +11496,11 @@ async def _async_call_llm_impl(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            )
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
@@ -11467,6 +11514,12 @@ async def _async_call_llm_impl(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_overload_error(
+                first_err,
+                provider=resolved_provider or "",
+                model=final_model or "",
+            ):
+                reason = "provider overloaded"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):

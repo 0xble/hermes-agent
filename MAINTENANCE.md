@@ -46,10 +46,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-020 | Active | `fix(skills): limit background review creation` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
 | HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback`; `fix(agent): generalize transient alternate credential recovery` | Try one alternate compatible same-provider credential for recoverable upstream failures before activating the fallback model. |
 | HERMES-022 | Active | `feat(cron): job-scoped native outbound messages` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, adapter identity, and idempotent multi-message delivery. |
+| HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-023 — Route auxiliary provider overload through fallback
+
+- **Summary:** Uses the shared API error classifier to recognize provider-overload responses, including status-less overload messages, as auxiliary capacity failures. Sync and async auxiliary calls now continue through the configured model/provider fallback chain after overload instead of aborting compression or another side task.
+- **Surfaces:** `agent/auxiliary_client.py`; `tests/agent/test_auxiliary_client.py`.
+- **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryOverloadFallback'`.
+- **Rollback:** Remove `_is_overload_error`, its sync/async fallback predicates and reason labels, and the HERMES-023 focused tests. Preserve all existing auth, billing, connection, rate-limit, model-compatibility, and response-validation fallback behavior.
+- **Retirement:** Retire after released upstream routes classified provider overload through equivalent sync and async auxiliary fallback chains.
 
 ### HERMES-022 — Job-scoped native outbound messages for cron
 
