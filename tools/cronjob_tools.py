@@ -982,8 +982,9 @@ def _run_claimed_job(
     Returns {"claimed": True, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     _registered = False
-    fire_owner = None
     try:
         from cron.scheduler import (
             release_running_job,
@@ -1127,7 +1128,7 @@ def _run_claimed_job(
                 job_id,
                 False,
                 str(e),
-                expected_fire_owner=fire_owner,
+                expected_fire_owner=fire_owner or None,
             )
         except Exception:
             pass
