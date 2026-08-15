@@ -1264,6 +1264,15 @@ def _try_dispatch_background_run(
         # the tool returns. Run synchronously.
         return None
 
+    # Reap dead execution owners before registering a detached manual run.
+    try:
+        from cron.executions import recover_interrupted_executions
+        recovered = recover_interrupted_executions()
+        if recovered:
+            logger.warning("Recovered %d interrupted cron execution(s)", recovered)
+    except Exception:
+        logger.warning("Could not recover interrupted cron executions", exc_info=True)
+
     # ---- synchronous claim (same semantics as _execute_job_now) ----
     claimed_job = None
     try:
