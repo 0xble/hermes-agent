@@ -259,6 +259,10 @@ def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
     action = args.get("action", "send")
 
+    cron_gate = _maybe_handle_cron_outbound(args)
+    if cron_gate is not None:
+        return cron_gate
+
     if action == "list":
         return _handle_list()
 
@@ -267,10 +271,6 @@ def send_message_tool(args, **kw):
 
     if action == "unreact":
         return _handle_react(args, remove=True)
-
-    cron_gate = _maybe_handle_cron_outbound(args)
-    if cron_gate is not None:
-        return cron_gate
 
     return _handle_send(args)
 
@@ -502,6 +502,8 @@ def _handle_send(args):
             "media_files": media_files,
             "force_document": force_document_attachments,
         }
+        if args.get("_profile"):
+            send_kwargs["profile"] = args["_profile"]
         # Preserve the exact built-in call contract; only custom handlers need
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
@@ -828,6 +830,10 @@ def _maybe_handle_cron_outbound(args):
     cron_session = get_session_env("HERMES_CRON_SESSION", "")
     if cron_session != "1":
         return None
+    if args.get("action", "send") != "send":
+        return json.dumps(_error(
+            "Cron send_message permits only action='send' to the bound origin."
+        ))
     if not cron_outbound.is_cron_messaging_session():
         return json.dumps(_error(
             "This cron job is not opted in to native send_message. "
@@ -875,12 +881,16 @@ def _maybe_handle_cron_outbound(args):
         return cron_outbound.dumps(cron_outbound.reuse_payload(claim["record"]))
 
     try:
+        from gateway.session_context import get_session_env
+
+        profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
         raw = _handle_send({
             "target": (
                 f"{origin['platform']}:{origin['chat_id']}"
                 + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
             ),
             "message": message,
+            "_profile": profile or None,
         })
     except Exception as exc:
         record = cron_outbound.mark_result(
@@ -1054,6 +1064,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    profile=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -1076,7 +1087,22 @@ async def _send_via_adapter(
 
     if runner is not None:
         try:
-            adapter = runner.adapters.get(platform)
+            profile_name = str(profile or "").strip()
+            if profile_name and profile_name != "default":
+                active_profile = None
+                active_profile_fn = getattr(runner, "_active_profile_name", None)
+                if callable(active_profile_fn):
+                    active_profile = active_profile_fn()
+                if profile_name == active_profile:
+                    adapter = (getattr(runner, "adapters", None) or {}).get(platform)
+                else:
+                    adapter = (
+                        (getattr(runner, "_profile_adapters", None) or {})
+                        .get(profile_name, {})
+                        .get(platform)
+                    )
+            else:
+                adapter = (getattr(runner, "adapters", None) or {}).get(platform)
         except Exception:
             adapter = None
         if adapter is not None:
@@ -1211,7 +1237,17 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    args=None,
+    profile=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1561,6 +1597,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else None,
                 force_document=force_document,
+                profile=profile,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1631,6 +1668,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if i == len(chunks) - 1 else [],
                 force_document=force_document,
+                profile=profile,
             )
 
         if isinstance(result, dict) and result.get("error"):

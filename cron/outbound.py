@@ -14,19 +14,30 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-OUTBOUND_FILE = get_hermes_home().resolve() / "cron" / "outbound.db"
+# Test/embedding override only. Production resolves the active profile's home
+# for every transaction because multiplex cron ticks swap HERMES_HOME in the
+# current execution context.
+OUTBOUND_FILE: Optional[Path] = None
 _MESSAGE_KEY_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
 _lock = threading.RLock()
 
 
+def _outbound_file() -> Path:
+    if OUTBOUND_FILE is not None:
+        return Path(OUTBOUND_FILE)
+    return get_hermes_home().resolve() / "cron" / "outbound.db"
+
+
 def _connect() -> sqlite3.Connection:
-    OUTBOUND_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(OUTBOUND_FILE, timeout=5)
+    outbound_file = _outbound_file()
+    outbound_file.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(outbound_file, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
