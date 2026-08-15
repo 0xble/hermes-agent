@@ -359,6 +359,116 @@ class TestMoaAggregatorSharedResolution:
         assert mock_resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
 
 
+class TestStructuredResponseCompleteness:
+    @staticmethod
+    def _response(finish_reason="stop"):
+        return SimpleNamespace(
+            model="gemini-3.7-flash",
+            choices=[
+                SimpleNamespace(
+                    finish_reason=finish_reason,
+                    message=SimpleNamespace(content='{"title":"Financial Systems"}'),
+                )
+            ],
+            usage=None,
+        )
+
+    def test_structured_call_rejects_length_finish_across_router(self):
+        from agent.auxiliary_client import _validate_llm_response
+
+        response = self._response("length")
+
+        def validate_inside_router(**_kwargs):
+            return _validate_llm_response(response, task="title_generation")
+
+        with patch("agent.auxiliary_client._call_llm_impl", side_effect=validate_inside_router):
+            with pytest.raises(RuntimeError, match="incomplete structured response") as exc_info:
+                call_llm(
+                    task="title_generation",
+                    messages=[{"role": "user", "content": "title this"}],
+                    extra_body={"response_format": {"type": "json_object"}},
+                )
+
+        from agent.auxiliary_client import _is_invalid_aux_response_error
+
+        assert _is_invalid_aux_response_error(exc_info.value)
+
+    def test_unstructured_call_can_accept_length_finish(self):
+        from agent.auxiliary_client import _validate_llm_response
+
+        response = self._response("length")
+        assert _validate_llm_response(response, task="compression") is response
+
+    @pytest.mark.parametrize(
+        "finish_reason",
+        [
+            "content_filter",
+            "safety",
+            "blocked",
+            "blocklist",
+            "prohibited_content",
+            "spii",
+            "language",
+            "other",
+            "image_safety",
+            "malformed_function_call",
+        ],
+    )
+    def test_structured_call_rejects_known_non_output_finish(self, finish_reason):
+        from agent.auxiliary_client import _validate_llm_response
+
+        with pytest.raises(RuntimeError, match="incomplete structured response"):
+            _validate_llm_response(
+                self._response(finish_reason),
+                task="title_generation",
+                require_complete_response=True,
+            )
+
+    @pytest.mark.parametrize(
+        "finish_reason", [None, "stop", "end_turn", "completed", "eos_token"]
+    )
+    def test_structured_call_accepts_complete_finish(self, finish_reason):
+        from agent.auxiliary_client import _validate_llm_response
+
+        response = self._response(finish_reason)
+        assert _validate_llm_response(
+            response,
+            task="title_generation",
+            require_complete_response=True,
+        ) is response
+
+    def test_validation_records_request_side_route(self):
+        from agent.auxiliary_client import (
+            _relay_auxiliary_call,
+            _set_relay_auxiliary_route,
+            _validate_llm_response,
+        )
+
+        response = self._response()
+        response.model = "provider-canonical-versioned-name"
+
+        @_relay_auxiliary_call
+        def validate(task):
+            _set_relay_auxiliary_route(
+                "gemini",
+                "configured-model-alias",
+                "chat_completions",
+            )
+            return _validate_llm_response(
+                response,
+                task=task,
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+            )
+
+        accepted = validate("title_generation")
+        assert accepted._hermes_auxiliary_route == {
+            "provider": "gemini",
+            "model": "configured-model-alias",
+            "base_url": "https://generativelanguage.googleapis.com/v1beta",
+            "api_mode": "chat_completions",
+        }
+
+
 class TestBuildCallKwargsMaxTokens:
     """_build_call_kwargs should not cap output by default (#34530).
 

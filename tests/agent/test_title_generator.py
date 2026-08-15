@@ -78,6 +78,46 @@ class TestGenerateTitle:
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
         assert captured_kwargs["max_tokens"] == 1024
+        assert captured_kwargs["reasoning_config"] == {"enabled": False, "effort": "none"}
+        assert captured_kwargs["require_complete_response"] is True
+
+    def test_reports_successful_auxiliary_route(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title":"Financial Systems Check"}'
+        response._hermes_auxiliary_route = {
+            "provider": "gemini",
+            "model": "gemini-3.7-flash",
+        }
+        routes = []
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(
+                "Verify the financial tables",
+                route_callback=routes.append,
+            ) == "Financial Systems Check"
+
+        assert routes == [
+            {"provider": "gemini", "model": "gemini-3.7-flash"}
+        ]
+
+    def test_does_not_publish_route_for_malformed_title(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "```json"
+        response._hermes_auxiliary_route = {
+            "provider": "gemini",
+            "model": "gemini-3.7-flash",
+        }
+        routes = []
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(
+                "Verify the financial tables",
+                route_callback=routes.append,
+            ) is None
+
+        assert routes == []
 
     def test_rejects_length_truncated_response(self):
         response = MagicMock()
@@ -464,6 +504,34 @@ class TestChooseTopicIcon:
         assert "specific, playful visual metaphors" in prompt
         assert "📊" in prompt and "🚀" in prompt and "🛠️" in prompt
         assert llm.call_args.kwargs["temperature"] == 0.7
+        assert llm.call_args.kwargs["reasoning_config"] == {
+            "enabled": False,
+            "effort": "none",
+        }
+        assert llm.call_args.kwargs["max_tokens"] == 1024
+
+    def test_reuses_successful_title_route_for_icon_selection(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "📊"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as llm:
+            assert choose_topic_icon(
+                "Financial Systems",
+                "verify finance data",
+                ["📊", "🧪"],
+                preferred_route={
+                    "provider": "gemini",
+                    "model": "gemini-3.7-flash",
+                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
+                    "api_mode": "chat_completions",
+                },
+            ) == "📊"
+
+        assert llm.call_args.kwargs["provider"] == "gemini"
+        assert llm.call_args.kwargs["model"] == "gemini-3.7-flash"
+        assert llm.call_args.kwargs["base_url"].endswith("/v1beta")
+        assert llm.call_args.kwargs["api_mode"] == "chat_completions"
 
     def test_extracts_single_allowed_emoji_from_wrapped_response(self):
         mock_response = MagicMock()
@@ -756,6 +824,7 @@ class TestMaybeAutoTitle:
                 failure_callback=None,
                 main_runtime=None,
                 title_callback=None,
+                route_callback=None,
                 runtime_validator=None,
             )
 

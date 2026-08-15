@@ -7,9 +7,9 @@ Two stages, both off the critical path:
    means a session is named the moment it starts instead of after the first
    turn finishes (which measured p50 151s / p90 1212s on real sessions).
 2. **Upgrade** — one small-model call that replaces the derived title with a
-   proper one. Runs on a cheap/fast tier, with thinking disabled and the
-   response constrained to a JSON object, so there is no reasoning preamble to
-   strip and nothing to parse out of prose.
+   proper one. Runs on a cheap/fast tier, disables reasoning when supported,
+   and constrains the response to a JSON object, so there is no reasoning
+   preamble to strip and nothing to parse out of prose.
 
 Provenance (``derived`` < ``llm`` < ``user``) is enforced by the storage layer,
 so stage 2 can only ever replace stage 1, and neither can replace a name the
@@ -51,6 +51,7 @@ FailureCallback = Callable[[str, BaseException], None]
 # to end up at the same name, and on Discord (2 renames per 10 minutes per
 # channel) the throwaway one can be what survives.
 TitleCallback = Callable[[str, str], None]
+AuxiliaryRouteCallback = Callable[[dict[str, str]], None]
 
 # Validation callback: () -> bool. Called right before the LLM request in
 # generate_title(). Return False to skip — e.g. the user switched models
@@ -584,12 +585,14 @@ def generate_title(
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     avoid_titles: Optional[list[str]] = None,
+    route_callback: Optional[AuxiliaryRouteCallback] = None,
 ) -> Optional[str]:
     """Generate a session title from the user's opening message.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
-    small/fast model tier. Thinking is disabled and the response is constrained
-    to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
+    small/fast model tier. It disables reasoning through the provider-agnostic
+    control when supported and constrains the response to
+    ``{"title": "..."}`` so there is no preamble or reasoning to strip.
 
     Titles come from the user's message alone — every surveyed implementation
     that titles well (Claude Code, OpenCode, Cursor, OpenClaw) does the same.
@@ -653,6 +656,8 @@ def generate_title(
             timeout=timeout,
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            reasoning_config={"enabled": False, "effort": "none"},
+            require_complete_response=True,
         )
         choice = response.choices[0]
         finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
@@ -710,9 +715,14 @@ def generate_title(
                 title = f"{canonical_name} {title}"
             elif not title:
                 title = canonical_name
-        return _clean_title(
+        final_title = _clean_title(
             title or "", preferences.max_characters, preferences.max_words
         )
+        if final_title:
+            route = getattr(response, "_hermes_auxiliary_route", None)
+            if route_callback is not None and isinstance(route, dict) and route:
+                route_callback(dict(route))
+        return final_title
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -840,6 +850,7 @@ def choose_topic_icon(
     *,
     recent_emojis: Optional[list[str]] = None,
     instructions: str = "",
+    preferred_route: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Choose a varied semantic Telegram topic emoji from a live allowlist.
 
@@ -910,12 +921,22 @@ def choose_topic_icon(
     ]
 
     try:
+        route = preferred_route if isinstance(preferred_route, dict) else {}
+        route_provider: Any = route.get("provider") or None
+        route_model: Any = route.get("model") or None
+        route_base_url: Any = route.get("base_url") or None
+        route_api_mode: Any = route.get("api_mode") or None
         response = call_llm(
             task="title_generation",
+            provider=route_provider,
+            model=route_model,
+            base_url=route_base_url,
+            api_mode=route_api_mode,
             messages=messages,
-            max_tokens=64,
+            max_tokens=TITLE_MAX_OUTPUT_TOKENS,
             temperature=0.7,
             timeout=timeout,
+            reasoning_config={"enabled": False, "effort": "none"},
         )
         content = response.choices[0].message.content or ""
         from agent.agent_runtime_helpers import strip_think_blocks
@@ -1103,6 +1124,7 @@ def auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    route_callback: Optional[AuxiliaryRouteCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Generate and store the model title for a session.
@@ -1130,6 +1152,7 @@ def auto_title_session(
             failure_callback=failure_callback,
             main_runtime=main_runtime,
             title_callback=title_callback,
+            route_callback=route_callback,
             runtime_validator=runtime_validator,
         )
     except Exception as e:
@@ -1155,6 +1178,7 @@ def _auto_title_session(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    route_callback: Optional[AuxiliaryRouteCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
@@ -1208,6 +1232,7 @@ def _auto_title_session(
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
         avoid_titles=recent_titles,
+        route_callback=route_callback,
     )
     source = "llm"
     if not title:
@@ -1240,6 +1265,7 @@ def _auto_title_session(
                     main_runtime=main_runtime,
                     runtime_validator=runtime_validator,
                     avoid_titles=(recent_titles + [title])[-24:],
+                    route_callback=route_callback,
                 )
                 if (
                     retry_title
@@ -1326,6 +1352,7 @@ def maybe_auto_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    route_callback: Optional[AuxiliaryRouteCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
     """Title a session from its opening message: instant, then upgraded.
@@ -1376,6 +1403,7 @@ def maybe_auto_title(
             "failure_callback": failure_callback,
             "main_runtime": main_runtime,
             "title_callback": title_callback,
+            "route_callback": route_callback,
             "runtime_validator": runtime_validator,
         },
         daemon=True,

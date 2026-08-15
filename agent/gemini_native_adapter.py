@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import re
@@ -671,7 +672,7 @@ def _normalize_response_format(
     if not isinstance(schema_config, dict):
         return "application/json", None
     schema = schema_config.get("schema")
-    return "application/json", schema if isinstance(schema, dict) else None
+    return "application/json", copy.deepcopy(schema) if isinstance(schema, dict) else None
 
 
 def build_gemini_request(
