@@ -25722,7 +25722,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_id,
                     title,
                     user_message=title_context,
-                ) if title_source in {"llm", "derived"} else None,
+                ) if title_source == "llm" else None,
                 runtime_validator=lambda: True,
             )
         except Exception:
