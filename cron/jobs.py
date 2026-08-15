@@ -2288,6 +2288,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     timezone: Optional[str] = None,
+    allow_messaging: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2505,6 +2506,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "allow_messaging": bool(allow_messaging),
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the

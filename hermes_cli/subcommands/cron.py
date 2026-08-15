@@ -139,6 +139,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Omit to inherit the profile timezone."
         ),
     )
+    cron_create.add_argument(
+        "--allow-messaging",
+        dest="allow_messaging",
+        action="store_true",
+        default=False,
+        help=(
+            "Let this job send multiple native messages through send_message "
+            "to its bound origin. Default off."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -258,6 +268,21 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Pin cron wall-clock schedules to an IANA timezone. "
             "Pass empty string to clear and inherit the profile timezone."
         ),
+    )
+    cron_edit.add_argument(
+        "--allow-messaging",
+        dest="allow_messaging",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Enable native origin-only send_message for this cron job.",
+    )
+    cron_edit.add_argument(
+        "--no-allow-messaging",
+        dest="allow_messaging",
+        action="store_const",
+        const=False,
+        help="Disable native send_message for this cron job.",
     )
     cron_edit.add_argument(
         "--reasoning-effort",
