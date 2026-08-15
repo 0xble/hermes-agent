@@ -1100,11 +1100,10 @@ def _select_alternate_credential(agent) -> Optional[Any]:
     pool = getattr(agent, "_credential_pool", None)
     if pool is None:
         return None
-    # This policy is intentionally scoped to the multi-account Codex
-    # subscription pool. Other providers have different credential semantics
-    # and retain their existing recovery behavior until they opt in.
-    if (getattr(agent, "provider", "") or "").strip().lower() != "openai-codex":
-        return None
+    # Provider compatibility is enforced by recover_with_credential_pool before
+    # this selector runs. Selection itself is capability-based: any matching
+    # provider pool with a distinct healthy runtime credential may recover a
+    # transient failure without quarantining the credential that failed.
     current_id = getattr(agent, "_credential_pool_entry_id", None)
     current_key = getattr(agent, "api_key", None)
     if current_key:
