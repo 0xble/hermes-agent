@@ -77,7 +77,15 @@ describe('cronEditorUpdates', () => {
   it('includes prompt when the user typed one on a script-only job', () => {
     expect(
       cronEditorUpdates(
-        { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1', timezone: '' },
+        {
+          deliver: 'email',
+          model: '',
+          name: 'Weekly',
+          prompt: 'note',
+          provider: '',
+          schedule: '0 9 * * 1',
+          timezone: ''
+        },
         { scriptOnlyJob: true }
       ).prompt
     ).toBe('note')
