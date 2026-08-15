@@ -40,7 +40,6 @@ import os
 import platform
 import re
 import shlex
-import stat
 import time
 import threading
 import atexit
@@ -3118,56 +3117,29 @@ def terminal_tool(
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
-
-                For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
-                """
+                """Best-effort bounded read from a non-local execution backend."""
                 if env is None:
                     return None
+                # Read through the target environment. Host files are not
+                # authoritative for SSH, container, or sandbox paths.
                 try:
-                    local_path = Path(script_path).expanduser()
-                    if not local_path.is_absolute():
-                        local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
-                        metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
-                            data = local_path.read_bytes()
-                            if len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-                                if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
-                                    return None
-                                return data.decode("utf-8", errors="replace")
-                except Exception:
-                    pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                # Bound the read at the source with `head -c` so an oversized
-                # file (e.g. a 166MB ELF invoked by absolute path) never
-                # crosses the wire — `cat` of such a binary previously pinned
-                # the gateway's tool thread on a superlinear shlex scan for
-                # 30+ minutes. One byte over the guard's budget is enough for
-                # lifecycle_guard's sanitizer to fail the oversized case
-                # closed, mirroring the local-read semantics. The `< path`
-                # redirect keeps leading-dash paths out of argv (same form as
-                # tools/image_source.py).
-                try:
+                    reader = (
+                        "import os,sys; "
+                        "path=os.path.expanduser(sys.argv[1]); "
+                        f"data=open(path,'rb').read({_MAX_REFERENCED_SCRIPT_BYTES + 1}); "
+                        "sys.stdout.buffer.write(data)"
+                    )
                     result = env.execute(
-                        f"head -c {_MAX_REFERENCED_SCRIPT_BYTES + 1} "
-                        f"< {shlex.quote(script_path)}"
+                        f"python3 -c {shlex.quote(reader)} {shlex.quote(script_path)}"
                     )
                     if result.get("returncode", -1) == 0:
-                        output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote read: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
+                        # Preserve the successful read result verbatim.  The
+                        # lifecycle guard's ingestion boundary distinguishes a
+                        # real empty/binary script from ``None`` (remote read
+                        # failure); collapsing NUL-bearing binary data to None
+                        # would now correctly fail closed, but would also block
+                        # every explicitly invoked remote binary.
+                        return result.get("output", "")
                 except Exception:
                     pass
                 return None
@@ -3175,7 +3147,9 @@ def terminal_tool(
             if contains_gateway_lifecycle_command_or_referenced_script(
                 command,
                 cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
+                read_remote_script=(
+                    _read_script_in_env if env_type != "local" else None
+                ),
             ):
                 return json.dumps({
                     "output": "",

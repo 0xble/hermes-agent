@@ -149,14 +149,19 @@ def _emit_compaction_terminal(
     message_override: Optional[str] = None,
 ) -> None:
     """Emit the truthful structured terminal edge for a started compaction."""
-    status_callback = getattr(agent, "status_callback", None)
-    if not status_callback:
-        return
     event, default_message = _COMPACTION_TERMINAL_STATUS.get(
         outcome,
         _COMPACTION_TERMINAL_STATUS["aborted"],
     )
     message = message_override or default_message
+    if outcome != "committed":
+        try:
+            agent._vprint(f"{getattr(agent, 'log_prefix', '')}{message}", force=True)
+        except Exception:
+            pass
+    status_callback = getattr(agent, "status_callback", None)
+    if not status_callback:
+        return
     try:
         status_callback(event, message)
     except Exception:
@@ -3389,10 +3394,10 @@ def compress_context(
         if _compaction_terminal_emitted:
             return
         _compaction_terminal_emitted = True
-        # A suppressed start (quiet context engine) opened no visible
-        # compaction phase — emit no terminal edge either. Detailed failure
-        # text can ride the aborted terminal event through the message override.
-        if _compaction_status_emitted:
+        # A suppressed start (quiet context engine) opened no success phase.
+        # Failures and deferrals still emit their single terminal notice so
+        # quiet and non-gateway callers are not left without an explanation.
+        if _compaction_status_emitted or _compaction_outcome != "committed":
             _emit_compaction_terminal(
                 agent,
                 _compaction_outcome,

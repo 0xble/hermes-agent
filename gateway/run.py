@@ -3548,19 +3548,39 @@ def _build_document_context_note(
     mtype: str,
     *,
     content_inlined: bool = True,
+    resolution_status: str = "resolved",
 ) -> str:
     """Context note prepended to a user turn when they attach a document.
 
     Text documents (``text/*``) are usually inlined upstream by the platform
     adapter. ``content_inlined=False`` records adapters that cache the file
-    without injecting its content, so the note tells the agent to read it.
+    without injecting its content, so the note tells the agent to read it. The
+    flag is supplied by the adapter via ``MessageEvent.media_text_inlined``;
+    MIME type alone is not evidence that bytes were included in the user turn.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
     must tell the agent to *extract* the text itself before answering — earlier
     wording ("Ask the user what they'd like you to do with it") steered the
     model into punting back to the user, which is why attached PDFs/DOCX looked
     "unreadable" to the agent even though it has the tools to read them.
+
+    ``resolution_status`` is intentionally small and machine-testable:
+    ``resolved``, ``absent``, or ``inaccessible``. A cached file the gateway
+    could not find or open is reported as such so the agent does not claim to
+    have read it.
     """
+    if resolution_status == "absent":
+        return (
+            f"[The user sent a document: '{display_name}', but its cached file "
+            f"could not be found at the expected path: {agent_path}. "
+            "Attachment resolution failed; do not claim to have read it.]"
+        )
+    if resolution_status == "inaccessible":
+        return (
+            f"[The user sent a document: '{display_name}', but its cached file "
+            f"is inaccessible at: {agent_path}. Attachment resolution failed; "
+            "do not claim to have read it.]"
+        )
     if mtype.startswith("text/") and content_inlined:
         return (
             f"[The user sent a text document: '{display_name}'. "
@@ -20163,11 +20183,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 inline_flags = getattr(event, "media_text_inlined", None) or []
                 inline_flag = inline_flags[i] if i < len(inline_flags) else None
+                if not os.path.isfile(path):
+                    _resolution_status = "absent"
+                else:
+                    try:
+                        with open(path, "rb") as _attachment_probe:
+                            _attachment_probe.read(1)
+                    except OSError:
+                        _resolution_status = "inaccessible"
+                    else:
+                        _resolution_status = "resolved"
                 context_note = _build_document_context_note(
                     display_name,
                     agent_path,
                     mtype,
                     content_inlined=inline_flag is not False,
+                    resolution_status=_resolution_status,
                 )
                 message_text = f"{context_note}\n\n{message_text}"
 

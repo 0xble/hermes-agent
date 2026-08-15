@@ -3053,7 +3053,13 @@ class ShellFileOperations(FileOperations):
         # default, and has parallel directory traversal (~200x faster than
         # find on wide trees).  Mirrors _search_content which already uses rg.
         if self._has_command('rg'):
-            return self._search_files_rg(search_pattern, path, limit, offset)
+            return self._search_files_rg(
+                search_pattern,
+                path,
+                limit,
+                offset,
+                explicit_hidden_root=has_hidden_path_ancestor,
+            )
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
@@ -3134,7 +3140,15 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+    def _search_files_rg(
+        self,
+        pattern: str,
+        path: str,
+        limit: int,
+        offset: int,
+        *,
+        explicit_hidden_root: bool = False,
+    ) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
@@ -3155,10 +3169,19 @@ class ShellFileOperations(FileOperations):
             for item in self._macos_search_exclusions(path)
         )
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
+        # Explicit hidden roots are permitted, but hidden descendants remain
+        # excluded to preserve broad hidden-data isolation. Ripgrep applies
+        # these globs relative to the search root, so they do not exclude a
+        # hidden component in the root path itself. Filtering in rg (rather
+        # than after ``head``) also preserves pagination when a root contains
+        # many hidden descendants before its visible files.
+        hidden_flags = (
+            " --hidden -g '!.*' -g '!**/.*'" if explicit_hidden_root else ""
+        )
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)}"
-            f"{exclusion_args} "
+            f"{hidden_flags}{exclusion_args} "
             f"{self._escape_native_tool_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
@@ -3170,7 +3193,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)}"
-                f"{exclusion_args} "
+                f"{hidden_flags}{exclusion_args} "
                 f"{self._escape_native_tool_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )

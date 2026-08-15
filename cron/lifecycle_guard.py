@@ -752,94 +752,153 @@ def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optiona
     return path
 
 
-def _iter_option_values(
-    segment: list[str], start: int, option: str
-) -> Iterator[str]:
-    """Yield values given to *option*, in both ``--opt v`` and ``--opt=v`` form."""
-    prefix = option + "="
-    for position in range(start + 1, len(segment)):
-        token = segment[position]
-        if token == option and position + 1 < len(segment):
-            yield segment[position + 1]
-        elif token.startswith(prefix):
-            yield token[len(prefix):]
+class _UnresolvedExecutableReference(Exception):
+    """A shell-expanded executable reference cannot be inspected statically."""
 
 
-def _references_at(
-    segment: list[str], index: int, cwd: Optional[str]
-) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
-    if index >= len(segment):
-        return
-    executable = segment[index]
-    executable_name = _executable_name(executable)
+def _has_unresolved_shell_expansion(candidate: str) -> bool:
+    return any(character in candidate for character in ("$", "`", "*", "?", "["))
 
-    if executable_name in {".", "source"}:
-        if len(segment) > index + 1:
-            resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
-            if resolved is not None:
-                yield resolved
-        return
 
-    if executable_name in _SHELL_EXECUTABLES:
-        arguments = segment[index + 1 :]
-        arg_index = 0
-        while arg_index < len(arguments):
-            argument = arguments[arg_index]
-            if argument == "--":
-                arg_index += 1
-                break
-            if argument in {"-c", "--command"}:
-                break
-            if argument in _SHELL_OPTIONS_WITH_VALUES:
-                arg_index += 2
-                continue
-            if argument.startswith("-"):
-                arg_index += 1
-                continue
-            break
-        if arg_index < len(arguments) and arguments[arg_index] not in {
-            "-c",
-            "--command",
-        }:
-            resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
-            if resolved is not None:
-                yield resolved
-        return
+def _is_safe_unresolved_test_executable(executable: str, _arguments: list[str]) -> bool:
+    """Allow the POSIX test builtin token; dynamic executables stay fail-closed."""
+    return executable == "["
 
-    # A bare "/" token is pathlib's division operator in Python sources
-    # (e.g. `Path.home() / ".hermes"`), not an executable reference.
-    # Resolving it walks to the filesystem root and fails the
-    # regular-file check below, hard-blocking innocent .py scripts
-    # (#77131). Skip pure-separator tokens.
-    if executable.strip("/"):
-        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-            resolved = _resolve_terminal_script_path(executable, cwd)
-            if resolved is not None:
-                yield resolved
+
+def _resolve_executable_reference(
+    candidate: str,
+    cwd: Optional[str],
+    *,
+    fail_on_unresolved: bool,
+    remote: bool,
+) -> Optional[Path]:
+    if _has_unresolved_shell_expansion(candidate):
+        if fail_on_unresolved:
+            raise _UnresolvedExecutableReference(candidate)
+        return None
+    if remote:
+        path = Path(candidate)
+        if candidate.startswith("~") or path.is_absolute():
+            return path
+        return Path(cwd or ".") / path
+    return _resolve_terminal_script_path(candidate, cwd)
+
+
+def _is_known_shell_interpreter(executable: str) -> bool:
+    path = Path(executable)
+    return (
+        path.is_absolute()
+        and path.name in _SHELL_EXECUTABLES
+        and str(path.parent) in _KNOWN_SHELL_INTERPRETER_DIRS
+    )
 
 
 def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell.
-
-    Each segment is read twice: once at the token the walk has always used,
-    and again at the command a wrapper chain hands off to. Additive on
-    purpose — peeling must never REMOVE a reference the un-peeled read would
-    have found. A local script named ``./timeout`` is a script, not the
-    coreutils wrapper, and reading only the peeled index would skip it.
-    """
+    fail_on_unresolved: bool = False,
+    remote: bool = False,
+) -> Iterator[tuple[Path, Optional[str]]]:
+    """Yield referenced scripts with their explicit shell dialect, if any."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
-        peeled = _peel_transparent_prefixes(segment, index)
-        if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+        executable = segment[index]
+        executable_name = Path(executable).name
+        if fail_on_unresolved and _has_unresolved_shell_expansion(executable):
+            if _is_safe_unresolved_test_executable(executable, segment[index + 1 :]):
+                continue
+            raise _UnresolvedExecutableReference(executable)
+
+        # A path-qualified command is itself executable input, even when its
+        # basename resembles a trusted shell or the `source` builtin. Scan it
+        # before applying interpreter-specific argument rules so a local or
+        # remote wrapper named `sh`, `bash`, or `source` cannot evade the walk.
+        path_qualified = bool(executable.strip("/")) and "/" in executable
+        if path_qualified and not _is_known_shell_interpreter(executable):
+            resolved = _resolve_executable_reference(
+                executable,
+                cwd,
+                fail_on_unresolved=fail_on_unresolved,
+                remote=remote,
+            )
+            if resolved is not None:
+                yield (
+                    resolved,
+                    (
+                        executable_name
+                        if executable_name in _SHELL_EXECUTABLES
+                        and _is_known_shell_interpreter(executable)
+                        else "sh"
+                        if executable_name in {".", "source"}
+                        else None
+                    ),
+                )
+
+        if executable_name in {".", "source"}:
+            if len(segment) > index + 1:
+                resolved = _resolve_executable_reference(
+                    segment[index + 1],
+                    cwd,
+                    fail_on_unresolved=fail_on_unresolved,
+                    remote=remote,
+                )
+                if resolved is not None:
+                    yield resolved, "sh"
+            continue
+
+        if executable_name in _SHELL_EXECUTABLES:
+            arguments = segment[index + 1 :]
+            arg_index = 0
+            while arg_index < len(arguments):
+                argument = arguments[arg_index]
+                if argument == "--":
+                    arg_index += 1
+                    break
+                if argument in {"-c", "--command"}:
+                    break
+                if argument in _SHELL_OPTIONS_WITH_VALUES:
+                    arg_index += 2
+                    continue
+                if argument.startswith("-"):
+                    arg_index += 1
+                    continue
+                break
+            if arg_index < len(arguments) and arguments[arg_index] not in {
+                "-c",
+                "--command",
+            }:
+                resolved = _resolve_executable_reference(
+                    arguments[arg_index],
+                    cwd,
+                    fail_on_unresolved=fail_on_unresolved,
+                    remote=remote,
+                )
+                if resolved is not None:
+                    dialect = (
+                        executable_name
+                        if _is_known_shell_interpreter(executable)
+                        else "sh"
+                    )
+                    yield resolved, dialect
+            continue
+
+        # A bare "/" token is pathlib's division operator in Python sources
+        # (e.g. `Path.home() / ".hermes"`), not an executable reference.
+        # Resolving it walks to the filesystem root and fails the
+        # regular-file check below, hard-blocking innocent .py scripts
+        # (#77131). Skip pure-separator tokens.
+        if not path_qualified and executable.endswith((".sh", ".bash", ".zsh")):
+            resolved = _resolve_executable_reference(
+                executable,
+                cwd,
+                fail_on_unresolved=fail_on_unresolved,
+                remote=remote,
+            )
+            if resolved is not None:
+                yield resolved, "sh"
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -944,6 +1003,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     try:
         metadata = os.fstat(descriptor)
+        if stat.S_ISDIR(metadata.st_mode):
+            # A directory cannot feed a shell. Treat it as absent so a remote
+            # reader still gets a chance when local and remote paths collide.
+            return None, False
         if not stat.S_ISREG(metadata.st_mode):
             # Directories are not scripts. Docker Desktop writes
             # ``fpath=(~/.docker/completions …)`` into ``~/.zshrc``; the
@@ -1016,6 +1079,14 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     callback so the guarantee holds for every callback, not just the ones
     we hardened.
     """
+    # ``None`` means the remote backend could not read the path (missing,
+    # permission denied, transport error, or an adapter that swallowed the
+    # real error).  A remote lifecycle guard must fail closed in that case:
+    # treating an unreadable script as safe defeats the whole inspection.
+    # An empty string, on the other hand, is a successfully read empty script
+    # and is safe to ignore.
+    if text is None:
+        return None, True
     if not text:
         return None, False
     if "\x00" in text:
@@ -1025,12 +1096,24 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+def _script_declares_shell(text: str) -> bool:
+    first_line = text.partition("\n")[0]
+    if not first_line.startswith("#!"):
+        return False
+    try:
+        tokens = shlex.split(first_line[2:])
+    except ValueError:
+        return False
+    return any(Path(token).name in _SHELL_EXECUTABLES for token in tokens)
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
     cwd: Optional[str],
     depth: int,
-    visited: set[Path],
+    shell_context: bool,
+    visited: set[tuple[Path, bool]],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
     if _direct_lifecycle_scan(command):
@@ -1043,54 +1126,87 @@ def _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
             depth=depth + 1,
+            shell_context=True,
             visited=visited,
             read_remote_script=read_remote_script,
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    try:
+        referenced_scripts = list(
+            _iter_referenced_shell_scripts(
+                command,
+                cwd=cwd,
+                fail_on_unresolved=shell_context,
+                remote=read_remote_script is not None,
+            )
+        )
+    except _UnresolvedExecutableReference:
+        # The shell will choose the executable or script only after expansion.
+        # Without the runtime environment, the guard cannot inspect that target.
+        return True
+
+    remote = read_remote_script is not None
+    for script_path, referenced_shell_context in referenced_scripts:
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into
         # a cloud subtree. _read_referenced_script repeats both checks as the
         # shared choke point, so every caller stays covered even if this
         # walk-level short-circuit is bypassed.
-        if _is_cloud_placeholder_path(script_path):
-            return True
-        try:
-            resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
-            # OSError: unreadable/long paths. ValueError: embedded NUL byte
-            # from a binary's decoded contents tokenized as a path — a
-            # guarded path must never crash the guard (#76762).
+        if remote:
             resolved = script_path
-        if _is_cloud_placeholder_path(resolved):
-            return True
-        if resolved in visited:
+        else:
+            if _is_cloud_placeholder_path(script_path):
+                return True
+            try:
+                resolved = script_path.resolve(strict=False)
+            except (OSError, ValueError):
+                # OSError: unreadable/long paths. ValueError: embedded NUL byte
+                # from a binary's decoded contents tokenized as a path. A
+                # guarded path must never crash the guard (#76762).
+                resolved = script_path
+            if _is_cloud_placeholder_path(resolved):
+                return True
+        visit_key = (resolved, referenced_shell_context)
+        if visit_key in visited:
             continue
-        visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        visited.add(visit_key)
+        if remote:
+            try:
+                remote_text = read_remote_script(str(script_path))
+            except Exception:
+                # Callback failures are indistinguishable from an unreadable
+                # remote script and therefore must not turn into a safe
+                # verdict.
+                logger.warning(
+                    "remote lifecycle script read failed for %s; failing closed",
+                    script_path,
+                    exc_info=True,
+                )
+                return True
+            script_text, unsafe = _sanitize_remote_script_text(remote_text)
+        else:
+            script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
-            # The callback's output crosses the same trust boundary as a
-            # local read — sanitize it identically before it enters the
-            # recursion (binary skip + size fail-closed).
-            script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path))
-            )
-            if unsafe:
-                return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
-        # directory, not the original command's cwd.
-        script_dir = _resolve_script_directory(str(resolved)) or cwd
+        # directory in the same execution environment.
+        script_dir = (
+            str(script_path.parent)
+            if remote
+            else _resolve_script_directory(str(resolved)) or cwd
+        )
+        child_shell_context = referenced_shell_context or _script_declares_shell(
+            script_text
+        )
         if _contains_unsafe_gateway_action(
             script_text,
             cwd=script_dir,
             depth=depth + 1,
+            shell_context=child_shell_context,
             visited=visited,
             read_remote_script=read_remote_script,
         ):
@@ -1125,6 +1241,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             command,
             cwd=cwd,
             depth=0,
+            shell_context=True,
             visited=set(),
             read_remote_script=read_remote_script,
         )
@@ -1134,6 +1251,12 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             "falling back to direct-scan verdict",
             exc_info=True,
         )
+        # A remote callback is part of the trust boundary.  If any part of
+        # remote inspection fails unexpectedly, do not fall back to a
+        # direct-only scan: that would incorrectly permit a lifecycle action
+        # hidden in an unreadable referenced script.
+        if read_remote_script is not None:
+            return True
         # Pure string scans of the top-level command — cannot raise.
         try:
             return _direct_lifecycle_scan(command)

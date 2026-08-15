@@ -4017,7 +4017,12 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     return _fallback_client, model
 
 
-def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+def _build_xai_oauth_aux_client(
+    model: str,
+    *,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an xAI Grok OAuth-authenticated session.
 
     xAI's ``/v1/responses`` endpoint speaks the OpenAI Responses API, so we
@@ -4034,10 +4039,16 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    resolved = _resolve_xai_oauth_for_aux()
-    if resolved is None:
-        return None, None
-    api_key, base_url = resolved
+    if explicit_api_key:
+        from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL
+
+        api_key = explicit_api_key
+        base_url = explicit_base_url or DEFAULT_XAI_OAUTH_BASE_URL
+    else:
+        resolved = _resolve_xai_oauth_for_aux()
+        if resolved is None:
+            return None, None
+        api_key, base_url = resolved
     logger.debug("Auxiliary client: xAI OAuth (%s via Responses API)", model)
     from tools.xai_http import hermes_xai_default_headers
 
@@ -4049,7 +4060,12 @@ def _build_xai_oauth_aux_client(model: str) -> Tuple[Optional[Any], Optional[str
     return CodexAuxiliaryClient(real_client, model), model
 
 
-def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+def _build_codex_client(
+    model: str,
+    *,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Build a CodexAuxiliaryClient for an explicitly-requested model.
 
     There is no auto-selection of the Codex model: the ChatGPT-account
@@ -4066,21 +4082,25 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
             "pass model explicitly (auxiliary.<task>.model in config.yaml)."
         )
         return None, None
-    pool_present, entry = _select_pool_entry("openai-codex")
-    if pool_present:
-        codex_token = _pool_runtime_api_key(entry)
-        if codex_token:
-            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+    if explicit_api_key:
+        codex_token = explicit_api_key
+        base_url = explicit_base_url or _CODEX_AUX_BASE_URL
+    else:
+        pool_present, entry = _select_pool_entry("openai-codex")
+        if pool_present:
+            codex_token = _pool_runtime_api_key(entry)
+            if codex_token:
+                base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+            else:
+                codex_token = _read_codex_access_token()
+                if not codex_token:
+                    return None, None
+                base_url = _CODEX_AUX_BASE_URL
         else:
             codex_token = _read_codex_access_token()
             if not codex_token:
                 return None, None
             base_url = _CODEX_AUX_BASE_URL
-    else:
-        codex_token = _read_codex_access_token()
-        if not codex_token:
-            return None, None
-        base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", model)
     real_client = _create_openai_client(
         api_key=codex_token,
@@ -6956,7 +6976,11 @@ def resolve_provider_client(
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
-        client, default = _build_codex_client(model)
+        client, default = _build_codex_client(
+            model,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
         if client is None:
             logger.warning("resolve_provider_client: openai-codex requested "
                            "but no Codex OAuth token found (run: hermes model)")
@@ -6974,7 +6998,11 @@ def resolve_provider_client(
     # OpenRouter / Nous bills for side tasks they thought were running on
     # their xAI subscription.
     if provider == "xai-oauth":
-        client, default = _build_xai_oauth_aux_client(model)
+        client, default = _build_xai_oauth_aux_client(
+            model,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
         if client is None:
             logger.warning(
                 "resolve_provider_client: xai-oauth requested but no xAI "
@@ -10750,6 +10778,7 @@ def _call_llm_impl(
             model=final_model or "",
         )
         if pool_provider and transient_reason:
+            transient_fallback_err = first_err
             alternate = _select_transient_aux_alternate(
                 pool_provider,
                 failed_api_key=_client_api_key,
@@ -10784,7 +10813,13 @@ def _call_llm_impl(
                         extra_headers=extra_headers,
                     )
                 except Exception as alternate_err:
-                    first_err = alternate_err
+                    logger.info(
+                        "Auxiliary %s: alternate credential %s failed (%s); continuing fallback",
+                        task or "call",
+                        alternate_label,
+                        type(alternate_err).__name__,
+                    )
+                    first_err = transient_fallback_err
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
@@ -11592,6 +11627,7 @@ async def _async_call_llm_impl(
             model=final_model or "",
         )
         if pool_provider and transient_reason:
+            transient_fallback_err = first_err
             alternate = _select_transient_aux_alternate(
                 pool_provider,
                 failed_api_key=_client_api_key,
@@ -11624,7 +11660,13 @@ async def _async_call_llm_impl(
                         reasoning_config=reasoning_config,
                     )
                 except Exception as alternate_err:
-                    first_err = alternate_err
+                    logger.info(
+                        "Auxiliary %s: alternate credential %s failed (%s); continuing fallback",
+                        task or "call",
+                        alternate_label,
+                        type(alternate_err).__name__,
+                    )
+                    first_err = transient_fallback_err
 
         # ── Payment / connection / rate-limit fallback (mirrors sync call_llm) ──
         # Auth error fallback (#21165): a 401 that survived the refresh path

@@ -11,7 +11,7 @@ stale value and its ``echo $HERMES_SESSION_ID`` reported a FOREIGN session's id
 ``_inject_session_context_env``.
 
 The fix strips the per-session bridged vars (HERMES_SESSION_* / UI /
-CRON_AUTO_DELIVER_) from the snapshot at both dump sites in
+HERMES_CRON_*) from the snapshot at both dump sites in
 ``tools/environments/base.py``; they are re-injected fresh on every command.
 """
 
@@ -48,7 +48,7 @@ def test_export_snippet_shape():
     # continuation lines in the snapshot (issue #71296).
     assert "unset" in snippet
     assert "${!HERMES_SESSION_*}" in snippet
-    assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
+    assert "${!HERMES_CRON_*}" in snippet
     assert "${!HERMES_BROWSER_CONTROL_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
     assert "grep -vE" not in snippet
@@ -105,5 +105,26 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_does_not_persist_cron_authority(tmp_path, monkeypatch):
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("HERMES_CRON_ALLOW_MESSAGING", "1")
+    monkeypatch.setenv("HERMES_CRON_JOB_ID", "job-a")
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        env.execute("true")
+        monkeypatch.delenv("HERMES_CRON_ALLOW_MESSAGING")
+        monkeypatch.delenv("HERMES_CRON_JOB_ID")
+        result = env.execute(
+            'printf "[%s][%s]" "${HERMES_CRON_ALLOW_MESSAGING:-}" '
+            '"${HERMES_CRON_JOB_ID:-}"'
+        )
+        assert result.get("output", "").strip() == "[][]"
     finally:
         env.cleanup()

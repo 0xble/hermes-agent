@@ -459,6 +459,30 @@ class TestSearchFilesFallbackHiddenPaths:
         assert result.error is None
         assert set(result.files) == {str(visible_file), str(visible_nested_file)}
 
+    def test_rg_hidden_root_includes_visible_files_and_excludes_hidden_descendants(
+        self, tmp_path, monkeypatch
+    ):
+        """The ripgrep path follows the same hidden-root contract as find."""
+        root = tmp_path / ".hermes" / "logs"
+        visible_files = [
+            root / "agent.log",
+            root / "nested" / "visible.log",
+        ]
+        hidden_files = [
+            root / ".hidden" / "secret.log",
+            root / "nested" / ".secret.log",
+        ]
+        for path in visible_files + hidden_files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+
+        ops = ShellFileOperations(self._make_env())
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "rg")
+        result = ops._search_files("*.log", str(root), limit=50, offset=0)
+
+        assert result.error is None
+        assert set(result.files) == {str(path) for path in visible_files}
+
     def test_normal_root_still_excludes_hidden_descendants(self, tmp_path, monkeypatch):
         """Fallback find should still exclude hidden descendant paths for normal roots."""
         root = tmp_path / "repo"

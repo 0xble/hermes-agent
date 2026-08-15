@@ -26,7 +26,12 @@ _build_document_context_note = gateway_run._build_document_context_note
 class TestTextDocumentNote:
     @pytest.mark.parametrize("mtype", ["text/plain", "text/markdown", "text/csv"])
     def test_text_note_mentions_included_content_and_path(self, mtype):
-        note = _build_document_context_note("notes.txt", "/cache/doc_notes.txt", mtype)
+        note = _build_document_context_note(
+            "notes.txt",
+            "/cache/doc_notes.txt",
+            mtype,
+            content_inlined=True,
+        )
         assert "text document" in note
         assert "notes.txt" in note
         assert "/cache/doc_notes.txt" in note
@@ -44,7 +49,15 @@ class TestTextDocumentNote:
         assert "read" in note.lower()
 
     @pytest.mark.asyncio
-    async def test_event_contract_marks_non_inlined_text_and_preserves_path(self):
+    async def test_event_contract_marks_non_inlined_text_and_preserves_path(
+        self, tmp_path
+    ):
+        # The note builder probes the cached file so a missing attachment is
+        # reported as unresolved; this test is about the inlined flag and path
+        # plumbing, so give it a real file to resolve.
+        cached = tmp_path / "notes.txt"
+        cached.write_text("the notes")
+
         runner = object.__new__(GatewayRunner)
         runner.config = GatewayConfig(
             platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
@@ -64,7 +77,7 @@ class TestTextDocumentNote:
             text="summarize this",
             message_type=MessageType.DOCUMENT,
             source=source,
-            media_urls=["/cache/notes.txt"],
+            media_urls=[str(cached)],
             media_types=["text/plain"],
             media_text_inlined=[False],
         )
@@ -76,9 +89,29 @@ class TestTextDocumentNote:
         )
 
         assert prepared is not None
-        assert "/cache/notes.txt" in prepared
+        assert str(cached) in prepared
         assert "included below" not in prepared
         assert "read the cached file" in prepared.lower()
+
+
+class TestDocumentResolutionFailureNote:
+    @pytest.mark.parametrize(
+        ("resolution_status", "expected"),
+        [("absent", "could not be found"), ("inaccessible", "is inaccessible")],
+    )
+    def test_resolution_failure_never_claims_document_was_read(
+        self, resolution_status, expected
+    ):
+        note = _build_document_context_note(
+            "contract.pdf",
+            "/cache/doc_contract.pdf",
+            "application/pdf",
+            resolution_status=resolution_status,
+        )
+
+        assert expected in note
+        assert "do not claim to have read it" in note
+        assert "/cache/doc_contract.pdf" in note
 
 
 class TestBinaryDocumentNote:

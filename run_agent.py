@@ -6799,6 +6799,17 @@ class AIAgent:
             runtime_base
         )
 
+        # Credential rotation invalidates the per-request wire client too,
+        # not only the shared client below.  Keep this cleanup at the common
+        # rotation boundary so every OpenAI-compatible provider gets the same
+        # treatment; the helper safely no-ops for test doubles and for agents
+        # whose current transport has no request-client cache.
+        close_request_client = getattr(
+            self, "_close_cached_request_openai_client", None
+        )
+        if callable(close_request_client):
+            close_request_client(reason="credential_rotation")
+
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 
