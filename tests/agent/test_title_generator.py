@@ -77,6 +77,24 @@ class TestGenerateTitle:
 
         assert captured_kwargs["task"] == "title_generation"
         assert captured_kwargs["timeout"] is None
+        assert captured_kwargs["max_tokens"] == 1024
+
+    def test_rejects_length_truncated_response(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].finish_reason = "length"
+        response.choices[0].message.content = '```json\n{"title": "Financial'
+        failures = []
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(
+                "Verify the financial tables",
+                failure_callback=lambda task, exc: failures.append((task, exc)),
+            ) is None
+
+        assert len(failures) == 1
+        assert failures[0][0] == "title generation"
+        assert "truncated response" in str(failures[0][1])
 
 
 
@@ -590,6 +608,23 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "Verify the financial tables")
 
         assert db.get_session_title("sess-1") == "Verify financial tables"
+        assert db.get_session_title_source("sess-1") == "derived"
+
+    def test_truncated_model_output_preserves_derived_title(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        db.set_auto_title(
+            "sess-1", "Verify the financial tables", source="derived"
+        )
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].finish_reason = "length"
+        response.choices[0].message.content = '{"title": "Financial'
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            auto_title_session(db, "sess-1", "Verify the financial tables")
+
+        assert db.get_session_title("sess-1") == "Verify the financial tables"
         assert db.get_session_title_source("sess-1") == "derived"
 
 

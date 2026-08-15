@@ -75,6 +75,13 @@ MAX_DERIVED_TITLE_CHARS = 48
 # while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
 
+# Gemini 3.x counts hidden thinking against maxOutputTokens. The old 64-token
+# ceiling reproducibly left 0-3 visible tokens after provider failover, turning
+# a structured title into a truncated Markdown fence. 1024 remained sufficient
+# across a live replay while staying tiny relative to normal model output limits
+# and the persisted title is still hard-capped below.
+TITLE_MAX_OUTPUT_TOKENS = 1024
+
 _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
     "that lets them find this conversation again in a list.\n\n"
@@ -637,15 +644,23 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
+            # The visible title is only a handful of tokens, but thinking-capable
+            # fallbacks share this ceiling with hidden provider-side reasoning.
+            # The cleaner below still hard-limits the persisted title itself.
+            max_tokens=TITLE_MAX_OUTPUT_TOKENS,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
-        content = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
+        if finish_reason in {"length", "max_tokens"}:
+            raise RuntimeError(
+                "Title generation returned a truncated response "
+                f"(finish_reason={finish_reason})"
+            )
+        content = choice.message.content or ""
         # Normalize model chatter first, then apply aliases, then enforce the
         # configured limits exactly once so ellipsis handling is stable.
         title = _clean_title(
