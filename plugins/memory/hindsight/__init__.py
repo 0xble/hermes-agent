@@ -56,6 +56,7 @@ from hermes_cli.config import cfg_get
 from plugins.memory.hindsight.source_retention import (
     SourceCandidate,
     discover_source_candidates,
+    read_verified_source_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -2254,7 +2255,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     "tags": list(candidate.tags),
                     "metadata": candidate.metadata,
                 }
-                file_bytes = Path(candidate.file_path).read_bytes()
+                file_bytes = read_verified_source_file(candidate)
+                if file_bytes is None:
+                    raise ValueError("attachment changed or left the trusted media cache before retain")
                 response = self._run_hindsight_operation(
                     lambda client: client._files_api.file_retain(
                         bank_id=bank_id,

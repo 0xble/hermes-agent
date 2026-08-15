@@ -15,12 +15,14 @@ import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
 _MIN_TEXT_CHARS = 512
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 _TEXT_SOURCE_TOOLS = {
     "web_extract": "webpage",
     "web_extract_content": "webpage",
@@ -156,6 +158,20 @@ def _safe_file(path: str, trusted_roots: tuple[Path, ...]) -> Path | None:
         return None
 
 
+def _read_nofollow(path: Path) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_ATTACHMENT_BYTES:
+                return None
+            data = handle.read(_MAX_ATTACHMENT_BYTES + 1)
+    except OSError:
+        return None
+    return data if len(data) <= _MAX_ATTACHMENT_BYTES else None
+
+
 def _looks_like_pasted_source(content: str) -> bool:
     """Recognize long pasted evidence without treating every prompt as a source."""
     normalized = content.strip()
@@ -237,6 +253,19 @@ class SourceCandidate:
         return self.source_id, self.content_hash
 
 
+def read_verified_source_file(
+    candidate: SourceCandidate,
+    trusted_roots: Iterable[Path] | None = None,
+) -> bytes | None:
+    """Revalidate and hash-check attachment bytes at the upload boundary."""
+    roots = tuple(Path(root).resolve() for root in (trusted_roots or _attachment_cache_roots()))
+    safe = _safe_file(candidate.file_path, roots)
+    data = _read_nofollow(safe) if safe is not None else None
+    if data is None or _sha256_bytes(data) != candidate.content_hash:
+        return None
+    return data
+
+
 def _candidate_text(
     *,
     source_type: str,
@@ -285,10 +314,10 @@ def _candidate_file(
     safe = _safe_file(path, trusted_roots)
     if safe is None:
         return None
-    try:
-        digest = _sha256_bytes(safe.read_bytes())
-    except OSError:
+    data = _read_nofollow(safe)
+    if data is None:
         return None
+    digest = _sha256_bytes(data)
     metadata = {
         "source_type": source_type,
         "source_id": source_id,
