@@ -18,6 +18,7 @@ same ``custom > ai > fallback`` precedence in its session importer.
 """
 
 import hashlib
+import hashlib
 import json
 import logging
 import re
