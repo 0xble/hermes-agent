@@ -1088,19 +1088,22 @@ async def _send_via_adapter(
     if runner is not None:
         try:
             profile_name = str(profile or "").strip()
-            if profile_name and profile_name != "default":
-                active_profile = None
-                active_profile_fn = getattr(runner, "_active_profile_name", None)
-                if callable(active_profile_fn):
-                    active_profile = active_profile_fn()
-                if profile_name == active_profile:
+            active_profile = None
+            active_profile_fn = getattr(runner, "_active_profile_name", None)
+            if callable(active_profile_fn):
+                active_profile = str(active_profile_fn() or "").strip() or None
+            if profile_name:
+                requested_profile = profile_name
+                if requested_profile == active_profile:
                     adapter = (getattr(runner, "adapters", None) or {}).get(platform)
                 else:
                     adapter = (
                         (getattr(runner, "_profile_adapters", None) or {})
-                        .get(profile_name, {})
+                        .get(requested_profile, {})
                         .get(platform)
                     )
+                if adapter is None:
+                    return {"error": f"No live adapter for profile '{requested_profile}' and platform '{platform_name}'"}
             else:
                 adapter = (getattr(runner, "adapters", None) or {}).get(platform)
         except Exception:

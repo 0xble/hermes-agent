@@ -311,6 +311,61 @@ class TestSendGate:
         secondary_adapter.send.assert_awaited_once()
         default_adapter.send.assert_not_awaited()
 
+    def test_literal_default_profile_does_not_use_nondefault_active_adapter(self, monkeypatch):
+        from gateway.config import Platform
+
+        active_adapter = SimpleNamespace(send=AsyncMock())
+        default_adapter = SimpleNamespace(
+            send=AsyncMock(
+                return_value=SimpleNamespace(
+                    success=True,
+                    message_id="default-message",
+                    error=None,
+                )
+            )
+        )
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: active_adapter},
+            _profile_adapters={"default": {Platform.TELEGRAM: default_adapter}},
+            _active_profile_name=lambda: "secondary",
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = asyncio.run(_send_via_adapter(
+            Platform.TELEGRAM,
+            SimpleNamespace(),
+            "2027045491",
+            "hello",
+            profile="default",
+        ))
+
+        assert result == {"success": True, "message_id": "default-message"}
+        default_adapter.send.assert_awaited_once()
+        active_adapter.send.assert_not_awaited()
+
+    def test_explicit_missing_profile_adapter_fails_closed(self, monkeypatch):
+        from gateway.config import Platform
+
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())},
+            _profile_adapters={},
+            _active_profile_name=lambda: "secondary",
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = asyncio.run(_send_via_adapter(
+            Platform.TELEGRAM,
+            SimpleNamespace(),
+            "2027045491",
+            "hello",
+            profile="default",
+        ))
+
+        assert result == {
+            "error": "No live adapter for profile 'default' and platform 'telegram'"
+        }
+        runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
     def test_two_native_sends_are_separate(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch)
         with patch(
