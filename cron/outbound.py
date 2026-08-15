@@ -142,6 +142,18 @@ def claim_or_reuse(
                     f"message_key '{message_key}' was already used in this run "
                     "with a different body or target."
                 )
+            if record["status"] == "failed":
+                conn.execute(
+                    """UPDATE outbound_messages
+                       SET status='queued', error=NULL, updated_at=?
+                       WHERE job_id=? AND run_id=? AND message_key=?""",
+                    (now, job_id, run_id, message_key),
+                )
+                row = conn.execute(
+                    "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
+                    (job_id, run_id, message_key),
+                ).fetchone()
+                return {"action": "claim", "record": dict(row)}
             return {"action": "reuse", "record": record}
         conn.execute(
             """INSERT INTO outbound_messages (

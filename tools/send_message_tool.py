@@ -874,13 +874,23 @@ def _maybe_handle_cron_outbound(args):
     if claim["action"] == "reuse":
         return cron_outbound.dumps(cron_outbound.reuse_payload(claim["record"]))
 
-    raw = _handle_send({
-        "target": (
-            f"{origin['platform']}:{origin['chat_id']}"
-            + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
-        ),
-        "message": message,
-    })
+    try:
+        raw = _handle_send({
+            "target": (
+                f"{origin['platform']}:{origin['chat_id']}"
+                + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
+            ),
+            "message": message,
+        })
+    except Exception as exc:
+        record = cron_outbound.mark_result(
+            job_id=job_id,
+            run_id=run_id,
+            message_key=message_key,
+            status="ambiguous",
+            error=f"send engine raised {type(exc).__name__}",
+        )
+        return cron_outbound.dumps(cron_outbound.success_payload(record))
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
     except ValueError:

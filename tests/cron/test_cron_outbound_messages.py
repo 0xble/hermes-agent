@@ -115,6 +115,30 @@ class TestOutboundLedger:
         assert reused["record"]["status"] == "verified"
         assert reused["record"]["transport_message_id"] == "131192"
 
+    def test_confirmed_failure_can_be_retried(self, tmp_outbound):
+        params = {
+            "job_id": "job-1",
+            "run_id": "run-1",
+            "message_key": "automatic-action:retry",
+            "target": "origin",
+            "body": "hello",
+            "platform": "telegram",
+            "chat_id": "2027045491",
+            "thread_id": None,
+        }
+        claim_or_reuse(**params)
+        mark_result(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:retry",
+            status="failed",
+            error="confirmed pre-send failure",
+        )
+        retried = claim_or_reuse(**params)
+        assert retried["action"] == "claim"
+        assert retried["record"]["status"] == "queued"
+        assert retried["record"]["error"] is None
+
     def test_same_key_different_body_fails_closed(self, tmp_outbound):
         claim_or_reuse(
             job_id="job-1",
@@ -213,6 +237,22 @@ class TestSendGate:
         assert send_mock.call_count == 2
         assert first["message_id"] == "1"
         assert second["message_id"] == "2"
+
+    def test_send_exception_is_recorded_as_ambiguous(self, tmp_outbound, monkeypatch):
+        self._bind_cron(monkeypatch)
+        with patch(
+            "tools.send_message_tool._handle_send",
+            side_effect=RuntimeError("secret provider detail"),
+        ):
+            payload = json.loads(send_message_tool({
+                "target": "origin",
+                "message": "action done",
+                "message_key": "automatic-action:exception",
+            }))
+        assert payload["success"] is False
+        assert payload["status"] == "ambiguous"
+        assert payload["error"] == "send engine raised RuntimeError"
+        assert "secret provider detail" not in json.dumps(payload)
 
     def test_job_without_opt_in_cannot_send(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch, allow=False)
