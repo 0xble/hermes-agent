@@ -1139,7 +1139,14 @@ async def _send_via_adapter(
                     return {"error": f"No live adapter for profile '{requested_profile}' and platform '{platform_name}'"}
             else:
                 adapter = (getattr(runner, "adapters", None) or {}).get(platform)
-        except Exception:
+        except Exception as exc:
+            if str(profile or "").strip():
+                return {
+                    "error": (
+                        f"Profile resolution failed for '{str(profile).strip()}': "
+                        f"{type(exc).__name__}"
+                    )
+                }
             adapter = None
         if adapter is not None:
             try:
