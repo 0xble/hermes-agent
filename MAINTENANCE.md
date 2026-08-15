@@ -51,10 +51,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-025 | Active | `fix(compression): report aborted compaction accurately` | Emit committed, aborted, or deferred terminal outcomes instead of unconditional success. |
 | HERMES-026 | Active | `feat(memory): retain source material automatically`; `fix(memory): gate raw attachment retention` | Preserve source evidence while requiring explicit opt-in before reading or uploading raw attachment bytes. |
 | HERMES-027 | Active | `fix: harden gateway runtime boundaries`; `fix(gateway): recover unacknowledged terminal responses` | Resume recent sessions after an unexpected exit unless outbound delivery is durably acknowledged. |
+| HERMES-028 | Active | `fix: harden gateway runtime boundaries`; `fix(terminal): avoid remote Python lifecycle dependency` | Inspect referenced remote scripts through the POSIX shell contract without requiring Python. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-028 — Inspect remote scripts without a Python dependency
+
+- **Summary:** Keeps the gateway self-control guard fail-closed while reading bounded referenced scripts through the target's POSIX `sh` and `dd` contract. Supported SSH, container, and sandbox targets no longer need Python merely to run an otherwise valid shell script.
+- **Surfaces:** `tools/terminal_tool.py`; `tests/hermes_cli/test_gateway_restart_loop.py`.
+- **Upstream tracking:** Local fork correction to the concurrent gateway-boundary hardening; no released upstream equivalent was identified.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/hermes_cli/test_gateway_restart_loop.py -k 'remote_backend or referenced_script'`.
+- **Rollback:** Replace the remote reader only with another bounded target-environment primitive that is guaranteed by every supported backend. Preserve fail-closed behavior for unreadable referenced scripts and the gateway self-control block.
+- **Retirement:** Retire after released upstream performs equivalent bounded remote script inspection without adding runtime dependencies beyond the supported remote shell contract.
 
 ### HERMES-027 — Recover recent sessions until delivery is acknowledged
 
