@@ -25817,9 +25817,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Generate a Telegram topic title after a successful assistant turn.
 
-        The title generator remains best-effort and runs in its own background
-        thread. Telegram receives the opening request plus the final assistant
-        response, rather than progress text or intermediate tool output.
+        The best-effort background task waits for a completed response, but sends
+        only the opening user request across the auxiliary-provider boundary.
         """
         if (
             source.platform != Platform.TELEGRAM
@@ -25842,10 +25841,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         opening_text = str(user_message or "").strip()
         if not opening_text or len(response_text) < 20:
             return
-        combined_context = (
-            f"User request:\n{opening_text}\n\n"
-            f"Completed assistant response:\n{response_text}"
-        )[:4000]
+        title_context = opening_text[:4000]
 
         try:
             from agent.title_generator import maybe_auto_title
@@ -25860,14 +25856,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             maybe_auto_title(
                 getattr(agent, "_session_db", None),
                 session_id,
-                combined_context,
+                title_context,
                 failure_callback=getattr(agent, "_title_failure_callback", None),
                 main_runtime=runtime,
                 title_callback=lambda title, title_source: self._schedule_telegram_topic_title_rename(
                     source,
                     session_id,
                     title,
-                    user_message=combined_context,
+                    user_message=title_context,
                 ) if title_source in {"llm", "derived"} else None,
                 runtime_validator=lambda: True,
             )

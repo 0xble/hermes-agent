@@ -1654,7 +1654,7 @@ def test_topic_title_generation_waits_for_completed_response_and_uses_context():
     auto_title.assert_called_once()
     context = auto_title.call_args.args[2]
     assert "Help move the reporting workflow to the VPS" in context
-    assert "direct Supabase queries on the LPG VPS" in context
+    assert "direct Supabase queries on the LPG VPS" not in context
 
 
 def test_topic_title_generation_skips_failed_or_empty_responses():
