@@ -1310,6 +1310,17 @@ async def _send_to_platform(
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     media_files = media_files or []
+    if str(profile or "").strip():
+        return await _send_via_adapter(
+            platform,
+            pconfig,
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+            profile=profile,
+        )
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
