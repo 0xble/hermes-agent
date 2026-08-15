@@ -504,56 +504,6 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     re.MULTILINE,
 )
 
-# A normal Markdown blank line is visually too subtle in some Telegram
-# clients, especially on narrow screens. Keep the source structure intact,
-# but add an explicit non-breaking-space line between prose blocks so the
-# transport has a reliably visible spacer. Code fences and pipe tables are
-# protected because their internal whitespace is syntax, not presentation.
-_TELEGRAM_SPACING_PROTECTED_REGION_RE = _RICH_PROTECTED_REGION_RE
-_TELEGRAM_VISUAL_SPACER = "\u00a0"
-
-
-def _telegram_add_visual_paragraph_spacing(text: str) -> str:
-    """Make existing paragraph boundaries visibly distinct in Telegram.
-
-    This is deliberately a renderer-level normalization, not a generic
-    whitespace rewrite. It only expands existing blank-line boundaries,
-    leaves single-line lists alone, is idempotent, and never changes fenced
-    code or native pipe-table blocks.
-    """
-    if not text or "\n\n" not in text:
-        return text
-
-    def normalize_prose(prose: str) -> str:
-        # Mask canonical spacer boundaries before normalizing ordinary blank
-        # lines; otherwise the second newline pair in our own output would be
-        # mistaken for a new paragraph on the next invocation.
-        placeholder = "\x00TELEGRAM_SPACER\x00"
-        masked = re.sub(
-            rf"\n{{2,}}{re.escape(_TELEGRAM_VISUAL_SPACER)}\n+",
-            placeholder,
-            prose,
-        )
-        normalized = re.sub(
-            r"\n{2,}",
-            f"\n\n{_TELEGRAM_VISUAL_SPACER}\n\n",
-            masked,
-        )
-        return normalized.replace(
-            placeholder,
-            f"\n\n{_TELEGRAM_VISUAL_SPACER}\n\n",
-        )
-
-    out: list[str] = []
-    position = 0
-    for match in _TELEGRAM_SPACING_PROTECTED_REGION_RE.finditer(text):
-        out.append(normalize_prose(text[position : match.start()]))
-        out.append(match.group(0))
-        position = match.end()
-    out.append(normalize_prose(text[position:]))
-    return "".join(out)
-
-
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
 
@@ -5827,11 +5777,6 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-
-        # Apply Telegram-only visual spacing at the final transport boundary.
-        # Cron agents use platform="cron" upstream, so a pre-delivery output
-        # guard cannot reliably infer that the destination is Telegram.
-        content = _telegram_add_visual_paragraph_spacing(content)
 
         # The cooldown is reserved immediately before each Bot API send below,
         # not once for the whole high-level operation. This keeps rich sends,
