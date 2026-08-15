@@ -866,9 +866,16 @@ def _maybe_handle_cron_outbound(args):
     run_id = cron_outbound.current_cron_run_id()
     origin = _get_cron_auto_delivery_target()
     profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
+    fire_owner = cron_outbound.current_cron_fire_owner()
     if not job_id or not run_id or not origin:
         return json.dumps(_error(
             "Cron outbound send is missing the job, run, or origin binding."
+        ))
+    if not fire_owner or not cron_outbound.live_fire_claim_matches(
+        job_id, run_id, fire_owner
+    ):
+        return json.dumps(_error(
+            "Cron outbound send is missing its trusted fire-claim binding."
         ))
     if not profile:
         return json.dumps(_error(
@@ -1209,6 +1216,14 @@ async def _send_via_adapter(
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
+
+    if runner is None and str(profile or "").strip():
+        return {
+            "error": (
+                f"Cannot honor trusted profile '{str(profile).strip()}' for "
+                f"standalone platform '{platform_name}'; refusing cross-profile send."
+            )
+        }
 
     entry = None
     try:
