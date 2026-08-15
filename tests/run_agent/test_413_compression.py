@@ -581,6 +581,33 @@ class TestPreflightCompression:
         assert [event for event, _ in events] == ["lifecycle", "warn"]
         assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
+    def test_quiet_summary_failure_still_prints_abort_notice(self, agent):
+        agent.compression_enabled = False
+        agent.context_compressor.emit_automatic_compaction_status = False
+        agent.status_callback = None
+        agent._vprint = MagicMock()
+        messages = [{"role": "user", "content": "hello"}]
+
+        def _abort(*_args, **_kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            agent.context_compressor._last_summary_error = "provider overloaded"
+            return messages
+
+        with patch.object(agent.context_compressor, "compress", side_effect=_abort):
+            compressed, _prompt = agent._compress_context(
+                messages,
+                "system prompt",
+                force=True,
+            )
+
+        assert compressed is messages
+        printed = " ".join(
+            str(call.args[0]) for call in agent._vprint.call_args_list if call.args
+        )
+        assert "Compression aborted: provider overloaded" in printed
+        assert "conversation continues unchanged" in printed
+
+
     def test_compression_reuses_cached_prompt_when_memory_snapshot_is_unchanged(self, agent):
         """A byte-equal rebuild must keep the EXACT cached prompt object.
 

@@ -57,7 +57,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 ### HERMES-025 — Outcome-aware compaction lifecycle
 
 - **Summary:** Replaces the unconditional post-compression `compacted` event with one truthful terminal edge: `compacted` after a committed transcript boundary, `compaction_aborted` after failed work that preserves the prior transcript, or `compaction_deferred` when another path or a cooldown prevents the attempt. Summary, empty-transcript, and Codex-native failures carry their detailed failure text in that single terminal event rather than emitting a failure followed by false success.
-- **Surfaces:** `agent/conversation_compression.py`; `tests/run_agent/test_413_compression.py`; `tests/run_agent/test_codex_app_server_compaction.py`; `tests/gateway/test_telegram_noise_filter.py`.
+- **Surfaces:** `agent/conversation_compression.py`; `apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts`; `apps/desktop/src/app/session/hooks/use-message-stream/compaction-event.test.tsx`; `tests/run_agent/test_413_compression.py`; `tests/run_agent/test_codex_app_server_compaction.py`; `tests/gateway/test_telegram_noise_filter.py`.
 - **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
 - **Upstream PR:** None.
 - **Regression:** `pytest -q tests/run_agent/test_413_compression.py tests/run_agent/test_codex_app_server_compaction.py tests/gateway/test_telegram_noise_filter.py`.
