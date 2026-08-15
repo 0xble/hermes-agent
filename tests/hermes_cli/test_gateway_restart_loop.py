@@ -1391,6 +1391,27 @@ class TestLifecycleGuardModule:
         )
         assert result is True
 
+    def test_unreadable_remote_callback_fails_closed(self):
+        """A remote read failure must not be treated as an empty script."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/helper.sh",
+            read_remote_script=lambda _path: None,
+        ) is True
+
+    def test_remote_callback_exception_fails_closed(self):
+        """Transport/backend exceptions cannot bypass lifecycle inspection."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        def _remote_read(_path):
+            raise OSError("backend unavailable")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /remote/helper.sh",
+            read_remote_script=_remote_read,
+        ) is True
+
     def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
         """The public guard is a total function: no input may raise. Covers
         the residual class beyond the four named sites — including
@@ -1828,14 +1849,30 @@ class TestRestartLoopGuard:
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""
 
-    def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
+    def _patch_env(
+        self,
+        monkeypatch,
+        fake_env,
+        *,
+        inside_gateway: bool,
+        env_type: str = "local",
+    ):
         import tools.terminal_tool as tt
         from tools import process_registry
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
+        monkeypatch.setattr(
+            tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": env_type,
+                "cwd": "/tmp",
+                "timeout": 60,
+                "lifetime_seconds": 3600,
+            },
+        )
         monkeypatch.setattr(
             process_registry, "_is_supervised_gateway_process",
             lambda: inside_gateway,
@@ -1844,8 +1881,8 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
     def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
-        # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to a bounded env.execute('head -c ...') read.
+        # Path exists only in the target environment. Mark the backend as SSH
+        # so remote content, rather than coincidental host content, is authoritative.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -1854,19 +1891,25 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "head -c" in command and "/remote/workspace/remote.sh" in command:
+                if "sh -c" in command and "dd if=" in command and "/remote/workspace/remote.sh" in command:
                     return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
-        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
+        self._patch_env(
+            monkeypatch,
+            fake_env,
+            inside_gateway=True,
+            env_type="ssh",
+        )
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("head -c" in c for c in calls)
+        assert any("sh -c" in c and "dd if=" in c for c in calls)
+        assert all("python" not in c for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:
@@ -2006,55 +2049,139 @@ class TestLifecycleGuardNeverRaises:
         weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
         assert self._scan(f"bash {weird}") is False
 
-    def test_sourced_zshrc_docker_completions_dir_is_not_blocked(self, tmp_path):
-        """#86753: Docker Desktop writes ``fpath=(~/.docker/completions …)``
-        into ``.zshrc``. Completions is a directory. The walk must treat
-        that as nothing-to-scan, not fail-closed, or ``source ~/.zshrc``
-        is blocked on every terminal command."""
-        completions = tmp_path / ".docker" / "completions"
-        completions.mkdir(parents=True)
-        zshrc = tmp_path / ".zshrc"
-        zshrc.write_text(
-            f"fpath=({completions} /usr/local/share/zsh/site-functions $fpath)\n",
-            encoding="utf-8",
-        )
-        assert self._scan(f"source {zshrc}") is False
-
-    def test_fstat_directory_mode_is_not_unsafe(self, tmp_path, monkeypatch):
-        """#86753 Unix contract: os.open(dir) succeeds, fstat is not S_ISREG.
-
-        Windows raises OSError on os.open(dir) and already returns
-        nothing-to-scan. Linux/macOS open the directory and used to
-        return unsafe=True, blocking sourced zshrcs that mention
-        ``~/.docker/completions``.
-        """
-        import os
-        import stat as statmod
-
-        from cron.lifecycle_guard import _read_referenced_script
-
-        probe = tmp_path / "probe"
-        probe.write_text("echo hi\n", encoding="utf-8")
-        orig = os.fstat
-
-        def _dir_fstat(fd):
-            orig(fd)
-            class _DirStat:
-                st_mode = statmod.S_IFDIR | 0o755
-            return _DirStat()
-
-        monkeypatch.setattr(os, "fstat", _dir_fstat)
-        text, unsafe = _read_referenced_script(probe)
-        assert text is None
-        assert unsafe is False
-
-    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
-        # Directories are not scripts (#86753). Devices stay fail-closed
-        # where the OS actually exposes them (POSIX /dev/null).
-        # The important contract is: verdict, not exception.
+    def test_directory_is_harmless_and_dev_null_fails_closed(self, tmp_path):
+        # Directories cannot feed a shell, while devices can.
         assert self._scan(f"bash {tmp_path}") is False
-        if os.name != "nt":
-            assert self._scan("bash /dev/null") is True
+        assert self._scan("bash /dev/null") is True
+
+    def test_extensionless_python_wrapper_may_name_a_directory(self, tmp_path):
+        wrapper = tmp_path / "wrapper"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            f"CONTROL_ROOT = Path({str(tmp_path)!r})\n"
+        )
+        wrapper.chmod(0o755)
+
+        assert self._scan(str(wrapper)) is False
+
+    def test_local_directory_does_not_hide_remote_script(self, tmp_path):
+        calls = []
+
+        def read_remote_script(path):
+            calls.append(path)
+            return "hermes gateway restart\n"
+
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            str(tmp_path),
+            read_remote_script=read_remote_script,
+        ) is True
+        assert calls == [str(tmp_path)]
+
+    @pytest.mark.parametrize("name", ["sh", "bash", "dash", "ksh", "zsh", "source"])
+    def test_path_qualified_interpreter_name_scans_the_executable(
+        self,
+        tmp_path,
+        name,
+    ):
+        executable = tmp_path / name
+        executable.write_text("hermes gateway restart\n")
+        executable.chmod(0o755)
+
+        assert self._scan(f"{executable} benign-argument") is True
+
+    @pytest.mark.parametrize("name", ["sh", "bash", "source"])
+    def test_remote_path_qualified_interpreter_name_scans_the_executable(
+        self,
+        name,
+    ):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        executable = f"/remote/workspace/{name}"
+        calls = []
+
+        def read_remote_script(path):
+            calls.append(path)
+            if path == executable:
+                return "hermes gateway restart\n"
+            return None
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"{executable} benign-argument",
+            read_remote_script=read_remote_script,
+        ) is True
+        assert calls[0] == executable
+
+    def test_remote_reader_is_authoritative_over_local_regular_file(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        executable = tmp_path / "bash"
+        executable.write_text("printf 'locally safe\\n'\n")
+        executable.chmod(0o755)
+        calls = []
+
+        def read_remote_script(path):
+            calls.append(path)
+            if path == str(executable):
+                return "hermes gateway restart\n"
+            return None
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"{executable} benign-argument",
+            read_remote_script=read_remote_script,
+        ) is True
+        assert calls[0] == str(executable)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "$EVILROOT/bash benign-argument",
+            "${HOME}/bin/sh benign-argument",
+            "$RUNNER benign-argument",
+            "$(printf ./runner) benign-argument",
+            "runner* benign-argument",
+            "bash $SCRIPT",
+            "source ${SCRIPT}",
+        ],
+    )
+    def test_unresolved_executable_expansion_fails_closed(self, command):
+        assert self._scan(command) is True
+
+    def test_nested_shell_script_expansion_fails_closed(self, tmp_path):
+        wrapper = tmp_path / "wrapper"
+        wrapper.write_text("#!/bin/bash\nbash \"$SCRIPT\"\n")
+        wrapper.chmod(0o755)
+
+        assert self._scan(str(wrapper)) is True
+
+    def test_remote_tilde_path_preserves_target_spelling(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        calls = []
+
+        def read_remote_script(path):
+            calls.append(path)
+            if path == "~/unsafe.sh":
+                return "hermes gateway restart\n"
+            return None
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash ~/unsafe.sh",
+            cwd="/remote/workspace",
+            read_remote_script=read_remote_script,
+        ) is True
+        assert "~/unsafe.sh" in calls
+        assert all("/Users/" not in path for path in calls)
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
@@ -2082,8 +2209,12 @@ class TestLifecycleGuardNeverRaises:
         )
         binary = tmp_path / "prog"
         binary.write_bytes(b"\x7fELF" + bytes(128))
-        for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh", str(tmp_path)):
+        for value in (
+            "nul\x00byte.sh",
+            str(binary),
+            "/nonexistent/x.sh",
+            str(tmp_path),
+        ):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        if os.name != "nt":
-            with pytest.raises(GatewayLifecycleBlocked):
-                check_gateway_lifecycle("clean prompt", "/dev/null")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", "/dev/null")

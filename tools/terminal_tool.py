@@ -3123,14 +3123,15 @@ def terminal_tool(
                 # Read through the target environment. Host files are not
                 # authoritative for SSH, container, or sandbox paths.
                 try:
+                    # Use only the POSIX shell contract available on supported
+                    # remote targets; Python is not guaranteed on SSH hosts,
+                    # minimal containers, or sandbox environments.
                     reader = (
-                        "import os,sys; "
-                        "path=os.path.expanduser(sys.argv[1]); "
-                        f"data=open(path,'rb').read({_MAX_REFERENCED_SCRIPT_BYTES + 1}); "
-                        "sys.stdout.buffer.write(data)"
+                        'path=$1; case "$path" in "~") path=$HOME;; "~/"*) path=$HOME/${path#??};; esac; '
+                        f'dd if="$path" bs={_MAX_REFERENCED_SCRIPT_BYTES + 1} count=1 2>/dev/null'
                     )
                     result = env.execute(
-                        f"python3 -c {shlex.quote(reader)} {shlex.quote(script_path)}"
+                        f"sh -c {shlex.quote(reader)} sh {shlex.quote(script_path)}"
                     )
                     if result.get("returncode", -1) == 0:
                         # Preserve the successful read result verbatim.  The
