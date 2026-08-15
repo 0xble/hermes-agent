@@ -48,10 +48,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-022 | Active | `feat(cron): job-scoped native outbound messages` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, adapter identity, and idempotent multi-message delivery. |
 | HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
 | HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
+| HERMES-025 | Active | `fix(compression): report aborted compaction accurately` | Emit committed, aborted, or deferred terminal outcomes instead of unconditional success. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-025 — Outcome-aware compaction lifecycle
+
+- **Summary:** Replaces the unconditional post-compression `compacted` event with one truthful terminal edge: `compacted` after a committed transcript boundary, `compaction_aborted` after failed work that preserves the prior transcript, or `compaction_deferred` when another path or a cooldown prevents the attempt. Summary, empty-transcript, and Codex-native failures carry their detailed failure text in that single terminal event rather than emitting a failure followed by false success.
+- **Surfaces:** `agent/conversation_compression.py`; `tests/run_agent/test_413_compression.py`; `tests/run_agent/test_codex_app_server_compaction.py`; `tests/gateway/test_telegram_noise_filter.py`.
+- **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/run_agent/test_413_compression.py tests/run_agent/test_codex_app_server_compaction.py tests/gateway/test_telegram_noise_filter.py`.
+- **Rollback:** Restore `_emit_compaction_done` and remove the outcome/message state, the aborted/deferred constants, and HERMES-025 tests. Preserve all compression locking, commit-fence, cooldown, and transcript-preservation behavior.
+- **Retirement:** Retire after released upstream emits exactly one equivalent terminal outcome per visible compaction lifecycle and never reports completion for an aborted or deferred attempt.
 
 ### HERMES-024 — Retry auxiliary transient failure on one alternate credential
 

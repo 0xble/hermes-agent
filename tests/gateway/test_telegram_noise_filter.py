@@ -3,6 +3,8 @@
 import pytest
 
 from agent.conversation_compression import (
+    COMPACTION_ABORTED_STATUS,
+    COMPACTION_DEFERRED_STATUS,
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
@@ -64,6 +66,8 @@ NOISY_STATUS_MESSAGES = [
 # feedback (manual_compression_feedback.py headlines) and abort/failure
 # notices that require user action.
 VISIBLE_COMPRESSION_MESSAGES = [
+    COMPACTION_ABORTED_STATUS,
+    COMPACTION_DEFERRED_STATUS,
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
     "Compressed with fallback: 30 → 12 messages",

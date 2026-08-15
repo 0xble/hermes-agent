@@ -16,7 +16,11 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX, _DB_PERSISTED_MARKER
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_DEFERRED_STATUS,
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -508,8 +512,54 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn", "compacted"]
-        assert events[-1] == ("compacted", COMPACTION_DONE_STATUS)
+        assert [event for event, _ in events] == [
+            "lifecycle",
+            "warn",
+            "compaction_deferred",
+        ]
+        terminal_events = [
+            event
+            for event, _ in events
+            if event in {"compacted", "compaction_aborted", "compaction_deferred"}
+        ]
+        assert terminal_events == ["compaction_deferred"]
+        assert events[-1] == (
+            "compaction_deferred",
+            COMPACTION_DEFERRED_STATUS,
+        )
+
+    def test_compress_context_emits_aborted_terminal_status_on_summary_failure(
+        self, agent
+    ):
+        agent.compression_enabled = False
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        messages = [{"role": "user", "content": "hello"}]
+
+        def _abort(*_args, **_kwargs):
+            agent.context_compressor._last_compress_aborted = True
+            agent.context_compressor._last_summary_error = "provider overloaded"
+            return messages
+
+        with patch.object(agent.context_compressor, "compress", side_effect=_abort):
+            compressed, prompt = agent._compress_context(
+                messages,
+                "system prompt",
+                force=True,
+            )
+
+        assert compressed is messages
+        assert prompt == "You are helpful."
+        terminal_events = [
+            event
+            for event, _ in events
+            if event in {"compacted", "compaction_aborted", "compaction_deferred"}
+        ]
+        assert terminal_events == ["compaction_aborted"]
+        assert events[-1][0] == "compaction_aborted"
+        assert "Compression aborted: provider overloaded" in events[-1][1]
+        assert "conversation continues unchanged" in events[-1][1]
+        assert not any(event == "compacted" for event, _ in events)
 
     def test_compress_context_does_not_emit_completion_after_an_abort(self, agent):
         """An aborted summary must not claim that compaction completed."""
