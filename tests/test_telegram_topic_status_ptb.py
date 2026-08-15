@@ -64,7 +64,7 @@ def test_registered_status_observer_matches_dm_topic_updates_without_dispatching
             collector = HandlerCollector()
             adapter._app = collector
             adapter.handle_message = AsyncMock()
-            adapter._register_handlers()
+            adapter._register_handlers(collector)
 
             status_handlers = [
                 handler

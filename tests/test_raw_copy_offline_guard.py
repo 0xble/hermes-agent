@@ -105,7 +105,9 @@ def _connect_attempt_during(monkeypatch, db_path):
 def test_backup_db_file_refuses_with_live_connection(db_file):
     conn = connect_tracked(str(db_file))
     try:
-        assert hermes_state._backup_db_file(db_file) is None
+        backup, reason = hermes_state._backup_db_file(db_file)
+        assert backup is None
+        assert reason is not None
         assert not list(db_file.parent.glob("*.malformed-backup-*"))
     finally:
         conn.close()
@@ -115,9 +117,10 @@ def test_backup_db_file_copy_is_atomic_with_the_registry(db_file, monkeypatch):
     """A connect attempted mid-copy must wait, not land in the gap."""
     thread, holder, verdict = _connect_attempt_during(monkeypatch, db_file)
 
-    result = hermes_state._backup_db_file(db_file)
+    result, reason = hermes_state._backup_db_file(db_file)
 
     assert result is not None and result.exists()
+    assert reason is None
     assert verdict["landed_during_copy"] is False, (
         "a connection was opened while the raw copy was in flight -- its "
         "POSIX locks would be cancelled by the copy's close()"
@@ -139,8 +142,9 @@ def test_backup_db_file_still_copies_without_the_registry(db_file, monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _no_safe_read)
-    result = hermes_state._backup_db_file(db_file)
+    result, reason = hermes_state._backup_db_file(db_file)
     assert result is not None and result.exists()
+    assert reason is None
     assert result.with_name(result.name + "-wal").exists()
 
 
