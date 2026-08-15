@@ -828,6 +828,7 @@ class TestRecallStatus:
         assert status is not None
         assert status.provider_label == "Hindsight"
         assert status.count == 2
+        assert status.glyph == "🧠"
 
     def test_reports_count_in_recall_sync_mode(self, provider_with_config):
         # recall_sync path does a live recall inside prefetch() (no background
@@ -1015,7 +1016,7 @@ class TestSyncTurn:
 
 
 class TestRetainIndicator:
-    _SAVING = "👁️ Hindsight — saving to memory…"
+    _SAVING = "🧠 Hindsight — saving to memory…"
 
     def test_emits_saving_on_dispatch(self, provider_with_config):
         calls = []

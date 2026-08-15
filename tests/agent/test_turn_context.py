@@ -380,14 +380,14 @@ def test_recall_indicator_emitted_when_memory_injected():
     agent._emit_status = MagicMock()
     mm = MagicMock()
     mm.prefetch_all.return_value = "- recalled fact"
-    mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
+    mm.describe_recall.return_value = "🧠 Hindsight — recalled 2 memories"
     agent._memory_manager = mm
 
     # A substantive query — a trivial prompt ("hi", "hello") skips prefetch_all
     # entirely, so there'd be nothing to indicate. See is_trivial_prompt.
     _build(agent, user_message="what did we decide about the deploy pipeline?")
 
-    agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
+    agent._emit_status.assert_any_call("🧠 Hindsight — recalled 2 memories")
 
 
 def test_recall_indicator_skipped_when_nothing_injected():

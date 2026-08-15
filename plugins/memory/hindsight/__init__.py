@@ -86,9 +86,9 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # generic user-facing opt-in exists, so this stays unset unless the user sets it
 # via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
 _DEFAULT_RETAIN_SOURCE = ""
-# Hindsight brand mark — the logo is an eye ringed by graph nodes. Used for
-# the deterministic recall/retain indicators (overrides the generic core default).
-_HINDSIGHT_GLYPH = "👁️"
+# Use the generic brain mark for Hindsight's deterministic recall/retain
+# indicators rather than the provider-specific eye mark.
+_HINDSIGHT_GLYPH = "🧠"
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -1246,8 +1246,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
-            {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
-            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
+            {"key": "recall_indicator", "description": "Show a '🧠 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "retain_indicator", "description": "Show a '🧠 Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_attachments", "description": "Upload raw file attachments to Hindsight during automatic source retention. Default off because this reads and durably transmits the original file bytes.", "default": False},
             {"key": "retain_file_extractions", "description": "Retain generic read_file output as source evidence. Default off because arbitrary files can contain credentials that blacklist detection cannot safely identify.", "default": False},
@@ -1861,11 +1861,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
-        # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
+        # Hermes emits a "🧠 Hindsight — recalled N memories" status line so the
         # user SEES memory working, independent of whether the model mentions it.
         # Off switch for customer-facing agents that shouldn't surface internals.
         self._recall_indicator = bool(self._config.get("recall_indicator", True))
-        # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
+        # Companion retain indicator: "🧠 Hindsight — saving to memory…" emitted
         # when a turn is dispatched to the writer. Same off switch rationale.
         self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
