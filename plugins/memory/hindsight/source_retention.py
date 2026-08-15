@@ -126,7 +126,20 @@ def _is_ephemeral_path(path: str) -> bool:
     return bool(_EPHEMERAL_PATH_RE.search(path.replace(os.sep, "/")))
 
 
-def _safe_file(path: str) -> Path | None:
+def _attachment_cache_roots() -> tuple[Path, ...]:
+    try:
+        from gateway.platforms.base import (
+            get_audio_cache_dir, get_document_cache_dir,
+            get_image_cache_dir, get_video_cache_dir,
+        )
+        getters = (get_audio_cache_dir, get_document_cache_dir,
+                   get_image_cache_dir, get_video_cache_dir)
+        return tuple(Path(getter()).resolve() for getter in getters)
+    except (ImportError, OSError, RuntimeError):
+        return ()
+
+
+def _safe_file(path: str, trusted_roots: tuple[Path, ...]) -> Path | None:
     if not path or _is_secret_path(path):
         return None
     try:
@@ -134,6 +147,8 @@ def _safe_file(path: str) -> Path | None:
         if original.is_symlink():
             return None
         candidate = original.resolve()
+        if not any(candidate.is_relative_to(root) for root in trusted_roots):
+            return None
         if not candidate.is_file():
             return None
         return candidate
@@ -265,8 +280,9 @@ def _candidate_file(
     path: str,
     context: str,
     session_id: str,
+    trusted_roots: tuple[Path, ...],
 ) -> SourceCandidate | None:
-    safe = _safe_file(path)
+    safe = _safe_file(path, trusted_roots)
     if safe is None:
         return None
     try:
@@ -299,6 +315,7 @@ def discover_source_candidates(
     session_id: str = "",
     retain_attachments: bool = False,
     retain_file_extractions: bool = False,
+    attachment_roots: Iterable[Path] | None = None,
 ) -> list[SourceCandidate]:
     """Discover substantive, non-sensitive sources from completed messages.
 
@@ -308,6 +325,10 @@ def discover_source_candidates(
     if not messages:
         return []
     messages = list(messages)
+    trusted_roots = tuple(
+        Path(root).expanduser().resolve()
+        for root in (attachment_roots or _attachment_cache_roots())
+    )
     # ``MemoryManager.sync_all`` supplies the session message list. Restrict
     # discovery to the latest user-led turn so an old webpage/file is not
     # re-submitted on every later turn or after a long session append.
@@ -348,6 +369,7 @@ def discover_source_candidates(
                         "claims from Hermes analysis."
                     ),
                     session_id=session_id,
+                    trusted_roots=trusted_roots,
                 )
                 if candidate:
                     candidates.append(candidate)
