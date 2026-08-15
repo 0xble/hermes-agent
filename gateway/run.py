@@ -5343,6 +5343,16 @@ class TurnRunner:
                 _edit_accepts_metadata = False
 
         async def _edit_progress_message(message_id: str, content: str):
+            nonlocal _last_edit_ts
+            while True:
+                _now = time.monotonic()
+                _remaining = _PROGRESS_EDIT_INTERVAL - _edit_gate_elapsed(_now)
+                if _remaining <= 0:
+                    # Claim before the API await so another session in this
+                    # chat cannot observe a stale slot and edit concurrently.
+                    _last_edit_ts = _stamp_edit_clock(_now)
+                    break
+                await asyncio.sleep(_remaining)
             kwargs = {
                 "chat_id": ctx.source.chat_id,
                 "message_id": message_id,
@@ -5497,25 +5507,6 @@ class TurnRunner:
                 # API calls to avoid hitting Telegram flood control.
                 # (grammY auto-retry pattern: proactively rate-limit
                 # instead of reacting to 429s.)
-                _now = time.monotonic()
-                _remaining = _PROGRESS_EDIT_INTERVAL - _edit_gate_elapsed(_now)
-                if _remaining > 0:
-                    # Wait out the throttle interval, then loop back to
-                    # drain any additional queued messages before sending
-                    # a single batched edit.
-                    await asyncio.sleep(_remaining)
-                    continue
-
-                # Claim the slot BEFORE the API call, not after it. The edit
-                # below is an await of ~100-300ms; stamping only on completion
-                # leaves that whole window open, and every other session in
-                # this chat that reaches the gate inside it reads a stale
-                # clock and edits too. Claiming up front makes the shared
-                # clock an actual rate limiter rather than a mostly-advisory
-                # one. A slot spent on an edit that then fails or is skipped
-                # is the safe direction to err.
-                _last_edit_ts = _stamp_edit_clock(_now)
-
                 if not ctx._run_still_current():
                     return
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from cron import outbound as cron_outbound
 from cron.outbound import (
     claim_or_reuse,
     classify_send_result,
@@ -14,9 +17,13 @@ from cron.outbound import (
     job_allows_messaging,
     mark_result,
 )
-from cron.scheduler import _build_job_prompt, _resolve_cron_disabled_toolsets
+from cron.scheduler import (
+    _build_job_prompt,
+    _resolve_cron_disabled_toolsets,
+    _resolve_cron_enabled_toolsets,
+)
 from cron.jobs import create_job
-from tools.send_message_tool import send_message_tool
+from tools.send_message_tool import _send_via_adapter, send_message_tool
 
 
 @pytest.fixture
@@ -49,6 +56,28 @@ class TestJobOptIn:
         )
         assert "messaging" in disabled
 
+    def test_opt_in_adds_messaging_to_explicit_toolset_allowlist(self):
+        enabled = _resolve_cron_enabled_toolsets(
+            {
+                "id": "opted",
+                "allow_messaging": True,
+                "enabled_toolsets": ["terminal"],
+            },
+            {},
+        )
+        assert enabled == ["terminal", "messaging"]
+
+    def test_opt_in_adds_messaging_to_default_cron_toolsets(self):
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"terminal", "file"},
+        ):
+            enabled = _resolve_cron_enabled_toolsets(
+                {"id": "opted", "allow_messaging": True},
+                {},
+            )
+        assert enabled == ["file", "terminal", "messaging"]
+
     def test_prompt_changes_only_for_opted_in_jobs(self):
         opted = _build_job_prompt({"id": "opted", "allow_messaging": True, "prompt": "do work"})
         default = _build_job_prompt({"id": "plain", "prompt": "do work"})
@@ -58,6 +87,17 @@ class TestJobOptIn:
 
 
 class TestOutboundLedger:
+    def test_default_path_resolves_for_each_active_profile(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cron_outbound, "OUTBOUND_FILE", None)
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        with patch(
+            "cron.outbound.get_hermes_home",
+            side_effect=[first, second],
+        ):
+            assert cron_outbound._outbound_file() == first / "cron" / "outbound.db"
+            assert cron_outbound._outbound_file() == second / "cron" / "outbound.db"
+
     def test_two_keys_are_distinct(self, tmp_outbound):
         first = claim_or_reuse(
             job_id="job-1",
@@ -191,6 +231,13 @@ class TestSendGate:
         assert payload.get("error")
         assert "origin" in payload["error"]
 
+    @pytest.mark.parametrize("action", ["list", "react", "unreact"])
+    def test_non_send_actions_are_rejected(self, tmp_outbound, monkeypatch, action):
+        self._bind_cron(monkeypatch)
+        payload = json.loads(send_message_tool({"action": action}))
+        assert payload.get("error")
+        assert "only action='send'" in payload["error"]
+
     def test_account_override_cannot_be_selected(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch)
         raw = send_message_tool({
@@ -214,6 +261,55 @@ class TestSendGate:
         assert sent_args["target"] == "telegram:2027045491:104992"
         assert "account" not in sent_args
         assert payload["status"] == "verified"
+
+    def test_cron_send_carries_session_profile_to_transport(self, tmp_outbound, monkeypatch):
+        self._bind_cron(monkeypatch)
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_SESSION_PROFILE"].set("secondary")
+        with patch(
+            "tools.send_message_tool._handle_send",
+            return_value=json.dumps({"success": True, "message_id": "131193"}),
+        ) as send_mock:
+            payload = json.loads(send_message_tool({
+                "target": "origin",
+                "message": "profile scoped",
+                "message_key": "automatic-action:profile",
+            }))
+        assert payload["status"] == "verified"
+        assert send_mock.call_args.args[0]["_profile"] == "secondary"
+
+    def test_live_transport_uses_secondary_profile_adapter(self, monkeypatch):
+        from gateway.config import Platform
+
+        default_adapter = SimpleNamespace(send=AsyncMock())
+        secondary_adapter = SimpleNamespace(
+            send=AsyncMock(
+                return_value=SimpleNamespace(
+                    success=True,
+                    message_id="secondary-message",
+                    error=None,
+                )
+            )
+        )
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: default_adapter},
+            _profile_adapters={"secondary": {Platform.TELEGRAM: secondary_adapter}},
+            _active_profile_name=lambda: "default",
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        result = asyncio.run(_send_via_adapter(
+            Platform.TELEGRAM,
+            SimpleNamespace(),
+            "2027045491",
+            "hello",
+            profile="secondary",
+        ))
+
+        assert result == {"success": True, "message_id": "secondary-message"}
+        secondary_adapter.send.assert_awaited_once()
+        default_adapter.send.assert_not_awaited()
 
     def test_two_native_sends_are_separate(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch)

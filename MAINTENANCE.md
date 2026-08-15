@@ -28,7 +28,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Make raw SQLite backup and quarantine connection-safe. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
 | HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics` | Enforce a per-chat Telegram send cooldown. |
-| HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Share the progress-edit throttle per chat. |
+| HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(fork): preserve reconciled patch contracts` | Share the progress-edit throttle per chat. |
 | HERMES-006 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Resolve memory notifications per platform. |
 | HERMES-007 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Keep interrupt sentinels out of API assistant text. |
 | HERMES-008 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Preserve Hindsight's explicit shared observation scope. |
@@ -41,11 +41,11 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
 | HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
 | HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): support configurable casing` | Make title shape configurable while preserving durable, race-safe uniqueness. |
-| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
+| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons`; `fix(fork): preserve reconciled patch contracts` | Select live Telegram topic icons without repeating the 24 most recent choices or overwriting manual icons. |
 | HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
 | HERMES-020 | Active | `fix(skills): limit background review creation` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
 | HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback`; `fix(agent): generalize transient alternate credential recovery` | Try one alternate compatible same-provider credential for recoverable upstream failures before activating the fallback model. |
-| HERMES-022 | Active | `feat(cron): job-scoped native outbound messages` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, adapter identity, and idempotent multi-message delivery. |
+| HERMES-022 | Active | `feat(cron): job-scoped native outbound messages`; `fix(fork): preserve reconciled patch contracts` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, adapter identity, and idempotent multi-message delivery. |
 | HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
 | HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
 | HERMES-025 | Active | `fix(compression): report aborted compaction accurately` | Emit committed, aborted, or deferred terminal outcomes instead of unconditional success. |
