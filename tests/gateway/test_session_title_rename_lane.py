@@ -167,3 +167,46 @@ async def test_telegram_topic_deduplicates_same_title_request(monkeypatch):
     runner._schedule_telegram_topic_title_rename(source, "session-1", "Real title")
 
     assert scheduled == [True]
+
+
+def test_telegram_response_aware_path_renames_only_once(monkeypatch):
+    calls = []
+    captured = {}
+    runner = object.__new__(GatewayRunner)
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._schedule_telegram_topic_title_rename = (
+        lambda source, session_id, title, **kwargs: calls.append(title)
+    )
+
+    def fake_maybe_auto_title(*args, **kwargs):
+        captured["callback"] = kwargs["title_callback"]
+
+    monkeypatch.setattr("agent.title_generator.maybe_auto_title", fake_maybe_auto_title)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+    agent = types.SimpleNamespace(
+        model="model",
+        provider="provider",
+        base_url=None,
+        api_key=None,
+        api_mode=None,
+        _session_db=None,
+        _title_failure_callback=None,
+    )
+
+    runner._schedule_telegram_topic_title_after_response(
+        source,
+        "session-1",
+        "Research X and produce a grounded summary",
+        "A completed response long enough to pass the response-aware guard.",
+        agent,
+        {"completed": True},
+    )
+
+    captured["callback"]("Derived opening title", "derived")
+    captured["callback"]("Final response title", "llm")
+    assert calls == ["Final response title"]
