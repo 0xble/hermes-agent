@@ -248,9 +248,18 @@ MEMORY_GUIDANCE = build_memory_guidance(True, True)
 USER_PROFILE_GUIDANCE = build_memory_guidance(False, True)
 
 SESSION_SEARCH_GUIDANCE = (
-    "When the user references something from a past conversation or you suspect "
-    "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "When the user explicitly asks to find, inspect, or reconstruct a past Hermes "
+    "transcript, use session_search before asking them to repeat themselves."
+)
+
+SEMANTIC_MEMORY_HISTORY_GUIDANCE = (
+    "Use semantic memory for relevant durable cross-session context, including "
+    "preferences, decisions, people, projects, relationships, recurring patterns, "
+    "and implicit references to prior context. Use session_search for exact transcript "
+    "evidence, exact wording, chronology, session IDs, or locating a specific conversation. "
+    "Use canonical live systems for current mutable facts such as task status, payments, "
+    "permissions, and account state. If semantic memory is unavailable, use session_search "
+    "for recoverable historical context when appropriate."
 )
 
 # NOTE (#82154): the opening sentence is worded deliberately. Anthropic's

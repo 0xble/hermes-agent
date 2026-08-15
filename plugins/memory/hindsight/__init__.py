@@ -1985,27 +1985,23 @@ class HindsightMemoryProvider(MemoryProvider):
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
 
+    def semantic_memory_enabled(self) -> bool:
+        return self._memory_mode in {"context", "tools", "hybrid"}
+
     def system_prompt_block(self) -> str:
-        if self._memory_mode == "context":
-            return (
-                f"# Hindsight Memory\n"
-                f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Relevant memories are automatically injected into context."
-            )
-        if self._memory_mode == "tools":
-            return (
-                f"# Hindsight Memory\n"
-                f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
-                f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-                f"hindsight_retain to store facts."
-            )
-        return (
-            f"# Hindsight Memory\n"
-            f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
-            f"Relevant memories are automatically injected into context. "
-            f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
-            f"hindsight_retain to store facts."
-        )
+        lines = ["# Hindsight Memory"]
+        if self._memory_mode in {"context", "hybrid"} and self._auto_recall:
+            lines.append("Relevant Hindsight memories may be automatically injected into context.")
+        if self._memory_mode in {"tools", "hybrid"}:
+            if self._auto_recall and self._memory_mode == "hybrid":
+                lines.append("Use hindsight_recall for targeted semantic retrieval when supplied memory is absent or insufficient.")
+            else:
+                lines.append("Use hindsight_recall for targeted semantic retrieval of prior context.")
+            lines.append("Use hindsight_reflect only when synthesis across multiple memories is required.")
+            if self._auto_retain:
+                lines.append("Use hindsight_retain for deliberate high-signal facts or source material that should persist.")
+        lines.append("Treat Hindsight as historical context, not current truth. Verify mutable or consequential claims against live or canonical sources.")
+        return "\n".join(lines)
 
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""

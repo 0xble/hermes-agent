@@ -44,6 +44,7 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
+    SEMANTIC_MEMORY_HISTORY_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
@@ -432,6 +433,23 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _semantic_memory_enabled(agent: Any) -> bool:
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return any(
+            name in getattr(agent, "valid_tool_names", set())
+            for name in ("hindsight_recall", "hindsight_reflect")
+        )
+    try:
+        return any(
+            bool(provider.semantic_memory_enabled())
+            for provider in manager.providers
+            if hasattr(provider, "semantic_memory_enabled")
+        )
+    except Exception:
+        return False
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -535,7 +553,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         elif _profile_enabled:
             tool_guidance.append(USER_PROFILE_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
-        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        if _semantic_memory_enabled(agent):
+            tool_guidance.append(SEMANTIC_MEMORY_HISTORY_GUIDANCE)
+        else:
+            tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the

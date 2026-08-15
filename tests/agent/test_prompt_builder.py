@@ -30,7 +30,7 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
-    SESSION_SEARCH_GUIDANCE,
+    SEMANTIC_MEMORY_HISTORY_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -74,9 +74,16 @@ class TestGuidanceConstants:
         assert "PR numbers" not in MEMORY_GUIDANCE
         assert "tool quirks" not in MEMORY_GUIDANCE
 
-    def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
-        assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+    def test_session_search_guidance_is_exact_transcript_recall(self):
+        from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+
+        assert "explicitly asks to find" in SESSION_SEARCH_GUIDANCE
+        assert "relevant cross-session context exists" not in SESSION_SEARCH_GUIDANCE
+
+    def test_semantic_memory_guidance_preserves_transcript_boundary(self):
+        assert "durable cross-session context" in SEMANTIC_MEMORY_HISTORY_GUIDANCE
+        assert "exact transcript evidence" in SEMANTIC_MEMORY_HISTORY_GUIDANCE
+        assert "canonical live systems" in SEMANTIC_MEMORY_HISTORY_GUIDANCE
 
 
 # =========================================================================

@@ -245,9 +245,30 @@ class TestSchemas:
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
 
+    def test_hybrid_prompt_is_capability_oriented(self, provider):
+        block = provider.system_prompt_block()
+        assert "Relevant Hindsight memories may be automatically injected" in block
+        assert "hindsight_recall" in block
+        assert "hindsight_reflect" in block
+        assert "hindsight_retain" in block
+        assert "historical context, not current truth" in block
+        assert "Bank:" not in block
+        assert "budget:" not in block
 
-# ---------------------------------------------------------------------------
-# Config tests
+    def test_context_prompt_omits_explicit_tool_claims(self, provider_with_config):
+        p = provider_with_config(memory_mode="context")
+        block = p.system_prompt_block()
+        assert "automatically injected" in block
+        assert "hindsight_recall" not in block
+        assert "hindsight_reflect" not in block
+
+    def test_tools_prompt_omits_automatic_injection_claim(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        block = p.system_prompt_block()
+        assert "automatically injected" not in block
+        assert "hindsight_recall" in block
+        assert "hindsight_reflect" in block
+
 # ---------------------------------------------------------------------------
 
 
