@@ -264,7 +264,7 @@ def classify_send_result(result: Any) -> Dict[str, Any]:
         }
     if result.get("error"):
         return {
-            "status": "failed",
+            "status": "failed" if result.get("delivery_stage") == "pre_send" else "ambiguous",
             "transport_message_id": result.get("message_id"),
             "error": str(result.get("error")),
         }
