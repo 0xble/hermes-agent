@@ -330,6 +330,86 @@ def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatc
     assert response.choices[0].message.content == "hello"
 
 
+def test_json_object_maps_to_native_json_mime_type():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    request = build_gemini_request(
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert request["generationConfig"]["responseMimeType"] == "application/json"
+    assert "responseJsonSchema" not in request["generationConfig"]
+
+
+def test_unsupported_response_format_is_not_forwarded():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    request = build_gemini_request(
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format={"type": "text"},
+    )
+
+    assert "responseMimeType" not in request["generationConfig"]
+    assert "responseJsonSchema" not in request["generationConfig"]
+
+
+def test_response_schema_is_copied_before_request_construction():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+    }
+    request = build_gemini_request(
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"schema": schema},
+        },
+    )
+
+    request["generationConfig"]["responseJsonSchema"]["properties"]["title"][
+        "type"
+    ] = "number"
+    assert schema["properties"]["title"]["type"] == "string"
+
+
+def test_top_level_response_format_overrides_extra_body(monkeypatch):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    recorded = {}
+
+    class DummyHTTP:
+        def post(self, _url, json=None, **_kwargs):
+            recorded["json"] = json
+            return DummyResponse(
+                payload={
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "{}"}]},
+                            "finishReason": "STOP",
+                        }
+                    ]
+                }
+            )
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "agent.gemini_native_adapter.httpx.Client", lambda *a, **k: DummyHTTP()
+    )
+    client = GeminiNativeClient(api_key="AIza-test")
+    client.chat.completions.create(
+        messages=[{"role": "user", "content": "Hello"}],
+        response_format={"type": "json_object"},
+        extra_body={"response_format": {"type": "text"}},
+    )
+
+    assert recorded["json"]["generationConfig"]["responseMimeType"] == "application/json"
+
+
 
 
 
