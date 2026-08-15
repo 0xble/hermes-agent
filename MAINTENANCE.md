@@ -55,7 +55,8 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 - **Summary:** Restores `send_message` as a default-off `messaging` toolset and lets a single cron job opt in with `allow_messaging=true`. The opted-in job may send multiple native messages through the configured Hermes adapter identity, but only to the job's bound origin. Sends are idempotent by `message_key`, `[SILENT]` suppresses only the scheduler's final automatic delivery, and the tool cannot select another account, profile, or chat ID.
 - **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `cron/outbound.py`; `tools/send_message_tool.py`; `tools/cronjob_tools.py`; `toolsets.py`; `tests/cron/test_cron_outbound_messages.py`; `tests/cron/test_scheduler.py`; `tests/cron/test_jobs.py`; `tests/cron/test_cronjob_schema.py`.
-- **Upstream tracking:** Issues `#20140` and `#67591`. Open PRs `#7388` and `#70304` are incomplete: `#7388` is a process-wide env var, `#70304` restores a broader platform-level messaging toolset, and neither provides job-scoped origin-only targeting plus idempotent multi-message delivery. Removal context: `#47856`.
+- **Upstream tracking:** Direct PR `#86648` implements this patch contract on current upstream `main` and links issues `#20140` and `#67591`. Related open PRs `#7388` and `#70304` are incomplete: `#7388` is a process-wide env var, `#70304` restores a broader platform-level messaging toolset, and neither provides job-scoped origin-only targeting plus idempotent multi-message delivery. Removal context: `#47856`.
+- **Upstream PR:** Direct: #86648 (open; checked 2026-08-14). Related: #7388 and #70304. Removal context: #47856.
 - **Regression:** `pytest -q tests/cron/test_cron_outbound_messages.py tests/cron/test_scheduler.py -k 'disabled_toolsets or memory_toolset or PerJobToolset' tests/cron/test_jobs.py -k allow_messaging tests/cron/test_cronjob_schema.py`.
 - **Rollback:** Remove the `allow_messaging` field, the cron outbound ledger, the cron-only `send_message` registration/check, the origin-only send gate, the `[SILENT]` exception for explicit outbound messages, and the HERMES-022 tests. Restore the previous default cron denylist and delivery hint. Do not restore a process-wide messaging env var.
 - **Retirement:** Retire after released upstream provides job-scoped opt-in, origin-only targeting, adapter-owned identity, idempotent multi-message delivery, and `[SILENT]` that does not suppress those explicit messages.
@@ -65,6 +66,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Adds `skills.background_review_allow_create`, enforced at the `skill_manage` runtime boundary for the `background_review` origin only. `false` blocks `create` while preserving foreground creation and background updates to existing skills.
 - **Surfaces:** `tools/skill_manager_tool.py`; `cli-config.yaml.example`; `tests/tools/test_skill_manager_tool.py`.
 - **Upstream tracking:** Local fork behavior; no released upstream setting currently provides this selective policy.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/tools/test_skill_manager_tool.py`.
 - **Rollback:** Remove the create guard, its focused test, the example setting, and this manifest entry in one follow-up commit. Preserve the existing background ownership and read-before-write guards.
 
@@ -73,6 +75,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Adds a bounded alternate-credential attempt in the credential-pool recovery path. Codex timeout, server-error, and provider-overload failures may swap to one different available pool entry without marking the failing account exhausted; existing rate-limit and billing paths continue to exhaust and rotate accounts, while authentication failures and upstream-aggregator 429s retain their existing refresh/fallback behavior. This prevents a transient Codex backend failure from jumping directly to a lower-quality fallback provider while a configured same-provider account remains healthy.
 - **Surfaces:** `agent/agent_runtime_helpers.py`; `agent/conversation_loop.py`; `agent/turn_retry_state.py`; `run_agent.py`; `tests/agent/test_credential_pool_routing.py`; `tests/agent/test_turn_retry_state.py`.
 - **Upstream tracking:** Issue `#22916` asks for same-provider profile rotation before provider fallback but remains open without implementation. PRs `#24539` and `#11034` instead eagerly activate fallback for overloaded providers; PR `#84128` extends same-account Codex backoff. None provides one alternate same-provider account attempt before provider fallback.
+- **Upstream PR:** None directly implements the patch after checked 2026-08-14. Related: #24539, #11034, and #84128.
 - **Regression:** `pytest -q tests/agent/test_credential_pool_routing.py -k 'alternate or rate_limit or billing or auth'`.
 - **Rollback:** Remove the alternate-entry selector and the overload/transport branch from `recover_with_credential_pool`, then remove only the HERMES-021 focused tests. Preserve rate-limit retry semantics, billing rotation, auth refresh behavior, and upstream-aggregator fallback bypass.
 - **Retirement:** Retire after a released upstream implementation provides configurable same-provider account rotation before provider fallback for rate-limit and transient provider-overload failures and passes equivalent focused tests.
@@ -82,6 +85,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Serializes writable-schema repair across processes, re-probes after lock acquisition, and bumps SQLite's schema cookie after direct `sqlite_master` surgery. This prevents simultaneous repairers and stale prepared schemas from re-corrupting the database.
 - **Surfaces:** `hermes_state.py`; `tests/test_state_db_malformed_repair.py`.
 - **Upstream tracking:** Related upstream work was recorded as PRs `#69609` and `#71982`. Re-evaluate their released descendants rather than assuming title-level equivalence.
+- **Upstream PR:** Related: #69609 and #71982 (open; checked 2026-08-14).
 - **Regression:** `pytest -q tests/test_state_db_malformed_repair.py`.
 - **Rollback:** In a follow-up commit, remove `_cross_process_repair_lock`, `_repair_state_db_schema_locked`, `_bump_schema_cookie`, their constants/imports, and their call sites while preserving unrelated `hermes_state.py` changes. Remove only the four patch-owned repair-lock/schema-cookie tests. Run the regression against the upstream replacement before promotion. Do not revert the umbrella commit.
 
@@ -90,6 +94,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Holds `offline_file_access` across the live-connection check and byte-level copy/fingerprint operation, closing the check/use race that could cancel POSIX SQLite locks.
 - **Surfaces:** `hermes_state.py`; `hermes_cli/kanban_db.py`; `tests/test_raw_copy_offline_guard.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/test_raw_copy_offline_guard.py`.
 - **Rollback:** Remove the `_copy_all`/`offline_file_access` guarded backup path in `hermes_state.py` and `_backup_corrupt_db_locked` guarded quarantine path in `hermes_cli/kanban_db.py`, then remove `tests/test_raw_copy_offline_guard.py`. Preserve HERMES-001 and all unrelated database-repair behavior. Verify the upstream replacement with the same live-connection race cases before deleting the private test.
 
@@ -98,6 +103,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** The private pre-dispatch helper that best-effort raised `RLIMIT_NOFILE` to a fixed 8192 has been removed. Upstream now owns the complete contract through profile-aware `runtime.nofile_soft_limit`, a shared `apply_nofile_soft_limit()` helper for gateway and dashboard/serve entrypoints, and matching generated-service limits. The upstream implementation preserves the private safety properties: POSIX-only, best-effort, never lowers an existing limit, and clamps to a finite hard limit.
 - **Surfaces:** Historical private surfaces were `hermes_cli/main.py` and `tests/test_fd_soft_limit.py`. The active replacement is upstream `hermes_cli/resource_limits.py`, its gateway/dashboard call sites, configuration, service generators, and upstream tests.
 - **Upstream tracking:** Replaced by released upstream commits `87aedbe7b`, `0472c31aa`, `373631bea`, and `acb7547da` (including the configurable process and service-manager limit contract). Related historical issues were `#36899` and `#75269`.
+- **Upstream PR:** None; replacement landed as released commits rather than a tracked PR in this record (checked 2026-08-14).
 - **Regression:** Upstream resource-limit tests plus the repository's canonical suite. Runtime supervisor acceptance remains part of a separately authorized deployment, not fork synchronization.
 - **Rollback:** Do not restore the private helper or test. If the upstream replacement regresses, fix or backport the upstream `runtime.nofile_soft_limit` path as one coherent contract; do not layer a second pre-dispatch limit implementation over it.
 
@@ -106,6 +112,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Inside `TelegramAdapter`, atomically reserves a per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock; lock acquisition plus cooldown waiting share a bounded budget; control boundaries preserve retry metadata; positively identified pre-send connection/pool timeouts do not consume a slot; and idle chat state is pruned. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/test_telegram_send_cooldown.py`.
 - **Upstream tracking:** Related upstream pull request `#66722` remains open and unmerged.
+- **Upstream PR:** Related: #66722 (open; checked 2026-08-14).
 - **Regression:** `pytest -q tests/test_telegram_send_cooldown.py`.
 - **Rollback:** Remove `_TelegramSendCooldownExceeded`, the per-chat cooldown state maps and bound, `_send_cooldown_seconds`, `_send_cooldown_max_wait`, the atomic send helper and its call sites, then remove the dedicated test. Verify the upstream adapter atomically coordinates concurrent rich, chunked, fallback, control, and media calls per chat, shares `RetryAfter` deadlines, bounds excessive waits, and prunes idle state before deploying the removal.
 
@@ -114,6 +121,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Coordinates progress edits across sessions sharing a chat, claims throttle slots before API calls, bounds clock storage, and avoids issuing a fresh send while Telegram is already flood-limiting edits.
 - **Surfaces:** `gateway/run.py`; `tests/test_progress_edit_chat_throttle.py`; `tests/gateway/test_progress_edit_shared_clock_integration.py`; flood-control coverage in `tests/gateway/test_run_progress_interrupt.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/test_progress_edit_chat_throttle.py tests/gateway/test_progress_edit_shared_clock_integration.py tests/gateway/test_run_progress_interrupt.py`.
 - **Rollback:** Remove `GatewayRunner._progress_edit_clock`, the shared-clock helpers and call-site stamps in `TurnRunner`, and the flood-control no-fallback branch. Remove only the patch-owned progress tests. Preserve unrelated gateway/session changes. Verify upstream coordinates the limit at `platform:chat_id` scope and does not fallback-send during a flood penalty.
 
@@ -122,6 +130,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Uses the platform-specific display setting before the global fallback, allowing one platform to disable memory notifications without disabling them everywhere.
 - **Surfaces:** `gateway/run.py`; `tests/gateway/test_memory_notifications_per_platform.py`.
 - **Upstream tracking:** Narrow backport associated with upstream `#59364`.
+- **Upstream PR:** Associated: #59364 (open; checked 2026-08-14).
 - **Regression:** `pytest -q tests/gateway/test_memory_notifications_per_platform.py`.
 - **Rollback:** Replace the `resolve_display_setting(...)` call with the released upstream configuration path and remove the private test only after equivalent per-platform precedence is covered upstream. Do not fall back to reading only `display.memory_notifications`.
 
@@ -130,6 +139,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Preserves interrupt/completion state as API metadata while suppressing Hermes's internal “waiting for model” sentinel from assistant content and transcript messages.
 - **Surfaces:** `gateway/platforms/api_server.py`; interrupt tests in `tests/gateway/test_session_api.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/gateway/test_session_api.py -k interrupt`.
 - **Rollback:** Remove `_is_api_interrupt_sentinel` and `_api_final_response_text`, switch response construction to the released upstream representation, and remove/adapt only the two interrupt-metadata tests. Prove interrupted synchronous and streaming responses expose correct metadata without leaking the internal sentinel.
 
@@ -138,6 +148,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Preserves an explicit empty inner scope (`[[]]`) so Hindsight performs one shared consolidation pass instead of silently reverting to the combined default.
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; `TestObservationScopes` coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** Related upstream issue `#74933`.
+- **Upstream PR:** None after checked 2026-08-14; issue #74933 only.
 - **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k 'ObservationScopes or shared_scope'`.
 - **Rollback:** Remove only the explicit-empty-inner-list preservation branch and its seven patch-owned tests after the released upstream parser proves equivalent handling for native and JSON forms, mixed scopes, whitespace-only entries, provider config, and retain calls.
 
@@ -146,6 +157,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Sets `HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS=true` for embedded profiles so collectors cannot mistake extraction failure for a legitimately empty successful document and advance source cursors.
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; embedded-profile environment coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** No equivalent released upstream Hermes behavior was identified when this patch was published; also verify the current Hindsight server contract before retirement.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k embedded_profile_env` plus a failed-extraction operation probe against the supported embedded Hindsight version.
 - **Rollback:** Remove the managed environment key only after upstream Hermes/Hindsight guarantees failed extraction yields a failed operation. Update the environment assertion and prove cursor-owning consumers still distinguish failure from an empty document.
 
@@ -154,6 +166,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Compares only Hermes-managed environment keys, ignores daemon-added keys, and preserves a stored API key when live secret resolution is temporarily empty. This avoids restarting the embedded daemon on every session initialization and killing in-flight work.
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; embedded-profile drift coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k 'embedded and (env or config or restart)'` plus a daemon restart-count probe across repeated session initialization.
 - **Rollback:** Replace the managed-key comparison and preserved-key materialization with the released upstream lifecycle implementation. Remove/adapt only its focused tests after proving daemon-added keys cause no restart and an unavailable secret lookup cannot blank a persisted credential.
 
@@ -162,6 +175,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Routes the remaining unsafe public reads through `_read_ctx`, makes `GatewayRunner` reuse `SessionStore`'s database, and emits sanitized persistence diagnostics without unsafe retries. Upstream now owns the pooled-reader lifecycle and hard peak-connection permit; the private per-thread reader budget/reclamation implementation was removed during reconciliation rather than retained beside it.
 - **Surfaces:** `hermes_state.py`; `gateway/run.py`; `run_agent.py`; `tests/test_sessiondb_cross_thread_safety.py`; `tests/gateway/test_runner_session_db_fd_budget.py`; persistence diagnostics in `tests/run_agent/test_run_agent.py`.
 - **Upstream tracking:** The remaining private behavior combines the public-read, single-owner, and diagnostics contracts from upstream PRs `#73803` and `#78287`; deliberately excludes the fallback spool from `#78552`. Released upstream commits `87aedbe7b` and `0472c31aa` now provide the pooled reader lifecycle and hard peak budget.
+- **Upstream PR:** Associated: #73803 and #78287 (open; checked 2026-08-14). Related but excluded: #78552.
 - **Regression:** `pytest -q tests/test_sessiondb_cross_thread_safety.py tests/gateway/test_runner_session_db_fd_budget.py tests/run_agent/test_run_agent.py -k 'persistence or sqlite or session_db or reader or writer'`.
 - **Rollback:** Remove only the remaining private public-read routing, shared gateway database ownership, and sanitized diagnostics in a follow-up change while preserving upstream's pooled-reader implementation and later unrelated edits. Before retirement, verify upstream covers all public-read serialization, single gateway DB ownership, sanitized diagnostics, and no duplicate-prone retry; upstream already owns the hard peak reader budget and cross-thread pooled drain.
 
@@ -170,6 +184,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** The former three-workflow GitHub Actions pipeline fetched upstream, rebased the private stack, tested a temporary candidate, and promoted an exact SHA. It was retired because the `maintain-hermes-fork` Hermes cron now owns the same responsibility without a second scheduler or GitHub-owned promotion path.
 - **Surfaces:** Historical commits named in the index above; this lifecycle record. The active replacement is the external Hermes cron named `maintain-hermes-fork`, not repository code.
 - **Upstream tracking:** This was fork-owner release machinery rather than an upstream product defect. The replacement remains Brian-owned and must continue to fail closed, test before publication, use an exact recorded lease, and keep runtime deployment separate.
+- **Upstream PR:** None; fork-owner release machinery is not an upstream product contribution (checked 2026-08-14).
 - **Regression:** Verify the live scheduler has exactly one enabled `maintain-hermes-fork` job; its prompt requires an isolated clone, this manifest, affected patch regressions, canonical tests and lint, independent review, exact-SHA force-with-lease, remote readback, and no runtime deployment. Verify the three retired workflow files and stale `automation/candidate/*` branches are absent.
 - **Rollback:** Do not restore the retired workflows. If the cron is defective, pause it before its next run, leave fork `main` unchanged, repair or replace the single cron owner, and prove a manual isolated reconciliation plus remote readback before resuming it.
 
@@ -178,6 +193,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Adds an optional validated `timezone` field to cron jobs across persistence, scheduler calculations, tool/API/CLI/web/desktop surfaces, including update/clear recalculation, DST behavior, restart persistence, and legacy profile-timezone inheritance. Intervals and absolute one-shots retain their original semantics.
 - **Surfaces:** `cron/jobs.py`; `tools/cronjob_tools.py`; gateway/CLI/web/desktop cron surfaces; `tests/cron/test_job_timezone.py` and associated cron UI/API tests.
 - **Upstream tracking:** Issue `#26549`; open PR `#27393` superseded `#21926` but was incomplete for this explicit job-field contract when the patch was implemented.
+- **Upstream PR:** Associated: #27393 (open) and superseded #21926 (closed; checked 2026-08-14).
 - **Regression:** `pytest -q tests/cron/test_job_timezone.py tests/cron/test_cronjob_schema.py tests/cron/test_cron_script.py tests/gateway/test_api_server_jobs.py tests/hermes_cli/test_cron.py tests/hermes_cli/test_cron_interactive_timezone.py tests/hermes_cli/test_cron_parser_builder.py tests/hermes_cli/test_web_server_cron_profiles.py`; run the web and desktop cron model tests with their repository commands.
 - **Rollback:** Inventory every persisted job with an explicit timezone. Migrate each to the released upstream representation or an equivalent profile/schedule arrangement before removing the private field. Then revert the stable-subject commit in a follow-up change, resolve current upstream overlap, remove duplicate UI/API/tool fields and fork-only tests, and prove New York/Los Angeles separation, profile fallback, update/clear behavior, DST, restart persistence, and interval/one-shot invariance against upstream.
 
@@ -186,6 +202,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Returns `cron_command(args)` from `cmd_cron` so nonzero cron subcommand results reach the top-level dispatcher and process exit status instead of being discarded as `None`.
 - **Surfaces:** `hermes_cli/main.py`; `tests/hermes_cli/test_cron.py`.
 - **Upstream tracking:** Current `upstream/main` still calls `cron_command(args)` without returning its result. Retire when a released upstream dispatcher propagates cron failures through an equivalent process-status contract.
+- **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `source venv/bin/activate && python -m pytest -q tests/hermes_cli/test_cron.py -k top_level_handler_propagates_failure_status`.
 - **Rollback:** Once the released upstream dispatcher owns the same exit-status contract, remove the private `return` change and delete only `test_top_level_handler_propagates_failure_status` if upstream provides equivalent coverage. Run `tests/hermes_cli/test_cron.py`, invoke a deliberately failing read-only cron CLI operation, and verify its nonzero process status before promotion.
 
@@ -194,6 +211,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Captures the gateway's configured cwd before cron execution begins, binds it into every interactive gateway turn, and makes prompt and tool cwd resolution prefer that session-scoped value over the mutable process-global `TERMINAL_CWD`. This prevents a concurrently running workdir cron from injecting its repository instructions or routing an unrelated gateway tool call into its project.
 - **Surfaces:** `agent/runtime_cwd.py`; `gateway/run.py`; `gateway/slash_commands.py`; `gateway/runtime_footer.py`; `gateway/platforms/api_server.py`; `gateway/platforms/base.py`; cwd consumers in agent/tool modules; `tests/gateway/test_gateway_cron_cwd_isolation.py`.
 - **Upstream tracking:** Issue `#81451`; PR `#81516` covers only sessions bound before the cron mutation and does not reproduce the observed cron-first ordering. PR `#61976` is directionally related but broader and not merge-ready.
+- **Upstream PR:** Related: #81516 and #61976 (open; checked 2026-08-14).
 - **Regression:** `scripts/run_tests.sh tests/gateway/test_gateway_cron_cwd_isolation.py tests/gateway/test_async_delivery_capability.py tests/agent/test_runtime_cwd.py tests/cron/test_cron_workdir.py tests/cron/test_terminal_cwd_lock.py tests/tools/test_file_tools_cwd_resolution.py tests/tools/test_terminal_task_cwd.py tests/tools/test_code_execution_modes.py`.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated edits. Remove only HERMES-015's gateway baseline capture, ContextVar-aware cwd consumer changes, and dedicated regression. Before retirement, prove released upstream behavior under the cron-first ordering: hold a workdir cron in repository B, start a gateway session whose configured cwd is A, verify A's prompt/context/file/terminal/code-exec/delegation paths, and prove B's `AGENTS.md` never enters the gateway session.
 
@@ -202,6 +220,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Detects an explicit legacy flat MoA preset in a user or managed configuration layer and removes only inherited named-preset selectors before the layer is merged. This lets the existing flat-config normalization path select the configured references and aggregator instead of silently using `DEFAULT_CONFIG` models.
 - **Surfaces:** `hermes_cli/config.py`; `tests/hermes_cli/test_moa_config.py`.
 - **Upstream tracking:** Issue `#82726`. Retire after an upstream release preserves or explicitly rejects flat MoA configuration at the complete `load_config()` boundary instead of silently substituting built-in models.
+- **Upstream PR:** None after checked 2026-08-14; issue #82726 only.
 - **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_moa_config.py tests/hermes_cli/test_config.py tests/hermes_cli/test_config_loader_e2e.py tests/hermes_cli/test_config_validation.py tests/hermes_cli/test_config_read_guard.py -q` plus an isolated flat-config resolution probe using non-default model identifiers.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later config-loader changes, remove only the flat-MoA regression, and restore affected profiles to named `moa.presets.default` configuration before promotion. Do not return a runtime to flat configuration until released upstream behavior passes the same end-to-end resolution probe.
 
@@ -210,6 +229,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Adds validated title-generation limits, sentence-case or title-case prompt selection, operator instructions, and canonical name aliases; deterministically enforces configured word/character caps; warns the title model away from recent session titles; and preserves the database's transactional uniqueness authority with one bounded distinct-title retry before the existing numbered fallback. Compression continuations retain their intentional lineage naming.
 - **Surfaces:** `agent/title_generator.py`; `hermes_cli/config_defaults.py`; `hermes_state.py`; `cli-config.yaml.example`; `website/docs/user-guide/configuration.md`; `website/docs/user-guide/messaging/telegram.md`; focused title, state, and auxiliary-config tests.
 - **Upstream tracking:** Cherry-picks the title commit from open PR `#66353`, then hardens it with backward-compatible defaults, operator instructions, deterministic word enforcement, normalized recent-title avoidance, and bounded collision retry. Retire only after released upstream satisfies that complete contract.
+- **Upstream PR:** Source: #66353 (open; checked 2026-08-14).
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/test_hermes_state.py tests/hermes_cli/test_aux_config.py -q` plus a clean-profile end-to-end title-generation probe proving configured limits and collision handling.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated title/session changes. Remove only HERMES-017 configuration fields, prompt construction, deterministic normalization, recent-title query, bounded retry, and focused tests. Restore affected profiles to upstream-supported title configuration before promotion, then prove released upstream still preserves manual-title precedence, exact transactional uniqueness, compression lineage, and configured title shape.
 
@@ -218,6 +238,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Opt-in semantic native Telegram topic icons resolve against the live allowed sticker set, honor exact emoji overrides, preserve observed manual choices, validate bindings immediately before mutation, and avoid the 24 most recently selected icons with durable per-chat least-recently-used history. Icon failure never blocks session-title persistence or topic renaming.
 - **Surfaces:** `agent/title_generator.py`; `gateway/run.py`; `hermes_state.py`; `plugins/platforms/telegram/adapter.py`; `website/docs/user-guide/messaging/telegram.md`; focused state, selector, adapter, and gateway tests.
 - **Upstream tracking:** Cherry-picks the icon commit from open PR `#66353`, then replaces process-local-only ownership/diversity with durable `state.db` state and deterministic least-recent reuse. PR `#35737` hardcodes one account's icon IDs and couples Telegram metadata to the generic title callback. Retire only after released upstream uses a live allowlist, preserves manual ownership across restarts, rechecks topic/session authority, and degrades without losing titles.
+- **Upstream PR:** Source: #66353; related: #35737 (both open; checked 2026-08-14).
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary before activation.
 - **Rollback:** Disable `gateway.platforms.telegram.extra.auto_topic_icons` in every affected profile, verify title-only topic renaming, then revert the stable-subject patch in a follow-up commit while preserving unrelated Telegram/state changes. Remove only HERMES-018's derived state, selector, adapter methods, docs, and tests after released upstream passes the same live-set, restart, manual-preservation, race, and failure-degradation contract.
 
@@ -226,22 +247,37 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Summary:** Drops hidden `message_changed` events when Slack changed only thread-reply bookkeeping on an existing parent. This prevents a cold process cache from normalizing the old parent into a phantom user turn while preserving genuine visible edits and newly added mentions.
 - **Surfaces:** `plugins/platforms/slack/adapter.py`; sanitized cold-restart incident and focused `message_changed` coverage in `tests/gateway/test_slack.py`.
 - **Upstream tracking:** Open PR `#73450` identifies the same live replay path but is intentionally not cherry-picked because its broad classifier and test expansion are disproportionate to this patch contract. Retire when a released upstream implementation rejects equivalent hidden metadata-only parent updates with a cold cache while preserving visible edits.
+- **Upstream PR:** Related: #73450 (open; checked 2026-08-14).
 - **Regression:** `scripts/run_tests.sh tests/gateway/test_slack.py -k 'hidden_thread_parent or sanitized_lpg or message_edit_with_new_mention' -q`. The incident regression asserts the parent reaches neither routing nor persistence, cannot interrupt the active reply, and emits no busy acknowledgement.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Slack adapter changes. Remove only the hidden parent-update classifier and its focused tests after released upstream passes the cold-cache metadata-only replay, visible text/block/file/attachment changes, malformed and partial snapshots, and edited-in mention cases.
+
+## Upstream association and feedback contract
+
+Every patch record must carry separate `Upstream tracking` and `Upstream PR` fields. The PR field must identify direct, source, associated, or merely related pull requests, or say `None after checked YYYY-MM-DD`. An issue is not a PR. A commit without a traceable PR is recorded as a commit, not silently promoted to a PR association.
+
+On every maintenance run, and before publishing, promoting, or retiring a patch:
+
+1. Resolve each linked issue, PR, commit, and released descendant against the live official repository. Check open and closed state, reviews, requested changes, unresolved threads, comments, CI, linked commits, merge/revert state, and release evidence.
+2. Judge feedback against the patch contract, current source, reproductions, and executable tests. Maintainer authority, reviewer count, or approval state alone is not proof.
+3. Classify each substantive item as valid, invalid, stale, already addressed, or requiring a narrower decision. Record the evidence for consequential classifications.
+4. Apply valid feedback to the maintained fork implementation and focused regressions first. Then port that same verified correction to the associated upstream PR branch and read back both remote SHAs. Never let the public PR become a second, divergent implementation.
+5. Block fork publication when valid feedback remains unresolved, when an upstream association is stale or ambiguous, or when the fork and its direct PR no longer implement the same behavior.
+6. If released upstream satisfies the complete contract, retire the private implementation rather than retaining duplicate paths. A merged PR without released and verified equivalence is not enough.
 
 ## Adding or changing a patch
 
 1. Load the canonical `hermes-patch` skill.
-2. Add a provisional record here before implementation, including ID, summary, expected stable commit subject, upstream search, regression, retirement condition, and rollback procedure.
+2. Add a provisional record here before implementation, including ID, summary, expected stable commit subject, upstream search, explicit upstream issue and PR associations (including a dated `None` result), regression, retirement condition, and rollback procedure.
 3. Implement and verify the patch.
-4. Update the record with final surfaces, tests, and the published commit identity.
-5. Verify the manifest row is `Active`; the `maintain-hermes-fork` cron validates this index, its records, active stable subjects, and fork-only patch coverage before publication.
-6. Ship the code and manifest together. A source patch without a complete record is not publishable.
-7. On every upstream rebase, inspect patch equivalence; never resolve a conflict by retaining both private and upstream implementations.
+4. Update the record with final surfaces, tests, published commit identity, and live upstream issue/PR state.
+5. If a direct upstream PR exists, inspect all current feedback and apply every valid item to the fork first, then update the PR from the verified fork correction.
+6. Verify the manifest row is `Active`; the `maintain-hermes-fork` cron validates this index, its records, active stable subjects, upstream-association fields, and fork-only patch coverage before publication.
+7. Ship the code and manifest together. A source patch without a complete record is not publishable.
+8. On every upstream rebase, inspect patch equivalence and associated issue/PR feedback; never resolve a conflict by retaining both private and upstream implementations.
 
 ## Automatic synchronization
 
-The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, inventories the currently installed and enabled plugins from the live maintained profiles, rebases the maintained stack, compares conflicts against patch contracts, and checks newly released upstream behavior for native replacements of both fork patches and plugin-owned problem contracts. It runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
+The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, inventories the currently installed and enabled plugins from the live maintained profiles, resolves every patch's upstream issue/PR ledger and all substantive review feedback, rebases the maintained stack, compares conflicts against patch contracts, and checks newly released upstream behavior for native replacements of both fork patches and plugin-owned problem contracts. Valid review feedback must be applied to the fork and verified there before the corresponding PR branch is updated. It runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
 
 The cron never pushes to Nous Research, never deploys, uninstalls plugins, edits plugin canonical-source repositories, or restarts a runtime, and never guesses through an ambiguous conflict. If a native replacement qualifies, its result must identify every affected profile and canonical owner plus the separate promotion and complete-uninstall work required by “Plugin overlap and retirement.” Failures must abort the isolated rebase, leave fork `main` unchanged, and deliver the exact blocker in the cron result.
 
