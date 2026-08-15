@@ -502,6 +502,15 @@ def _handle_send(args):
             "media_files": media_files,
             "force_document": force_document_attachments,
         }
+        try:
+            from gateway.session_context import get_session_env
+            trusted_profile = str(
+                get_session_env("HERMES_SESSION_PROFILE", "") or ""
+            ).strip()
+        except Exception:
+            trusted_profile = ""
+        if trusted_profile:
+            send_kwargs["profile"] = trusted_profile
         # Preserve the exact built-in call contract; only custom handlers need
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
@@ -856,9 +865,14 @@ def _maybe_handle_cron_outbound(args):
     job_id = cron_outbound.current_cron_job_id()
     run_id = cron_outbound.current_cron_run_id()
     origin = _get_cron_auto_delivery_target()
+    profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
     if not job_id or not run_id or not origin:
         return json.dumps(_error(
             "Cron outbound send is missing the job, run, or origin binding."
+        ))
+    if not profile:
+        return json.dumps(_error(
+            "Cron outbound send is missing its trusted profile binding."
         ))
 
     try:
@@ -885,16 +899,13 @@ def _maybe_handle_cron_outbound(args):
         return cron_outbound.dumps(cron_outbound.reuse_payload(started["record"]))
 
     try:
-        from gateway.session_context import get_session_env
-
-        profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip()
         raw = _handle_send({
             "target": (
                 f"{origin['platform']}:{origin['chat_id']}"
                 + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
             ),
             "message": message,
-            "_profile": profile or None,
+            "_profile": profile,
         })
     except Exception as exc:
         record = cron_outbound.mark_result(
