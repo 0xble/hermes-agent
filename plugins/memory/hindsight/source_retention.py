@@ -298,6 +298,7 @@ def discover_source_candidates(
     *,
     session_id: str = "",
     retain_attachments: bool = False,
+    retain_file_extractions: bool = False,
 ) -> list[SourceCandidate]:
     """Discover substantive, non-sensitive sources from completed messages.
 
@@ -388,6 +389,8 @@ def discover_source_candidates(
     for name, args, result in _assistant_calls(messages):
         if name in _TEXT_SOURCE_TOOLS:
             source_type = _TEXT_SOURCE_TOOLS[name]
+            if source_type == "file_extraction" and not retain_file_extractions:
+                continue
             origin = _url_value(args) or _path_value(args) or name
             if source_type == "webpage":
                 source_id = f"webpage-{_sha256_text(origin)[:32]}"
