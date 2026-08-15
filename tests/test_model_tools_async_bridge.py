@@ -254,8 +254,14 @@ class TestRunAsyncWithRunningLoop:
             FakeExecutor,
         )
 
-        with pytest.raises(concurrent.futures.TimeoutError):
-            _run_async(_never_finishes())
+        never_finishes = _never_finishes()
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                _run_async(never_finishes)
+        finally:
+            # FakeExecutor deliberately never invokes the submitted closure,
+            # so the test owns cleanup of the otherwise-unawaited coroutine.
+            never_finishes.close()
 
         assert events["result_timeout"] == 300
         # The worker wrapper creates its own event loop so _run_async can
@@ -371,11 +377,7 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 side_effect=lambda url, dest, **kw: _write_fake_image(dest),
             ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
+            patch("tools.image_source._http_block_reason", return_value=None),
             patch(
                 "tools.vision_tools._image_to_base64_data_url",
                 return_value="data:image/jpeg;base64,abc",
@@ -416,11 +418,7 @@ class TestVisionDispatchLoopSafety:
                 new_callable=AsyncMock,
                 side_effect=lambda url, dest, **kw: _write_fake_image(dest),
             ),
-            patch(
-                "tools.vision_tools._validate_image_url_async",
-                new_callable=AsyncMock,
-                return_value=True,
-            ),
+            patch("tools.image_source._http_block_reason", return_value=None),
             patch(
                 "tools.vision_tools._image_to_base64_data_url",
                 return_value="data:image/jpeg;base64,abc",

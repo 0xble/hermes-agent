@@ -110,6 +110,15 @@ def web_registry_populated():
 
 
 @pytest.fixture
+def allow_test_web_urls(monkeypatch):
+    """Keep provider-routing tests independent of host DNS classification."""
+    async def _allow(_url: str) -> bool:
+        return True
+
+    monkeypatch.setattr("tools.web_tools.async_is_safe_url", _allow)
+
+
+@pytest.fixture
 def disable_lazy_stt_install():
     """Disarm the runtime lazy-install probe so static ``_HAS_FASTER_WHISPER``
     patches accurately simulate 'faster-whisper not installed'.

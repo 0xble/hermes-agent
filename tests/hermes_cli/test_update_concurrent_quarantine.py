@@ -1,8 +1,8 @@
 """Tests for issue #26670 — concurrent hermes.exe detection and improved
 quarantine retry / reboot-deferred fallback during `hermes update` on Windows.
 
-These tests force ``_is_windows`` to return ``True`` via patching so the
-Windows-specific code paths can be exercised on any host.
+Host-independent tests patch ``_is_windows`` where needed. Tests whose behavior
+depends on native Windows path/process semantics use ``windows_only`` instead.
 """
 
 from __future__ import annotations
@@ -599,8 +599,8 @@ def _fake_psutil_tree(tree, venv_exe, worker_exe, dead=None):
     return mod
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
-def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
+@pytest.mark.windows_only
+def test_venv_launcher_ancestors_returns_venv_side_parent(monkeypatch):
     """The worker's venv-side parent is reported so the guard set is covered."""
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
     worker_exe = r"C:\Users\x\AppData\Roaming\uv\python\cpython-3.11\python.exe"
@@ -612,8 +612,8 @@ def test_venv_launcher_ancestors_returns_venv_side_parent(_winp, monkeypatch):
     assert cli_main._venv_launcher_ancestors([200]) == [100]
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
-def test_venv_launcher_ancestors_ignores_non_venv_parents(_winp, monkeypatch):
+@pytest.mark.windows_only
+def test_venv_launcher_ancestors_ignores_non_venv_parents(monkeypatch):
     """A Scheduled Task's cmd.exe / an operator shell is not a venv holder."""
     venv_exe = str(cli_main.PROJECT_ROOT / "venv" / "Scripts" / "python.exe")
     worker_exe = r"C:\Windows\System32\cmd.exe"
@@ -625,15 +625,14 @@ def test_venv_launcher_ancestors_ignores_non_venv_parents(_winp, monkeypatch):
     assert cli_main._venv_launcher_ancestors([200]) == []
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
-def test_venv_launcher_ancestors_is_empty_without_pids(_winp):
+@pytest.mark.windows_only
+def test_venv_launcher_ancestors_is_empty_without_pids():
     """No mapped gateways means nothing to walk up from."""
     assert cli_main._venv_launcher_ancestors([]) == []
 
 
-@patch.object(cli_main, "_is_windows", return_value=True)
+@pytest.mark.windows_only
 def test_pause_kill_set_covers_venv_guard_abort_set(
-    _winp,
     monkeypatch,
     tmp_path,
 ):

@@ -39,6 +39,9 @@ class TestNavigationSessionKey:
     def test_public_url_uses_bare_task_id(self, monkeypatch):
         """Public URL with cloud provider configured → bare task_id (cloud)."""
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: Mock())
+        # Keep this routing unit test independent of CI DNS interception (some
+        # resolvers map public hosts into private or RFC 2544 benchmark space).
+        monkeypatch.setattr(browser_tool, "_url_is_private", lambda _url: False)
         key = browser_tool._navigation_session_key("default", "https://github.com/x/y")
         assert key == "default"
 

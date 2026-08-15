@@ -6,10 +6,28 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 def test_registered_status_observer_matches_dm_topic_updates_without_dispatching():
     """Exercise real PTB filters in a clean interpreter, outside gateway mocks."""
     repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root)
+    probe = subprocess.run(
+        [sys.executable, "-c", "import telegram"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip("python-telegram-bot not installed in clean test interpreter")
+
     script = textwrap.dedent(
         r"""
         import asyncio
@@ -106,14 +124,14 @@ def test_registered_status_observer_matches_dm_topic_updates_without_dispatching
         asyncio.run(main())
         """
     )
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root)
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=repo_root,
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=30,
         check=False,
     )
