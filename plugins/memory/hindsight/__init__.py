@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -406,15 +407,57 @@ RETAIN_SCHEMA = {
 RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
-        "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "Search long-term memory. Returns ranked memories with optional compact "
+        "provenance, entities, chunks, and source facts. Automatic recall remains "
+        "compact; use the optional controls when investigating why a memory was returned."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array", "items": {"type": "string", "enum": ["world", "experience", "observation"]},
+                "description": "Optional fact types; defaults to the configured recall types.",
+            },
+            "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional exact recall tags."},
+            "tags_match": {"type": "string", "enum": ["any", "all", "any_strict", "all_strict", "exact"]},
+            "tag_groups": {"type": "array", "items": {"type": "object"}, "description": "Optional provider tag-group filters."},
+            "include_provenance": {"type": "boolean", "description": "Include IDs, types, document lineage, timestamps, and source IDs."},
+            "include_entities": {"type": "boolean", "description": "Include bounded entity context."},
+            "max_entity_tokens": {"type": "integer", "minimum": 1, "maximum": 2000},
+            "include_chunks": {"type": "boolean", "description": "Include bounded original chunks."},
+            "max_chunk_tokens": {"type": "integer", "minimum": 1, "maximum": 8192},
+            "include_source_facts": {"type": "boolean", "description": "Include facts supporting returned observations."},
+            "max_source_facts_tokens": {"type": "integer", "minimum": 1, "maximum": 8192},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 500},
         },
         "required": ["query"],
+    },
+}
+
+INVALIDATE_SCHEMA = {
+    "name": "hindsight_invalidate",
+    "description": "Soft-invalidate one incorrect Hindsight world/experience memory. This is reversible and requires a reason.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "The exact memory ID to invalidate."},
+            "reason": {"type": "string", "description": "Source-backed reason for invalidation; do not invent a correction."},
+        },
+        "required": ["memory_id", "reason"],
+    },
+}
+
+RESTORE_SCHEMA = {
+    "name": "hindsight_restore",
+    "description": "Restore one previously invalidated Hindsight memory. The operation is reversible and read-back verified.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "memory_id": {"type": "string", "description": "The exact invalidated memory ID to restore."},
+        },
+        "required": ["memory_id"],
     },
 }
 
@@ -434,9 +477,45 @@ REFLECT_SCHEMA = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    """Parse strict boolean configuration without treating arbitrary text as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return default
+
+
+def _supports_kwarg(client: Any, method_name: str, kwarg: str) -> bool:
+    """Return whether a client method can accept an optional keyword."""
+    try:
+        method = getattr(client, method_name)
+        parameters = inspect.signature(method).parameters.values()
+        return kwarg in {p.name for p in parameters} or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters
+        )
+    except Exception:
+        return False
+
+
+def _looks_like_optional_recall_rejection(error: Exception) -> bool:
+    """Identify request-shape errors safe to retry without optional recall fields."""
+    text = str(error).lower()
+    return any(token in text for token in ("422", "400", "unknown field", "unexpected keyword", "unrecognized"))
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
+
 
 def _load_config() -> dict:
     """Load config from profile-scoped path, legacy path, or env vars.
@@ -923,6 +1002,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # `recall_max_tokens` budget. Users can restore the broader
         # recall via the `recall_types` config key.
         self._recall_types: list[str] = ["observation"]
+        self._prefer_observations = False
+        self._provenance_mode = "none"
+        self._allow_memory_mutations = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
@@ -1260,7 +1342,10 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
-            {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+            {"key": "recall_types", "description": "Fact types to surface on recall — applies to auto-recall and the hindsight_recall tool. Defaults to observation-only; set observation,world,experience for observation-preferred mixed recall.", "default": "observation"},
+            {"key": "prefer_observations", "description": "When mixed recall is enabled, suppress raw facts already covered by returned observations (requires Hindsight 0.9.1)", "default": False},
+            {"key": "provenance_mode", "description": "Automatic recall provenance mode; keep none for compact context", "default": "none", "choices": ["none", "compact"]},
+            {"key": "allow_memory_mutations", "description": "Expose explicit, audited invalidation and restoration tools; does not enable automatic mutation", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '🧠 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
@@ -1675,7 +1760,10 @@ class HindsightMemoryProvider(MemoryProvider):
             # loop on current hindsight-client releases.
             client = self._get_client()
             self._client = client
-            return await operation(client)
+            result = operation(client)
+            if inspect.isawaitable(result):
+                return await result
+            return result
 
         try:
             return self._run_sync(_invoke())
@@ -1905,6 +1993,14 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list(configured_types) or ["observation"]
+        self._recall_types = [t for t in self._recall_types if t in {"world", "experience", "observation"}]
+        if not self._recall_types:
+            self._recall_types = ["observation"]
+        self._prefer_observations = _coerce_bool(self._config.get("prefer_observations", False), default=False)
+        self._provenance_mode = self._config.get("provenance_mode", "none")
+        if self._provenance_mode not in {"none", "compact"}:
+            self._provenance_mode = "none"
+        self._allow_memory_mutations = _coerce_bool(self._config.get("allow_memory_mutations", False), default=False)
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
         # Hermes emits a "🧠 Hindsight — recalled N memories" status line so the
@@ -2080,21 +2176,17 @@ class HindsightMemoryProvider(MemoryProvider):
                 resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                 # Reflect synthesizes across many memories -> no discrete count.
                 return _RecallResult(resp.text or "", 0)
-            recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                recall_kwargs["tags"] = self._recall_tags
-                recall_kwargs["tags_match"] = self._recall_tags_match
-            if self._recall_types:
-                recall_kwargs["types"] = self._recall_types
-            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
+            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s, types=%s, prefer_observations=%s)",
+                         self._bank_id, len(query), self._budget, self._recall_types, self._prefer_observations)
+            resp = self._compatible_recall(
+                query,
+                {"include_provenance": self._provenance_mode == "compact"},
+            )
+            text, num_results = self._format_recall_response(
+                resp,
+                {"include_provenance": self._provenance_mode == "compact", "limit": 50},
+            )
             logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
             return _RecallResult(text, num_results)
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
@@ -2502,10 +2594,133 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception:
             logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
+    def _recall_kwargs(self, client, query: str, args: Optional[dict] = None) -> tuple[dict, dict]:
+        """Build required and optional recall kwargs from config/tool arguments."""
+        args = args or {}
+        raw_types = args.get("types", self._recall_types)
+        if isinstance(raw_types, str):
+            raw_types = [item.strip() for item in raw_types.split(",") if item.strip()]
+        types = [item for item in (raw_types or ["observation"]) if item in {"world", "experience", "observation"}]
+        if not types:
+            types = ["observation"]
+        required = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "types": types,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        optional: dict = {}
+        if self._recall_tags or args.get("tags"):
+            optional["tags"] = args.get("tags") or self._recall_tags
+            optional["tags_match"] = args.get("tags_match") or self._recall_tags_match
+        if args.get("tag_groups"):
+            optional["tag_groups"] = args["tag_groups"]
+        if self._prefer_observations and "observation" in types and any(t in types for t in ("world", "experience")):
+            optional["prefer_observations"] = True
+        for key, default in {
+            "include_entities": False,
+            "max_entity_tokens": _bounded_int(args.get("max_entity_tokens"), default=500, minimum=1, maximum=2000),
+            "include_chunks": False,
+            "max_chunk_tokens": _bounded_int(args.get("max_chunk_tokens"), default=8192, minimum=1, maximum=8192),
+            "include_source_facts": False,
+            "max_source_facts_tokens": _bounded_int(args.get("max_source_facts_tokens"), default=4096, minimum=1, maximum=8192),
+        }.items():
+            if args.get(key, default):
+                optional[key] = args.get(key, default)
+        supported = {key: value for key, value in optional.items() if _supports_kwarg(client, "arecall", key)}
+        omitted = set(optional) - set(supported)
+        if omitted:
+            logger.warning("Hindsight recall optional fields unavailable in installed client: %s", sorted(omitted))
+        return {**required, **supported}, {key: value for key, value in supported.items() if key in {"prefer_observations", "include_entities", "include_chunks", "include_source_facts"}}
+
+    def _compatible_recall(self, query: str, args: Optional[dict] = None):
+        """Recall with optional-feature retry that fails closed to baseline recall."""
+        async def _call(client):
+            kwargs, optional = self._recall_kwargs(client, query, args)
+            try:
+                return await client.arecall(**kwargs)
+            except Exception as exc:
+                if not optional or not _looks_like_optional_recall_rejection(exc):
+                    raise
+                logger.warning("Hindsight server rejected optional recall fields; retrying baseline recall: %s", exc)
+                baseline = {key: value for key, value in kwargs.items() if key not in optional}
+                return await client.arecall(**baseline)
+        return self._run_hindsight_operation(_call)
+
+    @staticmethod
+    def _result_provenance(result: Any) -> dict:
+        fields = ("id", "type", "document_id", "chunk_id", "mentioned_at", "occurred_start", "occurred_end", "source_fact_ids", "tags", "metadata")
+        return {field: getattr(result, field, None) for field in fields if getattr(result, field, None) not in (None, [], "")}
+
+    def _format_recall_response(self, response: Any, args: Optional[dict] = None) -> tuple[str, int]:
+        args = args or {}
+        results = list(getattr(response, "results", None) or [])
+        offset = _bounded_int(args.get("offset"), default=0, minimum=0, maximum=500)
+        limit = _bounded_int(args.get("limit"), default=50, minimum=1, maximum=50)
+        results = results[offset:offset + limit]
+        include_provenance = bool(args.get("include_provenance", self._provenance_mode == "compact"))
+        lines = []
+        for index, result in enumerate(results, 1):
+            line = f"{index}. {getattr(result, 'text', '')}"
+            if include_provenance:
+                provenance = self._result_provenance(result)
+                if provenance:
+                    line += "\n   provenance: " + json.dumps(provenance, sort_keys=True, default=str)
+            lines.append(line)
+        if args.get("include_entities") and getattr(response, "entities", None):
+            lines.append("\nEntities:\n" + json.dumps(response.entities, default=str, sort_keys=True))
+        if args.get("include_chunks") and getattr(response, "chunks", None):
+            lines.append("\nSource chunks:\n" + json.dumps(response.chunks, default=str, sort_keys=True))
+        if args.get("include_source_facts") and getattr(response, "source_facts", None):
+            lines.append("\nSource facts:\n" + json.dumps(response.source_facts, default=str, sort_keys=True))
+            if getattr(response, "source_facts_truncated", False):
+                lines.append("Source facts were truncated by Hindsight's token budget.")
+        return "\n".join(lines), len(results)
+
+    def _mutation_disabled_error(self) -> str:
+        return tool_error("Memory mutation tools are disabled; enable allow_memory_mutations only for explicit audited curation.")
+
+    def _curate_memory(self, memory_id: str, *, state: str, reason: Optional[str] = None) -> str:
+        if not self._allow_memory_mutations:
+            return self._mutation_disabled_error()
+        memory_id = str(memory_id or "").strip()
+        if not memory_id:
+            return tool_error("Missing required parameter: memory_id")
+        if state == "invalidated" and not str(reason or "").strip():
+            return tool_error("Invalidation requires a non-empty reason")
+        try:
+            from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
+            request = UpdateMemoryRequest(state=state, reason=str(reason).strip() if reason else None)
+
+            def _update(client):
+                memory_api = getattr(client, "memory", None)
+                update_method = getattr(memory_api, "update_memory", None)
+                get_method = getattr(memory_api, "get_memory", None)
+                if update_method is None or get_method is None:
+                    raise RuntimeError("installed Hindsight client does not support auditable memory curation")
+                updated = update_method(self._bank_id, memory_id, request)
+                verified = get_method(self._bank_id, memory_id)
+                return updated, verified
+
+            updated, verified = self._run_hindsight_operation(_update)
+            verified_state = getattr(verified, "state", None) or getattr(updated, "state", None)
+            if state == "invalidated" and verified_state not in (None, "invalidated"):
+                raise RuntimeError(f"provider readback state was {verified_state!r}, expected invalidated")
+            if state == "valid" and verified_state not in (None, "valid"):
+                raise RuntimeError(f"provider readback state was {verified_state!r}, expected valid")
+            return json.dumps({"result": "Memory invalidated." if state == "invalidated" else "Memory restored.", "memory_id": memory_id, "state": verified_state or state})
+        except Exception as exc:
+            logger.warning("Hindsight memory curation failed (%s, %s): %s", state, memory_id, exc, exc_info=True)
+            return tool_error(f"Failed to {state} memory: {exc}")
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        schemas = [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        if self._allow_memory_mutations:
+            schemas.extend([INVALIDATE_SCHEMA, RESTORE_SCHEMA])
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -2539,27 +2754,20 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
+                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
+                resp = self._compatible_recall(query, args)
+                result, num_results = self._format_recall_response(resp, args)
                 logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
-                    return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
+                return json.dumps({"result": result or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
+
+        elif tool_name == "hindsight_invalidate":
+            return self._curate_memory(args.get("memory_id", ""), state="invalidated", reason=args.get("reason"))
+
+        elif tool_name == "hindsight_restore":
+            return self._curate_memory(args.get("memory_id", ""), state="valid")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
