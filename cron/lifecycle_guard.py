@@ -288,6 +288,9 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+_KNOWN_SHELL_INTERPRETER_DIRS = frozenset(
+    {"/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"}
+)
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8

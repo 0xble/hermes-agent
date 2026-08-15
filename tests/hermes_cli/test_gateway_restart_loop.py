@@ -1878,6 +1878,19 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             lambda: inside_gateway,
         )
 
+    def test_remote_absolute_shell_inspects_only_the_script_argument(self):
+        from cron.lifecycle_guard import _iter_referenced_shell_scripts
+
+        refs = list(
+            _iter_referenced_shell_scripts(
+                "/bin/sh /remote/workspace/job.sh", remote=True
+            )
+        )
+
+        assert [(str(path), shell) for path, shell in refs] == [
+            ("/remote/workspace/job.sh", True)
+        ]
+
     def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
