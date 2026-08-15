@@ -3598,10 +3598,10 @@ class SessionStore:
         (#7536).  Only marks sessions updated within *max_age_seconds* to
         avoid touching long-idle sessions.  When a durable transcript is
         available, an ``assistant/stop`` tail proves the last turn completed
-        before the crash, so the legacy recency fallback skips that entry.
-        Entries with no transcript remain eligible because older Hermes
-        versions and first-turn crashes may refresh routing metadata before
-        persisting a message.  Eligible entries are resumed during startup or
+        before the crash. A terminal model transcript is not delivery
+        acknowledgement: the gateway may persist it before the platform
+        adapter sends it, so every recent non-suspended candidate remains
+        eligible for recovery. Eligible entries are resumed during startup or
         when the next message arrives.
 
         Entries already flagged ``resume_pending=True`` are skipped.  Entries
@@ -3629,36 +3629,6 @@ class SessionStore:
                 and entry.updated_at >= cutoff
             ]
 
-        completed_candidates: set[tuple[str, str]] = set()
-        if self._db is not None:
-            for session_key, session_id in candidates:
-                transcript_session_id = (
-                    self._compression_tip_for_session_id(session_id) or session_id
-                )
-                try:
-                    latest = self._db.get_messages(
-                        transcript_session_id,
-                        limit=1,
-                        latest=True,
-                    )
-                except Exception as exc:
-                    # Recovery must fail safe. A transcript read error is not
-                    # proof that the interrupted work finished.
-                    logger.warning(
-                        "Legacy recovery transcript check failed for %s; "
-                        "keeping session eligible: %s",
-                        transcript_session_id,
-                        exc,
-                    )
-                    continue
-                if (
-                    latest
-                    and latest[-1].get("role") == "assistant"
-                    and latest[-1].get("finish_reason") == "stop"
-                    and not latest[-1].get("tool_calls")
-                ):
-                    completed_candidates.add((session_key, session_id))
-
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
@@ -3666,8 +3636,6 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
-                    if (entry.session_key, entry.session_id) in completed_candidates:
-                        continue
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()

@@ -50,10 +50,21 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
 | HERMES-025 | Active | `fix(compression): report aborted compaction accurately` | Emit committed, aborted, or deferred terminal outcomes instead of unconditional success. |
 | HERMES-026 | Active | `feat(memory): retain source material automatically`; `fix(memory): gate raw attachment retention` | Preserve source evidence while requiring explicit opt-in before reading or uploading raw attachment bytes. |
+| HERMES-027 | Active | `fix: harden gateway runtime boundaries`; `fix(gateway): recover unacknowledged terminal responses` | Resume recent sessions after an unexpected exit unless outbound delivery is durably acknowledged. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-027 — Recover recent sessions until delivery is acknowledged
+
+- **Summary:** Treats a persisted terminal assistant transcript as model-completion evidence, not outbound-delivery evidence. After an unexpected gateway exit, recent non-suspended sessions remain eligible for recovery because a crash can occur after transcript persistence but before the platform adapter confirms delivery.
+- **Surfaces:** `gateway/session.py`; `tests/gateway/test_clean_shutdown_marker.py`.
+- **Upstream tracking:** Local fork correction to the concurrent gateway-boundary hardening; no released upstream durable delivery acknowledgement was identified.
+- **Upstream PR:** None.
+- **Regression:** `pytest -q tests/gateway/test_clean_shutdown_marker.py`.
+- **Rollback:** Restore terminal-transcript suppression only after the platform delivery path writes a durable acknowledgement that is atomically associated with the transcript turn. Never infer delivery from `finish_reason=stop` alone.
+- **Retirement:** Retire after released upstream recovery suppresses only turns with durable confirmed delivery and preserves generated-but-undelivered responses across gateway crashes.
 
 ### HERMES-026 — Retain source evidence without implicit raw attachment upload
 
