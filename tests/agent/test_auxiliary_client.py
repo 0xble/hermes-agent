@@ -582,6 +582,28 @@ class TestReadCodexAccessToken:
 
 
 class TestResolveXaiOAuthForAux:
+    def test_builder_prefers_explicit_alternate_credential(self):
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_xai_oauth_for_aux",
+                side_effect=AssertionError("pool resolution must not run"),
+            ),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import _build_xai_oauth_aux_client
+
+            client, model = _build_xai_oauth_aux_client(
+                "grok-4.20",
+                explicit_api_key="alternate-xai-token",
+                explicit_base_url="https://alternate.x.ai/v1",
+            )
+
+        assert client is not None
+        assert model == "grok-4.20"
+        assert mock_openai.call_args.kwargs["api_key"] == "alternate-xai-token"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://alternate.x.ai/v1"
+
     def test_uses_pool_backed_credentials_without_singleton(self, tmp_path, monkeypatch):
         """Auxiliary xAI OAuth must see pool-only credentials.
 
@@ -708,6 +730,28 @@ class TestAnthropicOAuthFlag:
 
 
 class TestBuildCodexClient:
+    def test_explicit_credential_bypasses_pool_selection(self):
+        with (
+            patch(
+                "agent.auxiliary_client._select_pool_entry",
+                side_effect=AssertionError("pool selection must not run"),
+            ),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock()
+            from agent.auxiliary_client import _build_codex_client
+
+            client, model = _build_codex_client(
+                "gpt-5.6-terra",
+                explicit_api_key="alternate-token",
+                explicit_base_url="https://alternate.example/codex",
+            )
+
+        assert client is not None
+        assert model == "gpt-5.6-terra"
+        assert mock_openai.call_args.kwargs["api_key"] == "alternate-token"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://alternate.example/codex"
+
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (
             patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)),
@@ -2194,7 +2238,7 @@ class TestAuxiliaryTransientCredentialRetry:
             ),
             patch(
                 "agent.auxiliary_client._retry_same_provider_sync",
-                side_effect=self._overload(),
+                side_effect=_StatusError("unauthorized", status_code=401),
             ) as retry_alt,
             patch(
                 "agent.auxiliary_client._try_configured_fallback_chain",
