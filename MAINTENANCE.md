@@ -24,7 +24,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
-| HERMES-001 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Serialize malformed `state.db` repair and invalidate stale schemas. |
+| HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Make raw SQLite backup and quarantine connection-safe. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
 | HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics` | Enforce a per-chat Telegram send cooldown. |
@@ -113,14 +113,14 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Rollback:** Remove the alternate-entry selector, transient soft-cooldown registry, rotation/cache telemetry, and overload/transport branch from `recover_with_credential_pool`, then remove only the HERMES-021 focused tests. Preserve rate-limit retry semantics, billing rotation, auth refresh behavior, prompt-cache key construction, and upstream-aggregator fallback bypass.
 - **Retirement:** Retire after a released upstream implementation provides capability-based same-provider credential alternation before provider fallback for transient overload, server-error, and timeout failures and passes equivalent focused tests.
 
-### HERMES-001 — Serialize malformed `state.db` repair and invalidate stale schemas
+### HERMES-001 — Retired malformed `state.db` repair serialization
 
-- **Summary:** Serializes writable-schema repair across processes, re-probes after lock acquisition, and bumps SQLite's schema cookie after direct `sqlite_master` surgery. This prevents simultaneous repairers and stale prepared schemas from re-corrupting the database.
-- **Surfaces:** `hermes_state.py`; `tests/test_state_db_malformed_repair.py`.
-- **Upstream tracking:** Related upstream work was recorded as PRs `#69609` and `#71982`. Re-evaluate their released descendants rather than assuming title-level equivalence.
-- **Upstream PR:** Related: #69609 and #71982 (open; checked 2026-08-14).
-- **Regression:** `pytest -q tests/test_state_db_malformed_repair.py`.
-- **Rollback:** In a follow-up commit, remove `_cross_process_repair_lock`, `_repair_state_db_schema_locked`, `_bump_schema_cookie`, their constants/imports, and their call sites while preserving unrelated `hermes_state.py` changes. Remove only the four patch-owned repair-lock/schema-cookie tests. Run the regression against the upstream replacement before promotion. Do not revert the umbrella commit.
+- **Summary:** The private writable-schema repair lock, post-lock re-probe, schema-cookie bump, and duplicate fork tests have been removed. Released upstream commit `923d86e09` now owns the complete locking, re-probe, schema-cookie, hard-stop backup, and regression contract.
+- **Surfaces:** Historical private surfaces were `hermes_state.py` and four patch-owned cases in `tests/test_state_db_malformed_repair.py`. The active replacement is upstream's repair implementation and tests in those same files.
+- **Upstream tracking:** Replaced by released upstream commit `923d86e09`, the released descendant of the work previously tracked through PRs `#69609` and `#71982`.
+- **Upstream PR:** Associated historical PRs: #69609 and #71982; released replacement commit: `923d86e09` (verified 2026-08-14).
+- **Regression:** `scripts/run_tests.sh tests/test_state_db_malformed_repair.py` against the upstream-backed implementation.
+- **Rollback:** Do not restore the private implementation or duplicate tests. If the upstream contract regresses, repair or backport upstream's coherent lock/re-probe/schema-cookie/hard-stop path; do not layer a second repair lock over it. HERMES-002's atomic raw-copy guard remains independent and must be preserved.
 
 ### HERMES-002 — Make raw SQLite backup and quarantine connection-safe
 
@@ -129,7 +129,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
 - **Upstream PR:** None after checked 2026-08-14.
 - **Regression:** `pytest -q tests/test_raw_copy_offline_guard.py`.
-- **Rollback:** Remove the `_copy_all`/`offline_file_access` guarded backup path in `hermes_state.py` and `_backup_corrupt_db_locked` guarded quarantine path in `hermes_cli/kanban_db.py`, then remove `tests/test_raw_copy_offline_guard.py`. Preserve HERMES-001 and all unrelated database-repair behavior. Verify the upstream replacement with the same live-connection race cases before deleting the private test.
+- **Rollback:** Remove the `_copy_all`/`offline_file_access` guarded backup path in `hermes_state.py` and `_backup_corrupt_db_locked` guarded quarantine path in `hermes_cli/kanban_db.py`, then remove `tests/test_raw_copy_offline_guard.py`. Preserve upstream's released HERMES-001 replacement and all unrelated database-repair behavior. Verify the upstream replacement with the same live-connection race cases before deleting the private test.
 
 ### HERMES-003 — Retired fixed file-descriptor soft-limit floor
 
