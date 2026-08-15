@@ -138,7 +138,12 @@ def test_attachment_bytes_require_explicit_opt_in(tmp_path, monkeypatch):
     assert discover_source_candidates(messages) == []
     assert reads == 0
 
-    candidates = discover_source_candidates(messages, retain_attachments=True)
+    assert discover_source_candidates(messages, retain_attachments=True) == []
+    assert reads == 0
+
+    candidates = discover_source_candidates(
+        messages, retain_attachments=True, attachment_roots=(tmp_path,)
+    )
     assert len(candidates) == 1
     assert candidates[0].file_path == str(path.resolve())
     assert reads == 1
