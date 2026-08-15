@@ -166,6 +166,10 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def semantic_memory_enabled(self) -> bool:
+        """Whether this provider supplies durable semantic cross-session memory."""
+        return False
+
     def system_prompt_block(self) -> str:
         """Return text to include in the system prompt.
 
