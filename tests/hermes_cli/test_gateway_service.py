@@ -344,6 +344,34 @@ class TestGeneratedSystemdUnits:
         assert "SoftResourceLimits" not in plist
 
 
+    def test_launchd_plist_declares_supervisor_marker(self):
+        """The generated plist must export the explicit supervisor marker."""
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>" in plist
+        marker_index = plist.index("<key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>")
+        assert "<string>1</string>" in plist[marker_index : marker_index + 200]
+
+    def test_launchd_plist_supervisor_marker_satisfies_guard_probe(self, monkeypatch):
+        """The marker must satisfy the supervisor probe behind the wrapper."""
+        import re
+
+        plist = gateway_cli.generate_launchd_plist()
+        match = re.search(
+            r"<key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>\s*<string>([^<]*)</string>",
+            plist,
+        )
+        assert match is not None
+
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+        monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+        monkeypatch.setenv(
+            gateway_cli.EXTERNAL_GATEWAY_SUPERVISOR_ENV, match.group(1)
+        )
+
+        assert gateway_cli._running_under_gateway_supervisor() is True
+
 
 class TestGatewayStopCleanup:
     @pytest.mark.linux_only

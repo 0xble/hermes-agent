@@ -5401,6 +5401,18 @@ def generate_launchd_plist() -> str:
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>
         <string>1</string>
+        <!-- launchd's XPC marker can become "0" when the gateway is
+             started behind the stderr_timestamp wrapper. Export the
+             explicit supervisor marker so the gateway does not mistake its
+             own launchd startup for an interactive process and refuse to
+             start against the job that launched it. Complementary to
+             HERMES_SUPERVISED_CHILD above, not a replacement: that one is
+             upstream's cross-supervisor marker (systemd/Windows/service
+             manager set it too), while this one is what gateway/restart.py
+             and hermes_cli/main.py actually read for the external-supervisor
+             contract. -->
+        <key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>
