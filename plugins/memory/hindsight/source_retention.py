@@ -297,6 +297,7 @@ def discover_source_candidates(
     messages: Iterable[dict[str, Any]] | None,
     *,
     session_id: str = "",
+    retain_attachments: bool = False,
 ) -> list[SourceCandidate]:
     """Discover substantive, non-sensitive sources from completed messages.
 
@@ -317,34 +318,38 @@ def discover_source_candidates(
     messages = messages[last_user_index:]
     candidates: list[SourceCandidate] = []
 
-    # File attachments whose local path is available in the message payload.
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        parts = content if isinstance(content, list) else []
-        for part in parts:
-            if not isinstance(part, dict):
+    # Raw file bytes cross a stronger trust boundary than text already present
+    # in the session. Do not even open or hash attachments unless the provider
+    # has an explicit, default-off opt-in.
+    if retain_attachments:
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
                 continue
-            ptype = str(part.get("type") or "").strip().lower()
-            if ptype not in _FILE_SOURCE_TYPES:
-                continue
-            path = _path_value(part)
-            if not path:
-                continue
-            source_id = str(part.get("file_id") or part.get("id") or f"file-{_sha256_text(str(Path(path).expanduser().resolve()))[:32]}")
-            candidate = _candidate_file(
-                source_type="user_file",
-                source_id=f"attachment:{source_id}",
-                path=path,
-                context=(
-                    "Non-sensitive file supplied by Brian in chat and used in the completed turn. "
-                    "Preserve the source and distinguish its claims from Hermes analysis."
-                ),
-                session_id=session_id,
-            )
-            if candidate:
-                candidates.append(candidate)
+            content = message.get("content")
+            parts = content if isinstance(content, list) else []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                ptype = str(part.get("type") or "").strip().lower()
+                if ptype not in _FILE_SOURCE_TYPES:
+                    continue
+                path = _path_value(part)
+                if not path:
+                    continue
+                source_id = str(part.get("file_id") or part.get("id") or f"file-{_sha256_text(str(Path(path).expanduser().resolve()))[:32]}")
+                candidate = _candidate_file(
+                    source_type="user_file",
+                    source_id=f"attachment:{source_id}",
+                    path=path,
+                    context=(
+                        "File supplied by the user in chat and retained under the explicit "
+                        "raw-attachment opt-in. Preserve the source and distinguish its "
+                        "claims from Hermes analysis."
+                    ),
+                    session_id=session_id,
+                )
+                if candidate:
+                    candidates.append(candidate)
 
     # Long, explicitly source-like pasted text is separate evidence rather than
     # merely another conversational request. Short prose remains ordinary

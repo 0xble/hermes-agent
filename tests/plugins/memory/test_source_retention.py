@@ -2,6 +2,7 @@
 
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -107,6 +108,40 @@ def test_current_turn_boundary_and_duplicate_content_are_deterministic():
     duplicate = _tool_turn("web_extract", {"url": "https://new.example"}, "new " * 200)
     candidates = discover_source_candidates(duplicate + duplicate[1:])
     assert len(candidates) == 1
+
+
+def test_attachment_bytes_require_explicit_opt_in(tmp_path, monkeypatch):
+    path = tmp_path / "confidential.pdf"
+    path.write_bytes(b"private source bytes")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "file_attachment",
+                    "file_id": "file-1",
+                    "file_path": str(path),
+                }
+            ],
+        }
+    ]
+    reads = 0
+    original_read_bytes = Path.read_bytes
+
+    def tracked_read_bytes(candidate):
+        nonlocal reads
+        reads += 1
+        return original_read_bytes(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", tracked_read_bytes)
+
+    assert discover_source_candidates(messages) == []
+    assert reads == 0
+
+    candidates = discover_source_candidates(messages, retain_attachments=True)
+    assert len(candidates) == 1
+    assert candidates[0].file_path == str(path.resolve())
+    assert reads == 1
 
 
 def _source_candidate(tmp_path):
