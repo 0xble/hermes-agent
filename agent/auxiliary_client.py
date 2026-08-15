@@ -3636,6 +3636,22 @@ def _record_route_info(
         route_info["model"] = model or "default"
 
 
+def _attach_relay_route(response: Any, base_url: Optional[str] = None) -> Any:
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return response
+    route = {
+        "provider": str(context.get("provider") or "auxiliary"),
+        "model": str(context.get("model") or "unknown"),
+        "base_url": str(base_url or ""),
+        "api_mode": str(context.get("api_mode") or "chat_completions"),
+    }
+    try:
+        setattr(response, "_hermes_auxiliary_route", route)
+    except Exception:
+        pass
+    return response
+
 def _relay_auxiliary_metadata(
     *,
     provider: str | None = None,
@@ -4950,8 +4966,10 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return (
         "auxiliary " in msg
-        and "llm returned invalid response" in msg
-        and "choices[0].message" in msg
+        and (
+            ("llm returned invalid response" in msg and "choices[0].message" in msg)
+            or "incomplete structured response" in msg
+        )
     )
 
 
@@ -9453,6 +9471,7 @@ def _validate_llm_response(
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
             _record_relay_auxiliary_response_model(response)
+            _attach_relay_route(response, base_url)
             _complete_relay_auxiliary_call()
             return recovered
         response_type = type(response).__name__
@@ -9477,6 +9496,7 @@ def _validate_llm_response(
             f"response (finish_reason={finish_reason})"
         )
     _record_relay_auxiliary_response_model(response)
+    _attach_relay_route(response, base_url)
     _complete_relay_auxiliary_call()
     return response
 
