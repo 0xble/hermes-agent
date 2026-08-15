@@ -554,7 +554,11 @@ def _clean_title(
     # providers that ignore response_format.  Do not let that permissiveness
     # promote a bare Markdown fence (or any other formatting-only fragment)
     # over the usable deterministic title derived from the opening message.
-    if not title or not any(char.isalnum() for char in title):
+    is_incomplete_fence = re.fullmatch(
+        r"(?:`{3,}|~{3,})(?:\s*[\w.+-]+)?",
+        title,
+    )
+    if not title or is_incomplete_fence or not any(char.isalnum() for char in title):
         return None
     if max_words is not None:
         words = title.split()

@@ -21,7 +21,10 @@ from hermes_state import SessionDB
 class TestGenerateTitle:
     """Unit tests for generate_title()."""
 
-    @pytest.mark.parametrize("content", ["```", "!!!", "---"])
+    @pytest.mark.parametrize(
+        "content",
+        ["```", "!!!", "---", "```json", "~~~yaml", '{"title": "```"}'],
+    )
     def test_rejects_formatting_only_model_output(self, content):
         response = MagicMock()
         response.choices = [MagicMock()]
@@ -574,6 +577,20 @@ class TestChooseTopicIcon:
 
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""
+
+    def test_malformed_model_title_preserves_derived_title_and_source(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        db.set_auto_title("sess-1", "Verify financial tables", source="derived")
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "```json"
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            auto_title_session(db, "sess-1", "Verify the financial tables")
+
+        assert db.get_session_title("sess-1") == "Verify financial tables"
+        assert db.get_session_title_source("sess-1") == "derived"
 
 
 
