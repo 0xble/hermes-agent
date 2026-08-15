@@ -222,14 +222,18 @@ def test_long_pasted_source_is_retained_but_short_prompt_is_not():
     assert discover_source_candidates([{"role": "user", "content": "short request"}]) == []
 
 
-def test_read_file_extraction_is_preserved_and_secret_path_is_skipped():
+def test_read_file_extraction_requires_explicit_opt_in_and_secret_paths_stay_blocked():
     content = "Document source text. " * 60
-    extracted = discover_source_candidates(
-        _tool_turn("read_file", {"path": "/Users/brianle/Vault/source.md"}, content)
+    messages = _tool_turn(
+        "read_file", {"path": "/Users/brianle/Vault/source.md"}, content
     )
+    assert discover_source_candidates(messages) == []
+
+    extracted = discover_source_candidates(messages, retain_file_extractions=True)
     assert len(extracted) == 1
     assert extracted[0].source_type == "file_extraction"
     skipped = discover_source_candidates(
-        _tool_turn("read_file", {"path": "/Users/brianle/.env"}, content)
+        _tool_turn("read_file", {"path": "/Users/brianle/.env"}, content),
+        retain_file_extractions=True,
     )
     assert skipped == []
