@@ -4743,10 +4743,12 @@ class BasePlatformAdapter(ABC):
         Returns:
             Tuple of (list of (url, alt_text) pairs, cleaned content with image tags removed).
         """
+        from urllib.parse import quote as _quote, unquote as _unquote
+
         images = []
         cleaned = content
-        
-        # Match markdown images: ![alt](url)
+
+        # Match remote markdown images: ![alt](url)
         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
         for match in re.finditer(md_pattern, content):
             alt_text = match.group(1)
@@ -4755,24 +4757,63 @@ class BasePlatformAdapter(ABC):
             if any(url.lower().endswith(ext) or ext in url.lower() for ext in
                    ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery']):
                 images.append((url, alt_text))
-        
+
+        # Models also emit Markdown image syntax for screenshots and generated
+        # files on the agent's local filesystem, e.g.
+        # ``![caption](/Users/brian/.../image.png)``.  Do not let those paths
+        # fall through to platform Markdown rendering: Telegram then exposes
+        # the literal ``!caption`` instead of delivering the image.  Validate
+        # the path before extracting it so a Markdown image cannot bypass the
+        # normal local-media safety boundary.
+        local_md_pattern = (
+            r'!\[([^\]]*)\]\((file://(?:[^)\n]+)|'
+            r'(?:~/|/|[A-Za-z]:[/\\])[^)\n]*)\)'
+        )
+        for match in re.finditer(local_md_pattern, content):
+            alt_text = match.group(1)
+            raw_path = match.group(2)
+            if raw_path.startswith("file://"):
+                path = _unquote(raw_path[7:])
+            else:
+                path = raw_path
+            safe_path = validate_media_delivery_path(path)
+            if safe_path and Path(safe_path).suffix.lower() in {
+                '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg'
+            }:
+                images.append((f"file://{_quote(safe_path)}", alt_text))
+
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
         html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
         for match in re.finditer(html_pattern, content):
             url = match.group(1)
             images.append((url, ""))
-        
+
         # Remove only the matched image tags from content (not all markdown images)
         if images:
             extracted_urls = {url for url, _ in images}
-            def _remove_if_extracted(match):
-                url = match.group(2) if match.lastindex >= 2 else match.group(1)
-                return '' if url in extracted_urls else match.group(0)
-            cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
-            cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
+            cleaned = re.sub(
+                md_pattern,
+                lambda match: '' if match.group(2) in extracted_urls else match.group(0),
+                cleaned,
+            )
+            local_md_re = re.compile(local_md_pattern)
+            local_file_urls = {
+                _unquote(url[7:]) for url in extracted_urls if url.startswith("file://")
+            }
+            cleaned = local_md_re.sub(
+                lambda match: '' if _unquote(
+                    match.group(2)[7:] if match.group(2).startswith("file://") else match.group(2)
+                ) in local_file_urls else match.group(0),
+                cleaned,
+            )
+            cleaned = re.sub(
+                html_pattern,
+                lambda match: '' if match.group(1) in extracted_urls else match.group(0),
+                cleaned,
+            )
             # Clean up leftover blank lines
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-        
+
         return images, cleaned
     
     async def send_voice(

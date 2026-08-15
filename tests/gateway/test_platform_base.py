@@ -139,6 +139,26 @@ class TestExtractImages:
         assert "![cat]" not in cleaned
 
 
+    def test_local_markdown_image_with_spaces_is_extracted(self, tmp_path):
+        from urllib.parse import quote
+
+        image_path = tmp_path / "Noorani Qaida — Next Page 4.png"
+        image_path.write_bytes(b"not-a-real-image-but-an-existing-safe-file")
+        content = f"![Likely next Noorani Qaida page]({image_path})"
+
+        images, cleaned = BasePlatformAdapter.extract_images(content)
+
+        assert images == [(f"file://{quote(str(image_path))}", "Likely next Noorani Qaida page")]
+        assert cleaned == ""
+
+    def test_nonexistent_local_markdown_image_is_preserved(self):
+        content = "![missing](/tmp/hermes-missing-image.png)"
+
+        images, cleaned = BasePlatformAdapter.extract_images(content)
+
+        assert images == []
+        assert cleaned == content
+
     def test_fal_media_cdn(self):
         content = "![gen](https://fal.media/files/abc123/output.png)"
         images, _ = BasePlatformAdapter.extract_images(content)
