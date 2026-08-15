@@ -113,6 +113,16 @@ COMPACTION_STATUS = (
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
 
+COMPACTION_ABORTED_STATUS = "⚠ Compression failed; conversation preserved."
+COMPACTION_DEFERRED_STATUS = "ℹ Compression deferred; conversation unchanged."
+
+_COMPACTION_TERMINAL_STATUS = {
+    "committed": ("compacted", COMPACTION_DONE_STATUS),
+    "aborted": ("compaction_aborted", COMPACTION_ABORTED_STATUS),
+    "deferred": ("compaction_deferred", COMPACTION_DEFERRED_STATUS),
+}
+
+
 def _strip_marker_for_comparison(msgs: Any) -> Any:
     """Copy ``msgs`` with the ``_db_persisted`` persistence marker removed.
 
@@ -133,16 +143,28 @@ def _strip_marker_for_comparison(msgs: Any) -> Any:
         for m in msgs
     ]
 
-
-def _emit_compaction_done(agent: Any) -> None:
-    """Emit the structured terminal edge for a started compaction."""
+def _emit_compaction_terminal(
+    agent: Any,
+    outcome: str,
+    message_override: Optional[str] = None,
+) -> None:
+    """Emit the truthful structured terminal edge for a started compaction."""
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
         return
+    event, default_message = _COMPACTION_TERMINAL_STATUS.get(
+        outcome,
+        _COMPACTION_TERMINAL_STATUS["aborted"],
+    )
+    message = message_override or default_message
     try:
-        status_callback("compacted", COMPACTION_DONE_STATUS)
+        status_callback(event, message)
     except Exception:
-        logger.debug("status_callback error in compaction completion", exc_info=True)
+        logger.debug(
+            "status_callback error in compaction terminal outcome=%s",
+            outcome,
+            exc_info=True,
+        )
 
 
 # ── Routine compression status templates ────────────────────────────────────
@@ -3350,29 +3372,32 @@ def compress_context(
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
         agent._emit_status(_compaction_status)
-    _compaction_done_emitted = False
-    # Commit outcome of this attempt; rebound to "committed" on the success
-    # path just before returning the compressed history. The lifecycle
-    # closure reads it at call time, so any abort/exception path that skips
-    # that rebind keeps the terminal edge suppressed.
-    _commit_status = "aborted"
+    _compaction_terminal_emitted = False
+    _compaction_outcome = "aborted"
+    _compaction_terminal_message: Optional[str] = None
 
-    def _complete_compaction_lifecycle(*, force_terminal: bool = False) -> None:
-        nonlocal _compaction_done_emitted
-        if _compaction_done_emitted:
+    def _set_compaction_outcome(
+        outcome: str,
+        message: Optional[str] = None,
+    ) -> None:
+        nonlocal _compaction_outcome, _compaction_terminal_message
+        _compaction_outcome = outcome
+        _compaction_terminal_message = message
+
+    def _complete_compaction_lifecycle() -> None:
+        nonlocal _compaction_terminal_emitted
+        if _compaction_terminal_emitted:
             return
-        _compaction_done_emitted = True
+        _compaction_terminal_emitted = True
         # A suppressed start (quiet context engine) opened no visible
-        # compaction phase — emit no terminal edge either. Failure warnings
-        # go through agent._emit_warning and are never suppressed here.
-        # Aborts that never compacted (lock contender, cancelled commit
-        # fence) opt in via force_terminal: they still need the structured
-        # terminal edge so clients can retire their compaction phase. Chat
-        # surfaces filter this routine notice independently.
-        if _compaction_status_emitted and (
-            _commit_status == "committed" or force_terminal
-        ):
-            _emit_compaction_done(agent)
+        # compaction phase — emit no terminal edge either. Detailed failure
+        # text can ride the aborted terminal event through the message override.
+        if _compaction_status_emitted:
+            _emit_compaction_terminal(
+                agent,
+                _compaction_outcome,
+                _compaction_terminal_message,
+            )
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -3500,7 +3525,8 @@ def compress_context(
                         split_status="aborted",
                         failure_class="commit_fence_cancelled",
                     )
-                    _complete_compaction_lifecycle(force_terminal=True)
+                    _set_compaction_outcome("deferred")
+                    _complete_compaction_lifecycle()
                     return messages, _existing_sp
             try:
                 _lock_acquired = _try_acquire_lock(
@@ -3592,7 +3618,8 @@ def compress_context(
                 split_status="aborted",
                 failure_class="lock_contended",
             )
-            _complete_compaction_lifecycle(force_terminal=True)
+            _set_compaction_outcome("deferred")
+            _complete_compaction_lifecycle()
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -3698,17 +3725,20 @@ def compress_context(
             recovered_messages = _adopt_live_compression_child(
                 agent, _lock_db, _lock_sid
             )
-            _release_lock()
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
             if recovered_messages is not None:
+                _set_compaction_outcome("committed")
+                _release_lock()
                 logger.warning(
                     "compression recovery: stale session=%s adopted live child=%s",
                     _lock_sid,
                     agent.session_id,
                 )
                 return recovered_messages, _existing_sp
+            _set_compaction_outcome("deferred")
+            _release_lock()
             logger.warning(
                 "compression skipped: session=%s was already rotated by "
                 "another compression path, but no unique live child could be adopted",
@@ -3753,6 +3783,7 @@ def compress_context(
         )
         if callable(blocked) and blocked(compressor):
             _mark_compression_blocked_transient(agent, compressor)
+            _set_compaction_outcome("deferred")
             _release_lock()
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
@@ -4165,13 +4196,13 @@ def compress_context(
         if getattr(agent.context_compressor, "_last_compress_aborted", False):
             try:
                 _err = getattr(agent.context_compressor, "_last_summary_error", None) or "unknown error"
-                if getattr(agent, "_last_compression_summary_warning", None) != _err:
-                    agent._last_compression_summary_warning = _err
-                    agent._emit_warning(
-                        f"⚠ Compression aborted: {_err}. "
-                        "No messages were dropped — conversation continues unchanged. "
-                        "Run /compress to retry, or /new to start a fresh session."
-                    )
+                _abort_message = (
+                    f"⚠ Compression aborted: {_err}. "
+                    "No messages were dropped — conversation continues unchanged. "
+                    "Run /compress to retry, or /new to start a fresh session."
+                )
+                agent._last_compression_summary_warning = _err
+                _set_compaction_outcome("aborted", _abort_message)
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
                     _existing_sp = agent._build_system_prompt(system_message)
@@ -4246,13 +4277,11 @@ def compress_context(
                 "rotate session=%s so the parent remains resumable",
                 agent.session_id or "none",
             )
-            try:
-                agent._emit_warning(
-                    "⚠ Compression returned an empty transcript. "
-                    "No session split was performed; conversation continues unchanged."
-                )
-            except Exception:
-                pass
+            _set_compaction_outcome(
+                "aborted",
+                "⚠ Compression returned an empty transcript. "
+                "No session split was performed; conversation continues unchanged.",
+            )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
@@ -5351,6 +5380,7 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        _set_compaction_outcome(_commit_status)
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
@@ -5496,6 +5526,29 @@ def _compress_context_via_codex_app_server(
     except Exception:
         pass
 
+    _compaction_terminal_emitted = False
+    _compaction_outcome = "aborted"
+    _compaction_terminal_message: Optional[str] = None
+
+    def _set_compaction_outcome(
+        outcome: str,
+        message: Optional[str] = None,
+    ) -> None:
+        nonlocal _compaction_outcome, _compaction_terminal_message
+        _compaction_outcome = outcome
+        _compaction_terminal_message = message
+
+    def _complete_compaction_lifecycle() -> None:
+        nonlocal _compaction_terminal_emitted
+        if _compaction_terminal_emitted:
+            return
+        _compaction_terminal_emitted = True
+        _emit_compaction_terminal(
+            agent,
+            _compaction_outcome,
+            _compaction_terminal_message,
+        )
+
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
@@ -5518,12 +5571,12 @@ def _compress_context_via_codex_app_server(
         agent._codex_session = None
 
     if getattr(result, "interrupted", False) or getattr(result, "error", None):
-        try:
-            agent._emit_warning(
-                f"⚠ Codex app-server compaction failed: {result.error}"
-            )
-        except Exception:
-            pass
+        _error_message = (
+            f"⚠ Codex app-server compaction failed: {result.error}. "
+            "No messages were dropped — conversation continues unchanged. "
+            "Run /compress to retry or /new to start a fresh session."
+        )
+        _set_compaction_outcome("aborted", _error_message)
         # The transcript is returned unchanged, so the session is still over
         # threshold. Without a brake the next turn retries immediately.
         _record_codex_compaction_failure(
@@ -5533,6 +5586,7 @@ def _compress_context_via_codex_app_server(
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
+        _complete_compaction_lifecycle()
         return messages, existing_prompt
 
     try:
@@ -5572,9 +5626,8 @@ def _compress_context_via_codex_app_server(
     existing_prompt = getattr(agent, "_cached_system_prompt", None)
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
-    # Terminal edge only on success — failure/interrupt paths above return
-    # without it, matching the main compress_context() gating.
-    _emit_compaction_done(agent)
+    _set_compaction_outcome("committed")
+    _complete_compaction_lifecycle()
     return messages, existing_prompt
 
 

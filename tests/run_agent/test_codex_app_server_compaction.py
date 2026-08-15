@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    compress_context,
+)
 from agent.transports.codex_app_server_session import TurnResult
 
 
@@ -111,6 +115,41 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
     assert agent._codex_session.calls == 0
     assert agent.context_compressor.compression_count == 0
     assert agent.events == []
+
+
+def test_codex_app_server_failure_emits_aborted_terminal_status():
+    result = TurnResult(
+        thread_id="thread-1",
+        turn_id="compact-turn-1",
+        error="provider overloaded",
+    )
+    agent = DummyAgent(result)
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    terminal_events = [
+        event
+        for event, _ in agent.status_events
+        if event in {"compacted", "compaction_aborted", "compaction_deferred"}
+    ]
+    assert terminal_events == ["compaction_aborted"]
+    assert agent.status_events[-1][0] == "compaction_aborted"
+    assert (
+        "Codex app-server compaction failed: provider overloaded"
+        in agent.status_events[-1][1]
+    )
+    assert "conversation continues unchanged" in agent.status_events[-1][1]
+    assert not any(event == "compacted" for event, _ in agent.status_events)
 
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():
