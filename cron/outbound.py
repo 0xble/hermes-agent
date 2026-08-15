@@ -112,6 +112,25 @@ def current_cron_job_id() -> str:
     return str(get_session_env("HERMES_CRON_JOB_ID", "") or "").strip()
 
 
+def current_cron_fire_owner() -> str:
+    from gateway.session_context import get_session_env
+
+    return str(get_session_env("HERMES_CRON_FIRE_OWNER", "") or "").strip()
+
+
+def live_fire_claim_matches(job_id: str, run_id: str, owner: str) -> bool:
+    if not job_id or not run_id or not owner:
+        return False
+    from cron.jobs import get_job
+    job = get_job(job_id)
+    claim = job.get("fire_claim") if isinstance(job, dict) else None
+    return (
+        isinstance(claim, dict)
+        and str(claim.get("run_id") or "") == run_id
+        and str(claim.get("by") or "") == owner
+    )
+
+
 def is_cron_messaging_session() -> bool:
     from gateway.session_context import get_session_env
 

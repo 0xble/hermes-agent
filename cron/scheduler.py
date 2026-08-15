@@ -5968,6 +5968,9 @@ def run_job(
             else ""
         )
         _VAR_MAP["HERMES_CRON_RUN_ID"].set(durable_run_id or str(uuid.uuid4()))
+        _VAR_MAP["HERMES_CRON_FIRE_OWNER"].set(
+            str(claim.get("by") or "").strip() if isinstance(claim, dict) else ""
+        )
         _VAR_MAP["HERMES_CRON_ALLOW_MESSAGING"].set(
             "1" if job_allows_messaging(job) and delivery_target else ""
         )
