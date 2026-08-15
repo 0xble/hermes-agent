@@ -20,6 +20,23 @@ from hermes_state import SessionDB
 class TestGenerateTitle:
     """Unit tests for generate_title()."""
 
+    @pytest.mark.parametrize("content", ["```", "!!!", "---"])
+    def test_rejects_formatting_only_model_output(self, content):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = content
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title("Verify the financial tables") is None
+
+    def test_accepts_non_latin_letters(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "財務テーブル"}'
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title("財務テーブルを確認") == "財務テーブル"
+
 
 
 

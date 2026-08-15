@@ -549,7 +549,11 @@ def _clean_title(
         title = title[6:].strip()
     # Trailing sentence punctuation reads wrong in a sidebar list.
     title = title.rstrip(".!,;:")
-    if not title:
+    # The structured-output fallback deliberately accepts first-line prose for
+    # providers that ignore response_format.  Do not let that permissiveness
+    # promote a bare Markdown fence (or any other formatting-only fragment)
+    # over the usable deterministic title derived from the opening message.
+    if not title or not any(char.isalnum() for char in title):
         return None
     if max_words is not None:
         words = title.split()
