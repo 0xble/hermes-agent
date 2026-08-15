@@ -3795,6 +3795,11 @@ class ShellFileOperations(FileOperations):
             return SearchResult(
                 error="File search requires at least one search root in 'path'."
             )
+        has_hidden_path_ancestor = any(
+            part not in {".", ".."} and part.startswith(".")
+            for root in roots
+            for part in Path(root).parts
+        )
 
         # Prefer ripgrep: bounded parallel traversal with ignore semantics.
         # Resolve the engine and exact-order capability before admission so a
@@ -3815,6 +3820,7 @@ class ShellFileOperations(FileOperations):
                 return self._search_files_rg(
                     search_pattern, path, limit, offset, order,
                     rg_executable=rg_executable,
+                    explicit_hidden_root=has_hidden_path_ancestor,
                 )
             finally:
                 _release_filename_search_roots(keys)
@@ -3923,9 +3929,17 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    def _search_files_rg(self, pattern: str, path: str | List[str], limit: int, offset: int,
-                         order: str = "discovery",
-                         rg_executable: Optional[str] = None) -> SearchResult:
+    def _search_files_rg(
+        self,
+        pattern: str,
+        path: str | List[str],
+        limit: int,
+        offset: int,
+        order: str = "discovery",
+        *,
+        rg_executable: Optional[str] = None,
+        explicit_hidden_root: bool = False,
+    ) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
@@ -3972,6 +3986,11 @@ class ShellFileOperations(FileOperations):
             ]
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
+        # Explicit hidden roots are permitted, but hidden descendants remain
+        # excluded to preserve broad hidden-data isolation.
+        hidden_flags = (
+            " --hidden -g '!.*' -g '!**/.*'" if explicit_hidden_root else ""
+        )
         rg_executable = rg_executable or self._resolve_command("rg")
         if not rg_executable:
             return SearchResult(error="File search requires ripgrep (rg).")
@@ -3987,7 +4006,7 @@ class ShellFileOperations(FileOperations):
         )
         cmd = (
             f"set -o pipefail; {cd_prefix}{rg} --files{sort_arg} -g {self._escape_shell_arg(glob_pattern)}"
-            f"{exclusion_args} -- {root_args} 2>/dev/null | head -n {fetch_limit}"
+            f"{hidden_flags}{exclusion_args} -- {root_args} 2>/dev/null | head -n {fetch_limit}"
         )
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)

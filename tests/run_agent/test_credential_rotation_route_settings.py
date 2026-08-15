@@ -109,3 +109,36 @@ def test_credential_rotation_does_not_carry_global_headers_across_routes():
     headers = agent._client_kwargs["default_headers"]
     assert "Authorization" not in headers
     assert headers["X-Route"] == "b"
+
+
+def test_credential_rotation_cleans_request_cache_for_all_wire_providers():
+    """Rotation must retire the cached request client before rebuilding."""
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        provider="custom",
+        model="shared-model",
+        api_key="old",
+        base_url="https://a.example/v1",
+        _client_kwargs={"api_key": "old", "base_url": "https://a.example/v1"},
+        _close_cached_request_openai_client=MagicMock(),
+        _apply_client_headers_for_base_url=MagicMock(),
+        _replace_primary_openai_client=MagicMock(),
+    )
+    agent._reapply_route_client_config = MethodType(
+        AIAgent._reapply_route_client_config,
+        agent,
+    )
+    entry = SimpleNamespace(
+        id="new-entry",
+        runtime_api_key="new",
+        access_token="",
+        runtime_base_url="https://a.example/v1",
+        base_url="https://a.example/v1",
+    )
+
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        AIAgent._swap_credential(agent, entry)
+
+    agent._close_cached_request_openai_client.assert_called_once_with(
+        reason="credential_rotation"
+    )

@@ -47,15 +47,18 @@ describe('useMessageStream compaction lifecycle', () => {
     expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true })
   })
 
-  it('clears the compaction phase on the structured completion edge', () => {
-    mountStream()
-    setSessionCompacting(OTHER_SID, true)
+  it.each(['compacted', 'compaction_aborted', 'compaction_deferred'] as const)(
+    'clears the compaction phase on the structured %s terminal edge',
+    kind => {
+      mountStream()
+      setSessionCompacting(OTHER_SID, true)
 
-    emit('status.update', { kind: 'compacting' })
-    emit('status.update', { kind: 'compacted' })
+      emit('status.update', { kind: 'compacting' })
+      emit('status.update', { kind })
 
-    expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true })
-  })
+      expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true })
+    }
+  )
 
   // #97948: a manual /compress whose RPC answered `pending` (the compute host
   // outlived the gateway's wait) has no turn-end hydrate — the `compacted`
