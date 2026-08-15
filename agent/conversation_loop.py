@@ -2072,6 +2072,10 @@ def run_conversation(
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
+    # Rotation telemetry belongs to one request sequence. A cancelled or
+    # crashed prior turn must never make this turn's ordinary success look like
+    # a successful alternate-account retry.
+    agent._last_credential_rotation = None
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
@@ -4686,6 +4690,10 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                # The request outcome is interruption, not a successful
+                # credential rotation. Clear before redirect handling because
+                # redirects may continue within this same user turn.
+                agent._last_credential_rotation = None
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
