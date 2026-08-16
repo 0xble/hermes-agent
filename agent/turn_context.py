@@ -133,21 +133,11 @@ def compose_user_api_content(
     ext_prefetch_cache: str,
     plugin_user_context: str,
 ) -> Optional[str]:
-    """Compose the API-bound content of the current turn's user message.
+    """Compose request-scoped content for the current provider call.
 
-    Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
-    target="user_message" (the default). Both are appended to the *API copy*
-    of the user message only — the stored content stays clean.
-
-    This is the single source of that composition. The prologue stamps the
-    result onto the live message as ``api_content`` (persisted alongside the
-    clean content) and the ``api_messages`` build in ``conversation_loop``
-    sends the same helper's output, so the persisted sidecar can never drift
-    from the bytes on the wire — which is the whole prompt-cache invariant:
-    what turn N sends must be what turn N+1 replays.
-
-    Returns ``None`` when nothing is injected (multimodal/non-string content,
-    or no ephemeral context), meaning the message is sent as-is.
+    Memory-manager prefetch and plugin hook context are internal request
+    context. They are appended to the API copy only, while the transcript
+    message remains clean and no ``api_content`` replay sidecar is stamped.
     """
     if not isinstance(content, str):
         return None
@@ -1526,61 +1516,10 @@ def build_turn_context(
             except Exception:
                 pass
 
-    # ── api_content sidecar: persist what you send ──
-    # The prefetch/plugin context above is injected into the API copy of this
-    # turn's user message, never into the stored content — so on the next
-    # turn the message would replay WITHOUT the injection, diverging the
-    # request prefix at this point and re-prefilling everything after it
-    # (the whole previous turn's assistant/tool chain). Stamp the exact
-    # API-bound bytes on the live dict, only when they differ from the clean
-    # content, so the crash persist below writes both in the same row and
-    # replay can reproduce the sent prefix byte-for-byte. Guarded by the
-    # same predicate the api_messages build uses, so the stamped bytes are
-    # exactly the bytes the loop sends. codex_app_server turns bypass the
-    # api_messages build entirely (the codex thread gets the plain user
-    # message), so stamping there would persist bytes that were never sent.
-    # MoA turns append per-call aggregated reference context to the same API
-    # copy AFTER this composition, so the stamped bytes would never match the
-    # wire either — skip the stamp rather than persist provably wrong "exact
-    # sent bytes" (MoA keeps its pre-sidecar cache behavior).
-    if (
-        not moa_active
-        and getattr(agent, "api_mode", None) != "codex_app_server"
-        and 0 <= current_turn_user_idx < len(messages)
-        and messages[current_turn_user_idx].get("role") == "user"
-    ):
-        _turn_user_msg = messages[current_turn_user_idx]
-        _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
-        )
-        if _api_content is not None and _api_content != _turn_user_msg.get("content"):
-            _turn_user_msg["api_content"] = _api_content
-            # In-place preflight compaction has ALREADY inserted this turn's
-            # user row (archive_and_compact runs before prefetch/pre_llm_call
-            # can compose the sidecar), and the crash persist below identity-
-            # skips every compacted dict (they are all in the rebound
-            # conversation_history) — so the stamp would never reach the DB.
-            # Backfill it onto the freshly-inserted row directly. Rotation
-            # mode needs nothing here: its compacted copies flush to the
-            # child session after this stamp.
-            if _preflight_compressed and bool(
-                getattr(agent, "_last_compaction_in_place", False)
-            ):
-                _db = getattr(agent, "_session_db", None)
-                if _db is not None:
-                    try:
-                        _db.set_latest_user_api_content(
-                            agent.session_id,
-                            _turn_user_msg.get("content"),
-                            _api_content,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "in-place compaction api_content backfill failed "
-                            "for session=%s",
-                            agent.session_id or "none",
-                            exc_info=True,
-                        )
+    # Ephemeral provider/plugin context remains request-scoped. It is composed
+    # by conversation_loop for this turn but is never stamped into the
+    # durable api_content replay sidecar. Persisting it would recast retrieved
+    # context as ordinary user-authored history and multiply it on replay.
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)

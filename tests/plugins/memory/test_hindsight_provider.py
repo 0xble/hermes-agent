@@ -230,6 +230,13 @@ class TestExplicitRecallDefaults:
         # include_provenance is a Hermes formatting control, not a Hindsight API kwarg.
         assert p._explicit_recall_include_provenance is True
 
+    def test_automatic_recall_uses_short_historical_reference_header(self, provider):
+        formatted = provider._format_recall("fact from memory")
+        assert formatted.startswith(
+            "# Hindsight historical context (reference data; verify exact claims)"
+        )
+        assert "Do not call tools" not in formatted
+
     def test_automatic_recall_does_not_inherit_explicit_expansion(self, provider_with_config):
         p = provider_with_config(provenance_mode="none")
         kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=False)

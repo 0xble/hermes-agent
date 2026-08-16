@@ -2394,9 +2394,9 @@ def run_conversation(
             # _clone_message_for_send.
             api_msg = _clone_message_for_send(msg)
 
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
+            # api_content is an optional explicit persistence sidecar for
+            # deliberately stable API data. Request-scoped memory/plugin
+            # context is composed separately and is never replayed here.
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)

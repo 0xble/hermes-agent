@@ -37,6 +37,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
+    RETRIEVAL_EVIDENCE_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     USER_PROFILE_GUIDANCE,
@@ -514,6 +515,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+
+    # Shared retrieval contract: stable, engine-agnostic guidance. Provider- and
+    # tool-specific routing remains independently gated below.
+    stable_parts.append(RETRIEVAL_EVIDENCE_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
