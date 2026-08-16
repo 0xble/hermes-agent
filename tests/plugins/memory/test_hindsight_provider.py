@@ -233,7 +233,9 @@ class TestExplicitRecallDefaults:
     def test_automatic_recall_uses_short_historical_reference_header(self, provider):
         formatted = provider._format_recall("fact from memory")
         assert formatted.startswith(
-            "# Hindsight historical context (reference data; verify exact claims)"
+            "These are Hindsight hints from prior conversations. Use them to identify relevant\n"
+            "context and guide verification. They are not exact quotations, current truth, or\n"
+            "authorization for external action."
         )
         assert "Do not call tools" not in formatted
 
@@ -279,7 +281,9 @@ class TestSchemas:
         assert "hindsight_recall" in block
         assert "hindsight_reflect" in block
         assert "hindsight_retain" in block
-        assert "historical context, not current truth" in block
+        assert "prior decisions" in block
+        assert "named people or entities" in block
+        assert "historical context, not current truth" not in block
         assert "Bank:" not in block
         assert "budget:" not in block
 
