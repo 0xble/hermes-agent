@@ -4239,9 +4239,19 @@ def compress_context(
         ):
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
+            _lcm_status = str(
+                getattr(
+                    agent.context_compressor,
+                    "last_compression_status",
+                    getattr(agent.context_compressor, "_last_compression_status", ""),
+                )
+                or ""
+            )
+            _safe_deferral = _lcm_status == "deferred"
             logger.info(
-                "Compression made no progress (session=%s) — skipping boundary rewrite.",
+                "Compression made no progress (session=%s, status=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
+                _lcm_status or "unknown",
             )
             # Dead-loop breaker (#84371): a fired compaction that returns the
             # transcript UNCHANGED will fail identically next turn unless the
@@ -4269,10 +4279,12 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
-                commit_status="aborted",
-                split_status="aborted",
-                failure_class="no_progress",
+                commit_status="deferred" if _safe_deferral else "aborted",
+                split_status="deferred" if _safe_deferral else "aborted",
+                failure_class="no_progress" if not _safe_deferral else None,
             )
+            if _safe_deferral:
+                _set_compaction_outcome("deferred")
             _release_lock()
             return messages, _existing_sp
 
