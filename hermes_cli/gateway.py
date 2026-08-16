@@ -8811,18 +8811,14 @@ def _gateway_command_inner(args):
 
     elif subcmd == "restart":
         # Defense: refuse self-targeting gateway restart from inside the gateway.
-        # Prevents agent-initiated kill loops when combined with supervisor KeepAlive.
-        # The supervised probe also PASSES a plain foreground `hermes gateway run`
-        # (env set, PID owned, but no supervisor): that is intentional and
-        # harmless — with no supervisor there is no KeepAlive, so a self-restart
-        # is a single relaunch rather than a respawn loop.
-        from tools.process_registry import _is_supervised_gateway_process
-
-        if _is_supervised_gateway_process():
+        # Treat any inherited marker as tainted. Do not interpret or override it
+        # from a child shell: ``_HERMES_GATEWAY=0`` is still inherited gateway
+        # context, not proof of an external operator shell.
+        if "_HERMES_GATEWAY" in os.environ:
             print_error(
-                "Refusing to restart the gateway from inside the gateway process.\n"
-                "This command was blocked to prevent restart loops.\n"
-                "Use `hermes gateway restart` from a shell outside the running gateway."
+                "Refusing to restart the gateway from gateway-derived context.\n"
+                "This command was blocked to prevent agent-initiated restart loops.\n"
+                "Run `hermes gateway restart` from a clean external login shell."
             )
             sys.exit(1)
 
