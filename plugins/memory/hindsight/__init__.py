@@ -422,8 +422,8 @@ RECALL_SCHEMA = {
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional exact recall tags."},
             "tags_match": {"type": "string", "enum": ["any", "all", "any_strict", "all_strict", "exact"]},
             "tag_groups": {"type": "array", "items": {"type": "object"}, "description": "Optional provider tag-group filters."},
-            "include_provenance": {"type": "boolean", "description": "Include IDs, types, document lineage, timestamps, and source IDs."},
-            "include_entities": {"type": "boolean", "description": "Include bounded entity context."},
+            "include_provenance": {"type": "boolean", "default": True, "description": "Include IDs, types, document lineage, timestamps, and source IDs for explicit recall."},
+            "include_entities": {"type": "boolean", "default": True, "description": "Include bounded entity context for explicit recall."},
             "max_entity_tokens": {"type": "integer", "minimum": 1, "maximum": 2000},
             "include_chunks": {"type": "boolean", "description": "Include bounded original chunks."},
             "max_chunk_tokens": {"type": "integer", "minimum": 1, "maximum": 8192},
@@ -1004,6 +1004,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._prefer_observations = False
         self._provenance_mode = "none"
+        self._explicit_recall_include_provenance = True
+        self._explicit_recall_include_entities = True
         self._allow_memory_mutations = False
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
@@ -1345,6 +1347,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to auto-recall and the hindsight_recall tool. Defaults to observation-only; set observation,world,experience for observation-preferred mixed recall.", "default": "observation"},
             {"key": "prefer_observations", "description": "When mixed recall is enabled, suppress raw facts already covered by returned observations (requires Hindsight 0.9.1)", "default": False},
             {"key": "provenance_mode", "description": "Automatic recall provenance mode; keep none for compact context", "default": "none", "choices": ["none", "compact"]},
+            {"key": "explicit_recall_include_provenance", "description": "Default provenance metadata for explicit hindsight_recall only; does not affect automatic recall", "default": True},
+            {"key": "explicit_recall_include_entities", "description": "Default entity context for explicit hindsight_recall only; does not affect automatic recall", "default": True},
             {"key": "allow_memory_mutations", "description": "Expose explicit, audited invalidation and restoration tools; does not enable automatic mutation", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
@@ -2000,6 +2004,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._provenance_mode = self._config.get("provenance_mode", "none")
         if self._provenance_mode not in {"none", "compact"}:
             self._provenance_mode = "none"
+        self._explicit_recall_include_provenance = _coerce_bool(
+            self._config.get("explicit_recall_include_provenance", True), default=True
+        )
+        self._explicit_recall_include_entities = _coerce_bool(
+            self._config.get("explicit_recall_include_entities", True), default=True
+        )
         self._allow_memory_mutations = _coerce_bool(self._config.get("allow_memory_mutations", False), default=False)
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
@@ -2594,7 +2604,7 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception:
             logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
-    def _recall_kwargs(self, client, query: str, args: Optional[dict] = None) -> tuple[dict, dict]:
+    def _recall_kwargs(self, client, query: str, args: Optional[dict] = None, *, explicit: bool = False) -> tuple[dict, dict]:
         """Build required and optional recall kwargs from config/tool arguments."""
         args = args or {}
         raw_types = args.get("types", self._recall_types)
@@ -2611,6 +2621,16 @@ class HindsightMemoryProvider(MemoryProvider):
             "max_tokens": self._recall_max_tokens,
         }
         optional: dict = {}
+        optional_defaults = {
+            "include_entities": self._explicit_recall_include_entities if explicit else False,
+            "max_entity_tokens": _bounded_int(args.get("max_entity_tokens"), default=500, minimum=1, maximum=2000),
+            "include_chunks": False,
+            "max_chunk_tokens": _bounded_int(args.get("max_chunk_tokens"), default=8192, minimum=1, maximum=8192),
+            "include_source_facts": False,
+            "max_source_facts_tokens": _bounded_int(args.get("max_source_facts_tokens"), default=4096, minimum=1, maximum=8192),
+        }
+        if explicit:
+            optional_defaults["include_provenance"] = self._explicit_recall_include_provenance
         if self._recall_tags or args.get("tags"):
             optional["tags"] = args.get("tags") or self._recall_tags
             optional["tags_match"] = args.get("tags_match") or self._recall_tags_match
@@ -2618,26 +2638,19 @@ class HindsightMemoryProvider(MemoryProvider):
             optional["tag_groups"] = args["tag_groups"]
         if self._prefer_observations and "observation" in types and any(t in types for t in ("world", "experience")):
             optional["prefer_observations"] = True
-        for key, default in {
-            "include_entities": False,
-            "max_entity_tokens": _bounded_int(args.get("max_entity_tokens"), default=500, minimum=1, maximum=2000),
-            "include_chunks": False,
-            "max_chunk_tokens": _bounded_int(args.get("max_chunk_tokens"), default=8192, minimum=1, maximum=8192),
-            "include_source_facts": False,
-            "max_source_facts_tokens": _bounded_int(args.get("max_source_facts_tokens"), default=4096, minimum=1, maximum=8192),
-        }.items():
+        for key, default in optional_defaults.items():
             if args.get(key, default):
                 optional[key] = args.get(key, default)
         supported = {key: value for key, value in optional.items() if _supports_kwarg(client, "arecall", key)}
         omitted = set(optional) - set(supported)
         if omitted:
             logger.warning("Hindsight recall optional fields unavailable in installed client: %s", sorted(omitted))
-        return {**required, **supported}, {key: value for key, value in supported.items() if key in {"prefer_observations", "include_entities", "include_chunks", "include_source_facts"}}
+        return {**required, **supported}, {key: value for key, value in supported.items() if key in {"prefer_observations", "include_provenance", "include_entities", "include_chunks", "include_source_facts"}}
 
-    def _compatible_recall(self, query: str, args: Optional[dict] = None):
+    def _compatible_recall(self, query: str, args: Optional[dict] = None, *, explicit: bool = False):
         """Recall with optional-feature retry that fails closed to baseline recall."""
         async def _call(client):
-            kwargs, optional = self._recall_kwargs(client, query, args)
+            kwargs, optional = self._recall_kwargs(client, query, args, explicit=explicit)
             try:
                 return await client.arecall(**kwargs)
             except Exception as exc:
@@ -2755,8 +2768,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 return tool_error("Missing required parameter: query")
             try:
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s", self._bank_id, len(query), self._budget)
-                resp = self._compatible_recall(query, args)
-                result, num_results = self._format_recall_response(resp, args)
+                explicit_args = dict(args)
+                explicit_args.setdefault("include_provenance", self._explicit_recall_include_provenance)
+                explicit_args.setdefault("include_entities", self._explicit_recall_include_entities)
+                resp = self._compatible_recall(query, explicit_args, explicit=True)
+                result, num_results = self._format_recall_response(resp, explicit_args)
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 return json.dumps({"result": result or "No relevant memories found."})
             except Exception as e:

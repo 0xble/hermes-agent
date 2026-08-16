@@ -222,9 +222,30 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
     ]
 
 
-# ---------------------------------------------------------------------------
-# Schema tests
-# ---------------------------------------------------------------------------
+class TestExplicitRecallDefaults:
+    def test_explicit_recall_defaults_provenance_and_entities(self, provider_with_config):
+        p = provider_with_config()
+        kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=True)
+        assert kwargs["include_entities"] is True
+        # include_provenance is a Hermes formatting control, not a Hindsight API kwarg.
+        assert p._explicit_recall_include_provenance is True
+
+    def test_automatic_recall_does_not_inherit_explicit_expansion(self, provider_with_config):
+        p = provider_with_config(provenance_mode="none")
+        kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=False)
+        assert "include_entities" not in kwargs
+        assert "include_source_facts" not in kwargs
+        assert "include_chunks" not in kwargs
+
+    def test_explicit_defaults_are_configurable_and_overridable(self, provider_with_config):
+        p = provider_with_config(
+            explicit_recall_include_provenance=False,
+            explicit_recall_include_entities=False,
+        )
+        kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=True)
+        assert "include_entities" not in kwargs
+        args = {"include_provenance": False, "include_entities": False}
+        assert p._format_recall_response(SimpleNamespace(results=[]), args) == ("", 0)
 
 
 class TestSchemas:
