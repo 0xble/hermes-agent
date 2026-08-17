@@ -4253,14 +4253,6 @@ def compress_context(
                 agent.session_id or "none",
                 _lcm_status or "unknown",
             )
-            logger.debug(
-                "[compression-diagnostic] unchanged result: session=%s compressor=%s "
-                "engine=%s status=%s",
-                agent.session_id or "none",
-                type(agent.context_compressor).__name__,
-                getattr(agent.context_compressor, "name", "unknown"),
-                _lcm_status or "unknown",
-            )
             # Dead-loop breaker (#84371): a fired compaction that returns the
             # transcript UNCHANGED will fail identically next turn unless the
             # transcript changes — yet this path recorded telemetry only, so
@@ -4691,8 +4683,8 @@ def compress_context(
                     _emit_compression_attempt_telemetry(
                         agent,
                         started_at=_attempt_started_at,
-                        commit_status="aborted",
-                        split_status="aborted",
+                        commit_status="deferred",
+                        split_status="deferred",
                         failure_class="would_grow",
                     )
                     # Record the rejected attempt as an ineffective
@@ -4727,6 +4719,7 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
+                    _set_compaction_outcome("deferred")
                     _release_lock()
                     return messages, _existing_sp
 
