@@ -144,6 +144,33 @@ class TestResetSemanticsPreserved:
 
 
 class TestStrikesPersistFromEveryVerdictSite:
+    def test_would_grow_rejection_trips_and_persists_guard(self, tmp_path):
+        """A rejected growing candidate must stop automatic retry loops."""
+        db = _db(tmp_path)
+        db.create_session("s1", source="cli")
+
+        cc = _compressor(db, "s1")
+        cc.record_rejected_compaction(reason="would_grow", automatic=True)
+
+        assert cc._ineffective_compression_count == 2
+        assert cc._last_compression_savings_pct == 0.0
+        assert cc._verify_compaction_cleared_threshold is False
+        assert db.get_compression_ineffective_count("s1") == 2
+        assert cc.should_compress(10**9) is False
+
+        # The durable strike survives a fresh compressor, like a gateway restart.
+        fresh = _compressor(db, "s1")
+        assert fresh._ineffective_compression_count == 2
+        assert fresh.should_compress(10**9) is False
+
+    def test_manual_would_grow_rejection_does_not_trip_automatic_guard(self):
+        """Explicit /compress remains available after automatic deferral."""
+        cc = _compressor()
+        cc.record_rejected_compaction(reason="would_grow", automatic=False)
+
+        assert cc._ineffective_compression_count == 0
+        assert cc._last_compression_savings_pct == 0.0
+
     def test_no_op_compaction_branch_does_not_strike(self, tmp_path):
         """The insufficient-messages branch is a structural no-op (#93022).
 

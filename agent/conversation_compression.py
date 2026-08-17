@@ -4649,6 +4649,10 @@ def compress_context(
                             compressed = _salvaged
                             _rough_out = _salv_est
                 if _rough_out > _rough_in:
+                    agent.context_compressor.record_rejected_compaction(
+                        reason="would_grow",
+                        automatic=not force,
+                    )
                     logger.warning(
                         "Compression refused: compressed transcript would be "
                         "larger than the original (session=%s, ~%s -> ~%s "
@@ -4687,20 +4691,6 @@ def compress_context(
                         split_status="deferred",
                         failure_class="would_grow",
                     )
-                    # Record the rejected attempt as an ineffective
-                    # compaction strike so the anti-thrash breaker latches
-                    # after the normal threshold. Without this, the unchanged
-                    # transcript stays over the compression threshold and
-                    # automatic compression retries the identical summary
-                    # request on every turn (#88568). Manual /compress keeps
-                    # bypassing the latch (force=True skips the guards).
-                    try:
-                        agent.context_compressor.record_rejected_compaction()
-                    except Exception:
-                        logger.debug(
-                            "could not record rejected-compaction strike",
-                            exc_info=True,
-                        )
                     # Restore ONLY the prune runway (same rationale as the
                     # rotation-failure rollback below): compress()'s successful
                     # tail already zeroed _proactive_prune_rearm_tokens in

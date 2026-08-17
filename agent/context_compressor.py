@@ -2912,6 +2912,42 @@ class ContextCompressor(ContextEngine):
             self._fallback_compression_streak = 0
         self._persist_fallback_compression_streak()
 
+    def record_rejected_compaction(
+        self, *, reason: str, automatic: bool,
+    ) -> None:
+        """Record a rejected, non-committed compression attempt.
+
+        A candidate rejected at the commit boundary is not a completed
+        compaction, so it must not arm the post-compaction real-usage verdict.
+        Automatic ``would_grow`` rejection is a strong ineffective verdict:
+        retrying the unchanged transcript immediately would only repeat the
+        same expensive summary attempt. Trip the existing durable breaker so
+        its bounded recovery probe controls the next automatic attempt.
+
+        Manual ``/compress`` remains available and must not poison the
+        automatic breaker merely because the user explicitly requested a
+        retry.
+        """
+        self._last_compression_savings_pct = 0.0
+        self._last_compression_made_progress = False
+        self._verify_compaction_cleared_threshold = False
+        if automatic and reason == "would_grow":
+            # A growth verdict is stronger than the ordinary post-provider
+            # effectiveness verdict: the candidate was already measured as
+            # larger than the exact transcript it would replace. Reuse the
+            # existing two-strike breaker and its durable recovery semantics,
+            # but trip it immediately so the unchanged transcript is not
+            # regenerated on the next turn.
+            self._record_ineffective_compression_verdict(
+                max(2, self._ineffective_compression_count),
+            )
+        if not self.quiet_mode:
+            logger.info(
+                "Rejected non-committed compaction: reason=%s automatic=%s",
+                reason,
+                automatic,
+            )
+
     def get_active_compression_failure_cooldown(
         self,
         *,
