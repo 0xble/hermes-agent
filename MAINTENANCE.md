@@ -54,10 +54,34 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-028 | Active | `fix: harden gateway runtime boundaries`; `fix(terminal): avoid remote Python lifecycle dependency`; `fix(terminal): skip known remote shell binaries`; `fix(terminal): trust only system shell paths` | Inspect referenced remote scripts through the POSIX shell contract without requiring Python. |
 | HERMES-029 | Active | `fix(media): honor provider retry delays for downloads` | Make idempotent image/audio URL-cache GETs honor bounded provider retry timing. |
 | HERMES-030 | Active | `fix(launchd): preserve supervisor marker through gateway wrapper` | Stop the supervised macOS gateway from refusing its own launchd startup into a permanent respawn loop. |
+| HERMES-031 | Active | `fix(output): preserve answers before verification receipts` | Keep a substantive answer when a verify-on-stop continuation returns only a verification receipt. |
+| HERMES-032 | Active | `fix(doctor): make state db advisory retention aware` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-032 — Make large-state diagnostics retention-aware
+
+- **Independent hypothesis (2026-08-16):** Doctor derives its large-`state.db` issue by searching rendered advisory text for `auto_prune`, without loading the effective session-retention configuration. That makes database size itself actionable even when positive retention is already configured. The correction belongs in Doctor's diagnostic boundary: resolve effective configuration through `hermes_cli.config.load_config()`, carry explicit issue metadata separately from rendered detail, and keep FTS storage warnings independent.
+- **Summary:** Treats an oversized `state.db` as informational when `sessions.auto_prune` is enabled with a valid positive integer `retention_days`, including a numeric string. Disabled, invalid, or unavailable retention remains actionable. Pending or legacy FTS storage continues to recommend offline `hermes sessions optimize-storage`. Messaging states that pruning removes ended inactive sessions, does not cap active-session growth, and does not itself shrink the SQLite file.
+- **Surfaces:** `hermes_cli/doctor.py`; `tests/test_state_db_stats.py`.
+- **Upstream tracking:** Issue #83933 remains open and directly reports the false `auto_prune` recommendation. Open PR #83954 is a narrower associated fix. Closed-unmerged PR #84091 proposed a related retention-aware severity model. Open PR #86271 is broader health-diagnostic work and is not an equivalent replacement. No released upstream implementation touched the affected files as of 2026-08-17 at upstream `93ed11379b`.
+- **Upstream PR:** Associated: #83954 (open, unmerged, no review decision; checked 2026-08-17). Related: #84091 (closed unmerged) and #86271 (open; checked 2026-08-17).
+- **Regression:** `uv run pytest tests/test_state_db_stats.py tests/hermes_cli/test_doctor.py tests/hermes_cli/test_doctor_journal_modes.py -q`; `uv run ruff check hermes_cli/doctor.py tests/test_state_db_stats.py`; `git diff --check`; and a real `uv run hermes doctor` against an oversized retained database.
+- **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Doctor changes. Remove `_session_retention_policy`, the explicit advisory issue field, retention-aware severity, and only HERMES-032's focused tests. Restore the prior tuple contract and issue construction without changing state-size, WAL, FTS, pruning, VACUUM, or runtime-maintenance behavior.
+- **Retirement:** Retire after released upstream loads effective retention configuration, treats a large database with valid positive retention as informational, keeps invalid or unavailable retention and pending or legacy FTS actionable, avoids rendered-text issue inference, and passes the focused regressions plus a real Doctor canary.
+
+### HERMES-031 — Preserve substantive answers before verification receipts
+
+- **Independent hypothesis (2026-08-16):** The verify-on-stop continuation correctly preserves the attempted answer when its budget is exhausted, but a later model response consisting only of a verification receipt can still become `final_response` and replace the substantive answer. The correction belongs at the finalization boundary: recognize only receipt-prefixed continuation output, compose it after the pending answer, and leave complete later answers authoritative.
+- **Summary:** Prevents a verify-on-stop or `pre_verify` continuation from replacing a substantive answer with a receipt-only response such as `Fresh verification from this turn passes`. The answer remains first and the receipt is appended under `## Verification`.
+- **Surfaces:** `agent/turn_finalizer.py`; `tests/run_agent/test_verification_continuation_budget.py`.
+- **Upstream tracking:** Issue #53828 remains open and directly describes this contract. Related merged messaging mitigation is PR #52412, but it does not cover an explicit `agent.verify_on_stop: true` override. Related response-loss work includes issue #62142 and closed PR #53553.
+- **Upstream PR:** None after checked 2026-08-16.
+- **Regression:** `pytest -q tests/run_agent/test_verification_continuation_budget.py`.
+- **Rollback:** Remove `_VERIFICATION_RECEIPT_PREFIX`, `_compose_verification_receipt_with_answer`, its finalization call, and the two focused tests. Preserve the existing budget-exhaustion fallback and ordinary later-answer replacement behavior.
+- **Retirement:** Retire after released upstream preserves a pending substantive answer whenever a verification continuation returns only a receipt, proven by the focused regression and a real Telegram or equivalent messaging-surface canary.
 
 ### HERMES-030 — Preserve the launchd supervisor marker across the stderr wrapper
 
