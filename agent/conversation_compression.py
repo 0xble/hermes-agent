@@ -4247,10 +4247,18 @@ def compress_context(
                 )
                 or ""
             )
-            _safe_deferral = _lcm_status == "deferred"
+            _safe_deferral = _lcm_status in {"deferred", "noop"}
             logger.info(
                 "Compression made no progress (session=%s, status=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
+                _lcm_status or "unknown",
+            )
+            logger.debug(
+                "[compression-diagnostic] unchanged result: session=%s compressor=%s "
+                "engine=%s status=%s",
+                agent.session_id or "none",
+                type(agent.context_compressor).__name__,
+                getattr(agent.context_compressor, "name", "unknown"),
                 _lcm_status or "unknown",
             )
             # Dead-loop breaker (#84371): a fired compaction that returns the
