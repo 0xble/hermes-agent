@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX, _DB_PERSISTED_MARKER
+from agent.context_engine import ContextEngine
 from agent.conversation_compression import (
     COMPACTION_DEFERRED_STATUS,
     COMPACTION_DONE_STATUS,
@@ -621,6 +622,68 @@ class TestPreflightCompression:
         ]
         assert terminal_events == ["compaction_deferred"]
         assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+
+    def test_would_grow_remains_deferred_for_alternative_context_engine(self, agent):
+        """The host rejection hook must not require built-in compressor internals."""
+
+        class AlternativeEngine(ContextEngine):
+            def __init__(self, delegate, result):
+                self._delegate = delegate
+                self._result = result
+
+            @property
+            def name(self):
+                return "alternative"
+
+            def update_from_response(self, usage):
+                return None
+
+            def should_compress(self, prompt_tokens=None):
+                return True
+
+            def compress(
+                self,
+                messages,
+                current_tokens=None,
+                focus_topic=None,
+                force=False,
+                memory_context="",
+            ):
+                return self._result
+
+            def __getattr__(self, name):
+                if name == "record_rejected_compaction":
+                    raise AttributeError(name)
+                return getattr(self._delegate, name)
+
+        agent.compression_enabled = True
+        agent._session_db = MagicMock()
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        messages = [{"role": "user", "content": "hello"}]
+        compressed_messages = messages + [{"role": "assistant", "content": "summary"}]
+        agent.context_compressor = AlternativeEngine(
+            agent.context_compressor,
+            compressed_messages,
+        )
+
+        with (
+            patch.object(agent, "commit_memory_session"),
+            patch(
+                "agent.conversation_compression.estimate_messages_tokens_rough",
+                side_effect=[10, 20],
+            ),
+        ):
+            compressed, prompt = agent._compress_context(
+                messages,
+                "system prompt",
+                force=False,
+            )
+
+        assert compressed is messages
+        assert prompt == "You are helpful."
+        assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+        agent._session_db.archive_and_compact.assert_not_called()
 
     def test_compress_context_emits_aborted_terminal_status_on_summary_failure(
         self, agent
