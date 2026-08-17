@@ -583,6 +583,44 @@ class TestPreflightCompression:
         assert terminal_events == ["compaction_deferred"]
         assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
 
+    def test_compress_context_emits_deferred_terminal_status_for_would_grow(
+        self, agent
+    ):
+        """Anti-growth rejection warns specifically without reporting failure."""
+        agent.compression_enabled = False
+        agent._session_db = MagicMock()
+        events = []
+        agent.status_callback = lambda event, message: events.append((event, message))
+        messages = [{"role": "user", "content": "hello"}]
+        compressed_messages = messages + [{"role": "assistant", "content": "summary"}]
+
+        def _compress(*_args, **_kwargs):
+            return compressed_messages
+
+        with (
+            patch.object(agent.context_compressor, "compress", side_effect=_compress),
+            patch.object(agent, "commit_memory_session"),
+            patch(
+                "agent.conversation_compression.estimate_messages_tokens_rough",
+                side_effect=[10, 20],
+            ),
+        ):
+            compressed, prompt = agent._compress_context(
+                messages,
+                "system prompt",
+                force=True,
+            )
+
+        assert compressed is messages
+        assert prompt == "You are helpful."
+        terminal_events = [
+            event
+            for event, _ in events
+            if event in {"compacted", "compaction_aborted", "compaction_deferred"}
+        ]
+        assert terminal_events == ["compaction_deferred"]
+        assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+
     def test_compress_context_emits_aborted_terminal_status_on_summary_failure(
         self, agent
     ):
