@@ -203,6 +203,7 @@ def test_render_warns_on_large_db():
     lines = _render_state_db_stats(
         _base_stats(logical_size_bytes=big, page_count=big // 4096, page_size=4096),
         holders=None,
+        retention_policy={"auto_prune": False, "retention_days": 90},
     )
     warns = [t for k, t, *rest in lines if k == "warn"] + [
         " ".join(rest) for k, t, *rest in lines if k == "warn"
@@ -210,6 +211,81 @@ def test_render_warns_on_large_db():
     blob = " ".join(str(x) for x in warns)
     assert "auto_prune" in blob
     assert "config.yaml" in blob
+    assert lines[-1][3] == "state.db is large — sessions.auto_prune is disabled"
+
+
+def test_render_large_db_with_valid_retention_is_informational():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        retention_policy={"auto_prune": True, "retention_days": 90},
+    )
+    advisory = lines[-1]
+    assert advisory[0] == "info"
+    assert advisory[3] is None
+    assert "retention_days=90" in advisory[2]
+    assert "active-session growth" in advisory[2]
+
+
+@pytest.mark.parametrize("retention_days", [None, 0, -1, True, "invalid"])
+def test_render_large_db_with_invalid_retention_is_actionable(retention_days):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        retention_policy={"auto_prune": True, "retention_days": retention_days},
+    )
+    advisory = lines[-1]
+    assert advisory[0] == "warn"
+    assert advisory[3] is not None
+    assert "retention policy" in advisory[2]
+
+
+def test_render_large_db_with_pending_fts_warns_even_with_retention():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_rebuild_pending=True),
+        retention_policy={"auto_prune": True, "retention_days": 90},
+    )
+    advisory = lines[-1]
+    assert advisory[0] == "warn"
+    assert "optimize-storage" in advisory[2]
+    assert "optimize-storage" in advisory[3]
+
+
+def test_session_retention_policy_parses_string_values(monkeypatch):
+    import hermes_cli.config
+    from hermes_cli.doctor import _session_retention_policy
+
+    monkeypatch.setattr(
+        hermes_cli.config,
+        "load_config",
+        lambda: {"sessions": {"auto_prune": True, "retention_days": "90"}},
+    )
+    assert _session_retention_policy() == {
+        "auto_prune": True,
+        "retention_days": 90,
+        "error": None,
+    }
+
+
+def test_session_retention_policy_reports_config_failure(monkeypatch):
+    import hermes_cli.config
+    from hermes_cli.doctor import _session_retention_policy
+
+    def fail():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(hermes_cli.config, "load_config", fail)
+    policy = _session_retention_policy()
+    assert policy["auto_prune"] is None
+    assert policy["retention_days"] is None
+    assert "config unavailable" in policy["error"]
 
 
 def test_render_large_db_with_pending_rebuild_suggests_optimize():
