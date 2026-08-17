@@ -55,11 +55,22 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-029 | Active | `fix(media): honor provider retry delays for downloads` | Make idempotent image/audio URL-cache GETs honor bounded provider retry timing. |
 | HERMES-030 | Active | `fix(launchd): preserve supervisor marker through gateway wrapper` | Stop the supervised macOS gateway from refusing its own launchd startup into a permanent respawn loop. |
 | HERMES-031 | Active | `fix(output): preserve answers before verification receipts` | Keep a substantive answer when a verify-on-stop continuation returns only a verification receipt. |
+| HERMES-033 | Active | `fix(compression): defer automatic retries after growth rejection` | Persistently defer automatic compression after a `would_grow` rejection while preserving manual retries. |
 | HERMES-032 | Active | `fix(doctor): make state db advisory retention aware` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-033 — Defer automatic retries after growth rejection
+
+- **Summary:** When core in-place compression generates a candidate whose rough token estimate is larger than the original transcript, the commit-site anti-growth guard preserves the original transcript and returns a deferred outcome. This patch records that `would_grow` result as a strong ineffective automatic-compaction verdict, persists the existing anti-thrashing breaker, and blocks the next automatic retry while keeping manual `/compress` available. No committed boundary or post-compaction real-usage verification is recorded.
+- **Surfaces:** `agent/context_compressor.py`; `agent/conversation_compression.py`; `tests/agent/test_compression_anti_thrash_persistence.py`; `tests/run_agent/test_413_compression.py`.
+- **Upstream tracking:** Issue #88568. Related safety fix: #86700. Related gateway cooldown work: #79540 and #79876. Related small-window inflation work: #23811, #21470, and #25413. No equivalent released upstream behavior was identified before publication.
+- **Upstream PR:** None at publication.
+- **Regression:** `pytest -q tests/run_agent/test_413_compression.py::TestPreflightCompression::test_compress_context_emits_deferred_terminal_status_for_would_grow tests/agent/test_compression_anti_thrash_persistence.py::TestStrikesPersistFromEveryVerdictSite tests/agent/test_compression_anti_thrash_recovery.py`.
+- **Rollback:** Remove `record_rejected_compaction`, its `would_grow` call site, and the two focused regression cases. Preserve the existing anti-growth transcript-preservation guard and all other anti-thrashing verdict paths.
+- **Retirement:** Retire after released upstream records an equivalent core `would_grow` rejection as a durable automatic-compaction deferral, preserves manual retries, and passes the focused persistence and restart regressions.
 
 ### HERMES-032 — Make large-state diagnostics retention-aware
 

@@ -586,8 +586,8 @@ class TestPreflightCompression:
     def test_compress_context_emits_deferred_terminal_status_for_would_grow(
         self, agent
     ):
-        """Anti-growth rejection warns specifically without reporting failure."""
-        agent.compression_enabled = False
+        """Automatic anti-growth rejection arms the durable breaker."""
+        agent.compression_enabled = True
         agent._session_db = MagicMock()
         events = []
         agent.status_callback = lambda event, message: events.append((event, message))
@@ -608,11 +608,12 @@ class TestPreflightCompression:
             compressed, prompt = agent._compress_context(
                 messages,
                 "system prompt",
-                force=True,
+                force=False,
             )
 
         assert compressed is messages
         assert prompt == "You are helpful."
+        assert agent.context_compressor._ineffective_compression_count == 2
         terminal_events = [
             event
             for event, _ in events
