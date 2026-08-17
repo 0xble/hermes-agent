@@ -189,6 +189,18 @@ class ContextEngine(ABC):
                 host filters unsupported optional arguments by signature.
         """
 
+    def record_rejected_compaction(
+        self, *, reason: str, automatic: bool,
+    ) -> None:
+        """Observe a candidate rejected by the host before commit.
+
+        The default is a safe no-op for alternative and older context engines.
+        Engines with host-compatible anti-thrashing state may override this hook
+        to persist a rejection verdict, but must not treat it as a committed
+        compaction. ``automatic`` distinguishes threshold-driven maintenance
+        from an explicit user request.
+        """
+
     # -- Optional: proactive tool-result prune -----------------------------
 
     def prune_tool_results_only(
