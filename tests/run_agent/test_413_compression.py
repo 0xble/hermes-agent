@@ -21,6 +21,7 @@ from agent.conversation_compression import (
     COMPACTION_DEFERRED_STATUS,
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
+    COMPACTION_WOULD_GROW_STATUS,
 )
 from run_agent import AIAgent
 import run_agent
@@ -587,7 +588,7 @@ class TestPreflightCompression:
     def test_compress_context_emits_deferred_terminal_status_for_would_grow(
         self, agent
     ):
-        """Automatic anti-growth rejection arms the durable breaker."""
+        """A growth rejection emits one detailed terminal and arms the breaker."""
         agent.compression_enabled = True
         agent._session_db = MagicMock()
         events = []
@@ -615,13 +616,18 @@ class TestPreflightCompression:
         assert compressed is messages
         assert prompt == "You are helpful."
         assert agent.context_compressor._ineffective_compression_count == 2
+        event_names = [event for event, _ in events]
+        assert "warn" not in event_names
         terminal_events = [
             event
-            for event, _ in events
+            for event in event_names
             if event in {"compacted", "compaction_aborted", "compaction_deferred"}
         ]
         assert terminal_events == ["compaction_deferred"]
-        assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+        assert events[-1] == (
+            "compaction_deferred",
+            COMPACTION_WOULD_GROW_STATUS,
+        )
 
     def test_would_grow_remains_deferred_for_alternative_context_engine(self, agent):
         """The host rejection hook must not require built-in compressor internals."""
@@ -682,7 +688,10 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert events[-1] == ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+        assert events[-1] == (
+            "compaction_deferred",
+            COMPACTION_WOULD_GROW_STATUS,
+        )
         agent._session_db.archive_and_compact.assert_not_called()
 
     def test_compress_context_emits_aborted_terminal_status_on_summary_failure(

@@ -115,6 +115,11 @@ COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn...
 
 COMPACTION_ABORTED_STATUS = "⚠ Compression failed; conversation preserved."
 COMPACTION_DEFERRED_STATUS = "ℹ Compression deferred; conversation unchanged."
+COMPACTION_WOULD_GROW_STATUS = (
+    "⚠️ Compression refused: the generated summary would have GROWN "
+    "the conversation instead of shrinking it. No messages were dropped — "
+    "conversation continues unchanged."
+)
 
 _COMPACTION_TERMINAL_STATUS = {
     "committed": ("compacted", COMPACTION_DONE_STATUS),
@@ -4672,15 +4677,6 @@ def compress_context(
                         agent.context_compressor._last_compress_refused_would_grow = True
                     except Exception:
                         pass
-                    try:
-                        agent._emit_warning(
-                            "⚠️ Compression refused: the generated summary "
-                            "would have GROWN the conversation instead of "
-                            "shrinking it. No messages were dropped — "
-                            "conversation continues unchanged."
-                        )
-                    except Exception:
-                        pass
                     _existing_sp = getattr(agent, "_cached_system_prompt", None)
                     if not _existing_sp:
                         _existing_sp = agent._build_system_prompt(system_message)
@@ -4709,7 +4705,10 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
-                    _set_compaction_outcome("deferred")
+                    _set_compaction_outcome(
+                        "deferred",
+                        COMPACTION_WOULD_GROW_STATUS,
+                    )
                     _release_lock()
                     return messages, _existing_sp
 
