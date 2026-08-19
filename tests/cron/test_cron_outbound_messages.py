@@ -155,6 +155,37 @@ class TestOutboundLedger:
         assert reused["record"]["status"] == "verified"
         assert reused["record"]["transport_message_id"] == "131192"
 
+    def test_verified_result_cannot_be_downgraded(self, tmp_outbound):
+        claim_or_reuse(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            target="origin",
+            body="hello",
+            platform="telegram",
+            chat_id="2027045491",
+            thread_id=None,
+        )
+        mark_result(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            status="verified",
+            transport_message_id="131192",
+        )
+
+        preserved = mark_result(
+            job_id="job-1",
+            run_id="run-1",
+            message_key="automatic-action:immutable",
+            status="failed",
+            error="late duplicate callback",
+        )
+
+        assert preserved["status"] == "verified"
+        assert preserved["transport_message_id"] == "131192"
+        assert preserved["error"] is None
+
     def test_confirmed_failure_can_be_retried(self, tmp_outbound):
         params = {
             "job_id": "job-1",

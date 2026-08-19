@@ -252,7 +252,8 @@ def mark_result(
         conn.execute(
             """UPDATE outbound_messages
                SET status=?, transport_message_id=?, error=?, updated_at=?
-               WHERE job_id=? AND run_id=? AND message_key=?""",
+               WHERE job_id=? AND run_id=? AND message_key=?
+                 AND status != 'verified'""",
             (
                 status,
                 transport_message_id,
