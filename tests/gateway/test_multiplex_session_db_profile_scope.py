@@ -426,27 +426,30 @@ def test_runner_session_db_follows_the_active_profile_scope(multiplex_homes):
 
     /resume, /title, /history and session search run inside
     ``_profile_runtime_scope`` on a multiplexed gateway and must read the
-    serving profile's state.db.  Exercise the property on a bare runner shell
-    (full construction wires adapters and is irrelevant to the seam under
-    test).
+    serving profile's state.db. Exercise the property on a runner shell bound
+    to the same profile-aware SessionStore used by the full gateway.
     """
     import threading
 
     from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
 
     root, profile = multiplex_homes
+    store = _make_store(root)
     runner = object.__new__(GatewayRunner)
+    runner.session_store = store
     runner._session_db_pinned = _SESSION_DB_UNPINNED
     runner._session_db_handles = {}
     runner._session_db_handles_lock = threading.Lock()
 
     root_db = runner._session_db
     assert Path(root_db._db.db_path) == root / "state.db"
+    assert root_db._db is store._db
 
     token = set_hermes_home_override(str(profile))
     try:
         profile_db = runner._session_db
         assert Path(profile_db._db.db_path) == profile / "state.db"
+        assert profile_db._db is store._db
         # Cached per path: same wrapper identity on re-access.
         assert runner._session_db is profile_db
     finally:
@@ -465,6 +468,10 @@ def test_runner_session_db_follows_the_active_profile_scope(multiplex_homes):
 
     runner.close_all_session_db_handles()
     assert runner._session_db_handles == {}
+    # Runner wrappers are non-owning; SessionStore closes the shared handles.
+    assert root_db._db._conn is not None
+    assert profile_db._db._conn is not None
+    store.close_all_db_handles()
     assert root_db._db._conn is None
     assert profile_db._db._conn is None
 
