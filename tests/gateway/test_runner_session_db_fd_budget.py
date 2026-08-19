@@ -5,6 +5,8 @@ cover only the remaining private contract: ``GatewayRunner`` must not construct
 a second ``SessionDB`` beside the one ``SessionStore`` already owns.
 """
 
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -43,56 +45,18 @@ def test_runner_reuses_session_store_db(tmp_path):
         store_db.close()
 
 
-def test_runner_replacement_db_is_stored_back_on_the_store(tmp_path, monkeypatch):
-    """When SessionStore has no DB, the runner's replacement becomes the store's."""
+def test_runner_preserves_explicit_degraded_store_without_replacement(monkeypatch):
+    """A deliberate JSONL/degraded state must not reopen SQLite."""
     import hermes_state
     from gateway.run import GatewayRunner
-    from hermes_state import AsyncSessionDB
 
-    monkeypatch.setattr(
-        hermes_state, "_default_db_path", lambda: tmp_path / "state.db"
-    )
+    def forbidden_session_db(*_args, **_kwargs):
+        raise AssertionError("runner must not manufacture a replacement SessionDB")
 
+    monkeypatch.setattr(hermes_state, "SessionDB", forbidden_session_db)
     store = type("S", (), {"_db": None})()
-    shared = GatewayRunner._resolve_shared_session_db(store)
-    session_db = AsyncSessionDB(shared)
 
-    try:
-        assert shared is not None
-        assert store._db is shared, "replacement was not stored back on the store"
-        assert session_db._db is store._db
-    finally:
-        shared.close()
+    with pytest.raises(RuntimeError, match="no SQLite handle"):
+        GatewayRunner._resolve_shared_session_db(store)
 
-
-def test_shutdown_closes_shared_db_once(tmp_path, monkeypatch):
-    """Identity dedup means one close() call even though two handles point at it."""
-    import hermes_state
-    from gateway.run import GatewayRunner
-    from hermes_state import AsyncSessionDB
-
-    monkeypatch.setattr(
-        hermes_state, "_default_db_path", lambda: tmp_path / "state.db"
-    )
-    store = type("S", (), {"_db": None})()
-    shared = GatewayRunner._resolve_shared_session_db(store)
-    async_db = AsyncSessionDB(shared)
-
-    calls = []
-    real_close = shared.close
-    monkeypatch.setattr(
-        shared, "close", lambda: (calls.append(1), real_close())[1]
-    )
-
-    # Mirrors the runner's shutdown loop.
-    self_db = getattr(async_db, "_db", async_db)
-    seen: set = set()
-    for db_obj in (self_db, getattr(store, "_db", None)):
-        if db_obj is None or not hasattr(db_obj, "close"):
-            continue
-        if id(db_obj) in seen:
-            continue
-        seen.add(id(db_obj))
-        db_obj.close()
-
-    assert calls == [1], "shared SessionDB was closed more than once"
+    assert getattr(store, "_db") is None
