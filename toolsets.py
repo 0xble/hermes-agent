@@ -278,12 +278,6 @@ TOOLSETS = {
         "tools": ["send_message"],
         "includes": []
     },
-
-    "messaging": {
-        "description": "Native outbound send_message. Default-off. Cron jobs receive it only with allow_messaging=true.",
-        "tools": ["send_message"],
-        "includes": []
-    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
