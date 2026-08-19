@@ -34,29 +34,50 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-008 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Preserve Hindsight's explicit shared observation scope. |
 | HERMES-009 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Fail Hindsight retains on extraction errors. |
 | HERMES-010 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Avoid destructive Hindsight daemon restarts and empty-key overwrite. |
-| HERMES-011 | Active | `fix(state): serialize public reads, bound readers, one gateway SessionDB` | SessionDB concurrency, reader lifecycle, and gateway ownership. |
-| HERMES-012 | Retired | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest`; `chore(fork): retire GitHub sync workflows` | Historical GitHub Actions synchronization pipeline, replaced by the `maintain-hermes-fork` Hermes cron. |
+| HERMES-011 | Active | `fix(state): serialize public reads, bound readers, one gateway SessionDB`; `test(state): align shared SessionDB ownership regressions` | SessionDB concurrency, reader lifecycle, and gateway ownership. |
+| HERMES-012 | Retired | `chore: automate maintained fork synchronization`; `fix: use fork-safe candidate verification`; `fix: promote only dispatched fork candidates`; `chore(fork): enforce maintained patch manifest`; `chore(fork): adopt root maintenance manifest`; `chore(fork): retire GitHub sync workflows`; `docs(fork): retire plugins superseded upstream`; `fix(sync): reconcile fork patches with current upstream APIs`; `fix(fork): remove duplicate reconciled toolset entry`; `docs(fork): reconcile maintenance ownership and patch registry` | Historical GitHub Actions synchronization pipeline, replaced by unified `maintain-targets` ownership and dedicated repository reconciliation. |
 | HERMES-013 | Active | `feat(cron): support per-job timezones` | Explicit IANA timezone pins for individual cron jobs. |
 | HERMES-014 | Active | `fix(cron): propagate CLI failures` | Return cron subcommand failure status through the top-level CLI dispatcher. |
 | HERMES-015 | Active | `fix(cwd): isolate gateway sessions from cron workdirs` | Keep a workdir cron's process-global cwd override out of concurrent gateway prompts and tools. |
-| HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
-| HERMES-017 | Active | `feat(titles): configure concise distinct session titles`; `feat(titles): support configurable casing`; `fix(titles): reject malformed auxiliary output`; `fix(titles): reject incomplete markdown fences`; `fix(titles): harden Gemini fallback generation` | Make title shape configurable while preserving durable, race-safe uniqueness and the usable derived title when model output is malformed or truncated. |
-| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons`; `fix(fork): preserve reconciled patch contracts`; `fix(telegram): fall back deterministically for topic icons`; `fix(titles): keep completed responses in primary provider` | Select live Telegram topic icons without repeating the 24 most recent choices, overwriting manual icons, or silently leaving an eligible topic iconless after model-selection failure. |
-| HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
-| HERMES-020 | Active | `fix(skills): limit background review creation` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
-| HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback`; `fix(agent): generalize transient alternate credential recovery` | Try one alternate compatible same-provider credential for recoverable upstream failures before activating the fallback model. |
-| HERMES-022 | Active | `feat(cron): job-scoped native outbound messages`; `fix(fork): preserve reconciled patch contracts`; `fix(cron): keep outbound adapter profile-bound`; `fix(cron): preserve outbound run identity across retries`; `fix(cron): recover pre-send outbound claims`; `fix(cron): preserve ambiguous post-send errors` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, profile-bound adapter identity, and idempotent multi-message delivery. |
+| HERMES-016 | Active | `fix(config): preserve flat MoA settings during merge`; `docs(maintenance): track flat MoA merge patch` | Prevent inherited default presets from shadowing explicit flat MoA configuration. |
+| HERMES-017 | Active | `feat(title): add compact titles and canonical aliases`; `feat(titles): configure concise distinct session titles`; `feat(titles): support configurable casing`; `fix(titles): reject malformed auxiliary output`; `fix(titles): reject incomplete markdown fences`; `fix(titles): harden Gemini fallback generation`; `docs(maintenance): track related title fixes`; `fix(titles): reuse healthy auxiliary routes`; `fix(auxiliary): preserve route attribution with complete responses`; `test(auxiliary): stabilize timeout deadline` | Make title shape configurable while preserving durable, race-safe uniqueness and the usable derived title when model output is malformed or truncated. |
+| HERMES-018 | Active | `feat(telegram): add semantic topic icons and robust auto-renames`; `feat(telegram): remember 24 recent topic icons`; `fix(fork): preserve reconciled patch contracts`; `fix(telegram): fall back deterministically for topic icons`; `fix(titles): keep completed responses in primary provider`; `feat(telegram): title topics after completed replies`; `fix(telegram): suppress duplicate topic title updates`; `fix(telegram): defer topic metadata until response`; `fix(telegram): suppress derived topic rename` | Select live Telegram topic icons without repeating the 24 most recent choices, overwriting manual icons, or silently leaving an eligible topic iconless after model-selection failure. |
+| HERMES-019 | Active | `fix(slack): ignore hidden parent metadata updates`; `test(slack): prove parent replay isolation` | Prevent Slack reply bookkeeping from replaying an old thread parent as a fresh user turn after a gateway restart. |
+| HERMES-020 | Active | `fix(skills): limit background review creation`; `fix(config): recognize background skill creation policy` | Allow background review updates while disabling autonomous creation of new skills through configuration. |
+| HERMES-021 | Active | `fix(agent): try alternate credential before provider fallback`; `fix(agent): soften transient credential overloads`; `fix(agent): clear stale rotation telemetry`; `fix(agent): generalize transient alternate credential recovery` | Try one alternate compatible same-provider credential for recoverable upstream failures before activating the fallback model. |
+| HERMES-022 | Active | `feat(cron): job-scoped native outbound messages`; `fix(fork): preserve reconciled patch contracts`; `fix(cron): reconcile outbound retry states`; `docs: record upstream PR feedback state`; `fix(cron): keep outbound adapter profile-bound`; `fix(cron): preserve outbound run identity across retries`; `fix(cron): recover pre-send outbound claims`; `fix(cron): preserve ambiguous post-send errors`; `fix(cron): bind native sends to owning profile`; `fix(review): restore backup and cron ownership fences`; `fix(review): fence cron ownership and profile-bound sends`; `fix(review): narrow origin normalization and fail closed on profile`; `fix(review): commit complete malformed backup bundles`; `fix(review): revoke stale cron outbound authority`; `fix(review): atomically fence cron transport and backup reuse`; `fix(review): fence outbound claims and validate source manifests`; `fix(review): stabilize backup publication and profile fallback`; `fix(review): validate final bundles and route trusted profiles`; `fix(review): recover interrupted manual cron executions`; `test(cron): bind trusted owner in outbound fixtures`; `fix(review): restore upstream cron and title contracts`; `fix(cron): keep verified outbound results immutable` | Restore opt-in cron `send_message` for one job at a time, with origin-only targeting, profile-bound adapter identity, and idempotent multi-message delivery. |
 | HERMES-023 | Active | `fix(auxiliary): route provider overload through fallback chain` | Treat classified provider overload as auxiliary capacity failure in sync and async calls. |
-| HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
-| HERMES-025 | Active | `fix(compression): report aborted compaction accurately`; `fix(compression): collapse growth rejection notices` | Emit exactly one committed, aborted, or deferred terminal outcome instead of unconditional success or duplicate failure notices. |
+| HERMES-024 | Active | `fix(auxiliary): retry transient failure on one alternate credential`; `fix(auxiliary): require exact failed credential identity`; `fix(auxiliary): bind and preserve alternate credential recovery` | Try one isolated same-provider pool credential before auxiliary model/provider fallback. |
+| HERMES-025 | Active | `fix(compression): report aborted compaction accurately`; `test(compression): cover quiet terminal failure notice`; `fix(compression): collapse growth rejection notices` | Emit exactly one committed, aborted, or deferred terminal outcome instead of unconditional success or duplicate failure notices. |
 | HERMES-026 | Active | `feat(memory): retain source material automatically`; `fix(memory): gate raw attachment retention`; `fix(memory): gate generic file extraction retention`; `fix(memory): constrain retained attachment paths`; `fix(memory): revalidate attachment bytes before upload` | Preserve source evidence while requiring explicit opt-in before retaining raw attachments or generic file reads. |
 | HERMES-027 | Active | `fix: harden gateway runtime boundaries`; `fix(gateway): recover unacknowledged terminal responses` | Resume recent sessions after an unexpected exit unless outbound delivery is durably acknowledged. |
 | HERMES-028 | Active | `fix: harden gateway runtime boundaries`; `fix(terminal): avoid remote Python lifecycle dependency`; `fix(terminal): skip known remote shell binaries`; `fix(terminal): trust only system shell paths` | Inspect referenced remote scripts through the POSIX shell contract without requiring Python. |
 | HERMES-029 | Active | `fix(media): honor provider retry delays for downloads` | Make idempotent image/audio URL-cache GETs honor bounded provider retry timing. |
-| HERMES-030 | Active | `fix(launchd): preserve supervisor marker through gateway wrapper` | Stop the supervised macOS gateway from refusing its own launchd startup into a permanent respawn loop. |
+| HERMES-030 | Retired | `fix(launchd): preserve supervisor marker through gateway wrapper`; `docs(fork): register HERMES-030 launchd supervisor marker`; `fix(fork): retire launchd supervisor marker patch` | Historical generated-plist supervisor marker, replaced by upstream wrapper propagation in released commit `c69a0872ea`. |
 | HERMES-031 | Active | `fix(output): preserve answers before verification receipts` | Keep a substantive answer when a verify-on-stop continuation returns only a verification receipt. |
-| HERMES-033 | Active | `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility` | Persistently defer automatic compression after a `would_grow` rejection while preserving manual retries and pluggable context-engine compatibility. |
+| HERMES-033 | Active | `fix(compression): report LCM safe deferrals`; `fix(compression): classify LCM no-op as deferred`; `fix(compression): classify anti-growth rejection as deferred`; `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility` | Persistently defer automatic compression after a `would_grow` rejection while preserving manual retries and pluggable context-engine compatibility. |
 | HERMES-032 | Active | `fix(doctor): make state db advisory retention aware` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
+| HERMES-034 | Active | `feat(telegram): configure rich message routing mode` | Add explicit adaptive, always-attempt, and legacy-only Telegram Rich Message routing modes. |
+| HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing` | Preserve visible Telegram paragraph separation without over-spacing lists, code, or native tables. |
+| HERMES-036 | Active | `feat(cron): allow local memory opt-in`; `test(cron): verify local USER memory writes` | Let individual cron jobs opt into the local file-backed memory toolset without activating external memory providers. |
+| HERMES-037 | Active | `fix(clarify): explain decisions before prompts`; `fix(gateway): preserve clarify decision context` | Keep decision context in normal assistant prose before interactive clarify prompts. |
+| HERMES-038 | Active | `feat(hindsight): use brain indicator glyph` | Use the brain indicator only when Hindsight supplied retrieved context. |
+| HERMES-039 | Active | `feat(memory): clarify semantic and transcript recall guidance`; `feat(memory): prefer observations and curate hindsight memories`; `feat(memory): expand explicit recall context by default`; `fix(context): keep retrieved provider context request-scoped`; `refactor(prompt): scope retrieval guidance by capability` | Keep retrieved memory request-scoped while giving capability-aware semantic and transcript recall guidance. |
+| HERMES-040 | Active | `fix(gateway): extract local markdown images` | Extract eligible local Markdown images at the gateway media boundary. |
+| HERMES-041 | Active | `fix(gateway): fail closed on inherited restart marker`; `fix(safety): block destructive gateway launchctl verbs` | Prevent gateway-derived contexts from bypassing lifecycle self-control guards. |
+| HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
+| HERMES-043 | Active | `fix(gateway): skip completed legacy resumes` | Avoid re-running completed legacy sessions during startup continuation recovery. |
+| HERMES-044 | Active | `fix(output): compose and protect final responses` | Compose plugin output transforms without letting empty or non-substantive transforms erase the final answer. |
+
+## Fork-only administrative subject exemptions
+
+These exact subjects are fork-only history but do not define independently retireable product behavior. The validator requires every other fork-only subject to appear in a patch-index row.
+
+| Stable commit subject | Narrow non-patch reason |
+| --- | --- |
+| `fmt(js): npm run fix after upstream refresh` | Mechanical formatter output created during an upstream reconciliation. |
+| `test: make local CI deterministic across hosts` | Repository test-runner determinism only; no shipped Hermes behavior. |
+| `test: force sounddevice path in beep unit test` | Host-specific test-fixture repair only; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -97,15 +118,15 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-030 — Preserve the launchd supervisor marker across the stderr wrapper
 
+- **Retired (2026-08-18):** Released upstream commit `c69a0872ea` now preserves supervision at the actual wrapper boundary: `stderr_timestamp` detects a real nonzero launchd `XPC_SERVICE_NAME` on itself and passes `HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1` only to its gateway child. Interactive `XPC_SERVICE_NAME=0` children remain unmarked. The private generated-plist environment entry and its duplicate tests were removed; upstream's wrapper tests now own the contract. Runtime regeneration and a live launchd canary remain part of a separately authorized promotion and were not performed during source reconciliation.
 - **Observed failure (2026-08-15):** Promoting the fork sync (`0.20.0` → `0.20.1`, runtime repo at `401d808610`) ran `hermes gateway start`, which regenerated `ai.hermes.gateway.plist`. Upstream `1db9273584 fix(gateway): timestamp launchd error log lines` had changed `ProgramArguments` from a direct `python -m hermes_cli.main gateway run --replace` exec to `python -m hermes_cli.stderr_timestamp --error-log … -- python -m hermes_cli.main gateway run --replace`. From that rewrite the runtime gateway never started again: every spawn printed `A gateway is already running under launchd for this profile.` and exited 1, and `KeepAlive` respawned it every `ThrottleInterval` (30s) indefinitely, so Hermes was fully down until the marker was restored. Measured on the live job: the gateway process reported `XPC_SERVICE_NAME="0"` with its ppid being the wrapper.
 - **Root cause:** launchd stamps `XPC_SERVICE_NAME` with the job label only onto the process it spawns **directly**. With the wrapper in `ProgramArguments` that process is `stderr_timestamp`, and macOS resets the `Popen`-ed grandchild's `XPC_SERVICE_NAME` to the sentinel `"0"` rather than inheriting the label (macOS actively manages this variable — a process falsely claiming a service name is `SIGABRT`ed). `is_gateway_supervisor_process()` treats `"0"` as "an interactive shell launched me", so `_guard_supervised_gateway_conflict()` sees `service_installed=True, service_running=True` from launchd's own registration, concludes a *different* gateway owns the profile, and `sys.exit(1)`s on the service's own startup — the exact respawn/refuse loop its docstring warns against.
-- **Summary:** Declares the supported `HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1` marker in the generated launchd plist's `EnvironmentVariables`. launchd injects job environment variables into the whole job, so the marker survives the wrapper hop that strips the native XPC marker and the supervised gateway is again exempt from the conflict guard. The fix belongs in the plist **generator**, not the installed file: `launchd_plist_is_current()` compares generated against installed, so an installed-only edit reads as stale and the next `hermes gateway start` strips it and reintroduces the loop. Only supervisor detection is affected; the `--external-supervisor` *flag* (which additionally reroutes the post-update restart path away from the detached watcher) is deliberately not used, so restart semantics are unchanged.
-- **Surfaces:** `hermes_cli/gateway.py`; `tests/hermes_cli/test_gateway_service.py`.
-- **Upstream tracking:** Present and unfixed on official `main` (`165c889e5b4277b56dadd42949a4112c1e6175a6`, checked 2026-08-15): the plist generator still emits the `stderr_timestamp` wrapper and no supervisor marker. Reported upstream independently as issue #86893 (opened 2026-08-15, open), whose diagnosis matches this one — including the grandchild `XPC_SERVICE_NAME` reset — with three independent reproductions covering both named and default profiles.
-- **Upstream PR:** None as of 2026-08-15.
-- **Regression:** `venv/bin/python -m pytest tests/hermes_cli/test_gateway_service.py -k 'launchd_plist' -q`. The two `supervisor_marker` cases were confirmed to fail with the generator change reverted and pass with it applied, so they are not vacuous. Note that `test_launchd_plist_wraps_gateway_stderr_with_timestamps` parses the generated plist with `plistlib`; keep double hyphens out of any XML comment added to this template or plist parsing breaks.
-- **Rollback:** Remove the `HERMES_GATEWAY_EXTERNAL_SUPERVISOR` entry from the `EnvironmentVariables` block in `generate_launchd_plist()` and drop the two `supervisor_marker` tests, then regenerate and reload the plist. Only safe once launchd-supervised startup is exempted some other way — either upstream restores a direct exec in `ProgramArguments`, or `is_gateway_supervisor_process()` gains a marker that survives an intermediate process. Never resolve this by weakening `_guard_supervised_gateway_conflict()` itself; the multi-writer kanban protection it provides against genuine shell-launched duplicates must stay intact.
-- **Retirement:** Retire after released upstream keeps a launchd-supervised gateway recognized as supervised through whatever `ProgramArguments` shape it ships, proven by the focused regression above plus a live `launchctl` start that reaches `state = running` with `runs = 1` and no repeated non-zero exits.
+- **Summary:** The historical private implementation declared `HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1` in generated launchd plists. Released upstream now owns the same safety contract more narrowly in `hermes_cli/stderr_timestamp.py`, forwarding the marker only when the wrapper itself has a real launchd service label.
+- **Surfaces:** Historical private surfaces were `hermes_cli/gateway.py` and two cases in `tests/hermes_cli/test_gateway_service.py`. The active replacement is upstream `hermes_cli/stderr_timestamp.py` with `tests/hermes_cli/test_stderr_timestamp.py`.
+- **Upstream tracking:** Replaced by released upstream commit `c69a0872ea` (contained in tags `v2026.8.16`, `v2026.8.16.2`, and `v2026.8.18`), which closed issue #86893 on 2026-08-16 after four independent macOS reproductions.
+- **Upstream PR:** None; the released replacement is tracked as commit `c69a0872ea` and issue #86893 (checked 2026-08-18).
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_stderr_timestamp.py tests/hermes_cli/test_gateway_service.py -q`. Runtime promotion separately regenerates the plist and proves one live launchd start without a respawn loop.
+- **Rollback:** Do not restore the private generated-plist marker or duplicate tests. If wrapper propagation regresses, repair or backport upstream's `_child_env_for_command()` boundary while preserving the rule that interactive `XPC_SERVICE_NAME=0` processes are never marked supervised.
 
 ### HERMES-029 — Provider-directed retries for idempotent media downloads
 
@@ -184,8 +205,8 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 - **Summary:** Restores `send_message` as a default-off `messaging` toolset and lets a single cron job opt in with `allow_messaging=true`. The opted-in job may send multiple native messages through the configured Hermes adapter identity, but only to the job's bound origin. Each claimed firing receives a durable run identity that survives stale-claim recovery. Pre-send `queued` records are reclaimable; an atomic transport-start fence becomes `ambiguous` before adapter invocation, preventing duplicate retries after an uncertain send. Adapter errors remain ambiguous unless explicit `delivery_stage="pre_send"` evidence proves transport never began. `[SILENT]` suppresses only the scheduler's final automatic delivery, and the tool cannot select another account, profile, or chat ID.
 - **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `cron/outbound.py`; `tools/send_message_tool.py`; `tools/cronjob_tools.py`; `toolsets.py`; `tests/cron/test_cron_outbound_messages.py`; `tests/cron/test_scheduler.py`; `tests/cron/test_jobs.py`; `tests/cron/test_cronjob_schema.py`.
-- **Upstream tracking:** Direct PR `#86648` implements this patch contract on current upstream `main` and links issues `#20140` and `#67591`. Related open PRs `#7388` and `#70304` are incomplete: `#7388` is a process-wide env var, `#70304` restores a broader platform-level messaging toolset, and neither provides job-scoped origin-only targeting plus idempotent multi-message delivery. Removal context: `#47856`.
-- **Upstream PR:** Direct: #86648 (open and mergeable; no reviews, comments, or requested changes as checked 2026-08-14). Related: #7388 and #70304. Removal context: #47856.
+- **Upstream tracking:** Direct PR `#86648` implements this patch contract on current upstream `main` and links issues `#20140` and `#67591`. Its 2026-08-16 automated review raised three items. The edit-preservation concern was valid as a missing regression: the CLI already forwards `None` without coercion and the update boundary already treats it as “unchanged,” now proven by an unrelated timezone edit preserving `allow_messaging=true`. The result-downgrade concern was valid and fixed in the fork by making a durable `verified` record immutable against late callbacks. The toolset-name concern is stale against this fork: `messaging` is an explicit default-off capability, no platform base toolset includes it, and runtime send gates remain a second boundary. Related open PRs `#7388` and `#70304` remain incomplete: `#7388` is a process-wide env var, `#70304` restores a broader platform-level messaging toolset, and neither provides job-scoped origin-only targeting plus idempotent multi-message delivery. Removal context: merged PR `#47856`.
+- **Upstream PR:** Direct: #86648 (open, no reviews or review threads, one automated issue comment addressed as classified above, head checks not reported; checked 2026-08-18). Related: #7388 (open, failing head checks, one unresolved review thread) and #70304 (open, failing head checks, no unresolved review threads). Removal context: #47856 (merged).
 - **Regression:** `pytest -q tests/cron/test_cron_outbound_messages.py tests/cron/test_scheduler.py tests/cron/test_jobs.py tests/cron/test_cronjob_schema.py -k 'disabled_toolsets or memory_toolset or PerJobToolset or allow_messaging or fire_claim_run_id'`.
 - **Rollback:** Remove the `allow_messaging` field, the cron outbound ledger, the cron-only `send_message` registration/check, the origin-only send gate, the `[SILENT]` exception for explicit outbound messages, and the HERMES-022 tests. Restore the previous default cron denylist and delivery hint. Do not restore a process-wide messaging env var.
 - **Retirement:** Retire after released upstream provides job-scoped opt-in, origin-only targeting, adapter-owned identity, idempotent multi-message delivery, and `[SILENT]` that does not suppress those explicit messages.
@@ -310,12 +331,12 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-012 — Retired GitHub Actions fork synchronization pipeline
 
-- **Summary:** The former three-workflow GitHub Actions pipeline fetched upstream, rebased the private stack, tested a temporary candidate, and promoted an exact SHA. It was retired because the `maintain-hermes-fork` Hermes cron now owns the same responsibility without a second scheduler or GitHub-owned promotion path.
-- **Surfaces:** Historical commits named in the index above; this lifecycle record. The active replacement is the external Hermes cron named `maintain-hermes-fork`, not repository code.
+- **Summary:** The former three-workflow GitHub Actions pipeline fetched upstream, rebased the private stack, tested a temporary candidate, and promoted an exact SHA. It remains retired. Unified Hermes job `maintain-targets` (`a6b63c34d53c`) now owns fleet-level scheduling and durable dispatcher receipts; hermes-agent is a heavy target that requires a dedicated repository-bound reconciliation rather than a second product-specific cron.
+- **Surfaces:** Historical commits named in the index above; this lifecycle record. The live scheduler owner is external job `maintain-targets`; its dispatcher ledger and per-target receipts live outside this repository. This repository owns the hermes-agent patch contract and validator used by each dedicated reconciliation.
 - **Upstream tracking:** This was fork-owner release machinery rather than an upstream product defect. The replacement remains Brian-owned and must continue to fail closed, test before publication, use an exact recorded lease, and keep runtime deployment separate.
 - **Upstream PR:** None; fork-owner release machinery is not an upstream product contribution (checked 2026-08-14).
-- **Regression:** Verify the live scheduler has exactly one enabled `maintain-hermes-fork` job; its prompt requires an isolated clone, this manifest, affected patch regressions, canonical tests and lint, independent review, exact-SHA force-with-lease, remote readback, and no runtime deployment. Verify the three retired workflow files and stale `automation/candidate/*` branches are absent.
-- **Rollback:** Do not restore the retired workflows. If the cron is defective, pause it before its next run, leave fork `main` unchanged, repair or replace the single cron owner, and prove a manual isolated reconciliation plus remote readback before resuming it.
+- **Regression:** Verify live job `a6b63c34d53c` is the only enabled `maintain-targets` owner, runs every 720 minutes in `America/Los_Angeles`, works from `/Users/brianle/dotfiles`, and records accepted per-target receipts before claiming another target. Verify hermes-agent is routed as a heavy dedicated case whose repository-bound run reads this manifest, preserves dirty work, runs affected and canonical gates plus independent review, uses an exact force-with-lease, proves remote readback, and never promotes a runtime. Verify the three retired workflow files and stale `automation/candidate/*` branches are absent.
+- **Rollback:** Do not restore the retired workflows or recreate a `maintain-hermes-fork` job. If unified dispatch is defective, pause `maintain-targets` before its next run, leave fork `main` unchanged, repair the unified dispatcher/receipt owner, and prove one manual dedicated reconciliation plus remote readback before resuming it.
 
 ### HERMES-013 — Pin cron wall-clock schedules to per-job IANA timezones
 
@@ -371,22 +392,116 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/gateway/test_telegram_topic_mode.py tests/test_hermes_state.py tests/test_telegram_topic_status_ptb.py -q` plus one disposable live Telegram topic canary proving an eligible topic receives an allowed icon when model selection fails.
 - **Rollback:** To roll back only the 2026-08-15 hardening, remove the deterministic fallback and warning reason while preserving live allowlist resolution, manual ownership, durable history, binding revalidation, and title-independent degradation. For full HERMES-018 retirement, disable `gateway.platforms.telegram.extra.auto_topic_icons` in every affected profile, verify title-only renaming, then remove the remaining selector, state, adapter, docs, and focused tests only after released upstream passes the complete contract.
 
-### HERMES-021 — Add configurable Telegram Rich Message routing modes
+### HERMES-034 — Add configurable Telegram Rich Message routing modes
 
 - **Summary:** Adds `rich_messages: auto|always|never` to Telegram configuration. `auto` is the default adaptive route, `always` attempts Rich Messages for every final response that passes capability, client-risk, and size guards, and `never` forces legacy MarkdownV2. Existing booleans remain compatible: `true` maps to `auto`, `false` to `never`. Rich draft previews remain separately controlled by `rich_drafts`.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `hermes_cli/config_defaults.py`; `agent/system_prompt.py`; `cli-config.yaml.example`; Telegram messaging documentation; Rich Message tests.
+- **Upstream tracking:** Fork-owned routing control. Current released upstream retains adaptive Rich Message delivery but does not provide the explicit `auto|always|never` contract after checked 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
 - **Regression:** `uv run pytest -q tests/gateway/test_telegram_rich_messages.py tests/agent/test_system_prompt.py tests/gateway/test_config.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_visual_spacing.py` — 117 passed. `git diff --check` passed.
 - **Activation:** The active personal profile now has `gateway.platforms.telegram.extra.rich_drafts: true`. The running gateway could not self-restart; an external `hermes gateway restart` is still required. The new `always` mode is not active until the patched Hermes runtime is published and activated.
 - **Rollback:** Set `rich_drafts: false`; set `rich_messages: true` or `auto` for adaptive routing; or revert the patch and restart externally. Do not force-push over the current fork/remote divergence.
+- **Retirement:** Retire after released upstream exposes equivalent validated routing modes across config, system guidance, adapter behavior, backward-compatible booleans, and the focused Rich Message regressions.
 
-### HERMES-020 — Add visible paragraph spacing to Telegram text delivery
+### HERMES-035 — Add visible paragraph spacing to Telegram text delivery
 
 - **Summary:** At the Telegram transport boundary, expands existing Markdown paragraph boundaries with an explicit non-breaking-space line so headings, prose sections, and action blocks remain visually separated on narrow clients. The normalization is idempotent, leaves single-line lists unchanged, and protects fenced code blocks and native pipe tables.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_visual_spacing.py`.
 - **Upstream tracking:** Independent 2026-08-15 reproduction from Telegram screenshots showed ordinary Markdown blank lines rendering too tightly between report sections. The fix belongs at the channel renderer because cron agents expose `platform="cron"` before the scheduler selects a Telegram destination. No equivalent upstream implementation was identified in the maintained source during this change.
-- **Upstream PR:** None after checked 2026-08-15.
+- **Upstream PR:** None after checked 2026-08-18.
 - **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_text_batching.py tests/gateway/test_text_batching.py tests/gateway/test_telegram_error_redaction.py tests/gateway/test_dm_topics.py` plus live Telegram readback of a representative multi-section report confirming visible spacing and no duplicate delivery.
 - **Rollback:** Revert the stable-subject patch and its focused test, then verify ordinary Telegram Markdown delivery, rich-message tables/task lists, fenced code, chunking, and error fallback through the listed regressions. Runtime promotion remains separate from fork publication.
+- **Retirement:** Retire after released upstream preserves equivalent visible paragraph spacing without changing single-line lists, fenced code, native tables, chunking, or fallback delivery, proven by the focused regressions and a live Telegram canary during separate promotion.
+
+### HERMES-036 — Allow per-job local memory opt-in for cron
+
+- **Summary:** Lets a cron job explicitly add the local file-backed `memory` toolset while cron continues to run with `skip_memory=True`, so external memory-provider hooks remain disabled.
+- **Surfaces:** `cron/scheduler.py`; `tests/cron/test_scheduler.py`; `tests/agent/test_skip_memory_store_65429.py`; cron documentation.
+- **Upstream tracking:** No equivalent released per-job local-memory opt-in was identified through upstream `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/cron/test_scheduler.py tests/agent/test_skip_memory_store_65429.py -k 'memory_toolset or local_user_memory'`.
+- **Rollback:** Remove only the explicit `memory` allowlist path and its focused tests; preserve cron's default memory-provider suppression and all unrelated per-job toolsets.
+- **Retirement:** Retire after released upstream permits the same explicit local-memory toolset without invoking external provider hooks and passes the focused regressions.
+
+### HERMES-037 — Explain decisions before interactive clarify prompts
+
+- **Summary:** Keeps findings, terminology, trade-offs, and recommendations in normal assistant prose before a concise interactive question, and preserves that prose across gateway progress/prompt transitions.
+- **Surfaces:** `tools/clarify_tool.py`; `gateway/run.py`; clarify, gateway-progress, and Codex-response tests; tool and Telegram documentation.
+- **Upstream tracking:** No equivalent released cross-surface decision-context contract was identified through upstream `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_clarify_tool.py tests/gateway/test_run_progress_topics.py tests/run_agent/test_run_agent_codex_responses.py`.
+- **Rollback:** Remove the explain-first schema guidance and gateway preservation branch together with their focused tests; preserve upstream multi-question, recommendation, and multi-select behavior.
+- **Retirement:** Retire after released upstream preserves ordinary assistant decision context before clarify prompts on CLI and messaging surfaces.
+
+### HERMES-038 — Show the Hindsight brain indicator only for retrieved context
+
+- **Summary:** Uses the brain glyph only when Hindsight actually supplied retrieved context, avoiding a misleading provider indicator on turns without retrieval.
+- **Surfaces:** `plugins/memory/hindsight/__init__.py`; Hindsight README; turn-context and Hindsight-provider tests.
+- **Upstream tracking:** No equivalent released indicator contract was identified through upstream `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_turn_context.py tests/plugins/memory/test_hindsight_provider.py -k 'indicator or glyph or context'`.
+- **Rollback:** Restore upstream's provider indicator behavior and remove only the focused glyph assertions.
+- **Retirement:** Retire after released upstream exposes an equivalent truthful retrieved-context indicator.
+
+### HERMES-039 — Keep memory retrieval guidance capability-aware and request-scoped
+
+- **Summary:** Distinguishes semantic memory from transcript/session search, prefers curated observations for Hindsight recall, expands explicit recall context, and keeps provider-retrieved context scoped to the current request rather than mutating durable conversation history.
+- **Surfaces:** `agent/memory_provider.py`; `agent/prompt_builder.py`; `agent/system_prompt.py`; `agent/conversation_loop.py`; `agent/turn_context.py`; `plugins/memory/hindsight/__init__.py`; `tools/session_search_tool.py`; focused prompt, sidecar, and Hindsight tests.
+- **Upstream tracking:** No released upstream implementation satisfies the complete guidance, curation, expanded-context, and request-scoped sidecar contract through `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/agent/test_api_content_sidecar.py tests/agent/test_turn_context.py tests/plugins/memory/test_hindsight_provider.py`.
+- **Rollback:** Remove the request-scoped retrieval sidecar and fork guidance/curation changes together; preserve upstream message alternation, prompt caching, and ordinary memory-provider lifecycle.
+- **Retirement:** Retire after released upstream keeps retrieved provider context request-scoped and provides equivalent capability-aware semantic/transcript guidance and Hindsight curation.
+
+### HERMES-040 — Extract eligible local Markdown images at the gateway boundary
+
+- **Summary:** Detects eligible local Markdown image references in gateway output and routes them through the existing bounded native-media extraction path instead of leaving broken local links in delivered text.
+- **Surfaces:** `gateway/platforms/base.py`; `tests/gateway/test_platform_base.py`.
+- **Upstream tracking:** No equivalent released gateway extraction behavior was identified through upstream `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_platform_base.py -k 'markdown and image'`.
+- **Rollback:** Remove only local Markdown image extraction and its tests; preserve remote-image, attachment, path-validation, and media-size safeguards.
+- **Retirement:** Retire after released upstream safely extracts equivalent local Markdown images at the delivery boundary.
+
+### HERMES-041 — Fail closed on gateway-derived lifecycle control
+
+- **Summary:** Treats any inherited gateway marker as tainted for self-control and blocks destructive launchctl verbs from gateway-origin terminal execution, preventing marker spoofing and supervisor kill loops.
+- **Surfaces:** `hermes_cli/gateway.py`; `cron/lifecycle_guard.py`; `tests/cron/test_gateway_lifecycle_guard_launchctl.py`.
+- **Upstream tracking:** No released upstream implementation satisfies both inherited-marker and destructive-launchctl contracts through `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/cron/test_gateway_lifecycle_guard_launchctl.py tests/hermes_cli/test_gateway_restart_loop.py`.
+- **Rollback:** Remove only the inherited-marker hardening and launchctl verb classifier after another released mechanism prevents gateway self-termination; preserve ordinary external operator lifecycle commands.
+- **Retirement:** Retire after released upstream fails closed on equivalent gateway-derived restart and launchctl self-control paths.
+
+### HERMES-042 — Pin the supported Hindsight 0.9.1 client contract
+
+- **Summary:** Pins `hindsight-client==0.9.1` and aligns provider adapters, lazy dependencies, packaging metadata, lock data, and documentation with that supported API.
+- **Surfaces:** `pyproject.toml`; `uv.lock`; `tools/lazy_deps.py`; Hindsight provider source, metadata, docs, and tests.
+- **Upstream tracking:** Upstream `5dd15872a6` still pins Hindsight client 0.6.1; no released equivalent 0.9.1 integration was identified on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `uv lock --check`; `scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py tests/test_packaging_metadata.py`.
+- **Rollback:** Revert the client pin and matching API adaptations as one unit; regenerate `uv.lock` with the repository-supported uv and preserve unrelated dependency updates.
+- **Retirement:** Retire after released upstream supports the same or newer compatible Hindsight API and passes packaging plus provider regressions.
+
+### HERMES-043 — Skip completed legacy startup resumes
+
+- **Summary:** Prevents startup continuation recovery from re-running legacy sessions that already have a completed terminal response while preserving genuinely interrupted work.
+- **Surfaces:** `gateway/session.py`; `tests/gateway/test_clean_shutdown_marker.py`.
+- **Upstream tracking:** No equivalent released legacy-completion filter was identified through upstream `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_clean_shutdown_marker.py`.
+- **Rollback:** Remove only the completed-legacy suppression and its focused cases; preserve current delivery-acknowledgement recovery and clean-shutdown semantics.
+- **Retirement:** Retire after released upstream distinguishes completed legacy sessions from interrupted resumable work with equivalent regressions.
+
+### HERMES-044 — Compose and protect final response transforms
+
+- **Summary:** Composes output-transform hooks at the finalization boundary while preserving a substantive answer when a transform returns empty or non-substantive output.
+- **Surfaces:** `agent/turn_finalizer.py`; `gateway/run.py`; `hermes_cli/lifecycle.py`; `hermes_cli/plugins.py`; Telegram adapter; transform-hook and Rich Message tests.
+- **Upstream tracking:** No released upstream implementation satisfies the complete transform-composition and answer-preservation contract through `5dd15872a6` on 2026-08-18.
+- **Upstream PR:** None after checked 2026-08-18.
+- **Regression:** `scripts/run_tests.sh tests/test_transform_llm_output_hook.py tests/gateway/test_telegram_rich_messages.py`.
+- **Rollback:** Remove the fork transform-composition path and its tests while preserving upstream finalization, plugin lifecycle, and Telegram rendering behavior.
+- **Retirement:** Retire after released upstream composes equivalent transforms without permitting empty transform output to erase a substantive answer.
 
 ### HERMES-019 — Ignore hidden Slack thread-parent metadata updates
 
@@ -417,15 +532,15 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 3. Implement and verify the patch.
 4. Update the record with final surfaces, tests, published commit identity, and live upstream issue/PR state.
 5. If a direct upstream PR exists, inspect all current feedback and apply every valid item to the fork first, then update the PR from the verified fork correction.
-6. Verify the manifest row is `Active`; the `maintain-hermes-fork` cron validates this index, its records, active stable subjects, upstream-association fields, and fork-only patch coverage before publication.
+6. Verify the manifest row is `Active`; run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation so duplicate IDs, unindexed records, missing stable subjects, upstream-association fields, and fork-only patch coverage block publication. The unified `maintain-targets` dispatcher records the accepted result; it is not a substitute for repository validation.
 7. Ship the code and manifest together. A source patch without a complete record is not publishable.
 8. On every upstream rebase, inspect patch equivalence and associated issue/PR feedback; never resolve a conflict by retaining both private and upstream implementations.
 
 ## Automatic synchronization
 
-The Hermes cron `maintain-hermes-fork` runs daily at 09:20 America/New_York and can also be run manually. It never mutates the canonical checkout. In a fresh temporary clone it fetches `0xble/hermes-agent:main` and `NousResearch/hermes-agent:main`, reads this manifest, inventories the currently installed and enabled plugins from the live maintained profiles, resolves every patch's upstream issue/PR ledger and all substantive review feedback, rebases the maintained stack, compares conflicts against patch contracts, and checks newly released upstream behavior for native replacements of both fork patches and plugin-owned problem contracts. Valid review feedback must be applied to the fork and verified there before the corresponding PR branch is updated. It runs affected regressions plus canonical tests and lint, and independently reviews the exact candidate. It may advance fork `main` only with an exact recorded `force-with-lease`, followed by remote readback proving the verified candidate landed and contains upstream.
+Unified Hermes job `maintain-targets` (`a6b63c34d53c`) runs every 720 minutes in `America/Los_Angeles` from `/Users/brianle/dotfiles`. The scheduler is only the trigger: the dispatcher ledger, immutable target snapshot, and accepted per-target receipts are authoritative. Each tick resumes one dispatcher run, processes at most three targets serially, and cannot claim the next target before recording the current target's receipt. Hermes-agent is classified as a heavy dedicated case. Its repository-bound reconciliation works from `/Users/brianle/Repos/hermes-agent`, fetches `origin` and `upstream`, reads this manifest, inventories installed and enabled plugins, resolves the live upstream issue/PR ledger and substantive feedback, rebases maintained `main`, compares conflicts against patch contracts, and checks released upstream for native patch or plugin replacements. It runs affected regressions, canonical gates, and an independent review of the exact rewritten delta. It may advance fork `main` only with the origin SHA fetched for that dedicated run as an explicit force-with-lease, followed by remote readback proving the verified candidate landed and contains upstream.
 
-The cron never pushes to Nous Research, never deploys, uninstalls plugins, edits plugin canonical-source repositories, or restarts a runtime, and never guesses through an ambiguous conflict. If a native replacement qualifies, its result must identify every affected profile and canonical owner plus the separate promotion and complete-uninstall work required by “Plugin overlap and retirement.” Failures must abort the isolated rebase, leave fork `main` unchanged, and deliver the exact blocker in the cron result.
+Neither unified dispatch nor the dedicated reconciliation may push to Nous Research, deploy or restart a runtime, uninstall plugins, edit plugin canonical-source repositories, or guess through an ambiguous conflict. A qualified native replacement must identify every affected profile and canonical owner plus the separately authorized promotion and complete-uninstall work required by “Plugin overlap and retirement.” A failed or ambiguous dedicated reconciliation must leave fork `origin/main` unchanged, restore or retain unrelated dirty work, and record the exact blocker or execution limitation in the unified dispatcher receipt. Runtime promotion remains a separate operation.
 
 ## Invariants
 
@@ -442,7 +557,7 @@ The cron never pushes to Nous Research, never deploys, uninstalls plugins, edits
 
 When synchronization is blocked:
 
-1. Inspect the failed `maintain-hermes-fork` cron run and its delivered blocker.
+1. Inspect the `maintain-targets` dispatcher run and accepted hermes-agent target receipt; distinguish a target blocker from a dispatcher, gateway, credential, tool, or host execution limitation.
 2. Reproduce from `/Users/brianle/Repos/hermes-agent`.
 3. Fetch `upstream/main` and rebase maintained `main` locally.
 4. Resolve only after comparing current upstream behavior with every affected patch record above.
