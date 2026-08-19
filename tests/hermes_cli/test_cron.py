@@ -77,10 +77,12 @@ class TestCronCommandLifecycle:
                 monitor_script=None,
                 monitor_url=None,
                 timezone="America/New_York",
+                allow_messaging=True,
             )
         )
         job = list_jobs()[0]
         assert job["timezone"] == "America/New_York"
+        assert job["allow_messaging"] is True
 
         cron_command(
             Namespace(
@@ -106,7 +108,10 @@ class TestCronCommandLifecycle:
                 timezone="America/Los_Angeles",
             )
         )
-        assert get_job(job["id"])["timezone"] == "America/Los_Angeles"
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["timezone"] == "America/Los_Angeles"
+        assert updated["allow_messaging"] is True
 
         cron_command(Namespace(cron_command="list", all=True))
         out = capsys.readouterr().out
