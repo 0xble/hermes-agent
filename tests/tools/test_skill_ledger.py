@@ -56,7 +56,7 @@ def _create(name="my-skill", content=VALID_SKILL_CONTENT):
 def test_background_review_patch_ledgers_and_rolls_back(ledger_env, monkeypatch):
     """A curator-pass patch lands in the ledger tagged 'curator', and a
     single-entry rollback restores the exact pre-patch content."""
-    from tools import skill_ledger
+    from tools import skill_ledger, skill_usage
     from tools.skill_manager_tool import skill_manage
     from tools.skill_provenance import (
         BACKGROUND_REVIEW,
@@ -65,13 +65,18 @@ def test_background_review_patch_ledgers_and_rolls_back(ledger_env, monkeypatch)
     )
     from tools.skill_manager_tool import mark_background_review_skill_read
 
+    # Background review may update an explicitly curator-managed skill but
+    # cannot create one unless opted in. Create in the foreground, adopt it
+    # through the same policy boundary as `hermes curator adopt`, then switch
+    # origin for the curator patch under test.
+    assert _create()["success"] is True
+    adopted, message = skill_usage.adopt_skill("my-skill")
+    assert adopted is True, message
+    skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
+    original = skill_md.read_text(encoding="utf-8")
+
     token = set_current_write_origin(BACKGROUND_REVIEW)
     try:
-        # Created under the review fork → marked created_by: agent, so the
-        # curator pass is allowed to patch it (curator invariant unchanged).
-        assert _create()["success"] is True
-        skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
-        original = skill_md.read_text(encoding="utf-8")
         mark_background_review_skill_read(skill_md)
         patched = json.loads(
             skill_manage(
@@ -84,7 +89,7 @@ def test_background_review_patch_ledgers_and_rolls_back(ledger_env, monkeypatch)
     finally:
         reset_current_write_origin(token)
 
-    assert patched["success"] is True
+    assert patched["success"] is True, patched
     assert "Updated body." in skill_md.read_text(encoding="utf-8")
 
     rows = skill_ledger.list_entries(skill="my-skill")
