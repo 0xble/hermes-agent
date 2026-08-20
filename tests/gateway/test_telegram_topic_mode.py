@@ -1660,6 +1660,31 @@ def test_topic_title_generation_uses_bounded_request_and_response_context():
     assert context.index("User request:") < context.index("Assistant response so far:")
 
 
+def test_topic_title_generation_context_does_not_exceed_provider_cap():
+    from agent.title_generator import MAX_TITLE_INPUT_CHARS
+
+    runner = _make_runner()
+    runner._telegram_topic_mode_enabled = lambda source: True
+    source = _make_source(thread_id="42")
+    agent = SimpleNamespace(_session_db=MagicMock())
+    result = {"completed": True, "failed": False, "interrupted": False}
+
+    with patch("agent.title_generator.maybe_auto_title") as auto_title:
+        runner._schedule_telegram_topic_title_after_response(
+            source,
+            "sess-topic",
+            "u" * 5000,
+            "a" * 5000,
+            agent,
+            result,
+        )
+
+    context = auto_title.call_args.args[2]
+    assert len(context) <= MAX_TITLE_INPUT_CHARS
+    assert "User request:\n" in context
+    assert "Assistant response so far:\n" in context
+
+
 def test_topic_title_generation_skips_failed_or_empty_responses():
     runner = _make_runner()
     runner._telegram_topic_mode_enabled = lambda source: True

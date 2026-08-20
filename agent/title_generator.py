@@ -59,8 +59,11 @@ TitleCallback = Callable[[str, str], None]
 RuntimeValidator = Callable[[], bool]
 AuxiliaryRouteCallback = Callable[[dict], None]
 
-# Cap on the text handed to the model. Keep enough room for both sides of a
-# Telegram title exchange: the opening request and useful assistant output.
+# Total character cap for the combined title input at the provider boundary.
+# Telegram topic mode may opt in to sending bounded request and visible
+# response excerpts through the configured title-generation route, including
+# its configured fallback routes; keep the cap enforced here as the final
+# boundary regardless of the caller's excerpting.
 MAX_TITLE_INPUT_CHARS = 2400
 
 # Cap on the instant derived title. Deliberately shorter than the model's
@@ -591,16 +594,18 @@ def generate_title(
     avoid_titles: Optional[list[str]] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
 ) -> Optional[str]:
-    """Generate a session title from the user's opening message.
+    """Generate a session title from bounded title context.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
     small/fast model tier. Thinking is disabled and the response is constrained
     to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
 
-    Titles come from the user's message alone — every surveyed implementation
-    that titles well (Claude Code, OpenCode, Cursor, OpenClaw) does the same.
-    Waiting for the assistant is what made this slow, and it bought nothing:
-    the user's opening message already states the intent worth naming.
+    For the opt-in, feature-scoped Telegram topic title path, the input may
+    contain bounded excerpts of both the user's request and visible assistant
+    response. Those excerpts may cross the configured title-generation route,
+    including configured fallback routes. ``MAX_TITLE_INPUT_CHARS`` is the
+    total combined character cap enforced immediately before that provider
+    request; other callers retain their existing request-only behavior.
 
     ``failure_callback`` is invoked with ``(task, exception)`` when the
     auxiliary call raises — the caller typically wires this to

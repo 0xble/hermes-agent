@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.title_generator import (
+    MAX_TITLE_INPUT_CHARS,
     generate_title,
     choose_topic_icon,
     choose_topic_icon_deterministic,
@@ -80,6 +81,28 @@ class TestGenerateTitle:
         assert captured_kwargs["max_tokens"] == 1024
         assert captured_kwargs["reasoning_config"] == {"enabled": False, "effort": "none"}
         assert captured_kwargs["require_complete_response"] is True
+
+    def test_combined_title_context_is_capped_at_provider_boundary(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Bounded Context"}'
+        captured = {}
+
+        def mock_call_llm(**kwargs):
+            captured.update(kwargs)
+            return response
+
+        context = (
+            "User request:\n"
+            + "u" * 1400
+            + "\n\nAssistant response so far:\n"
+            + "a" * 1600
+        )
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            assert generate_title(context) == "Bounded Context"
+
+        provider_input = captured["messages"][1]["content"]
+        assert len(provider_input) == MAX_TITLE_INPUT_CHARS
 
     def test_reports_successful_auxiliary_route(self):
         response = MagicMock()
