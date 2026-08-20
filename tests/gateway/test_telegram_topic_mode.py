@@ -1628,7 +1628,7 @@ async def test_operator_declared_topic_is_not_auto_renamed(tmp_path):
     fake.rename_dm_topic.assert_not_called()
 
 
-def test_topic_title_generation_waits_for_completed_response_and_uses_context():
+def test_topic_title_generation_uses_bounded_request_and_response_context():
     runner = _make_runner()
     runner._telegram_topic_mode_enabled = lambda source: True
     source = _make_source(thread_id="42")
@@ -1656,7 +1656,8 @@ def test_topic_title_generation_waits_for_completed_response_and_uses_context():
     auto_title.assert_called_once()
     context = auto_title.call_args.args[2]
     assert "Help move the reporting workflow to the VPS" in context
-    assert "direct Supabase queries on the LPG VPS" not in context
+    assert "direct Supabase queries on the LPG VPS" in context
+    assert context.index("User request:") < context.index("Assistant response so far:")
 
 
 def test_topic_title_generation_skips_failed_or_empty_responses():

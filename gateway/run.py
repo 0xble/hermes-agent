@@ -7058,6 +7058,47 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        _topic_title_lock = threading.Lock()
+        _topic_title_claimed = False
+        _topic_title_timer = None
+
+        def _maybe_schedule_topic_title(
+            assistant_text: str,
+            *,
+            completed: bool,
+            turn_result: Optional[dict] = None,
+        ) -> None:
+            nonlocal _topic_title_claimed
+            text = str(assistant_text or "").strip()
+            if len(text) < 20:
+                return
+            with _topic_title_lock:
+                if _topic_title_claimed:
+                    return
+                _topic_title_claimed = True
+            self._runner._schedule_telegram_topic_title_after_response(
+                ctx.source,
+                str(ctx.session_id or ""),
+                str(ctx.message or ""),
+                text,
+                agent,
+                turn_result or {"completed": completed, "partial": not completed},
+                allow_incomplete=not completed,
+            )
+
+        def _schedule_interim_topic_title() -> None:
+            # This is intentionally based on visible streamed text. If the
+            # provider is non-streaming or has not emitted enough prose yet,
+            # the completed-response path below remains eligible.
+            _maybe_schedule_topic_title(
+                getattr(agent, "_current_streamed_assistant_text", ""),
+                completed=False,
+            )
+
+        _topic_title_timer = threading.Timer(20.0, _schedule_interim_topic_title)
+        _topic_title_timer.daemon = True
+        _topic_title_timer.start()
+
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -7124,6 +7165,8 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
+            if _topic_title_timer is not None:
+                _topic_title_timer.cancel()
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -7384,18 +7427,15 @@ class TurnRunner:
                     unique_tags.insert(0, "[[audio_as_voice]]")
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
-        self._runner._schedule_telegram_topic_title_after_response(
-            ctx.source,
-            str(ctx.session_id or ""),
-            str(ctx.message or ""),
-            str(final_response or ""),
-            ctx.agent_holder[0],
-            result,
+        _maybe_schedule_topic_title(
+            final_response,
+            completed=True,
+            turn_result=result,
         )
 
-        # Auto-titling for Telegram topics runs after a successful response so
-        # the title and icon can use both the opening request and the completed
-        # assistant answer. Other surfaces retain their existing title path.
+        # Auto-titling for Telegram topics runs after a successful response or,
+        # for long-running turns, after 20 seconds of visible partial output.
+        # The title uses both the opening request and the assistant text.
 
         return {
             "final_response": final_response,
@@ -25848,11 +25888,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         assistant_response: str,
         agent: Any,
         result: dict,
+        *,
+        allow_incomplete: bool = False,
     ) -> None:
-        """Generate a Telegram topic title after a successful assistant turn.
+        """Generate a Telegram topic title from completed or interim turn text.
 
-        The best-effort background task waits for a completed response, but sends
-        only the opening user request across the auxiliary-provider boundary.
+        A completed turn is preferred. For long-running turns, the gateway may
+        call this once with visible streamed text after the interim delay.
         """
         if (
             source.platform != Platform.TELEGRAM
@@ -25866,8 +25908,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             result.get("failed")
             or result.get("interrupted")
-            or result.get("partial")
-            or result.get("completed") is False
+            or (result.get("partial") and not allow_incomplete)
+            or (result.get("completed") is False and not allow_incomplete)
         ):
             return
 
@@ -25875,7 +25917,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         opening_text = str(user_message or "").strip()
         if not opening_text or len(response_text) < 20:
             return
-        title_context = opening_text[:4000]
+        # Keep both sides of the exchange visible to the auxiliary title model.
+        # Preserve the opening request and the most informative response text
+        # instead of letting a long user prompt crowd the answer out entirely.
+        opening_excerpt = opening_text[:1400]
+        response_excerpt = response_text[:1600]
+        title_context = (
+            "User request:\n"
+            f"{opening_excerpt}\n\n"
+            "Assistant response so far:\n"
+            f"{response_excerpt}"
+        )
 
         try:
             from agent.title_generator import maybe_auto_title

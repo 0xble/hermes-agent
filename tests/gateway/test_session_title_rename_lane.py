@@ -179,6 +179,7 @@ def test_telegram_response_aware_path_renames_only_once(monkeypatch):
     )
 
     def fake_maybe_auto_title(*args, **kwargs):
+        captured["context"] = args[2]
         captured["callback"] = kwargs["title_callback"]
 
     monkeypatch.setattr("agent.title_generator.maybe_auto_title", fake_maybe_auto_title)
@@ -206,6 +207,9 @@ def test_telegram_response_aware_path_renames_only_once(monkeypatch):
         agent,
         {"completed": True},
     )
+
+    assert "Research X and produce a grounded summary" in captured["context"]
+    assert "A completed response long enough" in captured["context"]
 
     captured["callback"]("Derived opening title", "derived")
     captured["callback"]("Final response title", "llm")

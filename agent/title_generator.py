@@ -59,10 +59,9 @@ TitleCallback = Callable[[str, str], None]
 RuntimeValidator = Callable[[], bool]
 AuxiliaryRouteCallback = Callable[[dict], None]
 
-# Cap on the text handed to the model. Claude Code and OpenClaw independently
-# converged on the same 1000-char budget; a title needs the opening intent, not
-# a pasted stack trace.
-MAX_TITLE_INPUT_CHARS = 1000
+# Cap on the text handed to the model. Keep enough room for both sides of a
+# Telegram title exchange: the opening request and useful assistant output.
+MAX_TITLE_INPUT_CHARS = 2400
 
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
@@ -85,11 +84,16 @@ _MAX_TITLE_WORDS = 12
 TITLE_MAX_OUTPUT_TOKENS = 1024
 
 _TITLE_PROMPT_TEMPLATE = (
-    "You name chat sessions. Given the user's opening message, write a title "
-    "that lets them find this conversation again in a list.\n\n"
+    "You name chat sessions. Given a user's request and the assistant's "
+    "response so far, write a short title that lets them find this "
+    "conversation again in a list.\n\n"
     "Rules:\n"
     "__LENGTH_RULE__\n"
-    "- Name what the user wants DONE, not that they asked a question.\n"
+    "- Use concise Title Case by default, including for technical titles.\n"
+    "- Title the concrete subject or artifact discussed, not the conversation's "
+    "abstract intent, theme, goal, or emotional tone.\n"
+    "- Use the assistant response to resolve vague requests, URLs, filenames, "
+    "and broad prompts. Do not summarize the response or answer the request.\n"
     "- Prefer an explicitly named project, person, product, or other proper name.\n"
     "- Avoid generic leading labels such as Fixing, Update, or Analysis when a specific subject is available.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
@@ -225,7 +229,7 @@ def _title_preferences() -> _TitlePreferences:
         min_words = int(title_config.get("min_words", default_min_words))
         max_words = int(title_config.get("max_words", default_max_words))
         max_characters = int(title_config.get("max_characters", default_max_characters))
-        case_style = str(title_config.get("case_style", "sentence_case")).strip().lower()
+        case_style = str(title_config.get("case_style", "title_case")).strip().lower()
         raw_aliases = title_config.get("name_aliases", {})
         aliases = (
             {
@@ -260,7 +264,7 @@ def _title_preferences() -> _TitlePreferences:
             min_words=default_min_words,
             max_words=default_max_words,
             max_characters=default_max_characters,
-            case_style="sentence_case",
+            case_style="title_case",
             name_aliases={},
             instructions="",
         )
