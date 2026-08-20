@@ -55,7 +55,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-029 | Active | `fix(media): honor provider retry delays for downloads` | Make idempotent image/audio URL-cache GETs honor bounded provider retry timing. |
 | HERMES-030 | Retired | `fix(launchd): preserve supervisor marker through gateway wrapper`; `docs(fork): register HERMES-030 launchd supervisor marker`; `fix(fork): retire launchd supervisor marker patch` | Historical generated-plist supervisor marker, replaced by upstream wrapper propagation in released commit `c69a0872ea`. |
 | HERMES-031 | Active | `fix(output): preserve answers before verification receipts` | Keep a substantive answer when a verify-on-stop continuation returns only a verification receipt. |
-| HERMES-033 | Active | `fix(compression): report LCM safe deferrals`; `fix(compression): classify LCM no-op as deferred`; `fix(compression): classify anti-growth rejection as deferred`; `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility` | Persistently defer automatic compression after a `would_grow` rejection while preserving manual retries and pluggable context-engine compatibility. |
+| HERMES-033 | Active | `fix(compression): report LCM safe deferrals`; `fix(compression): classify LCM no-op as deferred`; `fix(compression): classify anti-growth rejection as deferred`; `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility`; `fix(compression): reconcile rejected-compaction API` | Persistently defer automatic compression after a `would_grow` rejection while preserving manual retries and pluggable context-engine compatibility. |
 | HERMES-032 | Active | `fix(doctor): make state db advisory retention aware` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
 | HERMES-034 | Active | `feat(telegram): configure rich message routing mode` | Add explicit adaptive, always-attempt, and legacy-only Telegram Rich Message routing modes. |
 | HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing` | Preserve visible Telegram paragraph separation without over-spacing lists, code, or native tables. |
@@ -79,6 +79,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fmt(js): npm run fix after upstream refresh` | Mechanical formatter output created during an upstream reconciliation. |
 | `test: make local CI deterministic across hosts` | Repository test-runner determinism only; no shipped Hermes behavior. |
 | `test: force sounddevice path in beep unit test` | Host-specific test-fixture repair only; no shipped Hermes behavior. |
+| `docs(fork): register reconciled compression patch` | Maintenance-only manifest correction for the rebased compression compatibility patch. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
