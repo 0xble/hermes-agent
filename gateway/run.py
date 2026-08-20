@@ -25917,16 +25917,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         opening_text = str(user_message or "").strip()
         if not opening_text or len(response_text) < 20:
             return
-        # Keep both sides of the exchange visible to the auxiliary title model.
-        # Preserve the opening request and the most informative response text
-        # instead of letting a long user prompt crowd the answer out entirely.
-        opening_excerpt = opening_text[:1400]
-        response_excerpt = response_text[:1600]
+        # Telegram topic mode is the opt-in, feature-scoped path that may send
+        # bounded request and visible response excerpts through the configured
+        # title-generation route (including configured fallback routes). Keep
+        # the formatted context within the provider-boundary cap deterministically
+        # instead of constructing 1400 + 1600 chars and relying on a later slice.
+        from agent.title_generator import MAX_TITLE_INPUT_CHARS
+
+        request_label = "User request:\n"
+        response_label = "\n\nAssistant response so far:\n"
+        available_excerpt_chars = max(
+            0,
+            MAX_TITLE_INPUT_CHARS - len(request_label) - len(response_label),
+        )
+        opening_excerpt = opening_text[: min(1400, available_excerpt_chars)]
+        response_excerpt = response_text[
+            : max(0, available_excerpt_chars - len(opening_excerpt))
+        ]
         title_context = (
-            "User request:\n"
-            f"{opening_excerpt}\n\n"
-            "Assistant response so far:\n"
-            f"{response_excerpt}"
+            f"{request_label}{opening_excerpt}\n\n"
+            f"{response_label[2:]}{response_excerpt}"
         )
 
         try:
