@@ -115,11 +115,6 @@ COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn...
 
 COMPACTION_ABORTED_STATUS = "⚠ Compression failed; conversation preserved."
 COMPACTION_DEFERRED_STATUS = "ℹ Compression deferred; conversation unchanged."
-COMPACTION_WOULD_GROW_STATUS = (
-    "⚠️ Compression refused: the generated summary would have GROWN "
-    "the conversation instead of shrinking it. No messages were dropped — "
-    "conversation continues unchanged."
-)
 
 _COMPACTION_TERMINAL_STATUS = {
     "committed": ("compacted", COMPACTION_DONE_STATUS),
@@ -4244,19 +4239,9 @@ def compress_context(
         ):
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
-            _lcm_status = str(
-                getattr(
-                    agent.context_compressor,
-                    "last_compression_status",
-                    getattr(agent.context_compressor, "_last_compression_status", ""),
-                )
-                or ""
-            )
-            _safe_deferral = _lcm_status in {"deferred", "noop"}
             logger.info(
-                "Compression made no progress (session=%s, status=%s) — skipping boundary rewrite.",
+                "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
-                _lcm_status or "unknown",
             )
             # Dead-loop breaker (#84371): a fired compaction that returns the
             # transcript UNCHANGED will fail identically next turn unless the
@@ -4284,12 +4269,10 @@ def compress_context(
             _emit_compression_attempt_telemetry(
                 agent,
                 started_at=_attempt_started_at,
-                commit_status="deferred" if _safe_deferral else "aborted",
-                split_status="deferred" if _safe_deferral else "aborted",
-                failure_class="no_progress" if not _safe_deferral else None,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="no_progress",
             )
-            if _safe_deferral:
-                _set_compaction_outcome("deferred")
             _release_lock()
             return messages, _existing_sp
 
@@ -4654,10 +4637,6 @@ def compress_context(
                             compressed = _salvaged
                             _rough_out = _salv_est
                 if _rough_out > _rough_in:
-                    agent.context_compressor.record_rejected_compaction(
-                        reason="would_grow",
-                        automatic=not force,
-                    )
                     logger.warning(
                         "Compression refused: compressed transcript would be "
                         "larger than the original (session=%s, ~%s -> ~%s "
@@ -4677,14 +4656,23 @@ def compress_context(
                         agent.context_compressor._last_compress_refused_would_grow = True
                     except Exception:
                         pass
+                    try:
+                        agent._emit_warning(
+                            "⚠️ Compression refused: the generated summary "
+                            "would have GROWN the conversation instead of "
+                            "shrinking it. No messages were dropped — "
+                            "conversation continues unchanged."
+                        )
+                    except Exception:
+                        pass
                     _existing_sp = getattr(agent, "_cached_system_prompt", None)
                     if not _existing_sp:
                         _existing_sp = agent._build_system_prompt(system_message)
                     _emit_compression_attempt_telemetry(
                         agent,
                         started_at=_attempt_started_at,
-                        commit_status="deferred",
-                        split_status="deferred",
+                        commit_status="aborted",
+                        split_status="aborted",
                         failure_class="would_grow",
                     )
                     # Restore ONLY the prune runway (same rationale as the
@@ -4705,10 +4693,6 @@ def compress_context(
                                 "_proactive_prune_rearm_tokens"
                             ]
                         )
-                    _set_compaction_outcome(
-                        "deferred",
-                        COMPACTION_WOULD_GROW_STATUS,
-                    )
                     _release_lock()
                     return messages, _existing_sp
 
