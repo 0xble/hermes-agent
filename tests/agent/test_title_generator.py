@@ -63,6 +63,9 @@ class TestGenerateTitle:
         assert title == "AB..."
         assert not title.removesuffix("...").endswith("\u200d")
 
+    def test_character_truncation_keeps_word_ending_at_budget_space(self):
+        assert _truncate_title("Alpha Beta Gamma", 14) == "Alpha Beta..."
+
     def test_default_timeout_delegates_to_auxiliary_config(self):
         captured_kwargs = {}
 
@@ -193,16 +196,83 @@ class TestGenerateTitle:
             assert title is None
 
 
-    def test_truncates_long_titles(self):
+    def test_preserves_complete_titles_that_exceed_the_preferred_character_budget(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "A" * 100
+        mock_response.choices[0].message.content = "OLIPOP And Sparkling Ice Effects"
 
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "min_words": 2,
+                    "max_words": 5,
+                    "max_characters": 30,
+                }
+            }
+        }
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
             title = generate_title("question")
-            assert title is not None
-            assert len(title) == 80
-            assert title.endswith("...")
+            assert title == "OLIPOP And Sparkling Ice Effects"
+
+    def test_database_hard_limit_uses_word_safe_truncation(self):
+        proposed = (
+            "Kubernetes CrashLoopBackOff Troubleshooting Documentation "
+            "Recommendations Implementation Considerations"
+        )
+        assert len(proposed) > 100
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = f'{{"title": "{proposed}"}}'
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "max_words": 7,
+                    "max_characters": 30,
+                }
+            }
+        }
+
+        with patch("agent.title_generator.call_llm", return_value=response), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            title = generate_title("question")
+
+        assert title == (
+            "Kubernetes CrashLoopBackOff Troubleshooting Documentation "
+            "Recommendations Implementation..."
+        )
+        assert len(title) <= 100
+
+    def test_prompt_states_character_budget_as_mandatory(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Compact Topic Title"}'
+        captured = {}
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "min_words": 2,
+                    "max_words": 5,
+                    "max_characters": 30,
+                }
+            }
+        }
+
+        def mock_call_llm(**kwargs):
+            captured.update(kwargs)
+            return response
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            assert generate_title("question") == "Compact Topic Title"
+
+        prompt = captured["messages"][0]["content"]
+        assert "must use 2-5 words" in prompt
+        assert "must not exceed 30 characters" in prompt
 
     def test_rejects_answer_shaped_output(self):
         """A model that ignores the titling task and answers the user's
@@ -378,7 +448,7 @@ class TestGenerateTitle:
 
         assert title == "ProjectAtlas"
 
-    def test_character_limit_outranks_invalid_overlong_alias(self):
+    def test_complete_canonical_alias_may_exceed_character_preference(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "Atlas"}'
@@ -397,7 +467,8 @@ class TestGenerateTitle:
         ):
             title = generate_title("Open the atlas app")
 
-        assert title == "Atlas"
+        assert title == "ProjectAtlasLongName Atlas"
+        assert len(title) > 12
 
     def test_name_alias_after_prompt_snippet_is_still_enforced(self):
         response = MagicMock()
@@ -441,7 +512,7 @@ class TestGenerateTitle:
 
         assert title == "Title leak"
 
-    def test_configured_character_limit_is_enforced(self):
+    def test_configured_character_limit_remains_a_prompt_preference(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "' + "A" * 40 + '"}'
@@ -457,9 +528,7 @@ class TestGenerateTitle:
         ):
             title = generate_title("question")
 
-        assert title is not None
-        assert len(title) == 24
-        assert title.endswith("...")
+        assert title == "A" * 40
 
     def test_configured_word_limit_is_enforced_after_generation(self):
         response = MagicMock()
@@ -1076,7 +1145,7 @@ class TestAutoTitleDuplicateHandling:
         # callback fires with the actually-persisted (deduped) title
         assert seen == ["Debugging Import Error #2"]
 
-    def test_collision_variant_respects_configured_hard_limits(self, tmp_path):
+    def test_collision_variant_preserves_complete_title_beyond_character_preference(self, tmp_path):
         from agent.title_generator import _persist_session_title
 
         db = SessionDB(tmp_path / "state.db")
@@ -1100,9 +1169,42 @@ class TestAutoTitleDuplicateHandling:
             )
 
         assert persisted is not None
-        assert len(persisted) <= 24
+        assert persisted == original + " #2"
+        assert len(persisted) > 24
         assert len(persisted.split()) <= 3
         assert persisted.endswith("#2")
+
+    def test_database_length_limit_does_not_create_false_collision_suffix(self, tmp_path):
+        from agent.title_generator import _persist_session_title
+
+        proposed = (
+            "Kubernetes CrashLoopBackOff Troubleshooting Documentation "
+            "Recommendations Implementation Considerations"
+        )
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session("sess-1", "cli")
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "max_words": 7,
+                    "max_characters": 30,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config_readonly", return_value=config):
+            persisted = _persist_session_title(
+                db,
+                "sess-1",
+                proposed,
+                source="llm",
+            )
+
+        assert persisted == (
+            "Kubernetes CrashLoopBackOff Troubleshooting Documentation "
+            "Recommendations Implementation..."
+        )
+        assert not persisted.endswith("#2")
+        assert db.get_session_title("sess-1") == persisted
 
 
 
