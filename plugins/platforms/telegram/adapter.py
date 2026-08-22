@@ -902,6 +902,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._general_request_drain_lock = asyncio.Lock()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
+        # Topics Telegram has authoritatively rejected as deleted. This is
+        # process-local delivery state, not a durable binding replacement.
+        self._stale_dm_topic_ids: Dict[tuple[str, str], None] = {}
         # Creation-time custom icon state for user-created DM topics. Missing
         # key = unknown (usually gateway restarted); None = Telegram default
         # bubble; string = a user-selected full-size custom topic icon.
@@ -1772,6 +1775,25 @@ class TelegramAdapter(BasePlatformAdapter):
     def _is_thread_not_found_error(error: Exception) -> bool:
         return "thread not found" in str(error).lower()
 
+    def _mark_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> bool:
+        if chat_id is None or thread_id is None:
+            return False
+        stale = getattr(self, "_stale_dm_topic_ids", None)
+        if not isinstance(stale, dict):
+            stale = {}
+            self._stale_dm_topic_ids = stale
+        key = (str(chat_id), str(thread_id))
+        if key in stale:
+            return False
+        if len(stale) >= 512:
+            stale.pop(next(iter(stale)))
+        stale[key] = None
+        return True
+
+    def is_dm_topic_stale(self, chat_id: Any, thread_id: Any) -> bool:
+        stale = getattr(self, "_stale_dm_topic_ids", {})
+        return (str(chat_id), str(thread_id)) in stale
+
     def _prune_stale_dm_topic_binding(
         self, chat_id: Any, thread_id: Any,
     ) -> None:
@@ -1812,6 +1834,65 @@ class TelegramAdapter(BasePlatformAdapter):
                 "chat=%s thread=%s (Bot API: thread not found)",
                 self.name, chat_id, thread_id,
             )
+
+    async def _recover_stale_subchat_delivery(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        send_result: SendResult,
+        error_text: str,
+    ) -> Optional[SendResult]:
+        """Recover a completed response at chat root when its DM topic vanished."""
+        topic_metadata = dict(metadata or {})
+        thread_id = self._metadata_thread_id(topic_metadata)
+        if (
+            not topic_metadata.get("notify")
+            or not thread_id
+            or "thread not found" not in str(error_text or "").lower()
+            or not self._is_private_dm_topic_send(chat_id, thread_id, topic_metadata)
+        ):
+            return None
+
+        if self._mark_dm_topic_stale(chat_id, thread_id):
+            self._prune_stale_dm_topic_binding(chat_id, thread_id)
+
+        for key in (
+            "thread_id",
+            "message_thread_id",
+            "direct_messages_topic_id",
+            "telegram_direct_messages_topic_id",
+            "telegram_reply_to_message_id",
+            "reply_to_message_id",
+            "telegram_dm_topic_reply_fallback",
+            "telegram_dm_topic_created_for_send",
+        ):
+            topic_metadata.pop(key, None)
+        topic_metadata["telegram_stale_topic_recovery"] = True
+        partial_delivery = bool(
+            isinstance(send_result.raw_response, dict)
+            and send_result.raw_response.get("telegram_stale_topic_partial_delivery")
+        )
+        recovery_content = (
+            "A response was partially delivered before its Telegram topic was deleted. "
+            "The complete response remains in Hermes session history."
+            if partial_delivery
+            else "Recovered response from a deleted Telegram topic:\n\n" + content
+        )
+        logger.warning(
+            "[%s] Recovering completed response at chat root after stale topic chat=%s thread=%s",
+            self.name,
+            chat_id,
+            thread_id,
+        )
+        return await self._send_with_retry(
+            chat_id=chat_id,
+            content=recovery_content,
+            reply_to=None,
+            metadata=topic_metadata,
+        )
 
     @staticmethod
     def _is_bad_request_error(error: Exception) -> bool:
@@ -6054,18 +6135,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
-                                    return SendResult(
-                                        success=False,
-                                        error=str(send_err),
-                                        retryable=False,
-                                    )
-                                # Telegram has been observed to return a
-                                # one-off "thread not found" that recovers on
-                                # an immediate retry (transient flake — see
-                                # test_send_retries_transient_thread_not_found_before_fallback).
-                                # Try the same thread_id once without sleeping
-                                # before falling back to a plain send.
+                                # Telegram can return a one-off "thread not found"
+                                # for a healthy topic. Confirm with one immediate
+                                # same-thread retry before declaring the topic stale.
                                 if not retried_thread_not_found:
                                     retried_thread_not_found = True
                                     logger.warning(
@@ -6073,6 +6145,19 @@ class TelegramAdapter(BasePlatformAdapter):
                                         self.name, effective_thread_id,
                                     )
                                     continue
+                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                    if private_dm_topic_send and self._mark_dm_topic_stale(chat_id, effective_thread_id):
+                                        self._prune_stale_dm_topic_binding(chat_id, effective_thread_id)
+                                    return SendResult(
+                                        success=False,
+                                        error=str(send_err),
+                                        raw_response={
+                                            "telegram_stale_topic_partial_delivery": bool(message_ids),
+                                            "delivered_chunks": len(message_ids),
+                                            "total_chunks": len(chunks),
+                                        },
+                                        retryable=False,
+                                    )
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune

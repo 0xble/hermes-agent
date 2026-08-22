@@ -1261,9 +1261,9 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "language": "",
-            # Title-shaping preferences. The word range guides the model; both
-            # maxima are enforced after generation. Defaults preserve the
-            # historical 3-7 word / 80 character behavior.
+            # Title-shaping preferences. The model must follow both budgets;
+            # max_words is enforced after generation, while a complete title
+            # that exceeds max_characters is preserved for semantic quality.
             "min_words": 3,
             "max_words": 7,
             "max_characters": 80,

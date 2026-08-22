@@ -77,6 +77,7 @@ MAX_DERIVED_TITLE_CHARS = 48
 # can1357/oh-my-pi#7306). 12 leaves headroom for legitimate wordy titles
 # while excluding full-sentence answers.
 _MAX_TITLE_WORDS = 12
+_MAX_PERSISTED_TITLE_CHARS = 100
 
 # Gemini 3.x counts hidden thinking against maxOutputTokens. The old 64-token
 # ceiling reproducibly left 0-3 visible tokens after provider failover, turning
@@ -215,7 +216,8 @@ def _title_preferences() -> _TitlePreferences:
     """Return validated title-shaping preferences.
 
     Defaults preserve Hermes' pre-patch 3-7 word / 80 character contract.
-    ``min_words`` guides the model; both maxima are enforced after generation.
+    ``min_words`` and ``max_characters`` guide the model; ``max_words`` and the
+    independent 100-character persistence boundary are enforced after generation.
     Operator instructions are bounded so config cannot create an unbounded
     auxiliary prompt.
     """
@@ -250,7 +252,7 @@ def _title_preferences() -> _TitlePreferences:
         aliases = {
             alias: canonical
             for alias, canonical in list(aliases.items())[:64]
-            if len(canonical) <= max_characters
+            if len(canonical) <= 100
         }
         instructions = str(title_config.get("instructions", "") or "").strip()[:1000]
         return _TitlePreferences(
@@ -302,8 +304,8 @@ def _build_title_prompt(
         else "use sentence case (capitalize only the first word and proper nouns)"
     )
     length_rule = (
-        f"- Prefer {preferences.min_words}-{preferences.max_words} words and at most "
-        f"{preferences.max_characters} characters; {case_rule}."
+        f"- You must use {preferences.min_words}-{preferences.max_words} words; the title "
+        f"must not exceed {preferences.max_characters} characters; {case_rule}."
     )
     alias_rule = ""
     if preferences.name_aliases:
@@ -514,7 +516,7 @@ def _title_comparison_key(title: str) -> str:
 
 
 def _truncate_title(title: str, max_characters: int) -> str:
-    """Truncate to a codepoint budget without splitting a grapheme cluster."""
+    """Truncate at a word boundary when possible, preserving grapheme clusters."""
     if len(title) <= max_characters:
         return title
     budget = max(1, max_characters - 3)
@@ -550,15 +552,23 @@ def _truncate_title(title: str, max_characters: int) -> str:
             break
         kept.append(cluster)
         used += len(cluster)
-    return "".join(kept).rstrip() + "..."
+    raw_prefix = "".join(kept)
+    prefix = raw_prefix.rstrip()
+    if len(kept) < len(clusters) and prefix:
+        next_cluster = clusters[len(kept)]
+        if not next_cluster.isspace() and not raw_prefix[-1].isspace():
+            boundary = prefix.rfind(" ")
+            if boundary > 0:
+                prefix = prefix[:boundary].rstrip(" ,.;:—-")
+    return prefix + "..."
 
 
 def _clean_title(
     text: str,
-    max_characters: int = 80,
+    max_characters: Optional[int] = 80,
     max_words: Optional[int] = None,
 ) -> Optional[str]:
-    """Normalize and hard-limit a model-produced title."""
+    """Normalize a model-produced title and enforce the requested limits."""
     title = " ".join((text or "").split())
     title = title.strip("\"'").strip()
     if title.lower().startswith("title:"):
@@ -579,7 +589,7 @@ def _clean_title(
         words = title.split()
         if len(words) > max_words:
             title = " ".join(words[:max_words]).rstrip(" ,.;:—-")
-    if len(title) > max_characters:
+    if max_characters is not None and len(title) > max_characters:
         title = _truncate_title(title, max_characters)
     return title or None
 
@@ -675,12 +685,9 @@ def generate_title(
             )
         content = choice.message.content or ""
         # Normalize model chatter first, then apply aliases, then enforce the
-        # configured limits exactly once so ellipsis handling is stable.
-        title = _clean_title(
-            _extract_title_text(content),
-            100,
-            None,
-        )
+        # configured word limit. The character budget is prompt guidance; a
+        # complete over-budget model title is preserved for semantic quality.
+        title = _clean_title(_extract_title_text(content), None, None)
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
         # the user's message instead. Reject it rather than storing an
@@ -723,7 +730,9 @@ def generate_title(
             elif not title:
                 title = canonical_name
         final_title = _clean_title(
-            title or "", preferences.max_characters, preferences.max_words
+            title or "",
+            _MAX_PERSISTED_TITLE_CHARS,
+            preferences.max_words,
         )
         if final_title and route_callback is not None:
             route = getattr(response, "_hermes_auxiliary_route", None)
@@ -1038,6 +1047,15 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     """
     auto_fn = getattr(session_db, "set_auto_title", None)
 
+    preferences = _title_preferences()
+    title = _clean_title(
+        str(title or ""),
+        _MAX_PERSISTED_TITLE_CHARS,
+        preferences.max_words,
+    )
+    if not title:
+        return None
+
     def _set(candidate):
         if auto_fn is not None:
             if not auto_fn(session_id, candidate, source=source):
@@ -1063,16 +1081,18 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
         if not dedupe:
             raise
 
-    preferences = _title_preferences()
     for number in range(2, 10_000):
         suffix = f"#{number}"
         if preferences.max_words <= 1:
-            stem = _truncate_title(title, preferences.max_characters - len(suffix))
+            stem = _truncate_title(
+                title,
+                _MAX_PERSISTED_TITLE_CHARS - len(suffix),
+            )
             candidate = f"{stem}{suffix}"
         else:
             stem = _clean_title(
                 title,
-                max_characters=preferences.max_characters - len(suffix) - 1,
+                max_characters=_MAX_PERSISTED_TITLE_CHARS - len(suffix) - 1,
                 max_words=preferences.max_words - 1,
             )
             if not stem:

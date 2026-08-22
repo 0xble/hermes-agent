@@ -5799,6 +5799,19 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    async def _recover_stale_subchat_delivery(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Any,
+        send_result: "SendResult",
+        error_text: str,
+    ) -> Optional["SendResult"]:
+        """Optionally recover a final response whose thread/topic disappeared."""
+        return None
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -5828,6 +5841,17 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+        stale_recovery = await self._recover_stale_subchat_delivery(
+            chat_id=chat_id,
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+            send_result=result,
+            error_text=error_str,
+        )
+        if stale_recovery is not None:
+            return stale_recovery
+
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been

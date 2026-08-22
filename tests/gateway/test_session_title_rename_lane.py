@@ -14,7 +14,7 @@ import types
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner, TurnRunner
+from gateway.run import GatewayRunner, TurnRunner, _InterimTopicTitleLatch
 from gateway.session import SessionSource
 
 
@@ -169,6 +169,43 @@ async def test_telegram_topic_deduplicates_same_title_request(monkeypatch):
     assert scheduled == [True]
 
 
+def test_telegram_topic_skips_rename_after_delivery_marks_topic_stale(monkeypatch):
+    class StaleAdapter:
+        def is_dm_topic_stale(self, chat_id, thread_id):
+            return (str(chat_id), str(thread_id)) == ("chat-1", "thread-1")
+
+    runner = object.__new__(GatewayRunner)
+    runner._telegram_topic_last_scheduled_titles = {}
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._telegram_topic_auto_rename_disabled = lambda source: False
+    runner._sanitize_telegram_topic_title = lambda title: title.strip()
+    runner._adapter_for_source = lambda source: StaleAdapter()
+    runner._gateway_loop = None
+    scheduled = []
+
+    def capture(coro, loop, **kwargs):
+        coro.close()
+        scheduled.append(True)
+        return None
+
+    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+
+    runner._schedule_telegram_topic_title_rename(
+        source,
+        "session-1",
+        "Internet Game Help",
+    )
+
+    assert scheduled == []
+    assert runner._telegram_topic_last_scheduled_titles == {}
+
+
 def test_telegram_response_aware_path_renames_only_once(monkeypatch):
     calls = []
     captured = {}
@@ -214,3 +251,49 @@ def test_telegram_response_aware_path_renames_only_once(monkeypatch):
     captured["callback"]("Derived opening title", "derived")
     captured["callback"]("Final response title", "llm")
     assert calls == ["Final response title"]
+
+
+def test_interim_title_latch_fires_when_text_precedes_deadline():
+    ready = []
+    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
+
+    latch.observe("A" * 20)
+    assert ready == []
+
+    latch.reach_deadline()
+    assert ready == ["A" * 20]
+
+
+def test_interim_title_latch_fires_when_text_arrives_after_deadline():
+    ready = []
+    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
+
+    latch.reach_deadline()
+    latch.observe("A" * 19)
+    assert ready == []
+
+    latch.observe("A" * 20)
+    latch.observe("A" * 30)
+    assert ready == ["A" * 20]
+
+
+def test_interim_title_latch_close_prevents_late_fire():
+    ready = []
+    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
+
+    latch.reach_deadline()
+    latch.close()
+    latch.observe("A" * 20)
+
+    assert ready == []
+
+
+def test_interim_title_latch_preserves_useful_text_across_stream_resets():
+    ready = []
+    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
+
+    latch.observe("First visible response")
+    latch.observe("short")
+    latch.reach_deadline()
+
+    assert ready == ["First visible response"]
