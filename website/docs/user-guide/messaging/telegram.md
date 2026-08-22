@@ -815,16 +815,15 @@ The title policy is configurable for every Hermes surface:
 auxiliary:
   title_generation:
     min_words: 2
-    max_words: 2
-    max_characters: 24
+    max_words: 5
     case_style: title_case
-    instructions: "Use concrete noun phrases"
+    instructions: "Use concrete noun phrases. Aim for 30 characters, but keep words complete."
     name_aliases:
       project atlas: ProjectAtlas
       atlas app: ProjectAtlas
 ```
 
-`case_style` accepts `sentence_case` (the default) or `title_case` and changes the title model's prompt without rewriting proper names after generation. `name_aliases` is case-insensitive and keeps personal project vocabulary in user config rather than Hermes source code. When an alias appears in the opening message, Hermes deterministically canonicalizes the generated title without collapsing every conversation to the bare project name. The model is required to follow both configured budgets. `max_words` is enforced after generation, while `max_characters` remains a strong prompt preference: Hermes preserves a complete over-budget model title instead of truncating it mid-word. Platform-native hard limits still apply. Hermes also supplies a bounded list of recent session titles to the model, retries one real collision with explicit exclusions, and keeps the transactional unique-title check as the final authority.
+`case_style` accepts `sentence_case` (the default) or `title_case`. `name_aliases` keeps canonical project vocabulary in user config. Explicit `max_words` and `max_characters` values are hard post-generation limits. A profile with no title-generation settings retains the 80-character default; a profile that configures title generation and omits `max_characters` has no profile character cap. Put lower stylistic targets in `instructions`. Storage and platform safety ceilings still apply, using a word boundary when possible. Hermes also supplies recent titles to the model and keeps the transactional unique-title check as the final authority.
 
 If Telegram confirms that a private topic was deleted before a completed response can be delivered, Hermes prunes the stale binding and suppresses later rename attempts. When no response chunk was delivered, it recovers the complete response at chat root. If Telegram accepted an earlier chunk before the topic vanished, Hermes sends a root-level notice instead of duplicating already delivered content. It does not recreate the deleted topic.
 
