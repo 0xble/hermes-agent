@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import stat
 import subprocess
@@ -24,6 +25,19 @@ from plugins.platforms.telegram.user_transport import (
     telegram_user_lock_path,
     telegram_user_session_path,
 )
+
+
+@contextlib.contextmanager
+def _private_file_creation_umask():
+    """Keep newly-created MTProto credential files private from first write."""
+    if os.name == "nt":
+        yield
+        return
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
 
 
 class _SessionLease:
@@ -232,12 +246,13 @@ async def authorize_attended(
             password_needed_exception = (
                 password_needed_exception or SessionPasswordNeededError
             )
-        client = client_factory(
-            str(session_path), api_id, api_hash, receive_updates=False
-        )
-        await asyncio.wait_for(
-            client.connect(), timeout=config.connect_timeout_seconds
-        )
+        with _private_file_creation_umask():
+            client = client_factory(
+                str(session_path), api_id, api_hash, receive_updates=False
+            )
+            await asyncio.wait_for(
+                client.connect(), timeout=config.connect_timeout_seconds
+            )
         ensure_safe_session_storage(Path(hermes_home))
         authorized = await asyncio.wait_for(
             client.is_user_authorized(), timeout=config.rpc_timeout_seconds
@@ -499,15 +514,17 @@ class TelethonTelegramUserTransport:
             self._lease.acquire()
             client = None
             try:
-                client = factory(
-                    str(session_path),
-                    self.api_id,
-                    self._api_hash,
-                    receive_updates=False,
-                )
-                await asyncio.wait_for(
-                    client.connect(), timeout=self.config.connect_timeout_seconds
-                )
+                with _private_file_creation_umask():
+                    client = factory(
+                        str(session_path),
+                        self.api_id,
+                        self._api_hash,
+                        receive_updates=False,
+                    )
+                    await asyncio.wait_for(
+                        client.connect(),
+                        timeout=self.config.connect_timeout_seconds,
+                    )
                 ensure_safe_session_storage(self.hermes_home)
                 if not await asyncio.wait_for(
                     client.is_user_authorized(),
