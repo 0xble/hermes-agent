@@ -192,7 +192,7 @@ _MACHINE_PREFIXES = (
 class _TitlePreferences:
     min_words: int
     max_words: int
-    max_characters: int
+    max_characters: Optional[int]
     case_style: str
     name_aliases: dict[str, str]
     instructions: str
@@ -215,9 +215,9 @@ def _title_language() -> str:
 def _title_preferences() -> _TitlePreferences:
     """Return validated title-shaping preferences.
 
-    Defaults preserve Hermes' pre-patch 3-7 word / 80 character contract.
-    ``min_words`` and ``max_characters`` guide the model; ``max_words`` and the
-    independent 100-character persistence boundary are enforced after generation.
+    Profiles without title settings retain the 3-7 word / 80 character default.
+    A profile that configures title generation but omits ``max_characters`` has
+    no profile character cap; storage and platform safety ceilings still apply.
     Operator instructions are bounded so config cannot create an unbounded
     auxiliary prompt.
     """
@@ -225,14 +225,23 @@ def _title_preferences() -> _TitlePreferences:
     default_max_words = 7
     default_max_characters = 80
     try:
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly, read_raw_config
 
         title_config = ((load_config_readonly() or {}).get("auxiliary") or {}).get(
             "title_generation", {}
         )
         min_words = int(title_config.get("min_words", default_min_words))
         max_words = int(title_config.get("max_words", default_max_words))
-        max_characters = int(title_config.get("max_characters", default_max_characters))
+        raw_config = read_raw_config() or {}
+        raw_title_config = (raw_config.get("auxiliary") or {}).get(
+            "title_generation"
+        )
+        if isinstance(raw_title_config, dict) and "max_characters" not in raw_title_config:
+            max_characters = None
+        else:
+            max_characters = int(
+                title_config.get("max_characters", default_max_characters)
+            )
         case_style = str(title_config.get("case_style", "title_case")).strip().lower()
         raw_aliases = title_config.get("name_aliases", {})
         aliases = (
@@ -246,13 +255,14 @@ def _title_preferences() -> _TitlePreferences:
         )
         max_words = max(1, min(max_words, 12))
         min_words = max(1, min(min_words, max_words))
-        max_characters = max(12, min(max_characters, 100))
+        if max_characters is not None:
+            max_characters = max(12, min(max_characters, 100))
         if case_style not in {"sentence_case", "title_case"}:
             case_style = "sentence_case"
         aliases = {
             alias: canonical
             for alias, canonical in list(aliases.items())[:64]
-            if len(canonical) <= 100
+            if len(canonical) <= (max_characters or _MAX_PERSISTED_TITLE_CHARS)
         }
         instructions = str(title_config.get("instructions", "") or "").strip()[:1000]
         return _TitlePreferences(
@@ -303,10 +313,15 @@ def _build_title_prompt(
         if preferences.case_style == "title_case"
         else "use sentence case (capitalize only the first word and proper nouns)"
     )
-    length_rule = (
-        f"- You must use {preferences.min_words}-{preferences.max_words} words; the title "
-        f"must not exceed {preferences.max_characters} characters; {case_rule}."
-    )
+    if preferences.max_characters is None:
+        length_rule = (
+            f"- Prefer {preferences.min_words}-{preferences.max_words} words; {case_rule}."
+        )
+    else:
+        length_rule = (
+            f"- Prefer {preferences.min_words}-{preferences.max_words} words and at most "
+            f"{preferences.max_characters} characters; {case_rule}."
+        )
     alias_rule = ""
     if preferences.name_aliases:
         aliases_json = json.dumps(
@@ -565,10 +580,10 @@ def _truncate_title(title: str, max_characters: int) -> str:
 
 def _clean_title(
     text: str,
-    max_characters: Optional[int] = 80,
+    max_characters: int = 80,
     max_words: Optional[int] = None,
 ) -> Optional[str]:
-    """Normalize a model-produced title and enforce the requested limits."""
+    """Normalize and hard-limit a model-produced title."""
     title = " ".join((text or "").split())
     title = title.strip("\"'").strip()
     if title.lower().startswith("title:"):
@@ -589,7 +604,7 @@ def _clean_title(
         words = title.split()
         if len(words) > max_words:
             title = " ".join(words[:max_words]).rstrip(" ,.;:—-")
-    if max_characters is not None and len(title) > max_characters:
+    if len(title) > max_characters:
         title = _truncate_title(title, max_characters)
     return title or None
 
@@ -685,9 +700,12 @@ def generate_title(
             )
         content = choice.message.content or ""
         # Normalize model chatter first, then apply aliases, then enforce the
-        # configured word limit. The character budget is prompt guidance; a
-        # complete over-budget model title is preserved for semantic quality.
-        title = _clean_title(_extract_title_text(content), None, None)
+        # configured limits exactly once so ellipsis handling is stable.
+        title = _clean_title(
+            _extract_title_text(content),
+            100,
+            None,
+        )
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
         # the user's message instead. Reject it rather than storing an
@@ -731,7 +749,7 @@ def generate_title(
                 title = canonical_name
         final_title = _clean_title(
             title or "",
-            _MAX_PERSISTED_TITLE_CHARS,
+            preferences.max_characters or _MAX_PERSISTED_TITLE_CHARS,
             preferences.max_words,
         )
         if final_title and route_callback is not None:
@@ -1045,16 +1063,14 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     Returns the title actually persisted, or None when a higher-authority
     title already held the row (nothing was written).
     """
-    auto_fn = getattr(session_db, "set_auto_title", None)
-
     preferences = _title_preferences()
-    title = _clean_title(
-        str(title or ""),
-        _MAX_PERSISTED_TITLE_CHARS,
-        preferences.max_words,
+    effective_max_characters = (
+        preferences.max_characters or _MAX_PERSISTED_TITLE_CHARS
     )
+    title = _clean_title(title, effective_max_characters, preferences.max_words)
     if not title:
         return None
+    auto_fn = getattr(session_db, "set_auto_title", None)
 
     def _set(candidate):
         if auto_fn is not None:
@@ -1084,15 +1100,12 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     for number in range(2, 10_000):
         suffix = f"#{number}"
         if preferences.max_words <= 1:
-            stem = _truncate_title(
-                title,
-                _MAX_PERSISTED_TITLE_CHARS - len(suffix),
-            )
+            stem = _truncate_title(title, effective_max_characters - len(suffix))
             candidate = f"{stem}{suffix}"
         else:
             stem = _clean_title(
                 title,
-                max_characters=_MAX_PERSISTED_TITLE_CHARS - len(suffix) - 1,
+                max_characters=effective_max_characters - len(suffix) - 1,
                 max_words=preferences.max_words - 1,
             )
             if not stem:
