@@ -47,6 +47,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes egress` | Outbound credential-injection firewall for remote terminal sandboxes (iron-proxy). Disabled by default. See [Egress proxy](../user-guide/egress/iron-proxy.md). |
 | `hermes lsp` | Manage Language Server Protocol integration (semantic diagnostics for write_file/patch). |
 | `hermes setup` | Interactive setup wizard for all or part of the configuration. |
+| `hermes telegram` | Configure and diagnose Telegram, authorize the optional user transport, and inspect or set readback-verified custom topic icons. |
 | `hermes whatsapp` | Configure and pair the WhatsApp bridge. |
 | `hermes whatsapp-cloud` | Configure the official Meta WhatsApp Business Cloud API adapter (Business account + public webhook required). Distinct from `hermes whatsapp` (Baileys personal-account bridge). |
 | `hermes slack` | Slack helpers (currently: generate the app manifest with every command as a native slash). |
@@ -100,6 +101,20 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes --version` | Show version information. |
 | `hermes update` | Pull latest code and reinstall dependencies. `--check` previews without installing; `--backup` takes a pre-pull `HERMES_HOME` snapshot. |
 | `hermes uninstall` | Remove Hermes from the system. |
+
+## `hermes telegram`
+
+```bash
+hermes telegram setup [options]
+hermes telegram status [--live] [--json]
+hermes telegram doctor [--live] [--json]
+hermes telegram user {login,status,doctor,logout,capabilities,peers}
+hermes telegram topic-icons {status,catalog,resolve,verify,set}
+```
+
+The namespace administers Hermes's Telegram integration. It is not a general Telegram client. The optional Telethon transport is profile-scoped and exposes only `topic.read` and `topic.icon.write`. `topic-icons set` requires `--yes` and reports success only after exact MTProto readback. `telegram_custom_packs` never falls back to Telegram's default icon provider.
+
+Use `hermes telegram user login` for attended QR plus private cloud-2FA authorization. On macOS, the short-lived QR opens in Preview and is deleted after authorization. `hermes telegram user logout` remains available for credential containment even when the transport is disabled. See [Telegram](../user-guide/messaging/telegram.md) for configuration and custom-pack examples.
 
 ## `hermes chat`
 

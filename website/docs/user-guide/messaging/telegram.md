@@ -840,11 +840,64 @@ gateway:
           ProjectAtlas: "🔭"
 ```
 
-Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 24 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
+Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to six semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 24 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
+
+To use configured custom emoji packs rather than Telegram's default topic-icon set, enable the optional native user transport. Bot API remains the gateway for inbound messages, responses, topic creation, titles, and custom-pack catalog reads. The user transport is restricted to exact topic reads and icon writes, and every write is accepted only after `messages.getForumTopicsByID` returns the requested document ID.
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        user_transport:
+          enabled: true
+          implementation: telethon
+          expected_user_id: 123456789
+          require_premium: true
+          capabilities: [topic.read, topic.icon.write]
+          allowed_bot_peer_ids: [987654321]
+        auto_topic_icons: true
+        preserve_manual_topic_icons: true
+        topic_icon_provider: telegram_custom_packs
+        topic_icon_custom_packs:
+          - AppleFacesEmotions
+          - AppleAnimalsNature
+          - AppleObjectsHomeTools
+```
+
+Install the optional dependency and authorize the profile locally:
+
+```bash
+pip install 'hermes-agent[telegram-user]'
+hermes telegram setup --non-interactive \
+  --enable-user-transport \
+  --expected-user-id 123456789 \
+  --bot-peer-id 987654321 \
+  --enable-custom-icons \
+  --pack AppleFacesEmotions \
+  --pack AppleAnimalsNature \
+  --pack AppleObjectsHomeTools
+hermes telegram user login
+```
+
+Login creates a short-lived QR locally. On macOS, Hermes opens a mode-`0600` PNG in Preview and deletes it after authorization. Other platforms receive a terminal QR with a full quiet zone. Scan it from **Telegram → Settings → Devices → Link Desktop Device** and enter cloud 2FA only in the hidden local prompt if Telegram requires it. The gateway never prompts for login during startup. The profile-local session directory is mode `0700`, and the session file plus SQLite sidecars are required to remain mode `0600` on POSIX systems. Ordinary `hermes backup` archives exclude the entire `state/telegram-user` credential directory. Recovery requires attended reauthorization.
+
+Use the operator surface to inspect or verify behavior without exposing a general Telegram userbot:
+
+```bash
+hermes telegram status --live --json
+hermes telegram user capabilities --json
+hermes telegram topic-icons catalog --pack AppleObjectsHomeTools --limit 20 --json
+hermes telegram topic-icons resolve '🧹' --json
+hermes telegram topic-icons verify --topic 141123 --json
+hermes telegram topic-icons set --topic 141123 --emoji '🧹' --yes --json
+```
+
+`telegram_custom_packs` never falls back to Telegram's default icon set. If the catalog or user transport is unavailable, the title may still be applied through Bot API while the existing icon remains unchanged. Operator `set` records manual ownership. Automatic title icons record ownership and recent history only after exact native readback.
 
 `topic_icon_overrides` is optional and uses ordinary emoji characters as portable selectors rather than hard-coded Telegram IDs. An exact override always wins, which is useful when a recurring project should keep a recognizable signature icon.
 
-With `preserve_manual_topic_icons: true` (the default), Hermes preserves a custom icon it positively observed during topic creation or editing. Observed ownership is stored in `state.db`, so known manual choices survive restarts. Private DM topics do not always deliver a creation update, so unknown icon state remains eligible during each session's one-shot first-title path, including after `/new` in an existing topic; this never triggers a background scan or mass edit. Because Telegram provides no topic-icon read-back endpoint, preservation can only be guaranteed for state Hermes observed. Hermes rechecks that state after icon selection so a manual change made while the auxiliary call is running still wins.
+With `preserve_manual_topic_icons: true` (the default), Hermes preserves a custom icon it positively observed during topic creation or editing. Observed ownership is stored in `state.db`, so known manual choices survive restarts. The default Bot API provider preserves the prior observation-based behavior. The custom-pack provider reads the exact current topic icon through MTProto before writing, then rechecks ownership after selection so a manual change made while the auxiliary call is running still wins.
 
 The rename and icon assignment are best-effort: failures are logged but don't break the session.
 

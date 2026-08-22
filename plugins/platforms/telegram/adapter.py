@@ -909,6 +909,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topic_icon_observer: Optional[
             Callable[[str, str, Optional[str]], None]
         ] = None
+        # Optional native user transport and custom-pack catalog are both
+        # profile-owned and lazy. Bot API remains the gateway transport.
+        self._telegram_user_transport = None
+        self._telegram_user_transport_key = None
+        self._custom_topic_icon_catalog = None
         # Track forum chats where we've already registered bot commands
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
@@ -4118,6 +4123,75 @@ class TelegramAdapter(BasePlatformAdapter):
             options.append({"emoji": emoji, "custom_emoji_id": custom_id})
         return options
 
+    async def get_telegram_user_transport(
+        self,
+        *,
+        active_bot_peer_id: int,
+        hermes_home=None,
+    ):
+        """Return this profile's narrow native topic transport."""
+        from hermes_constants import get_hermes_home
+        from plugins.platforms.telegram.mtproto_telethon import (
+            TelethonTelegramUserTransport,
+        )
+        from plugins.platforms.telegram.user_transport import (
+            TelegramUserTransportConfig,
+            TelegramUserTransportError,
+        )
+
+        if self._bot is None:
+            raise TelegramUserTransportError("Active Bot API identity is unavailable")
+        identity = await self._bot.get_me()
+        if getattr(identity, "id", None) != active_bot_peer_id:
+            raise TelegramUserTransportError(
+                "Active Bot API identity does not match the requested peer"
+            )
+        config = TelegramUserTransportConfig.from_mapping(
+            self.config.extra.get("user_transport")
+        )
+        profile_home = _Path(hermes_home or get_hermes_home())
+        bot_username = str(getattr(identity, "username", "") or "").strip() or None
+        key = (str(profile_home.resolve()), active_bot_peer_id, bot_username, config)
+        existing = getattr(self, "_telegram_user_transport", None)
+        if existing is not None and self._telegram_user_transport_key == key:
+            return existing
+        if existing is not None:
+            await existing.close()
+
+        from agent.secret_scope import get_secret
+
+        raw_api_id = str(get_secret("TELEGRAM_API_ID", "") or "").strip()
+        api_hash = str(get_secret("TELEGRAM_API_HASH", "") or "").strip()
+        try:
+            api_id = int(raw_api_id)
+        except (TypeError, ValueError) as exc:
+            raise TelegramUserTransportError(
+                "TELEGRAM_API_ID is missing or invalid for this profile"
+            ) from exc
+        if not api_hash:
+            raise TelegramUserTransportError(
+                "TELEGRAM_API_HASH is missing for this profile"
+            )
+        transport = TelethonTelegramUserTransport(
+            config=config,
+            active_bot_peer_id=active_bot_peer_id,
+            active_bot_username=bot_username,
+            api_id=api_id,
+            api_hash=api_hash,
+            hermes_home=profile_home,
+        )
+        self._telegram_user_transport = transport
+        self._telegram_user_transport_key = key
+        return transport
+
+    async def apply_custom_topic_icon_after_title(self, **kwargs):
+        """Delegate automatic custom-icon work outside the adapter god-file."""
+        from plugins.platforms.telegram.topic_icon_gateway import (
+            apply_custom_topic_icon_after_title,
+        )
+
+        return await apply_custom_topic_icon_after_title(self, **kwargs)
+
     @staticmethod
     def _dm_topic_icon_key(chat_id: str, thread_id: str) -> str:
         return f"{chat_id}:{thread_id}"
@@ -5500,6 +5574,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 "identity-refresh cancel",
             )
         self._bot_identity_refresh_task = None
+
+        user_transport = getattr(self, "_telegram_user_transport", None)
+        if user_transport is not None:
+            await self._await_disconnect_step(
+                user_transport.close(),
+                _DISCONNECT_STEP_TIMEOUT,
+                "Telegram user transport close",
+            )
+        self._telegram_user_transport = None
+        self._telegram_user_transport_key = None
 
         # Mark the bot "Offline" in its short description while the bot's HTTP
         # client is still alive (before app shutdown closes it). Opt-in via

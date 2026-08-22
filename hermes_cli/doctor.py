@@ -1298,6 +1298,29 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _check_telegram_user_transport(issues: list[str]) -> None:
+    """Aggregate the same local, non-networking checks as `hermes telegram doctor`."""
+    try:
+        from hermes_cli.telegram import _local_status
+        from hermes_cli.telegram_user import local_diagnostics
+
+        status = _local_status()
+        if not status.get("user_transport", {}).get("enabled", False):
+            check_info("Telegram user transport disabled (optional)")
+            return
+        for check in local_diagnostics(status):
+            name = str(check.get("name") or "telegram_user_transport")
+            if check.get("ok"):
+                check_ok(f"Telegram user transport: {name}")
+            else:
+                detail = str(check.get("detail") or "not ready")
+                check_fail(f"Telegram user transport: {name}", detail)
+                issues.append(f"Telegram user transport {name}: {detail}")
+    except Exception as exc:
+        check_fail("Telegram user transport diagnostics", "unavailable")
+        issues.append(f"Telegram user transport diagnostics unavailable: {type(exc).__name__}")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1517,6 +1540,9 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
+
+    _section("Telegram User Transport")
+    _check_telegram_user_transport(issues)
     
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.

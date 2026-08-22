@@ -4807,6 +4807,22 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "messaging",
     },
+    "TELEGRAM_API_ID": {
+        "description": "Telegram application API ID for the optional attended user transport",
+        "prompt": "Telegram application API ID",
+        "url": "https://my.telegram.org/apps",
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "TELEGRAM_API_HASH": {
+        "description": "Telegram application API hash for the optional attended user transport",
+        "prompt": "Telegram application API hash",
+        "url": "https://my.telegram.org/apps",
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     "TELEGRAM_ALLOWED_USERS": {
         "description": "Optional comma-separated numeric Telegram user IDs allowed immediately; leave blank to approve new users through DM pairing",
         "prompt": "Allowed Telegram user IDs (comma-separated)",

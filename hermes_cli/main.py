@@ -12443,7 +12443,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "telegram", "tools", "uninstall", "update",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -13546,6 +13546,13 @@ def main():
     # setup command  (parser built in hermes_cli/subcommands/setup.py)
     # =========================================================================
     build_setup_parser(subparsers, cmd_setup=cmd_setup)
+
+    # Hermes-specific Telegram administration. Bot API messaging remains in
+    # the gateway; this namespace owns only setup/health and narrow topic-icon
+    # user operations.
+    from hermes_cli.telegram import register_cli as _register_telegram_cli
+
+    _register_telegram_cli(subparsers)
 
 
     # =========================================================================

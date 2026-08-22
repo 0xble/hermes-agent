@@ -25765,13 +25765,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter is None:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
-        icon_custom_emoji_id = await self._select_telegram_topic_icon_id(
-            adapter,
-            source,
-            topic_name,
-            user_message,
-            preferred_aux_route=preferred_aux_route,
+        extra = self._telegram_topic_extra(source, adapter)
+        custom_pack_provider = (
+            str(extra.get("topic_icon_provider") or "telegram_default").strip()
+            == "telegram_custom_packs"
         )
+        icon_custom_emoji_id = None
+        if not custom_pack_provider:
+            icon_custom_emoji_id = await self._select_telegram_topic_icon_id(
+                adapter,
+                source,
+                topic_name,
+                user_message,
+                preferred_aux_route=preferred_aux_route,
+            )
         if session_db is not None:
             try:
                 latest_binding = await session_db.get_telegram_topic_binding(
@@ -25816,6 +25823,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Failed to persist automatic Telegram icon ownership", exc_info=True)
 
+        async def _apply_custom_pack_icon() -> None:
+            if not custom_pack_provider:
+                return
+            apply_icon = getattr(adapter, "apply_custom_topic_icon_after_title", None)
+            if not callable(apply_icon):
+                return
+            profile_home = self._resolve_profile_home_for_source(source)
+            try:
+                with _profile_runtime_scope(profile_home):
+                    await apply_icon(  # type: ignore[misc]
+                        chat_id=str(source.chat_id),
+                        thread_id=str(source.thread_id),
+                        session_id=str(session_id),
+                        title=topic_name,
+                        user_message=user_message,
+                        session_db=session_db,
+                        hermes_home=profile_home,
+                        preferred_aux_route=preferred_aux_route,
+                    )
+            except Exception:
+                logger.warning(
+                    "Telegram topic title was applied but custom icon assignment failed",
+                    exc_info=True,
+                )
+
         rename_topic = getattr(adapter, "rename_dm_topic", None)
         try:
             if rename_topic is not None:
@@ -25830,6 +25862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **rename_kwargs,
                 )
                 await _mark_auto_icon()
+                await _apply_custom_pack_icon()
                 return
 
             bot = getattr(adapter, "_bot", None)
@@ -25861,6 +25894,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **edit_kwargs,
                 )
             await _mark_auto_icon()
+            await _apply_custom_pack_icon()
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
