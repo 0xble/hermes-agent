@@ -50,9 +50,29 @@ _INERT_HEREDOC_CONSUMER_RE = re.compile(
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
     r"(?:env\s+)?"
     r"(?:[A-Za-z0-9_./-]+/)?"
-    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
+    r"(?P<consumer>python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
     re.IGNORECASE,
 )
+_DEFAULT_INERT_HEREDOC_CONSUMERS = frozenset({"python", "osascript", "cat"})
+_EXECUTABLE_HEREDOC_SHELL_RE = re.compile(
+    r"^\s*"
+    r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
+    r"(?:env\s+)?"
+    r"(?:[A-Za-z0-9_./-]+/)?"
+    r"(?P<shell>bash|sh|dash|ksh|zsh|ssh)(?=\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _body_has_executable_substitution(body: str) -> bool:
+    return (
+        "`" in body
+        or "<(" in body
+        or ">(" in body
+        or "=(" in body
+        or re.search(r"\$\((?!\()", body) is not None
+        or re.search(r"\$\{\|?\s", body) is not None
+    )
 
 
 def _mask_simple_quotes(command: str) -> str:
@@ -276,6 +296,102 @@ def _find_heredoc_close(
         if newline == -1:
             return None
         cursor = after
+
+
+def partition_heredoc_bodies(
+    command: str,
+    *,
+    inert_consumers: frozenset[str] = _DEFAULT_INERT_HEREDOC_CONSUMERS,
+    preserve_shell_dialect: bool = False,
+) -> tuple[str, tuple[str, ...], bool]:
+    """Separate outer shell text from heredoc bodies for recursive scanners.
+
+    Returns ``(outer_command, executable_bodies, unsafe)``. Every well-formed
+    body is masked from the outer command while preserving newlines. Bodies fed
+    to a shell-like or unknown consumer are returned for separate fail-closed
+    scanning. Quoted bodies for a known non-shell consumer are inert data;
+    unquoted data bodies are returned only when they contain command/process
+    substitution. Malformed or unterminated heredocs set ``unsafe`` and leave
+    the command unchanged.
+    """
+    if "<<" not in command:
+        return command, (), False
+
+    ranges: list[tuple[int, int]] = []
+    executable_bodies: list[str] = []
+    command_start = 0
+    last_opener_index = command.rfind("<<")
+
+    while command_start < len(command):
+        if command_start > last_opener_index:
+            break
+        command_end, specs, unknown_operator, has_list_operator = (
+            _scan_heredoc_command_unit(command, command_start)
+        )
+        if unknown_operator:
+            return command, (), True
+        if not specs:
+            if command_end >= len(command):
+                break
+            command_start = command_end + 1
+            continue
+        if command_end >= len(command):
+            return command, (), True
+
+        masked_opener = _mask_simple_quotes(command[command_start:command_end])
+        consumer_match = _INERT_HEREDOC_CONSUMER_RE.search(masked_opener)
+        shell_match = _EXECUTABLE_HEREDOC_SHELL_RE.search(masked_opener)
+        consumer = consumer_match.group("consumer").lower() if consumer_match else ""
+        if consumer.startswith("python"):
+            consumer = "python"
+        known_data_consumer = (
+            not has_list_operator
+            and not _contains_nested_shell_scope(masked_opener)
+            and consumer in inert_consumers
+        )
+        body_cursor = command_end + 1
+        for delimiter, strip_tabs, quoted in specs:
+            close_end = _find_heredoc_close(
+                command,
+                body_cursor,
+                delimiter,
+                strip_tabs,
+            )
+            if close_end is None:
+                return command, (), True
+            span = command[body_cursor:close_end]
+            lines = span.splitlines(keepends=True)
+            body = "".join(lines[:-1]) if lines else ""
+            if not quoted and _body_has_executable_substitution(body):
+                executable_bodies.append("$(")
+            elif not known_data_consumer:
+                if preserve_shell_dialect:
+                    if len(specs) > 1 or has_list_operator:
+                        body = f"#!/bin/sh\n{body}"
+                    elif shell_match is not None:
+                        shell_name = shell_match.group("shell").lower()
+                        if shell_name == "ssh":
+                            shell_name = "sh"
+                        body = f"#!/bin/{shell_name}\n{body}"
+                    elif consumer:
+                        body = f"#!/usr/bin/{consumer}\n{body}"
+                    else:
+                        body = f"#!/bin/sh\n{body}"
+                executable_bodies.append(body)
+            ranges.append((body_cursor, close_end))
+            body_cursor = close_end
+        command_start = body_cursor
+
+    if not ranges:
+        return command, tuple(executable_bodies), False
+    parts: list[str] = []
+    previous = 0
+    for start, end in ranges:
+        parts.append(command[previous:start])
+        parts.append("\n" * command.count("\n", start, end))
+        previous = end
+    parts.append(command[previous:])
+    return "".join(parts), tuple(executable_bodies), False
 
 
 def strip_inert_heredoc_bodies(command: str) -> str:

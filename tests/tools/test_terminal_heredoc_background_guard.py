@@ -22,7 +22,7 @@ cannot be bypassed: a false positive on exotic syntax is acceptable, hiding a
 real background operator is not.
 """
 
-from tools.shell_heredoc import strip_inert_heredoc_bodies
+from tools.shell_heredoc import partition_heredoc_bodies, strip_inert_heredoc_bodies
 from tools.terminal_tool import (
     _foreground_background_guidance as guidance,
     _strip_quotes,
@@ -32,6 +32,82 @@ from tools.terminal_tool import (
 # test file itself never trips a naive scanner. AMP is just an ampersand.
 AMP = chr(38)
 NL = chr(10)
+
+
+class TestHeredocPartitionForRecursiveScanners:
+    def test_data_body_is_masked_from_outer_shell(self):
+        command = "cat <<'EOF'\n[[\nEOF\nlaunchctl submit -l x -- /bin/true\n"
+        outer, bodies, unsafe = partition_heredoc_bodies(command)
+        assert unsafe is False
+        assert "[[" not in outer
+        assert "launchctl submit" in outer
+        assert bodies == ()
+
+    def test_shell_body_is_returned_for_recursive_scan(self):
+        command = "bash <<'EOF'\ncase x in *) true;; esac\nEOF\nprintf done\n"
+        outer, bodies, unsafe = partition_heredoc_bodies(command)
+        assert unsafe is False
+        assert "case x" not in outer
+        assert bodies == ("case x in *) true;; esac\n",)
+
+    def test_shell_body_can_preserve_consumer_dialect(self):
+        command = "sh <<'EOF'\n[[ x || true\nEOF\n"
+        _outer, bodies, unsafe = partition_heredoc_bodies(
+            command,
+            preserve_shell_dialect=True,
+        )
+        assert unsafe is False
+        assert bodies == ("#!/bin/sh\n[[ x || true\n",)
+
+    def test_program_body_can_preserve_consumer_dialect(self):
+        command = "python3 <<'PY'\n[[\nprint('ok')\n]]\nPY\n"
+        _outer, bodies, unsafe = partition_heredoc_bodies(
+            command,
+            preserve_shell_dialect=True,
+            inert_consumers=frozenset(),
+        )
+        assert unsafe is False
+        assert bodies == ("#!/usr/bin/python\n[[\nprint('ok')\n]]\n",)
+
+    def test_multiple_heredoc_consumers_fall_back_to_posix(self):
+        command = (
+            "bash <<'B1' | sh <<'B2'\n"
+            "[[ x == x ]]\nB1\n"
+            "[[ x || true\nB2\n"
+        )
+        _outer, bodies, unsafe = partition_heredoc_bodies(
+            command,
+            preserve_shell_dialect=True,
+            inert_consumers=frozenset(),
+        )
+        assert unsafe is False
+        assert bodies == (
+            "#!/bin/sh\n[[ x == x ]]\n",
+            "#!/bin/sh\n[[ x || true\n",
+        )
+
+    def test_list_heredoc_consumer_falls_back_to_posix(self):
+        command = "bash -c true && sh <<'EOF'\n[[ x || true\nEOF\n"
+        _outer, bodies, unsafe = partition_heredoc_bodies(
+            command,
+            preserve_shell_dialect=True,
+            inert_consumers=frozenset(),
+        )
+        assert unsafe is False
+        assert bodies == ("#!/bin/sh\n[[ x || true\n",)
+
+    def test_unquoted_data_substitution_is_returned_for_recursive_scan(self):
+        command = 'cat <<EOF\n$(bash "$SCRIPT")\nEOF\nprintf done\n'
+        outer, bodies, unsafe = partition_heredoc_bodies(command)
+        assert unsafe is False
+        assert "$(bash" not in outer
+        assert bodies == ("$(",)
+
+    def test_unterminated_heredoc_fails_closed(self):
+        outer, bodies, unsafe = partition_heredoc_bodies("cat <<'EOF'\npayload\n")
+        assert unsafe is True
+        assert outer == "cat <<'EOF'\npayload\n"
+        assert bodies == ()
 
 
 class TestInertQuotedHeredocPayloadAllowed:
