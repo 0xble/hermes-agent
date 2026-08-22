@@ -509,6 +509,22 @@ class TestGenerateTitle:
 
 
 class TestChooseTopicIcon:
+    def test_requests_up_to_six_ranked_unicode_selectors(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "🧹"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as llm:
+            choose_topic_icon(
+                "Workshop",
+                "clean the tools",
+                ["🧹", "💡", "🚀", "📊", "🛠️", "✅", "🎨"],
+            )
+
+        assert "Choose 6 distinct ranked emoji candidates" in (
+            llm.call_args.kwargs["messages"][0]["content"]
+        )
+
     def test_returns_exact_allowed_emoji(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

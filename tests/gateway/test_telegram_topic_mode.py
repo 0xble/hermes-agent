@@ -887,6 +887,51 @@ async def test_first_auto_title_assigns_icon_when_creation_state_is_unknown(tmp_
 
 
 @pytest.mark.asyncio
+async def test_custom_pack_icon_runs_after_bot_api_title_and_uses_native_service(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.apply_telegram_topic_migration()
+    db.create_session("sess-topic", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="42",
+        user_id="208214988",
+        session_key="agent:main:telegram:dm:208214988:42",
+        session_id="sess-topic",
+    )
+    runner = _make_runner(session_db=db)
+    runner._telegram_topic_mode_enabled = lambda source: True
+    adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
+    adapter.config = runner.config.platforms[Platform.TELEGRAM]
+    adapter.config.extra.update(
+        {
+            "auto_topic_icons": True,
+            "topic_icon_provider": "telegram_custom_packs",
+            "preserve_manual_topic_icons": True,
+        }
+    )
+    adapter.apply_custom_topic_icon_after_title = AsyncMock(
+        return_value={"result": "verified"}
+    )
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "Workshop Cleanup",
+        user_message="Organize the tools",
+    )
+
+    adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988", thread_id="42", name="Workshop Cleanup"
+    )
+    adapter.get_forum_topic_icon_options.assert_not_awaited()
+    adapter.apply_custom_topic_icon_after_title.assert_awaited_once()
+    kwargs = adapter.apply_custom_topic_icon_after_title.await_args.kwargs
+    assert kwargs["session_id"] == "sess-topic"
+    assert kwargs["title"] == "Workshop Cleanup"
+    assert kwargs["session_db"] is runner._session_db
+
+
+@pytest.mark.asyncio
 async def test_auto_topic_icon_uses_secondary_transport_profile_config():
     runner = _make_runner()
     default_adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
