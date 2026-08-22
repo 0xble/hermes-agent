@@ -1888,7 +1888,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         )
 
         assert [(str(path), shell) for path, shell in refs] == [
-            ("/remote/workspace/job.sh", True)
+            ("/remote/workspace/job.sh", "sh")
         ]
         writable = list(_iter_referenced_shell_scripts(
             "/opt/homebrew/bin/bash /remote/workspace/job.sh", remote=True))
@@ -2030,6 +2030,379 @@ class TestLifecycleGuardDataArgumentExemption:
             "WHERE msg LIKE '%systemctl restart hermes-gateway%'\""
         )
         check_gateway_lifecycle(prompt, str(script))
+
+
+class TestLifecycleGuardShellGrammar:
+    """Valid shell grammar must not become a fake executable reference."""
+
+    def _scan_script(self, tmp_path, body):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "check"
+        script.write_text(f"#!/bin/bash\n{body}", encoding="utf-8")
+        script.chmod(0o755)
+        return contains_gateway_lifecycle_command_or_referenced_script(str(script))
+
+    def test_case_default_pattern_is_not_an_executable(self, tmp_path):
+        assert (
+            self._scan_script(
+                tmp_path,
+                'case "${1:-}" in\n  --fast) true ;;\n  *) exit 64 ;;\nesac\n',
+            )
+            is False
+        )
+
+    def test_double_bracket_operands_are_not_executables(self, tmp_path):
+        assert (
+            self._scan_script(
+                tmp_path,
+                'configured_path=".git/hooks"\n'
+                'if [[ "$configured_path" == .lefthook || '
+                '"$configured_path" == */.lefthook ]]; then\n'
+                "  true\n"
+                "fi\n",
+            )
+            is False
+        )
+
+    def test_argument_position_double_bracket_cannot_poison_state(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            ': [[ && launchctl submit -l neutral -- /bin/true\n',
+        ) is True
+
+    def test_argument_position_double_bracket_remains_data(self, tmp_path):
+        assert self._scan_script(tmp_path, "printf '%s\\n' [[\n") is False
+
+    def test_inline_shell_payload_preserves_posix_dialect(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/sh -c '[[ x || launchctl submit -l neutral -- /bin/true'"
+        ) is True
+
+    def test_inline_bash_payload_retains_double_bracket_grammar(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/bash -c '[[ x == x ]]'"
+        ) is False
+
+    def test_bash_arithmetic_expansion_is_not_command_substitution(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "#!/bin/bash\n[[ $attempts -lt $((max_attempts + 1)) ]]\n"
+        ) is False
+
+    def test_zsh_process_substitution_fails_closed(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            '#!/bin/zsh\n[[ -f =(bash "$SCRIPT") ]]\n'
+        ) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "printf '%s\\n' '[['; launchctl submit -l neutral -- /bin/true\n",
+            "case x in *) printf '%s\\n' ';;'; "
+            "launchctl submit -l neutral -- /bin/true ;; esac\n",
+        ],
+    )
+    def test_quoted_grammar_cannot_hide_lifecycle_commands(self, tmp_path, body):
+        assert self._scan_script(tmp_path, body) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'case x in x) "$RUNNER" ;; esac\n',
+            "if [[ x == x ]]; then launchctl submit -l neutral -- /bin/true; fi\n",
+            'if "$RUNNER"; then true; fi\n',
+            'for value in $(bash "$SCRIPT"); do true; done\n',
+            "worker() { launchctl submit -l neutral -- /bin/true; }\n",
+            "function worker { launchctl submit -l neutral -- /bin/true; }\n",
+            "coproc worker if launchctl submit -l neutral -- /bin/true; then :; fi\n",
+            "[[ x == y ]]>/dev/null\n"
+            "launchctl submit -l neutral -- /bin/true\n",
+            "case x in x) true ;; esac>/dev/null\n"
+            "launchctl submit -l neutral -- /bin/true\n",
+            ": >/dev/null; launchctl submit -l neutral -- /bin/true\n",
+            "[[ x == x ]]>`launchctl submit -l neutral -- /bin/true`\n",
+            ": >`launchctl submit -l neutral -- /bin/true`\n",
+            "> out launchctl submit -l neutral -- /bin/true\n",
+            "< input launchctl submit -l neutral -- /bin/true\n",
+            "[[ ${ launchctl submit -l neutral -- /bin/true; } == x ]]\n",
+            "case x in ${| launchctl submit -l neutral -- /bin/true; }) true ;; esac\n",
+            "case $'x\\ny' in\n'x\ny')\n"
+            "launchctl submit -l neutral -- /bin/true\n;;\nesac\n",
+            "time -p launchctl submit -l neutral -- /bin/true\n",
+            ': > "$(launchctl${IFS}submit -l neutral -- /bin/true)"\n',
+            ': <<< "$(launchctl${IFS}submit -l neutral -- /bin/true)"\n',
+            "time -`launchctl${IFS}submit -l neutral -- /bin/true` true\n",
+            "2>&1 launchctl submit -l neutral -- /bin/true\n",
+            "3<&0 launchctl submit -l neutral -- /bin/true\n",
+            ">|/tmp/log launchctl submit -l neutral -- /bin/true\n",
+            "{guard_fd}>/tmp/log launchctl submit -l neutral -- /bin/true\n",
+        ],
+    )
+    def test_compound_grammar_cannot_hide_first_executable(
+        self, tmp_path, body
+    ):
+        assert self._scan_script(tmp_path, body) is True
+
+    def test_time_options_are_not_executables(self, tmp_path):
+        assert self._scan_script(tmp_path, "time -p pnpm lint\n") is False
+
+    def test_named_coproc_compound_command_is_parsed(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "coproc worker if true; then :; fi\n",
+        ) is False
+
+    def test_descriptor_redirections_are_not_executables(self, tmp_path):
+        assert self._scan_script(tmp_path, "2>&1 pnpm lint\n") is False
+        assert self._scan_script(tmp_path, ">|/tmp/log pnpm lint\n") is False
+        assert self._scan_script(
+            tmp_path,
+            "{guard_fd}>/tmp/log pnpm lint\n",
+        ) is False
+
+    def test_posix_select_does_not_poison_loop_state(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        payload = tmp_path / "payload.sh"
+        payload.write_text("hermes gateway restart\n", encoding="utf-8")
+        payload.chmod(0o755)
+        script = tmp_path / "posix-check"
+        script.write_text(f"#!/bin/sh\nselect\n{payload}\n", encoding="utf-8")
+        script.chmod(0o755)
+        assert contains_gateway_lifecycle_command_or_referenced_script(str(script)) is True
+
+    def test_posix_shell_argument_decorates_shebangless_script(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        payload = tmp_path / "payload"
+        payload.write_text(
+            "[[ x || launchctl submit -l neutral -- /bin/true; ]]\n",
+            encoding="utf-8",
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"/bin/sh {payload}"
+        ) is True
+
+    def test_posix_shell_argument_overrides_bash_shebang(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        payload = tmp_path / "payload-with-shebang"
+        payload.write_text(
+            "#!/bin/bash\n[[ x || launchctl submit -l neutral -- /bin/true; ]]\n",
+            encoding="utf-8",
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"/bin/sh {payload}"
+        ) is True
+
+    def test_bash_argument_overrides_posix_shebang(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        payload = tmp_path / "bash-payload-with-posix-shebang"
+        payload.write_text(
+            "#!/bin/sh\n[[ x == x ]]\n",
+            encoding="utf-8",
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f"/bin/bash {payload}"
+        ) is False
+
+    def test_case_branch_scans_first_referenced_script(self, tmp_path):
+        payload = tmp_path / "payload.sh"
+        payload.write_text("hermes gateway restart\n", encoding="utf-8")
+        payload.chmod(0o755)
+        assert self._scan_script(
+            tmp_path,
+            f"case x in x) {payload} ;; esac\n",
+        ) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "printf '%s\\n' '[[' ';;'\n",
+            'case "$value" in \'$(\') true ;; esac\n',
+            'if [[ "$value" == \'$(\' ]]; then true; fi\n',
+        ],
+    )
+    def test_quoted_grammar_and_substitutions_remain_inert(self, tmp_path, body):
+        assert self._scan_script(tmp_path, body) is False
+
+    @pytest.mark.parametrize(
+        "delimiter",
+        ["'EOF'", "EOF"],
+    )
+    def test_heredoc_data_cannot_poison_outer_shell_state(
+        self, tmp_path, delimiter
+    ):
+        assert self._scan_script(
+            tmp_path,
+            f"cat <<{delimiter}\n[[\ncase x in\nEOF\n"
+            "launchctl submit -l neutral -- /bin/true\n",
+        ) is True
+
+    def test_inert_heredoc_grammar_remains_data(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<'EOF'\n[[\ncase x in\nEOF\nprintf done\n",
+        ) is False
+
+    def test_shell_heredoc_body_is_scanned_separately(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "bash <<'EOF'\nbash \"$SCRIPT\"\nEOF\nprintf done\n",
+        ) is True
+
+    def test_shell_heredoc_body_preserves_posix_dialect(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "/bin/sh <<'EOF'\n"
+            "[[ x || launchctl submit -l neutral -- /bin/true\n"
+            "EOF\n",
+        ) is True
+
+    def test_shell_heredoc_body_preserves_bash_dialect(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "/bin/bash <<'EOF'\n[[ x == x ]]\nEOF\n",
+        ) is False
+
+    def test_multiple_heredoc_consumers_fail_closed_to_posix(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "bash <<'B1' | sh <<'B2'\n"
+            "true\nB1\n"
+            "[[ x || launchctl submit -l neutral -- /bin/true; : ]]\nB2\n",
+        ) is True
+
+    def test_list_heredoc_consumer_fails_closed_to_posix(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "/bin/bash -c true && /bin/sh <<'EOF'\n"
+            "[[ x || launchctl submit -l neutral -- /bin/true\n"
+            "EOF\n",
+        ) is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "python3 <<'PY'\nimport os; os.system('hermes gateway restart')\nPY\n",
+            'osascript <<\'APPLESCRIPT\'\ndo shell script "hermes gateway restart"\nAPPLESCRIPT\n',
+        ],
+    )
+    def test_program_heredoc_body_is_scanned_separately(
+        self, tmp_path, body
+    ):
+        assert self._scan_script(tmp_path, body) is True
+
+    def test_program_heredoc_body_does_not_use_bash_grammar(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "python3 <<'PY'\n"
+            "[[\n"
+            '__import__("os").system("hermes gateway restart")\n'
+            "]]\n"
+            "PY\n",
+        ) is True
+
+    def test_benign_program_heredoc_brackets_remain_data(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "python3 <<'PY'\n[[\nprint('ok')\n]]\nPY\n",
+        ) is False
+
+    def test_program_heredoc_loop_does_not_poison_shell_state(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "python3 <<'PY'\n"
+            "for x in [1]:\n"
+            " __import__('os').system('hermes gateway restart')\n"
+            "PY\n",
+        ) is True
+
+    def test_benign_program_heredoc_loop_remains_data(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "python3 <<'PY'\nfor x in [1]:\n print(x)\nPY\n",
+        ) is False
+
+    def test_benign_program_shift_is_not_nested_heredoc(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "python3 <<'PY'\nvalue = 1 << 2\nprint(value)\nPY\n",
+        ) is False
+
+    def test_bare_cat_heredoc_is_scanned_fail_closed(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<'EOF'\nhermes gateway restart\nEOF\nprintf done\n",
+        ) is True
+
+    def test_unquoted_data_heredoc_substitution_fails_closed(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<EOF\n$(bash \"$SCRIPT\")\nEOF\nprintf done\n",
+        ) is True
+
+    def test_unquoted_heredoc_arithmetic_remains_inert(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<EOF\nvalue=$((1 + 2))\nEOF\n",
+        ) is False
+
+    def test_nested_command_substitution_in_arithmetic_fails_closed(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<EOF\nvalue=$(( $(bash \"$SCRIPT\") ))\nEOF\n",
+        ) is True
+
+    def test_unquoted_heredoc_body_quotes_do_not_hide_substitution(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<EOF\nprintf '%s\\n' '$(bash \"$SCRIPT\")'\nEOF\n",
+        ) is True
+
+    def test_quoted_heredoc_body_quotes_keep_substitution_inert(self, tmp_path):
+        assert self._scan_script(
+            tmp_path,
+            "cat <<'EOF'\nprintf '%s\\n' '$(bash \"$SCRIPT\")'\nEOF\n",
+        ) is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'case "$value" in\n  $(printf pattern)) true ;;\nesac\n',
+            'case "$value" in $(bash "$SCRIPT")) true ;; esac\n',
+            'if [[ -n "$(printf value)" ]]; then true; fi\n',
+        ],
+    )
+    def test_executing_shell_grammar_remains_fail_closed(self, tmp_path, body):
+        assert self._scan_script(tmp_path, body) is True
 
 
 class TestLifecycleGuardNeverRaises:
