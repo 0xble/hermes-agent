@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 
 import pytest
 
@@ -93,6 +94,37 @@ async def test_attended_login_renders_qr_and_prompts_for_2fa_locally_hidden(tmp_
     assert prompts == ["Telegram cloud 2FA password: "]
     assert client_box[0].passwords == ["2fa-secret"]
     assert client_box[0].disconnected is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not enforced")
+async def test_attended_login_creates_new_session_with_private_mode(tmp_path):
+    class NewSessionClient(_Client):
+        async def connect(self):
+            path = telegram_user_session_path(self.session_path.parents[2])
+            descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o666)
+            os.close(descriptor)
+
+    previous_umask = os.umask(0o022)
+    try:
+        identity = await authorize_attended(
+            config=_config(),
+            api_id=123,
+            api_hash="api-secret",
+            hermes_home=tmp_path,
+            client_factory=lambda *_args, **_kwargs: NewSessionClient(
+                telegram_user_session_path(tmp_path)
+            ),
+            password_needed_exception=_PasswordNeeded,
+            qr_renderer=lambda _value: None,
+            password_prompt=lambda _prompt: "2fa-secret",
+        )
+    finally:
+        os.umask(previous_umask)
+
+    session = telegram_user_session_path(tmp_path)
+    assert identity.user_id == 101
+    assert stat.S_IMODE(session.stat().st_mode) == 0o600
 
 
 @pytest.mark.asyncio
