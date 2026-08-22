@@ -58,7 +58,7 @@ _EXECUTABLE_HEREDOC_SHELL_RE = re.compile(
     r"^\s*"
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
     r"(?:env\s+)?"
-    r"(?:[A-Za-z0-9_./-]+/)?"
+    r"(?P<path>/bin/|/usr/bin/)?"
     r"(?P<shell>bash|sh|dash|ksh|zsh|ssh)(?=\s|$)",
     re.IGNORECASE,
 )
@@ -370,7 +370,11 @@ def partition_heredoc_bodies(
                         body = f"#!/bin/sh\n{body}"
                     elif shell_match is not None:
                         shell_name = shell_match.group("shell").lower()
-                        if shell_name == "ssh":
+                        trusted_path = shell_match.group("path") in {"/bin/", "/usr/bin/"}
+                        if shell_name == "ssh" or (
+                            shell_name in {"bash", "zsh", "ksh"}
+                            and not trusted_path
+                        ):
                             shell_name = "sh"
                         body = f"#!/bin/{shell_name}\n{body}"
                     elif consumer:

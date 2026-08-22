@@ -2111,6 +2111,9 @@ class TestLifecycleGuardShellGrammar:
         assert contains_gateway_lifecycle_command_or_referenced_script(
             "/bin/sh -c '[[ x || launchctl submit -l neutral -- /bin/true'"
         ) is True
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "bash -c '[[ x || launchctl submit -l neutral -- /bin/true'"
+        ) is True
 
     def test_inline_bash_payload_retains_double_bracket_grammar(self):
         from cron.lifecycle_guard import (
@@ -2129,6 +2132,12 @@ class TestLifecycleGuardShellGrammar:
         assert contains_gateway_lifecycle_command_or_referenced_script(
             "#!/bin/bash\n[[ $attempts -lt $((max_attempts + 1)) ]]\n"
         ) is False
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "#!/bin/bash\n(( case = 1 ))\n"
+        ) is False
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            '#!/bin/bash\n(( case = $(bash "$SCRIPT") ))\n'
+        ) is True
 
     def test_zsh_process_substitution_fails_closed(self):
         from cron.lifecycle_guard import (
@@ -2318,6 +2327,12 @@ class TestLifecycleGuardShellGrammar:
             tmp_path,
             "/bin/bash <<'EOF'\n[[ x == x ]]\nEOF\n",
         ) is False
+        assert self._scan_script(
+            tmp_path,
+            "bash <<'EOF'\n"
+            "[[ x || launchctl submit -l neutral -- /bin/true\n"
+            "EOF\n",
+        ) is True
 
     def test_multiple_heredoc_consumers_fail_closed_to_posix(self, tmp_path):
         assert self._scan_script(
