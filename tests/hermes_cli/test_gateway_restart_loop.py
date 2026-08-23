@@ -592,10 +592,17 @@ class TestTerminalToolGatewayLifecycleGuard:
             "setsid hermes gateway restart"
         )
 
-    def test_blocks_variable_resolved_lifecycle_executable(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'gateway_cmd=hermes; "$gateway_cmd" gateway restart',
+            'gateway_cmd=hermes; env "$gateway_cmd" gateway restart',
+            'gateway_cmd=hermes; command "$gateway_cmd" gateway stop',
+        ],
+    )
+    def test_blocks_variable_resolved_lifecycle_executable(self, monkeypatch, command):
         import tools.terminal_tool as tt
 
-        command = 'gateway_cmd=hermes; "$gateway_cmd" gateway restart'
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
         monkeypatch.setattr(
             tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
