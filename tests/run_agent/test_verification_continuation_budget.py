@@ -148,8 +148,13 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
 
 
 def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
-    agent, monkeypatch
+    agent, monkeypatch, tmp_path
 ):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id=agent.session_id, source="cli")
+    agent._session_db = db
     agent.max_iterations = 3
     agent.iteration_budget.max_total = 3
     blocker = "I cannot provide fresh verification evidence for that edit."
@@ -191,6 +196,10 @@ def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
         for message in result["messages"]
         if isinstance(message, dict)
     )
+    persisted = db.get_messages(agent.session_id)
+    assert [message["role"] for message in persisted] == ["user", "assistant"], persisted
+    assert persisted[-1]["content"] == expected
+    db.close()
 
 
 def test_verification_composition_persists_transformed_canonical_response(
