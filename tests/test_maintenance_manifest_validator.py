@@ -259,3 +259,11 @@ def test_history_validation_accepts_same_commit_registration(tmp_path):
     _git(repo, "commit", "-m", "fix: registered")
 
     assert validate_manifest(manifest, history_baseline=baseline) == []
+
+
+def test_ci_validates_pull_request_head_instead_of_synthetic_merge():
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "lint.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
