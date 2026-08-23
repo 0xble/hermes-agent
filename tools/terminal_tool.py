@@ -3151,6 +3151,8 @@ def terminal_tool(
                 read_remote_script=(
                     _read_script_in_env if env_type != "local" else None
                 ),
+                execution_only=True,
+                fail_on_unresolved=False,
             ):
                 return json.dumps({
                     "output": "",

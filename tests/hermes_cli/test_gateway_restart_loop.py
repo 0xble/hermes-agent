@@ -556,6 +556,46 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    @pytest.mark.parametrize(
+        "script_body",
+        [
+            "#!/bin/bash\nprintf '%s\\n' 'hermes gateway restart'\n",
+            (
+                "#!/bin/bash\n"
+                "RUNNER=${RUNNER:-python3}\n"
+                "[ -x \"$RUNNER\" ] || true\n"
+                "\"$RUNNER\" -m pytest --version\n"
+            ),
+        ],
+    )
+    def test_allows_benign_referenced_test_and_diagnostic_scripts(
+        self, monkeypatch, tmp_path, script_body
+    ):
+        """Referenced source is judged by executed argv, not vocabulary or expansion."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "ok", "returncode": 0}
+
+        script = tmp_path / "benign.sh"
+        script.write_text(script_body, encoding="utf-8")
+        command = f"/bin/bash {script}"
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
     def test_blocks_lifecycle_command_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
     ):
