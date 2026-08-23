@@ -86,6 +86,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(deps): clear known lockfile vulnerabilities` | Security-only updates to Electron, nanoid, h2, and hpack; no fork-owned product contract. |
 | `fix(ci): enforce patch history without code-scanning dependency` | Fork-governance and CI reporting enforcement only; no shipped Hermes behavior. |
 | `fix(deps): align desktop Electron build pin` | Mechanical build metadata alignment for the reviewed Electron security update. |
+| `fix(ci): preserve OSV findings without code scanning` | CI artifact and review-status routing repair only; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
