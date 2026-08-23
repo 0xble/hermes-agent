@@ -296,6 +296,15 @@ def _canonical_name_for_message(
     return None
 
 
+def _punctuation_tolerant_alias_pattern(alias: str) -> Optional[re.Pattern]:
+    """Match the same multiword alias even when model punctuation drifts."""
+    words = re.findall(r"\w+", alias, flags=re.UNICODE)
+    if len(words) < 2:
+        return None
+    body = r"(?:[\W_]+)".join(re.escape(word) for word in words)
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
+
+
 def _build_title_prompt(
     *,
     language: str,
@@ -740,6 +749,10 @@ def generate_title(
                         continue
                     pattern = re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)", re.IGNORECASE)
                     title, count = pattern.subn(canonical_name, title)
+                    if not count:
+                        loose_pattern = _punctuation_tolerant_alias_pattern(alias)
+                        if loose_pattern is not None:
+                            title, count = loose_pattern.subn(canonical_name, title)
                     if count:
                         replaced = True
                         break

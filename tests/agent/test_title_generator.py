@@ -425,6 +425,39 @@ class TestGenerateTitle:
 
         assert title == "ProjectAtlas"
 
+    def test_alias_restores_punctuation_dropped_by_model(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "Quarterly Host Home Pricing Audit"
+        config = {
+            "auxiliary": {
+                "title_generation": {
+                    "name_aliases": {"host & home": "Host & Home"}
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config_readonly", return_value=config), patch(
+            "agent.title_generator.call_llm", return_value=response
+        ):
+            title = generate_title("Audit Host & Home quarterly pricing")
+        assert title == "Quarterly Host & Home Pricing Audit"
+
+    def test_alias_preserves_stylized_brand_case(self):
+        aliases = {"gog": "gog", "onepass": "1Password"}
+        cases = [
+            ("Validate gog email", "Gog Email Validation", "gog Email Validation"),
+            ("Resolve onepass key", "OnePass Key Resolution", "1Password Key Resolution"),
+        ]
+        for user_message, model_title, expected in cases:
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = model_title
+            config = {"auxiliary": {"title_generation": {"name_aliases": aliases}}}
+            with patch("hermes_cli.config.load_config_readonly", return_value=config), patch(
+                "agent.title_generator.call_llm", return_value=response
+            ):
+                assert generate_title(user_message) == expected
+
     def test_character_limit_outranks_invalid_overlong_alias(self):
         response = MagicMock()
         response.choices = [MagicMock()]
