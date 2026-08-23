@@ -557,6 +557,53 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert "Blocked" in result["error"]
 
     @pytest.mark.parametrize(
+        "command",
+        [
+            "timeout 5 hermes gateway restart",
+            "nice hermes gateway restart",
+            "eval 'hermes gateway restart'",
+        ],
+    )
+    def test_blocks_lifecycle_actions_through_execution_wrappers(
+        self, monkeypatch, command
+    ):
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_execution_classifier_unwraps_setsid(self):
+        from cron.lifecycle_guard import contains_executed_gateway_lifecycle_command
+
+        assert contains_executed_gateway_lifecycle_command(
+            "setsid hermes gateway restart"
+        )
+
+    @pytest.mark.parametrize(
+        "command",
+        ["command -v hermes gateway restart", "command -V hermes gateway restart"],
+    )
+    def test_allows_nonexecuting_command_lookup(self, monkeypatch, command):
+        import tools.terminal_tool as tt
+
+        class _LookupEnv:
+            env = {}
+
+            def execute(self, executed, **kwargs):
+                return {"output": executed, "returncode": 0}
+
+        self._patch_env(monkeypatch, _LookupEnv(), inside_gateway=True)
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+
+    @pytest.mark.parametrize(
         "script_body",
         [
             "#!/bin/bash\nprintf '%s\\n' 'hermes gateway restart'\n",
