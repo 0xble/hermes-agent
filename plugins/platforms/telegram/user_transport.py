@@ -206,9 +206,10 @@ def telegram_user_lock_path(hermes_home: Path) -> Path:
 
 
 def _require_owned(path: Path) -> None:
-    if os.name == "nt" or not hasattr(os, "getuid"):
+    getuid = getattr(os, "getuid", None)
+    if os.name == "nt" or getuid is None:
         return
-    if path.stat(follow_symlinks=False).st_uid != os.getuid():
+    if path.stat(follow_symlinks=False).st_uid != getuid():
         raise TelegramUserTransportError("Telegram user session path has unsafe ownership")
 
 

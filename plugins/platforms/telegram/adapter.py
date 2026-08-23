@@ -6135,17 +6135,14 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                # Telegram can return a one-off "thread not found"
-                                # for a healthy topic. Confirm with one immediate
-                                # same-thread retry before declaring the topic stale.
-                                if not retried_thread_not_found:
-                                    retried_thread_not_found = True
-                                    logger.warning(
-                                        "[%s] Thread %s not found, retrying once with same thread_id",
-                                        self.name, effective_thread_id,
-                                    )
-                                    continue
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                created_or_private_topic = private_dm_topic_send or bool(
+                                    metadata and metadata.get("telegram_dm_topic_created_for_send")
+                                )
+                                # A topic created for this send is not a stale
+                                # pre-existing binding. Retrying the same rejected
+                                # thread can duplicate an ambiguous delivery and
+                                # must never fall back into All Messages.
+                                if created_or_private_topic:
                                     if private_dm_topic_send and self._mark_dm_topic_stale(chat_id, effective_thread_id):
                                         self._prune_stale_dm_topic_binding(chat_id, effective_thread_id)
                                     return SendResult(
@@ -6158,6 +6155,17 @@ class TelegramAdapter(BasePlatformAdapter):
                                         },
                                         retryable=False,
                                     )
+                                # Telegram can return a one-off "thread not found"
+                                # for an existing healthy topic. Confirm with one
+                                # immediate same-thread retry before declaring the
+                                # existing binding stale.
+                                if not retried_thread_not_found:
+                                    retried_thread_not_found = True
+                                    logger.warning(
+                                        "[%s] Thread %s not found, retrying once with same thread_id",
+                                        self.name, effective_thread_id,
+                                    )
+                                    continue
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune

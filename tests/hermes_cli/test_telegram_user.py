@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +23,28 @@ from tests.hermes_cli.test_telegram_namespace import _parser
 
 class _PasswordNeeded(Exception):
     pass
+
+
+class _FakeQrCode:
+    def __init__(self, **_kwargs):
+        pass
+
+    def add_data(self, _value):
+        pass
+
+    def make(self, **_kwargs):
+        pass
+
+    def make_image(self, **_kwargs):
+        return SimpleNamespace(save=lambda stream: stream.write(b"synthetic-qr"))
+
+    def print_ascii(self, **_kwargs):
+        pass
+
+
+def _install_fake_qrcode(monkeypatch):
+    """Keep QR safety tests independent of the optional Telegram extra."""
+    monkeypatch.setitem(sys.modules, "qrcode", SimpleNamespace(QRCode=_FakeQrCode))
 
 
 class _Qr:
@@ -282,6 +306,7 @@ async def test_logout_remains_available_when_transport_is_disabled(tmp_path):
 
 
 def test_qr_renderer_rejects_preexisting_symlink(tmp_path, monkeypatch):
+    _install_fake_qrcode(monkeypatch)
     monkeypatch.setattr("plugins.platforms.telegram.mtproto_telethon.sys.platform", "darwin")
     target = tmp_path / "outside.txt"
     target.write_text("do not truncate", encoding="utf-8")
@@ -295,6 +320,7 @@ def test_qr_renderer_rejects_preexisting_symlink(tmp_path, monkeypatch):
 def test_qr_renderer_removes_partial_artifact_when_preview_launch_fails(
     tmp_path, monkeypatch
 ):
+    _install_fake_qrcode(monkeypatch)
     monkeypatch.setattr("plugins.platforms.telegram.mtproto_telethon.sys.platform", "darwin")
 
     def fail_open(*_args, **_kwargs):
