@@ -82,8 +82,8 @@ def _compose_verification_receipt_with_answer(
 ) -> str | None:
     """Keep a real answer when a verification continuation returns only its receipt.
 
-    Repeated verification passes replace a prior receipt rather than stacking
-    duplicate sections. Ordinary complete responses remain authoritative.
+    Identical synthesized receipts are deduplicated. A pending answer is never
+    parsed or truncated based on user-visible headings.
     """
     if not pending_response or not final_response:
         return final_response
@@ -93,10 +93,10 @@ def _compose_verification_receipt_with_answer(
         return final_response
     if not _VERIFICATION_RECEIPT_PREFIX.match(final):
         return final_response
-    if _VERIFICATION_RECEIPT_PREFIX.match(pending):
-        return final_response
-    answer = pending.split(_VERIFICATION_SECTION, 1)[0].rstrip()
-    return f"{answer}{_VERIFICATION_SECTION}{final}"
+    receipt_suffix = f"{_VERIFICATION_SECTION}{final}"
+    if pending.endswith(receipt_suffix):
+        return pending_response
+    return f"{pending_response.rstrip()}{receipt_suffix}"
 
 
 def _merge_verification_candidate(
