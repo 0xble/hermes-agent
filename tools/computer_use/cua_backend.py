@@ -4089,9 +4089,20 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
+        # Prefer the live input schema over the optional capability label.
+        # cua-driver 0.21 exposes and requires ``element_token`` in the click
+        # schema but does not advertise ``accessibility.element_tokens`` in
+        # tools/list. Gating only on the capability label therefore strips a
+        # valid token and makes every element-index action fail with
+        # ``snapshot_id_required``. Older drivers remain safe because their
+        # strict schemas do not expose the property.
+        accepts_token = self._session.supports_input_property(
+            tool, "element_token"
+        )
+        advertises_token = self._session.supports_capability(
             "accessibility.element_tokens", tool=tool
-        ):
+        )
+        if not (accepts_token or advertises_token):
             return
         args["element_token"] = token
 
