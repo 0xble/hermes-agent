@@ -1058,10 +1058,12 @@ TELEGRAM_RICH_MESSAGES_HINT = (
     "`$$...$$`), underline, subscript/superscript, marked (highlighted) "
     "text, and anchors. Default to structured formatting over dense "
     "paragraphs for any comparison, set of steps, key/value summary, or "
-    "tabular data. Prefer real Markdown tables and task lists over "
-    "hand-built bullet substitutes when presenting structured data; these "
-    "degrade gracefully (tables become readable bullet groups) when rich "
-    "rendering is unavailable, but advanced constructs like math and "
+    "tabular data. Use real Markdown tables for compact tabular data and "
+    "real task lists instead of hand-built substitutes. Keep tables narrow. "
+    "When many columns would force horizontal scanning or scrolling, "
+    "transpose or split the data into vertically stacked records with labeled "
+    "fields. Rich tables degrade gracefully into readable bullet groups when "
+    "rich rendering is unavailable, but advanced constructs like math and "
     "collapsible details may render as plain source text in that case. "
 )
 

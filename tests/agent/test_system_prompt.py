@@ -411,6 +411,7 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" in stable
         assert "task lists" in stable
         assert "math/formulas" in stable
+        assert "Keep tables narrow" in stable
 
     def test_rich_hint_from_top_level_platforms(self):
         """Top-level ``platforms.telegram.extra.rich_messages`` is merged

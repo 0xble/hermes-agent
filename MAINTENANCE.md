@@ -68,6 +68,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
 | HERMES-043 | Active | `fix(gateway): skip completed legacy resumes` | Avoid re-running completed legacy sessions during startup continuation recovery. |
 | HERMES-044 | Active | `fix(output): compose and protect final responses` | Compose plugin output transforms without letting empty or non-substantive transforms erase the final answer. |
+| HERMES-045 | Active | `fix(telegram): keep rich tables narrow` | Prefer compact tables and vertically stacked records over wide Telegram output. |
 
 ## Fork-only administrative subject exemptions
 
@@ -85,6 +86,16 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-045 — Keep rich Telegram tables narrow
+
+- **Summary:** Narrows the rich-message prompt so compact tables remain available while many-column data is transposed or split into vertically stacked records with labeled fields instead of requiring horizontal scanning or scrolling on a phone. Existing Telegram table rendering and fallback conversion remain unchanged.
+- **Surfaces:** `agent/prompt_builder.py`; `tests/agent/test_system_prompt.py`.
+- **Upstream tracking:** Closed issue #14160 and merged PR #16997 introduced Telegram table-to-row-group fallback. Closed issue #47095 tracks native Bot API 10.1 table support and was marked duplicate. Closed issue #46009 repaired rich formatting during streamed edits. No exact upstream issue or pull request requires the model prompt to avoid wide native tables as of upstream `0159b51f2b1cdaa8fcf65d181fc0527692724fae` on 2026-08-23.
+- **Upstream PR:** None for narrow rich-table generation after checked 2026-08-23. Related merged PR: #16997.
+- **Regression:** `.venv/bin/python -m pytest tests/agent/test_system_prompt.py tests/agent/test_prompt_builder.py -q`; `git diff --check`.
+- **Rollback:** Restore `TELEGRAM_RICH_MESSAGES_HINT` to prefer real Markdown tables for all structured data and remove the focused narrow-table assertion. Preserve rich-message activation, native table rendering, fallback row-group conversion, and unrelated formatting guidance.
+- **Retirement:** Retire after released upstream instructs agents to keep native tables phone-readable by using compact tables and vertically stacked labeled records for wide data, while preserving existing rich-message behavior and passing the focused prompt regression.
 
 ### HERMES-033 — Defer automatic retries after growth rejection
 
