@@ -83,6 +83,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `test: force sounddevice path in beep unit test` | Host-specific test-fixture repair only; no shipped Hermes behavior. |
 | `docs(fork): register reconciled compression patch` | Maintenance-only manifest correction for the rebased compression compatibility patch. |
 | `fix(title): remove duplicate hashlib import` | Mechanical duplicate-import cleanup only; no independently retireable behavior. |
+| `fix(deps): clear known lockfile vulnerabilities` | Security-only updates to Electron, nanoid, h2, and hpack; no fork-owned product contract. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
