@@ -67,13 +67,22 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 
 
 _VERIFICATION_RECEIPT_PREFIX = re.compile(
-    r"^\s*(?:"
-    r"(?:fresh\s+)?verification\b"
-    r"|i\s+(?:cannot|can't|could\s+not)\s+provide\s+fresh\s+verification\s+evidence\b"
-    r")",
+    r"^\s*fresh\s+verification(?:\s+from\s+this\s+turn)?\s+passes\b",
+    re.IGNORECASE,
+)
+_VERIFICATION_FAILURE_RECEIPT = re.compile(
+    r"^\s*i\s+(?:cannot|can't|could\s+not)\s+provide\s+fresh\s+verification\s+"
+    r"evidence\s+for\s+(?:that|this)\s+edit\.\s*$",
     re.IGNORECASE,
 )
 _VERIFICATION_SECTION = "\n\n## Verification\n\n"
+
+
+def _is_verification_receipt_only(response: str) -> bool:
+    return bool(
+        _VERIFICATION_RECEIPT_PREFIX.match(response)
+        or _VERIFICATION_FAILURE_RECEIPT.fullmatch(response)
+    )
 
 
 def _compose_verification_receipt_with_answer(
@@ -91,7 +100,7 @@ def _compose_verification_receipt_with_answer(
     final = final_response.strip()
     if pending == final:
         return final_response
-    if not _VERIFICATION_RECEIPT_PREFIX.match(final):
+    if not _is_verification_receipt_only(final):
         return final_response
     receipt_suffix = f"{_VERIFICATION_SECTION}{final}"
     if pending.endswith(receipt_suffix):
@@ -110,6 +119,20 @@ def _merge_verification_candidate(
         pending_response,
         candidate_response,
     )
+
+
+def _verification_candidate_replaces_pending(
+    pending_response: str | None,
+    candidate_response: str | None,
+) -> bool:
+    """Return whether a complete later candidate supersedes prior visible text."""
+    if not pending_response or not candidate_response:
+        return False
+    if pending_response.strip() == candidate_response.strip():
+        return False
+    return not _is_verification_receipt_only(candidate_response)
+
+
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,

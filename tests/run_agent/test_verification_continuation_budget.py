@@ -100,6 +100,23 @@ def test_complete_later_answer_still_replaces_pending_answer():
     assert result == "The complete verified answer."
 
 
+@pytest.mark.parametrize(
+    "complete_answer",
+    [
+        (
+            "I cannot provide fresh verification evidence for the original edit, "
+            "so I reverted it and implemented the corrected solution."
+        ),
+        "Verification report: the corrected implementation is complete.",
+    ],
+)
+def test_substantive_verification_response_replaces_pending_answer(complete_answer):
+    assert _compose_verification_receipt_with_answer(
+        "The obsolete answer.",
+        complete_answer,
+    ) == complete_answer
+
+
 def test_provisional_verification_candidates_remain_crash_durable():
     assert not _is_ephemeral_scaffolding(
         {
