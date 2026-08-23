@@ -565,6 +565,8 @@ class TestTerminalToolGatewayLifecycleGuard:
             "exec -a harmless hermes gateway stop",
             "sudo NAME=value hermes gateway restart",
             "sudo --user root hermes gateway stop",
+            "env -S 'hermes gateway restart'",
+            "env --split-string='hermes gateway stop'",
             "eval 'hermes gateway restart'",
             "cmd='hermes gateway stop'; eval \"$cmd\"",
         ],
