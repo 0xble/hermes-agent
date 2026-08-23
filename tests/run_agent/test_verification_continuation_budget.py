@@ -100,8 +100,8 @@ def test_complete_later_answer_still_replaces_pending_answer():
     assert result == "The complete verified answer."
 
 
-def test_provisional_verification_candidates_are_not_durable_scaffolding():
-    assert _is_ephemeral_scaffolding(
+def test_provisional_verification_candidates_remain_crash_durable():
+    assert not _is_ephemeral_scaffolding(
         {
             "role": "assistant",
             "content": "candidate",
