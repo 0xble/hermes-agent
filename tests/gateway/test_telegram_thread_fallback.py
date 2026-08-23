@@ -362,8 +362,8 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
 
 
 @pytest.mark.asyncio
-async def test_created_private_topic_thread_not_found_fails_without_root_fallback():
-    """Created private-topic sends must not retry into All Messages on stale thread IDs."""
+async def test_created_private_topic_thread_not_found_retries_same_thread_without_root_fallback():
+    """Allow one propagation retry but never reroute a created topic to All Messages."""
     adapter = _make_adapter()
     call_log = []
 
@@ -384,8 +384,8 @@ async def test_created_private_topic_thread_not_found_fails_without_root_fallbac
 
     assert result.success is False
     assert "thread not found" in str(result.error).lower()
-    assert len(call_log) == 1
-    assert call_log[0]["message_thread_id"] == 32343
+    assert len(call_log) == 2
+    assert {call["message_thread_id"] for call in call_log} == {32343}
 
 
 @pytest.mark.asyncio
