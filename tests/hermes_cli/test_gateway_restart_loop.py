@@ -570,6 +570,8 @@ class TestTerminalToolGatewayLifecycleGuard:
             "sudo --user root hermes gateway stop",
             "env -S 'hermes gateway restart'",
             "env --split-string='hermes gateway stop'",
+            "cmd=hermes; env -a harmless \"$cmd\" gateway restart",
+            "cmd=hermes; env --argv0=harmless \"$cmd\" gateway stop",
             "a=hermes; b=gateway; c=restart; env -S \"$a $b $c\"",
             "launchctl asuser 501 hermes gateway restart",
             "systemctl --job-mode replace restart hermes-gateway",
