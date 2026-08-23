@@ -575,6 +575,7 @@ class TestTerminalToolGatewayLifecycleGuard:
             "eval 'hermes gateway restart'",
             "cmd='hermes gateway stop'; eval \"$cmd\"",
             "$(printf hermes) gateway restart -m pytest",
+            "v=s; v=${v}t; v=${v}o; v=${v}p; hermes gateway \"$v\"",
         ],
     )
     def test_blocks_lifecycle_actions_through_execution_wrappers(
