@@ -563,6 +563,7 @@ class TestTerminalToolGatewayLifecycleGuard:
             "nice hermes gateway restart",
             "nice -- hermes gateway restart",
             "nice -n5 hermes gateway restart",
+            "nice -- \"$(printf hermes)\" gateway restart",
             "exec hermes gateway restart",
             "exec -a harmless hermes gateway stop",
             "sudo NAME=value hermes gateway restart",
