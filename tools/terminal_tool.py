@@ -3152,7 +3152,7 @@ def terminal_tool(
                     _read_script_in_env if env_type != "local" else None
                 ),
                 execution_only=True,
-                fail_on_unresolved=False,
+                fail_on_unresolved=True,
             ):
                 return json.dumps({
                     "output": "",
