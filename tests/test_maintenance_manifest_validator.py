@@ -267,6 +267,8 @@ def test_ci_validates_pull_request_head_instead_of_synthetic_merge():
     ).read_text(encoding="utf-8")
 
     assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+    assert "git fetch --no-tags --filter=blob:none canonical-upstream main" in workflow
+    assert "--depth=1 canonical-upstream" not in workflow
 
 
 def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_path):

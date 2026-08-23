@@ -168,7 +168,7 @@ jobs:
       - name: Fetch canonical upstream
         run: |
           git remote add canonical-upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch --no-tags --depth=1 canonical-upstream main
+          git fetch --no-tags --filter=blob:none canonical-upstream main
 
       - name: Validate maintained patch history
         run: |
