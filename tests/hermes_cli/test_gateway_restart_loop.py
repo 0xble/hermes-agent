@@ -561,12 +561,16 @@ class TestTerminalToolGatewayLifecycleGuard:
         [
             "timeout 5 hermes gateway restart",
             "nice hermes gateway restart",
+            "nice -- hermes gateway restart",
+            "nice -n5 hermes gateway restart",
             "exec hermes gateway restart",
             "exec -a harmless hermes gateway stop",
             "sudo NAME=value hermes gateway restart",
             "sudo --user root hermes gateway stop",
             "env -S 'hermes gateway restart'",
             "env --split-string='hermes gateway stop'",
+            "launchctl asuser 501 hermes gateway restart",
+            "systemctl --job-mode replace restart hermes-gateway",
             "eval 'hermes gateway restart'",
             "cmd='hermes gateway stop'; eval \"$cmd\"",
         ],
@@ -615,7 +619,12 @@ class TestTerminalToolGatewayLifecycleGuard:
 
     @pytest.mark.parametrize(
         "command",
-        ["command -v hermes gateway restart", "command -V hermes gateway restart"],
+        [
+            "command -v hermes gateway restart",
+            "command -V hermes gateway restart",
+            "printf '%s\\n' 'hermes gateway restart'",
+            "echo 'systemctl restart hermes-gateway'",
+        ],
     )
     def test_allows_nonexecuting_command_lookup(self, monkeypatch, command):
         import tools.terminal_tool as tt
