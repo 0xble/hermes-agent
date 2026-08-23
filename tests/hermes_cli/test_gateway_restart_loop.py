@@ -626,6 +626,9 @@ class TestTerminalToolGatewayLifecycleGuard:
         [
             "command -v hermes gateway restart",
             "command -V hermes gateway restart",
+            'systemctl status "$unit"',
+            'launchctl print "$domain"',
+            'kill -0 "$pid"',
         ],
     )
     def test_allows_nonexecuting_command_lookup(self, monkeypatch, command):
