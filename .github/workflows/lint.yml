@@ -151,6 +151,27 @@ jobs:
         run: |
           ruff check .
 
+  maintenance-manifest:
+    name: Maintained patch history (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout full fork history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch canonical upstream
+        run: |
+          git remote add canonical-upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch --no-tags --depth=1 canonical-upstream main
+
+      - name: Validate maintained patch history
+        run: |
+          python scripts/validate_maintenance_manifest.py \
+            --upstream-ref canonical-upstream/main \
+            --history-baseline 383eb6a808ce32b7cfd850697d9c94de471a717d
+
   windows-footguns:
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),
     # os.killpg, os.setsid, signal.SIGKILL without getattr fallback,

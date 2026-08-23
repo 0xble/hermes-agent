@@ -32,11 +32,80 @@ def _fork_subjects(repo: Path, upstream_ref: str) -> set[str]:
     return {line for line in result.stdout.splitlines() if line}
 
 
+def _registered_subjects(text: str) -> set[str]:
+    """Return patch-index and administrative subjects from one manifest tree."""
+    lines = text.splitlines()
+    try:
+        index_start = lines.index("## Maintained patch index")
+        records_start = lines.index("## Patch records")
+    except ValueError:
+        return set()
+    subjects: set[str] = set()
+    for line in lines[index_start:records_start]:
+        match = _INDEX_ROW_RE.match(line)
+        if match:
+            subjects.update(_SUBJECT_RE.findall(match.group(3)))
+    exemption_heading = "## Fork-only administrative subject exemptions"
+    if exemption_heading in lines:
+        exemption_start = lines.index(exemption_heading) + 1
+        for line in lines[exemption_start:records_start]:
+            if line.startswith("## ") or line.startswith("### "):
+                break
+            if line.startswith("|") and not line.startswith("| ---"):
+                subjects.update(_SUBJECT_RE.findall(line))
+    return subjects
+
+
+def _validate_registration_history(repo: Path, baseline: str) -> list[str]:
+    """Reject fork commits registered only by a later descendant."""
+    try:
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+        commits = subprocess.run(
+            ["git", "rev-list", "--reverse", f"{baseline}..HEAD"],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+    except subprocess.CalledProcessError:
+        return [
+            "maintenance history baseline is not an ancestor of HEAD: " + baseline
+        ]
+
+    errors: list[str] = []
+    for commit in commits:
+        subject = subprocess.run(
+            ["git", "show", "-s", "--format=%s", commit],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        manifest = subprocess.run(
+            ["git", "show", f"{commit}:MAINTENANCE.md"],
+            cwd=repo,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if manifest.returncode != 0 or subject not in _registered_subjects(manifest.stdout):
+            errors.append(
+                f"fork subject was not registered in its own commit {commit[:12]}: {subject}"
+            )
+    return errors
+
+
 def validate_manifest(
     path: Path,
     *,
     upstream_ref: str | None = None,
     fork_subjects: set[str] | None = None,
+    history_baseline: str | None = None,
 ) -> list[str]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -157,6 +226,11 @@ def validate_manifest(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )
 
+    if history_baseline is not None:
+        errors.extend(
+            _validate_registration_history(path.resolve().parent, history_baseline)
+        )
+
     return errors
 
 
@@ -172,9 +246,17 @@ def main() -> int:
         "--upstream-ref",
         help="Also require every indexed stable subject in <ref>..HEAD history.",
     )
+    parser.add_argument(
+        "--history-baseline",
+        help="Require every later commit to register its subject in that same commit.",
+    )
     args = parser.parse_args()
 
-    errors = validate_manifest(args.manifest, upstream_ref=args.upstream_ref)
+    errors = validate_manifest(
+        args.manifest,
+        upstream_ref=args.upstream_ref,
+        history_baseline=args.history_baseline,
+    )
     if errors:
         for error in errors:
             print(f"ERROR: {error}")

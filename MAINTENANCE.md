@@ -84,6 +84,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `docs(fork): register reconciled compression patch` | Maintenance-only manifest correction for the rebased compression compatibility patch. |
 | `fix(title): remove duplicate hashlib import` | Mechanical duplicate-import cleanup only; no independently retireable behavior. |
 | `fix(deps): clear known lockfile vulnerabilities` | Security-only updates to Electron, nanoid, h2, and hpack; no fork-owned product contract. |
+| `fix(ci): enforce patch history without code-scanning dependency` | Fork-governance and CI reporting enforcement only; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 

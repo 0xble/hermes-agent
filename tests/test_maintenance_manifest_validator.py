@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -186,3 +187,75 @@ def test_explicit_administrative_subject_exemption_is_accepted(tmp_path):
             "chore: regenerate formatter output",
         },
     ) == []
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+
+def _init_history_repo(tmp_path: Path) -> tuple[Path, Path, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Hermes Test")
+    _git(repo, "config", "user.email", "hermes@example.invalid")
+    manifest = _write(
+        repo,
+        INDEX
+        + """
+### HERMES-001 — One
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+### HERMES-002 — Two
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+""",
+    )
+    _git(repo, "add", "MAINTENANCE.md")
+    _git(repo, "commit", "-m", "fix: one")
+    return repo, manifest, _git(repo, "rev-parse", "HEAD")
+
+
+def test_history_validation_rejects_post_hoc_patch_registration(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-m", "fix: orphan")
+
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", "`fix: one`; `fix: orphan`"
+        ),
+        encoding="utf-8",
+    )
+    _git(repo, "add", "MAINTENANCE.md")
+    _git(repo, "commit", "-m", "docs: register orphan")
+
+    errors = validate_manifest(manifest, history_baseline=baseline)
+
+    assert any(
+        "fork subject was not registered in its own commit" in error
+        and "fix: orphan" in error
+        for error in errors
+    )
+
+
+def test_history_validation_accepts_same_commit_registration(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", "`fix: one`; `fix: registered`"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "MAINTENANCE.md", "feature.py")
+    _git(repo, "commit", "-m", "fix: registered")
+
+    assert validate_manifest(manifest, history_baseline=baseline) == []
