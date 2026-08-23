@@ -81,7 +81,7 @@ def _validate_registration_history(
                 f"could not read fork history from {upstream_ref}: "
                 f"git exited {exc.returncode}"
             ]
-        marker_index = None
+        marker_indexes = []
         for index, commit in enumerate(commits):
             subject = subprocess.run(
                 ["git", "show", "-s", "--format=%s", commit],
@@ -91,13 +91,18 @@ def _validate_registration_history(
                 capture_output=True,
             ).stdout.strip()
             if subject == baseline_subject:
-                marker_index = index
-        if marker_index is None:
+                marker_indexes.append(index)
+        if not marker_indexes:
             return [
                 "maintenance history baseline subject is absent from fork history: "
                 + baseline_subject
             ]
-        commits = commits[marker_index + 1 :]
+        if len(marker_indexes) != 1:
+            return [
+                "maintenance history baseline subject must occur exactly once: "
+                + baseline_subject
+            ]
+        commits = commits[marker_indexes[0] + 1 :]
     elif baseline is not None:
         try:
             subprocess.run(

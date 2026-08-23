@@ -321,3 +321,17 @@ def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_pat
         upstream_ref="canonical",
         baseline_subject="fix: one",
     ) == []
+
+    (repo / "duplicate.txt").write_text("duplicate marker\n", encoding="utf-8")
+    _git(repo, "add", "duplicate.txt")
+    _git(repo, "commit", "-m", "fix: one")
+
+    errors = _validate_registration_history(
+        repo,
+        None,
+        upstream_ref="canonical",
+        baseline_subject="fix: one",
+    )
+    assert errors == [
+        "maintenance history baseline subject must occur exactly once: fix: one"
+    ]
