@@ -702,6 +702,7 @@ def finalize_turn(
 
     _response_transformed = bool(_verification_delivery_pre_transform)
     _pre_transform_response = _verification_delivery_pre_transform
+    _output_hook_transformed = False
     _canonical_response_before_output_transform = final_response
 
     # Output transforms compose sequentially. Each callback receives the
@@ -722,13 +723,14 @@ def finalize_turn(
                     _pre_transform_response = final_response
                 final_response = _transformed_response
                 _response_transformed = True
+                _output_hook_transformed = True
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
     # The finalized response is the canonical user-visible assistant text.
     # Replace the matching current-turn assistant message so persistence,
     # memory sync, and future context cannot reintroduce pre-transform text.
-    if _response_transformed and _pre_transform_response is not None:
+    if _output_hook_transformed and _pre_transform_response is not None:
         for _message in reversed(messages):
             if (
                 isinstance(_message, dict)

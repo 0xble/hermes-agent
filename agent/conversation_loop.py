@@ -8793,9 +8793,16 @@ def run_conversation(
                     final_response = None
                     continue
 
+                if _pending_verification_response:
+                    # A completed answer after a verification nudge is still
+                    # provisional until finalization decides whether it replaces
+                    # or composes with the pending answer.
+                    final_msg["_verification_candidate"] = True
                 append_message(messages, final_msg)
-                # Make the completed answer durable before leaving the loop —
-                # a session torn down before finalize_turn's _persist_session
+                # Make an ordinary completed answer durable before leaving the
+                # loop. Provisional verification candidates are skipped by the
+                # flush and persisted only after finalization collapses them.
+                # A session torn down before finalize_turn's _persist_session
                 # otherwise loses a reply the user already saw (#81641). Same
                 # contract as the tool-call exit (#49045) and the verify exits
                 # above; _DB_PERSISTED_MARKER keeps _persist_session idempotent.
