@@ -562,8 +562,11 @@ class TestTerminalToolGatewayLifecycleGuard:
             "timeout 5 hermes gateway restart",
             "nice hermes gateway restart",
             "exec hermes gateway restart",
+            "exec -a harmless hermes gateway stop",
             "sudo NAME=value hermes gateway restart",
+            "sudo --user root hermes gateway stop",
             "eval 'hermes gateway restart'",
+            "cmd='hermes gateway stop'; eval \"$cmd\"",
         ],
     )
     def test_blocks_lifecycle_actions_through_execution_wrappers(
