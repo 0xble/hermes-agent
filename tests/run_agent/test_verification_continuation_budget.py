@@ -60,6 +60,56 @@ def _assert_pending_response_survives(agent, result):
     ]
 
 
+def test_verification_receipt_cannot_replace_substantive_answer():
+    pending = "Implemented the Exa usage estimator and documented its evidence contract."
+    receipt = "Fresh verification from this turn passes:\n\n`pnpm run lint`"
+
+    result = _compose_verification_receipt_with_answer(pending, receipt)
+
+    assert result == (
+        "Implemented the Exa usage estimator and documented its evidence contract.\n\n"
+        "## Verification\n\n"
+        "Fresh verification from this turn passes:\n\n`pnpm run lint`"
+    )
+
+
+def test_substantive_verification_heading_is_never_parsed_as_a_receipt():
+    pending = "Verification report:\n\nThe migration preserved every customer row."
+    receipt = "I cannot provide fresh verification evidence for that edit."
+
+    result = _compose_verification_receipt_with_answer(pending, receipt)
+
+    assert result == f"{pending}\n\n## Verification\n\n{receipt}"
+
+
+def test_authored_verification_section_is_preserved_verbatim():
+    pending = "Analysis\n\n## Verification\n\nThe authored evidence narrative."
+    receipt = "Fresh verification from this turn passes."
+
+    result = _compose_verification_receipt_with_answer(pending, receipt)
+
+    assert result == f"{pending}\n\n## Verification\n\n{receipt}"
+
+
+def test_complete_later_answer_still_replaces_pending_answer():
+    result = _compose_verification_receipt_with_answer(
+        "The initial answer.",
+        "The complete verified answer.",
+    )
+
+    assert result == "The complete verified answer."
+
+
+def test_provisional_verification_candidates_are_not_durable_scaffolding():
+    assert _is_ephemeral_scaffolding(
+        {
+            "role": "assistant",
+            "content": "candidate",
+            "_verification_candidate": True,
+        }
+    )
+
+
 def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}
