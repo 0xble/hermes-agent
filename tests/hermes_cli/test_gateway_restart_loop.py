@@ -561,6 +561,8 @@ class TestTerminalToolGatewayLifecycleGuard:
         [
             "timeout 5 hermes gateway restart",
             "nice hermes gateway restart",
+            "exec hermes gateway restart",
+            "sudo NAME=value hermes gateway restart",
             "eval 'hermes gateway restart'",
         ],
     )
@@ -584,6 +586,20 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert contains_executed_gateway_lifecycle_command(
             "setsid hermes gateway restart"
         )
+
+    def test_blocks_variable_resolved_lifecycle_executable(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        command = 'gateway_cmd=hermes; "$gateway_cmd" gateway restart'
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
 
     @pytest.mark.parametrize(
         "command",
