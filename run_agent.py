@@ -286,7 +286,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # The nudge exists only to drive the verification loop; persisting it
     # poisons the resumed transcript and breaks prompt-prefix cache reuse
     # on later turns. The assistant candidate is NOT synthetic — it is
-    # persisted and emitted as an interim message (#65919).
+    # persisted and emitted as an interim message (#65919). Provisional
+    # candidates stay durable for crash recovery and are atomically
+    # consolidated after successful finalization.
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block

@@ -171,7 +171,7 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
-def _collapse_verification_candidates(messages, final_response, agent) -> None:
+def _collapse_verification_candidates(messages, final_response, agent) -> bool:
     """Collapse provisional verification answers into one canonical assistant row."""
     candidate_indices = [
         index
@@ -179,7 +179,7 @@ def _collapse_verification_candidates(messages, final_response, agent) -> None:
         if isinstance(message, dict) and message.get("_verification_candidate")
     ]
     if not candidate_indices or not final_response:
-        return
+        return False
 
     first_candidate = candidate_indices[0]
     canonical_index = candidate_indices[-1]
@@ -202,6 +202,7 @@ def _collapse_verification_candidates(messages, final_response, agent) -> None:
     canonical.pop("_db_persisted", None)
     stamp_message_timestamp(canonical)
     agent._db_flush_scan_prefix = None
+    return True
 
 
 def finalize_turn(
@@ -402,6 +403,7 @@ def finalize_turn(
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _verification_candidates_collapsed = False
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -410,7 +412,11 @@ def finalize_turn(
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
-        _collapse_verification_candidates(messages, final_response, agent)
+        _verification_candidates_collapsed = _collapse_verification_candidates(
+            messages,
+            final_response,
+            agent,
+        )
 
         # #95514: an empty terminal completion is not authoritative when the
         # stream already delivered text. Recover before persist so a blank
@@ -561,6 +567,16 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        if (
+            _verification_candidates_collapsed
+            and getattr(agent, "_session_db", None) is not None
+            and agent.session_id
+        ):
+            agent._session_db.replace_messages(
+                agent.session_id,
+                messages,
+                active_only=True,
+            )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
