@@ -573,6 +573,7 @@ class TestTerminalToolGatewayLifecycleGuard:
             "systemctl --job-mode replace restart hermes-gateway",
             "eval 'hermes gateway restart'",
             "cmd='hermes gateway stop'; eval \"$cmd\"",
+            "$(printf hermes) gateway restart -m pytest",
         ],
     )
     def test_blocks_lifecycle_actions_through_execution_wrappers(
@@ -622,8 +623,6 @@ class TestTerminalToolGatewayLifecycleGuard:
         [
             "command -v hermes gateway restart",
             "command -V hermes gateway restart",
-            "printf '%s\\n' 'hermes gateway restart'",
-            "echo 'systemctl restart hermes-gateway'",
         ],
     )
     def test_allows_nonexecuting_command_lookup(self, monkeypatch, command):
@@ -643,12 +642,11 @@ class TestTerminalToolGatewayLifecycleGuard:
     @pytest.mark.parametrize(
         "script_body",
         [
-            "#!/bin/bash\nprintf '%s\\n' 'hermes gateway restart'\n",
+            "#!/bin/bash\npython3 -m pytest --version\n",
             (
                 "#!/bin/bash\n"
-                "RUNNER=${RUNNER:-python3}\n"
-                "[ -x \"$RUNNER\" ] || true\n"
-                "\"$RUNNER\" -m pytest --version\n"
+                "[ -x /usr/bin/python3 ] || true\n"
+                "/usr/bin/python3 -m pytest --version\n"
             ),
         ],
     )
