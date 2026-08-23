@@ -159,6 +159,10 @@ jobs:
       - name: Checkout full fork history
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # Validate the submitted head, not GitHub's synthetic pull-request
+          # merge commit, whose generated subject cannot exist in the branch's
+          # own maintenance manifest.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Fetch canonical upstream
