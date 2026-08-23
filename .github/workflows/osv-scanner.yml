@@ -14,14 +14,10 @@ name: OSV-Scanner
 # code patterns in PR diffs) by covering the orthogonal "currently-pinned
 # dep became known-vulnerable" case.
 #
-# Uses Google's officially-recommended reusable workflow, pinned by SHA.
-# Findings land in the repo's Security tab (Code Scanning > OSV-Scanner).
-# fail-on-vuln is disabled so the job does not block merges on pre-existing
-# vulnerabilities in pinned deps that we may need to patch deliberately.
-#
-# The reusable workflow can't emit custom outputs, so a wrapper job
-# downloads the SARIF result and summarizes the vulnerability count into
-# a review_status for the unified PR comment.
+# Uses Google's scanner action directly, pinned by SHA. The private fork does
+# not have GitHub Advanced Security, so SARIF is retained as an Actions artifact
+# and summarized into review_status without attempting Code Scanning upload.
+# The scanner remains fail-closed: known vulnerabilities fail the scan job.
 
 on:
   workflow_call:
@@ -32,10 +28,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  # Required to upload SARIF file to CodeQL. See: https://github.com/github/codeql-action/issues/2117
   actions: read
   contents: read
-  security-events: write
 
 jobs:
   scan:
@@ -54,11 +48,22 @@ jobs:
         uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
         with:
           scan-args: |-
+            --format=sarif
+            --output-file=osv-results.sarif
             --lockfile=uv.lock
             --lockfile=package-lock.json
             --lockfile=website/package-lock.json
             --lockfile=plugins/platforms/photon/sidecar/package-lock.json
             --lockfile=scripts/whatsapp-bridge/package-lock.json
+
+      - name: Upload OSV SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: OSV Scanner SARIF file
+          path: osv-results.sarif
+          retention-days: 1
+          if-no-files-found: error
 
   emit-status:
     name: Emit review status
@@ -125,7 +130,7 @@ jobs:
           except Exception:
               print(json.dumps(''))
           ")
-              STATUS="[{\"source\":\"osv scan\",\"results\":[{\"kind\":\"warning\",\"title\":\"OSV vulnerability scan\",\"summary\":\"${VULN_COUNT} known vulnerabilit${VULN_PLURAL} found in pinned dependencies.\",\"detail\":${VULN_DETAIL},\"how_to_fix\":\"Review the findings in the [Security tab](../../security/code-scanning). Update the affected dependencies if a patched version is available.\"}]}]"
+              STATUS="[{\"source\":\"osv scan\",\"results\":[{\"kind\":\"warning\",\"title\":\"OSV vulnerability scan\",\"summary\":\"${VULN_COUNT} known vulnerabilit${VULN_PLURAL} found in pinned dependencies.\",\"detail\":${VULN_DETAIL},\"how_to_fix\":\"Download the OSV Scanner SARIF file from this Actions run and update the affected dependencies when a patched version is available.\"}]}]"
             else
               STATUS="[]"
             fi
