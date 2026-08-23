@@ -66,8 +66,9 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
-_VERIFICATION_RECEIPT_PREFIX = re.compile(
-    r"^\s*fresh\s+verification(?:\s+from\s+this\s+turn)?\s+passes\b",
+_VERIFICATION_SUCCESS_RECEIPT = re.compile(
+    r"^\s*fresh\s+verification(?:\s+from\s+this\s+turn)?\s+passes"
+    r"(?:\.\s*|:\s*(?:`[^`]+`(?:\s*\n\s*)?)+)$",
     re.IGNORECASE,
 )
 _VERIFICATION_FAILURE_RECEIPT = re.compile(
@@ -80,7 +81,7 @@ _VERIFICATION_SECTION = "\n\n## Verification\n\n"
 
 def _is_verification_receipt_only(response: str) -> bool:
     return bool(
-        _VERIFICATION_RECEIPT_PREFIX.match(response)
+        _VERIFICATION_SUCCESS_RECEIPT.fullmatch(response)
         or _VERIFICATION_FAILURE_RECEIPT.fullmatch(response)
     )
 
