@@ -109,7 +109,11 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
 
   const mock = await startMockServer({ verificationWritePath: changedFile })
   writeMockProviderConfig(sandbox.hermesHome, mock.url)
-  fs.appendFileSync(path.join(sandbox.hermesHome, 'config.yaml'), '\nagent:\n  verify_on_stop: true\n', 'utf8')
+  fs.appendFileSync(
+    path.join(sandbox.hermesHome, 'config.yaml'),
+    '\nagent:\n  verify_on_stop: true\ndisplay:\n  interim_assistant_messages: false\nauxiliary:\n  title_generation:\n    enabled: false\n',
+    'utf8',
+  )
   writeEnvFile(sandbox.hermesHome)
   const { app, page } = await launchDesktop(buildAppEnv(sandbox))
   const fixture: MockBackendFixture = {
@@ -134,12 +138,20 @@ test('live verify-on-stop continuations stay out of the transcript', async ({}, 
 
     const transcript = page.locator('[data-slot="aui_thread-viewport"]')
     await expect(transcript).toContainText(VERIFICATION_STOP_TEXT, { timeout: 60_000 })
+    await expect(transcript).toContainText('The code edit is complete.', { timeout: 60_000 })
     await expect.poll(
       () => mock.receivedPrompts.some(prompt => prompt.includes('[System: You edited code in this turn')),
       { timeout: 30_000 },
     ).toBe(true)
     expect(fs.existsSync(changedFile), 'The scripted write_file call should edit only the sandbox project').toBe(true)
     await expect(transcript).not.toContainText('[System: You edited code in this turn')
+
+    await page.reload()
+    await waitForAppReady(fixture, 120_000)
+    const resumedTranscript = page.locator('[data-slot="aui_thread-viewport"]')
+    await expect(resumedTranscript).toContainText('The code edit is complete.', { timeout: 60_000 })
+    await expect(resumedTranscript).toContainText(VERIFICATION_STOP_TEXT, { timeout: 60_000 })
+    await expect(resumedTranscript).not.toContainText('[System: You edited code in this turn')
     await page.screenshot({ path: testInfo.outputPath('live-verification-nudge.png') })
   } finally {
     await fixture.cleanup()

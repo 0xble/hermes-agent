@@ -147,6 +147,86 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
+def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
+    agent, monkeypatch
+):
+    agent.max_iterations = 3
+    agent.iteration_budget.max_total = 3
+    blocker = "I cannot provide fresh verification evidence for that edit."
+    answers = iter(
+        [
+            _response("The code edit is complete."),
+            _response(blocker),
+            _response(blocker),
+        ]
+    )
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", "verify it again", None],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    expected = (
+        "The code edit is complete.\n\n"
+        "## Verification\n\n"
+        "I cannot provide fresh verification evidence for that edit."
+    )
+    assert result["final_response"] == expected
+    assert result["response_transformed"] is True
+    assert result["pre_transform_response"] == blocker
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert result["messages"][-1]["content"] == expected
+    assert not any(
+        message.get("_verification_candidate")
+        for message in result["messages"]
+        if isinstance(message, dict)
+    )
+
+
+def test_verification_composition_persists_transformed_canonical_response(
+    agent, monkeypatch
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter(
+        [
+            _response("The code edit is complete."),
+            _response("Fresh verification passes."),
+        ]
+    )
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._persist_session = MagicMock()
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    def transform(text, **_kwargs):
+        return f"{text}\n\n[guarded]", True
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", None],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        patch("hermes_cli.lifecycle.transform_llm_output", side_effect=transform),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"].endswith("[guarded]")
+    assert result["messages"][-1]["content"] == result["final_response"]
+    persisted_messages = agent._persist_session.call_args_list[-1].args[0]
+    assert persisted_messages[-1]["content"] == result["final_response"]
+
+
 def test_multiple_verification_retries_publish_each_candidate_once(agent, monkeypatch):
     """Multiple verification retries should publish each candidate once, in order."""
     agent.max_iterations = 3

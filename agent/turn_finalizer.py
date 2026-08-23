@@ -66,6 +66,50 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 )
 
 
+_VERIFICATION_RECEIPT_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"(?:fresh\s+)?verification\b"
+    r"|i\s+(?:cannot|can't|could\s+not)\s+provide\s+fresh\s+verification\s+evidence\b"
+    r")",
+    re.IGNORECASE,
+)
+_VERIFICATION_SECTION = "\n\n## Verification\n\n"
+
+
+def _compose_verification_receipt_with_answer(
+    pending_response: str | None,
+    final_response: str | None,
+) -> str | None:
+    """Keep a real answer when a verification continuation returns only its receipt.
+
+    Repeated verification passes replace a prior receipt rather than stacking
+    duplicate sections. Ordinary complete responses remain authoritative.
+    """
+    if not pending_response or not final_response:
+        return final_response
+    pending = pending_response.strip()
+    final = final_response.strip()
+    if pending == final:
+        return final_response
+    if not _VERIFICATION_RECEIPT_PREFIX.match(final):
+        return final_response
+    if _VERIFICATION_RECEIPT_PREFIX.match(pending):
+        return final_response
+    answer = pending.split(_VERIFICATION_SECTION, 1)[0].rstrip()
+    return f"{answer}{_VERIFICATION_SECTION}{final}"
+
+
+def _merge_verification_candidate(
+    pending_response: str | None,
+    candidate_response: str | None,
+) -> str | None:
+    """Accumulate a verification candidate without losing a substantive answer."""
+    if not pending_response:
+        return candidate_response
+    return _compose_verification_receipt_with_answer(
+        pending_response,
+        candidate_response,
+    )
 def _record_kanban_budget_exhausted(
     kanban_task: str,
     api_call_count: int,
@@ -125,6 +169,39 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+
+
+def _collapse_verification_candidates(messages, final_response, agent) -> None:
+    """Collapse provisional verification answers into one canonical assistant row."""
+    candidate_indices = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("_verification_candidate")
+    ]
+    if not candidate_indices or not final_response:
+        return
+
+    first_candidate = candidate_indices[0]
+    canonical_index = candidate_indices[-1]
+    for index in range(len(messages) - 1, first_candidate - 1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            canonical_index = index
+            break
+
+    for index in reversed(candidate_indices):
+        if index == canonical_index:
+            continue
+        messages.pop(index)
+        if index < canonical_index:
+            canonical_index -= 1
+
+    canonical = messages[canonical_index]
+    canonical["content"] = final_response
+    canonical.pop("_verification_candidate", None)
+    canonical.pop("_db_persisted", None)
+    stamp_message_timestamp(canonical)
+    agent._db_flush_scan_prefix = None
 
 
 def finalize_turn(
@@ -201,6 +278,26 @@ def finalize_turn(
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
         iteration_limit_fallback = True
+
+    # A later verification continuation is allowed to replace the pending
+    # candidate when it produces a complete answer. It must not replace that
+    # answer with a receipt-only response such as "Fresh verification...".
+    # This is the response-safe boundary for messaging and streamed surfaces.
+    _verification_delivery_pre_transform = None
+    if not continuation_budget_exhausted:
+        _raw_final_response = final_response
+        final_response = _compose_verification_receipt_with_answer(
+            _pending_verification_response,
+            final_response,
+        )
+        if (
+            _raw_final_response
+            and final_response
+            and final_response != _raw_final_response
+        ):
+            # The streamed/previewed receipt is not the canonical response.
+            # Signal the gateway to deliver the composed answer in full.
+            _verification_delivery_pre_transform = _raw_final_response
 
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
@@ -313,6 +410,7 @@ def finalize_turn(
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
+        _collapse_verification_candidates(messages, final_response, agent)
 
         # #95514: an empty terminal completion is not authoritative when the
         # stream already delivered text. Recover before persist so a blank
@@ -602,8 +700,9 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
-    _pre_transform_response = None
+    _response_transformed = bool(_verification_delivery_pre_transform)
+    _pre_transform_response = _verification_delivery_pre_transform
+    _canonical_response_before_output_transform = final_response
 
     # Output transforms compose sequentially. Each callback receives the
     # previous callback's result so a later hard guard cannot be bypassed by an
@@ -619,7 +718,8 @@ def finalize_turn(
                 platform=getattr(agent, "platform", None) or "",
             )
             if _did_transform:
-                _pre_transform_response = final_response
+                if _pre_transform_response is None:
+                    _pre_transform_response = final_response
                 final_response = _transformed_response
                 _response_transformed = True
         except Exception as exc:
@@ -633,9 +733,22 @@ def finalize_turn(
             if (
                 isinstance(_message, dict)
                 and _message.get("role") == "assistant"
-                and _message.get("content") == _pre_transform_response
+                and _message.get("content") == _canonical_response_before_output_transform
             ):
                 _message["content"] = final_response
+                _message.pop("_db_persisted", None)
+                agent._db_flush_scan_prefix = None
+                try:
+                    agent._persist_session(messages, conversation_history)
+                except Exception as _persist_transform_err:
+                    _cleanup_errors.append(
+                        f"persist_transformed_response: {_persist_transform_err}"
+                    )
+                    logger.error(
+                        "finalize_turn: transformed response persistence failed: %s",
+                        _persist_transform_err,
+                        exc_info=True,
+                    )
                 break
 
     # Plugin hook: post_llm_call
