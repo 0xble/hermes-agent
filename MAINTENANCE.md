@@ -89,6 +89,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): preserve OSV findings without code scanning` | CI artifact and review-status routing repair only; no shipped Hermes behavior. |
 | `fix(ci): validate patch history at PR head` | GitHub Actions synthetic-merge avoidance for maintenance validation only; no shipped Hermes behavior. |
 | `fix(ci): make patch history upstream-aware` | Fork maintenance history scoping across upstream merges and rebases only; no shipped Hermes behavior. |
+| `fix(ci): fetch complete upstream ancestry` | Git history completeness for maintenance validation only; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
