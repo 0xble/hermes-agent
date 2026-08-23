@@ -6138,10 +6138,18 @@ class TelegramAdapter(BasePlatformAdapter):
                                 created_or_private_topic = private_dm_topic_send or bool(
                                     metadata and metadata.get("telegram_dm_topic_created_for_send")
                                 )
-                                # A topic created for this send is not a stale
-                                # pre-existing binding. Retrying the same rejected
-                                # thread can duplicate an ambiguous delivery and
-                                # must never fall back into All Messages.
+                                # Telegram can briefly reject a newly created
+                                # or existing topic before propagation settles.
+                                # A thread-not-found BadRequest was rejected, so
+                                # one same-thread retry is safe; never reroute a
+                                # created/private topic into All Messages.
+                                if not retried_thread_not_found:
+                                    retried_thread_not_found = True
+                                    logger.warning(
+                                        "[%s] Thread %s not found, retrying once with same thread_id",
+                                        self.name, effective_thread_id,
+                                    )
+                                    continue
                                 if created_or_private_topic:
                                     if private_dm_topic_send and self._mark_dm_topic_stale(chat_id, effective_thread_id):
                                         self._prune_stale_dm_topic_binding(chat_id, effective_thread_id)
@@ -6155,17 +6163,6 @@ class TelegramAdapter(BasePlatformAdapter):
                                         },
                                         retryable=False,
                                     )
-                                # Telegram can return a one-off "thread not found"
-                                # for an existing healthy topic. Confirm with one
-                                # immediate same-thread retry before declaring the
-                                # existing binding stale.
-                                if not retried_thread_not_found:
-                                    retried_thread_not_found = True
-                                    logger.warning(
-                                        "[%s] Thread %s not found, retrying once with same thread_id",
-                                        self.name, effective_thread_id,
-                                    )
-                                    continue
                                 # Second failure: the thread is genuinely gone.
                                 # Retry without ``message_thread_id`` so the
                                 # message still reaches the chat, and prune
