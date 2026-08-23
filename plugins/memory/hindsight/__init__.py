@@ -2636,8 +2636,6 @@ class HindsightMemoryProvider(MemoryProvider):
             "include_source_facts": False,
             "max_source_facts_tokens": _bounded_int(args.get("max_source_facts_tokens"), default=4096, minimum=1, maximum=8192),
         }
-        if explicit:
-            optional_defaults["include_provenance"] = self._explicit_recall_include_provenance
         if self._recall_tags or args.get("tags"):
             optional["tags"] = args.get("tags") or self._recall_tags
             optional["tags_match"] = args.get("tags_match") or self._recall_tags_match

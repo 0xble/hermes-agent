@@ -228,6 +228,7 @@ class TestExplicitRecallDefaults:
         kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=True)
         assert kwargs["include_entities"] is True
         # include_provenance is a Hermes formatting control, not a Hindsight API kwarg.
+        assert "include_provenance" not in kwargs
         assert p._explicit_recall_include_provenance is True
 
     def test_automatic_recall_uses_short_historical_reference_header(self, provider):

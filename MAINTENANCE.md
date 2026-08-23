@@ -65,7 +65,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-039 | Active | `feat(memory): clarify semantic and transcript recall guidance`; `feat(memory): prefer observations and curate hindsight memories`; `feat(memory): expand explicit recall context by default`; `fix(context): keep retrieved provider context request-scoped`; `refactor(prompt): scope retrieval guidance by capability`; `test(memory): align request-scoped gateway turn context` | Keep retrieved memory request-scoped while giving capability-aware semantic and transcript recall guidance. |
 | HERMES-040 | Active | `fix(gateway): extract local markdown images` | Extract eligible local Markdown images at the gateway media boundary. |
 | HERMES-041 | Active | `fix(gateway): fail closed on inherited restart marker`; `fix(safety): block destructive gateway launchctl verbs`; `fix(safety): narrow live lifecycle guard to executable actions` | Prevent gateway-derived contexts from bypassing lifecycle self-control guards. |
-| HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
+| HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1`; `fix(memory): keep provenance out of Hindsight API kwargs` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
 | HERMES-043 | Active | `fix(gateway): skip completed legacy resumes` | Avoid re-running completed legacy sessions during startup continuation recovery. |
 | HERMES-044 | Active | `fix(output): compose and protect final responses` | Compose plugin output transforms without letting empty or non-substantive transforms erase the final answer. |
 | HERMES-045 | Active | `fix(telegram): keep rich tables narrow` | Prefer compact tables and vertically stacked records over wide Telegram output. |
@@ -504,11 +504,11 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-042 — Pin the supported Hindsight 0.9.1 client contract
 
-- **Summary:** Pins `hindsight-client==0.9.1` and aligns provider adapters, lazy dependencies, packaging metadata, lock data, and documentation with that supported API.
-- **Surfaces:** `pyproject.toml`; `uv.lock`; `tools/lazy_deps.py`; Hindsight provider source, metadata, docs, and tests.
+- **Summary:** Pins `hindsight-client==0.9.1`, aligns packaging with that API, and keeps Hermes-only provenance formatting out of Hindsight `arecall` kwargs so explicit recalls remain expanded without emitting one unsupported-field warning per call.
+- **Surfaces:** `pyproject.toml`; `uv.lock`; `tools/lazy_deps.py`; `plugins/memory/hindsight/__init__.py`; Hindsight metadata, docs, and tests.
 - **Upstream tracking:** Upstream `5dd15872a6` still pins Hindsight client 0.6.1; no released equivalent 0.9.1 integration was identified on 2026-08-18.
 - **Upstream PR:** None after checked 2026-08-18.
-- **Regression:** `uv lock --check`; `scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py tests/test_packaging_metadata.py`.
+- **Regression:** `uv lock --check`; `scripts/run_tests.sh tests/plugins/memory/test_hindsight_provider.py tests/test_packaging_metadata.py`; explicit recall regression proving `include_provenance` controls Hermes formatting but is absent from `arecall` kwargs.
 - **Rollback:** Revert the client pin and matching API adaptations as one unit; regenerate `uv.lock` with the repository-supported uv and preserve unrelated dependency updates.
 - **Retirement:** Retire after released upstream supports the same or newer compatible Hindsight API and passes packaging plus provider regressions.
 
