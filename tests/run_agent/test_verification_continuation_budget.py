@@ -108,6 +108,10 @@ def test_complete_later_answer_still_replaces_pending_answer():
             "so I reverted it and implemented the corrected solution."
         ),
         "Verification report: the corrected implementation is complete.",
+        (
+            "Fresh verification from this turn passes. I found the original fix "
+            "was wrong and replaced it with the corrected solution."
+        ),
     ],
 )
 def test_substantive_verification_response_replaces_pending_answer(complete_answer):
