@@ -68,7 +68,7 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 
 _VERIFICATION_SUCCESS_RECEIPT = re.compile(
     r"^\s*fresh\s+verification(?:\s+from\s+this\s+turn)?\s+passes"
-    r"(?:\.\s*|:\s*(?:`[^`]+`(?:\s*\n\s*)?)+)$",
+    r"(?:\s*|\.\s*|:\s*(?:`[^`]+`(?:\s*\n\s*)?)+)$",
     re.IGNORECASE,
 )
 _VERIFICATION_FAILURE_RECEIPT = re.compile(
