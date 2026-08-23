@@ -2173,14 +2173,15 @@ class TestElementTokenAttachment:
     1. capture() refreshes a per-snapshot {index -> token} map from
        structuredContent.elements.
     2. Whenever an action carrying element_index is about to hit cua-driver,
-       look up the matching token and attach it — but ONLY for tools that
-       advertise `accessibility.element_tokens` (Surface 4 gate). Older
-       drivers reject unknown args via additionalProperties=false.
+       look up the matching token and attach it when the live tool schema
+       accepts `element_token` or the tool advertises
+       `accessibility.element_tokens`. Older drivers reject unknown args via
+       additionalProperties=false, so neither signal means do not attach it.
     3. cua-driver prefers token over index when both are supplied, so
        sending both is safe and stale-detection becomes explicit.
     """
 
-    def _backend_with_session(self, capabilities):
+    def _backend_with_session(self, capabilities, *, token_property=False):
         """Build a backend whose session reports the given capabilities map."""
         from unittest.mock import MagicMock
         from tools.computer_use.cua_backend import CuaDriverBackend
@@ -2197,6 +2198,9 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property = (
+            lambda tool, prop: token_property and prop == "element_token"
+        )
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2212,6 +2216,30 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_token_attached_when_schema_accepts_it_without_capability_label(self):
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},
+        }, token_property=True)
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert args["element_token"] == "s0001:5"
+
+    def test_token_omitted_when_schema_and_capability_both_reject_it(self):
+        backend = self._backend_with_session({
+            "click": {"input.pointer.click"},
+        })
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert "element_token" not in args
 
 
     def test_capture_refreshes_snapshot_tokens(self):
