@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from scripts.validate_maintenance_manifest import validate_manifest
+from scripts.validate_maintenance_manifest import _validate_registration_history, validate_manifest
 
 
 INDEX = """## Maintained patch index
@@ -267,3 +267,55 @@ def test_ci_validates_pull_request_head_instead_of_synthetic_merge():
     ).read_text(encoding="utf-8")
 
     assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+
+
+def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Hermes Test")
+    _git(repo, "config", "user.email", "hermes@example.invalid")
+    (repo / "base.txt").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-m", "upstream: root")
+    _git(repo, "branch", "canonical")
+
+    manifest = _write(
+        repo,
+        INDEX
+        + """
+### HERMES-001 — One
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+### HERMES-002 — Two
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+""",
+    )
+    _git(repo, "add", "MAINTENANCE.md")
+    _git(repo, "commit", "-m", "fix: one")
+    fork_branch = _git(repo, "branch", "--show-current")
+
+    _git(repo, "checkout", "canonical")
+    (repo / "upstream.py").write_text("upstream = True\n", encoding="utf-8")
+    _git(repo, "add", "upstream.py")
+    _git(repo, "commit", "-m", "upstream: change")
+
+    _git(repo, "checkout", fork_branch)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", "`fix: one`; `fix: registered`"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "feature.py").write_text("feature = True\n", encoding="utf-8")
+    _git(repo, "add", "MAINTENANCE.md", "feature.py")
+    _git(repo, "commit", "-m", "fix: registered")
+    _git(repo, "merge", "--no-ff", "canonical", "-m", "Merge canonical upstream")
+
+    assert _validate_registration_history(
+        repo,
+        None,
+        upstream_ref="canonical",
+        baseline_subject="fix: one",
+    ) == []

@@ -56,26 +56,69 @@ def _registered_subjects(text: str) -> set[str]:
     return subjects
 
 
-def _validate_registration_history(repo: Path, baseline: str) -> list[str]:
+def _validate_registration_history(
+    repo: Path,
+    baseline: str | None,
+    *,
+    upstream_ref: str | None = None,
+    baseline_subject: str | None = None,
+) -> list[str]:
     """Reject fork commits registered only by a later descendant."""
-    try:
-        subprocess.run(
-            ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
-            cwd=repo,
-            check=True,
-            capture_output=True,
-        )
-        commits = subprocess.run(
-            ["git", "rev-list", "--reverse", f"{baseline}..HEAD"],
-            cwd=repo,
-            check=True,
-            text=True,
-            capture_output=True,
-        ).stdout.splitlines()
-    except subprocess.CalledProcessError:
-        return [
-            "maintenance history baseline is not an ancestor of HEAD: " + baseline
-        ]
+    if upstream_ref and baseline_subject:
+        try:
+            commits = subprocess.run(
+                [
+                    "git", "rev-list", "--reverse", "--no-merges",
+                    f"{upstream_ref}..HEAD",
+                ],
+                cwd=repo,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+        except subprocess.CalledProcessError as exc:
+            return [
+                f"could not read fork history from {upstream_ref}: "
+                f"git exited {exc.returncode}"
+            ]
+        marker_index = None
+        for index, commit in enumerate(commits):
+            subject = subprocess.run(
+                ["git", "show", "-s", "--format=%s", commit],
+                cwd=repo,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            if subject == baseline_subject:
+                marker_index = index
+        if marker_index is None:
+            return [
+                "maintenance history baseline subject is absent from fork history: "
+                + baseline_subject
+            ]
+        commits = commits[marker_index + 1 :]
+    elif baseline is not None:
+        try:
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+            commits = subprocess.run(
+                ["git", "rev-list", "--reverse", f"{baseline}..HEAD"],
+                cwd=repo,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+        except subprocess.CalledProcessError:
+            return [
+                "maintenance history baseline is not an ancestor of HEAD: " + baseline
+            ]
+    else:
+        return ["maintenance history validation requires a baseline"]
 
     errors: list[str] = []
     for commit in commits:
@@ -106,6 +149,7 @@ def validate_manifest(
     upstream_ref: str | None = None,
     fork_subjects: set[str] | None = None,
     history_baseline: str | None = None,
+    history_baseline_subject: str | None = None,
 ) -> list[str]:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -226,9 +270,14 @@ def validate_manifest(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )
 
-    if history_baseline is not None:
+    if history_baseline is not None or history_baseline_subject is not None:
         errors.extend(
-            _validate_registration_history(path.resolve().parent, history_baseline)
+            _validate_registration_history(
+                path.resolve().parent,
+                history_baseline,
+                upstream_ref=upstream_ref,
+                baseline_subject=history_baseline_subject,
+            )
         )
 
     return errors
@@ -250,12 +299,17 @@ def main() -> int:
         "--history-baseline",
         help="Require every later commit to register its subject in that same commit.",
     )
+    parser.add_argument(
+        "--history-baseline-subject",
+        help="Rebase-stable fork subject after which same-commit registration is required.",
+    )
     args = parser.parse_args()
 
     errors = validate_manifest(
         args.manifest,
         upstream_ref=args.upstream_ref,
         history_baseline=args.history_baseline,
+        history_baseline_subject=args.history_baseline_subject,
     )
     if errors:
         for error in errors:
