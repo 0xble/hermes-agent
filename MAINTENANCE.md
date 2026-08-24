@@ -71,6 +71,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-045 | Active | `fix(telegram): keep rich tables narrow` | Prefer compact tables and vertically stacked records over wide Telegram output. |
 | HERMES-046 | Active | `fix(computer-use): honor live element-token schema`; `docs(maintenance): register element-token schema patch` | Preserve safe element-index targeting when cua-driver accepts tokens through its live action schema without advertising the legacy capability label. |
 | HERMES-047 | Active | `fix(computer-use): preserve private macOS runtime readiness` | Keep bounded and unrestricted private computer-use runtimes startable with slow healthy status clients and preserve macOS TCC identity by launching the exact signed CuaDriver.app bundle. |
+| HERMES-048 | Active | `fix(gateway): recover stale progress anchors` | Replace a verified stale tool-progress message anchor and resume coalesced edits instead of fragmenting the rest of the run into separate messages. |
 
 ## Fork-only administrative subject exemptions
 
@@ -96,6 +97,19 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-048 — Recover stale gateway progress anchors
+
+- **Independent hypothesis (2026-08-23):** Gateway tool progress owns one mutable message anchor per run. A Telegram edit that returns `message to edit not found` currently enters the generic permanent-failure branch, sets `can_edit = False`, sends the current line separately, and leaves every later tool update in send-only mode. Production logs and the affected Telegram topic show that exact causal sequence, while unaffected runs keep coalescing when the first edit succeeds. The correction belongs in the gateway progress state machine, not Telegram configuration: classify only verified stale-anchor errors, send the complete accumulated progress text once as a replacement anchor, capture its message ID through the existing send and cleanup boundary, and resume editing it. Retryable network and flood-control behavior remains unchanged; permission, unsupported-edit, and unknown permanent errors remain send-only.
+- **Summary:** Replaces a verified stale tool-progress message anchor with one complete accumulated progress bubble and resumes edits against the replacement. Recovery is bounded to one replacement attempt per stale anchor and fails closed to the existing send-only fallback when replacement delivery does not return an editable message ID.
+- **Surfaces:** `gateway/run.py`; `tests/gateway/test_run_progress_topics.py`; this record.
+- **Upstream tracking:** Direct open issue #9136 reports progress coalescing stopping after a stale edit. Open PR #9345 implements stale-anchor replacement and is the direct upstream candidate. Related open PRs #9805 and #28327 attempt broader recovery but received review feedback for conflating stale, transient, and permanent failures. Merged PRs #28484 (`1b3c51bccc`) and #28485 (`6be579f626`) cover flood control and retryable network failures respectively, but intentionally do not recover `message to edit not found`. Checked 2026-08-23 against upstream `9ab056d4e8b892fccb797cc5cd5dffd090ac827e`, which still contains the stale-anchor fallback defect.
+- **Upstream PR:** Direct: #9345 (open, non-draft, GitHub reports mergeable, green CI, no review approval; checked 2026-08-23). Related only: #9805 and #28327.
+- **Regression:** `.venv/bin/python -m pytest tests/gateway/test_run_progress_topics.py -q`; `.venv/bin/python -m pytest tests/gateway/test_progress_edit_shared_clock_integration.py tests/test_progress_edit_chat_throttle.py tests/gateway/test_telegram_progress_edit_transient.py -q`; `.venv/bin/python scripts/validate_maintenance_manifest.py MAINTENANCE.md`; `git diff --check`. Before implementation, `test_stale_progress_anchor_is_replaced_and_edits_resume` failed with four separate sends instead of two; the focused suite now proves ordinary and overflow replacement, bounded replacement failure, permanent-failure send-only behavior, and existing retryable/flood contracts.
+- **Published commit identity:** Stable subject `fix(gateway): recover stale progress anchors`; source, tests, and manifest ship together in the same fork commit.
+- **Activation:** Source publication is separate from runtime promotion. Gateways started before this patch retain the old progress state machine until a separately authorized promotion and restart.
+- **Rollback:** Revert `fix(gateway): recover stale progress anchors` in a follow-up commit. Remove only the stale-anchor classifier, replacement-anchor branch, and focused regression while preserving retryable-network recovery, flood-control suppression, shared edit throttling, topic metadata, cleanup tracking, and unrelated progress behavior. Expect a stale edit to fragment the remainder of the run again.
+- **Retirement:** Retire after a released upstream version narrowly replaces verified stale progress anchors, resumes coalescing on the returned message ID, preserves topic and cleanup metadata, bounds replacement failure, leaves permissions and unsupported edits permanent, and passes the focused regression plus a real Telegram topic canary. Remove the private implementation and duplicate test rather than retaining parallel paths.
 
 ### HERMES-047 — Preserve private macOS computer-use runtime readiness
 
