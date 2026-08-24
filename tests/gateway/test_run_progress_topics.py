@@ -173,6 +173,99 @@ class RetryableFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class StaleFirstEditProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Lose one progress anchor, then accept edits on its replacement."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self._next_message_id = 0
+        self.edit_outcomes = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self._next_message_id += 1
+        message_id = f"progress-{self._next_message_id}"
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+                "message_id": message_id,
+            }
+        )
+        return SendResult(success=True, message_id=message_id)
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        outcome = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "content": content,
+            "success": message_id != "progress-1",
+        }
+        self.edits.append(outcome)
+        self.edit_outcomes.append(outcome["success"])
+        if not outcome["success"]:
+            return SendResult(success=False, error="Message to edit not found")
+        return SendResult(success=True, message_id=message_id)
+
+
+class StaleReplacementFailureProgressCaptureAdapter(
+    StaleFirstEditProgressCaptureAdapter
+):
+    """Lose an anchor and reject the one bounded replacement send."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.send_attempts = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.send_attempts += 1
+        if self.send_attempts == 2:
+            return SendResult(success=False, error="temporary replacement send failure")
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+
+class PermanentEditFailureProgressCaptureAdapter(
+    StaleFirstEditProgressCaptureAdapter
+):
+    """Reject edits for a reason that must remain permanently send-only."""
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+                "success": False,
+            }
+        )
+        return SendResult(success=False, error="Forbidden: bot lacks permission")
+
+
+class StaleOverflowEditProgressAdapter(SmallLimitProgressAdapter):
+    """Lose the first overflow anchor, then edit its replacement."""
+
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.stale_edit_failures = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        if self.stale_edit_failures == 0 and len(content) > 100:
+            self.stale_edit_failures += 1
+            self.edits.append(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "content": content,
+                    "success": False,
+                }
+            )
+            return SendResult(success=False, error="MESSAGE_ID_INVALID")
+        result = await super().edit_message(chat_id, message_id, content)
+        self.edits[-1]["success"] = True
+        return result
+
+
 class RetryableOverflowEditProgressAdapter(SmallLimitProgressAdapter):
     """Fail the first split edit transiently, then keep editing."""
 
@@ -406,6 +499,93 @@ class RetryableEditProgressAgent:
         time.sleep(0.5)
         callback("tool.started", "terminal", "fourth command", {})
         time.sleep(0.6)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_stale_progress_anchor_is_replaced_and_edits_resume(monkeypatch, tmp_path):
+    """A missing progress message must not fragment every later tool update."""
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RetryableEditProgressAgent,
+        session_id="sess-stale-progress-anchor",
+        config_data={"display": {"tool_progress": "all"}},
+        adapter_cls=StaleFirstEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 2
+    assert adapter.sent[0]["message_id"] == "progress-1"
+    assert adapter.sent[1]["message_id"] == "progress-2"
+    assert "first command" in adapter.sent[1]["content"]
+    assert "second command" in adapter.sent[1]["content"]
+    assert adapter.edits[0]["message_id"] == "progress-1"
+    assert adapter.edits[0]["success"] is False
+    assert any(
+        edit["message_id"] == "progress-2" and edit["success"]
+        for edit in adapter.edits[1:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_progress_replacement_failure_is_bounded(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RetryableEditProgressAgent,
+        session_id="sess-stale-progress-replacement-failure",
+        config_data={"display": {"tool_progress": "all"}},
+        adapter_cls=StaleReplacementFailureProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, StaleReplacementFailureProgressCaptureAdapter)
+    assert adapter.send_attempts == 4
+    assert len(adapter.edits) == 1
+    assert adapter.edits[0]["message_id"] == "progress-1"
+
+
+@pytest.mark.asyncio
+async def test_permanent_progress_edit_failure_stays_send_only(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RetryableEditProgressAgent,
+        session_id="sess-permanent-progress-edit-failure",
+        config_data={"display": {"tool_progress": "all"}},
+        adapter_cls=PermanentEditFailureProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, PermanentEditFailureProgressCaptureAdapter)
+    assert len(adapter.edits) == 1
+    assert len(adapter.sent) == 4
+    assert "first command" not in adapter.sent[1]["content"]
+    assert "second command" in adapter.sent[1]["content"]
+
+
+class StaleOverflowProgressAgent:
+    """Overflow once, then emit a later line that must edit the replacement."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "first-short", {})
+        time.sleep(0.35)
+        for idx in range(1, 8):
+            cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
+        time.sleep(1.7)
+        cb("tool.started", "terminal", "after-overflow", {})
+        time.sleep(0.5)
         return {
             "final_response": "done",
             "messages": [],
@@ -1148,6 +1328,30 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
     assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
     assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
     assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_overflow_anchor_is_replaced_and_remains_editable(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StaleOverflowProgressAgent,
+        session_id="sess-stale-progress-overflow",
+        config_data={"display": {"tool_progress": "all"}},
+        adapter_cls=StaleOverflowEditProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert isinstance(adapter, StaleOverflowEditProgressAdapter)
+    assert adapter.stale_edit_failures == 1
+    stale_index = next(i for i, edit in enumerate(adapter.edits) if not edit["success"])
+    stale_message_id = adapter.edits[stale_index]["message_id"]
+    assert any(
+        edit.get("success") and edit["message_id"] != stale_message_id
+        for edit in adapter.edits[stale_index + 1 :]
+    )
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
 
 
 @pytest.mark.asyncio

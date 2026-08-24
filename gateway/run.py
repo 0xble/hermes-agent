@@ -5428,6 +5428,23 @@ class TurnRunner:
         def _progress_text(lines: list) -> str:
             return "\n".join(str(line) for line in lines)
 
+        def _is_stale_progress_anchor_error(result) -> bool:
+            """Return whether a failed edit proves only the anchor is stale."""
+            if getattr(result, "success", False) or getattr(result, "retryable", False):
+                return False
+            error = (getattr(result, "error", "") or "").lower()
+            return any(
+                marker in error
+                for marker in (
+                    "message to edit not found",
+                    "message_id_invalid",
+                    "message identifier is not specified",
+                    "message identifier is not valid",
+                )
+            )
+
+        recovered_stale_anchor_ids: set[str] = set()
+
         def _split_progress_groups(lines: list) -> list[list]:
             """Partition progress lines into platform-sized editable bubbles."""
             groups: list[list] = []
@@ -5486,9 +5503,24 @@ class TurnRunner:
                             adapter.name,
                         )
                         return True
-                    can_edit = False
-                    # Fall back to the existing non-edit behavior below.
-                    return False
+                    stale_anchor_id = str(progress_msg_id)
+                    if (
+                        _is_stale_progress_anchor_error(result)
+                        and stale_anchor_id not in recovered_stale_anchor_ids
+                    ):
+                        recovered_stale_anchor_ids.add(stale_anchor_id)
+                        replacement = await _send_progress_text(first_text)
+                        replacement_id = getattr(replacement, "message_id", None)
+                        if getattr(replacement, "success", False) and replacement_id:
+                            progress_msg_id = str(replacement_id)
+                        else:
+                            can_edit = False
+                            progress_msg_id = None
+                            return True
+                    else:
+                        can_edit = False
+                        # Fall back to the existing non-edit behavior below.
+                        return False
             else:
                 result = await _send_progress_text(first_text)
                 if result.success and result.message_id:
@@ -5613,26 +5645,37 @@ class TurnRunner:
                             )
                             _last_edit_ts = _stamp_edit_clock(time.monotonic())
                             continue
-                        can_edit = False
-                        # Non-flood permanent failure (message deleted,
-                        # permission revoked, etc.) — fall back to a fresh
-                        # message bubble so the user still sees the
-                        # progress line. This branch intentionally keeps
-                        # the legacy send() fallback because the failure
-                        # mode here is local, not a Telegram rate-limit
-                        # signal.
-                        _perm_result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        stale_anchor_id = str(progress_msg_id)
                         if (
-                            ctx._cleanup_progress
-                            and getattr(_perm_result, "success", False)
-                            and getattr(_perm_result, "message_id", None)
+                            _is_stale_progress_anchor_error(result)
+                            and stale_anchor_id not in recovered_stale_anchor_ids
                         ):
-                            ctx._cleanup_msg_ids.append(str(_perm_result.message_id))
+                            recovered_stale_anchor_ids.add(stale_anchor_id)
+                            replacement = await _send_progress_text(full_text)
+                            replacement_id = getattr(replacement, "message_id", None)
+                            if getattr(replacement, "success", False) and replacement_id:
+                                progress_msg_id = str(replacement_id)
+                                logger.info(
+                                    "[%s] Replaced stale progress message %s with %s; "
+                                    "edits remain enabled",
+                                    getattr(adapter, "name", "unknown"),
+                                    stale_anchor_id,
+                                    progress_msg_id,
+                                )
+                            else:
+                                can_edit = False
+                                progress_msg_id = None
+                                logger.info(
+                                    "[%s] Stale progress replacement failed; "
+                                    "disabling edits for this run",
+                                    getattr(adapter, "name", "unknown"),
+                                )
+                            continue
+                        can_edit = False
+                        # Unknown permanent failures (permission revoked,
+                        # unsupported edits, etc.) keep the legacy send-only
+                        # fallback. A verified stale anchor is replaced above.
+                        await _send_progress_text(str(msg))
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
