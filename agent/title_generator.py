@@ -95,6 +95,8 @@ _TITLE_PROMPT_TEMPLATE = (
     "- Use concise Title Case by default, including for technical titles.\n"
     "- Title the concrete subject or artifact discussed, not the conversation's "
     "abstract intent, theme, goal, or emotional tone.\n"
+    "- Use a noun phrase, not a command, instruction, recommendation, question, "
+    "or conditional action. Name the subject, artifact, event, decision, or review.\n"
     "- Use the assistant response to resolve vague requests, URLs, filenames, "
     "and broad prompts. Do not summarize the response or answer the request.\n"
     "- Prefer an explicitly named project, person, product, or other proper name.\n"
@@ -117,12 +119,16 @@ _TITLE_PROMPT_TEMPLATE = (
 )
 
 _TITLE_EXAMPLES_SENTENCE_CASE = (
-    'Good: {"title": "Fix mobile login"}\n'
+    'Bad: {"title": "Cancel iCloud+ 2TB if unused"}\n'
+    'Good: {"title": "iCloud+ 2TB subscription review"}\n'
+    'Good: {"title": "Mobile login fix"}\n'
     'Good: {"title": "Postgres pool exhaustion"}\n'
     'Good: {"title": "Friendly greeting"}\n'
 )
 _TITLE_EXAMPLES_TITLE_CASE = (
-    'Good: {"title": "Fix Mobile Login"}\n'
+    'Bad: {"title": "Cancel iCloud+ 2TB If Unused"}\n'
+    'Good: {"title": "iCloud+ 2TB Subscription Review"}\n'
+    'Good: {"title": "Mobile Login Fix"}\n'
     'Good: {"title": "Postgres Pool Exhaustion"}\n'
     'Good: {"title": "Friendly Greeting"}\n'
 )
