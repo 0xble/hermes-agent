@@ -384,8 +384,12 @@ class TestGenerateTitle:
         prompt = llm.call_args.kwargs["messages"][0]["content"]
         assert "30 characters" in prompt
         assert "use Title Case" in prompt
-        assert 'Good: {"title": "Fix Mobile Login"}' in prompt
-        assert 'Good: {"title": "Fix mobile login"}' not in prompt
+        assert "Use a noun phrase, not a command" in prompt
+        assert 'Bad: {"title": "Cancel iCloud+ 2TB If Unused"}' in prompt
+        assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
+        assert 'Good: {"title": "Mobile Login Fix"}' in prompt
+        assert 'Good: {"title": "Fix Mobile Login"}' not in prompt
+        assert 'Good: {"title": "Mobile login fix"}' not in prompt
 
     def test_name_aliases_match_whole_terms_not_substrings(self):
         response = MagicMock()
