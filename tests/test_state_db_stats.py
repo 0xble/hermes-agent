@@ -100,7 +100,7 @@ def test_collect_and_render_stale_fts_holder_deferral(populated_db):
     rendered = _render_state_db_stats(stats)
     warnings = [
         " ".join((text, detail))
-        for kind, text, detail in rendered
+        for kind, text, detail, *_ in rendered
         if kind == "warn"
     ]
     assert any("4242" in warning and "optimize-storage" in warning for warning in warnings)

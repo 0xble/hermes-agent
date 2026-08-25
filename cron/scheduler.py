@@ -6515,11 +6515,10 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            # Memory is enabled for cron agents like any other agent run:
-            # MEMORY.md / USER.md load into the system prompt and the memory
-            # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            # Cron keeps external MemoryManager providers disabled. A job that
+            # explicitly requests the memory toolset still receives the local
+            # file-backed store through AIAgent's skip-memory exception.
+            skip_memory=True,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,

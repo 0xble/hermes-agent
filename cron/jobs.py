@@ -1401,6 +1401,7 @@ def get_persisted_error_recovery_stats() -> Dict[str, Any]:
 def _cron_next_run_matches_expr(
     schedule: Dict[str, Any],
     next_run_dt: datetime,
+    timezone: Optional[str] = None,
 ) -> bool:
     """Whether ``next_run_dt`` is an occurrence of the schedule's current expr.
 
@@ -1420,9 +1421,10 @@ def _cron_next_run_matches_expr(
         # The last occurrence at-or-before the stored instant: base croniter
         # a second past it so an exact occurrence is included, then compare
         # at second granularity (croniter returns second-precision datetimes).
-        base = next_run_dt + timedelta(seconds=1)
+        scheduled = next_run_dt.astimezone(_effective_cron_timezone(timezone))
+        base = scheduled + timedelta(seconds=1)
         prev = croniter(str(expr), base).get_prev(datetime)
-        return abs((prev - next_run_dt).total_seconds()) < 1.0
+        return abs((prev - scheduled).total_seconds()) < 1.0
     except Exception:
         return True
 
@@ -4061,7 +4063,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     recovered_next = now.isoformat()
                     recovered_next_dt = now
                 else:
-                    recovered_next = compute_next_run(schedule, now.isoformat())
+                    recovered_next = _compute_next_run_for_job(job, now.isoformat())
                     try:
                         recovered_next_dt = (
                             _ensure_aware(datetime.fromisoformat(recovered_next))
@@ -4100,9 +4102,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # current expression, so this converges — it cannot defer
                 # forever.
                 if not manual_run and kind == "cron" and not _cron_next_run_matches_expr(
-                    schedule, next_run_dt
+                    schedule, next_run_dt, job.get("timezone")
                 ):
-                    new_next = compute_next_run(schedule, now.isoformat())
+                    new_next = _compute_next_run_for_job(job, now.isoformat())
                     logger.info(
                         "Job '%s' next_run_at %s does not match its current "
                         "cron expression %r (direct jobs.json edit?); "
