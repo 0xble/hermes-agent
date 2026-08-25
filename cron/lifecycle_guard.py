@@ -57,11 +57,14 @@ class GatewayLifecycleBlocked(ValueError):
 # actual shell-command-shaped strings, not on prose.
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
+    # Branch A: destructive `hermes gateway` operations.
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    # Require command position and a complete verb so prose such as
+    # `/docs/hermes gateway restart-notes.md` and `gateway restarted` stays
+    # inert while restart/stop/uninstall remain blocked.
+    r"(?:(?<![/\w.\-])hermes\s+gateway\s+(?:restart|stop|uninstall)\b)"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.
@@ -89,8 +92,8 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
-    r"|(?:p?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:p?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
+    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
 )
 
 
@@ -106,13 +109,93 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 # across genuinely separate lines.
 _SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 
+# Python argv-list punctuation (#68289): subprocess calls commonly express
+# executable argv with brackets and commas rather than shell whitespace.
+_ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
+
+# Explicit profile selectors are only unsafe when they target the profile
+# running this guard. Sibling-profile lifecycle operations remain legitimate.
+_PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
+    r"(?i)"
+    r"hermes\s+"
+    r"(?:-{1,2}\S+(?:\s+\S+)?\s+)*"
+    r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
+    r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
+    r"\s+gateway\s+(?:restart|stop)"
+)
+
+
+def _current_profile_name() -> Optional[str]:
+    """Return the profile running the guard, if it can be determined."""
+    for env_name in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = os.environ.get(env_name)
+        if value and value.strip():
+            return value.strip()
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or None
+    except Exception:
+        return None
+
+
+def _named_profile_is_current(named: str) -> bool:
+    """Return whether *named* is the profile executing this guard."""
+    current = _current_profile_name()
+    if not current:
+        return False
+    return named.strip().casefold() == current.strip().casefold()
+
+
+# The gateway label can be defined before a later launchctl invocation, so
+# the same-span lifecycle regex is not sufficient for shell loops that pass
+# the label through a variable. Keep this companion label-anchored but
+# order-independent; neutral-label submit/bootstrap remains handled by the
+# execution-aware scanner below.
+_LAUNCHCTL_LIFECYCLE_VERBS_RE = re.compile(
+    r"(?i)\blaunchctl\s+(?:kickstart|unload|load|stop|restart|bootout|kill|disable|remove)\b"
+)
+_HERMES_GATEWAY_LABEL_RE = re.compile(r"(?i)\bhermes[.\-]?gateway\b")
+
+
+def _contains_launchctl_gateway_lifecycle(normalized_text: str) -> bool:
+    """Detect a launchctl lifecycle verb and gateway label in either order."""
+    return bool(_LAUNCHCTL_LIFECYCLE_VERBS_RE.search(normalized_text)) and bool(
+        _HERMES_GATEWAY_LABEL_RE.search(normalized_text)
+    )
+
 
 def contains_gateway_lifecycle_command(text: str) -> bool:
-    """Return True if *text* contains a gateway lifecycle command pattern."""
+    """Return True when *text* contains command-shaped lifecycle behavior."""
     if not text:
         return False
+
+    # Quoted heredocs feeding inert consumers are data, not commands. The
+    # helper deliberately preserves ambiguous or executable heredocs.
+    from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+    text = strip_inert_heredoc_bodies(text)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
+    if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+        return True
+
+    profile_match = _PROFILE_FLAG_LIFECYCLE_PATTERN.search(normalized)
+    if profile_match:
+        named = profile_match.group(1) or profile_match.group(2)
+        if named and _named_profile_is_current(named.strip().strip("\"'")):
+            return True
+
+    # Re-scan shell-normalized argv to catch quote/backslash splicing, and
+    # Python argv-list punctuation used by execute_code subprocess calls.
+    for segment in _iter_command_segments(normalized):
+        joined = " ".join(segment)
+        if joined and _GATEWAY_LIFECYCLE_PATTERN.search(joined):
+            return True
+        stripped = _ARGV_LIST_PUNCTUATION.sub(" ", joined)
+        if stripped != joined and _GATEWAY_LIFECYCLE_PATTERN.search(stripped):
+            return True
+
+    return _contains_launchctl_gateway_lifecycle(normalized)
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
@@ -148,6 +231,7 @@ def _is_cloud_placeholder_path(path: Path) -> bool:
         if index
     )
 
+
 # Executables whose arguments are DATA, not commands: search patterns, SQL
 # statements, log filters. None of these can execute their argument text, so
 # a lifecycle-shaped string inside their arguments (a grep pattern hunting
@@ -156,17 +240,26 @@ def _is_cloud_placeholder_path(path: Path) -> bool:
 # conservative: no `awk` (system()), no `sed` (`s///e`), no `echo`/`printf`
 # (their output can rewrite a script executed later), and no `mysql`
 # (`\\!` and `system` escapes).
-_DATA_SINK_EXECUTABLES = frozenset(
-    {
-        "ack", "ag", "egrep", "fgrep", "grep", "journalctl", "psql", "rg",
-        "sqlite3",
-    }
-)
+_DATA_SINK_EXECUTABLES = frozenset({
+    "ack",
+    "ag",
+    "egrep",
+    "fgrep",
+    "grep",
+    "journalctl",
+    "psql",
+    "rg",
+    "sqlite3",
+})
 # Argument shapes that can smuggle execution back INTO a data sink: command
 # and process substitution anywhere, sqlite3 dot-commands (`.shell ...`),
 # psql backslash escapes (`\! ...`). Any hit disables masking for the whole
 # segment — fail closed to the plain regex verdict.
 _UNSAFE_DATA_ARG_MARKERS = ("`", "$(", "<(", ">(", "\\!")
+# sqlite3 dot-commands are executable escapes, but ordinary relative paths
+# (`.`, `./logs`, `../archive`) are data operands and must not disable the
+# grep/rg/sql data exemption.
+_DOT_COMMAND_ARGUMENT = re.compile(r"^\.[A-Za-z]")
 # A data sink piped into a shell/interpreter can feed matched lines straight
 # to execution (`grep 'systemctl restart hermes-gateway' f | sh`); never mask
 # such a line.
@@ -185,11 +278,19 @@ _BINARY_MAGIC_PREFIXES = (
     b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xce",
     b"\xfe\xed\xfa\xcf",
+    b"!<arch>",
+    b"\x1f\x8b",
+    b"PK\x03\x04",
 )
 _BINARY_SNIFF_BYTES = 4096
 _LIFECYCLE_INERT_HEREDOC_CONSUMERS = frozenset()
 
 
+def _has_binary_magic(data: bytes) -> bool:
+    """Identify compiled/compressed files without treating every NUL as binary."""
+    if data.startswith(b"#!"):
+        return False
+    return data.startswith(_BINARY_MAGIC_PREFIXES)
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
@@ -271,9 +372,7 @@ def _lex_shell_line(line: str) -> list[_ShellToken]:
             descriptor = ""
             if current and (
                 all(part.isdigit() for part in current)
-                or re.fullmatch(
-                    r"\{[A-Za-z_][A-Za-z0-9_]*\}", "".join(current)
-                )
+                or re.fullmatch(r"\{[A-Za-z_][A-Za-z0-9_]*\}", "".join(current))
             ):
                 descriptor = "".join(current)
                 current.clear()
@@ -354,6 +453,7 @@ def _lex_shell_line(line: str) -> list[_ShellToken]:
         tokens.append(_ShellToken(text, raw, quoted))
     return tokens
 
+
 def _tokens_execute_shell_substitution(tokens: list[_ShellToken]) -> bool:
     """Return whether shell evaluation of *tokens* can execute another command."""
     source_parts: list[str] = []
@@ -400,6 +500,46 @@ def _tokens_execute_shell_substitution(tokens: list[_ShellToken]) -> bool:
     return False
 
 
+def _split_logical_lines(text: str) -> list[str]:
+    """Split text on newlines that are not inside quotes.
+
+    A newline inside a quoted string (single or double quotes) is data,
+    not a command separator. Handles escaped quotes within strings.
+    """
+    lines = []
+    current = []
+    in_single = False
+    in_double = False
+    escape = False
+
+    for ch in text:
+        if escape:
+            current.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            current.append(ch)
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            current.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            current.append(ch)
+            continue
+        if ch == "\n" and not in_single and not in_double:
+            lines.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+
+    if current:
+        lines.append("".join(current))
+    return lines
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield executable shell segments while discarding inert shell grammar."""
     normalized = command.replace("\\\n", "")
@@ -432,9 +572,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
 
     def control(value: _ShellToken) -> bool:
         return (
-            bool(value.text)
-            and not value.quoted
-            and set(value.text) <= _CONTROL_CHARS
+            bool(value.text) and not value.quoted and set(value.text) <= _CONTROL_CHARS
         )
 
     synthetic_separator = _ShellToken(";", ";", False)
@@ -445,8 +583,10 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
         if not filtered or not control(filtered[-1]):
             filtered.append(synthetic_separator)
 
+    logical_lines = _split_logical_lines(normalized)
+
     if not shell_grammar:
-        for line in normalized.splitlines() or [normalized]:
+        for line in logical_lines:
             try:
                 tokens = _lex_shell_line(line)
             except ValueError:
@@ -463,7 +603,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 yield segment
         return
 
-    for line in normalized.splitlines() or [normalized]:
+    for line in logical_lines:
         try:
             tokens = _lex_shell_line(line)
         except ValueError:
@@ -648,10 +788,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 continue
 
             if (
-                (
-                    token.text == "for"
-                    or (token.text == "select" and bash_grammar)
-                )
+                (token.text == "for" or (token.text == "select" and bash_grammar))
                 and not token.quoted
                 and command_start
             ):
@@ -698,27 +835,24 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 index += 1
                 continue
 
-            if (
-                not token.quoted
-                and (
-                    token.text in {"{", "}"}
-                    or (
-                        command_start
-                        and token.text
-                        in {
-                            "if",
-                            "elif",
-                            "while",
-                            "until",
-                            "then",
-                            "do",
-                            "else",
-                            "fi",
-                            "done",
-                            "!",
-                            "function",
-                        }
-                    )
+            if not token.quoted and (
+                token.text in {"{", "}"}
+                or (
+                    command_start
+                    and token.text
+                    in {
+                        "if",
+                        "elif",
+                        "while",
+                        "until",
+                        "then",
+                        "do",
+                        "else",
+                        "fi",
+                        "done",
+                        "!",
+                        "function",
+                    }
                 )
             ):
                 separate(filtered)
@@ -727,11 +861,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
                 continue
 
             filtered.append(token)
-            if (
-                case_depth
-                and not token.quoted
-                and token.text in {";;", ";&", ";;&"}
-            ):
+            if case_depth and not token.quoted and token.text in {";;", ";&", ";;&"}:
                 expecting_case_pattern = True
                 command_start = True
             elif control(token):
@@ -763,10 +893,165 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
         yield ["$("]
 
 
+def _executable_name(token: str) -> str:
+    """Return a path basename while preserving the POSIX ``.`` builtin."""
+    return Path(token).name or token
+
+
+_TRANSPARENT_COMMAND_PREFIXES = frozenset({
+    "sudo",
+    "doas",
+    "env",
+    "nohup",
+    "setsid",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "timeout",
+    "exec",
+    "command",
+    "builtin",
+    "eatmydata",
+    "pkexec",
+    "su",
+    "runuser",
+    "setpriv",
+    "systemd-run",
+    "nsenter",
+    "unshare",
+})
+_TRANSPARENT_PREFIX_VALUE_OPTIONS = {
+    "sudo": {
+        "-u",
+        "-g",
+        "-U",
+        "-C",
+        "-p",
+        "-r",
+        "-t",
+        "-T",
+        "--user",
+        "--group",
+        "--prompt",
+    },
+    "doas": {"-u", "-C"},
+    "env": {"-u", "--unset", "-S", "--split-string", "-C", "--chdir"},
+    "nice": {"-n", "--adjustment"},
+    "ionice": {"-c", "-n", "-p", "--class", "--classdata"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "pkexec": {"--user"},
+    "su": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "runuser": {"-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"},
+    "setpriv": {
+        "--reuid",
+        "--regid",
+        "--groups",
+        "--inh-caps",
+        "--ambient-caps",
+        "--bounding-set",
+        "--selinux-label",
+        "--apparmor-profile",
+    },
+    "systemd-run": {
+        "-u",
+        "--unit",
+        "-p",
+        "--property",
+        "-E",
+        "--setenv",
+        "--slice",
+        "--description",
+        "--uid",
+        "--gid",
+        "--on-calendar",
+        "--service-type",
+    },
+    "nsenter": {
+        "-t",
+        "--target",
+        "-S",
+        "--setuid",
+        "-G",
+        "--setgid",
+        "-r",
+        "--root",
+        "-w",
+        "--wd",
+    },
+    "unshare": {
+        "--map-user",
+        "--map-group",
+        "--setgroups",
+        "-R",
+        "--root",
+        "-w",
+        "--wd",
+    },
+}
+_STRING_COMMAND_OPTIONS = {
+    "env": ("-S", "--split-string"),
+    "su": ("-c", "--command"),
+    "runuser": ("-c", "--command"),
+}
+_TRANSPARENT_PREFIX_OPERANDS = {"timeout": 1}
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_MAX_PREFIX_PEELS = 8
+
+
+def _peel_transparent_prefixes(segment: list[str], index: int) -> int:
+    """Return the argv index handed execution by a deterministic wrapper chain."""
+    for _ in range(_MAX_PREFIX_PEELS):
+        if index >= len(segment):
+            return index
+        name = _executable_name(segment[index])
+        if name not in _TRANSPARENT_COMMAND_PREFIXES:
+            return index
+        if (
+            name == "command"
+            and index + 1 < len(segment)
+            and segment[index + 1]
+            in {
+                "-v",
+                "-V",
+            }
+        ):
+            return len(segment)
+        value_options = _TRANSPARENT_PREFIX_VALUE_OPTIONS.get(name, frozenset())
+        index += 1
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                index += 1
+                break
+            if token in value_options:
+                index += 2
+                continue
+            if token.startswith("-") or _ENV_ASSIGNMENT.match(token):
+                index += 1
+                continue
+            break
+        for _ in range(_TRANSPARENT_PREFIX_OPERANDS.get(name, 0)):
+            if index < len(segment) and not segment[index].startswith("-"):
+                index += 1
+    return index
+
+
+def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator[str]:
+    """Yield values supplied as ``--option value`` or ``--option=value``."""
+    prefix = option + "="
+    for position in range(start + 1, len(segment)):
+        token = segment[position]
+        if token == option and position + 1 < len(segment):
+            yield segment[position + 1]
+        elif token.startswith(prefix):
+            yield token[len(prefix) :]
+
+
 def _command_token_index(segment: list[str]) -> Optional[int]:
     """Return the executable token index after simple env assignments."""
     for index, token in enumerate(segment):
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+        if _ENV_ASSIGNMENT.match(token):
             continue
         return index
     return None
@@ -786,7 +1071,10 @@ def contains_launchctl_submit_command(command: str) -> bool:
         index = _command_token_index(segment)
         if index is None:
             continue
-        if Path(segment[index]).name == "launchctl":
+        index = _peel_transparent_prefixes(segment, index)
+        if index >= len(segment):
+            continue
+        if _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
             if arguments and arguments[0].lower() in {"submit", "bootstrap"}:
                 return True
@@ -861,7 +1149,7 @@ def _mask_data_sink_arguments(text: str) -> str:
                 executable_name in _DATA_SINK_EXECUTABLES or inert_command_lookup
             ):
                 if not any(
-                    argument.startswith(".")
+                    _DOT_COMMAND_ARGUMENT.match(argument)
                     or any(marker in argument for marker in _UNSAFE_DATA_ARG_MARKERS)
                     for argument in arguments
                 ):
@@ -988,8 +1276,19 @@ def _iter_referenced_shell_scripts(
         index = _command_token_index(segment)
         if index is None:
             continue
+        # Additively inspect the argv tail a transparent wrapper executes.
+        # The original token is still processed below so a local executable
+        # named `./timeout` cannot be swallowed by wrapper recognition.
+        peeled = _peel_transparent_prefixes(segment, index)
+        if peeled != index and peeled < len(segment):
+            yield from _iter_referenced_shell_scripts(
+                shlex.join(segment[peeled:]),
+                cwd=cwd,
+                fail_on_unresolved=fail_on_unresolved,
+                remote=remote,
+            )
         executable = segment[index]
-        executable_name = Path(executable).name
+        executable_name = _executable_name(executable)
         if fail_on_unresolved and _has_unresolved_shell_expansion(executable):
             if _is_safe_unresolved_test_executable(executable, segment[index + 1 :]):
                 continue
@@ -1088,14 +1387,23 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield ``-c`` code with the selected shell dialect preserved."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
-        if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:
+        if index is None:
+            continue
+        # env/su/runuser options may themselves carry shell source. Preserve
+        # shell context so the Brian-owned grammar remains fail-closed.
+        for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
+            for payload in _iter_option_values(segment, index, option):
+                yield f"#!/bin/sh\n{payload}"
+        index = _peel_transparent_prefixes(segment, index)
+        if (
+            index >= len(segment)
+            or _executable_name(segment[index]) not in _SHELL_EXECUTABLES
+        ):
             continue
         executable = segment[index]
-        executable_name = Path(executable).name
+        executable_name = _executable_name(executable)
         payload_dialect = (
-            executable_name
-            if _is_known_shell_interpreter(executable)
-            else "sh"
+            executable_name if _is_known_shell_interpreter(executable) else "sh"
         )
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
@@ -1104,20 +1412,53 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
                 break
 
 
-_EXECUTION_WRAPPERS = frozenset({"command", "env", "exec", "nice", "nohup", "setsid", "sudo", "timeout"})
-_EXECUTION_CARRIERS = frozenset({"chroot", "doas", "find", "parallel", "watch", "xargs"})
-_SUDO_OPTIONS_WITH_VALUES = frozenset(
-    {
-        "-C", "-D", "-g", "-h", "-p", "-R", "-T", "-u",
-        "--chdir", "--close-from", "--group", "--host", "--other-user",
-        "--prompt", "--role", "--type", "--user",
-    }
-)
-_ENV_OPTIONS_WITH_VALUES = frozenset(
-    {
-        "-C", "-S", "-a", "-u", "--argv0", "--chdir", "--split-string", "--unset",
-    }
-)
+_EXECUTION_WRAPPERS = frozenset({
+    "command",
+    "env",
+    "exec",
+    "nice",
+    "nohup",
+    "setsid",
+    "sudo",
+    "timeout",
+})
+_EXECUTION_CARRIERS = frozenset({
+    "chroot",
+    "doas",
+    "find",
+    "parallel",
+    "watch",
+    "xargs",
+})
+_SUDO_OPTIONS_WITH_VALUES = frozenset({
+    "-C",
+    "-D",
+    "-g",
+    "-h",
+    "-p",
+    "-R",
+    "-T",
+    "-u",
+    "--chdir",
+    "--close-from",
+    "--group",
+    "--host",
+    "--other-user",
+    "--prompt",
+    "--role",
+    "--type",
+    "--user",
+})
+_ENV_OPTIONS_WITH_VALUES = frozenset({
+    "-C",
+    "-S",
+    "-a",
+    "-u",
+    "--argv0",
+    "--chdir",
+    "--split-string",
+    "--unset",
+})
 _EXEC_OPTIONS_WITH_VALUES = frozenset({"-a"})
 
 
@@ -1141,7 +1482,11 @@ def _unwrap_execution_wrapper(tokens: list[str]) -> list[str]:
             while index < len(remaining) and remaining[index].startswith("-"):
                 option = remaining[index].split("=", 1)[0]
                 index += 1
-                if option in {"-k", "--kill-after", "-s", "--signal"} and "=" not in remaining[index - 1] and index < len(remaining):
+                if (
+                    option in {"-k", "--kill-after", "-s", "--signal"}
+                    and "=" not in remaining[index - 1]
+                    and index < len(remaining)
+                ):
                     index += 1
             # The mandatory duration precedes the executed command.
             if index < len(remaining):
@@ -1195,7 +1540,11 @@ def _unwrap_execution_wrapper(tokens: list[str]) -> list[str]:
                 "exec": _EXEC_OPTIONS_WITH_VALUES,
                 "sudo": _SUDO_OPTIONS_WITH_VALUES,
             }.get(wrapper, frozenset())
-            if option in options_with_values and "=" not in token and index < len(remaining):
+            if (
+                option in options_with_values
+                and "=" not in token
+                and index < len(remaining)
+            ):
                 index += 1
         remaining = remaining[index:]
     return remaining
@@ -1210,19 +1559,33 @@ def _dynamic_executable_targets_gateway_lifecycle(argv: list[str]) -> bool:
             return True
         if dynamic_args[1] == "run" and "--replace" in dynamic_args[2:]:
             return True
-    if dynamic_args and dynamic_args[0] in {
-        "bootout", "disable", "kickstart", "load", "remove",
-        "restart", "start", "stop", "unload",
-    } and re.search(
-        r"\bhermes[.\-]?gateway\b",
-        " ".join(dynamic_args[1:]),
-        re.IGNORECASE,
+    if (
+        dynamic_args
+        and dynamic_args[0]
+        in {
+            "bootout",
+            "disable",
+            "kickstart",
+            "load",
+            "remove",
+            "restart",
+            "start",
+            "stop",
+            "unload",
+        }
+        and re.search(
+            r"\bhermes[.\-]?gateway\b",
+            " ".join(dynamic_args[1:]),
+            re.IGNORECASE,
+        )
     ):
         return True
     return bool(dynamic_args and dynamic_args[0] in {"submit", "bootstrap"})
 
 
-def contains_executed_gateway_lifecycle_command(command: str, *, _depth: int = 0) -> bool:
+def contains_executed_gateway_lifecycle_command(
+    command: str, *, _depth: int = 0
+) -> bool:
     """Detect lifecycle actions from executable argv, not source vocabulary."""
     if not command or _depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return False
@@ -1257,7 +1620,9 @@ def contains_executed_gateway_lifecycle_command(command: str, *, _depth: int = 0
         if _dynamic_executable_targets_gateway_lifecycle(raw_argv):
             return True
         if _token_basename(raw_argv[0]) == "eval":
-            if any(marker in argument for argument in raw_argv[1:] for marker in ("$", "`")):
+            if any(
+                marker in argument for argument in raw_argv[1:] for marker in ("$", "`")
+            ):
                 return True
             if contains_executed_gateway_lifecycle_command(
                 " ".join(raw_argv[1:]),
@@ -1289,15 +1654,29 @@ def contains_executed_gateway_lifecycle_command(command: str, *, _depth: int = 0
         if executable == "launchctl" and unresolved_arguments:
             launchctl_verb = lowered[0] if lowered else ""
             if 0 in unresolved_arguments or launchctl_verb in {
-                "asuser", "bootstrap", "bootout", "disable", "kickstart",
-                "load", "remove", "restart", "stop", "submit", "unload",
+                "asuser",
+                "bootstrap",
+                "bootout",
+                "disable",
+                "kickstart",
+                "load",
+                "remove",
+                "restart",
+                "stop",
+                "submit",
+                "unload",
             }:
                 return True
 
         if executable == "systemctl" and unresolved_arguments:
             lifecycle_verbs = {"restart", "start", "stop"}
             safe_read_verbs = {
-                "cat", "is-active", "is-enabled", "list-units", "show", "status",
+                "cat",
+                "is-active",
+                "is-enabled",
+                "list-units",
+                "show",
+                "status",
             }
             if any(argument in lifecycle_verbs for argument in lowered):
                 return True
@@ -1326,8 +1705,14 @@ def contains_executed_gateway_lifecycle_command(command: str, *, _depth: int = 0
             if verb in {"submit", "bootstrap"}:
                 return True
             if verb in {
-                "bootout", "disable", "kickstart", "load", "remove",
-                "restart", "stop", "unload",
+                "bootout",
+                "disable",
+                "kickstart",
+                "load",
+                "remove",
+                "restart",
+                "stop",
+                "unload",
             } and re.search(
                 r"\bhermes[.\-]?gateway\b",
                 " ".join(lowered[1:]),
@@ -1405,20 +1790,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
             if stat.S_ISDIR(metadata.st_mode):
                 return None, False
             return None, True
-        # Sniff a small prefix first: files that are clearly compiled
-        # binaries (executable magic, or NUL bytes in the head) are never
-        # shell scripts, so skip them WITHOUT reading the rest — reading a
-        # megabyte of machine code just to discard it wastes the guard's
-        # budget and (pre-#77703) fed decoded garbage into the recursion.
+        # Sniff only known binary magic. A NUL-bearing text script still runs
+        # under bash, so treating any NUL as binary creates a guard bypass.
         data = os.read(descriptor, _BINARY_SNIFF_BYTES)
-        if data.startswith(_BINARY_MAGIC_PREFIXES) or b"\x00" in data:
+        if _has_binary_magic(data):
             return None, False
         # Read the remainder (bounded). Loop because os.read may return
         # short for non-regular-file-backed descriptors.
         while len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
-            chunk = os.read(
-                descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1 - len(data)
-            )
+            chunk = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1 - len(data))
             if not chunk:
                 break
             data += chunk
@@ -1426,16 +1806,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
-    if b"\x00" in data:
+    if _has_binary_magic(data):
         return None, False
+    # Check size before stripping NULs: stripping must not make an oversized
+    # script appear bounded. Removing NULs only joins source characters and
+    # therefore remains fail-closed for shell token recognition.
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
+    if b"\x00" in data:
+        data = data.replace(b"\x00", b"")
     return data.decode("utf-8", errors="replace"), False
 
 
@@ -1694,8 +2073,6 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             ) or contains_launchctl_submit_command(command)
 
 
-
-
 def _resolve_script_path(script_path: str) -> Optional[Path]:
     """Resolve a cron ``script`` value the same way the scheduler does.
 
@@ -1769,9 +2146,9 @@ def check_gateway_lifecycle(
                 real_script = resolved_script.resolve(strict=False)
             except (OSError, ValueError):
                 real_script = resolved_script
-            if _is_cloud_placeholder_path(resolved_script) or _is_cloud_placeholder_path(
-                real_script
-            ):
+            if _is_cloud_placeholder_path(
+                resolved_script
+            ) or _is_cloud_placeholder_path(real_script):
                 # Attribute the refusal correctly: the script is not known to
                 # contain a lifecycle command — it lives on a cloud-synced
                 # FileProvider path (iCloud Drive / ~/Library/CloudStorage)
