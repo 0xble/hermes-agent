@@ -2803,8 +2803,7 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
     for stale in _existing_malformed_backups(db_path)[keep:]:
         for victim in (
             stale,
-            stale.with_name(stale.name + "-wal"),
-            stale.with_name(stale.name + "-shm"),
+            *(stale.with_name(stale.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
             stale.with_name("." + stale.name + ".complete"),
         ):
             try:
@@ -2850,7 +2849,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             return digest.hexdigest()
 
         required = []
-        for suffix in ("-wal", "-shm"):
+        for suffix in _DB_SIDECAR_SUFFIXES:
             sidecar = db_path.with_name(db_path.name + suffix)
             if sidecar.exists():
                 required.append((sidecar, backup_path.with_name(backup_path.name + suffix)))
@@ -2926,7 +2925,20 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             marker.unlink(missing_ok=True)
             raise
 
-    def _guarded_copy() -> tuple[Path, None]:
+    def _guarded_copy() -> "Tuple[Optional[Path], Optional[str]]":
+        # Remove unpublished debris from interrupted copies before dedupe. None
+        # of these names is a valid completed forensic bundle.
+        for pattern in (
+            f"{db_path.name}.backup-staging-*",
+            f"{db_path.name}.malformed-backup-*.incomplete*",
+            f".{db_path.name}.malformed-backup-*.tmp-*",
+            f"..{db_path.name}.malformed-backup-*.complete.tmp-*",
+        ):
+            for orphan in db_path.parent.glob(pattern):
+                try:
+                    orphan.unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             src_stat = db_path.stat()
             for existing in _existing_malformed_backups(db_path)[:1]:
@@ -2944,7 +2956,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                     db_path.name: db_path,
                     **{
                         db_path.name + suffix: db_path.with_name(db_path.name + suffix)
-                        for suffix in ("-wal", "-shm")
+                        for suffix in _DB_SIDECAR_SUFFIXES
                         if db_path.with_name(db_path.name + suffix).exists()
                     },
                 }
@@ -2968,13 +2980,40 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                         break
                 if complete and set(files) == {
                     existing.name,
-                    *[existing.name + suffix for suffix in ("-wal", "-shm")
+                    *[existing.name + suffix for suffix in _DB_SIDECAR_SUFFIXES
                       if db_path.with_name(db_path.name + suffix).exists()],
                 }:
                     logger.info("Reusing existing forensic backup %s.", existing)
                     return existing, None
         except OSError:
             pass
+        try:
+            sources = [db_path]
+            sources.extend(
+                sidecar
+                for suffix in _DB_SIDECAR_SUFFIXES
+                if (sidecar := db_path.with_name(db_path.name + suffix)).exists()
+            )
+            needed = sum(source.stat().st_size for source in sources)
+            usage = shutil.disk_usage(db_path.parent)
+            headroom = _repair_backup_headroom_bytes(usage.total)
+            if usage.free - needed < headroom:
+                reason = (
+                    f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; "
+                    f"copying the damaged DB bundle needs {needed / 1e9:.2f}GB "
+                    f"and must leave {headroom / 1e9:.2f}GB headroom. Free disk "
+                    "space, then retry."
+                )
+                logger.error("Refusing forensic backup of %s: %s", db_path, reason)
+                return None, reason
+        except OSError as exc:
+            reason = (
+                f"could not determine free space on {db_path.parent} ({exc}); "
+                "refusing the forensic copy rather than risk filling the volume"
+            )
+            logger.error("Refusing forensic backup of %s: %s", db_path, reason)
+            return None, reason
+
         result = _copy_all()
         _prune_malformed_backups(db_path)
         return result, None

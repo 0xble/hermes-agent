@@ -103,6 +103,15 @@ class TestHeredocPartitionForRecursiveScanners:
         assert "$(bash" not in outer
         assert bodies == ("$(",)
 
+    def test_unquoted_split_substitution_is_returned_for_recursive_scan(self):
+        command = (
+            "cat <<EOF\n$" + chr(92) + "\n(printf hidden)\nEOF\nprintf done\n"
+        )
+        outer, bodies, unsafe = partition_heredoc_bodies(command)
+        assert unsafe is False
+        assert "printf hidden" not in outer
+        assert bodies == ("$(",)
+
     def test_unterminated_heredoc_fails_closed(self):
         outer, bodies, unsafe = partition_heredoc_bodies("cat <<'EOF'\npayload\n")
         assert unsafe is True

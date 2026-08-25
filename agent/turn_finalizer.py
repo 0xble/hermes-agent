@@ -73,7 +73,7 @@ _VERIFICATION_SUCCESS_RECEIPT = re.compile(
 )
 _VERIFICATION_FAILURE_RECEIPT = re.compile(
     r"^\s*i\s+(?:cannot|can't|could\s+not)\s+provide\s+fresh\s+verification\s+"
-    r"evidence\s+for\s+(?:that|this)\s+edit\.\s*$",
+    r"evidence\s+for\s+(?:that|this)\s+edit[.!?]?\s*$",
     re.IGNORECASE,
 )
 _VERIFICATION_SECTION = "\n\n## Verification\n\n"

@@ -65,6 +65,10 @@ _EXECUTABLE_HEREDOC_SHELL_RE = re.compile(
 
 
 def _body_has_executable_substitution(body: str) -> bool:
+    # Unquoted heredocs remove shell line continuations before expansion.
+    # Normalize them so ``$\\\n(`` cannot hide command substitution from
+    # recursive safety scanning.
+    body = re.sub(r"\\\r?\n", "", body)
     return (
         "`" in body
         or "<(" in body

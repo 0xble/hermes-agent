@@ -83,6 +83,16 @@ def test_punctuation_free_success_receipt_preserves_pending_answer():
     ) == f"{pending}\n\n## Verification\n\n{receipt}"
 
 
+def test_punctuation_free_failure_receipt_preserves_pending_answer():
+    pending = "Implemented the requested change."
+    receipt = "I cannot provide fresh verification evidence for this edit"
+
+    assert _compose_verification_receipt_with_answer(
+        pending,
+        receipt,
+    ) == f"{pending}\n\n## Verification\n\n{receipt}"
+
+
 def test_substantive_verification_heading_is_never_parsed_as_a_receipt():
     pending = "Verification report:\n\nThe migration preserved every customer row."
     receipt = "I cannot provide fresh verification evidence for that edit."
