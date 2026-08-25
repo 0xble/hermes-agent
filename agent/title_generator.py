@@ -927,7 +927,7 @@ def choose_topic_icon(
     # allowlist exclusion is what guarantees real rotation across the live set.
     exclude_recent = bool(recent) and len(fresh_allowed) >= min(4, len(allowed))
     selection_pool = fresh_allowed if exclude_recent else allowed
-    candidate_count = min(4, len(selection_pool))
+    candidate_count = min(6, len(selection_pool))
     prompt = (
         f"Choose {candidate_count} distinct ranked emoji candidates for a conversation topic, "
         "from best fit to least preferred. Select only from this allowed list: "

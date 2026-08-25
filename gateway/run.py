@@ -25675,6 +25675,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         extra = self._telegram_topic_extra(source, adapter)
         if not is_truthy_value(extra.get("auto_topic_icons"), default=False):
             return None
+        if str(extra.get("topic_icon_provider") or "").strip() == "telegram_custom_packs":
+            logger.warning(
+                "Skipping Telegram topic icon selection for retired "
+                "topic_icon_provider=telegram_custom_packs; migrate the profile "
+                "to topic_icon_provider=telegram_default"
+            )
+            return None
 
         preserve_manual = is_truthy_value(
             extra.get("preserve_manual_topic_icons"),
