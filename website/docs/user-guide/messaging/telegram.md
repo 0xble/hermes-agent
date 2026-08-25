@@ -850,7 +850,7 @@ With `preserve_manual_topic_icons: true` (the default), Hermes preserves a custo
 The rename and icon assignment are best-effort: failures are logged but don't break the session.
 
 :::warning Legacy MTProto sessions
-Before upgrading an installation that previously enabled `telegram_custom_packs`, revoke its Telegram user authorization with the pre-retirement `hermes telegram user logout` command and change `topic_icon_provider` to `telegram_default`. A leftover `telegram_custom_packs` value fails closed and applies no automatic icon rather than silently falling back. If the code has already been upgraded, revoke the Hermes-owned authorization from Telegram’s official **Settings → Devices** surface before deleting `$HERMES_HOME/state/telegram-user`. Hermes permanently excludes that retired credential directory from backups so an overlooked session cannot enter an archive.
+Before upgrading an installation that previously enabled `telegram_custom_packs`, revoke its Telegram user authorization with the pre-retirement `hermes telegram user logout` command and change `topic_icon_provider` to `telegram_default`. A leftover `telegram_custom_packs` value fails closed and applies no automatic icon rather than silently falling back. If the code has already been upgraded, revoke the Hermes-owned authorization from Telegram’s official **Settings → Devices** surface before deleting `$HERMES_HOME/state/telegram-user`.
 :::
 
 To disable renaming entirely and keep your manually-chosen topic names untouched, set:
