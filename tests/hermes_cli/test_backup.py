@@ -122,10 +122,11 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class TestShouldExclude:
-    def test_excludes_retired_telegram_user_credentials(self):
+    def test_excludes_client_session_credentials_by_suffix(self):
         from hermes_cli.backup import _should_exclude
 
-        assert _should_exclude(Path("state/telegram-user/telethon.session"))
+        assert _should_exclude(Path("state/legacy-client/auth.session"))
+        assert _should_exclude(Path("state/legacy-client/auth.session-wal"))
 
     def test_excludes_hermes_agent(self):
         from hermes_cli.backup import _should_exclude
