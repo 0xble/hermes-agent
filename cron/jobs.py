@@ -1437,6 +1437,7 @@ def get_persisted_error_recovery_stats() -> Dict[str, Any]:
 def _cron_next_run_matches_expr(
     schedule: Dict[str, Any],
     next_run_dt: datetime,
+    timezone: Optional[str] = None,
 ) -> bool:
     """Whether ``next_run_dt`` is an occurrence of the schedule's current expr.
 
@@ -1456,9 +1457,10 @@ def _cron_next_run_matches_expr(
         # The last occurrence at-or-before the stored instant: base croniter
         # a second past it so an exact occurrence is included, then compare
         # at second granularity (croniter returns second-precision datetimes).
-        base = next_run_dt + timedelta(seconds=1)
+        scheduled = next_run_dt.astimezone(_effective_cron_timezone(timezone))
+        base = scheduled + timedelta(seconds=1)
         prev = croniter(str(expr), base).get_prev(datetime)
-        return abs((prev - next_run_dt).total_seconds()) < 1.0
+        return abs((prev - scheduled).total_seconds()) < 1.0
     except Exception:
         return True
 
@@ -1474,6 +1476,7 @@ def _classify_stale_cron_next_run(
     schedule: Dict[str, Any],
     raw_next_run_dt: datetime,
     next_run_dt: datetime,
+    timezone: Optional[str] = None,
 ) -> str:
     """Explain WHY a stored ``next_run_at`` misses the current cron lattice.
 
@@ -1502,12 +1505,14 @@ def _classify_stale_cron_next_run(
     is unchanged, so a genuine ``expr`` edit can never be misread as a
     migration.
     """
-    if _cron_next_run_matches_expr(schedule, next_run_dt):
+    if _cron_next_run_matches_expr(schedule, next_run_dt, timezone):
         return STALE_CRON_MATCH
     wall_clock_shifted = (
         raw_next_run_dt.replace(tzinfo=None) != next_run_dt.replace(tzinfo=None)
     )
-    if wall_clock_shifted and _cron_next_run_matches_expr(schedule, raw_next_run_dt):
+    if wall_clock_shifted and _cron_next_run_matches_expr(
+        schedule, raw_next_run_dt, timezone
+    ):
         return STALE_CRON_TIMEZONE_MIGRATION
     return STALE_CRON_EXPR_EDIT
 
@@ -4226,7 +4231,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     recovered_next = now.isoformat()
                     recovered_next_dt = now
                 else:
-                    recovered_next = compute_next_run(schedule, now.isoformat())
+                    recovered_next = _compute_next_run_for_job(job, now.isoformat())
                     try:
                         recovered_next_dt = (
                             _ensure_aware(datetime.fromisoformat(recovered_next))
@@ -4271,12 +4276,17 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # ever changing, and re-anchoring THAT silently swallowed a due
                 # occurrence. Classify first, and only the edit case skips.
                 stale_class = (
-                    _classify_stale_cron_next_run(schedule, raw_next_run_dt, next_run_dt)
+                    _classify_stale_cron_next_run(
+                        schedule,
+                        raw_next_run_dt,
+                        next_run_dt,
+                        job.get("timezone"),
+                    )
                     if not manual_run and kind == "cron"
                     else STALE_CRON_MATCH
                 )
                 if stale_class == STALE_CRON_EXPR_EDIT:
-                    new_next = compute_next_run(schedule, now.isoformat())
+                    new_next = _compute_next_run_for_job(job, now.isoformat())
                     logger.info(
                         "Job '%s' next_run_at %s does not match its current "
                         "cron expression %r (direct jobs.json edit?); "
