@@ -122,7 +122,7 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class TestShouldExclude:
-    def test_excludes_telegram_user_auth_session(self):
+    def test_excludes_retired_telegram_user_credentials(self):
         from hermes_cli.backup import _should_exclude
 
         assert _should_exclude(Path("state/telegram-user/telethon.session"))
@@ -1855,7 +1855,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 

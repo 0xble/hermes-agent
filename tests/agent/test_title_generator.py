@@ -589,7 +589,7 @@ class TestGenerateTitle:
 
 
 class TestChooseTopicIcon:
-    def test_requests_up_to_six_ranked_unicode_selectors(self):
+    def test_requests_up_to_four_ranked_unicode_selectors(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "🧹"
@@ -601,7 +601,7 @@ class TestChooseTopicIcon:
                 ["🧹", "💡", "🚀", "📊", "🛠️", "✅", "🎨"],
             )
 
-        assert "Choose 6 distinct ranked emoji candidates" in (
+        assert "Choose 4 distinct ranked emoji candidates" in (
             llm.call_args.kwargs["messages"][0]["content"]
         )
 

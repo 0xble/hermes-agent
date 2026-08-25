@@ -1269,41 +1269,10 @@ platform_toolsets:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: auto          # Bot API 10.1 rich messages: auto (adaptive, default), always, or never
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; opt in per profile
-#       # Optional native user transport. Disabled by default and limited to
-#       # exact forum-topic reads and custom-icon writes for the active bot.
-#       # TELEGRAM_API_ID and TELEGRAM_API_HASH remain secrets in .env.
-#       user_transport:
-#         enabled: false
-#         implementation: telethon
-#         expected_user_id: 123456789
-#         require_premium: true
-#         capabilities: [topic.read, topic.icon.write]
-#         allowed_bot_peer_ids: [987654321]
-#         connect_timeout_seconds: 15
-#         rpc_timeout_seconds: 20
-#         max_flood_wait_seconds: 5
-#         failure_cooldown_seconds: 300
 #       auto_topic_icons: false
 #       preserve_manual_topic_icons: true
-#       topic_icon_provider: telegram_default  # or telegram_custom_packs; never falls back
-#       topic_icon_catalog_ttl_seconds: 86400
-#       topic_icon_custom_packs:
-#         - AppleFacesEmotions
-#         - AppleAnimalsNature
-#         - AppleFoodDrink
-#         - AppleActivities
-#         - AppleSymbols
-#         - AppleFlagsAM
-#         - AppleFlagsNZ
-#         - AppleFlagsOther
-#         - ApplePeopleHandsBody
-#         - ApplePeopleRoles
-#         - AppleFamiliesRelationships
-#         - ApplePeopleActivitiesFantasy
-#         - AppleTravelPlaces
-#         - AppleTravelTransportTimeWeather
-#         - AppleObjectsHomeTools
-#         - AppleObjectsTechMediaOffice
+#       topic_icon_overrides:
+#         ProjectAtlas: "🔭"
 #       command_menu:
 #         # Telegram allows up to 100 BotCommands; Hermes defaults to 60 so
 #         # all built-in commands plus common skill commands stay visible
