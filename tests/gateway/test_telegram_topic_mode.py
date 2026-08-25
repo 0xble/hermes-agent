@@ -887,6 +887,25 @@ async def test_first_auto_title_assigns_icon_when_creation_state_is_unknown(tmp_
 
 
 @pytest.mark.asyncio
+async def test_legacy_custom_pack_config_fails_closed_without_default_icon_fallback():
+    runner = _make_runner()
+    adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
+    extra = runner.config.platforms[Platform.TELEGRAM].extra
+    extra["auto_topic_icons"] = True
+    extra["topic_icon_provider"] = "telegram_custom_packs"
+
+    selected = await runner._select_telegram_topic_icon_id(
+        adapter,
+        _make_source(thread_id="42"),
+        "ProjectAtlas",
+        "Improve the ProjectAtlas planning flow",
+    )
+
+    assert selected is None
+    adapter.get_forum_topic_icon_options.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_auto_topic_icon_uses_secondary_transport_profile_config():
     runner = _make_runner()
     default_adapter = cast(Any, runner.adapters[Platform.TELEGRAM])

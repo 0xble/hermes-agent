@@ -841,7 +841,7 @@ gateway:
           ProjectAtlas: "🔭"
 ```
 
-Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to four semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 24 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
+Hermes fetches the currently allowed icons with `getForumTopicIconStickers`, asks the title model for a ranked set of up to six semantically valid candidates from that live set, and applies the matching `custom_emoji_id`. The selector prefers specific, playful visual metaphors over generic computer, robot, or rocket icons when a clearer alternative fits. It keeps the 24 most recent selections per chat out of the next model candidate pool whenever at least four fresh options remain; if reuse is unavoidable, the least-recent ranked candidate wins. This bounded diversity history is stored in `state.db`, so rotation survives gateway restarts.
 
 `topic_icon_overrides` is optional and uses ordinary emoji characters as portable selectors rather than hard-coded Telegram IDs. An exact override always wins, which is useful when a recurring project should keep a recognizable signature icon.
 
@@ -850,7 +850,7 @@ With `preserve_manual_topic_icons: true` (the default), Hermes preserves a custo
 The rename and icon assignment are best-effort: failures are logged but don't break the session.
 
 :::warning Legacy MTProto sessions
-Before upgrading an installation that previously enabled `telegram_custom_packs`, revoke its Telegram user authorization with the pre-retirement `hermes telegram user logout` command. If the code has already been upgraded, revoke the Hermes-owned authorization from Telegram’s official **Settings → Devices** surface before deleting `$HERMES_HOME/state/telegram-user`. Hermes permanently excludes that retired credential directory from backups so an overlooked session cannot enter an archive.
+Before upgrading an installation that previously enabled `telegram_custom_packs`, revoke its Telegram user authorization with the pre-retirement `hermes telegram user logout` command and change `topic_icon_provider` to `telegram_default`. A leftover `telegram_custom_packs` value fails closed and applies no automatic icon rather than silently falling back. If the code has already been upgraded, revoke the Hermes-owned authorization from Telegram’s official **Settings → Devices** surface before deleting `$HERMES_HOME/state/telegram-user`. Hermes permanently excludes that retired credential directory from backups so an overlooked session cannot enter an archive.
 :::
 
 To disable renaming entirely and keep your manually-chosen topic names untouched, set:
