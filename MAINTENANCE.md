@@ -58,7 +58,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-033 | Retired | `fix(compression): report LCM safe deferrals`; `fix(compression): classify LCM no-op as deferred`; `fix(compression): classify anti-growth rejection as deferred`; `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility`; `fix(compression): reconcile rejected-compaction API`; `revert(compression): retire LCM patch family` | Historical LCM compatibility and deferral patch family, removed after LCM was retired from the Personal Hermes runtime. |
 | HERMES-032 | Active | `fix(doctor): make state db advisory retention aware`; `fix(reconcile): preserve cron and doctor contracts` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
 | HERMES-034 | Active | `feat(telegram): configure rich message routing mode` | Add explicit adaptive, always-attempt, and legacy-only Telegram Rich Message routing modes. |
-| HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing`; `fix(telegram): repair transport safety regressions` | Preserve visible Telegram paragraph separation without over-spacing lists, code, or native tables. |
+| HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing`; `fix(telegram): repair transport safety regressions` | Guard that outbound Telegram payloads preserve the author's paragraph boundaries exactly, after the earlier NBSP spacing expansion was removed. |
 | HERMES-036 | Active | `feat(cron): allow local memory opt-in`; `test(cron): verify local USER memory writes`; `fix(reconcile): preserve cron and doctor contracts` | Let individual cron jobs opt into the local file-backed memory toolset without activating external memory providers. |
 | HERMES-037 | Active | `fix(clarify): explain decisions before prompts`; `fix(gateway): preserve clarify decision context` | Keep decision context in normal assistant prose before interactive clarify prompts. |
 | HERMES-038 | Active | `feat(hindsight): use brain indicator glyph` | Use the brain indicator only when Hindsight supplied retrieved context. |
@@ -66,7 +66,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-040 | Active | `fix(gateway): extract local markdown images` | Extract eligible local Markdown images at the gateway media boundary. |
 | HERMES-041 | Active | `fix(gateway): fail closed on inherited restart marker`; `fix(safety): block destructive gateway launchctl verbs`; `fix(safety): narrow live lifecycle guard to executable actions`; `fix(safety): close executable wrapper bypasses`; `fix(safety): block dynamic lifecycle executables`; `fix(safety): close wrapper option and eval bypasses`; `fix(safety): inspect env split-string payloads`; `fix(safety): classify wrapped dynamic executables`; `fix(safety): combine argv and command-shape guards`; `fix(safety): keep unresolved script references fail-closed`; `fix(safety): remove dynamic runner and emitter exemptions`; `fix(safety): reject unresolved execution payloads`; `fix(safety): reject dynamic lifecycle control arguments`; `fix(safety): consume nice command separators`; `fix(safety): scope unresolved read-only commands`; `fix(safety): parse env argv0 options`; `fix(safety): inspect dynamic execution carriers`; `fix(safety): reconcile lifecycle guard contracts`; `fix(review): preserve reconciliation safety contracts` | Prevent gateway-derived contexts from bypassing lifecycle self-control guards. |
 | HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1`; `fix(memory): keep provenance out of Hindsight API kwargs` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
-| HERMES-043 | Active | `fix(gateway): skip completed legacy resumes` | Avoid re-running completed legacy sessions during startup continuation recovery. |
+| HERMES-043 | Retired | `fix(gateway): skip completed legacy resumes` | Historical completed-legacy resume suppression, deliberately removed by HERMES-027's delivery-acknowledgement recovery contract. |
 | HERMES-044 | Active | `fix(output): compose and protect final responses` | Compose plugin output transforms without letting empty or non-substantive transforms erase the final answer. |
 | HERMES-045 | Active | `fix(telegram): keep rich tables narrow` | Prefer compact tables and vertically stacked records over wide Telegram output. |
 | HERMES-046 | Active | `fix(computer-use): honor live element-token schema`; `docs(maintenance): register element-token schema patch` | Preserve safe element-index targeting when cua-driver accepts tokens through its live action schema without advertising the legacy capability label. |
@@ -96,6 +96,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): require unique patch history baseline` | Fork governance baseline hardening only; no shipped Hermes behavior. |
 | `test: align rebased regressions with fork contracts` | Adaptation of upstream-owned tests to registered fork contracts (HERMES-011 shared SessionDB ownership, HERMES-015 renamed upstream helper, HERMES-036 cron memory policy) after the 2026-08-26 rebase; no shipped Hermes behavior. |
 | `fix(gateway): restore string-form disabled_toolsets parsing` | Patch-neutral restoration of upstream commit `309cf2c5e2`'s `parse_config_string_list` hunks clobbered by fork replay. |
+| `docs(maintenance): reconcile stale patch records` | Maintenance-only reconciliation of already-registered patch records and exemptions; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -484,15 +485,15 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Rollback:** Set `rich_drafts: false`; set `rich_messages: true` or `auto` for adaptive routing; or revert the patch and restart externally. Do not force-push over the current fork/remote divergence.
 - **Retirement:** Retire after released upstream exposes equivalent validated routing modes across config, system guidance, adapter behavior, backward-compatible booleans, and the focused Rich Message regressions.
 
-### HERMES-035 — Add visible paragraph spacing to Telegram text delivery
+### HERMES-035 — Preserve exact Telegram paragraph boundaries
 
-- **Summary:** At the Telegram transport boundary, expands existing Markdown paragraph boundaries with an explicit non-breaking-space line so headings, prose sections, and action blocks remain visually separated on narrow clients. The normalization is idempotent, leaves single-line lists unchanged, and protects fenced code blocks and native pipe tables.
-- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_visual_spacing.py`.
-- **Upstream tracking:** Independent 2026-08-15 reproduction from Telegram screenshots showed ordinary Markdown blank lines rendering too tightly between report sections. The fix belongs at the channel renderer because cron agents expose `platform="cron"` before the scheduler selects a Telegram destination. No equivalent upstream implementation was identified in the maintained source during this change.
-- **Upstream PR:** None after checked 2026-08-18.
-- **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_text_batching.py tests/gateway/test_text_batching.py tests/gateway/test_telegram_error_redaction.py tests/gateway/test_dm_topics.py` plus live Telegram readback of a representative multi-section report confirming visible spacing and no duplicate delivery.
-- **Rollback:** Revert the stable-subject patch and its focused test, then verify ordinary Telegram Markdown delivery, rich-message tables/task lists, fenced code, chunking, and error fallback through the listed regressions. Runtime promotion remains separate from fork publication.
-- **Retirement:** Retire after released upstream preserves equivalent visible paragraph spacing without changing single-line lists, fenced code, native tables, chunking, or fallback delivery, proven by the focused regressions and a live Telegram canary during separate promotion.
+- **Summary:** The original patch expanded Markdown paragraph boundaries with an explicit non-breaking-space line at the Telegram transport boundary. That expansion made ordinary paragraphs excessively tall and was removed by `fix(telegram): remove excessive paragraph spacing`; the remaining fork surface is the regression guard `tests/gateway/test_telegram_visual_spacing.py`, which pins the inverted contract: the outbound Bot API payload preserves the author's paragraph boundaries exactly, with no NBSP or other spacing normalization re-added. (Record corrected 2026-08-27; it previously still described the retired expansion as active behavior.)
+- **Surfaces:** `tests/gateway/test_telegram_visual_spacing.py` (test-only guard; no shipped adapter delta remains).
+- **Upstream tracking:** Upstream never carried the NBSP expansion, so the guard asserts upstream-equivalent behavior. No upstream action required.
+- **Upstream PR:** None; not an upstream product divergence after the expansion was removed (checked 2026-08-27).
+- **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py`.
+- **Rollback:** Delete the test file; there is no adapter code to revert.
+- **Retirement:** Retire (delete the guard) once an upstream-owned test pins the same exact-paragraph-boundary payload contract.
 
 ### HERMES-036 — Allow per-job local memory opt-in for cron
 
@@ -564,15 +565,14 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Rollback:** Revert the client pin and matching API adaptations as one unit; regenerate `uv.lock` with the repository-supported uv and preserve unrelated dependency updates.
 - **Retirement:** Retire after released upstream supports the same or newer compatible Hindsight API and passes packaging plus provider regressions.
 
-### HERMES-043 — Skip completed legacy startup resumes
+### HERMES-043 — Retired completed-legacy resume suppression
 
-- **Summary:** Prevents startup continuation recovery from re-running legacy sessions that already have a completed terminal response while preserving genuinely interrupted work.
-- **Surfaces:** `gateway/session.py`; `tests/gateway/test_clean_shutdown_marker.py`.
-- **Upstream tracking:** No equivalent released legacy-completion filter was identified through upstream `5dd15872a6` on 2026-08-18.
-- **Upstream PR:** None after checked 2026-08-18.
-- **Regression:** `scripts/run_tests.sh tests/gateway/test_clean_shutdown_marker.py`.
-- **Rollback:** Remove only the completed-legacy suppression and its focused cases; preserve current delivery-acknowledgement recovery and clean-shutdown semantics.
-- **Retirement:** Retire after released upstream distinguishes completed legacy sessions from interrupted resumable work with equivalent regressions.
+- **Retired (2026-08-27, record correction):** The completed-transcript suppression added on 2026-08-11 was deliberately removed on 2026-08-15 by HERMES-027 (`fix(gateway): recover unacknowledged terminal responses`), whose contract treats a persisted terminal transcript as model-completion evidence rather than delivery evidence and keeps recent sessions recovery-eligible until outbound delivery is durably acknowledged. The two records had claimed mutually exclusive contracts on the same surface and test file; HERMES-027 is the live contract, and `tests/gateway/test_clean_shutdown_marker.py` asserts recovery eligibility.
+- **Surfaces:** Historical surface was `gateway/session.py` `suspend_recently_active`; the file's coverage now belongs to HERMES-027.
+- **Upstream tracking:** Not applicable; superseded internally by HERMES-027 before any upstream association existed.
+- **Upstream PR:** None.
+- **Regression:** Covered by HERMES-027's `pytest -q tests/gateway/test_clean_shutdown_marker.py`.
+- **Rollback:** Do not restore the suppression; if resuming completed legacy sessions becomes a problem again, solve it inside HERMES-027's delivery-acknowledgement model rather than re-adding transcript-based suppression.
 
 ### HERMES-044 — Compose and protect final response transforms
 
