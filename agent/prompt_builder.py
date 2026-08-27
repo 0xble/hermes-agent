@@ -1060,9 +1060,9 @@ TELEGRAM_RICH_MESSAGES_HINT = (
     "paragraphs for any comparison, set of steps, key/value summary, or "
     "tabular data. Use real Markdown tables for compact tabular data and "
     "real task lists instead of hand-built substitutes. Keep tables narrow. "
-    "When many columns would force horizontal scanning or scrolling, "
-    "transpose or split the data into vertically stacked records with labeled "
-    "fields. Rich tables degrade gracefully into readable bullet groups when "
+    "Never use Markdown tables with three or more columns. Instead, transpose "
+    "or split that data into vertically stacked records with labeled fields. "
+    "Rich tables degrade gracefully into readable bullet groups when "
     "rich rendering is unavailable, but advanced constructs like math and "
     "collapsible details may render as plain source text in that case. "
 )
