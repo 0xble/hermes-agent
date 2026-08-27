@@ -206,13 +206,12 @@ def test_codex_app_server_compression_failure_preserves_bookkeeping():
     assert agent._codex_session.calls == 1
     assert agent.context_compressor.compression_count == 0
     assert agent.context_compressor.last_prompt_tokens == 123
-    assert agent.warnings
+    assert not agent.warnings
     assert agent.touch_calls[0] == "context compression started"
     assert agent.touch_calls[-1] == "context compression failed"
-    assert agent.status_events == [
-        ("lifecycle", COMPACTION_STATUS),
-        ("warn", "⚠ Codex app-server compaction failed: compact failed"),
-    ]
+    assert agent.status_events[0] == ("lifecycle", COMPACTION_STATUS)
+    assert agent.status_events[-1][0] == "compaction_aborted"
+    assert "Codex app-server compaction failed: compact failed" in agent.status_events[-1][1]
 
 
 
