@@ -5832,7 +5832,13 @@ class TelegramAdapter(BasePlatformAdapter):
         overflow = retry_after > float(
             getattr(self, "_send_cooldown_max_wait", 5.0)
         )
-        if overflow or attempt >= 2:
+        if overflow:
+            # Over-cap penalties fail closed with upstream's structured
+            # ``flood_control:{wait}`` result (#91969): the caller's retry
+            # machinery owns the wait, and an inline retry here could
+            # duplicate chunks already delivered by this call.
+            return True, _flood_cap_result(retry_after)
+        if attempt >= 2:
             return True, SendResult(
                 success=False,
                 error=_redact_telegram_error_text(error),

@@ -27,7 +27,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(review): preserve reconciliation safety contracts` | Make raw SQLite backup and quarantine connection-safe. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
-| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics` | Enforce a per-chat Telegram send cooldown. |
+| HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics`; `fix(telegram): fail closed on over-cap flood penalties` | Enforce a per-chat Telegram send cooldown. |
 | HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(fork): preserve reconciled patch contracts` | Share the progress-edit throttle per chat. |
 | HERMES-006 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Resolve memory notifications per platform. |
 | HERMES-007 | Active | `chore(local): carry Brian-owned working-tree patches into the fork` | Keep interrupt sentinels out of API assistant text. |
@@ -94,6 +94,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): make patch history upstream-aware` | Fork maintenance history scoping across upstream merges and rebases only; no shipped Hermes behavior. |
 | `fix(ci): fetch complete upstream ancestry` | Git history completeness for maintenance validation only; no shipped Hermes behavior. |
 | `fix(ci): require unique patch history baseline` | Fork governance baseline hardening only; no shipped Hermes behavior. |
+| `test: align rebased regressions with fork contracts` | Adaptation of upstream-owned tests to registered fork contracts (HERMES-011 shared SessionDB ownership, HERMES-015 renamed upstream helper, HERMES-036 cron memory policy) after the 2026-08-26 rebase; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
@@ -336,7 +337,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-004 — Enforce a per-chat Telegram send cooldown
 
-- **Summary:** Inside `TelegramAdapter`, atomically reserves a per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock; lock acquisition plus cooldown waiting share a bounded budget; control boundaries preserve retry metadata; positively identified pre-send connection/pool timeouts do not consume a slot; and idle chat state is pruned. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
+- **Summary:** Inside `TelegramAdapter`, atomically reserves a per-chat slot immediately before every persistent message-delivery Bot API call, including rich messages, every chunk and fallback attempt, control messages, and native media. Telegram `RetryAfter` deadlines advance the same shared clock; lock acquisition plus cooldown waiting share a bounded budget; control boundaries preserve retry metadata; positively identified pre-send connection/pool timeouts do not consume a slot; and idle chat state is pruned. Over-cap flood penalties fail closed with upstream's structured `flood_control:{wait}` result (#91969, aligned 2026-08-26) instead of returning a retryable result whose blind full-content retry could duplicate already-delivered chunks. Standalone CLI/cron sends and draft/edit/typing APIs are outside this process-local contract.
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/test_telegram_send_cooldown.py`.
 - **Upstream tracking:** Related upstream pull request `#66722` remains open and unmerged.
 - **Upstream PR:** Related: #66722 (open; checked 2026-08-14).
