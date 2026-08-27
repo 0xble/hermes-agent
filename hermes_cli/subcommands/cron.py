@@ -120,6 +120,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--run-budget-seconds",
+        type=float,
+        help=(
+            "Positive total wall-clock budget for each execution, including "
+            "setup, scripts, agent work, and cleanup. Omit for no total limit."
+        ),
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -291,6 +299,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
+        ),
+    )
+    cron_edit.add_argument(
+        "--run-budget-seconds",
+        type=float,
+        help=(
+            "Set the total wall-clock execution budget in seconds. Pass 0 to "
+            "clear it and keep only the independent inactivity limit."
         ),
     )
 

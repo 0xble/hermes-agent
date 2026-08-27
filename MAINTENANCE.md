@@ -78,6 +78,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-055 | Active | `fix(state): attribute malformed errors before FTS repair` | Defer in-process FTS rebuilds above 1 GiB to startup/offline repair so a multi-minute rebuild cannot starve turns or be killed mid-flight by the liveness watchdog. |
 | HERMES-056 | Active | `fix(skills): trust configured symlink farms` | Stop false skill-security warnings for symlink entries inside explicitly configured external skill roots while preserving warnings for local/profile symlink escapes. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
+| HERMES-057 | Active | `fix(cron): enforce total run budgets` | Bound each opted-in cron fire by one total wall-clock deadline while preserving the separate inactivity watchdog. |
 
 ## Fork-only administrative subject exemptions
 
@@ -108,6 +109,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-057 — Enforce total cron run budgets
+
+- **Independent hypothesis (2026-08-27):** Cron currently arms only an inactivity watchdog after pre-agent script and setup work. `AIAgent.run_budget_seconds` begins its own clock inside `run_conversation` and provides an 80% wrap-up signal, but it neither covers earlier cron work nor hard-stops an agent that remains active. The correction belongs in `cron.scheduler.run_job`: compute one monotonic deadline before script or setup work, cap each script and agent allowance to the remaining total, retain the existing inactivity limit as an independent condition, and use the existing hard-interrupt, owned-resource teardown, and bounded-cleanup paths when the outer deadline expires. The job field must be optional and positive when set, with absent preserving legacy behavior and empty or zero on update clearing the limit.
+- **Summary:** Adds an optional per-job total execution budget across persistence, the model tool, CLI, and scheduler. The scheduler measures the entire opted-in fire from one monotonic start, caps pre-agent scripts and `AIAgent` to remaining time, and hard-expires continuously active agent runs without reclassifying the scheduler-owned deadline as a provider or fallback timeout. No-agent script jobs share the same limit; the existing inactivity watchdog remains separate.
+- **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `tools/cronjob_tools.py`; `hermes_cli/cron.py`; `hermes_cli/subcommands/cron.py`; focused cron job, tool, CLI, scheduler, and failure-classification regressions; this record.
+- **Upstream tracking:** Open issue #79244 reports continuously active cron runs outliving the documented hard timeout. Open PR #79880 adds a process-wide `HERMES_CRON_HARD_LIMIT` checked only in the agent polling loop; it does not provide per-job persistence, script/setup accounting, no-agent coverage, owned-resource cleanup, or the distinct failure classification required here, and a new non-secret `HERMES_*` setting conflicts with current config policy. Merged PR #90337 (commit `803397e`) supplies the `AIAgent.run_budget_seconds` 80% wrap-up and remaining-budget stale-timeout behavior this patch reuses, but deliberately does not hard-stop runs. No released or merged upstream change satisfies the complete per-job cron contract as of 2026-08-27.
+- **Upstream PR:** Related: #79880 (open, no reviews, checked 2026-08-27); dependency: #90337 (merged 2026-08-19 as commit `803397e`).
+- **Regression:** `scripts/run_tests.sh` over the focused cron budget persistence, tool/CLI surface, script deadline, agent deadline, no-agent, dormant-default, and failure-classification tests added with this patch.
+- **Rollback:** Revert only `fix(cron): enforce total run budgets`, removing the optional job field, CLI/tool exposure, scheduler deadline enforcement, and its focused regressions. Preserve HERMES-015 cwd isolation and the existing independent inactivity watchdog unchanged.
+- **Retirement:** Retire after a released upstream version supports an optional positive per-job total wall-clock budget across create/update/clear/list, scripts, setup consumption, continuously active agent runs, no-agent jobs, owned-process cleanup, and distinct scheduler-owned exhaustion classification while retaining inactivity timeout behavior.
 
 ### HERMES-056 — Trust configured external skill symlink farms
 

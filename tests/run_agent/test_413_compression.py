@@ -623,7 +623,7 @@ class TestPreflightCompression:
 
         assert compressed is messages
         assert prompt == "You are helpful."
-        assert [event for event, _ in events] == ["lifecycle", "warn"]
+        assert [event for event, _ in events] == ["lifecycle", "compaction_aborted"]
         assert ("compacted", COMPACTION_DONE_STATUS) not in events
 
     def test_quiet_summary_failure_still_prints_abort_notice(self, agent):

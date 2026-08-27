@@ -191,6 +191,21 @@ When `workdir` is set:
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. Set `cron.max_parallel_jobs` if you want to limit total cron concurrency.
 :::
 
+## Bounding total run time
+
+Use a per-job total wall-clock budget when a run must finish within a predictable window:
+
+```bash
+hermes cron create "every 12h" "Run bounded maintenance and checkpoint before exit" \
+  --run-budget-seconds 480
+hermes cron edit <job_id> --run-budget-seconds 600
+hermes cron edit <job_id> --run-budget-seconds 0  # clear
+```
+
+The budget starts when the scheduler begins the run and covers setup, monitor and script work, and the agent turn. At 80% of the remaining agent allowance, Hermes asks the agent to stop new work and wrap up, which lets checkpoint-aware jobs persist progress. At the deadline, Hermes interrupts the run, kills owned subprocesses through normal teardown, and reports a distinct total-budget failure. This is independent of `HERMES_CRON_TIMEOUT`, which detects inactivity rather than total elapsed time. Jobs without `run_budget_seconds` keep their existing behavior.
+
+The same field is available as `run_budget_seconds=` through the `cronjob` tool.
+
 ## Editing jobs
 
 You do not need to delete and recreate jobs just to change them.

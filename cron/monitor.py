@@ -109,7 +109,9 @@ def _write_last_output(job_id: str, output: str) -> None:
         logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
 
 
-def _fetch_monitor_url(url: str) -> tuple[bool, str]:
+def _fetch_monitor_url(
+    url: str, timeout_seconds: Optional[float] = None
+) -> tuple[bool, str]:
     """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
     import urllib.request
 
@@ -117,7 +119,10 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
         return False, f"monitor_url must be http(s): {url!r}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "hermes-cron-monitor"})
-        with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as resp:  # nosec B310 — scheme checked above
+        timeout = float(URL_TIMEOUT_SECONDS)
+        if timeout_seconds is not None:
+            timeout = min(timeout, max(0.0, float(timeout_seconds)))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — scheme checked above
             body = resp.read(MAX_URL_BYTES + 1)
         if len(body) > MAX_URL_BYTES:
             body = body[:MAX_URL_BYTES]
@@ -126,7 +131,9 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
         return False, f"monitor_url fetch failed: {exc}"
 
 
-def _run_monitor_source(job: dict) -> tuple[bool, str]:
+def _run_monitor_source(
+    job: dict, timeout_seconds: Optional[float] = None
+) -> tuple[bool, str]:
     """Run the job's monitor source (script or URL). Returns (ok, output)."""
     monitor_script = (job.get("monitor_script") or "").strip()
     if monitor_script:
@@ -134,10 +141,16 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
         from cron.scheduler import _run_job_script
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
+        if timeout_seconds is None:
+            return _run_job_script(monitor_script, workdir=workdir)
+        return _run_job_script(
+            monitor_script, workdir=workdir, timeout_seconds=timeout_seconds
+        )
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
-        return _fetch_monitor_url(monitor_url)
+        if timeout_seconds is None:
+            return _fetch_monitor_url(monitor_url)
+        return _fetch_monitor_url(monitor_url, timeout_seconds=timeout_seconds)
     return False, "monitor job has neither monitor_script nor monitor_url"
 
 
@@ -145,7 +158,9 @@ def job_has_monitor(job: dict) -> bool:
     return bool((job.get("monitor_script") or "").strip() or (job.get("monitor_url") or "").strip())
 
 
-def check_monitor(job: dict) -> MonitorOutcome:
+def check_monitor(
+    job: dict, timeout_seconds: Optional[float] = None
+) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
     On change (or first run) the new hash + snapshot are persisted BEFORE
@@ -154,7 +169,7 @@ def check_monitor(job: dict) -> MonitorOutcome:
     On failure nothing is persisted.
     """
     job_id = str(job.get("id") or "")
-    ok, output = _run_monitor_source(job)
+    ok, output = _run_monitor_source(job, timeout_seconds=timeout_seconds)
     if not ok:
         return MonitorOutcome(ok=False, error=output)
 

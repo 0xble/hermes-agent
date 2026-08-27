@@ -27,6 +27,11 @@ from cron.lifecycle_guard import (  # noqa: F401  (re-exported for terminal_tool
 )
 
 
+def _format_seconds(value: float) -> str:
+    """Render stored numeric seconds without a gratuitous decimal suffix."""
+    return f"{float(value):g}s"
+
+
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
     if skills is None:
         if single_skill is None:
@@ -214,6 +219,9 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        run_budget = job.get("run_budget_seconds")
+        if run_budget:
+            print(f"    Run budget: {_format_seconds(run_budget)} total wall clock")
 
         # Execution history
         last_status = job.get("last_status")
@@ -706,6 +714,7 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        run_budget_seconds=getattr(args, "run_budget_seconds", None),
         timezone=getattr(args, "timezone", None),
         allow_messaging=getattr(args, "allow_messaging", None),
     )
@@ -730,6 +739,8 @@ def cron_create(args):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("run_budget_seconds"):
+        print(f"  Run budget: {_format_seconds(job_data['run_budget_seconds'])} total wall clock")
     if job_data.get("timezone"):
         print(f"  Timezone: {job_data['timezone']} (explicit)")
     else:
@@ -787,6 +798,7 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        run_budget_seconds=getattr(args, "run_budget_seconds", None),
         timezone=getattr(args, "timezone", None),
         allow_messaging=getattr(args, "allow_messaging", None),
     )
@@ -814,6 +826,8 @@ def cron_edit(args):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("run_budget_seconds"):
+        print(f"  Run budget: {_format_seconds(updated['run_budget_seconds'])} total wall clock")
     if updated.get("timezone"):
         print(f"  Timezone: {updated['timezone']} (explicit)")
     else:

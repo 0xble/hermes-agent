@@ -874,6 +874,9 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         class FakeFuture:
+            def done(self):
+                return False
+
             def result(self):
                 return {"final_response": "ok"}
 

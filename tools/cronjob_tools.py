@@ -783,6 +783,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["script"] = job["script"]
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
+    if job.get("run_budget_seconds"):
+        result["run_budget_seconds"] = job["run_budget_seconds"]
     if job.get("monitor_script"):
         result["monitor_script"] = job["monitor_script"]
     if job.get("monitor_url"):
@@ -1483,6 +1485,7 @@ def cronjob(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    run_budget_seconds: Optional[float] = None,
     timezone: Optional[str] = None,
     allow_messaging: Optional[bool] = None,
     task_id: str = None,
@@ -1601,6 +1604,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    run_budget_seconds=run_budget_seconds,
                     timezone=timezone,
                     allow_messaging=bool(allow_messaging),
                 )
@@ -1819,6 +1823,8 @@ def cronjob(
                 # CLI-only lane (see create above): update_job validates
                 # against the canonical grammar; empty string clears the pin.
                 updates["reasoning_effort"] = reasoning_effort
+            if run_budget_seconds is not None:
+                updates["run_budget_seconds"] = run_budget_seconds
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -2048,6 +2054,11 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "run_budget_seconds": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional total wall-clock execution budget in seconds, including setup, scripts, agent work, and cleanup. Must be positive when set. On update, zero clears the budget. Omit to preserve the existing inactivity-only behavior."
+            },
         },
         "required": ["action"]
     }
@@ -2114,6 +2125,7 @@ def _cronjob_handler(args, **kw):
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         attach_to_session=args.get("attach_to_session"),
+        run_budget_seconds=args.get("run_budget_seconds"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
         timezone=args.get("timezone"),

@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -2186,6 +2187,30 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_run_budget_seconds(value: Any) -> Optional[float]:
+    """Normalize an optional positive per-job total execution budget.
+
+    ``None``, an empty string, and zero clear or omit the limit. Negative,
+    non-numeric, boolean, NaN, and infinite values are invalid because a
+    persisted budget must be a finite positive number when present.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("run_budget_seconds must be a positive number or zero to clear")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "run_budget_seconds must be a positive number or zero to clear"
+        ) from exc
+    if normalized == 0:
+        return None
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError("run_budget_seconds must be a positive finite number")
+    return normalized
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2289,6 +2314,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    run_budget_seconds: Optional[float] = None,
     timezone: Optional[str] = None,
     allow_messaging: bool = False,
 ) -> Dict[str, Any]:
@@ -2358,6 +2384,9 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        run_budget_seconds: Optional positive total wall-clock budget for one
+                execution, including setup, scripts, and agent cleanup. Zero
+                or empty values leave the budget unset.
         timezone: Optional validated IANA timezone for cron wall-clock
                 expressions. Intervals and one-shots retain their existing
                 elapsed-time and absolute-time semantics.
@@ -2397,6 +2426,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_run_budget = _normalize_run_budget_seconds(run_budget_seconds)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2519,6 +2549,8 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    if normalized_run_budget is not None:
+        job["run_budget_seconds"] = normalized_run_budget
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2656,8 +2688,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         "completed": (job.get("repeat") or {}).get("completed", 0),
                     }
 
+            if "run_budget_seconds" in updates:
+                updates["run_budget_seconds"] = _normalize_run_budget_seconds(
+                    updates["run_budget_seconds"]
+                )
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "run_budget_seconds" in updates and updates["run_budget_seconds"] is None:
+                updated.pop("run_budget_seconds", None)
 
             if (
                 is_terminal_job(job)

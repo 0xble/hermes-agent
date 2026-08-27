@@ -63,6 +63,49 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+_TOTAL_RUN_BUDGET_MARKER = "total execution budget exhausted"
+
+
+class CronTotalRunBudgetExpired(TimeoutError):
+    """Raised when one cron fire exhausts its total wall-clock budget."""
+
+
+def _remaining_run_budget(deadline: Optional[float]) -> Optional[float]:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _total_run_budget_error(job_name: str, budget_seconds: float) -> CronTotalRunBudgetExpired:
+    return CronTotalRunBudgetExpired(
+        f"Cron job '{job_name}' {_TOTAL_RUN_BUDGET_MARKER} "
+        f"after {float(budget_seconds):g}s"
+    )
+
+
+def _total_run_budget_failure(
+    job: dict,
+    job_name: str,
+    budget_seconds: float,
+) -> tuple[bool, str, str, str]:
+    """Build the pre-agent/no-agent failure shape for total budget expiry."""
+    job_id = str(job.get("id") or "unknown")
+    exc = _total_run_budget_error(job_name, budget_seconds)
+    error = f"{type(exc).__name__}: {exc}"
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+    doc = (
+        f"# Cron Job: {job_name} (FAILED)\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        f"**Status:** total execution budget exhausted\n\n"
+        f"{error}\n"
+    )
+    alert = (
+        f"⚠ Cron '{job_name}' total execution budget exhausted "
+        f"after {float(budget_seconds):g}s."
+    )
+    return False, doc, alert, error
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
@@ -341,6 +384,13 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Falling through leaves the generic cleaner below to report what actually
     # happened, naming the script. No new message text is needed.
     provider_reachable = not job.get("no_agent")
+
+    if _TOTAL_RUN_BUDGET_MARKER in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: total execution budget exhausted. "
+            "The scheduler's hard wall-clock safety limit stopped the run. "
+            "Full details saved in cron output."
+        )
 
     # Script execution happens outside the LLM/provider path (also for
     # agent-backed jobs that run a context script). Check the script runner's
@@ -4274,6 +4324,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4357,7 +4408,9 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = float(_get_script_timeout())
+    if timeout_seconds is not None:
+        script_timeout = min(script_timeout, max(0.0, float(timeout_seconds)))
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4439,7 +4492,9 @@ def _run_job_script(
                 # layer's tree-kill (#85147, d6a5cb9725).
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                return False, (
+                    f"Script timed out after {script_timeout:g}s: {path}"
+                )
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
@@ -4478,6 +4533,7 @@ def _run_job_script_with_claim_heartbeat(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4491,6 +4547,15 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    def _run_script() -> tuple[bool, str]:
+        kwargs = {
+            "workdir": workdir,
+            "cancel_event": cancel_event,
+        }
+        if timeout_seconds is not None:
+            kwargs["timeout_seconds"] = timeout_seconds
+        return _run_job_script(script_path, **kwargs)
+
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -4499,7 +4564,7 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_script()
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4530,10 +4595,10 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_script()
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_script()
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -5531,6 +5596,25 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    from cron.jobs import _normalize_run_budget_seconds
+
+    try:
+        _total_run_budget = _normalize_run_budget_seconds(
+            job.get("run_budget_seconds")
+        )
+    except ValueError as exc:
+        error = f"ValueError: {exc}"
+        doc = (
+            f"# Cron Job: {job_name} (FAILED)\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Status:** invalid run budget\n\n{error}\n"
+        )
+        return False, doc, "", error
+    _total_run_deadline = (
+        time.monotonic() + _total_run_budget
+        if _total_run_budget is not None
+        else None
+    )
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -5567,6 +5651,9 @@ def run_job(
                 "Job '%s': no_agent .env reload failed", job_id, exc_info=True
             )
 
+        if _remaining_run_budget(_total_run_deadline) == 0:
+            return _total_run_budget_failure(job, job_name, _total_run_budget)
+
         script_path = job.get("script")
         # Legacy/hand-edited records can still carry no_agent with a missing or
         # whitespace-only script. Erroring alone left the job enabled, so it
@@ -5593,14 +5680,24 @@ def run_job(
             _job_workdir = None
 
         try:
+            _script_budget = _remaining_run_budget(_total_run_deadline)
+            _script_kwargs = {
+                "workdir": _job_workdir,
+                "cancel_event": cancel_event,
+            }
+            if _script_budget is not None:
+                _script_kwargs["timeout_seconds"] = _script_budget
             ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir, cancel_event=cancel_event,
+                job, script_path, **_script_kwargs
             )
         except Exception as exc:
             logger.exception(
                 "Job '%s': script execution raised unexpectedly", job_id,
             )
             ok, output = False, f"Script execution failed: {exc}"
+
+        if _remaining_run_budget(_total_run_deadline) == 0:
+            return _total_run_budget_failure(job, job_name, _total_run_budget)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -5685,7 +5782,13 @@ def run_job(
 
     _monitor_context: Optional[str] = None
     if job_has_monitor(job):
-        _mon = check_monitor(job)
+        _monitor_budget = _remaining_run_budget(_total_run_deadline)
+        if _monitor_budget is None:
+            _mon = check_monitor(job)
+        else:
+            _mon = check_monitor(job, timeout_seconds=_monitor_budget)
+        if _remaining_run_budget(_total_run_deadline) == 0:
+            return _total_run_budget_failure(job, job_name, _total_run_budget)
         _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
         if not _mon.ok:
             # Source failure is an ERROR, never a change: alert the user so
@@ -5739,12 +5842,22 @@ def run_job(
     # ---------------------------------------------------------------
     from run_agent import AIAgent
 
+    _session_db = None
     # NOTE: the SQLite session store used to be initialized here, BEFORE the
     # wake-gate and prompt-validation early returns below. Every gated run
     # (``wakeAgent: false``, blocked prompt) opened state.db and returned
     # without reaching the finally that closes it, relying on GC to release
     # the handle. Init now happens inside the main try, right before the
     # agent is constructed — after every early-return path (#96290).
+
+    if _remaining_run_budget(_total_run_deadline) == 0:
+        if _session_db is not None:
+            _run_cron_cleanup_with_timeout(
+                _session_db.close,
+                job_id=job_id,
+                label="session store close after total budget exhaustion",
+            )
+        return _total_run_budget_failure(job, job_name, _total_run_budget)
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -5753,9 +5866,21 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
+        _prerun_budget = _remaining_run_budget(_total_run_deadline)
+        _prerun_kwargs = {"cancel_event": cancel_event}
+        if _prerun_budget is not None:
+            _prerun_kwargs["timeout_seconds"] = _prerun_budget
         prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, cancel_event=cancel_event,
+            job, script_path, **_prerun_kwargs
         )
+        if _remaining_run_budget(_total_run_deadline) == 0:
+            if _session_db is not None:
+                _run_cron_cleanup_with_timeout(
+                    _session_db.close,
+                    job_id=job_id,
+                    label="session store close after total budget exhaustion",
+                )
+            return _total_run_budget_failure(job, job_name, _total_run_budget)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -5806,6 +5931,7 @@ def run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _agent_teardown_complete = False
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -6433,7 +6559,16 @@ def run_job(
         # would wedge the job's worker thread, so the init is bounded and a
         # timeout proceeds without a session store instead of blocking the
         # run forever.
+        _agent_run_budget = _remaining_run_budget(_total_run_deadline)
+        if _agent_run_budget is not None and _agent_run_budget <= 0:
+            raise _total_run_budget_error(job_name, _total_run_budget)
+
         _session_db_timeout = _get_session_db_timeout()
+        if _agent_run_budget is not None:
+            if _session_db_timeout <= 0:
+                _session_db_timeout = _agent_run_budget
+            else:
+                _session_db_timeout = min(_session_db_timeout, _agent_run_budget)
         try:
             from hermes_state import SessionDB
 
@@ -6478,6 +6613,16 @@ def run_job(
         except Exception as e:
             logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
+        _agent_run_budget = _remaining_run_budget(_total_run_deadline)
+        if _agent_run_budget is not None and _agent_run_budget <= 0:
+            if _session_db is not None:
+                _run_cron_cleanup_with_timeout(
+                    _session_db.close,
+                    job_id=job_id,
+                    label="session store close after total budget exhaustion",
+                )
+            raise _total_run_budget_error(job_name, _total_run_budget)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -6515,6 +6660,11 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            **(
+                {"run_budget_seconds": _agent_run_budget}
+                if _agent_run_budget is not None
+                else {}
+            ),
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -6584,6 +6734,7 @@ def run_job(
             task_id=_cron_task_id,
         )
         _inactivity_timeout = False
+        _total_budget_timeout = False
         _watch_stop = threading.Event()
 
         def _idle_seconds() -> float:
@@ -6620,19 +6771,44 @@ def run_job(
                 # ``get_activity_summary`` on this thread can no longer keep
                 # the 600s inactivity limit from firing (#94285).
                 _watch_thread.start()
-            if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+            _must_poll = (
+                _cron_inactivity_limit is not None
+                or _total_run_deadline is not None
+                or _is_oneshot
+                or cancel_event is not None
+            )
+            if not _must_poll:
                 result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    if _cron_future.done():
+                        _abort_if_fire_claim_lost()
+                        result = _cron_future.result()
+                        break
+                    _remaining_total = _remaining_run_budget(
+                        _total_run_deadline
+                    )
+                    if _remaining_total is not None and _remaining_total <= 0:
+                        _total_budget_timeout = True
+                        break
+                    _wait_timeout = _POLL_INTERVAL
+                    if _remaining_total is not None:
+                        _wait_timeout = min(_wait_timeout, _remaining_total)
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_wait_timeout,
                     )
                     if done:
                         _abort_if_fire_claim_lost()
                         result = _cron_future.result()
                         break
                     if _inactivity_timeout:
+                        break
+                    _remaining_total = _remaining_run_budget(
+                        _total_run_deadline
+                    )
+                    if _remaining_total is not None and _remaining_total <= 0:
+                        _total_budget_timeout = True
                         break
                     _abort_if_fire_claim_lost()
                     _heartbeat_run_claim_if_due()
@@ -6642,6 +6818,25 @@ def run_job(
         finally:
             _watch_stop.set()
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _total_budget_timeout:
+            logger.error(
+                "Job '%s' exhausted its %.3fs total execution budget",
+                job_name,
+                _total_run_budget,
+            )
+            request_hard_interrupt(
+                agent, "Cron total execution budget exhausted"
+            )
+            # AIAgent.close() kills subprocesses owned by this session through
+            # the existing process registry, then releases terminal/browser/
+            # client resources. The wrapper keeps that cleanup bounded even if
+            # a backend close hangs. Do it here even when delivery requested
+            # deferred teardown: an expired run must not hand a live agent to
+            # the delivery lane.
+            _teardown_cron_agent(agent, job_id)
+            _agent_teardown_complete = True
+            raise _total_run_budget_error(job_name, _total_run_budget)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -6972,7 +7167,9 @@ def run_job(
         # When the caller opted to defer teardown (passed a list), hand the live
         # agent back instead of closing it here — delivery must run against a
         # live async client, and the caller tears down afterwards (#58720).
-        if defer_agent_teardown is not None:
+        if _agent_teardown_complete:
+            pass
+        elif defer_agent_teardown is not None:
             if agent is not None:
                 defer_agent_teardown.append(agent)
         else:
