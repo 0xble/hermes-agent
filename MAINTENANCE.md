@@ -95,6 +95,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): fetch complete upstream ancestry` | Git history completeness for maintenance validation only; no shipped Hermes behavior. |
 | `fix(ci): require unique patch history baseline` | Fork governance baseline hardening only; no shipped Hermes behavior. |
 | `test: align rebased regressions with fork contracts` | Adaptation of upstream-owned tests to registered fork contracts (HERMES-011 shared SessionDB ownership, HERMES-015 renamed upstream helper, HERMES-036 cron memory policy) after the 2026-08-26 rebase; no shipped Hermes behavior. |
+| `fix(gateway): restore string-form disabled_toolsets parsing` | Patch-neutral restoration of upstream commit `309cf2c5e2`'s `parse_config_string_list` hunks clobbered by fork replay. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
