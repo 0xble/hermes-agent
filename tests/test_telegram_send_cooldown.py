@@ -482,8 +482,12 @@ async def test_extreme_server_retry_after_never_sleeps_inline(monkeypatch):
     result = await adapter.send("flood-chat", "hello", metadata={"notify": True})
 
     assert result.success is False
-    assert result.retryable is True
-    assert result.retry_after == 5.0
+    # Over-cap penalties fail closed with upstream's structured result
+    # (#91969): a blind full-content retry could duplicate chunks already
+    # delivered, so the caller's retry machinery owns the wait instead.
+    assert result.retryable is False
+    assert result.error == "flood_control:7000.0"
+    assert result.retry_after == 7000.0
     assert sleeps == []
     assert bot.send_message.await_count == 1
 

@@ -73,7 +73,12 @@ async def test_send_short_flood_still_retries_inline(monkeypatch):
 
     assert result.success is True
     assert result.message_id == "7"
-    sleep.assert_awaited_once_with(2.0)
+    # The per-chat cooldown clock (HERMES-004) deducts time already elapsed
+    # since the RetryAfter was recorded, so the inline sleep is the remaining
+    # wait — equal to the server's penalty minus scheduling overhead.
+    sleep.assert_awaited_once()
+    (waited,) = sleep.await_args.args
+    assert waited == pytest.approx(2.0, abs=0.1)
 
 
 def test_mark_connected_publishes_connected_when_healthy():
