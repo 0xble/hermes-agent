@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.session_db_recovery import RecoverableHandleCache
@@ -145,17 +146,13 @@ def test_session_store_and_runner_reopen_after_failed_construction(monkeypatch, 
     clock.now = 1.0
     assert store._db is opened[-1]
 
-    runner_opened: list[object] = []
+    # HERMES-011: the runner opens no second SessionDB writer — its facade
+    # wraps SessionStore's shared handle for the active scope, so runner
+    # recovery follows store recovery.
+    def _no_second_writer():
+        raise AssertionError("runner must not construct a second SessionDB writer")
 
-    def runner_fail_once():
-        if not runner_opened:
-            runner_opened.append(None)
-            raise OSError("temporary open failure")
-        handle = object()
-        runner_opened.append(handle)
-        return handle
-
-    monkeypatch.setattr(hermes_state, "SessionDB", runner_fail_once)
+    monkeypatch.setattr(hermes_state, "SessionDB", _no_second_writer)
     monkeypatch.setattr(hermes_state, "AsyncSessionDB", lambda db: ("async", db))
     runner = object.__new__(GatewayRunner)
     runner._session_db_pinned = _SESSION_DB_UNPINNED
@@ -168,11 +165,15 @@ def test_session_store_and_runner_reopen_after_failed_construction(monkeypatch, 
         clock=clock,
         initial_retry_delay=1,
     )
+    # While the store has no SQLite handle the runner facade fails closed.
+    runner.session_store = SimpleNamespace(_db=None)
     assert runner._session_db is None
     assert runner._session_db is None
-    assert len(runner_opened) == 1
-    clock.now = 2.0
-    assert runner._session_db == ("async", runner_opened[-1])
+    # Once the store recovers, the runner's next retry wraps the store's
+    # exact shared handle.
+    runner.session_store = store
+    clock.now = 3.0
+    assert runner._session_db == ("async", store._db)
     assert runner._session_db_init_error is None
 
 
