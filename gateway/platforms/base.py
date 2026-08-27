@@ -6398,25 +6398,48 @@ class BasePlatformAdapter(ABC):
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
             cmd = event.get_command()
+            effective_cmd = cmd
+            is_quick_alias = False
+            runner = getattr(self, "gateway_runner", None)
+            resolve_quick_alias = getattr(runner, "_quick_command_alias_text", None)
+            if callable(resolve_quick_alias):
+                alias_text = resolve_quick_alias(
+                    event,
+                    profile_name=getattr(self, "_owner_profile", None),
+                )
+                if isinstance(alias_text, str) and alias_text:
+                    effective_cmd = alias_text.lstrip("/").split(maxsplit=1)[0]
+                    is_quick_alias = True
             from hermes_cli.commands import (
                 is_interrupt_then_dispatch,
                 should_bypass_active_session,
             )
 
-            if should_bypass_active_session(cmd):
+            alias_requires_lifecycle_handoff = bool(
+                is_quick_alias
+                and effective_cmd
+                and is_interrupt_then_dispatch(effective_cmd)
+            )
+            if (
+                should_bypass_active_session(effective_cmd)
+                and not alias_requires_lifecycle_handoff
+            ):
                 # /stop, /new, /reset must cancel the in-flight adapter task
-                # and preserve ordering of queued follow-ups.  Route those
-                # through the dedicated handoff path that serializes
-                # cancellation + runner response + pending drain.
-                # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
-                if cmd and is_interrupt_then_dispatch(cmd):
+                # and preserve ordering of queued follow-ups. Route raw built-ins
+                # through the dedicated handoff path that serializes cancellation,
+                # runner response, and pending drain. Quick aliases targeting these
+                # commands stay on ordinary busy semantics until Hermes has an
+                # authorization-aware alias handoff.
+                if effective_cmd and is_interrupt_then_dispatch(effective_cmd):
                     self._discard_text_debounce(session_key)
                     try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
+                        await self._dispatch_active_session_command(
+                            event, session_key, effective_cmd
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",
-                            self.name, cmd, e, exc_info=True,
+                            self.name, effective_cmd, e, exc_info=True,
                         )
                     return
 
@@ -6425,7 +6448,7 @@ class BasePlatformAdapter(ABC):
                 # don't cancel the running task.
                 logger.debug(
                     "[%s] Command '/%s' bypassing active-session guard for %s",
-                    self.name, cmd, session_key,
+                    self.name, effective_cmd, session_key,
                 )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
@@ -6445,7 +6468,13 @@ class BasePlatformAdapter(ABC):
                                 ttl_seconds=_eph_ttl,
                             )
                 except Exception as e:
-                    logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                    logger.error(
+                        "[%s] Command '/%s' dispatch failed: %s",
+                        self.name,
+                        effective_cmd,
+                        e,
+                        exc_info=True,
+                    )
                 return
 
             # Clarify reply bypass: if the agent is blocked on a

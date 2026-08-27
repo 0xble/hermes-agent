@@ -7658,6 +7658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # without rereading config or mutating process-global environment.
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
+        self._quick_commands_by_profile: Dict[str, Dict[str, Any]] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
@@ -10556,6 +10557,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_modes = self.__dict__.setdefault("_busy_text_modes_by_profile", {})
         input_modes[profile_name] = input_mode
         text_modes[profile_name] = text_mode
+
+    def _snapshot_profile_quick_commands(self, profile_name: str, config: dict) -> None:
+        """Cache one routed profile's quick commands for pre-scope dispatch."""
+        quick_commands = config.get("quick_commands", {}) if isinstance(config, dict) else {}
+        snapshots = self.__dict__.setdefault("_quick_commands_by_profile", {})
+        snapshots[profile_name] = dict(quick_commands) if isinstance(quick_commands, dict) else {}
 
     def _busy_profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Return the routed profile whose busy policy applies, if any."""
@@ -16928,6 +16935,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
+        self._snapshot_profile_quick_commands(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "
@@ -18304,6 +18312,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    def _quick_command_alias_text(
+        self,
+        event: MessageEvent,
+        profile_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the configured alias expansion without mutating the event."""
+        get_command = getattr(event, "get_command", None)
+        if not callable(get_command):
+            return None
+        command = get_command()
+        if not isinstance(command, str) or not command:
+            return None
+
+        from hermes_cli.commands import resolve_command
+
+        # Registry-owned commands always win over user configuration.
+        if resolve_command(command) is not None:
+            return None
+
+        if not profile_name:
+            source = getattr(event, "source", None)
+            profile_name = str(getattr(source, "profile", "") or "").strip() or None
+
+        quick_commands = None
+        if profile_name:
+            snapshots = getattr(self, "_quick_commands_by_profile", None)
+            if isinstance(snapshots, dict) and profile_name in snapshots:
+                quick_commands = snapshots[profile_name]
+        if quick_commands is None:
+            config = getattr(self, "config", {})
+            if isinstance(config, dict):
+                quick_commands = config.get("quick_commands", {}) or {}
+            else:
+                quick_commands = getattr(config, "quick_commands", {}) or {}
+        if not isinstance(quick_commands, dict):
+            return None
+
+        qcmd = quick_commands.get(command)
+        if not isinstance(qcmd, dict) or qcmd.get("type") != "alias":
+            return None
+        target = (qcmd.get("target") or "").strip()
+        if not target:
+            return None
+
+        target = target if target.startswith("/") else f"/{target}"
+        get_command_args = getattr(event, "get_command_args", None)
+        raw_args = get_command_args() if callable(get_command_args) else ""
+        user_args = raw_args.strip() if isinstance(raw_args, str) else ""
+        return f"{target} {user_args}".strip()
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -18514,6 +18572,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Expand configured aliases after authorization and plugin rewriting,
+        # but before any command-aware state gate. The base adapter separately
+        # peeks at this same resolver so aliases can reach this handler while a
+        # session is active without exposing the rewritten text to pre-auth
+        # hooks.
+        _alias_text = self._quick_command_alias_text(event)
+        if _alias_text is not None:
+            event.text = _alias_text
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
@@ -19140,28 +19207,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
-
-        # Expand alias quick commands before built-in dispatch so targets like
-        # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
-        # Preserve built-in precedence; aliases only need early handling when
-        # the typed command is not already known.
-        if command and _cmd_def is None:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if isinstance(quick_commands, dict) and command in quick_commands:
-                qcmd = quick_commands[command]
-                if qcmd.get("type") == "alias":
-                    target = (qcmd.get("target") or "").strip()
-                    if target:
-                        target = target if target.startswith("/") else f"/{target}"
-                        target_command = target.lstrip("/")
-                        user_args = event.get_command_args().strip()
-                        event.text = f"{target} {user_args}".strip()
-                        command = target_command.split()[0] if target_command else target_command
-                        _cmd_def = _resolve_cmd(command) if command else None
-                        canonical = _cmd_def.name if _cmd_def else command
 
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM
