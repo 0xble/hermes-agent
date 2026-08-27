@@ -256,6 +256,26 @@ def test_unregistered_session_never_inherits_another_sessions_record(
     assert resolved == (main / "target.py").resolve()
 
 
+def test_read_file_uses_resolved_workspace_not_shared_backend_cwd(
+    _two_worktree_sessions, monkeypatch
+):
+    import json
+    from tools.environments.local import LocalEnvironment
+
+    wt_a, wt_b, _main = _two_worktree_sessions
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": LocalEnvironment(cwd=str(wt_b))},
+    )
+
+    out = json.loads(ft.read_file_tool("target.py", task_id="sess-a"))
+
+    assert not out.get("error"), out
+    assert "1|wt_a" in out["content"], out
+    assert "1|wt_b" not in out["content"], out
+
+
 def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
     _isolated_cwd, monkeypatch
 ):

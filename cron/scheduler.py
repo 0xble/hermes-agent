@@ -1420,13 +1420,7 @@ def _inactivity_watchdog_loop(
 
 
 def _cron_inactivity_seconds() -> float:
-    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600.
-
-    Shared by run_job's inactivity monitor (which maps 0 to "no limit") and
-    the cwd-lock bound below (which keeps the wait bounded regardless) so
-    the two sites cannot drift apart — the lock bound must stay at or above
-    the inactivity limit or waiters would fail while a healthy holder runs.
-    """
+    """Parse HERMES_CRON_TIMEOUT (seconds). 0 = unlimited; bad input = 600."""
     raw = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
     if not raw:
         return 600.0
@@ -1458,7 +1452,6 @@ def _shutdown_parallel_pool() -> None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
         _parallel_pool_max_workers = None
-
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -5912,7 +5905,6 @@ def run_job(
     _non_dispatcher_token = None
     _session_db = None
     try:
-
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -8255,7 +8247,6 @@ def tick(
                 if job_id in _running_job_ids:
                     _running_futures[job_id] = fut
             return fut
-
 
         # Parallel pass — persistent pool, non-blocking dispatch.
         # Jobs that are already running (from a previous tick) are skipped.

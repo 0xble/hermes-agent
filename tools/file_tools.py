@@ -1847,7 +1847,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        # Pass the path already resolved for this task. File backends may be
+        # shared across sessions, so re-resolving a relative path against the
+        # backend environment's mutable cwd can read another session's file.
+        result = file_ops.read_file(str(_resolved), offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────

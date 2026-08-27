@@ -140,7 +140,9 @@ class TestCronjobToolWorkdir:
 class TestTickWorkdirPartition:
     """Workdir is per execution, so it must not force a global serial lane."""
 
-    def test_workdir_jobs_overlap_on_parallel_pool(self, tmp_path, monkeypatch):
+    def test_workdir_jobs_overlap_on_parallel_pool(
+        self, tmp_path, monkeypatch
+    ):
         import cron.scheduler as sched
         import threading
 
@@ -187,7 +189,7 @@ class TestRunJobTerminalCwd:
     """
 
     @staticmethod
-    def _install_stubs(monkeypatch, observed: dict):
+    def _install_stubs(monkeypatch, observed: dict, agent_cls=None):
         """Patch enough of run_job's deps that it executes without real creds."""
         import os
         import sys
@@ -195,13 +197,17 @@ class TestRunJobTerminalCwd:
 
         class FakeAgent:
             def __init__(self, **kwargs):
+                from agent.runtime_cwd import resolve_tool_cwd
+
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
                 observed["load_soul_identity"] = kwargs.get("load_soul_identity")
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                observed["resolved_cwd_during_init"] = resolve_tool_cwd()
 
             def run_conversation(self, *_a, task_id=None, **_kw):
+                from agent.runtime_cwd import resolve_tool_cwd
                 from tools.terminal_tool import get_session_cwd
 
                 observed["task_id"] = task_id
@@ -209,13 +215,14 @@ class TestRunJobTerminalCwd:
                 observed["terminal_cwd_during_run"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                observed["resolved_cwd_during_run"] = resolve_tool_cwd()
                 return {"final_response": "done", "messages": []}
 
             def get_activity_summary(self):
                 return {"seconds_since_activity": 0.0}
 
         fake_mod = type(sys)("run_agent")
-        fake_mod.AIAgent = FakeAgent
+        fake_mod.AIAgent = agent_cls or FakeAgent
         monkeypatch.setitem(sys.modules, "run_agent", fake_mod)
 
         # Bypass the real provider resolver — it reads ~/.hermes and credentials.
@@ -316,3 +323,170 @@ class TestRunJobTerminalCwd:
         assert observed["terminal_cwd_during_run"] == baseline
         assert os.environ["TERMINAL_CWD"] == baseline
         assert get_session_cwd(observed["task_id"]) is None
+
+    def test_workdir_uses_session_cwd_without_mutating_process_env(
+        self, monkeypatch, tmp_path
+    ):
+        import os
+        import cron.scheduler as sched
+
+        baseline = str(tmp_path / "process-baseline")
+        workdir = tmp_path / "job-workspace"
+        workdir.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", baseline)
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+
+        success, *_ = sched.run_job(
+            {
+                "id": "session-cwd",
+                "name": "session-cwd",
+                "prompt": "hi",
+                "workdir": str(workdir),
+                "schedule_display": "manual",
+            }
+        )
+
+        assert success is True
+        assert observed["skip_context_files"] is False
+        assert observed["resolved_cwd_during_init"] == str(workdir)
+        assert observed["resolved_cwd_during_run"] == str(workdir)
+        assert observed["terminal_cwd_during_init"] == baseline
+        assert observed["terminal_cwd_during_run"] == baseline
+        assert os.environ["TERMINAL_CWD"] == baseline
+
+    def test_concurrent_workdirs_keep_prompt_and_tools_session_scoped(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import os
+        import threading
+        from pathlib import Path
+
+        import cron.scheduler as sched
+
+        baseline = str(tmp_path / "process-baseline")
+        monkeypatch.setenv("TERMINAL_CWD", baseline)
+
+        workspaces = []
+        for label in ("alpha", "beta"):
+            workspace = tmp_path / label
+            workspace.mkdir()
+            (workspace / "marker.txt").write_text(label, encoding="utf-8")
+            (workspace / "AGENTS.md").write_text(
+                f"# {label} cron instructions\n", encoding="utf-8"
+            )
+            workspaces.append(workspace)
+
+        active: set[str] = set()
+        active_lock = threading.Lock()
+        both_active = threading.Event()
+        release = threading.Event()
+        observations: dict[str, dict] = {}
+
+        class ConcurrentAgent:
+            def __init__(self, **_kwargs):
+                self.session_id = "cron-test"
+
+            def run_conversation(self, *_args, **_kwargs):
+                from agent.prompt_builder import build_context_files_prompt
+                from agent.runtime_cwd import resolve_context_cwd, resolve_tool_cwd
+                from tools.code_execution_tool import _resolve_child_cwd
+                from tools.delegate_tool import _resolve_workspace_hint
+                from tools.file_tools import (
+                    _resolve_base_dir,
+                    _resolve_path_for_task,
+                    read_file_tool,
+                )
+                from tools.terminal_tool import clear_session_cwd, terminal_tool
+
+                cwd = resolve_tool_cwd()
+                label = Path(cwd).name
+                task_id = f"cron-cwd-{label}"
+                with active_lock:
+                    active.add(label)
+                    if len(active) == 2:
+                        both_active.set()
+                try:
+                    terminal_result = json.loads(
+                        terminal_tool(command="pwd", task_id=task_id)
+                    )
+                    file_base = str(_resolve_base_dir(task_id))
+                    file_path = str(_resolve_path_for_task("marker.txt", task_id))
+                    file_result = json.loads(
+                        read_file_tool("marker.txt", task_id=task_id)
+                    )
+                    code_cwd = _resolve_child_cwd(
+                        "project", str(tmp_path / "strict-staging"), task_id
+                    )
+                    observations[label] = {
+                        "resolved_cwd": cwd,
+                        "context": build_context_files_prompt(
+                            cwd=str(resolve_context_cwd())
+                        ),
+                        "terminal": terminal_result,
+                        "file_base": file_base,
+                        "file_path": file_path,
+                        "file": file_result,
+                        "code_cwd": code_cwd,
+                        "delegate_cwd": _resolve_workspace_hint(self),
+                        "process_cwd": os.environ.get("TERMINAL_CWD"),
+                    }
+                    release.wait(timeout=5)
+                    return {"final_response": label, "messages": []}
+                finally:
+                    clear_session_cwd(task_id)
+                    with active_lock:
+                        active.discard(label)
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+        harness_observed: dict = {}
+        self._install_stubs(
+            monkeypatch, harness_observed, agent_cls=ConcurrentAgent
+        )
+
+        results: dict[str, tuple] = {}
+
+        def run(workspace: Path) -> None:
+            results[workspace.name] = sched.run_job(
+                {
+                    "id": workspace.name,
+                    "name": workspace.name,
+                    "prompt": "inspect workspace",
+                    "workdir": str(workspace),
+                    "schedule_display": "manual",
+                }
+            )
+
+        threads = [
+            threading.Thread(target=run, args=(workspace,))
+            for workspace in workspaces
+        ]
+        for thread in threads:
+            thread.start()
+
+        overlapped = both_active.wait(timeout=1)
+        release.set()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert overlapped, "workdir cron jobs blocked each other"
+        assert os.environ["TERMINAL_CWD"] == baseline
+        for workspace in workspaces:
+            label = workspace.name
+            assert results[label][0] is True
+            observed = observations[label]
+            assert observed["resolved_cwd"] == str(workspace)
+            assert f"# {label} cron instructions" in observed["context"]
+            assert observed["terminal"]["exit_code"] == 0
+            assert observed["terminal"]["output"].strip() == str(workspace)
+            assert observed["file_base"] == str(workspace), observed
+            assert observed["file_path"] == str(workspace / "marker.txt"), observed
+            assert observed["file"]["content"].strip().endswith(f"|{label}")
+            assert observed["code_cwd"] == str(workspace)
+            assert observed["delegate_cwd"] == str(workspace)
+            assert observed["process_cwd"] == baseline
