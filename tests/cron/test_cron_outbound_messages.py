@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -350,13 +351,17 @@ class TestSendGate:
         )
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
-        result = asyncio.run(_send_via_adapter(
-            Platform.TELEGRAM,
-            SimpleNamespace(),
-            "2027045491",
-            "hello",
-            profile="secondary",
-        ))
+        async def exercise():
+            runner._gateway_loop = asyncio.get_running_loop()
+            return await _send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "hello",
+                profile="secondary",
+            )
+
+        result = asyncio.run(exercise())
 
         assert result == {"success": True, "message_id": "secondary-message"}
         secondary_adapter.send.assert_awaited_once()
@@ -382,13 +387,17 @@ class TestSendGate:
         )
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
-        result = asyncio.run(_send_via_adapter(
-            Platform.TELEGRAM,
-            SimpleNamespace(),
-            "2027045491",
-            "hello",
-            profile="default",
-        ))
+        async def exercise():
+            runner._gateway_loop = asyncio.get_running_loop()
+            return await _send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "hello",
+                profile="default",
+            )
+
+        result = asyncio.run(exercise())
 
         assert result == {"success": True, "message_id": "default-message"}
         default_adapter.send.assert_awaited_once()
@@ -416,6 +425,128 @@ class TestSendGate:
             "error": "No live adapter for profile 'default' and platform 'telegram'"
         }
         runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+    def test_live_transport_runs_on_gateway_owned_event_loop(self, monkeypatch):
+        from gateway.config import Platform
+
+        gateway_loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=gateway_loop.run_forever, daemon=True)
+        loop_thread.start()
+
+        class LoopBoundAdapter:
+            def __init__(self):
+                self.send_loop = None
+
+            async def send(self, *, chat_id, content, metadata=None):
+                self.send_loop = asyncio.get_running_loop()
+                if self.send_loop is not gateway_loop:
+                    raise RuntimeError("adapter send is bound to a different event loop")
+                return SimpleNamespace(success=True, message_id="gateway-loop-message", error=None)
+
+        adapter = LoopBoundAdapter()
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: adapter},
+            _profile_adapters={},
+            _active_profile_name=lambda: "default",
+            _gateway_loop=gateway_loop,
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        try:
+            result = asyncio.run(_send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "hello",
+                profile="default",
+            ))
+        finally:
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            loop_thread.join(timeout=5)
+            gateway_loop.close()
+
+        assert result == {"success": True, "message_id": "gateway-loop-message"}
+        assert adapter.send_loop is gateway_loop
+
+    def test_live_transport_fails_before_send_when_gateway_loop_is_stopped(self, monkeypatch):
+        from gateway.config import Platform
+
+        adapter = SimpleNamespace(send=AsyncMock())
+        stopped_loop = asyncio.new_event_loop()
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: adapter},
+            _profile_adapters={},
+            _active_profile_name=lambda: "default",
+            _gateway_loop=stopped_loop,
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        try:
+            result = asyncio.run(_send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "hello",
+                profile="default",
+            ))
+        finally:
+            stopped_loop.close()
+
+        assert result == {
+            "error": "Live gateway adapter owner loop is not running",
+            "delivery_stage": "pre_send",
+        }
+        adapter.send.assert_not_awaited()
+
+    def test_live_transport_owner_loop_stall_returns_ambiguous_without_late_send(self, monkeypatch):
+        from gateway.config import Platform
+        import tools.send_message_tool as send_tool
+
+        gateway_loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=gateway_loop.run_forever, daemon=True)
+        loop_thread.start()
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+
+        def block_loop():
+            blocker_started.set()
+            release_blocker.wait(timeout=5)
+
+        gateway_loop.call_soon_threadsafe(block_loop)
+        assert blocker_started.wait(timeout=5)
+
+        adapter = SimpleNamespace(send=AsyncMock())
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: adapter},
+            _profile_adapters={},
+            _active_profile_name=lambda: "default",
+            _gateway_loop=gateway_loop,
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+        monkeypatch.setattr(send_tool, "_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS", 0.01)
+
+        try:
+            result = asyncio.run(_send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "hello",
+                profile="default",
+            ))
+            release_blocker.set()
+            gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+            loop_thread.join(timeout=5)
+        finally:
+            release_blocker.set()
+            if loop_thread.is_alive():
+                gateway_loop.call_soon_threadsafe(gateway_loop.stop)
+                loop_thread.join(timeout=5)
+            gateway_loop.close()
+
+        assert result == {
+            "error": "Live gateway adapter send timed out after dispatch; delivery is ambiguous",
+        }
+        adapter.send.assert_not_awaited()
 
     def test_two_native_sends_are_separate(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch)
