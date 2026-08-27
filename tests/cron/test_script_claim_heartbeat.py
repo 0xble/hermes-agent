@@ -522,6 +522,7 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     import cron.scheduler as scheduler
 
     calls = 0
+    clock = iter([0.0, 0.01, 0.04])
 
     def heartbeat(*_args, **_kwargs):
         nonlocal calls
@@ -539,6 +540,7 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
         "fire_claim": {"at": "2026-07-12T12:00:00+00:00", "by": "owner"},
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
