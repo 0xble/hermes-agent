@@ -633,7 +633,7 @@ class TestChooseTopicIcon:
         }
         assert llm.call_args.kwargs["max_tokens"] == 1024
 
-    def test_reuses_successful_title_route_for_icon_selection(self):
+    def test_icon_selection_uses_configured_title_route(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "📊"
@@ -643,18 +643,12 @@ class TestChooseTopicIcon:
                 "Financial Systems",
                 "verify finance data",
                 ["📊", "🧪"],
-                preferred_route={
-                    "provider": "gemini",
-                    "model": "gemini-3.7-flash",
-                    "base_url": "https://generativelanguage.googleapis.com/v1beta",
-                    "api_mode": "chat_completions",
-                },
             ) == "📊"
 
-        assert llm.call_args.kwargs["provider"] == "gemini"
-        assert llm.call_args.kwargs["model"] == "gemini-3.7-flash"
-        assert llm.call_args.kwargs["base_url"].endswith("/v1beta")
-        assert llm.call_args.kwargs["api_mode"] == "chat_completions"
+        # Icon selection follows the configured title-generation route; the
+        # per-call route override was removed with the response-aware path.
+        assert "provider" not in llm.call_args.kwargs
+        assert "model" not in llm.call_args.kwargs
 
     def test_extracts_single_allowed_emoji_from_wrapped_response(self):
         mock_response = MagicMock()

@@ -1159,8 +1159,6 @@ async def _send_via_adapter(
             if not metadata:
                 metadata = None
 
-            _LIVE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-
             async def _send_live():
                 """Send text, then route extracted MEDIA attachments natively.
 
@@ -1184,11 +1182,19 @@ async def _send_via_adapter(
                 if not getattr(send_result, "success", False) or not media_files:
                     return outcome
 
+                def _media_failed(result) -> bool:
+                    # Several adapter media senders (send_multiple_images and
+                    # some send_video/send_document implementations) return
+                    # None on success and raise on failure; a SendResult with
+                    # success=False is an explicit failure. Mirrors the
+                    # scheduler's media path.
+                    return result is not None and not getattr(result, "success", True)
+
                 image_paths = []
                 other_media = []
                 for media_path, is_voice in media_files:
                     ext = _Path(media_path).suffix.lower()
-                    if ext in _LIVE_IMAGE_EXTS and not is_voice and not force_document:
+                    if ext in _IMAGE_EXTS and not is_voice and not force_document:
                         image_paths.append(media_path)
                     else:
                         other_media.append((media_path, is_voice, ext))
@@ -1199,7 +1205,7 @@ async def _send_via_adapter(
                         images=[(f"file://{_quote(p)}", "") for p in image_paths],
                         metadata=metadata,
                     )
-                    if not getattr(images_result, "success", False):
+                    if _media_failed(images_result):
                         outcome["media_error"] = (
                             getattr(images_result, "error", None) or "image delivery failed"
                         )
@@ -1212,13 +1218,19 @@ async def _send_via_adapter(
                             audio_path=media_path,
                             metadata=metadata,
                         )
+                    elif ext in _VIDEO_EXTS and not force_document:
+                        media_result = await adapter.send_video(
+                            chat_id=chat_id,
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
                     else:
                         media_result = await adapter.send_document(
                             chat_id=chat_id,
                             file_path=media_path,
                             metadata=metadata,
                         )
-                    if not getattr(media_result, "success", False):
+                    if _media_failed(media_result):
                         outcome["media_error"] = (
                             getattr(media_result, "error", None)
                             or f"media delivery failed for {media_path}"
@@ -1288,9 +1300,16 @@ async def _send_via_adapter(
                             "delivery_stage": "pre_send",
                         }
                     try:
+                        # The base budget covers one text send; each media
+                        # upload awaited inside _send_live gets its own
+                        # allowance so large attachments cannot convert a
+                        # successful delivery into an ambiguous timeout.
+                        _bridge_timeout = _LIVE_ADAPTER_SEND_TIMEOUT_SECONDS * (
+                            1 + len(media_files or [])
+                        )
                         result = await asyncio.wait_for(
                             asyncio.shield(asyncio.wrap_future(bridge)),
-                            timeout=_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS,
+                            timeout=_bridge_timeout,
                         )
                     except asyncio.TimeoutError:
                         bridge.cancel()
@@ -1777,15 +1796,19 @@ async def _send_to_platform(
                 f"target {platform.value} had only media attachments"
             )
         }
+    # A live in-process adapter now delivers attachments natively via
+    # _send_via_adapter; the omission warning applies only when the send
+    # falls through to a plugin standalone path without media support.
     warning = None
     if media_files and platform.value != "buzz":
         warning = (
-            f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
+            f"MEDIA attachments may have been omitted for {platform.value}; "
+            "standalone send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
         )
 
     last_result = None
-    for i, chunk in enumerate(chunks):
+    for chunk_index, chunk in enumerate(chunks):
+        is_last = chunk_index == len(chunks) - 1
         if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
@@ -1829,7 +1852,7 @@ async def _send_to_platform(
                 chat_id,
                 chunk,
                 thread_id=thread_id,
-                media_files=media_files if i == len(chunks) - 1 else [],
+                media_files=media_files if is_last else [],
                 force_document=force_document,
                 profile=profile,
             )

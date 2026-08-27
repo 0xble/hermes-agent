@@ -893,7 +893,6 @@ def choose_topic_icon(
     *,
     recent_emojis: Optional[list[str]] = None,
     instructions: str = "",
-    preferred_route: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
     """Choose a varied semantic Telegram topic emoji from a live allowlist.
 
@@ -970,10 +969,6 @@ def choose_topic_icon(
             max_tokens=1024,
             temperature=0.7,
             timeout=timeout,
-            provider=(preferred_route or {}).get("provider"),
-            model=(preferred_route or {}).get("model"),
-            base_url=(preferred_route or {}).get("base_url"),
-            api_mode=(preferred_route or {}).get("api_mode"),
             reasoning_config={"enabled": False, "effort": "none"},
             require_complete_response=True,
         )
