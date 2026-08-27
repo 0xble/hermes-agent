@@ -2734,12 +2734,16 @@ class HindsightMemoryProvider(MemoryProvider):
                     value = payload.get("state")
                 else:
                     value = getattr(payload, "state", None)
-                return str(value) if value is not None else None
+                return str(value).strip().lower() if value is not None else None
 
-            updated, verified = self._run_hindsight_operation(_update)
-            verified_state = _memory_state(verified) or _memory_state(updated)
-            # Readback must positively prove the requested state; a missing
-            # state is a verification failure, not a success.
+            _updated, verified = self._run_hindsight_operation(_update)
+            # Verification uses ONLY the independent get_memory readback —
+            # never the update call's echo of the requested state, which
+            # would "verify" what was asked rather than what was stored. The
+            # supported 0.9.x server always serializes a lowercase "state"
+            # literal on memory units, so a missing state is a verification
+            # failure, not a success.
+            verified_state = _memory_state(verified)
             if verified_state != state:
                 raise RuntimeError(
                     f"provider readback state was {verified_state!r}, expected {state!r}"

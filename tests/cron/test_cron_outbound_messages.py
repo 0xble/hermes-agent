@@ -745,3 +745,45 @@ class TestLiveAdapterMedia:
         assert result["success"] is True
         assert result["media_delivered"] == 1
         assert calls == [("document", "/tmp/diagram.png")]
+
+    def test_none_returning_media_senders_count_as_delivered(self, monkeypatch):
+        """Real adapters type send_multiple_images (and some senders) -> None.
+
+        A None result is success (failures raise or return success=False);
+        treating it as failure aborts remaining attachments and records an
+        ambiguous ledger result for a delivery that actually succeeded.
+        """
+        calls = []
+
+        class NoneReturningAdapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                return SimpleNamespace(success=True, message_id="m-1", error=None)
+
+            async def send_multiple_images(self, *, chat_id, images, metadata=None):
+                calls.append(("images", tuple(images)))
+                return None
+
+            async def send_video(self, *, chat_id, video_path, metadata=None):
+                calls.append(("video", video_path))
+                return None
+
+            async def send_document(self, *, chat_id, file_path, metadata=None):
+                calls.append(("document", file_path))
+                return SimpleNamespace(success=True, message_id="m-2", error=None)
+
+        adapter = NoneReturningAdapter()
+        result = self._send(
+            monkeypatch,
+            adapter,
+            message="album attached",
+            media_files=[
+                ("/tmp/chart.png", False),
+                ("/tmp/demo.mp4", False),
+                ("/tmp/report.pdf", False),
+            ],
+        )
+
+        assert result["success"] is True
+        assert result["media_delivered"] == 3
+        assert [c[0] for c in calls] == ["images", "video", "document"]
+        assert calls[1][1] == "/tmp/demo.mp4"
