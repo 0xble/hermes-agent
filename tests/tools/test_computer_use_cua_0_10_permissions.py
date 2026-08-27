@@ -355,3 +355,55 @@ def test_each_session_is_warned_separately(caplog):
         r for r in caplog.records if "escalated the cua-driver" in r.getMessage()
     ]
     assert len(escalation) == 2
+
+
+def test_private_daemon_allows_slow_healthy_status_probe():
+    """A healthy status client slower than 2s must not fail startup.
+
+    Each readiness probe gets up to _STATUS_PROBE_TIMEOUT_SECONDS, bounded by
+    the remaining overall startup budget (HERMES-047).
+    """
+    from tools.computer_use import cua_backend
+
+    process = Mock()
+    process.poll.return_value = None
+    process.stderr = []
+    time_values = iter([0.0, 0.0, 7.0])
+    probe_timeouts = []
+
+    def monotonic():
+        return next(time_values, 7.0)
+
+    def run(command, **kwargs):
+        if command[1] == "status":
+            probe_timeouts.append(kwargs["timeout"])
+            if kwargs["timeout"] < 5.0:
+                raise cua_backend.subprocess.TimeoutExpired(
+                    command,
+                    kwargs["timeout"],
+                )
+            return SimpleNamespace(returncode=0, stdout="running", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
+    daemon._START_TIMEOUT_SECONDS = 6.0
+    with patch.object(cua_backend.sys, "platform", "linux"), patch.object(
+        cua_backend,
+        "_resolve_mcp_invocation",
+        return_value=("/opt/cua-driver", ["mcp"]),
+    ), patch.object(
+        cua_backend.subprocess,
+        "Popen",
+        return_value=process,
+    ), patch.object(
+        cua_backend.subprocess,
+        "run",
+        side_effect=run,
+    ), patch.object(
+        cua_backend.time,
+        "monotonic",
+        side_effect=monotonic,
+    ), patch.object(cua_backend.time, "sleep"):
+        daemon.start()
+
+    assert probe_timeouts == [5.0]

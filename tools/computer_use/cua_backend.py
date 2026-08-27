@@ -682,6 +682,13 @@ class _EmbeddedCuaDaemon:
     """
 
     _START_TIMEOUT_SECONDS = 15.0
+    # Upper bound for one readiness probe. A fixed short per-probe timeout
+    # (2s) permanently fails a healthy-but-slow status client: every probe is
+    # killed before it can answer, so startup times out even though the
+    # daemon is fine. Give each probe headroom while still bounding it by the
+    # remaining overall budget (HERMES-047, narrowed to this constant after
+    # upstream absorbed the macOS app-bundle launch path).
+    _STATUS_PROBE_TIMEOUT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -825,7 +832,10 @@ class _EmbeddedCuaDaemon:
         self._stderr_thread.start()
 
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                break
             return_code = self._process.poll()
             if return_code is not None and (
                 not self._launch_via_app or return_code != 0
@@ -834,13 +844,17 @@ class _EmbeddedCuaDaemon:
                 raise RuntimeError(
                     f"embedded cua-driver exited during startup: {detail}"
                 )
+            probe_timeout = min(
+                self._STATUS_PROBE_TIMEOUT_SECONDS,
+                deadline - now,
+            )
             try:
                 probe = subprocess.run(
                     [self._command, "status", "--socket", self.socket_path],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=2.0,
+                    timeout=probe_timeout,
                     env=env,
                 )
             except (OSError, subprocess.SubprocessError):
