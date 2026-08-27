@@ -73,6 +73,9 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-047 | Active | `fix(computer-use): preserve private macOS runtime readiness`; `fix(computer-use): keep forced stop portable`; `fix(computer-use): allow slow healthy readiness probes` | Keep private computer-use runtimes startable with slow healthy status clients; the macOS signed-app TCC launch contract is now upstream-owned and the historical subjects remain indexed for attribution. |
 | HERMES-048 | Active | `fix(gateway): recover stale progress anchors` | Replace a verified stale tool-progress message anchor and resume coalesced edits instead of fragmenting the rest of the run into separate messages. |
 | HERMES-049 | Active | `fix(send_message): schedule live adapters on the gateway loop` | Keep profile-bound native sends on the event loop that owns the live adapter. |
+| HERMES-053 | Active | `fix(computer-use): resolve app bundle through driver symlinks` | Realpath the resolved driver before deriving CuaDriver.app and accept both observed official signing teams, so symlinked installs (the updater's layout) launch instead of failing closed. |
+| HERMES-054 | Active | `fix(state): attribute malformed errors before FTS repair` | Require a structure-only FTS5 integrity probe to confirm FTS damage before in-place rebuilds or stale markers, so corruption in unrelated tables stops triggering pointless index rebuilds. |
+| HERMES-055 | Active | `fix(state): attribute malformed errors before FTS repair` | Defer in-process FTS rebuilds above 1 GiB to startup/offline repair so a multi-minute rebuild cannot starve turns or be killed mid-flight by the liveness watchdog. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
 
 ## Fork-only administrative subject exemptions
@@ -115,6 +118,36 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Published commit identity:** Stable subject `fix(gateway): dispatch quick aliases while busy`; source, regression, and manifest ship together.
 - **Rollback:** Revert only `fix(gateway): dispatch quick aliases while busy`, removing the shared gateway alias expander, its pre-guard calls, and the focused `/s` active-session regression plus this record. Preserve ordinary cold-path `quick_commands`, registry-owned command bypass, exec quick-command handling, and unrelated busy input modes.
 - **Retirement:** Retire after a released upstream version expands configured aliases for non-interrupting commands before both the base-adapter and runner active-session guards, preserves built-in precedence and appended arguments, dispatches an alias targeting `/steer` during an active gateway run, and passes equivalent focused coverage. Remove the private implementation and duplicate test rather than retaining parallel paths.
+
+### HERMES-053 — Resolve CuaDriver.app through driver symlinks
+
+- **Independent hypothesis (2026-08-27):** After the 0.22.1 cua-driver refresh, computer_use failed closed with `CuaDriver.app is required` despite a current, correctly signed bundle. Upstream's `_resolve_cua_driver_app_path` string-matches `.app/Contents/MacOS/` on the unresolved driver path, but the updater installs `~/.local/bin/cua-driver` as a symlink into the bundle, so the marker never matches. Behind that, `_CUA_DRIVER_TEAM_ID` pins team `4YEC26S9KF`, while the genuinely installed 0.21.0 and 0.22.1 bundles are signed `com.trycua.driver` / team `YCK386LBJ7` (the retired fork implementation's original pin), so validation would reject the real bundle even after resolution. The correction belongs at the resolver and pin: realpath the resolved driver before deriving the bundle (the same file, not a directory fallback) and accept the tuple of both observed official teams with exact matching preserved.
+- **Surfaces:** `tools/computer_use/cua_backend.py`; `tests/tools/test_computer_use_browser_authorization.py`.
+- **Upstream tracking:** No matching upstream issue or PR found for the symlink-blind resolution or the team pin after targeted searches on 2026-08-27.
+- **Upstream PR:** None after checked 2026-08-27.
+- **Regression:** `.venv/bin/python -m pytest tests/tools/test_computer_use_browser_authorization.py tests/tools/test_computer_use_cua_0_10_permissions.py -q`; live probe proving `_resolve_cua_driver_app_path('~/.local/bin/cua-driver')` returns `/Applications/CuaDriver.app` and its signature validates.
+- **Rollback:** Restore the string-based resolver and single-team pin; expect symlinked installs to fail closed again.
+- **Retirement:** Retire after released upstream resolves symlinked driver installs to their carrying bundle and accepts the release signing team, with equivalent regressions.
+
+### HERMES-054 — Attribute malformed errors before FTS repair
+
+- **Independent hypothesis (2026-08-27):** `_is_fts_write_corruption_error` classifies ANY `database disk image is malformed` as FTS corruption. With genuine damage in a non-FTS table (live incident: `session_turn_leases` btree pages), the in-place rebuild "succeeds" against healthy indexes, the write fails again, the stale-FTS breadcrumb is set, and every process loops through multi-minute rebuilds while the real damage stays undiagnosed. The correction belongs at the repair boundary: before a generic-class malformed error may trigger a rebuild or stale marker, run FTS5's structure-only `integrity-check` (rank=1) against the present FTS tables; a clean probe routes the error to offline diagnosis (quick_check/dbstat guidance) instead. FTS5-specific messages skip the probe; a probe that cannot run preserves the historical fail-open behavior; results are cached for 60s.
+- **Surfaces:** `hermes_state.py`; `tests/state/test_fts_runtime_rebuild.py`.
+- **Upstream tracking:** Upstream's classifier and rebuild flow retain the generic-class attribution as of `36b0a96dcb` on 2026-08-27; no matching issue or PR found.
+- **Upstream PR:** None after checked 2026-08-27.
+- **Regression:** `.venv/bin/python -m pytest tests/state/test_fts_runtime_rebuild.py -q -k 'Attribution'`; the clean-probe case proves no rebuild and no stale marker for a non-FTS malformed error.
+- **Rollback:** Remove `_fts_structure_is_corrupt` and its two call-site guards; preserve the rebuild, fail-open, and startup recovery flows.
+- **Retirement:** Retire after released upstream positively attributes malformed errors to FTS structures before automatic index repair, with equivalent regressions.
+
+### HERMES-055 — Defer oversized in-process FTS rebuilds
+
+- **Independent hypothesis (2026-08-27):** The runtime `_try_runtime_fts_rebuild` rebuilds in-process regardless of database size. On a 16.7 GiB state.db a rebuild holds the writer lock for 8–11 minutes at full CPU: concurrent turns fail with lock timeouts, and the gateway liveness watchdog kills the process mid-rebuild (exit 75), producing a crash loop; the startup `_recover_stale_fts` path and offline `hermes sessions optimize-storage` complete the same rebuild safely. The correction belongs in the runtime path only: above `_RUNTIME_FTS_REBUILD_MAX_DB_BYTES` (1 GiB), skip the in-process rebuild and let the existing fail-open path set the stale marker so startup/offline repair owns the rebuild.
+- **Surfaces:** `hermes_state.py`; `tests/state/test_fts_runtime_rebuild.py`.
+- **Upstream tracking:** Same upstream head as HERMES-051; no size gate exists upstream and no matching issue or PR was found on 2026-08-27.
+- **Upstream PR:** None after checked 2026-08-27.
+- **Regression:** `.venv/bin/python -m pytest tests/state/test_fts_runtime_rebuild.py -q -k 'LargeDb'`; proves the oversized path skips rebuild yet heals via fail-open with the stale marker set and the canonical write preserved.
+- **Rollback:** Remove the size gate; preserve HERMES-054's attribution probe independently.
+- **Retirement:** Retire after released upstream bounds or offloads runtime FTS rebuilds so large databases cannot starve turns or trip the liveness watchdog, with equivalent regressions.
 
 ### HERMES-049 — Schedule live adapter sends on the gateway-owned event loop
 
