@@ -1247,7 +1247,8 @@ def skill_view(
         active_skills_dir = _skills_dir()
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        external_dirs = list(get_external_skills_dirs())
+        all_dirs.extend(external_dirs)
 
         if not all_dirs:
             return json.dumps(
@@ -1470,6 +1471,26 @@ def skill_view(
                 break
             except ValueError:
                 continue
+        if _outside_skills_dir:
+            # An explicitly configured external directory may intentionally be
+            # a symlink farm whose entries point at a generated build cache.
+            # Trust the lexical entry in that configured root, while retaining
+            # resolved-path enforcement for profile/project roots so an
+            # unconfigured local symlink escape still warns.
+            try:
+                lexical_skill = Path(os.path.abspath(str(skill_md.expanduser())))
+                for external_dir in external_dirs:
+                    lexical_root = Path(
+                        os.path.abspath(str(external_dir.expanduser()))
+                    )
+                    try:
+                        lexical_skill.relative_to(lexical_root)
+                        _outside_skills_dir = False
+                        break
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
 
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)

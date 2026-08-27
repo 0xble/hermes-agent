@@ -432,6 +432,55 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "knowledge-brain"
 
+    def test_configured_external_symlink_farm_does_not_warn(self, tmp_path, caplog):
+        local_root = tmp_path / "local"
+        external_root = tmp_path / "external"
+        build_root = tmp_path / "build"
+        local_root.mkdir()
+        external_root.mkdir()
+        real_skill = _make_skill(build_root, "managed-skill")
+        try:
+            (external_root / "managed-skill").symlink_to(
+                real_skill, target_is_directory=True
+            )
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+            caplog.at_level("WARNING", logger="tools.skills_tool"),
+        ):
+            result = json.loads(skill_view("managed-skill"))
+
+        assert result["success"] is True
+        assert "outside the trusted skills directory" not in caplog.text
+
+    def test_local_skill_symlink_escape_still_warns(self, tmp_path, caplog):
+        local_root = tmp_path / "local"
+        build_root = tmp_path / "build"
+        local_root.mkdir()
+        real_skill = _make_skill(build_root, "escaped-skill")
+        try:
+            (local_root / "escaped-skill").symlink_to(
+                real_skill, target_is_directory=True
+            )
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            caplog.at_level("WARNING", logger="tools.skills_tool"),
+        ):
+            result = json.loads(skill_view("escaped-skill"))
+
+        assert result["success"] is True
+        assert "outside the trusted skills directory" in caplog.text
+
 
 class TestSkillViewSecureSetupOnLoad:
     def test_requests_missing_required_env_and_continues(self, tmp_path, monkeypatch):

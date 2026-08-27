@@ -76,6 +76,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-053 | Active | `fix(computer-use): resolve app bundle through driver symlinks` | Realpath the resolved driver before deriving CuaDriver.app and accept both observed official signing teams, so symlinked installs (the updater's layout) launch instead of failing closed. |
 | HERMES-054 | Active | `fix(state): attribute malformed errors before FTS repair` | Require a structure-only FTS5 integrity probe to confirm FTS damage before in-place rebuilds or stale markers, so corruption in unrelated tables stops triggering pointless index rebuilds. |
 | HERMES-055 | Active | `fix(state): attribute malformed errors before FTS repair` | Defer in-process FTS rebuilds above 1 GiB to startup/offline repair so a multi-minute rebuild cannot starve turns or be killed mid-flight by the liveness watchdog. |
+| HERMES-056 | Active | `fix(skills): trust configured symlink farms` | Stop false skill-security warnings for symlink entries inside explicitly configured external skill roots while preserving warnings for local/profile symlink escapes. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
 
 ## Fork-only administrative subject exemptions
@@ -106,6 +107,16 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-056 — Trust configured external skill symlink farms
+
+- **Independent hypothesis (2026-08-27):** `skill_view` resolves both the selected `SKILL.md` and every trusted root before containment checks. A managed external root whose direct skill entries are symlinks into a generated build cache therefore emits `outside the trusted skills directory` on every valid load even though the unresolved entry is lexically inside an explicit `skills.external_dirs` root. The correction belongs only at that explicit external-root boundary: accept lexical containment there while retaining resolved containment for profile and project roots, so an unconfigured local symlink escape still warns.
+- **Surfaces:** `tools/skills_tool.py`; `tests/tools/test_skills_tool.py`; this record.
+- **Upstream tracking:** No equivalent released behavior or matching local upstream-history change found as of 2026-08-27.
+- **Upstream PR:** None checked 2026-08-27.
+- **Regression:** `pytest -q tests/tools/test_skills_tool.py`; the managed external symlink-farm case loads without a warning, while the local/profile symlink escape case still emits the warning.
+- **Rollback:** Revert only `fix(skills): trust configured symlink farms`, restoring resolved-only trust classification and its previous false positive. Preserve skill traversal, collision, mutation, and quarantine guards.
+- **Retirement:** Retire after a released upstream version distinguishes explicitly configured external symlink farms from unconfigured local symlink escapes with equivalent positive and negative regressions.
 
 ### HERMES-050 — Dispatch quick-command aliases during active runs
 
