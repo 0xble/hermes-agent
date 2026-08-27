@@ -120,65 +120,6 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
 
-class _InterimTopicTitleLatch:
-    """Fire once after both the deadline and visible-text threshold are met."""
-
-    def __init__(
-        self,
-        on_ready: Callable[[str], None],
-        *,
-        min_visible_characters: int = 20,
-    ) -> None:
-        self._on_ready = on_ready
-        self._min_visible_characters = max(1, int(min_visible_characters))
-        self._lock = threading.Lock()
-        self._latest_text = ""
-        self._deadline_reached = False
-        self._fired = False
-        self._closed = False
-
-    @staticmethod
-    def _visible_text(text: str) -> str:
-        return re.sub(r"\s+", " ", str(text or "")).strip()
-
-    @property
-    def visible_character_count(self) -> int:
-        with self._lock:
-            return len(self._visible_text(self._latest_text))
-
-    def observe(self, cumulative_text: str) -> None:
-        ready = None
-        with self._lock:
-            if self._closed or self._fired:
-                return
-            observed = str(cumulative_text or "")
-            if len(self._visible_text(observed)) >= len(self._visible_text(self._latest_text)):
-                self._latest_text = observed
-            ready = self._take_ready_text_locked()
-        if ready is not None:
-            self._on_ready(ready)
-
-    def reach_deadline(self) -> None:
-        ready = None
-        with self._lock:
-            if self._closed or self._fired:
-                return
-            self._deadline_reached = True
-            ready = self._take_ready_text_locked()
-        if ready is not None:
-            self._on_ready(ready)
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-
-    def _take_ready_text_locked(self) -> Optional[str]:
-        visible = self._visible_text(self._latest_text)
-        if not self._deadline_reached or len(visible) < self._min_visible_characters:
-            return None
-        self._fired = True
-        return self._latest_text
-
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -5903,11 +5844,15 @@ class TurnRunner:
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
             if self._runner._is_telegram_topic_lane(source):
-                # Telegram topics are named after the first completed response,
-                # not during the turn prologue. The response-aware path below
-                # supplies the opening request plus the assistant's final answer
-                # to both title and icon selection.
-                setattr(agent, "_defer_topic_title_until_response", True)
+                agent._on_session_title = lambda title, title_source: (
+                    title_source == "llm"
+                    and self._runner._schedule_telegram_topic_title_rename(
+                        source,
+                        session_id,
+                        title,
+                        user_message=getattr(ctx, "message", "") or "",
+                    )
+                )
             elif self._runner._is_discord_auto_thread_lane(source) or (
                 self._runner._is_relay_discord_channel_lane(source)
             ):
@@ -7162,94 +7107,6 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
-        _topic_title_lane = self._runner._is_telegram_topic_lane(ctx.source)
-        _topic_title_lock = threading.Lock()
-        _topic_title_claimed = False
-        _topic_title_timer = None
-        _topic_title_latch: Optional[_InterimTopicTitleLatch] = None
-        _topic_title_observer: Optional[Callable[[str], None]] = None
-
-        def _maybe_schedule_topic_title(
-            assistant_text: str,
-            *,
-            completed: bool,
-            turn_result: Optional[dict] = None,
-        ) -> None:
-            nonlocal _topic_title_claimed
-            if not _topic_title_lane:
-                return
-            mode = "completion" if completed else "interim"
-            text = str(assistant_text or "").strip()
-            if len(text) < 20:
-                logger.info(
-                    "telegram_topic_title_eligibility event=skipped mode=%s reason=insufficient_text visible_chars=%d",
-                    mode,
-                    len(text),
-                )
-                return
-            with _topic_title_lock:
-                if _topic_title_claimed:
-                    logger.info(
-                        "telegram_topic_title_eligibility event=skipped mode=%s reason=already_claimed",
-                        mode,
-                    )
-                    return
-                _topic_title_claimed = True
-            logger.info(
-                "telegram_topic_title_eligibility event=claimed mode=%s visible_chars=%d",
-                mode,
-                len(text),
-            )
-            self._runner._schedule_telegram_topic_title_after_response(
-                ctx.source,
-                str(ctx.session_id or ""),
-                str(ctx.message or ""),
-                text,
-                agent,
-                turn_result or {"completed": completed, "partial": not completed},
-                allow_incomplete=not completed,
-            )
-
-        def _schedule_interim_topic_title(assistant_text: str) -> None:
-            logger.info(
-                "telegram_topic_title_eligibility event=interim_ready visible_chars=%d",
-                len(re.sub(r"\s+", " ", str(assistant_text or "")).strip()),
-            )
-            _maybe_schedule_topic_title(assistant_text, completed=False)
-
-        if _topic_title_lane:
-            _topic_title_latch = _InterimTopicTitleLatch(_schedule_interim_topic_title)
-            _topic_title_observer = _topic_title_latch.observe
-            agent.streamed_assistant_text_callback = _topic_title_observer
-
-            def _reach_topic_title_deadline(
-                latch: _InterimTopicTitleLatch = _topic_title_latch,
-            ) -> None:
-                logger.info(
-                    "telegram_topic_title_eligibility event=deadline_reached visible_chars=%d",
-                    latch.visible_character_count,
-                )
-                latch.reach_deadline()
-
-            _topic_title_timer = threading.Timer(20.0, _reach_topic_title_deadline)
-            _topic_title_timer.daemon = True
-            try:
-                _topic_title_timer.start()
-            except Exception:
-                _topic_title_latch.close()
-                if (
-                    getattr(agent, "streamed_assistant_text_callback", None)
-                    is _topic_title_observer
-                ):
-                    agent.streamed_assistant_text_callback = None
-                _topic_title_timer = None
-                _topic_title_latch = None
-                _topic_title_observer = None
-                logger.warning(
-                    "Failed to start Telegram interim-title timer; completion path remains eligible",
-                    exc_info=True,
-                )
-
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -7316,16 +7173,6 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
-            if _topic_title_timer is not None:
-                _topic_title_timer.cancel()
-            if _topic_title_latch is not None:
-                _topic_title_latch.close()
-            if (
-                _topic_title_observer is not None
-                and getattr(agent, "streamed_assistant_text_callback", None)
-                is _topic_title_observer
-            ):
-                agent.streamed_assistant_text_callback = None
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -7586,15 +7433,13 @@ class TurnRunner:
                     unique_tags.insert(0, "[[audio_as_voice]]")
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
-        _maybe_schedule_topic_title(
-            final_response,
-            completed=True,
-            turn_result=result,
-        )
-
-        # Auto-titling for Telegram topics runs after a successful response or,
-        # for long-running turns, after 20 seconds of visible partial output.
-        # The title uses both the opening request and the assistant text.
+        # Auto-titling runs at TURN START (agent/turn_context.py) from the
+        # user's message alone, so it no longer waits on final_response — a
+        # failed or interrupted turn still gets a titled session. The
+        # platform-specific thread-rename callbacks are attached to the agent
+        # as `_on_session_title` before the run starts (see
+        # _attach_session_title_callback), because the titler now fires from
+        # inside the turn prologue rather than from here.
 
         return {
             "final_response": final_response,
@@ -26083,95 +25928,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
-    def _schedule_telegram_topic_title_after_response(
-        self,
-        source: SessionSource,
-        session_id: str,
-        user_message: str,
-        assistant_response: str,
-        agent: Any,
-        result: dict,
-        *,
-        allow_incomplete: bool = False,
-    ) -> None:
-        """Generate a Telegram topic title from completed or interim turn text.
-
-        A completed turn is preferred. For long-running turns, the gateway may
-        call this once with visible streamed text after the interim delay.
-        """
-        if (
-            source.platform != Platform.TELEGRAM
-            or not self._is_telegram_topic_lane(source)
-            or not session_id
-            or not str(assistant_response or "").strip()
-        ):
-            return
-        if not isinstance(result, dict):
-            return
-        if (
-            result.get("failed")
-            or result.get("interrupted")
-            or (result.get("partial") and not allow_incomplete)
-            or (result.get("completed") is False and not allow_incomplete)
-        ):
-            return
-
-        response_text = str(assistant_response).strip()
-        opening_text = str(user_message or "").strip()
-        if not opening_text or len(response_text) < 20:
-            return
-        # Telegram topic mode is the opt-in, feature-scoped path that may send
-        # bounded request and visible response excerpts through the configured
-        # title-generation route (including configured fallback routes). Keep
-        # the formatted context within the provider-boundary cap deterministically
-        # instead of constructing 1400 + 1600 chars and relying on a later slice.
-        from agent.title_generator import MAX_TITLE_INPUT_CHARS
-
-        request_label = "User request:\n"
-        response_label = "\n\nAssistant response so far:\n"
-        available_excerpt_chars = max(
-            0,
-            MAX_TITLE_INPUT_CHARS - len(request_label) - len(response_label),
-        )
-        opening_excerpt = opening_text[: min(1400, available_excerpt_chars)]
-        response_excerpt = response_text[
-            : max(0, available_excerpt_chars - len(opening_excerpt))
-        ]
-        title_context = (
-            f"{request_label}{opening_excerpt}\n\n"
-            f"{response_label[2:]}{response_excerpt}"
-        )
-
-        try:
-            from agent.title_generator import maybe_auto_title
-
-            runtime = {
-                "model": getattr(agent, "model", None),
-                "provider": getattr(agent, "provider", None),
-                "base_url": getattr(agent, "base_url", None),
-                "api_key": getattr(agent, "api_key", None),
-                "api_mode": getattr(agent, "api_mode", None),
-            }
-            maybe_auto_title(
-                getattr(agent, "_session_db", None),
-                session_id,
-                title_context,
-                failure_callback=getattr(agent, "_title_failure_callback", None),
-                main_runtime=runtime,
-                title_callback=lambda title, title_source: self._schedule_telegram_topic_title_rename(
-                    source,
-                    session_id,
-                    title,
-                    user_message=title_context,
-                ) if title_source == "llm" else None,
-                runtime_validator=lambda: True,
-            )
-        except Exception:
-            logger.debug(
-                "Response-aware Telegram topic title generation failed",
-                exc_info=True,
-            )
-
     def _schedule_telegram_topic_title_rename(
         self,
         source: SessionSource,
@@ -26192,18 +25948,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._telegram_topic_auto_rename_disabled(source):
             return
 
-        # ``User request:`` is the wrapper heading used when response-aware
-        # context is passed to the title generator. It is not a topic title and
-        # must never be sent to Telegram as an intermediate mutation.
         topic_name = self._sanitize_telegram_topic_title(title)
-        if topic_name.casefold() in {"user request", "user request:"}:
-            logger.debug(
-                "Skipping placeholder Telegram topic title chat=%s thread_id=%s",
-                source.chat_id,
-                source.thread_id,
-            )
-            return
-
         key = (str(source.chat_id or ""), str(source.thread_id or ""), str(session_id or ""))
         if key[0] and key[1]:
             previous = self._telegram_topic_last_scheduled_titles.get(key)

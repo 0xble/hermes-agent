@@ -58,12 +58,9 @@ TitleCallback = Callable[[str, str], None]
 RuntimeValidator = Callable[[], bool]
 AuxiliaryRouteCallback = Callable[[dict], None]
 
-# Total character cap for the combined title input at the provider boundary.
-# Telegram topic mode may opt in to sending bounded request and visible
-# response excerpts through the configured title-generation route, including
-# its configured fallback routes; keep the cap enforced here as the final
-# boundary regardless of the caller's excerpting.
-MAX_TITLE_INPUT_CHARS = 2400
+# Character cap for the title input at the provider boundary, enforced here
+# as the final boundary regardless of the caller's excerpting.
+MAX_TITLE_INPUT_CHARS = 1000
 
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
@@ -87,9 +84,8 @@ _MAX_PERSISTED_TITLE_CHARS = 100
 TITLE_MAX_OUTPUT_TOKENS = 1024
 
 _TITLE_PROMPT_TEMPLATE = (
-    "You name chat sessions. Given a user's request and the assistant's "
-    "response so far, write a short title that lets them find this "
-    "conversation again in a list.\n\n"
+    "You name chat sessions. Given the user's opening message, write a short "
+    "title that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
     "__LENGTH_RULE__\n"
     "- Use concise Title Case by default, including for technical titles.\n"
@@ -97,8 +93,6 @@ _TITLE_PROMPT_TEMPLATE = (
     "abstract intent, theme, goal, or emotional tone.\n"
     "- Use a noun phrase, not a command, instruction, recommendation, question, "
     "or conditional action. Name the subject, artifact, event, decision, or review.\n"
-    "- Use the assistant response to resolve vague requests, URLs, filenames, "
-    "and broad prompts. Do not summarize the response or answer the request.\n"
     "- Prefer an explicitly named project, person, product, or other proper name.\n"
     "- Avoid generic leading labels such as Fixing, Update, or Analysis when a specific subject is available.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
@@ -639,12 +633,8 @@ def generate_title(
     small/fast model tier. Thinking is disabled and the response is constrained
     to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
 
-    For the opt-in, feature-scoped Telegram topic title path, the input may
-    contain bounded excerpts of both the user's request and visible assistant
-    response. Those excerpts may cross the configured title-generation route,
-    including configured fallback routes. ``MAX_TITLE_INPUT_CHARS`` is the
-    total combined character cap enforced immediately before that provider
-    request; other callers retain their existing request-only behavior.
+    ``MAX_TITLE_INPUT_CHARS`` is the character cap enforced immediately
+    before the provider request.
 
     ``failure_callback`` is invoked with ``(task, exception)`` when the
     auxiliary call raises — the caller typically wires this to

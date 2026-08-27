@@ -474,8 +474,6 @@ class AIAgent:
     for AI models that support function calling.
     """
 
-    streamed_assistant_text_callback: Optional[Callable[[str], None]]
-
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
@@ -7010,15 +7008,6 @@ class AIAgent:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
             )
-            observer = getattr(self, "streamed_assistant_text_callback", None)
-            if callable(observer):
-                try:
-                    observer(self._current_streamed_assistant_text)
-                except Exception:
-                    logger.debug(
-                        "streamed assistant text observer failed",
-                        exc_info=True,
-                    )
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
