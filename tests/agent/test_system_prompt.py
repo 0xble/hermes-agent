@@ -412,6 +412,7 @@ class TestTelegramRichMessagesHint:
         assert "task lists" in stable
         assert "math/formulas" in stable
         assert "Keep tables narrow" in stable
+        assert "Never use Markdown tables with three or more columns" in stable
 
     def test_rich_hint_from_top_level_platforms(self):
         """Top-level ``platforms.telegram.extra.rich_messages`` is merged

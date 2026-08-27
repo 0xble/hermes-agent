@@ -68,7 +68,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-042 | Active | `fix(memory): pin hindsight client to 0.9.1`; `fix(memory): keep provenance out of Hindsight API kwargs` | Pin the Hindsight client and align the bundled provider with its supported 0.9.1 contract. |
 | HERMES-043 | Retired | `fix(gateway): skip completed legacy resumes` | Historical completed-legacy resume suppression, deliberately removed by HERMES-027's delivery-acknowledgement recovery contract. |
 | HERMES-044 | Active | `fix(output): compose and protect final responses` | Compose plugin output transforms without letting empty or non-substantive transforms erase the final answer. |
-| HERMES-045 | Active | `fix(telegram): keep rich tables narrow` | Prefer compact tables and vertically stacked records over wide Telegram output. |
+| HERMES-045 | Active | `fix(telegram): keep rich tables narrow`; `fix(telegram): keep wide tables out of mobile replies` | Permit only compact one- or two-column rich tables and use vertically stacked records for wider Telegram data. |
 | HERMES-046 | Active | `fix(computer-use): honor live element-token schema`; `docs(maintenance): register element-token schema patch` | Preserve safe element-index targeting when cua-driver accepts tokens through its live action schema without advertising the legacy capability label. |
 | HERMES-047 | Active | `fix(computer-use): preserve private macOS runtime readiness`; `fix(computer-use): keep forced stop portable`; `fix(computer-use): allow slow healthy readiness probes` | Keep private computer-use runtimes startable with slow healthy status clients; the macOS signed-app TCC launch contract is now upstream-owned and the historical subjects remain indexed for attribution. |
 | HERMES-048 | Active | `fix(gateway): recover stale progress anchors` | Replace a verified stale tool-progress message anchor and resume coalesced edits instead of fragmenting the rest of the run into separate messages. |
@@ -154,13 +154,14 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-045 — Keep rich Telegram tables narrow
 
-- **Summary:** Narrows the rich-message prompt so compact tables remain available while many-column data is transposed or split into vertically stacked records with labeled fields instead of requiring horizontal scanning or scrolling on a phone. Existing Telegram table rendering and fallback conversion remain unchanged.
+- **Summary:** Makes the rich-message prompt objective rather than advisory: Telegram replies may use compact one- or two-column tables, but must not generate tables with three or more columns. Wider data is transposed or split into vertically stacked records with labeled fields. Existing Telegram rendering and the transport fallback for clients without rich-table support remain unchanged.
 - **Surfaces:** `agent/prompt_builder.py`; `tests/agent/test_system_prompt.py`.
 - **Upstream tracking:** Closed issue #14160 and merged PR #16997 introduced Telegram table-to-row-group fallback. Closed issue #47095 tracks native Bot API 10.1 table support and was marked duplicate. Closed issue #46009 repaired rich formatting during streamed edits. No exact upstream issue or pull request requires the model prompt to avoid wide native tables as of upstream `0159b51f2b1cdaa8fcf65d181fc0527692724fae` on 2026-08-23.
 - **Upstream PR:** None for narrow rich-table generation after checked 2026-08-23. Related merged PR: #16997.
-- **Regression:** `.venv/bin/python -m pytest tests/agent/test_system_prompt.py tests/agent/test_prompt_builder.py -q`; `git diff --check`.
-- **Rollback:** Restore `TELEGRAM_RICH_MESSAGES_HINT` to prefer real Markdown tables for all structured data and remove the focused narrow-table assertion. Preserve rich-message activation, native table rendering, fallback row-group conversion, and unrelated formatting guidance.
-- **Retirement:** Retire after released upstream instructs agents to keep native tables phone-readable by using compact tables and vertically stacked labeled records for wide data, while preserving existing rich-message behavior and passing the focused prompt regression.
+- **Regression:** `.venv/bin/python -m pytest tests/agent/test_system_prompt.py tests/agent/test_prompt_builder.py -q`; `git diff --check`. The focused rich-message test requires the exact three-or-more-column prohibition.
+- **Published commit identity:** Stable subjects `fix(telegram): keep rich tables narrow` and `fix(telegram): keep wide tables out of mobile replies`; source, regression, and manifest ship together.
+- **Rollback:** Remove the exact three-or-more-column prohibition, restore the advisory many-column wording, and remove the focused assertion. Preserve rich-message activation, native table rendering, transport fallback, and unrelated formatting guidance.
+- **Retirement:** Retire after released upstream gives agents an objective no-three-or-more-column Telegram rule, uses vertically stacked labeled records for wider data, preserves existing rich-message behavior, and passes the focused prompt regression.
 
 ### HERMES-033 — Defer automatic retries after growth rejection
 
