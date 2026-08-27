@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -234,6 +235,105 @@ class TestCommandBypassActiveSession:
         assert any("handled:steer" in r for r in adapter.sent_responses), (
             "/steer response was not sent back to the user"
         )
+
+    @pytest.mark.asyncio
+    async def test_quick_alias_to_steer_bypasses_guard(self):
+        """A configured alias must be rewritten before the Level-1 guard."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "s": {"type": "alias", "target": "/steer"},
+            },
+        }
+        adapter.gateway_runner = runner
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/s also check auth.log"))
+
+        assert sk not in adapter._pending_messages, (
+            "/s was queued as unknown text instead of being expanded to /steer"
+        )
+        assert any("handled:s" in r for r in adapter.sent_responses), (
+            "the quick alias did not bypass the adapter's active-session guard"
+        )
+
+    @pytest.mark.asyncio
+    async def test_quick_alias_to_interrupt_command_stays_on_busy_input_path(self):
+        """Do not bypass the cancellation-and-drain lifecycle for aliases."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "x": {"type": "alias", "target": "/stop"},
+            },
+        }
+        adapter.gateway_runner = runner
+        adapter._dispatch_active_session_command = AsyncMock()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/x"))
+
+        adapter._dispatch_active_session_command.assert_not_awaited()
+        assert adapter._pending_messages[sk].text == "/x"
+        assert adapter.sent_responses == []
+
+    @pytest.mark.asyncio
+    async def test_quick_alias_uses_secondary_profile_snapshot(self):
+        """Level-1 resolution must not borrow the primary profile's aliases."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        adapter._owner_profile = "secondary"
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "s": {"type": "alias", "target": "/not-a-command"},
+            },
+        }
+        runner._quick_commands_by_profile = {
+            "secondary": {
+                "s": {"type": "alias", "target": "/steer"},
+            },
+        }
+        adapter.gateway_runner = runner
+        event = _make_event("/s use the routed profile")
+        sk = build_session_key(event.source, profile=adapter._owner_profile)
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(event)
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:s" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_empty_secondary_profile_does_not_inherit_primary_aliases(self):
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        adapter._owner_profile = "secondary"
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "s": {"type": "alias", "target": "/steer"},
+            },
+        }
+        runner._quick_commands_by_profile = {"secondary": {}}
+        adapter.gateway_runner = runner
+        event = _make_event("/s stay isolated")
+        sk = build_session_key(event.source, profile=adapter._owner_profile)
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(event)
+
+        assert adapter._pending_messages[sk].text == "/s stay isolated"
+        assert adapter.sent_responses == []
 
     @pytest.mark.asyncio
     async def test_help_bypasses_guard(self):

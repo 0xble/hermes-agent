@@ -229,6 +229,55 @@ async def test_active_session_bypass_commands_dispatch_without_interrupt(
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
 
 
+@pytest.mark.asyncio
+async def test_active_session_quick_alias_dispatches_to_steer_handler():
+    """Alias expansion must happen before the runner's active-session guard."""
+    runner = _make_runner()
+    runner.config.quick_commands = {
+        "s": {"type": "alias", "target": "/steer"},
+    }
+    event = _make_event(text="/s also check auth.log")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = True
+    runner._running_agents[session_key] = fake_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is not None and "Steer queued" in result
+    fake_agent.steer.assert_called_once_with("also check auth.log")
+    fake_agent.interrupt.assert_not_called()
+    assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_active_session_quick_alias_uses_routed_profile_snapshot():
+    runner = _make_runner()
+    runner.config.quick_commands = {
+        "s": {"type": "alias", "target": "/status"},
+    }
+    runner._quick_commands_by_profile = {
+        "secondary": {
+            "s": {"type": "alias", "target": "/steer"},
+        },
+    }
+    event = _make_event(text="/s keep the secondary profile")
+    event.source.profile = "secondary"
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    fake_agent.steer.return_value = True
+    runner._running_agents[session_key] = fake_agent
+
+    result = await runner._handle_message(event)
+
+    assert result is not None and "Steer queued" in result
+    fake_agent.steer.assert_called_once_with("keep the secondary profile")
+
+
 # ------------------------------------------------------------------
 # Test 6: /stop during sentinel force-cleans and unlocks session
 # ------------------------------------------------------------------
