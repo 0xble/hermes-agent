@@ -26,7 +26,7 @@ def test_cron_first_cwd_mutation_cannot_redirect_new_gateway_session(
     from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
     from gateway import run as gateway_run
     from gateway.config import Platform
-    from gateway.platforms.base import _default_docker_workspace_host_root
+    from gateway.platforms.base import _default_docker_workspace_host_roots
     from gateway.runtime_footer import format_runtime_footer
     from gateway.session import SessionContext, SessionSource
     from gateway.session_context import reset_session_vars
@@ -78,7 +78,7 @@ def test_cron_first_cwd_mutation_cannot_redirect_new_gateway_session(
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "true")
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
-        assert _default_docker_workspace_host_root() == gateway_cwd.resolve()
+        assert _default_docker_workspace_host_roots() == [gateway_cwd.resolve()]
         assert (
             format_runtime_footer(
                 model=None,
