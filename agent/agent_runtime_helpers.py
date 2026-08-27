@@ -47,7 +47,6 @@ from agent.credential_pool import (
     credential_pool_matches_provider,
     resolve_runtime_pool_key,
 )
-from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write

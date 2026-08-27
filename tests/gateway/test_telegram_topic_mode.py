@@ -868,7 +868,6 @@ async def test_first_auto_title_assigns_icon_when_creation_state_is_unknown(tmp_
             "sess-topic",
             "ProjectAtlas",
             user_message="Improve the ProjectAtlas planning flow",
-            preferred_aux_route={"provider": "gemini", "model": "gemini-3.7-flash"},
         )
 
     choose.assert_called_once_with(
@@ -876,7 +875,6 @@ async def test_first_auto_title_assigns_icon_when_creation_state_is_unknown(tmp_
         "Improve the ProjectAtlas planning flow",
         ["📊", "🚀"],
         recent_emojis=[],
-        preferred_route={"provider": "gemini", "model": "gemini-3.7-flash"},
     )
     adapter.rename_dm_topic.assert_awaited_once_with(
         chat_id="208214988",

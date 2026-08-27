@@ -5724,13 +5724,12 @@ class TurnRunner:
                             # pinned at "Retry in 7000+ seconds". Instead,
                             # drop this tick's update, leave the progress
                             # message and ``progress_lines`` intact, and
-                            # let the next tick try the edit again once the
-                            # per-chat send cooldown (added in
-                            # ``plugins/platforms/telegram/adapter.py``)
-                            # releases the chat. The user will see a
-                            # short stale-bubble window; that's strictly
-                            # better than escalating the Telegram penalty
-                            # by minutes.
+                            # let the next tick try the edit again after the
+                            # shared per-chat edit-clock interval (edits are
+                            # outside the adapter's send cooldown contract).
+                            # The user will see a short stale-bubble window;
+                            # that's strictly better than escalating the
+                            # Telegram penalty by minutes.
                             logger.info(
                                 "[%s] Progress edit flood control — skipping "
                                 "fallback send (would re-trigger penalty); "
@@ -21549,15 +21548,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # activity themselves. Otherwise periodic Kanban/process
             # notifications keep the stable routing key alive across every
             # daily/idle boundary.
-            try:
-                session_entry = await self.async_session_store.get_or_create_session(
-                    source,
-                    touch_activity=not bool(getattr(event, "internal", False)),
-                )
-            except TypeError as exc:
-                if "touch_activity" not in str(exc):
-                    raise
-                session_entry = await self.async_session_store.get_or_create_session(source)
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
         session_key = session_entry.session_key
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(
@@ -26346,7 +26340,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         title: str,
         user_message: str,
-        preferred_aux_route: Optional[dict[str, str]] = None,
     ) -> Optional[str]:
         """Serialize icon selection per chat so recent-history rotation is race-free."""
         history_key = str(source.chat_id)
@@ -26383,19 +26376,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             async with entry["lock"]:
-                if preferred_aux_route is None:
-                    return await self._select_telegram_topic_icon_id_unlocked(
-                        adapter,
-                        source,
-                        title,
-                        user_message,
-                    )
                 return await self._select_telegram_topic_icon_id_unlocked(
                     adapter,
                     source,
                     title,
                     user_message,
-                    preferred_aux_route=preferred_aux_route,
                 )
         finally:
             entry["users"] = max(0, int(entry.get("users", 1)) - 1)
@@ -26527,7 +26512,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         title: str,
         user_message: str,
-        preferred_aux_route: Optional[dict[str, str]] = None,
     ) -> Optional[str]:
         """Resolve an allowed full-size topic icon when the operator opts in."""
         extra = self._telegram_topic_extra(source, adapter)
@@ -26659,8 +26643,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.title_generator import choose_topic_icon
 
             choose_kwargs: dict[str, Any] = {"recent_emojis": recent_icons}
-            if preferred_aux_route:
-                choose_kwargs["preferred_route"] = preferred_aux_route
             icon_instructions = str(extra.get("topic_icon_instructions") or "").strip()
             if icon_instructions:
                 choose_kwargs["instructions"] = icon_instructions
@@ -26734,7 +26716,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         title: str,
         user_message: str = "",
-        preferred_aux_route: Optional[dict[str, str]] = None,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
@@ -26825,7 +26806,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source,
             topic_name,
             user_message,
-            preferred_aux_route=preferred_aux_route,
         )
         if session_db is not None:
             try:
