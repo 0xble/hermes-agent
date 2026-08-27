@@ -1159,26 +1159,73 @@ async def _send_via_adapter(
             if not metadata:
                 metadata = None
 
+            _LIVE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
             async def _send_live():
-                # Media descriptors route through the adapter's native media
-                # APIs.  Those helpers await adapter methods bound to the
-                # gateway loop as well, so they ride the same owner-loop
-                # dispatch below instead of scheduling themselves separately.
-                if media_files:
-                    return await _send_live_adapter_media(
-                        adapter,
-                        chat_id,
-                        chunk,
-                        media_files,
-                        thread_id=thread_id,
-                        metadata=metadata,
-                        force_document=force_document,
-                    )
-                return await adapter.send(
+                """Send text, then route extracted MEDIA attachments natively.
+
+                The trusted-profile path bypasses every standalone media
+                branch, so the live adapter must deliver the attachments
+                itself; dropping them here while returning success would let
+                the outbound ledger record a verified send that never
+                delivered the media.
+                """
+                from pathlib import Path as _Path
+                from urllib.parse import quote as _quote
+
+                from gateway.platforms.base import should_send_media_as_audio
+
+                send_result = await adapter.send(
                     chat_id=chat_id,
                     content=chunk,
                     metadata=metadata,
                 )
+                outcome = {"send": send_result, "media_delivered": 0, "media_error": None}
+                if not getattr(send_result, "success", False) or not media_files:
+                    return outcome
+
+                image_paths = []
+                other_media = []
+                for media_path, is_voice in media_files:
+                    ext = _Path(media_path).suffix.lower()
+                    if ext in _LIVE_IMAGE_EXTS and not is_voice and not force_document:
+                        image_paths.append(media_path)
+                    else:
+                        other_media.append((media_path, is_voice, ext))
+
+                if image_paths:
+                    images_result = await adapter.send_multiple_images(
+                        chat_id=chat_id,
+                        images=[(f"file://{_quote(p)}", "") for p in image_paths],
+                        metadata=metadata,
+                    )
+                    if not getattr(images_result, "success", False):
+                        outcome["media_error"] = (
+                            getattr(images_result, "error", None) or "image delivery failed"
+                        )
+                        return outcome
+                    outcome["media_delivered"] += len(image_paths)
+                for media_path, is_voice, ext in other_media:
+                    if should_send_media_as_audio(platform, ext, is_voice=is_voice):
+                        media_result = await adapter.send_voice(
+                            chat_id=chat_id,
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    else:
+                        media_result = await adapter.send_document(
+                            chat_id=chat_id,
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+                    if not getattr(media_result, "success", False):
+                        outcome["media_error"] = (
+                            getattr(media_result, "error", None)
+                            or f"media delivery failed for {media_path}"
+                        )
+                        return outcome
+                    outcome["media_delivered"] += 1
+                return outcome
 
             try:
                 current_loop = asyncio.get_running_loop()
@@ -1269,12 +1316,25 @@ async def _send_via_adapter(
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {_bounded_send_error(e)}"}
-            # _send_live_adapter_media already returns a tool-shaped result.
-            if isinstance(result, dict):
-                return result
-            if result.success:
-                return {"success": True, "message_id": result.message_id}
-            return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
+            send_result = result["send"]
+            if not getattr(send_result, "success", False):
+                return {"error": f"Adapter send failed: {_bounded_send_error(send_result.error)}"}
+            if result["media_error"]:
+                # The text already reached the platform, so this stays an
+                # ambiguous (non-pre_send) failure that names the partial
+                # delivery instead of reporting a verified success.
+                return {
+                    "error": (
+                        "Adapter delivered text but media attachment delivery "
+                        f"failed: {result['media_error']}"
+                    ),
+                    "message_id": send_result.message_id,
+                    "media_delivered": result["media_delivered"],
+                }
+            payload = {"success": True, "message_id": send_result.message_id}
+            if media_files:
+                payload["media_delivered"] = result["media_delivered"]
+            return payload
 
     if runner is None and str(profile or "").strip():
         return {

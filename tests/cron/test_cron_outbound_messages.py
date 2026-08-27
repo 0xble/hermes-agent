@@ -611,3 +611,137 @@ class TestSendGate:
         default = create_job(prompt="other", schedule="every 15m")
         assert default["allow_messaging"] is False
         assert not is_cron_messaging_session()
+
+
+class TestLiveAdapterMedia:
+    """Profile-bound live-adapter sends must deliver MEDIA attachments.
+
+    The trusted-profile path short-circuits every standalone media branch, so
+    the live adapter itself must route extracted attachments through its
+    native typed senders instead of silently dropping them while the ledger
+    records a verified success.
+    """
+
+    def _send(self, monkeypatch, adapter, **kwargs):
+        from gateway.config import Platform
+
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: adapter},
+            _profile_adapters={},
+            _active_profile_name=lambda: "default",
+            _gateway_loop=None,
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        async def _run():
+            # Bind the owner loop to the test loop so the direct-await
+            # path (gateway_loop is current_loop) exercises media routing.
+            runner._gateway_loop = asyncio.get_running_loop()
+            return await _send_via_adapter(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                kwargs.pop("message"),
+                profile="default",
+                **kwargs,
+            )
+
+        return asyncio.run(_run())
+
+    def test_live_adapter_delivers_media_attachments(self, monkeypatch):
+        from gateway.config import Platform
+
+        calls = []
+
+        class MediaAdapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                calls.append(("send", chat_id, content))
+                return SimpleNamespace(success=True, message_id="m-1", error=None)
+
+            async def send_multiple_images(self, *, chat_id, images, metadata=None):
+                calls.append(("images", chat_id, tuple(images)))
+                return SimpleNamespace(success=True, message_id="m-2", error=None)
+
+            async def send_voice(self, *, chat_id, audio_path, metadata=None):
+                calls.append(("voice", chat_id, audio_path))
+                return SimpleNamespace(success=True, message_id="m-3", error=None)
+
+            async def send_document(self, *, chat_id, file_path, metadata=None):
+                calls.append(("document", chat_id, file_path))
+                return SimpleNamespace(success=True, message_id="m-4", error=None)
+
+        adapter = MediaAdapter()
+        result = self._send(
+            monkeypatch,
+            adapter,
+            message="report attached",
+            media_files=[
+                ("/tmp/chart.png", False),
+                ("/tmp/report.pdf", False),
+                ("/tmp/note.ogg", True),
+            ],
+        )
+
+        assert result["success"] is True
+        assert result["message_id"] == "m-1"
+        assert result["media_delivered"] == 3
+        kinds = [c[0] for c in calls]
+        assert kinds == ["send", "images", "document", "voice"]
+        assert calls[1][2] == (("file:///tmp/chart.png", ""),)
+        assert calls[2][2] == "/tmp/report.pdf"
+        assert calls[3][2] == "/tmp/note.ogg"
+
+    def test_live_adapter_media_failure_is_reported_not_silent(self, monkeypatch):
+        from gateway.config import Platform
+
+        class FailingMediaAdapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                return SimpleNamespace(success=True, message_id="m-1", error=None)
+
+            async def send_document(self, *, chat_id, file_path, metadata=None):
+                return SimpleNamespace(
+                    success=False, message_id=None, error="document upload rejected"
+                )
+
+        adapter = FailingMediaAdapter()
+        result = self._send(
+            monkeypatch,
+            adapter,
+            message="report attached",
+            media_files=[("/tmp/report.pdf", False)],
+        )
+
+        assert "error" in result
+        assert "media" in result["error"]
+        assert "document upload rejected" in result["error"]
+        # Text already reached the platform: the failure must stay ambiguous
+        # (no pre_send marker) and surface what was delivered.
+        assert result.get("delivery_stage") != "pre_send"
+        assert result["message_id"] == "m-1"
+        assert result["media_delivered"] == 0
+
+    def test_live_adapter_force_document_routes_images_as_documents(self, monkeypatch):
+        from gateway.config import Platform
+
+        calls = []
+
+        class DocAdapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                return SimpleNamespace(success=True, message_id="m-1", error=None)
+
+            async def send_document(self, *, chat_id, file_path, metadata=None):
+                calls.append(("document", file_path))
+                return SimpleNamespace(success=True, message_id="m-2", error=None)
+
+        adapter = DocAdapter()
+        result = self._send(
+            monkeypatch,
+            adapter,
+            message="lossless attached",
+            media_files=[("/tmp/diagram.png", False)],
+            force_document=True,
+        )
+
+        assert result["success"] is True
+        assert result["media_delivered"] == 1
+        assert calls == [("document", "/tmp/diagram.png")]
