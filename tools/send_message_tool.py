@@ -18,6 +18,8 @@ from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
+_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS = 60.0
+
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 # Slack conversation IDs: C (public channel), G (private/group channel), D (DM).
@@ -1149,88 +1151,127 @@ async def _send_via_adapter(
                 }
             adapter = None
         if adapter is not None:
-            try:
-                metadata = {}
-                if thread_id:
-                    metadata["thread_id"] = thread_id
-                if platform_name == "ntfy" and chat_id:
-                    metadata["publish_topic"] = chat_id
-                if not metadata:
-                    metadata = None
-                # The adapter's send() uses asyncio.Queue + worker tasks bound
-                # to the gateway's main event loop.  Calling send() from a
-                # different thread/loop (the agent's tool worker thread) causes
-                # a cross-loop Future deadlock: the worker loop's selector never
-                # gets woken when the gateway loop resolves the future.
-                # When on a different loop, dispatch onto the gateway loop via
-                # run_coroutine_threadsafe and await the wrapped future.
-                gateway_loop = getattr(runner, "_gateway_loop", None)
-                try:
-                    _current_loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    _current_loop = None
+            metadata = {}
+            if thread_id:
+                metadata["thread_id"] = thread_id
+            if platform_name == "ntfy" and chat_id:
+                metadata["publish_topic"] = chat_id
+            if not metadata:
+                metadata = None
 
-                _need_cross_loop = (
-                    gateway_loop is not None
-                    and _current_loop is not gateway_loop
+            async def _send_live():
+                # Media descriptors route through the adapter's native media
+                # APIs.  Those helpers await adapter methods bound to the
+                # gateway loop as well, so they ride the same owner-loop
+                # dispatch below instead of scheduling themselves separately.
+                if media_files:
+                    return await _send_live_adapter_media(
+                        adapter,
+                        chat_id,
+                        chunk,
+                        media_files,
+                        thread_id=thread_id,
+                        metadata=metadata,
+                        force_document=force_document,
+                    )
+                return await adapter.send(
+                    chat_id=chat_id,
+                    content=chunk,
+                    metadata=metadata,
                 )
 
-                # Media descriptors route through the adapter's native media
-                # APIs (same cross-loop rules apply — the media helper awaits
-                # adapter methods bound to the gateway loop).
-                if media_files:
-                    def _media_coro():
-                        return _send_live_adapter_media(
-                            adapter,
-                            chat_id,
-                            chunk,
-                            media_files,
-                            thread_id=thread_id,
-                            metadata=metadata,
-                            force_document=force_document,
-                        )
-                    if _need_cross_loop:
-                        if not gateway_loop.is_running():
-                            return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
-                        from agent.async_utils import safe_schedule_threadsafe
-                        media_fut = safe_schedule_threadsafe(
-                            _media_coro(),
-                            gateway_loop,
-                            logger=logger,
-                            log_message="send_message: failed to schedule media send on gateway loop",
-                        )
-                        if media_fut is None:
-                            return {"error": "Gateway loop unavailable for send dispatch"}
-                        return await asyncio.shield(asyncio.wrap_future(media_fut))
-                    return await _media_coro()
-
-                if _need_cross_loop:
-                    if not gateway_loop.is_running():
-                        return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
-                    from agent.async_utils import safe_schedule_threadsafe
-                    fut = safe_schedule_threadsafe(
-                        adapter.send(chat_id=chat_id, content=chunk, metadata=metadata),
-                        gateway_loop,
-                        logger=logger,
-                        log_message="send_message: failed to schedule on gateway loop",
-                    )
-                    if fut is None:
-                        return {"error": "Gateway loop unavailable for send dispatch"}
-                    # Use shield so that if the caller's task is cancelled (e.g.
-                    # agent interrupt), the already-enqueued send on the gateway
-                    # loop is NOT cancelled — preventing "tool failed but message
-                    # still sent later" followed by agent retry causing duplicates.
-                    # No explicit timeout here: the adapter's internal request
-                    # timeout (15s) and the upper-layer _run_async 300s timeout
-                    # provide sufficient protection against hangs.
-                    result = await asyncio.shield(asyncio.wrap_future(fut))
+            try:
+                current_loop = asyncio.get_running_loop()
+                gateway_loop = getattr(runner, "_gateway_loop", None)
+                if gateway_loop is None:
+                    if str(profile or "").strip():
+                        return {
+                            "error": "Live gateway adapter owner loop is unavailable",
+                            "delivery_stage": "pre_send",
+                        }
+                    result = await _send_live()
+                elif gateway_loop is current_loop:
+                    result = await _send_live()
+                elif gateway_loop.is_closed() or not gateway_loop.is_running():
+                    return {
+                        "error": "Live gateway adapter owner loop is not running",
+                        "delivery_stage": "pre_send",
+                    }
                 else:
-                    # Same loop or no gateway loop (CLI, tests) — direct await.
-                    result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                    from concurrent.futures import Future, InvalidStateError
+
+                    bridge: Future = Future()
+                    task_holder = {}
+
+                    def _complete(task):
+                        if bridge.done():
+                            return
+                        try:
+                            result = task.result()
+                        except asyncio.CancelledError:
+                            bridge.cancel()
+                            return
+                        except BaseException as exc:
+                            try:
+                                bridge.set_exception(exc)
+                            except InvalidStateError:
+                                pass
+                            return
+                        try:
+                            bridge.set_result(result)
+                        except InvalidStateError:
+                            pass
+
+                    def _start_on_gateway_loop():
+                        if bridge.cancelled():
+                            return
+                        task = gateway_loop.create_task(_send_live())
+                        task_holder["task"] = task
+                        if bridge.cancelled():
+                            task.cancel()
+                            return
+                        task.add_done_callback(_complete)
+
+                    try:
+                        gateway_loop.call_soon_threadsafe(_start_on_gateway_loop)
+                    except Exception:
+                        bridge.cancel()
+                        return {
+                            "error": "Live gateway adapter send could not be scheduled",
+                            "delivery_stage": "pre_send",
+                        }
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(asyncio.wrap_future(bridge)),
+                            timeout=_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        bridge.cancel()
+                        task = task_holder.get("task")
+                        if task is not None and not task.done():
+                            try:
+                                gateway_loop.call_soon_threadsafe(task.cancel)
+                            except Exception:
+                                pass
+                        return {
+                            "error": "Live gateway adapter send timed out after dispatch; delivery is ambiguous",
+                        }
+                    except asyncio.CancelledError:
+                        bridge.cancel()
+                        task = task_holder.get("task")
+                        if task is not None and not task.done():
+                            try:
+                                gateway_loop.call_soon_threadsafe(task.cancel)
+                            except Exception:
+                                pass
+                        raise
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {_bounded_send_error(e)}"}
+            # _send_live_adapter_media already returns a tool-shaped result.
+            if isinstance(result, dict):
+                return result
             if result.success:
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
