@@ -103,6 +103,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(gateway): restore string-form disabled_toolsets parsing` | Patch-neutral restoration of upstream commit `309cf2c5e2`'s `parse_config_string_list` hunks clobbered by fork replay. |
 | `docs(maintenance): reconcile stale patch records` | Maintenance-only reconciliation of already-registered patch records and exemptions; no shipped Hermes behavior. |
 | `chore(fork): remove dead reconciliation residue` | Removal of dead code left by retired paths and rebase replay (response-aware title route plumbing, retired HERMES-043 snapshot, obsolete compatibility shims, unused helpers, duplicate import, stale docstrings/comments); no behavioral change. |
+| `test(cron): stabilize claim heartbeat grace` | Test-only heartbeat timing tolerance for HERMES-057 under loaded CI hosts; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
