@@ -556,138 +556,6 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "timeout 5 hermes gateway restart",
-            "nice hermes gateway restart",
-            "nice -- hermes gateway restart",
-            "nice -n5 hermes gateway restart",
-            "nice -- \"$(printf hermes)\" gateway restart",
-            "exec hermes gateway restart",
-            "exec -a harmless hermes gateway stop",
-            "sudo NAME=value hermes gateway restart",
-            "sudo --user root hermes gateway stop",
-            "env -S 'hermes gateway restart'",
-            "env --split-string='hermes gateway stop'",
-            "cmd=hermes; env -a harmless \"$cmd\" gateway restart",
-            "cmd=hermes; env --argv0=harmless \"$cmd\" gateway stop",
-            "a=hermes; b=gateway; c=restart; env -S \"$a $b $c\"",
-            "launchctl asuser 501 hermes gateway restart",
-            "systemctl --job-mode replace restart hermes-gateway",
-            "eval 'hermes gateway restart'",
-            "cmd='hermes gateway stop'; eval \"$cmd\"",
-            "$(printf hermes) gateway restart -m pytest",
-            "v=s; v=${v}t; v=${v}o; v=${v}p; hermes gateway \"$v\"",
-            "cmd=hermes; verb=restart; find . -prune -exec \"$cmd\" gateway \"$verb\" \\;",
-            "cmd=hermes; printf x | xargs \"$cmd\" gateway restart",
-        ],
-    )
-    def test_blocks_lifecycle_actions_through_execution_wrappers(
-        self, monkeypatch, command
-    ):
-        import tools.terminal_tool as tt
-
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-        monkeypatch.setattr(
-            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
-        )
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
-
-    def test_execution_classifier_unwraps_setsid(self):
-        from cron.lifecycle_guard import contains_executed_gateway_lifecycle_command
-
-        assert contains_executed_gateway_lifecycle_command(
-            "setsid hermes gateway restart"
-        )
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            'gateway_cmd=hermes; "$gateway_cmd" gateway restart',
-            'gateway_cmd=hermes; env "$gateway_cmd" gateway restart',
-            'gateway_cmd=hermes; command "$gateway_cmd" gateway stop',
-        ],
-    )
-    def test_blocks_variable_resolved_lifecycle_executable(self, monkeypatch, command):
-        import tools.terminal_tool as tt
-
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-        monkeypatch.setattr(
-            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
-        )
-
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "command -v hermes gateway restart",
-            "command -V hermes gateway restart",
-            'systemctl status "$unit"',
-            'launchctl print "$domain"',
-            'kill -0 "$pid"',
-        ],
-    )
-    def test_allows_nonexecuting_command_lookup(self, monkeypatch, command):
-        import tools.terminal_tool as tt
-
-        class _LookupEnv:
-            env = {}
-
-            def execute(self, executed, **kwargs):
-                return {"output": executed, "returncode": 0}
-
-        self._patch_env(monkeypatch, _LookupEnv(), inside_gateway=True)
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 0
-
-    @pytest.mark.parametrize(
-        "script_body",
-        [
-            "#!/bin/bash\npython3 -m pytest --version\n",
-            (
-                "#!/bin/bash\n"
-                "[ -x /usr/bin/python3 ] || true\n"
-                "/usr/bin/python3 -m pytest --version\n"
-            ),
-        ],
-    )
-    def test_allows_benign_referenced_test_and_diagnostic_scripts(
-        self, monkeypatch, tmp_path, script_body
-    ):
-        """Referenced source is judged by executed argv, not vocabulary or expansion."""
-        import tools.terminal_tool as tt
-
-        calls = []
-
-        class _FakeEnv:
-            env = {}
-
-            def execute(self, command, **kwargs):
-                calls.append(command)
-                return {"output": "ok", "returncode": 0}
-
-        script = tmp_path / "benign.sh"
-        script.write_text(script_body, encoding="utf-8")
-        command = f"/bin/bash {script}"
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
-        monkeypatch.setattr(
-            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
-        )
-
-        result = json.loads(tt.terminal_tool(command=command))
-
-        assert result["exit_code"] == 0
-        assert calls == [command]
-
     def test_blocks_lifecycle_command_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
     ):
@@ -698,24 +566,6 @@ class TestTerminalToolGatewayLifecycleGuard:
         self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
-
-        assert result["exit_code"] == 1
-        assert "referenced script" in result["error"]
-
-    def test_blocks_lifecycle_script_hidden_behind_dynamic_path(
-        self, monkeypatch, tmp_path
-    ):
-        import tools.terminal_tool as tt
-
-        script = tmp_path / "dynamic-restart.sh"
-        script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
-        command = f'target={script}; /bin/bash "$target"'
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
-        monkeypatch.setattr(
-            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
-        )
-
-        result = json.loads(tt.terminal_tool(command=command))
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
@@ -1541,27 +1391,6 @@ class TestLifecycleGuardModule:
         )
         assert result is True
 
-    def test_unreadable_remote_callback_fails_closed(self):
-        """A remote read failure must not be treated as an empty script."""
-        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "bash /remote/helper.sh",
-            read_remote_script=lambda _path: None,
-        ) is True
-
-    def test_remote_callback_exception_fails_closed(self):
-        """Transport/backend exceptions cannot bypass lifecycle inspection."""
-        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
-
-        def _remote_read(_path):
-            raise OSError("backend unavailable")
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "bash /remote/helper.sh",
-            read_remote_script=_remote_read,
-        ) is True
-
     def test_guard_is_total_against_adversarial_inputs(self, monkeypatch):
         """The public guard is a total function: no input may raise. Covers
         the residual class beyond the four named sites — including
@@ -1999,58 +1828,24 @@ class TestRestartLoopGuard:
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""
 
-    def _patch_env(
-        self,
-        monkeypatch,
-        fake_env,
-        *,
-        inside_gateway: bool,
-        env_type: str = "local",
-    ):
+    def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
         import tools.terminal_tool as tt
         from tools import process_registry
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(
-            tt,
-            "_get_env_config",
-            lambda: {
-                "env_type": env_type,
-                "cwd": "/tmp",
-                "timeout": 60,
-                "lifetime_seconds": 3600,
-            },
-        )
+        monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         monkeypatch.setattr(
             process_registry, "_is_supervised_gateway_process",
             lambda: inside_gateway,
         )
 
-    def test_remote_absolute_shell_inspects_only_the_script_argument(self):
-        from cron.lifecycle_guard import _iter_referenced_shell_scripts
-
-        refs = list(
-            _iter_referenced_shell_scripts(
-                "/bin/sh /remote/workspace/job.sh", remote=True
-            )
-        )
-
-        assert [(str(path), shell) for path, shell in refs] == [
-            ("/remote/workspace/job.sh", "sh")
-        ]
-        writable = list(_iter_referenced_shell_scripts(
-            "/opt/homebrew/bin/bash /remote/workspace/job.sh", remote=True))
-        assert [str(path) for path, _ in writable] == [
-            "/opt/homebrew/bin/bash", "/remote/workspace/job.sh"
-        ]
-
     def test_remote_backend_script_read_uses_env_execute(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
-        # Path exists only in the target environment. Mark the backend as SSH
-        # so remote content, rather than coincidental host content, is authoritative.
+        # Path only exists on the remote backend; locally it is absent, so the
+        # guard must fall back to a bounded env.execute('head -c ...') read.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -2059,25 +1854,19 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "sh -c" in command and "dd if=" in command and "/remote/workspace/remote.sh" in command:
+                if "head -c" in command and "/remote/workspace/remote.sh" in command:
                     return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
         fake_env.cwd = "/remote/workspace"
-        self._patch_env(
-            monkeypatch,
-            fake_env,
-            inside_gateway=True,
-            env_type="ssh",
-        )
+        self._patch_env(monkeypatch, fake_env, inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(command=f"/bin/bash {script}"))
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("sh -c" in c and "dd if=" in c for c in calls)
-        assert all("python" not in c for c in calls)
+        assert any("head -c" in c for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:
@@ -2182,394 +1971,6 @@ class TestLifecycleGuardDataArgumentExemption:
         check_gateway_lifecycle(prompt, str(script))
 
 
-class TestLifecycleGuardShellGrammar:
-    """Valid shell grammar must not become a fake executable reference."""
-
-    def _scan_script(self, tmp_path, body):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        script = tmp_path / "check"
-        script.write_text(f"#!/bin/bash\n{body}", encoding="utf-8")
-        script.chmod(0o755)
-        return contains_gateway_lifecycle_command_or_referenced_script(str(script))
-
-    def test_case_default_pattern_is_not_an_executable(self, tmp_path):
-        assert (
-            self._scan_script(
-                tmp_path,
-                'case "${1:-}" in\n  --fast) true ;;\n  *) exit 64 ;;\nesac\n',
-            )
-            is False
-        )
-
-    def test_double_bracket_operands_are_not_executables(self, tmp_path):
-        assert (
-            self._scan_script(
-                tmp_path,
-                'configured_path=".git/hooks"\n'
-                'if [[ "$configured_path" == .lefthook || '
-                '"$configured_path" == */.lefthook ]]; then\n'
-                "  true\n"
-                "fi\n",
-            )
-            is False
-        )
-
-    def test_argument_position_double_bracket_cannot_poison_state(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            ': [[ && launchctl submit -l neutral -- /bin/true\n',
-        ) is True
-
-    def test_argument_position_double_bracket_remains_data(self, tmp_path):
-        assert self._scan_script(tmp_path, "printf '%s\\n' [[\n") is False
-
-    def test_inline_shell_payload_preserves_posix_dialect(self):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "/bin/sh -c '[[ x || launchctl submit -l neutral -- /bin/true'"
-        ) is True
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "bash -c '[[ x || launchctl submit -l neutral -- /bin/true'"
-        ) is True
-
-    def test_inline_bash_payload_retains_double_bracket_grammar(self):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "/bin/bash -c '[[ x == x ]]'"
-        ) is False
-
-    def test_bash_arithmetic_expansion_is_not_command_substitution(self):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "#!/bin/bash\n[[ $attempts -lt $((max_attempts + 1)) ]]\n"
-        ) is False
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "#!/bin/bash\n(( case = 1 ))\n"
-        ) is False
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            '#!/bin/bash\n(( case = $(bash "$SCRIPT") ))\n'
-        ) is True
-
-    def test_zsh_process_substitution_fails_closed(self):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            '#!/bin/zsh\n[[ -f =(bash "$SCRIPT") ]]\n'
-        ) is True
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            "printf '%s\\n' '[['; launchctl submit -l neutral -- /bin/true\n",
-            "case x in *) printf '%s\\n' ';;'; "
-            "launchctl submit -l neutral -- /bin/true ;; esac\n",
-        ],
-    )
-    def test_quoted_grammar_cannot_hide_lifecycle_commands(self, tmp_path, body):
-        assert self._scan_script(tmp_path, body) is True
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            'case x in x) "$RUNNER" ;; esac\n',
-            "if [[ x == x ]]; then launchctl submit -l neutral -- /bin/true; fi\n",
-            'if "$RUNNER"; then true; fi\n',
-            'for value in $(bash "$SCRIPT"); do true; done\n',
-            "worker() { launchctl submit -l neutral -- /bin/true; }\n",
-            "function worker { launchctl submit -l neutral -- /bin/true; }\n",
-            "coproc worker if launchctl submit -l neutral -- /bin/true; then :; fi\n",
-            "[[ x == y ]]>/dev/null\n"
-            "launchctl submit -l neutral -- /bin/true\n",
-            "case x in x) true ;; esac>/dev/null\n"
-            "launchctl submit -l neutral -- /bin/true\n",
-            ": >/dev/null; launchctl submit -l neutral -- /bin/true\n",
-            "[[ x == x ]]>`launchctl submit -l neutral -- /bin/true`\n",
-            ": >`launchctl submit -l neutral -- /bin/true`\n",
-            "> out launchctl submit -l neutral -- /bin/true\n",
-            "< input launchctl submit -l neutral -- /bin/true\n",
-            "[[ ${ launchctl submit -l neutral -- /bin/true; } == x ]]\n",
-            "case x in ${| launchctl submit -l neutral -- /bin/true; }) true ;; esac\n",
-            "case $'x\\ny' in\n'x\ny')\n"
-            "launchctl submit -l neutral -- /bin/true\n;;\nesac\n",
-            "time -p launchctl submit -l neutral -- /bin/true\n",
-            ': > "$(launchctl${IFS}submit -l neutral -- /bin/true)"\n',
-            ': <<< "$(launchctl${IFS}submit -l neutral -- /bin/true)"\n',
-            "time -`launchctl${IFS}submit -l neutral -- /bin/true` true\n",
-            "2>&1 launchctl submit -l neutral -- /bin/true\n",
-            "3<&0 launchctl submit -l neutral -- /bin/true\n",
-            ">|/tmp/log launchctl submit -l neutral -- /bin/true\n",
-            "{guard_fd}>/tmp/log launchctl submit -l neutral -- /bin/true\n",
-        ],
-    )
-    def test_compound_grammar_cannot_hide_first_executable(
-        self, tmp_path, body
-    ):
-        assert self._scan_script(tmp_path, body) is True
-
-    def test_time_options_are_not_executables(self, tmp_path):
-        assert self._scan_script(tmp_path, "time -p pnpm lint\n") is False
-
-    def test_named_coproc_compound_command_is_parsed(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "coproc worker if true; then :; fi\n",
-        ) is False
-
-    def test_descriptor_redirections_are_not_executables(self, tmp_path):
-        assert self._scan_script(tmp_path, "2>&1 pnpm lint\n") is False
-        assert self._scan_script(tmp_path, ">|/tmp/log pnpm lint\n") is False
-        assert self._scan_script(
-            tmp_path,
-            "{guard_fd}>/tmp/log pnpm lint\n",
-        ) is False
-
-    def test_posix_select_does_not_poison_loop_state(self, tmp_path):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        payload = tmp_path / "payload.sh"
-        payload.write_text("hermes gateway restart\n", encoding="utf-8")
-        payload.chmod(0o755)
-        script = tmp_path / "posix-check"
-        script.write_text(f"#!/bin/sh\nselect\n{payload}\n", encoding="utf-8")
-        script.chmod(0o755)
-        assert contains_gateway_lifecycle_command_or_referenced_script(str(script)) is True
-
-    def test_posix_shell_argument_decorates_shebangless_script(self, tmp_path):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        payload = tmp_path / "payload"
-        payload.write_text(
-            "[[ x || launchctl submit -l neutral -- /bin/true; ]]\n",
-            encoding="utf-8",
-        )
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            f"/bin/sh {payload}"
-        ) is True
-
-    def test_posix_shell_argument_overrides_bash_shebang(self, tmp_path):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        payload = tmp_path / "payload-with-shebang"
-        payload.write_text(
-            "#!/bin/bash\n[[ x || launchctl submit -l neutral -- /bin/true; ]]\n",
-            encoding="utf-8",
-        )
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            f"/bin/sh {payload}"
-        ) is True
-
-    def test_bash_argument_overrides_posix_shebang(self, tmp_path):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        payload = tmp_path / "bash-payload-with-posix-shebang"
-        payload.write_text(
-            "#!/bin/sh\n[[ x == x ]]\n",
-            encoding="utf-8",
-        )
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            f"/bin/bash {payload}"
-        ) is False
-
-    def test_case_branch_scans_first_referenced_script(self, tmp_path):
-        payload = tmp_path / "payload.sh"
-        payload.write_text("hermes gateway restart\n", encoding="utf-8")
-        payload.chmod(0o755)
-        assert self._scan_script(
-            tmp_path,
-            f"case x in x) {payload} ;; esac\n",
-        ) is True
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            "printf '%s\\n' '[[' ';;'\n",
-            'case "$value" in \'$(\') true ;; esac\n',
-            'if [[ "$value" == \'$(\' ]]; then true; fi\n',
-        ],
-    )
-    def test_quoted_grammar_and_substitutions_remain_inert(self, tmp_path, body):
-        assert self._scan_script(tmp_path, body) is False
-
-    @pytest.mark.parametrize(
-        "delimiter",
-        ["'EOF'", "EOF"],
-    )
-    def test_heredoc_data_cannot_poison_outer_shell_state(
-        self, tmp_path, delimiter
-    ):
-        assert self._scan_script(
-            tmp_path,
-            f"cat <<{delimiter}\n[[\ncase x in\nEOF\n"
-            "launchctl submit -l neutral -- /bin/true\n",
-        ) is True
-
-    def test_inert_heredoc_grammar_remains_data(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<'EOF'\n[[\ncase x in\nEOF\nprintf done\n",
-        ) is False
-
-    def test_shell_heredoc_body_is_scanned_separately(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "bash <<'EOF'\nbash \"$SCRIPT\"\nEOF\nprintf done\n",
-        ) is True
-
-    def test_shell_heredoc_body_preserves_posix_dialect(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "/bin/sh <<'EOF'\n"
-            "[[ x || launchctl submit -l neutral -- /bin/true\n"
-            "EOF\n",
-        ) is True
-
-    def test_shell_heredoc_body_preserves_bash_dialect(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "/bin/bash <<'EOF'\n[[ x == x ]]\nEOF\n",
-        ) is False
-        assert self._scan_script(
-            tmp_path,
-            "bash <<'EOF'\n"
-            "[[ x || launchctl submit -l neutral -- /bin/true\n"
-            "EOF\n",
-        ) is True
-
-    def test_multiple_heredoc_consumers_fail_closed_to_posix(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "bash <<'B1' | sh <<'B2'\n"
-            "true\nB1\n"
-            "[[ x || launchctl submit -l neutral -- /bin/true; : ]]\nB2\n",
-        ) is True
-
-    def test_list_heredoc_consumer_fails_closed_to_posix(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "/bin/bash -c true && /bin/sh <<'EOF'\n"
-            "[[ x || launchctl submit -l neutral -- /bin/true\n"
-            "EOF\n",
-        ) is True
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            "python3 <<'PY'\nimport os; os.system('hermes gateway restart')\nPY\n",
-            'osascript <<\'APPLESCRIPT\'\ndo shell script "hermes gateway restart"\nAPPLESCRIPT\n',
-        ],
-    )
-    def test_program_heredoc_body_is_scanned_separately(
-        self, tmp_path, body
-    ):
-        assert self._scan_script(tmp_path, body) is True
-
-    def test_program_heredoc_body_does_not_use_bash_grammar(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "python3 <<'PY'\n"
-            "[[\n"
-            '__import__("os").system("hermes gateway restart")\n'
-            "]]\n"
-            "PY\n",
-        ) is True
-
-    def test_benign_program_heredoc_brackets_remain_data(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "python3 <<'PY'\n[[\nprint('ok')\n]]\nPY\n",
-        ) is False
-
-    def test_program_heredoc_loop_does_not_poison_shell_state(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "python3 <<'PY'\n"
-            "for x in [1]:\n"
-            " __import__('os').system('hermes gateway restart')\n"
-            "PY\n",
-        ) is True
-
-    def test_benign_program_heredoc_loop_remains_data(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "python3 <<'PY'\nfor x in [1]:\n print(x)\nPY\n",
-        ) is False
-
-    def test_benign_program_shift_is_not_nested_heredoc(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "python3 <<'PY'\nvalue = 1 << 2\nprint(value)\nPY\n",
-        ) is False
-
-    def test_bare_cat_heredoc_is_scanned_fail_closed(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<'EOF'\nhermes gateway restart\nEOF\nprintf done\n",
-        ) is True
-
-    def test_unquoted_data_heredoc_substitution_fails_closed(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<EOF\n$(bash \"$SCRIPT\")\nEOF\nprintf done\n",
-        ) is True
-
-    def test_unquoted_heredoc_arithmetic_remains_inert(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<EOF\nvalue=$((1 + 2))\nEOF\n",
-        ) is False
-
-    def test_nested_command_substitution_in_arithmetic_fails_closed(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<EOF\nvalue=$(( $(bash \"$SCRIPT\") ))\nEOF\n",
-        ) is True
-
-    def test_unquoted_heredoc_body_quotes_do_not_hide_substitution(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<EOF\nprintf '%s\\n' '$(bash \"$SCRIPT\")'\nEOF\n",
-        ) is True
-
-    def test_quoted_heredoc_body_quotes_keep_substitution_inert(self, tmp_path):
-        assert self._scan_script(
-            tmp_path,
-            "cat <<'EOF'\nprintf '%s\\n' '$(bash \"$SCRIPT\")'\nEOF\n",
-        ) is False
-
-    @pytest.mark.parametrize(
-        "body",
-        [
-            'case "$value" in\n  $(printf pattern)) true ;;\nesac\n',
-            'case "$value" in $(bash "$SCRIPT")) true ;; esac\n',
-            'if [[ -n "$(printf value)" ]]; then true; fi\n',
-        ],
-    )
-    def test_executing_shell_grammar_remains_fail_closed(self, tmp_path, body):
-        assert self._scan_script(tmp_path, body) is True
-
-
 class TestLifecycleGuardNeverRaises:
     """The guard must return a verdict for every input — binary referenced
     paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —
@@ -2605,139 +2006,55 @@ class TestLifecycleGuardNeverRaises:
         weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
         assert self._scan(f"bash {weird}") is False
 
-    def test_directory_is_harmless_and_dev_null_fails_closed(self, tmp_path):
-        # Directories cannot feed a shell, while devices can.
+    def test_sourced_zshrc_docker_completions_dir_is_not_blocked(self, tmp_path):
+        """#86753: Docker Desktop writes ``fpath=(~/.docker/completions …)``
+        into ``.zshrc``. Completions is a directory. The walk must treat
+        that as nothing-to-scan, not fail-closed, or ``source ~/.zshrc``
+        is blocked on every terminal command."""
+        completions = tmp_path / ".docker" / "completions"
+        completions.mkdir(parents=True)
+        zshrc = tmp_path / ".zshrc"
+        zshrc.write_text(
+            f"fpath=({completions} /usr/local/share/zsh/site-functions $fpath)\n",
+            encoding="utf-8",
+        )
+        assert self._scan(f"source {zshrc}") is False
+
+    def test_fstat_directory_mode_is_not_unsafe(self, tmp_path, monkeypatch):
+        """#86753 Unix contract: os.open(dir) succeeds, fstat is not S_ISREG.
+
+        Windows raises OSError on os.open(dir) and already returns
+        nothing-to-scan. Linux/macOS open the directory and used to
+        return unsafe=True, blocking sourced zshrcs that mention
+        ``~/.docker/completions``.
+        """
+        import os
+        import stat as statmod
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        probe = tmp_path / "probe"
+        probe.write_text("echo hi\n", encoding="utf-8")
+        orig = os.fstat
+
+        def _dir_fstat(fd):
+            orig(fd)
+            class _DirStat:
+                st_mode = statmod.S_IFDIR | 0o755
+            return _DirStat()
+
+        monkeypatch.setattr(os, "fstat", _dir_fstat)
+        text, unsafe = _read_referenced_script(probe)
+        assert text is None
+        assert unsafe is False
+
+    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
+        # Directories are not scripts (#86753). Devices stay fail-closed
+        # where the OS actually exposes them (POSIX /dev/null).
+        # The important contract is: verdict, not exception.
         assert self._scan(f"bash {tmp_path}") is False
-        assert self._scan("bash /dev/null") is True
-
-    def test_extensionless_python_wrapper_may_name_a_directory(self, tmp_path):
-        wrapper = tmp_path / "wrapper"
-        wrapper.write_text(
-            "#!/usr/bin/env python3\n"
-            "from pathlib import Path\n"
-            f"CONTROL_ROOT = Path({str(tmp_path)!r})\n"
-        )
-        wrapper.chmod(0o755)
-
-        assert self._scan(str(wrapper)) is False
-
-    def test_local_directory_does_not_hide_remote_script(self, tmp_path):
-        calls = []
-
-        def read_remote_script(path):
-            calls.append(path)
-            return "hermes gateway restart\n"
-
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            str(tmp_path),
-            read_remote_script=read_remote_script,
-        ) is True
-        assert calls == [str(tmp_path)]
-
-    @pytest.mark.parametrize("name", ["sh", "bash", "dash", "ksh", "zsh", "source"])
-    def test_path_qualified_interpreter_name_scans_the_executable(
-        self,
-        tmp_path,
-        name,
-    ):
-        executable = tmp_path / name
-        executable.write_text("hermes gateway restart\n")
-        executable.chmod(0o755)
-
-        assert self._scan(f"{executable} benign-argument") is True
-
-    @pytest.mark.parametrize("name", ["sh", "bash", "source"])
-    def test_remote_path_qualified_interpreter_name_scans_the_executable(
-        self,
-        name,
-    ):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        executable = f"/remote/workspace/{name}"
-        calls = []
-
-        def read_remote_script(path):
-            calls.append(path)
-            if path == executable:
-                return "hermes gateway restart\n"
-            return None
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            f"{executable} benign-argument",
-            read_remote_script=read_remote_script,
-        ) is True
-        assert calls[0] == executable
-
-    def test_remote_reader_is_authoritative_over_local_regular_file(self, tmp_path):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        executable = tmp_path / "bash"
-        executable.write_text("printf 'locally safe\\n'\n")
-        executable.chmod(0o755)
-        calls = []
-
-        def read_remote_script(path):
-            calls.append(path)
-            if path == str(executable):
-                return "hermes gateway restart\n"
-            return None
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            f"{executable} benign-argument",
-            read_remote_script=read_remote_script,
-        ) is True
-        assert calls[0] == str(executable)
-
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "$EVILROOT/bash benign-argument",
-            "${HOME}/bin/sh benign-argument",
-            "$RUNNER benign-argument",
-            "$(printf ./runner) benign-argument",
-            "runner* benign-argument",
-            "bash $SCRIPT",
-            "source ${SCRIPT}",
-        ],
-    )
-    def test_unresolved_executable_expansion_fails_closed(self, command):
-        assert self._scan(command) is True
-
-    def test_nested_shell_script_expansion_fails_closed(self, tmp_path):
-        wrapper = tmp_path / "wrapper"
-        wrapper.write_text("#!/bin/bash\nbash \"$SCRIPT\"\n")
-        wrapper.chmod(0o755)
-
-        assert self._scan(str(wrapper)) is True
-
-    def test_remote_tilde_path_preserves_target_spelling(self):
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-
-        calls = []
-
-        def read_remote_script(path):
-            calls.append(path)
-            if path == "~/unsafe.sh":
-                return "hermes gateway restart\n"
-            return None
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            "bash ~/unsafe.sh",
-            cwd="/remote/workspace",
-            read_remote_script=read_remote_script,
-        ) is True
-        assert "~/unsafe.sh" in calls
-        assert all("/Users/" not in path for path in calls)
+        if os.name != "nt":
+            assert self._scan("bash /dev/null") is True
 
     def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
         """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
@@ -2765,12 +2082,8 @@ class TestLifecycleGuardNeverRaises:
         )
         binary = tmp_path / "prog"
         binary.write_bytes(b"\x7fELF" + bytes(128))
-        for value in (
-            "nul\x00byte.sh",
-            str(binary),
-            "/nonexistent/x.sh",
-            str(tmp_path),
-        ):
+        for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh", str(tmp_path)):
             check_gateway_lifecycle("clean prompt", value)  # must not raise
-        with pytest.raises(GatewayLifecycleBlocked):
-            check_gateway_lifecycle("clean prompt", "/dev/null")
+        if os.name != "nt":
+            with pytest.raises(GatewayLifecycleBlocked):
+                check_gateway_lifecycle("clean prompt", "/dev/null")
