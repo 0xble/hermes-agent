@@ -138,15 +138,6 @@ def is_cron_messaging_session() -> bool:
     return get_session_env("HERMES_CRON_ALLOW_MESSAGING", "") == "1"
 
 
-def get_record(job_id: str, run_id: str, message_key: str) -> Optional[Dict[str, Any]]:
-    with _transaction() as conn:
-        row = conn.execute(
-            "SELECT * FROM outbound_messages WHERE job_id=? AND run_id=? AND message_key=?",
-            (job_id, run_id, message_key),
-        ).fetchone()
-    return dict(row) if row else None
-
-
 def claim_or_reuse(
     *, job_id: str, run_id: str, message_key: str, target: str, body: str,
     platform: str, chat_id: str, thread_id: Optional[str],
@@ -271,16 +262,6 @@ def mark_result(
     if not row:
         raise LookupError("outbound message record disappeared")
     return dict(row)
-
-
-def count_successful(job_id: str, run_id: str) -> int:
-    with _transaction() as conn:
-        row = conn.execute(
-            """SELECT COUNT(*) AS n FROM outbound_messages
-               WHERE job_id=? AND run_id=? AND status IN ('sent','verified')""",
-            (job_id, run_id),
-        ).fetchone()
-    return int(row["n"] if row else 0)
 
 
 def classify_send_result(result: Any) -> Dict[str, Any]:

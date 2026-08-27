@@ -2940,7 +2940,6 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                 except OSError:
                     pass
         try:
-            src_stat = db_path.stat()
             for existing in _existing_malformed_backups(db_path)[:1]:
                 marker = _bundle_marker(existing)
                 if not marker.is_file():

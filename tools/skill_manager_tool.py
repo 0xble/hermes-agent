@@ -489,8 +489,8 @@ def _background_review_create_allowed() -> bool:
     """Return whether autonomous review forks may create new skills.
 
     Updates to existing curator-managed skills remain independent of this
-    setting.  The default preserves historical behavior for installations
-    that have not opted into the narrower policy.
+    setting.  The default is ``False``: background review may update existing
+    skills but never autonomously creates new ones without an explicit opt-in.
     """
     try:
         from hermes_cli.config import load_config_readonly

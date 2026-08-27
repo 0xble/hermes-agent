@@ -1265,16 +1265,6 @@ def _try_dispatch_background_run(
         return None
 
     # ---- synchronous claim (same semantics as _execute_job_now) ----
-    try:
-        from cron.scheduler import get_running_job_ids
-        if job_id in get_running_job_ids():
-            return {
-                "claimed": False,
-                "success": False,
-                "error": "Job is already running (a scheduler tick or another manual run is executing it); not started again.",
-            }
-    except Exception:
-        pass
     claimed_job = None
     try:
         # Synchronously take the owner-bearing snapshot before dispatch.

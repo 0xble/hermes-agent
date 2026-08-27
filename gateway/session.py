@@ -3615,20 +3615,6 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(seconds=max_age_seconds)
-        # Snapshot candidates under the routing lock, then perform SessionDB
-        # reads outside it.  Compression can leave an entry keyed to a completed
-        # parent while the interrupted turn lives in its child, so resolve the
-        # durable tip before inspecting the transcript tail.
-        with self._lock:
-            self._ensure_loaded_locked()
-            candidates = [
-                (entry.session_key, entry.session_id)
-                for entry in self._entries.values()
-                if not entry.resume_pending
-                and not entry.suspended
-                and entry.updated_at >= cutoff
-            ]
-
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
