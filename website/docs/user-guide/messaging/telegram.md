@@ -807,7 +807,7 @@ Every topic gets its own conversation history, model state, tool execution, and 
 
 ### Auto-renamed topics
 
-When Hermes titles a session, the Telegram topic itself is renamed to match — e.g. "New Topic" becomes "Database migration plan". Internally, an instant derived title is stored first; the title model upgrades it in the background using both the opening request and the assistant response, and Telegram waits for that upgrade to avoid two remote renames. Completed turns title immediately. A turn that remains active for 20 seconds titles as soon as at least 20 visible assistant characters are available, even when that text arrives after the 20-second mark. By default titles use 3–7 words, favor an explicitly named project or proper name, and avoid filler such as "Fixing", "Update", or "Analysis".
+When Hermes titles a session, the Telegram topic itself is renamed to match — e.g. "New Topic" becomes "Database migration plan". Internally, an instant derived title is stored first; the title model upgrades it in the background from the user's opening message, and Telegram waits for that upgrade to avoid two remote renames. By default titles use 3–7 words, favor an explicitly named project or proper name, and avoid filler such as "Fixing", "Update", or "Analysis".
 
 The title policy is configurable for every Hermes surface:
 

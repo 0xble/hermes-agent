@@ -61,12 +61,10 @@ def test_real_agent_fence_still_supersedes_and_preserves_sole_writer():
     assert stream_writer_is_current(agent, second) is True
 
 
-def test_streamed_assistant_text_observer_receives_cumulative_visible_text():
+def test_streamed_assistant_text_accumulates_cumulative_visible_text():
     agent = _real_agent()
-    observed = []
-    agent.streamed_assistant_text_callback = observed.append
 
     agent._record_streamed_assistant_text("visible ")
     agent._record_streamed_assistant_text("response")
 
-    assert observed == ["visible ", "visible response"]
+    assert agent._current_streamed_assistant_text == "visible response"

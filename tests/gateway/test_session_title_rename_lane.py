@@ -14,7 +14,7 @@ import types
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner, TurnRunner, _InterimTopicTitleLatch
+from gateway.run import GatewayRunner, TurnRunner
 from gateway.session import SessionSource
 
 
@@ -45,8 +45,9 @@ def _attach(lane):
     return agent, renames
 
 
-def test_discord_rename_waits_for_the_model_title():
-    agent, renames = _attach("discord")
+@pytest.mark.parametrize("lane", ["telegram", "discord"])
+def test_the_rename_waits_for_the_model_title(lane):
+    agent, renames = _attach(lane)
     callback = agent._on_session_title
 
     callback("fix the flaky auth test in log", "derived")
@@ -104,40 +105,32 @@ async def test_native_thread_rename_passes_only_the_initial_name_guard():
     assert calls == [("999", "Semantic Session Title", "Initial words")]
 
 
-def test_telegram_topic_title_is_deferred_until_response():
-    agent, renames = _attach("telegram")
-
-    assert agent._defer_topic_title_until_response is True
-    assert not hasattr(agent, "_on_session_title")
-    assert renames == []
-
-
-@pytest.mark.asyncio
-async def test_telegram_topic_skips_placeholder_rename(monkeypatch):
-    runner = object.__new__(GatewayRunner)
-    runner._telegram_topic_last_scheduled_titles = {}
-    runner._is_telegram_topic_lane = lambda source: True
-    runner._telegram_topic_auto_rename_disabled = lambda source: False
-    runner._sanitize_telegram_topic_title = lambda title: title.strip()
-    runner._gateway_loop = None
-    scheduled = []
-
-    def capture(coro, loop, **kwargs):
-        coro.close()
-        scheduled.append(True)
-        return None
-
-    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        user_id="user-1",
-        chat_id="chat-1",
-        thread_id="thread-1",
+def test_telegram_callback_forwards_opening_message_to_icon_selector():
+    calls = []
+    source = types.SimpleNamespace(platform=Platform.TELEGRAM, chat_id="chat-1")
+    runner = types.SimpleNamespace(
+        _is_telegram_topic_lane=lambda src: True,
+        _is_discord_auto_thread_lane=lambda src: False,
+        _is_relay_discord_channel_lane=lambda src: False,
+        _schedule_telegram_topic_title_rename=(
+            lambda src, sid, title, **kwargs: calls.append((title, kwargs))
+        ),
+        _schedule_discord_semantic_thread_rename=lambda *args, **kwargs: None,
+    )
+    holder = types.SimpleNamespace(
+        _runner=runner,
+        _attach_session_title_callback=TurnRunner._attach_session_title_callback,
+    )
+    agent = types.SimpleNamespace(session_id="sess-1")
+    holder._attach_session_title_callback(
+        holder,
+        agent,
+        types.SimpleNamespace(source=source, message="Build a lunar calendar"),
     )
 
-    runner._schedule_telegram_topic_title_rename(source, "session-1", "User request:")
+    agent._on_session_title("Lunar calendar", "llm")
 
-    assert scheduled == []
+    assert calls == [("Lunar calendar", {"user_message": "Build a lunar calendar"})]
 
 
 @pytest.mark.asyncio
@@ -204,96 +197,3 @@ def test_telegram_topic_skips_rename_after_delivery_marks_topic_stale(monkeypatc
 
     assert scheduled == []
     assert runner._telegram_topic_last_scheduled_titles == {}
-
-
-def test_telegram_response_aware_path_renames_only_once(monkeypatch):
-    calls = []
-    captured = {}
-    runner = object.__new__(GatewayRunner)
-    runner._is_telegram_topic_lane = lambda source: True
-    runner._schedule_telegram_topic_title_rename = (
-        lambda source, session_id, title, **kwargs: calls.append(title)
-    )
-
-    def fake_maybe_auto_title(*args, **kwargs):
-        captured["context"] = args[2]
-        captured["callback"] = kwargs["title_callback"]
-
-    monkeypatch.setattr("agent.title_generator.maybe_auto_title", fake_maybe_auto_title)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        user_id="user-1",
-        chat_id="chat-1",
-        thread_id="thread-1",
-    )
-    agent = types.SimpleNamespace(
-        model="model",
-        provider="provider",
-        base_url=None,
-        api_key=None,
-        api_mode=None,
-        _session_db=None,
-        _title_failure_callback=None,
-    )
-
-    runner._schedule_telegram_topic_title_after_response(
-        source,
-        "session-1",
-        "Research X and produce a grounded summary",
-        "A completed response long enough to pass the response-aware guard.",
-        agent,
-        {"completed": True},
-    )
-
-    assert "Research X and produce a grounded summary" in captured["context"]
-    assert "A completed response long enough" in captured["context"]
-
-    captured["callback"]("Derived opening title", "derived")
-    captured["callback"]("Final response title", "llm")
-    assert calls == ["Final response title"]
-
-
-def test_interim_title_latch_fires_when_text_precedes_deadline():
-    ready = []
-    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
-
-    latch.observe("A" * 20)
-    assert ready == []
-
-    latch.reach_deadline()
-    assert ready == ["A" * 20]
-
-
-def test_interim_title_latch_fires_when_text_arrives_after_deadline():
-    ready = []
-    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
-
-    latch.reach_deadline()
-    latch.observe("A" * 19)
-    assert ready == []
-
-    latch.observe("A" * 20)
-    latch.observe("A" * 30)
-    assert ready == ["A" * 20]
-
-
-def test_interim_title_latch_close_prevents_late_fire():
-    ready = []
-    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
-
-    latch.reach_deadline()
-    latch.close()
-    latch.observe("A" * 20)
-
-    assert ready == []
-
-
-def test_interim_title_latch_preserves_useful_text_across_stream_resets():
-    ready = []
-    latch = _InterimTopicTitleLatch(ready.append, min_visible_characters=20)
-
-    latch.observe("First visible response")
-    latch.observe("short")
-    latch.reach_deadline()
-
-    assert ready == ["First visible response"]
