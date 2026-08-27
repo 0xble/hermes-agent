@@ -2711,23 +2711,40 @@ class HindsightMemoryProvider(MemoryProvider):
             from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
             request = UpdateMemoryRequest(state=state, reason=str(reason).strip() if reason else None)
 
-            def _update(client):
+            async def _update(client):
                 memory_api = getattr(client, "memory", None)
                 update_method = getattr(memory_api, "update_memory", None)
                 get_method = getattr(memory_api, "get_memory", None)
                 if update_method is None or get_method is None:
                     raise RuntimeError("installed Hindsight client does not support auditable memory curation")
+                # The 0.9.1 client's memory API methods are coroutine
+                # functions; an un-awaited call sends no request at all.
                 updated = update_method(self._bank_id, memory_id, request)
+                if inspect.isawaitable(updated):
+                    updated = await updated
                 verified = get_method(self._bank_id, memory_id)
+                if inspect.isawaitable(verified):
+                    verified = await verified
                 return updated, verified
 
+            def _memory_state(payload) -> Optional[str]:
+                # The client returns untyped JSON payloads (dicts), but keep
+                # attribute access for typed model objects.
+                if isinstance(payload, dict):
+                    value = payload.get("state")
+                else:
+                    value = getattr(payload, "state", None)
+                return str(value) if value is not None else None
+
             updated, verified = self._run_hindsight_operation(_update)
-            verified_state = getattr(verified, "state", None) or getattr(updated, "state", None)
-            if state == "invalidated" and verified_state not in (None, "invalidated"):
-                raise RuntimeError(f"provider readback state was {verified_state!r}, expected invalidated")
-            if state == "valid" and verified_state not in (None, "valid"):
-                raise RuntimeError(f"provider readback state was {verified_state!r}, expected valid")
-            return json.dumps({"result": "Memory invalidated." if state == "invalidated" else "Memory restored.", "memory_id": memory_id, "state": verified_state or state})
+            verified_state = _memory_state(verified) or _memory_state(updated)
+            # Readback must positively prove the requested state; a missing
+            # state is a verification failure, not a success.
+            if verified_state != state:
+                raise RuntimeError(
+                    f"provider readback state was {verified_state!r}, expected {state!r}"
+                )
+            return json.dumps({"result": "Memory invalidated." if state == "invalidated" else "Memory restored.", "memory_id": memory_id, "state": verified_state})
         except Exception as exc:
             logger.warning("Hindsight memory curation failed (%s, %s): %s", state, memory_id, exc, exc_info=True)
             return tool_error(f"Failed to {state} memory: {exc}")

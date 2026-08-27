@@ -1768,3 +1768,96 @@ class TestSharedObservationScope:
         p.handle_tool_call("hindsight_retain", {"content": "likes dark mode"})
         item = p._client.aretain_batch.call_args.kwargs["items"][0]
         assert item["observation_scopes"] == [[]]
+
+
+# ---------------------------------------------------------------------------
+# Memory curation (hindsight_invalidate / hindsight_restore) tests
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryCuration:
+    """The curation tools must actually reach the provider and verify readback.
+
+    hindsight-client 0.9.1 exposes ``memory.update_memory``/``get_memory`` as
+    coroutine functions returning untyped JSON payloads. Calling them without
+    awaiting sends no request at all, and the readback guard must not accept a
+    missing state as verified.
+    """
+
+    def _curation_client(self, readback_state="invalidated"):
+        calls = []
+
+        class _MemoryApi:
+            async def update_memory(self, bank_id, memory_id, request):
+                calls.append(("update", bank_id, memory_id, request.state))
+                return {"state": request.state} if readback_state is not None else {}
+
+            async def get_memory(self, bank_id, memory_id):
+                calls.append(("get", bank_id, memory_id))
+                if readback_state is None:
+                    return {"id": memory_id}
+                return {"id": memory_id, "state": readback_state}
+
+        client = SimpleNamespace(memory=_MemoryApi())
+        return client, calls
+
+    def test_invalidate_awaits_update_and_verifies_readback(self, provider, monkeypatch):
+        provider._allow_memory_mutations = True
+        client, calls = self._curation_client("invalidated")
+        monkeypatch.setattr(provider, "_get_client", lambda: client)
+
+        result = json.loads(
+            provider.handle_tool_call(
+                "hindsight_invalidate",
+                {"memory_id": "mem-1", "reason": "wrong fact"},
+            )
+        )
+
+        assert result["result"] == "Memory invalidated."
+        assert result["state"] == "invalidated"
+        assert calls == [
+            ("update", "test-bank", "mem-1", "invalidated"),
+            ("get", "test-bank", "mem-1"),
+        ]
+
+    def test_restore_awaits_update_and_verifies_readback(self, provider, monkeypatch):
+        provider._allow_memory_mutations = True
+        client, calls = self._curation_client("valid")
+        monkeypatch.setattr(provider, "_get_client", lambda: client)
+
+        result = json.loads(
+            provider.handle_tool_call("hindsight_restore", {"memory_id": "mem-2"})
+        )
+
+        assert result["result"] == "Memory restored."
+        assert result["state"] == "valid"
+        assert [c[0] for c in calls] == ["update", "get"]
+
+    def test_unverified_readback_state_fails_closed(self, provider, monkeypatch):
+        provider._allow_memory_mutations = True
+        client, _ = self._curation_client(readback_state="valid")
+        monkeypatch.setattr(provider, "_get_client", lambda: client)
+
+        result = json.loads(
+            provider.handle_tool_call(
+                "hindsight_invalidate",
+                {"memory_id": "mem-3", "reason": "wrong fact"},
+            )
+        )
+
+        assert "error" in result
+        assert "readback" in result["error"]
+
+    def test_missing_readback_state_fails_closed(self, provider, monkeypatch):
+        provider._allow_memory_mutations = True
+        client, _ = self._curation_client(readback_state=None)
+        monkeypatch.setattr(provider, "_get_client", lambda: client)
+
+        result = json.loads(
+            provider.handle_tool_call(
+                "hindsight_invalidate",
+                {"memory_id": "mem-4", "reason": "wrong fact"},
+            )
+        )
+
+        assert "error" in result
