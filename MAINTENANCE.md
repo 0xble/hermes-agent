@@ -87,6 +87,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-063 | Active | `feat(telegram): support business checklists`; `fix(telegram): harden checklist support` | Preserve Telegram Business connection identity through session routing and support typed native checklist send/edit operations. |
 | HERMES-064 | Active | `feat(browser): add isolated named real-profile identities` | Bind exact local Chromium profiles to explicit browser identities with isolated snapshots, processes, CDP state, Browser Use daemons, and fail-closed selection. |
 | HERMES-065 | Active | `fix(telegram): degrade unsupported markdown link targets to display text`; `fix(session-search): scope session links to desktop surfaces`; `docs(maintenance): register session-link rendering patch` | Keep Desktop-only session references off non-Desktop surfaces and degrade Telegram-unsupported Markdown targets to readable labels. |
+| HERMES-066 | Active | `fix(gateway): normalize background topic sources` | Apply Telegram DM-topic recovery before background execution and session-scoped resolution. |
 
 ## Fork-only administrative subject exemptions
 
@@ -147,6 +148,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Published commit identity:** Stable subjects `feat(telegram): support business checklists` and `fix(telegram): harden checklist support`; source, regressions, and this record ship together.
 - **Rollback:** Revert `fix(telegram): harden checklist support` first, then revert `feat(telegram): support business checklists`, removing the source discriminator, Telegram session-key component, reply metadata propagation, native checklist methods, focused regressions, and this record. Preserve HERMES-062 inbound normalization and ordinary non-Business Telegram routing.
 - **Retirement:** Retire after released upstream preserves Business connection identity end to end, isolates sessions by connection, passes it through ordinary replies, and exposes typed validated native checklist send/edit operations with equivalent transport-safety regressions.
+
+### HERMES-066 — Normalize background topic sources
+
+- **Independent hypothesis (2026-08-28):** `/background` dispatches the raw slash-command `event.source`, while normal Telegram DM-topic turns first recover a lobby-shaped or stripped source through `_normalize_source_for_session_key()`. The child can therefore receive an empty `thread_id` even when the gateway has a bound topic, making topic-aware tools refuse safely and resolving session-scoped model, reasoning, service-tier, channel prompt, and delivery metadata from the wrong source. The correction belongs at command receipt so one normalized source is pinned for the whole background run.
+- **Summary:** Normalize `/background`, `/bg`, and `/btw` sources through the existing Telegram DM-topic recovery path before creating the background task. Detached background semantics and transcript isolation remain unchanged.
+- **Surfaces:** `gateway/slash_commands.py`; `tests/gateway/test_background_command.py`; this record.
+- **Upstream tracking:** Open issue #97498 contains the current-upstream failing regression. Related open PR #83820 preserves structured background reply/topic context but still initializes the task from raw `event.source` as of 2026-08-28.
+- **Upstream PR:** Related but incomplete: #83820.
+- **Regression:** `python -m pytest tests/gateway/test_background_command.py::TestHandleBackgroundCommand::test_telegram_topic_source_is_normalized_before_dispatch -q`; the test failed on current upstream because the normalizer was never called and passes after dispatch uses the recovered source.
+- **Published commit identity:** Stable subject `fix(gateway): normalize background topic sources`; source, regression, and manifest record ship together.
+- **Rollback:** Revert only `fix(gateway): normalize background topic sources`, restoring raw slash-command source dispatch and removing the focused regression plus this record. Preserve all existing background execution and Telegram topic-recovery behavior.
+- **Retirement:** Retire after released upstream normalizes `/background` sources before session-key/runtime resolution and execution, with equivalent Telegram DM-topic coverage.
 
 ### HERMES-059 — Keep initialized memory-provider tools routable
 
