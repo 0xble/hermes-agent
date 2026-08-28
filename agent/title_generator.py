@@ -1256,22 +1256,11 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
-    recent_titles: list[str] = []
-    recent_fn = getattr(session_db, "list_recent_session_titles", None)
-    if callable(recent_fn):
-        try:
-            loaded_titles = recent_fn(exclude_session_id=session_id, limit=24)
-            if isinstance(loaded_titles, list):
-                recent_titles = [str(item) for item in loaded_titles if str(item).strip()]
-        except Exception:
-            logger.debug("Failed to load recent titles for diversity", exc_info=True)
-
     title = generate_title(
         user_message,
         failure_callback=failure_callback,
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
-        avoid_titles=recent_titles,
         route_callback=route_callback,
     )
     source = "llm"
@@ -1304,7 +1293,7 @@ def _auto_title_session(
                     failure_callback=None,
                     main_runtime=main_runtime,
                     runtime_validator=runtime_validator,
-                    avoid_titles=(recent_titles + [title])[-24:],
+                    avoid_titles=[title],
                 )
                 if (
                     retry_title
