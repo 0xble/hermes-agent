@@ -109,6 +109,18 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
         return self._prefetch_result
 
 
+class InitializedToolProvider(FakeMemoryProvider):
+    """Provider whose configured tool surface becomes final during initialize."""
+
+    def __init__(self, name="initialized", *, before=None, after=None):
+        super().__init__(name=name, tools=list(before or []))
+        self._tools_after_initialize = list(after or [])
+
+    def initialize(self, session_id, **kwargs):
+        super().initialize(session_id, **kwargs)
+        self._tools = list(self._tools_after_initialize)
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -166,6 +178,64 @@ class TestMemoryManager:
         mgr.add_provider(p)
         assert mgr.get_provider("test1") is p
         assert mgr.get_provider("nonexistent") is None
+
+    def test_initialized_provider_tools_are_advertised_and_routable(self):
+        """Schemas discovered during initialize must enter the dispatch table."""
+        late_tools = [
+            {"name": "hindsight_invalidate", "description": "invalidate", "parameters": {}},
+            {"name": "hindsight_restore", "description": "restore", "parameters": {}},
+        ]
+        mgr = MemoryManager()
+        provider = InitializedToolProvider(after=late_tools)
+        mgr.add_provider(provider)
+
+        assert not mgr.has_tool("hindsight_invalidate")
+
+        mgr.initialize_all("session")
+
+        advertised = {schema["name"] for schema in mgr.get_all_tool_schemas()}
+        assert advertised == {"hindsight_invalidate", "hindsight_restore"}
+        assert all(mgr.has_tool(name) for name in advertised)
+        result = json.loads(mgr.handle_tool_call("hindsight_invalidate", {"memory_id": "m1"}))
+        assert result["handled"] == "hindsight_invalidate"
+
+    def test_initialize_rebuild_removes_stale_routes(self):
+        """A provisional schema withdrawn during initialize must stop routing."""
+        before = [{"name": "provisional_tool", "description": "old", "parameters": {}}]
+        after = [{"name": "final_tool", "description": "new", "parameters": {}}]
+        mgr = MemoryManager()
+        provider = InitializedToolProvider(before=before, after=after)
+        mgr.add_provider(provider)
+
+        assert mgr.has_tool("provisional_tool")
+        mgr.initialize_all("session")
+
+        assert not mgr.has_tool("provisional_tool")
+        assert mgr.has_tool("final_tool")
+        assert {schema["name"] for schema in mgr.get_all_tool_schemas()} == {"final_tool"}
+
+    def test_initialize_rebuild_preserves_core_name_and_conflict_guards(self):
+        """Late schemas cannot shadow core tools or an earlier provider."""
+        shared = {"name": "shared_memory_tool", "description": "shared", "parameters": {}}
+        built_in = FakeMemoryProvider("builtin", tools=[shared])
+        external = InitializedToolProvider(
+            after=[
+                shared,
+                {"name": "clarify", "description": "shadow", "parameters": {}},
+                {"name": "external_memory_tool", "description": "safe", "parameters": {}},
+            ]
+        )
+        mgr = MemoryManager()
+        mgr.add_provider(built_in)
+        mgr.add_provider(external)
+        mgr.initialize_all("session")
+
+        assert mgr._tool_to_provider["shared_memory_tool"] is built_in
+        assert mgr._tool_to_provider["external_memory_tool"] is external
+        assert not mgr.has_tool("clarify")
+        advertised = {schema["name"] for schema in mgr.get_all_tool_schemas()}
+        assert "clarify" not in advertised
+        assert advertised == set(mgr.get_all_tool_names())
 
 
 
