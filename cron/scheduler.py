@@ -5977,9 +5977,9 @@ def run_job(
     try:
         from hermes_cli.profiles import get_active_profile_name
 
-        _job_profile = get_active_profile_name() or "default"
+        _job_profile = get_active_profile_name() or ""
     except Exception:
-        _job_profile = "default"
+        _job_profile = ""
 
     _ctx_tokens = set_session_vars(
         platform="",
