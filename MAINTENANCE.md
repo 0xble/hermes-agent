@@ -82,6 +82,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-058 | Active | `feat(gateway): make lifecycle guard configurable` | Keep gateway lifecycle protection default-on while permitting an explicit config opt-out across CLI, terminal, and cron enforcement. |
 | HERMES-059 | Active | `fix(memory): keep initialized provider tools routable`; `fix(memory): harden initialized provider routing` | Rebuild memory-provider tool routing after initialization and advertise only schemas that the manager can dispatch. |
 | HERMES-060 | Active | `fix(browser): reject guest profile for real-profile browsing` | Mirror only a real Chrome profile into the managed browser snapshot and normalize its copied Local State to launch `Default`. |
+| HERMES-061 | Active | `fix(desktop): compare shebang paths case-insensitively` | Recognize a venv-owned Python launcher on case-insensitive filesystems instead of prefixing it with a redundant interpreter. |
 
 ## Fork-only administrative subject exemptions
 
@@ -136,6 +137,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Published commit identity:** Stable subject `fix(browser): reject guest profile for real-profile browsing`; source, regression, and manifest ship together.
 - **Rollback:** Revert only `fix(browser): reject guest profile for real-profile browsing`, removing the guest/system rejection, copied-state normalizer, focused regressions, and this record. Preserve snapshot security, profile-copy exclusions, and all unrelated browser authorization behavior.
 - **Retirement:** Retire after a released upstream version rejects non-browsable guest/system profiles for managed real-profile snapshots, normalizes the copied launch state without mutating the source profile, and passes equivalent focused coverage.
+
+### HERMES-061 — Compare desktop launcher shebang paths case-insensitively
+
+- **Independent hypothesis (2026-08-28):** `_needs_interpreter()` lowercases the launcher shebang but compares it with the running interpreter directory without lowercasing that directory. On the default macOS case-insensitive filesystem, `/Users/...` and `/users/...` identify the same venv, but the mixed-case string comparison rejects the match and prefixes the launcher with a redundant interpreter.
+- **Summary:** Normalize both sides of the shebang containment comparison to lowercase. This preserves Linux behavior and makes the helper's path comparison consistent on case-insensitive filesystems.
+- **Surfaces:** `hermes_cli/linux_desktop_entry.py`; `tests/hermes_cli/test_linux_desktop_entry.py`; this record.
+- **Upstream tracking:** Upstream `main` at `93de1d3430a1cb955ef85715cf1f59581295fa21` lowercases only the shebang. A repository issue search found no direct report or fix. Checked 2026-08-28.
+- **Upstream PR:** None found as of 2026-08-28.
+- **Regression:** `.venv/bin/python -m pytest tests/hermes_cli/test_linux_desktop_entry.py -q`; `test_exec_leaves_venv_shebang_scripts_alone` failed before the fix on macOS and passes after both paths use the same case normalization.
+- **Published commit identity:** Stable subject `fix(desktop): compare shebang paths case-insensitively`; source, regression, and manifest record ship together.
+- **Rollback:** Revert the one-line normalization and this record. No data migration or persistent state is involved.
+- **Retirement:** Retire after a released upstream version performs a case-insensitive comparison for this helper or removes the string-containment test in favor of a filesystem-aware equivalent, with matching regression coverage.
 
 ### HERMES-057 — Enforce total cron run budgets
 
