@@ -781,6 +781,20 @@ class TestChooseTopicIcon:
 class TestAutoTitleSession:
     """Tests for auto_title_session() — the sync worker function."""
 
+    def test_does_not_send_other_session_titles_to_model(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        db.create_session(session_id="other", source="cli")
+        db.set_auto_title("other", "Sensitive unrelated title", source="llm")
+
+        with patch(
+            "agent.title_generator.generate_title",
+            return_value="Current session title",
+        ) as generate:
+            auto_title_session(db, "sess-1", "Current session prompt")
+
+        assert generate.call_args.kwargs.get("avoid_titles") in (None, [])
+
     def test_malformed_model_title_preserves_derived_title_and_source(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="cli")
