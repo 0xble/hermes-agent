@@ -83,6 +83,36 @@ def test_punctuation_free_success_receipt_preserves_pending_answer():
     ) == f"{pending}\n\n## Verification\n\n{receipt}"
 
 
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        "Fresh verification from this turn passes: pytest -q",
+        "Fresh verification passes: ruff check .\npytest -q",
+    ],
+)
+def test_plain_text_success_receipts_preserve_pending_answer(receipt):
+    pending = "Implemented the requested change."
+    assert _compose_verification_receipt_with_answer(
+        pending,
+        receipt,
+    ) == f"{pending}\n\n## Verification\n\n{receipt}"
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        "I couldn't provide fresh verification evidence for this edit",
+        "I could not provide fresh verification evidence for the edit.",
+    ],
+)
+def test_equivalent_failure_receipts_preserve_pending_answer(receipt):
+    pending = "Implemented the requested change."
+    assert _compose_verification_receipt_with_answer(
+        pending,
+        receipt,
+    ) == f"{pending}\n\n## Verification\n\n{receipt}"
+
+
 def test_punctuation_free_failure_receipt_preserves_pending_answer():
     pending = "Implemented the requested change."
     receipt = "I cannot provide fresh verification evidence for this edit"

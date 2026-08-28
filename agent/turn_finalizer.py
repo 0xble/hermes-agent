@@ -68,12 +68,12 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 
 _VERIFICATION_SUCCESS_RECEIPT = re.compile(
     r"^\s*fresh\s+verification(?:\s+from\s+this\s+turn)?\s+passes"
-    r"(?:\s*|\.\s*|:\s*(?:`[^`]+`(?:\s*\n\s*)?)+)$",
+    r"(?:\s*[.!?]?\s*|\s*:\s*[\s\S]+)$",
     re.IGNORECASE,
 )
 _VERIFICATION_FAILURE_RECEIPT = re.compile(
-    r"^\s*i\s+(?:cannot|can't|could\s+not)\s+provide\s+fresh\s+verification\s+"
-    r"evidence\s+for\s+(?:that|this)\s+edit[.!?]?\s*$",
+    r"^\s*i\s+(?:cannot|can't|could(?:\s+not|n't))\s+provide\s+fresh\s+verification\s+"
+    r"evidence\s+for\s+(?:that|this|the)\s+edit[.!?]?\s*$",
     re.IGNORECASE,
 )
 _VERIFICATION_SECTION = "\n\n## Verification\n\n"
