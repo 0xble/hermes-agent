@@ -1354,12 +1354,20 @@ async def _send_via_adapter(
             return payload
 
     if runner is None and str(profile or "").strip():
-        return {
-            "error": (
-                f"Cannot honor trusted profile '{str(profile).strip()}' for "
-                f"standalone platform '{platform_name}'; refusing cross-profile send."
-            )
-        }
+        requested_profile = str(profile).strip()
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            active_profile = str(get_active_profile_name() or "").strip()
+        except Exception:
+            active_profile = ""
+        if active_profile != requested_profile:
+            return {
+                "error": (
+                    f"Cannot honor trusted profile '{requested_profile}' for "
+                    f"standalone platform '{platform_name}'; refusing cross-profile send."
+                )
+            }
 
     entry = None
     try:

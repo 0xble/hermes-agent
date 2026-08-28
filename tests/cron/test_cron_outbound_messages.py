@@ -292,12 +292,6 @@ class TestSendGate:
 
     def test_account_override_cannot_be_selected(self, tmp_outbound, monkeypatch):
         self._bind_cron(monkeypatch)
-        raw = send_message_tool({
-            "target": "origin",
-            "message": "payroll",
-            "message_key": "manual-review:sharon",
-            "account": "brianle",
-        })
         with patch(
             "tools.send_message_tool._handle_send",
             return_value=json.dumps({"success": True, "message_id": "131192"}),
@@ -425,6 +419,48 @@ class TestSendGate:
             "error": "No live adapter for profile 'default' and platform 'telegram'"
         }
         runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
+
+    def test_profile_bound_standalone_send_uses_matching_active_profile(self, monkeypatch):
+        from gateway.config import Platform
+        from tools.send_message_tool import _send_to_platform
+
+        sender = AsyncMock(return_value={"success": True, "message_id": "standalone"})
+        entry = SimpleNamespace(standalone_sender_fn=sender)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
+        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM,
+            SimpleNamespace(),
+            "2027045491",
+            "hello",
+            profile="default",
+        ))
+
+        assert result == {"success": True, "message_id": "standalone"}
+        sender.assert_awaited_once()
+
+    def test_profile_bound_standalone_send_rejects_profile_mismatch(self, monkeypatch):
+        from gateway.config import Platform
+        from tools.send_message_tool import _send_to_platform
+
+        sender = AsyncMock(return_value={"success": True, "message_id": "wrong"})
+        entry = SimpleNamespace(standalone_sender_fn=sender)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
+        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "secondary")
+
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM,
+            SimpleNamespace(),
+            "2027045491",
+            "hello",
+            profile="default",
+        ))
+
+        assert "refusing cross-profile send" in result["error"]
+        sender.assert_not_awaited()
 
     def test_live_transport_runs_on_gateway_owned_event_loop(self, monkeypatch):
         from gateway.config import Platform
