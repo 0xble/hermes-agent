@@ -501,9 +501,11 @@ def _background_review_create_allowed() -> bool:
             "background_review_allow_create",
             default=False,
         )
+        if isinstance(value, bool):
+            return value
         if isinstance(value, str):
-            return value.strip().lower() not in {"false", "0", "no", "off"}
-        return bool(value)
+            return value.strip().lower() in {"true", "1", "yes", "on"}
+        return False
     except Exception:
         # Configuration failures must not silently broaden a safety policy.
         return False
