@@ -56,7 +56,13 @@ def test_real_disposable_bank_source_retention(tmp_path, monkeypatch):
             },
             {"role": "tool", "tool_call_id": "canary-call", "content": web_text},
         ]
-        candidates = discover_source_candidates(messages, session_id="canary-session")
+        candidates = discover_source_candidates(
+            messages,
+            session_id="canary-session",
+            retain_tool_sources=True,
+            retain_attachments=True,
+            attachment_roots=(tmp_path,),
+        )
         assert {candidate.source_type for candidate in candidates} == {"user_file", "webpage"}
 
         hermes_home = tmp_path / "hermes-home"

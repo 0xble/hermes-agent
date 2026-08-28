@@ -32,11 +32,17 @@ def _tool_turn(name, arguments, result, call_id="call-1"):
     ]
 
 
-def test_substantive_web_extraction_is_preserved_with_provenance():
+def test_substantive_web_extraction_requires_explicit_tool_source_opt_in():
     content = "Source paragraph. " * 60
+    messages = _tool_turn(
+        "web_extract", {"url": "HTTPS://Example.com/page#fragment"}, content
+    )
+    assert discover_source_candidates(messages, session_id="session-1") == []
+
     candidates = discover_source_candidates(
-        _tool_turn("web_extract", {"url": "HTTPS://Example.com/page#fragment"}, content),
+        messages,
         session_id="session-1",
+        retain_tool_sources=True,
     )
 
     assert len(candidates) == 1
@@ -61,7 +67,8 @@ def test_incidental_search_results_and_short_outputs_are_skipped():
 def test_transcript_is_complete_source_and_secret_bearing_content_is_skipped():
     transcript = "Speaker A: substantive transcript. " * 60
     candidates = discover_source_candidates(
-        _tool_turn("speech_to_text", {"file_path": "meeting.m4a"}, transcript)
+        _tool_turn("speech_to_text", {"file_path": "meeting.m4a"}, transcript),
+        retain_tool_sources=True,
     )
     assert len(candidates) == 1
     assert candidates[0].source_type == "transcript"
@@ -69,7 +76,8 @@ def test_transcript_is_complete_source_and_secret_bearing_content_is_skipped():
 
     secret = "api_key = sk_live_12345678901234567890\n" + ("x " * 400)
     assert discover_source_candidates(
-        _tool_turn("web_extract", {"url": "https://example.com"}, secret)
+        _tool_turn("web_extract", {"url": "https://example.com"}, secret),
+        retain_tool_sources=True,
     ) == []
 
 
@@ -80,7 +88,8 @@ def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
             "write_file",
             {"path": "/Users/brianle/Vault/Reports/review.md", "content": content},
             "written",
-        )
+        ),
+        retain_tool_sources=True,
     )
     assert len(retained) == 1
     assert retained[0].source_type == "artifact"
@@ -90,14 +99,16 @@ def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
             "write_file",
             {"path": "/tmp/scratch.md", "content": content},
             "written",
-        )
+        ),
+        retain_tool_sources=True,
     ) == []
     assert discover_source_candidates(
         _tool_turn(
             "write_file",
             {"path": "/Users/brianle/Workspaces/project/main.py", "content": content},
             "written",
-        )
+        ),
+        retain_tool_sources=True,
     ) == []
 
 
@@ -105,12 +116,14 @@ def test_current_turn_boundary_and_duplicate_content_are_deterministic():
     old = _tool_turn("web_extract", {"url": "https://old.example"}, "old " * 200)
     new = _tool_turn("web_extract", {"url": "https://new.example"}, "new " * 200)
     messages = old + new
-    candidates = discover_source_candidates(messages)
+    candidates = discover_source_candidates(messages, retain_tool_sources=True)
     assert len(candidates) == 1
     assert candidates[0].source_id.startswith("webpage-")
 
     duplicate = _tool_turn("web_extract", {"url": "https://new.example"}, "new " * 200)
-    candidates = discover_source_candidates(duplicate + duplicate[1:])
+    candidates = discover_source_candidates(
+        duplicate + duplicate[1:], retain_tool_sources=True
+    )
     assert len(candidates) == 1
 
 
@@ -245,11 +258,16 @@ def test_read_file_extraction_requires_explicit_opt_in_and_secret_paths_stay_blo
     )
     assert discover_source_candidates(messages) == []
 
-    extracted = discover_source_candidates(messages, retain_file_extractions=True)
+    extracted = discover_source_candidates(
+        messages,
+        retain_tool_sources=True,
+        retain_file_extractions=True,
+    )
     assert len(extracted) == 1
     assert extracted[0].source_type == "file_extraction"
     skipped = discover_source_candidates(
         _tool_turn("read_file", {"path": "/Users/brianle/.env"}, content),
+        retain_tool_sources=True,
         retain_file_extractions=True,
     )
     assert skipped == []
