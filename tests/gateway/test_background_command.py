@@ -77,6 +77,28 @@ class TestHandleBackgroundCommand:
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
 
+    @pytest.mark.asyncio
+    async def test_telegram_topic_source_is_normalized_before_dispatch(self):
+        """A stripped Telegram topic command dispatches with its recovered topic."""
+        runner = _make_runner()
+        event = _make_event(text="/background rename this topic")
+        recovered = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+            thread_id="42",
+        )
+        runner._normalize_source_for_session_key = MagicMock(return_value=recovered)
+        runner._run_background_task = AsyncMock()
+
+        await runner._handle_background_command(event)
+        await asyncio.gather(*runner._background_tasks)
+
+        runner._normalize_source_for_session_key.assert_called_once_with(event.source)
+        dispatched_source = runner._run_background_task.await_args.args[1]
+        assert dispatched_source.thread_id == "42"
+
 
 # ---------------------------------------------------------------------------
 # _run_background_task

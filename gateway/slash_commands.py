@@ -3636,7 +3636,10 @@ class GatewaySlashCommandsMixin:
         if not prompt:
             return t("gateway.background.usage")
 
-        source = event.source
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key,
+            event.source,
+        )
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
 
         event_message_id = self._reply_anchor_for_event(event)
