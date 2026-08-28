@@ -27619,6 +27619,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            business_connection_id = getattr(source, "business_connection_id", None)
+            if business_connection_id:
+                metadata = dict(metadata or {})
+                metadata["telegram_business_connection_id"] = str(
+                    business_connection_id
+                )
         # Routed profile for shared state.db namespaces (#76423): the Telegram
         # prune path needs it because under profile_routes the transport
         # adapter's stamp is not the profile that wrote the binding.
