@@ -27,10 +27,7 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     if (sessionId && payload?.kind === 'compacting') {
       setSessionCompacting(sessionId, true)
       compactedTurnRef.current.add(sessionId)
-    } else if (
-      sessionId &&
-      ['compacted', 'compaction_aborted', 'compaction_deferred'].includes(payload?.kind ?? '')
-    ) {
+    } else if (sessionId && ['compacted', 'compaction_aborted', 'compaction_deferred'].includes(payload?.kind ?? '')) {
       reconcileSessionCompacting(sessionId, 'terminal')
       compactedTurnRef.current.delete(sessionId)
     } else if (sessionId && payload?.kind === 'process') {
