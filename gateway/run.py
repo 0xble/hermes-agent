@@ -6105,10 +6105,13 @@ class TurnRunner:
                 or not str(text or "").strip()
             ):
                 return
+            display_text = _transform_outbound_text(text)
+            if not str(display_text or "").strip():
+                return
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
-                    text,
+                    display_text,
                     metadata=ctx._status_thread_metadata,
                 ),
                 ctx._loop_for_step,
