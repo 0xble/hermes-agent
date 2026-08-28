@@ -12,7 +12,28 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
+
+
+@pytest.fixture(autouse=True)
+def _isolate_update_host(monkeypatch):
+    """Keep prompt tests away from real gateways and the macOS TCC anchor."""
+    import hermes_cli.gateway as hermes_gateway
+    import hermes_cli.main as hermes_main
+    import hermes_cli.macos_tcc_anchor as macos_tcc_anchor
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(
+        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
+    )
+    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(macos_tcc_anchor, "ensure_tcc_anchor", lambda *a, **k: None)
 
 
 def _make_run_side_effect(

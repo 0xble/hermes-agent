@@ -552,6 +552,45 @@ class TestSkillManageDispatcher:
         assert not (tmp_path / "new-skill").exists()
         assert "safely" in (tmp_path / "existing" / "SKILL.md").read_text()
 
+    def test_background_review_batch_create_uses_same_create_guard(self, tmp_path):
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with _skill_dir(tmp_path), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"skills": {"background_review_allow_create": False}},
+            ):
+                blocked = json.loads(
+                    skill_manage(
+                        action="",
+                        name="",
+                        operations=[
+                            {
+                                "action": "create",
+                                "name": "new-skill",
+                                "content": VALID_SKILL_CONTENT,
+                            },
+                            {
+                                "action": "write_file",
+                                "name": "new-skill",
+                                "file_path": "references/proof.md",
+                                "file_content": "proof",
+                            },
+                        ],
+                    )
+                )
+        finally:
+            reset_current_write_origin(token)
+
+        assert blocked["success"] is False
+        assert "background_review_allow_create" in blocked["error"]
+        assert not (tmp_path / "new-skill").exists()
+
     @pytest.mark.parametrize("value", [True, "true", "1", "yes", "on"])
     def test_background_review_create_allowed_for_truthy_config(self, value):
         from tools.skill_manager_tool import _background_review_create_allowed

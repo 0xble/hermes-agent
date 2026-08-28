@@ -7,6 +7,7 @@ handling without requiring a running terminal environment.
 import json
 import logging
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,7 +31,9 @@ class TestReadFileHandler:
         result = json.loads(read_file_tool("/tmp/test.txt"))
         assert result["content"] == "line1\nline2"
         assert result["total_lines"] == 2
-        mock_ops.read_file.assert_called_once_with("/tmp/test.txt", 1, 2000)
+        mock_ops.read_file.assert_called_once_with(
+            str(Path("/tmp/test.txt").resolve()), 1, 2000
+        )
 
 
     @patch("tools.file_tools._get_file_ops")

@@ -109,6 +109,7 @@ def test_idle_exactly_at_threshold():
 
 import os
 import socket as _socket
+import tempfile
 import threading
 
 
@@ -124,7 +125,9 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    fd, sock_path = tempfile.mkstemp(prefix="hermes-fly-", suffix=".sock")
+    os.close(fd)
+    os.unlink(sock_path)
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -144,6 +147,10 @@ def _fake_flaps(tmp_path, status_line, capture):
                 f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
             )
         server.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()

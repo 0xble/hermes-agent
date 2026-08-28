@@ -110,6 +110,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `chore(fork): remove dead reconciliation residue` | Removal of dead code left by retired paths and rebase replay (response-aware title route plumbing, retired HERMES-043 snapshot, obsolete compatibility shims, unused helpers, duplicate import, stale docstrings/comments); no behavioral change. |
 | `test(cron): stabilize claim heartbeat grace` | Test-only heartbeat timing tolerance for HERMES-057 under loaded CI hosts; no shipped Hermes behavior. |
 | `fix(reconcile): remove duplicate auxiliary route parameters` | Patch-neutral syntax repair after preserving upstream route telemetry together with the fork's complete-response wrapper during rebase. |
+| `fix(reconcile): preserve active contracts and test isolation` | Patch-neutral rebase repair restoring HERMES-049 cross-loop cancellation safety, removing duplicated HERMES-007 API helpers, preserving HERMES-020's create guard for batch operations, and isolating upstream regressions from live host state; no independently retireable behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
