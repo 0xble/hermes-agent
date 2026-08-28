@@ -10474,7 +10474,6 @@ def call_llm(
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
     require_complete_response: bool = False,
-    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -10536,7 +10535,7 @@ def call_llm(
                 stream_options=stream_options,
                 route_info=route_info,
             )
-        if route_info is not None:
+        if route_info is not None and not route_info:
             route_info.update(getattr(response, "_hermes_auxiliary_route", {}) or {})
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -11548,7 +11547,6 @@ async def async_call_llm(
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
     require_complete_response: bool = False,
-    route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -11577,7 +11575,7 @@ async def async_call_llm(
             reasoning_config=reasoning_config,
             route_info=route_info,
         )
-        if route_info is not None:
+        if route_info is not None and not route_info:
             route_info.update(getattr(response, "_hermes_auxiliary_route", {}) or {})
         return response
     finally:
