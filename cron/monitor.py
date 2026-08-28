@@ -34,6 +34,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -122,11 +123,29 @@ def _fetch_monitor_url(
         timeout = float(URL_TIMEOUT_SECONDS)
         if timeout_seconds is not None:
             timeout = min(timeout, max(0.0, float(timeout_seconds)))
+        deadline = time.monotonic() + timeout
+        body = bytearray()
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — scheme checked above
-            body = resp.read(MAX_URL_BYTES + 1)
+            read_chunk = getattr(resp, "read1", resp.read)
+            while len(body) <= MAX_URL_BYTES:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("monitor URL total read deadline exceeded")
+                # HTTPResponse.read1 performs at most one raw socket read, so a
+                # trickling peer cannot keep one read call alive by resetting a
+                # per-operation timeout forever. Bound the underlying socket to
+                # the same remaining total budget when urllib exposes it.
+                try:
+                    resp.fp.raw._sock.settimeout(remaining)
+                except (AttributeError, OSError):
+                    pass
+                chunk = read_chunk(min(64 * 1024, MAX_URL_BYTES + 1 - len(body)))
+                if not chunk:
+                    break
+                body.extend(chunk)
         if len(body) > MAX_URL_BYTES:
             body = body[:MAX_URL_BYTES]
-        return True, body.decode("utf-8", errors="replace")
+        return True, bytes(body).decode("utf-8", errors="replace")
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 

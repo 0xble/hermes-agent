@@ -446,3 +446,32 @@ def test_cronjob_tool_update_clears_monitor_script(hermes_env):
     )
     assert result.get("success") is True
     assert get_job(created["job_id"]).get("monitor_script") is None
+
+
+def test_monitor_url_read_enforces_total_deadline(monkeypatch):
+    import cron.monitor as monitor
+
+    class TrickleResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            return b"x"
+
+        def read1(self, _size):
+            return b"x"
+
+    ticks = iter([10.0, 10.1, 10.6])
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: TrickleResponse())
+    monkeypatch.setattr(monitor.time, "monotonic", lambda: next(ticks))
+
+    ok, error = monitor._fetch_monitor_url(
+        "https://example.com/monitor",
+        timeout_seconds=0.5,
+    )
+
+    assert ok is False
+    assert "deadline" in error.lower()
