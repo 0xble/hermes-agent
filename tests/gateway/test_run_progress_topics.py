@@ -1410,6 +1410,10 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
 async def test_clarify_context_fallback_is_wired_when_interims_are_disabled(
     monkeypatch, tmp_path
 ):
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.transform_llm_output",
+        lambda text, **_kwargs: (f"[redacted] {text}", True),
+    )
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1426,7 +1430,7 @@ async def test_clarify_context_fallback_is_wired_when_interims_are_disabled(
 
     assert result["final_response"] == "done"
     assert [call["content"] for call in adapter.sent] == [
-        "Decision context that must precede the prompt."
+        "[redacted] Decision context that must precede the prompt."
     ]
 
 
