@@ -249,6 +249,17 @@ class TestOutboundLedger:
 
 
 class TestSendGate:
+    @pytest.fixture(autouse=True)
+    def _restore_session_context(self):
+        from gateway.session_context import _VAR_MAP
+
+        tokens = [(var, var.set(var.get())) for var in _VAR_MAP.values()]
+        try:
+            yield
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
+
     def _bind_cron(self, monkeypatch, *, allow=True):
         from contextlib import nullcontext
         from gateway.session_context import _VAR_MAP
