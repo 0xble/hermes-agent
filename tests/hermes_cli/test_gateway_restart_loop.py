@@ -441,6 +441,32 @@ class TestCronCreateLifecycleBlock:
 class TestGatewaySelfTargetingGuard:
     """Verify destructive gateway commands refuse inside the gateway."""
 
+    def test_restart_allows_inside_gateway_when_guard_disabled(self, monkeypatch):
+        from tools import process_registry
+        import hermes_cli.gateway as gw
+
+        monkeypatch.setattr(
+            process_registry, "_is_supervised_gateway_process", lambda: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"security": {"gateway_lifecycle_guard": False}},
+        )
+
+        class _ReachedRestartPath(Exception):
+            pass
+
+        def _reached_restart_path(*_args, **_kwargs):
+            raise _ReachedRestartPath()
+
+        monkeypatch.setattr(
+            gw, "_dispatch_via_service_manager_if_s6", _reached_restart_path
+        )
+
+        args = Namespace(gateway_command="restart", all=False, system=False)
+        with pytest.raises(_ReachedRestartPath):
+            gw.gateway_command(args)
+
     def test_stop_refuses_inside_gateway(self, monkeypatch):
         from tools import process_registry
         monkeypatch.setattr(
@@ -555,6 +581,32 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+
+    def test_allows_lifecycle_command_when_guard_disabled(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, cmd, **kwargs):
+                calls.append(cmd)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"security": {"gateway_lifecycle_guard": False}},
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 0
+        assert calls == ["hermes gateway restart"]
 
     def test_blocks_lifecycle_command_hidden_in_referenced_script(
         self, monkeypatch, tmp_path
@@ -860,6 +912,42 @@ class TestTerminalToolGatewayLifecycleGuard:
 
 class TestLifecycleGuardModule:
     """Direct tests for cron.lifecycle_guard.check_gateway_lifecycle."""
+
+    def test_config_gate_defaults_on_and_fails_closed(self, monkeypatch):
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
+
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+        assert gateway_lifecycle_guard_enabled() is True
+
+        def _broken_config():
+            raise RuntimeError("config unavailable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", _broken_config)
+        assert gateway_lifecycle_guard_enabled() is True
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"security": {"gateway_lifecycle_guard": None}},
+        )
+        assert gateway_lifecycle_guard_enabled() is True
+
+    def test_config_gate_accepts_explicit_false(self, monkeypatch):
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"security": {"gateway_lifecycle_guard": False}},
+        )
+        assert gateway_lifecycle_guard_enabled() is False
+
+    def test_check_allows_lifecycle_when_guard_disabled(self, monkeypatch):
+        from cron.lifecycle_guard import check_gateway_lifecycle
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"security": {"gateway_lifecycle_guard": False}},
+        )
+        check_gateway_lifecycle("Run hermes gateway restart after the update")
 
     def test_dot_operator_sourced_script_is_scanned(self, tmp_path):
         """`. ./script.sh` must reach the referenced-script scan.

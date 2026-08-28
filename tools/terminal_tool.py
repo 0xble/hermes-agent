@@ -3089,7 +3089,9 @@ def terminal_tool(
         # self-restart into a respawn loop.
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
+
+        if _is_supervised_gateway_process() and gateway_lifecycle_guard_enabled():
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,

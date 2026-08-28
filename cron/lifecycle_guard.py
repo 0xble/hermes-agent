@@ -55,6 +55,27 @@ class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
 
 
+def gateway_lifecycle_guard_enabled() -> bool:
+    """Return the default-on ``security.gateway_lifecycle_guard`` setting.
+
+    Read the live merged config at each enforcement point so an explicit opt-out
+    can authorize the lifecycle command that activates a newly written config.
+    Any config failure keeps the guard enabled.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        security = load_config_readonly().get("security") or {}
+        value = security.get("gateway_lifecycle_guard", True)
+        if value is False:
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() not in {"false", "0", "no", "off"}
+        return True
+    except Exception:
+        return True
+
+
 # Shell-level command shapes that target the gateway lifecycle. Each branch
 # is anchored on a concrete command identifier so a match can only fire on
 # actual shell-command-shaped strings, not on prose.
@@ -1212,6 +1233,9 @@ def check_gateway_lifecycle(
     fail with a ``ValueError``-shaped error (the agent's ``cronjob`` tool
     surfaces this as a tool error; the CLI prints it in red and exits 1).
     """
+    if not gateway_lifecycle_guard_enabled():
+        return
+
     combined = prompt or ""
     python_script = False
     if script:

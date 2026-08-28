@@ -79,6 +79,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-056 | Active | `fix(skills): trust configured symlink farms` | Stop false skill-security warnings for symlink entries inside explicitly configured external skill roots while preserving warnings for local/profile symlink escapes. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
 | HERMES-057 | Active | `fix(cron): enforce total run budgets` | Bound each opted-in cron fire by one total wall-clock deadline while preserving the separate inactivity watchdog. |
+| HERMES-058 | Active | `feat(gateway): make lifecycle guard configurable` | Keep gateway lifecycle protection default-on while permitting an explicit config opt-out across CLI, terminal, and cron enforcement. |
 | HERMES-060 | Active | `fix(browser): reject guest profile for real-profile browsing` | Mirror only a real Chrome profile into the managed browser snapshot and normalize its copied Local State to launch `Default`. |
 
 ## Fork-only administrative subject exemptions
@@ -674,6 +675,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream PR:** Related: #73450 (open; checked 2026-08-14).
 - **Regression:** `scripts/run_tests.sh tests/gateway/test_slack.py -k 'hidden_thread_parent or sanitized_lpg or message_edit_with_new_mention' -q`. The incident regression asserts the parent reaches neither routing nor persistence, cannot interrupt the active reply, and emits no busy acknowledgement.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Slack adapter changes. Remove only the hidden parent-update classifier and its focused tests after released upstream passes the cold-cache metadata-only replay, visible text/block/file/attachment changes, malformed and partial snapshots, and edited-in mention cases.
+
+### HERMES-058 — Make the gateway lifecycle guard configurable
+
+- **Hypothesis:** The current lifecycle safety policy is hard-coded independently in the gateway CLI, terminal tool, and cron creation path. A single default-on `security.gateway_lifecycle_guard` resolver, read live and fail-closed, can preserve existing behavior while permitting an explicit operator opt-out consistently across all three paths.
+- **Counter-hypothesis:** The native `/restart` command is sufficient and self-targeting terminal or cron lifecycle commands should remain unconditionally blocked. That remains the safer default, but it does not cover authorized agent-managed activation workflows that deliberately accept supervisor-loop risk and require the same policy at every enforcement boundary.
+- **Summary:** Adds a default-on config gate for supervised self-stop/restart/uninstall checks, terminal lifecycle-command inspection, and cron lifecycle-payload validation. Missing, malformed, or unreadable config keeps the guard enabled.
+- **Surfaces:** `cron/lifecycle_guard.py`; `tools/terminal_tool.py`; `hermes_cli/gateway.py`; `hermes_cli/config_defaults.py`; configuration documentation; focused gateway lifecycle tests.
+- **Upstream tracking:** Issue #30719 introduced the hard guard and mentioned an unimplemented `--allow-lifecycle` override. Closed PRs #35815 and #37057 proposed loop detection or guard removal; open PR #37063 proposes removal rather than a config switch. No released configurable equivalent identified after checked 2026-08-27.
+- **Upstream PR:** Related: #35815 (closed), #37057 (closed), #37063 (open); no direct PR after checked 2026-08-27.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_gateway_restart_loop.py -q`; config-default and documentation validation; broader local CI before publication.
+- **Rollback:** Set `security.gateway_lifecycle_guard: true` before reverting `feat(gateway): make lifecycle guard configurable`; restart externally and rerun the focused lifecycle tests. Never revert while relying on an in-process restart command for activation.
+- **Retirement:** Retire after released upstream provides a default-on, fail-closed operator opt-out that governs the CLI, terminal, and cron paths consistently and passes the fork regressions.
 
 ## Upstream association and feedback contract
 

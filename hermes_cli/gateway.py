@@ -8593,9 +8593,10 @@ def _gateway_command_inner(args):
         # PID-file ownership like stop/restart (#92560): the env marker is
         # inherited by every descendant, and CLI sessions spawned under the
         # gateway tree must stay able to manage it.
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if gateway_lifecycle_guard_enabled() and _is_supervised_gateway_process():
             print_error(
                 "Refusing to uninstall the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent the gateway from terminating itself.\n"
@@ -8717,9 +8718,10 @@ def _gateway_command_inner(args):
         # (env set, PID owned, but no supervisor): that is intentional and
         # harmless — with no supervisor there is no KeepAlive, so a self-stop is
         # a one-shot exit rather than a respawn loop.
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if gateway_lifecycle_guard_enabled() and _is_supervised_gateway_process():
             print_error(
                 "Refusing to stop the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"
@@ -8816,9 +8818,10 @@ def _gateway_command_inner(args):
         # (env set, PID owned, but no supervisor): that is intentional and
         # harmless — with no supervisor there is no KeepAlive, so a self-restart
         # is a single relaunch rather than a respawn loop.
+        from cron.lifecycle_guard import gateway_lifecycle_guard_enabled
         from tools.process_registry import _is_supervised_gateway_process
 
-        if _is_supervised_gateway_process():
+        if gateway_lifecycle_guard_enabled() and _is_supervised_gateway_process():
             print_error(
                 "Refusing to restart the gateway from inside the gateway process.\n"
                 "This command was blocked to prevent restart loops.\n"

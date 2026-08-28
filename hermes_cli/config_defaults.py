@@ -2694,6 +2694,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Block supervised gateways from stopping/restarting themselves and
+        # reject cron payloads that can create a lifecycle loop. Disable only
+        # when the supervisor and operator provide equivalent loop protection.
+        "gateway_lifecycle_guard": True,
         # Persisted acknowledgement for unattended model overrides whose tier
         # lets the vendor train on prompts/completions. The startup guard still
         # prints the full warning on every run and never bypasses cost guards.

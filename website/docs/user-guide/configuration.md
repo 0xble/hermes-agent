@@ -2458,6 +2458,7 @@ Pre-execution security scanning and secret redaction:
 ```yaml
 security:
   redact_secrets: true           # Redact API key patterns in tool output and logs (on by default)
+  gateway_lifecycle_guard: true  # Block supervised gateway self-restarts and lifecycle cron payloads
   tirith_enabled: true           # Enable Tirith security scanning for terminal commands
   tirith_path: "tirith"          # Path to tirith binary (default: "tirith" in $PATH)
   tirith_timeout: 5              # Seconds to wait for tirith scan before timing out
@@ -2469,6 +2470,7 @@ security:
 ```
 
 - `redact_secrets` — when `true`, automatically detects and redacts patterns that look like API keys, tokens, and passwords in tool output before it enters the conversation context and logs. **On by default**. Set to `false` explicitly only when you need raw credential-like strings for debugging or redactor development.
+- `gateway_lifecycle_guard` — when `true` (default), supervised gateways refuse self-targeting stop, restart, and uninstall commands, the terminal tool blocks equivalent lifecycle commands, and cron creation rejects lifecycle payloads. Set to `false` only when the process supervisor and operator provide equivalent restart-loop protection. Configuration read failures keep the guard enabled.
 - `tirith_enabled` — when `true`, terminal commands are scanned by [Tirith](https://github.com/sheeki03/tirith) before execution to detect potentially dangerous operations.
 - `tirith_path` — path to the tirith binary. Set this if tirith is installed in a non-standard location.
 - `tirith_timeout` — maximum seconds to wait for a tirith scan. Commands proceed if the scan times out.
