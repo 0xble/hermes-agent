@@ -25,7 +25,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
 | HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
-| HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(review): preserve reconciliation safety contracts` | Make raw SQLite backup and quarantine connection-safe. |
+| HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(review): preserve reconciliation safety contracts`; `fix(state): guard directory fsync by platform` | Make raw SQLite backup and quarantine connection-safe and portable. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
 | HERMES-004 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(telegram): atomically reserve per-chat sends`; `fix(telegram): preserve bounded cooldown semantics`; `fix(telegram): fail closed on over-cap flood penalties` | Enforce a per-chat Telegram send cooldown. |
 | HERMES-005 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(fork): preserve reconciled patch contracts` | Share the progress-edit throttle per chat. |
