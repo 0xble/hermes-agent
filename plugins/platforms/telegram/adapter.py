@@ -4724,6 +4724,15 @@ class TelegramAdapter(BasePlatformAdapter):
             topic_status_filter,
             self._handle_dm_topic_status_update,
         ))
+        checklist_filter = (
+            filters.CHECKLIST
+            | filters.StatusUpdate.CHECKLIST_TASKS_ADDED
+            | filters.StatusUpdate.CHECKLIST_TASKS_DONE
+        )
+        app.add_handler(TelegramMessageHandler(
+            checklist_filter,
+            self._handle_checklist_message,
+        ))
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text_message
@@ -4739,6 +4748,14 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TelegramMessageHandler(
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message
+        ))
+        # Keep this last in group 0. PTB dispatches only the first matching
+        # handler per group, so known message families are processed normally
+        # while future message-like payloads become observable instead of
+        # disappearing silently.
+        app.add_handler(TelegramMessageHandler(
+            filters.ALL,
+            self._handle_unmatched_message,
         ))
         # Handle inline keyboard button callbacks (update prompts)
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
@@ -9777,6 +9794,7 @@ class TelegramAdapter(BasePlatformAdapter):
         def _iter_sources():
             yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+            yield from cls._checklist_text_sources(message)
 
         for source_text, entities in _iter_sources():
             for entity in entities:
@@ -9843,6 +9861,7 @@ class TelegramAdapter(BasePlatformAdapter):
         def _iter_sources():
             yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
+            yield from self._checklist_text_sources(message)
 
         # Telegram parses mentions server-side and emits MessageEntity objects
         # (type=mention for @username, type=text_mention for @FirstName targeting
@@ -9950,7 +9969,12 @@ class TelegramAdapter(BasePlatformAdapter):
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
             return False
-        for candidate in (getattr(message, "text", None), getattr(message, "caption", None)):
+        checklist_text = [text for text, _entities in self._checklist_text_sources(message)]
+        for candidate in (
+            getattr(message, "text", None),
+            getattr(message, "caption", None),
+            *checklist_text,
+        ):
             if not candidate:
                 continue
             for pattern in self._mention_patterns:
@@ -10506,6 +10530,329 @@ class TelegramAdapter(BasePlatformAdapter):
         message = self._effective_update_message(update)
         if message is not None:
             self._record_dm_topic_status_update(message)
+
+    @staticmethod
+    def _checklist_from_message(message: Any) -> Any:
+        """Return a structurally valid checklist carried or referenced by a message."""
+
+        def _valid(value: Any) -> bool:
+            return (
+                value is not None
+                and isinstance(getattr(value, "title", None), str)
+                and isinstance(getattr(value, "tasks", None), (list, tuple))
+            )
+
+        checklist = getattr(message, "checklist", None)
+        if _valid(checklist):
+            return checklist
+        for attr in ("checklist_tasks_added", "checklist_tasks_done"):
+            status = getattr(message, attr, None)
+            referenced = getattr(status, "checklist_message", None)
+            checklist = getattr(referenced, "checklist", None)
+            if _valid(checklist):
+                return checklist
+        return None
+
+    @classmethod
+    def _checklist_text_sources(cls, message: Any):
+        """Yield checklist text/entity pairs for the existing mention gates."""
+        checklist = cls._checklist_from_message(message)
+        if checklist is None:
+            return
+        yield (
+            str(getattr(checklist, "title", "") or ""),
+            getattr(checklist, "title_entities", None) or [],
+        )
+        for task in list(getattr(checklist, "tasks", None) or []):
+            yield (
+                str(getattr(task, "text", "") or ""),
+                getattr(task, "text_entities", None) or [],
+            )
+
+    @staticmethod
+    def _checklist_entity_metadata(entities: Any) -> List[Dict[str, Any]]:
+        """Project Telegram entities to bounded JSON primitives."""
+        projected: List[Dict[str, Any]] = []
+        for entity in list(entities or [])[:100]:
+            item: Dict[str, Any] = {}
+            for key in (
+                "type",
+                "offset",
+                "length",
+                "url",
+                "language",
+                "custom_emoji_id",
+            ):
+                value = getattr(entity, key, None)
+                if value is not None:
+                    item[key] = str(value) if key in {"type", "url", "language", "custom_emoji_id"} else value
+            entity_user = getattr(entity, "user", None)
+            if entity_user is not None and getattr(entity_user, "id", None) is not None:
+                item["user_id"] = str(entity_user.id)
+            projected.append(item)
+        return projected
+
+    @staticmethod
+    def _checklist_actor_metadata(actor: Any) -> Optional[Dict[str, str]]:
+        if actor is None or getattr(actor, "id", None) is None:
+            return None
+        name = (
+            getattr(actor, "full_name", None)
+            or getattr(actor, "title", None)
+            or getattr(actor, "username", None)
+        )
+        return {
+            "id": str(actor.id),
+            "name": str(name) if name else "",
+        }
+
+    @classmethod
+    def _checklist_task_metadata(cls, task: Any) -> Dict[str, Any]:
+        completion_date = getattr(task, "completion_date", None)
+        completed_by_user = getattr(task, "completed_by_user", None)
+        completed_by_chat = getattr(task, "completed_by_chat", None)
+        completion_is_real = False
+        if completion_date is not None:
+            try:
+                # PTB uses a zero Unix timestamp datetime as the sentinel for
+                # an incomplete task. A truthiness check marks that task done.
+                completion_is_real = float(completion_date.timestamp()) > 0
+            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+                completion_is_real = bool(completion_date)
+        completed = bool(completed_by_user or completed_by_chat or completion_is_real)
+        return {
+            "id": int(getattr(task, "id")),
+            "text": str(getattr(task, "text", "") or "")[:100],
+            "text_entities": cls._checklist_entity_metadata(
+                getattr(task, "text_entities", None)
+            ),
+            "completed": completed,
+            "completed_by_user": cls._checklist_actor_metadata(completed_by_user),
+            "completed_by_chat": cls._checklist_actor_metadata(completed_by_chat),
+            "completion_date": (
+                completion_date.isoformat()
+                if completion_date is not None and hasattr(completion_date, "isoformat")
+                else None
+            ),
+        }
+
+    @classmethod
+    def _checklist_task_line(cls, task: Any) -> str:
+        item = cls._checklist_task_metadata(task)
+        return (
+            f"- [{'x' if item['completed'] else ' '}] "
+            f"#{item['id']} {item['text']}"
+        ).rstrip()
+
+    def _build_checklist_event(
+        self,
+        message: Message,
+        update_id: Optional[int] = None,
+    ) -> MessageEvent:
+        """Build one bounded text projection plus lossless checklist metadata."""
+        event = self._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=update_id,
+        )
+        checklist = self._checklist_from_message(message)
+        checklist_message = message
+        kind = "checklist"
+        tasks: List[Any] = []
+        metadata: Dict[str, Any]
+
+        added = getattr(message, "checklist_tasks_added", None)
+        done = getattr(message, "checklist_tasks_done", None)
+        if added is not None:
+            kind = "tasks_added"
+            tasks = list(getattr(added, "tasks", None) or [])
+            checklist_message = getattr(added, "checklist_message", None) or message
+        elif done is not None:
+            kind = "tasks_done"
+            checklist_message = getattr(done, "checklist_message", None) or message
+        elif checklist is not None:
+            tasks = list(getattr(checklist, "tasks", None) or [])
+
+        title = str(getattr(checklist, "title", "") or "")[:255]
+        checklist_message_id = getattr(checklist_message, "message_id", None)
+        metadata = {
+            "kind": kind,
+            "title": title,
+            "title_entities": self._checklist_entity_metadata(
+                getattr(checklist, "title_entities", None)
+            ),
+            "tasks": [self._checklist_task_metadata(task) for task in tasks[:30]],
+            "others_can_add_tasks": getattr(
+                checklist, "others_can_add_tasks", None
+            ),
+            "others_can_mark_tasks_as_done": getattr(
+                checklist, "others_can_mark_tasks_as_done", None
+            ),
+            "checklist_message_id": (
+                str(checklist_message_id) if checklist_message_id is not None else None
+            ),
+        }
+
+        if kind == "checklist":
+            lines = [f"Checklist: {title}" if title else "Checklist:"]
+            lines.extend(self._checklist_task_line(task) for task in tasks[:30])
+        elif kind == "tasks_added":
+            lines = [f"Checklist updated: {title}" if title else "Checklist updated:", "Added:"]
+            lines.extend(self._checklist_task_line(task) for task in tasks[:30])
+        else:
+            done_ids = [int(value) for value in list(
+                getattr(done, "marked_as_done_task_ids", None) or []
+            )[:30]]
+            undone_ids = [int(value) for value in list(
+                getattr(done, "marked_as_not_done_task_ids", None) or []
+            )[:30]]
+            metadata["marked_as_done_task_ids"] = done_ids
+            metadata["marked_as_not_done_task_ids"] = undone_ids
+            lines = [f"Checklist updated: {title}" if title else "Checklist updated:"]
+            if done_ids:
+                lines.append("Marked done: " + ", ".join(f"#{value}" for value in done_ids))
+            if undone_ids:
+                lines.append(
+                    "Marked not done: " + ", ".join(f"#{value}" for value in undone_ids)
+                )
+
+        event.text = "\n".join(lines)
+        event.allow_gateway_control = False
+        event.metadata["telegram_checklist"] = metadata
+        return event
+
+    async def _handle_checklist_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Normalize initial checklists and observe collaboration status changes."""
+        message = self._effective_update_message(update)
+        if message is None:
+            return
+        is_status = bool(
+            getattr(message, "checklist_tasks_added", None) is not None
+            or getattr(message, "checklist_tasks_done", None) is not None
+        )
+        if self._checklist_from_message(message) is None and not is_status:
+            logger.warning(
+                "[%s] Telegram checklist handler received no checklist payload "
+                "update_id=%s message_id=%s",
+                self.name,
+                getattr(update, "update_id", None),
+                getattr(message, "message_id", None),
+            )
+            return
+        if not self._is_user_authorized_from_message(message):
+            logger.warning(
+                "[Telegram] Blocked unauthorized checklist user %s in chat %s",
+                getattr(getattr(message, "from_user", None), "id", None),
+                getattr(getattr(message, "chat", None), "id", None),
+            )
+            return
+
+        event = self._build_checklist_event(message, update_id=update.update_id)
+        if is_status:
+            self._observe_unmentioned_group_message(
+                message,
+                MessageType.TEXT,
+                update_id=update.update_id,
+                event=event,
+            )
+            return
+
+        if not self._should_process_message(message):
+            if self._should_observe_unmentioned_group_message(message):
+                self._observe_unmentioned_group_message(
+                    message,
+                    MessageType.TEXT,
+                    update_id=update.update_id,
+                    event=event,
+                )
+            return
+        await self._ensure_forum_commands(message)
+        event = self._apply_telegram_group_observe_attribution(event)
+        await self.handle_message(event)
+
+    @staticmethod
+    def _unmatched_message_fields(message: Any) -> List[str]:
+        """Return bounded field names only, never payload values."""
+        ignored = {
+            "message_id", "date", "chat", "from_user", "sender_chat",
+            "from",
+            "business_connection_id", "message_thread_id", "is_topic_message",
+            "reply_to_message", "quote", "entities", "caption_entities",
+            "text", "caption", "forum_topic_created",
+        }
+
+        def _present(value: Any) -> bool:
+            if value is None or value is False:
+                return False
+            if isinstance(value, (str, bytes, list, tuple, dict, set)):
+                return bool(value)
+            return True
+
+        fields: Set[str] = set()
+        to_dict = getattr(message, "to_dict", None)
+        if callable(to_dict):
+            try:
+                serialized = to_dict()
+            except Exception:
+                serialized = None
+            if isinstance(serialized, dict):
+                fields.update(
+                    str(key)
+                    for key, value in serialized.items()
+                    if key not in ignored and key != "api_kwargs" and _present(value)
+                )
+        try:
+            instance_vars = vars(message)
+        except TypeError:
+            instance_vars = {}
+        fields.update(
+            str(key)
+            for key, value in instance_vars.items()
+            if key not in ignored and key != "api_kwargs" and _present(value)
+        )
+        # PTB TelegramObject subclasses are slotted and deliberately have no
+        # __dict__. Walk inherited slots so even a failed to_dict() call still
+        # yields a bounded shape without touching payload values.
+        for cls in type(message).__mro__:
+            slots = getattr(cls, "__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            for key in slots:
+                if key.startswith("_") or key in ignored or key == "api_kwargs":
+                    continue
+                try:
+                    value = getattr(message, key)
+                except Exception:
+                    continue
+                if _present(value):
+                    fields.add(str(key))
+        api_kwargs = getattr(message, "api_kwargs", None)
+        if isinstance(api_kwargs, dict):
+            fields.update(str(key) for key, value in api_kwargs.items() if _present(value))
+        return sorted(fields)[:32]
+
+    async def _handle_unmatched_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Surface future message families without logging their content."""
+        message = self._effective_update_message(update)
+        if message is None:
+            return
+        chat = getattr(message, "chat", None)
+        logger.warning(
+            "Unhandled Telegram message-like update update_id=%s message_id=%s "
+            "chat_type=%s payload_fields=%s",
+            getattr(update, "update_id", None),
+            getattr(message, "message_id", None),
+            str(getattr(chat, "type", "unknown"))[:32],
+            self._unmatched_message_fields(message),
+        )
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
