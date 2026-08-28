@@ -139,9 +139,10 @@ class TestExtractImages:
         assert "![cat]" not in cleaned
 
 
-    def test_local_markdown_image_with_spaces_is_extracted(self, tmp_path):
+    def test_local_markdown_image_with_spaces_is_extracted(self, tmp_path, monkeypatch):
         from urllib.parse import quote
 
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
         image_path = tmp_path / "Noorani Qaida — Next Page 4.png"
         image_path.write_bytes(b"not-a-real-image-but-an-existing-safe-file")
         content = f"![Likely next Noorani Qaida page]({image_path})"
@@ -150,6 +151,21 @@ class TestExtractImages:
 
         assert images == [(f"file://{quote(str(image_path))}", "Likely next Noorani Qaida page")]
         assert cleaned == ""
+
+    def test_local_markdown_image_outside_trusted_roots_is_preserved(
+        self, tmp_path, monkeypatch
+    ):
+        trusted = tmp_path / "trusted"
+        trusted.mkdir()
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(trusted))
+        image_path = tmp_path / "private.png"
+        image_path.write_bytes(b"not-a-real-image")
+        content = f"![private]({image_path})"
+
+        images, cleaned = BasePlatformAdapter.extract_images(content)
+
+        assert images == []
+        assert cleaned == content
 
     def test_nonexistent_local_markdown_image_is_preserved(self):
         content = "![missing](/tmp/hermes-missing-image.png)"
