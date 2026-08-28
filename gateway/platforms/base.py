@@ -1397,6 +1397,22 @@ def _media_delivery_allowed_roots() -> List[Path]:
     return roots
 
 
+def _is_media_delivery_allowed_root(path: str) -> bool:
+    """Return whether a resolved local path is inside an explicit media root."""
+    try:
+        candidate = Path(path).resolve(strict=True)
+    except OSError:
+        return False
+    for root in _media_delivery_allowed_roots():
+        try:
+            resolved_root = root.expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if candidate == resolved_root or _path_is_within(candidate, resolved_root):
+            return True
+    return False
+
+
 def _media_delivery_recency_seconds() -> float:
     """Return the recency window for trusting freshly-produced files.
 
@@ -4777,9 +4793,13 @@ class BasePlatformAdapter(ABC):
             else:
                 path = raw_path
             safe_path = validate_media_delivery_path(path)
-            if safe_path and Path(safe_path).suffix.lower() in {
-                '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg'
-            }:
+            if (
+                safe_path
+                and _is_media_delivery_allowed_root(safe_path)
+                and Path(safe_path).suffix.lower() in {
+                    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.svg'
+                }
+            ):
                 images.append((f"file://{_quote(safe_path)}", alt_text))
 
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
