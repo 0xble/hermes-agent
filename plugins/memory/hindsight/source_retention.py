@@ -343,6 +343,7 @@ def discover_source_candidates(
     *,
     session_id: str = "",
     retain_attachments: bool = False,
+    retain_tool_sources: bool = False,
     retain_file_extractions: bool = False,
     attachment_roots: Iterable[Path] | None = None,
 ) -> list[SourceCandidate]:
@@ -436,8 +437,12 @@ def discover_source_candidates(
         if candidate:
             candidates.append(candidate)
 
-    # Tool-produced source text and final durable text artifacts.
+    # Tool-derived source text and final durable text artifacts cross an
+    # external-retention boundary, so they require one explicit default-off
+    # opt-in in addition to any narrower source-type gate.
     for name, args, result in _assistant_calls(messages):
+        if not retain_tool_sources:
+            continue
         if name in _TEXT_SOURCE_TOOLS:
             source_type = _TEXT_SOURCE_TOOLS[name]
             if source_type == "file_extraction" and not retain_file_extractions:

@@ -967,6 +967,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Retain controls
         self._auto_retain = True
         self._retain_attachments = False
+        self._retain_tool_sources = False
         self._retain_file_extractions = False
         self._retain_every_n_turns = 1
         self._retain_async = True
@@ -1356,7 +1357,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_indicator", "description": "Show a '🧠 Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_attachments", "description": "Upload raw file attachments to Hindsight during automatic source retention. Default off because this reads and durably transmits the original file bytes.", "default": False},
-            {"key": "retain_file_extractions", "description": "Retain generic read_file output as source evidence. Default off because arbitrary files can contain credentials that blacklist detection cannot safely identify.", "default": False},
+            {"key": "retain_tool_sources", "description": "Retain tool-derived webpages, transcripts, file extracts, and written artifacts as source evidence. Default off because tool outputs may contain authenticated or private material.", "default": False},
+            {"key": "retain_file_extractions", "description": "Retain generic read_file output as source evidence when retain_tool_sources is also enabled. Default off because arbitrary files can contain credentials that blacklist detection cannot safely identify.", "default": False},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
@@ -1978,6 +1980,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # Retain controls
         self._auto_retain = self._config.get("auto_retain", True)
         self._retain_attachments = self._config.get("retain_attachments") is True
+        self._retain_tool_sources = self._config.get("retain_tool_sources") is True
         self._retain_file_extractions = self._config.get("retain_file_extractions") is True
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
@@ -2497,6 +2500,7 @@ class HindsightMemoryProvider(MemoryProvider):
             messages,
             session_id=self._session_id,
             retain_attachments=self._retain_attachments,
+            retain_tool_sources=self._retain_tool_sources,
             retain_file_extractions=self._retain_file_extractions,
         ) if messages else []
         if source_candidates:
