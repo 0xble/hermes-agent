@@ -151,6 +151,33 @@ def test_provisional_verification_candidates_remain_crash_durable():
     )
 
 
+def test_provisional_verification_candidate_is_written_by_crash_flush():
+    candidate = {
+        "role": "assistant",
+        "content": "candidate already shown to the user",
+        "_verification_candidate": True,
+    }
+    instance = object.__new__(AIAgent)
+    instance._session_db = MagicMock()
+    instance._session_db_created = True
+    instance.session_id = "verification-crash-window"
+    instance._last_flushed_db_idx = 0
+    instance._flushed_db_message_ids = set()
+    instance._flushed_db_message_session_id = None
+    setattr(instance, "_persist_disabled", False)
+    setattr(instance, "_persist_user_message_idx", None)
+    setattr(instance, "_persist_user_message_override", None)
+    setattr(instance, "_persist_user_message_timestamp", None)
+    setattr(instance, "_pending_cli_user_message", None)
+
+    assert instance._flush_messages_to_session_db([candidate], []) is True
+
+    written = instance._session_db.append_messages_batch.call_args.kwargs["messages"]
+    assert len(written) == 1
+    assert written[0]["role"] == "assistant"
+    assert written[0]["content"] == "candidate already shown to the user"
+
+
 def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}
