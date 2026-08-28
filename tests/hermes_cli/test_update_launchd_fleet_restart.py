@@ -213,6 +213,9 @@ class TestGetServicePidsScoping:
         monkeypatch.setattr(
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
+        monkeypatch.setattr(
+            gw.subprocess, "run", lambda *a, **k: _completed(0, "")
+        )
 
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
@@ -642,13 +645,15 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
-    def test_launchd_labels_get_launchctl_hint(self, capsys):
+    def test_launchd_labels_get_launchctl_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(gw, "is_macos", lambda: True)
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
-        assert "launchctl kickstart -k" in out
+        assert "launchctl bootstrap" in out
 
-    def test_systemd_units_keep_systemctl_hint(self, capsys):
+    def test_systemd_units_keep_systemctl_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(gw, "is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out

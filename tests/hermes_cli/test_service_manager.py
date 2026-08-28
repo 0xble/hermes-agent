@@ -316,9 +316,10 @@ def test_render_finish_script_does_not_restart_on_clean_exit(tmp_path) -> None:
     import subprocess
 
     script = tmp_path / "finish"
-    script.write_text(S6ServiceManager._render_finish_script(
-        encoding="utf-8"
-    ))
+    script.write_text(
+        S6ServiceManager._render_finish_script(),
+        encoding="utf-8",
+    )
     script.chmod(0o755)
 
     def finish_exit(run_exit_code: int) -> int:

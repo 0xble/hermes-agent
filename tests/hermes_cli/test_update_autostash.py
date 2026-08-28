@@ -40,15 +40,16 @@ def _patch_managed_uv(request):
         yield
 
 
-
-
-
-
-
-
-
-
-
+@pytest.fixture(autouse=True)
+def _isolate_update_host():
+    """Keep update tests away from live gateways and the macOS TCC anchor."""
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.gateway.is_macos", return_value=False), \
+         patch("hermes_cli.main._purge_stale_hermes_modules", return_value=None), \
+         patch("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", return_value=None):
+        yield
 
 
 # ---------------------------------------------------------------------------

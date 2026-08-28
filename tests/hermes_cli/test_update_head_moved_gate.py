@@ -88,6 +88,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_stash_local_changes_if_needed", lambda *a, **k: None
     )
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
     )
@@ -119,6 +120,11 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
     )
+    monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
+
+    import hermes_cli.macos_tcc_anchor as macos_tcc_anchor
+
+    monkeypatch.setattr(macos_tcc_anchor, "ensure_tcc_anchor", lambda *a, **k: None)
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):

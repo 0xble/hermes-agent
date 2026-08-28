@@ -1323,13 +1323,11 @@ async def _send_via_adapter(
                             "error": "Live gateway adapter send timed out after dispatch; delivery is ambiguous",
                         }
                     except asyncio.CancelledError:
-                        bridge.cancel()
-                        task = task_holder.get("task")
-                        if task is not None and not task.done():
-                            try:
-                                gateway_loop.call_soon_threadsafe(task.cancel)
-                            except Exception:
-                                pass
+                        # The adapter send has already been enqueued on its
+                        # owner loop. Caller cancellation must not cancel an
+                        # external side effect whose delivery may already be
+                        # visible; the completion callback will settle the
+                        # bridge after the caller has gone away.
                         raise
             except asyncio.CancelledError:
                 raise

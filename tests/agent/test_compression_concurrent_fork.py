@@ -174,7 +174,7 @@ def test_lock_contender_preserves_terminal_compaction_lifecycle(tmp_path: Path) 
     unless ``compression.progress_notices`` is enabled.  The low-level event
     must remain available so the desktop can retire its compaction phase.
     """
-    from agent.conversation_compression import COMPACTION_DONE_STATUS
+    from agent.conversation_compression import COMPACTION_DEFERRED_STATUS
 
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "LOCK_CONTENDER_STATUS_TEST"
@@ -198,7 +198,9 @@ def test_lock_contender_preserves_terminal_compaction_lifecycle(tmp_path: Path) 
 
     assert returned is messages
     assert getattr(agent, "_compression_skipped_due_to_lock", None) == "winner"
-    assert status_events.count(("compacted", COMPACTION_DONE_STATUS)) == 1
+    assert status_events.count(
+        ("compaction_deferred", COMPACTION_DEFERRED_STATUS)
+    ) == 1
 
 
 def test_failed_session_split_does_not_announce_compaction_complete(tmp_path: Path) -> None:

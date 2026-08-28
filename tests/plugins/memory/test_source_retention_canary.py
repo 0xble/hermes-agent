@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from hindsight_client import Hindsight
 from plugins.memory.hindsight import HindsightMemoryProvider
 from plugins.memory.hindsight.source_retention import discover_source_candidates
 
@@ -25,6 +24,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_real_disposable_bank_source_retention(tmp_path, monkeypatch):
+    from hindsight_client import Hindsight
+
     api_url = os.environ.get("HINDSIGHT_API_URL", "http://127.0.0.1:9177")
     bank_id = f"hermes-source-canary-{uuid.uuid4().hex[:12]}"
     client = Hindsight(base_url=api_url, timeout=180)

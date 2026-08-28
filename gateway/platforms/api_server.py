@@ -1231,23 +1231,6 @@ def _api_final_response_text(result: Dict[str, Any]) -> str:
     return _resolve_media_to_data_urls(text)
 
 
-def _is_api_interrupt_sentinel(result: Dict[str, Any], text: Any) -> bool:
-    """Return whether *text* is Hermes' internal API-wait interrupt status."""
-    return (
-        bool(result.get("interrupted"))
-        and isinstance(text, str)
-        and text.strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
-    )
-
-
-def _api_final_response_text(result: Dict[str, Any]) -> str:
-    """Return user-facing text while keeping interrupt sentinels as metadata."""
-    text = result.get("final_response", "") or ""
-    if _is_api_interrupt_sentinel(result, text):
-        return ""
-    return _resolve_media_to_data_urls(text)
-
-
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -7158,8 +7141,6 @@ class APIServerAdapter(BasePlatformAdapter):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") not in {"assistant", "tool"}:
-                continue
-            if msg.get("role") == "assistant" and _is_api_interrupt_sentinel(result, msg.get("content")):
                 continue
             if msg.get("role") == "assistant" and _is_api_interrupt_sentinel(result, msg.get("content")):
                 continue
