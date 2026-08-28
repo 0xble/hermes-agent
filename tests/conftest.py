@@ -1327,13 +1327,27 @@ def _live_system_guard(request, monkeypatch):
     # the live psutil walk below. Static set keeps the fast path cheap.
     try:
         import psutil as _psutil
-        _initial_children = {
-            c.pid for c in _psutil.Process(test_pid).children(recursive=True)
-        }
+        _initial_children = list(
+            _psutil.Process(test_pid).children(recursive=True)
+        )
     except Exception:
         _psutil = None
-        _initial_children = set()
-    _spawned_pids = set(_initial_children)
+        _initial_children = []
+    _spawned_identities = {}
+
+    def _remember_spawned_pid(pid: int) -> None:
+        if _psutil is None:
+            return
+        try:
+            _spawned_identities[int(pid)] = _psutil.Process(int(pid)).create_time()
+        except Exception:
+            pass
+
+    for _child in _initial_children:
+        try:
+            _spawned_identities[_child.pid] = _child.create_time()
+        except Exception:
+            pass
 
     def _is_own_subtree(pid: int) -> bool:
         # PID 0 means "our own process group"; -1 means "every process we
@@ -1344,10 +1358,21 @@ def _live_system_guard(request, monkeypatch):
             return True
         if pid < 0:
             return False
-        if pid == test_pid or pid in _spawned_pids:
+        if pid == test_pid:
             return True
         if _psutil is None:
             return False
+        expected_created = _spawned_identities.get(pid)
+        if expected_created is not None:
+            try:
+                if _psutil.Process(pid).create_time() == expected_created:
+                    return True
+            except Exception:
+                # The recorded child exited. A kill against the stale PID is a
+                # no-op unless the OS has already recycled it, which the
+                # creation-time mismatch above rejects.
+                return True
+            _spawned_identities.pop(pid, None)
         try:
             walker = _psutil.Process(pid)
         except Exception:
@@ -1572,7 +1597,7 @@ def _live_system_guard(request, monkeypatch):
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
                 super().__init__(cmd, *args, **kwargs)
-                _spawned_pids.add(self.pid)
+                _remember_spawned_pid(self.pid)
 
         _GuardedPopen.__name__ = "Popen"
         _GuardedPopen.__qualname__ = "Popen"
@@ -1646,13 +1671,13 @@ def _live_system_guard(request, monkeypatch):
                 "asyncio.create_subprocess_exec", [program, *args]
             )
             proc = await real_async_exec(program, *args, **kwargs)
-            _spawned_pids.add(proc.pid)
+            _remember_spawned_pid(proc.pid)
             return proc
 
         async def _guarded_async_shell(cmd, *args, **kwargs):
             _check_subprocess_cmd("asyncio.create_subprocess_shell", cmd)
             proc = await real_async_shell(cmd, *args, **kwargs)
-            _spawned_pids.add(proc.pid)
+            _remember_spawned_pid(proc.pid)
             return proc
 
         monkeypatch.setattr(_asyncio, "create_subprocess_exec", _guarded_async_exec)
