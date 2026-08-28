@@ -470,19 +470,29 @@ class MemoryManager:
 
     # -- Registration --------------------------------------------------------
 
-    def _rebuild_tool_routing(self) -> None:
+    def _rebuild_tool_routing(
+        self,
+        providers: Optional[List[MemoryProvider]] = None,
+        *,
+        reason: str = "provider registration",
+    ) -> None:
         """Atomically rebuild provider-tool routes from current schemas.
 
         Providers may change their tool surface during ``initialize()`` after
         loading configuration or completing discovery. A full rebuild adds
         newly available tools, removes stale routes, and keeps routing aligned
-        with the schemas exposed to the model.
+        with the schemas exposed to the model. When initialization completes,
+        callers pass only successfully initialized providers so a provider that
+        mutates its schemas before raising cannot expose untrusted routes.
         """
         from toolsets import _HERMES_CORE_TOOLS
 
+        routed_providers = self._providers if providers is None else providers
         core_tool_names = set(_HERMES_CORE_TOOLS)
+        old_routing = self._tool_to_provider
         new_routing: Dict[str, MemoryProvider] = {}
-        for provider in self._providers:
+        conflicts = 0
+        for provider in routed_providers:
             provider_routes: Dict[str, MemoryProvider] = {}
             try:
                 for raw_schema in provider.get_tool_schemas():
@@ -498,8 +508,14 @@ class MemoryManager:
                             provider.name, tool_name,
                         )
                         continue
-                    existing = new_routing.get(tool_name) or provider_routes.get(tool_name)
+                    if tool_name in new_routing:
+                        existing = new_routing[tool_name]
+                    elif tool_name in provider_routes:
+                        existing = provider_routes[tool_name]
+                    else:
+                        existing = None
                     if existing is not None:
+                        conflicts += 1
                         logger.warning(
                             "Memory tool name conflict: '%s' already registered by %s, "
                             "ignoring from %s",
@@ -519,7 +535,33 @@ class MemoryManager:
                 continue
             new_routing.update(provider_routes)
 
+        added = set(new_routing) - set(old_routing)
+        removed = set(old_routing) - set(new_routing)
+        moved = {
+            name
+            for name in set(old_routing) & set(new_routing)
+            if old_routing[name] is not new_routing[name]
+        }
         self._tool_to_provider = new_routing
+
+        if reason == "provider initialization" and (added or removed or moved or conflicts):
+            logger.info(
+                "Memory tool routing rebuilt after %s: added=%d removed=%d "
+                "moved=%d conflicts=%d",
+                reason,
+                len(added),
+                len(removed),
+                len(moved),
+                conflicts,
+            )
+        if added or removed or moved:
+            logger.debug(
+                "Memory tool routing delta after %s: added=%s removed=%s moved=%s",
+                reason,
+                sorted(added),
+                sorted(removed),
+                sorted(moved),
+            )
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a memory provider.
@@ -1444,12 +1486,17 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        initialized_providers: List[MemoryProvider] = []
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)
+                initialized_providers.append(provider)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
-        self._rebuild_tool_routing()
+        self._rebuild_tool_routing(
+            initialized_providers,
+            reason="provider initialization",
+        )
