@@ -589,6 +589,20 @@ def test_schema_surgery_bumps_the_schema_cookie(tmp_path):
 # then reachable against the only remaining copy of the damaged DB.
 
 
+def test_directory_fsync_is_skipped_on_windows(tmp_path, monkeypatch):
+    opened = []
+    monkeypatch.setattr(hermes_state.os, "name", "nt")
+    monkeypatch.setattr(
+        hermes_state.os,
+        "open",
+        lambda *args, **kwargs: opened.append((args, kwargs)),
+    )
+
+    hermes_state._fsync_directory(tmp_path)
+
+    assert opened == []
+
+
 def test_backup_refusal_hard_stops_the_repair(tmp_path, monkeypatch):
     """A refused pre-repair backup must abort the repair, not fail open."""
     db_path = tmp_path / "state.db"

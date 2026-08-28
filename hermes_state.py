@@ -2812,6 +2812,18 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
                 logger.warning("Could not prune stale DB backup %s: %s", victim, exc)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory fsync on platforms that support directory handles."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(path), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     """Atomically copy a malformed DB before repair, or return a hard-stop reason."""
     import datetime
@@ -2884,11 +2896,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                 )
                 os.replace(target, final)
                 published.append(final)
-            directory_fd = os.open(str(db_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(db_path.parent)
             final_snapshot = {
                 source.name: (source.stat().st_size, source.stat().st_mtime_ns, _sha256(source))
                 for source, _ in pairs
@@ -2910,11 +2918,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             with marker_tmp.open("rb") as handle:
                 os.fsync(handle.fileno())
             os.replace(marker_tmp, marker)
-            directory_fd = os.open(str(db_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            _fsync_directory(db_path.parent)
             return backup_path
         except Exception:
             for _, target in temporary:
