@@ -219,6 +219,11 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Telegram Business connection that owns this conversation. This is a
+    # routing discriminator, not an authorization claim. Kept last to preserve
+    # positional construction compatibility for older downstream integrations.
+    business_connection_id: Optional[str] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -277,6 +282,8 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.business_connection_id:
+            d["business_connection_id"] = self.business_connection_id
         if self.profile:
             d["profile"] = self.profile
         if self.auto_thread_created:
@@ -305,6 +312,7 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            business_connection_id=data.get("business_connection_id"),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
@@ -1132,6 +1140,12 @@ def build_session_key(
         if source.platform == Platform.SLACK and source.scope_id
         else None
     )
+    telegram_business_connection_id = (
+        str(getattr(source, "business_connection_id", ""))
+        if source.platform == Platform.TELEGRAM
+        and getattr(source, "business_connection_id", None)
+        else None
+    )
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -1140,6 +1154,8 @@ def build_session_key(
         dm_parts = [ns, platform, "dm"]
         if slack_scope_id:
             dm_parts.append(slack_scope_id)
+        if telegram_business_connection_id:
+            dm_parts.extend(("business", telegram_business_connection_id))
         if dm_chat_id:
             dm_parts.append(dm_chat_id)
             if source.thread_id:
@@ -1193,6 +1209,8 @@ def build_session_key(
 
     if slack_scope_id:
         key_parts.append(slack_scope_id)
+    if telegram_business_connection_id:
+        key_parts.extend(("business", telegram_business_connection_id))
     if source.chat_id:
         key_parts.append(source.chat_id)
     if effective_thread_id:

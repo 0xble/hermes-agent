@@ -1284,6 +1284,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    @staticmethod
+    def _business_connection_kwargs(
+        metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, str]:
+        """Return the PTB routing kwarg for a Telegram Business conversation."""
+        value = (metadata or {}).get("telegram_business_connection_id")
+        if value is None:
+            return {}
+        normalized = str(value).strip()
+        return {"business_connection_id": normalized} if normalized else {}
+
     def _is_callback_user_authorized(
         self,
         user_id: str,
@@ -2445,6 +2456,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # which must not be sent as a stray field on the raw endpoint.
         payload.update({k: v for k, v in thread_kwargs.items() if v is not None})
         payload.update(self._notification_kwargs(metadata))
+        payload.update(self._business_connection_kwargs(metadata))
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         if reply_to_id is not None:
@@ -2553,6 +2565,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "message_id": int(message_id),
             "rich_message": self._rich_message_payload(content),
         }
+        payload.update(self._business_connection_kwargs(metadata))
         # Edits target an existing message by chat_id + message_id. Topic
         # routing belongs only on send endpoints; forwarding message_thread_id
         # or direct_messages_topic_id makes Telegram reject this rich edit and
@@ -6037,6 +6050,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **self._business_connection_kwargs(metadata),
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -6053,6 +6067,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **self._business_connection_kwargs(metadata),
                                 )
                             else:
                                 raise
@@ -6245,6 +6260,208 @@ class TelegramAdapter(BasePlatformAdapter):
                 error_kind=error_kind,
             )
 
+    @staticmethod
+    def _load_input_checklist_types() -> tuple[Any, Any]:
+        """Load PTB checklist input types lazily for optional Telegram installs."""
+        from telegram import InputChecklist, InputChecklistTask
+
+        return InputChecklist, InputChecklistTask
+
+    def _build_input_checklist(
+        self,
+        title: str,
+        tasks: List[Dict[str, Any]],
+        *,
+        others_can_add_tasks: bool = False,
+        others_can_mark_tasks_as_done: bool = False,
+    ) -> Any:
+        """Validate and construct PTB checklist input objects."""
+        InputChecklist, InputChecklistTask = self._load_input_checklist_types()
+
+        if not isinstance(title, str):
+            raise ValueError("Checklist title must be a string")
+        normalized_title = title
+        if not 1 <= len(normalized_title) <= 255:
+            raise ValueError("Checklist title must contain 1-255 characters")
+        if not 1 <= len(tasks) <= 30:
+            raise ValueError("Checklist must contain 1-30 tasks")
+
+        normalized_tasks = []
+        seen_ids: Set[int] = set()
+        for raw_task in tasks:
+            if not isinstance(raw_task, dict):
+                raise ValueError("Each checklist task must be an object")
+            task_id = raw_task.get("id")
+            if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+                raise ValueError("Checklist task IDs must be positive integers")
+            if task_id in seen_ids:
+                raise ValueError("Checklist task IDs must be unique")
+            seen_ids.add(task_id)
+            text = raw_task.get("text")
+            if not isinstance(text, str) or not 1 <= len(text) <= 100:
+                raise ValueError("Checklist task text must contain 1-100 characters")
+            normalized_tasks.append(InputChecklistTask(id=task_id, text=text))
+
+        if not isinstance(others_can_add_tasks, bool) or not isinstance(
+            others_can_mark_tasks_as_done, bool
+        ):
+            raise ValueError("Checklist collaboration flags must be boolean")
+        return InputChecklist(
+            title=normalized_title,
+            tasks=normalized_tasks,
+            others_can_add_tasks=others_can_add_tasks,
+            others_can_mark_tasks_as_done=others_can_mark_tasks_as_done,
+        )
+
+    def _checklist_transport_failure(
+        self,
+        error: Exception,
+        *,
+        ambiguous_send: bool,
+    ) -> SendResult:
+        """Classify checklist failures without authorizing duplicate sends."""
+        retry_after = self._telegram_retry_after(error)
+        error_kind = classify_send_error(error)
+        retryable = bool(
+            retry_after is not None
+            or self._looks_like_connect_timeout(error)
+            or self._looks_like_pool_timeout(error)
+        )
+        if not ambiguous_send and error_kind in {"transient", "rate_limited"}:
+            # Checklist edits are idempotent for one message ID. Retrying a
+            # classified transport/rate-limit failure cannot create a duplicate.
+            retryable = True
+        return SendResult(
+            success=False,
+            error=_redact_telegram_error_text(error),
+            retryable=retryable,
+            retry_after=(
+                self._bounded_send_retry_after(retry_after)
+                if retry_after is not None
+                else None
+            ),
+            error_kind=error_kind,
+        )
+
+    async def send_checklist(
+        self,
+        chat_id: str,
+        title: str,
+        tasks: List[Dict[str, Any]],
+        *,
+        business_connection_id: Optional[str] = None,
+        others_can_add_tasks: bool = False,
+        others_can_mark_tasks_as_done: bool = False,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a native checklist through an explicit Telegram Business connection."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected", retryable=False)
+        connection_id = str(
+            business_connection_id
+            or (metadata or {}).get("telegram_business_connection_id")
+            or ""
+        ).strip()
+        if not connection_id:
+            return SendResult(
+                success=False,
+                error="Telegram native checklists require business_connection_id",
+                retryable=False,
+            )
+        try:
+            checklist = self._build_input_checklist(
+                title,
+                tasks,
+                others_can_add_tasks=others_can_add_tasks,
+                others_can_mark_tasks_as_done=others_can_mark_tasks_as_done,
+            )
+        except (TypeError, ValueError) as error:
+            return SendResult(success=False, error=str(error), retryable=False)
+
+        kwargs: Dict[str, Any] = {
+            "business_connection_id": connection_id,
+            "chat_id": normalize_telegram_chat_id(chat_id),
+            "checklist": checklist,
+            **self._notification_kwargs(metadata),
+        }
+        if reply_to is not None:
+            try:
+                kwargs["reply_to_message_id"] = int(reply_to)
+            except (TypeError, ValueError):
+                return SendResult(
+                    success=False,
+                    error="reply_to must be a Telegram message ID",
+                    retryable=False,
+                )
+        try:
+            message = await self._run_send_call(
+                chat_id,
+                self._bot.send_checklist,
+                **kwargs,
+            )
+        except _TelegramSendCooldownExceeded as error:
+            return self._send_cooldown_failure(error)
+        except Exception as error:
+            return self._checklist_transport_failure(error, ambiguous_send=True)
+        message_id = getattr(message, "message_id", None)
+        return SendResult(
+            success=True,
+            message_id=str(message_id) if message_id is not None else None,
+        )
+
+    async def edit_checklist(
+        self,
+        chat_id: str,
+        message_id: str,
+        title: str,
+        tasks: List[Dict[str, Any]],
+        *,
+        business_connection_id: Optional[str] = None,
+        others_can_add_tasks: bool = False,
+        others_can_mark_tasks_as_done: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Idempotently replace a native checklist through its Business connection."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected", retryable=False)
+        connection_id = str(
+            business_connection_id
+            or (metadata or {}).get("telegram_business_connection_id")
+            or ""
+        ).strip()
+        if not connection_id:
+            return SendResult(
+                success=False,
+                error="Telegram native checklists require business_connection_id",
+                retryable=False,
+            )
+        try:
+            normalized_message_id = int(message_id)
+            checklist = self._build_input_checklist(
+                title,
+                tasks,
+                others_can_add_tasks=others_can_add_tasks,
+                others_can_mark_tasks_as_done=others_can_mark_tasks_as_done,
+            )
+        except (TypeError, ValueError) as error:
+            return SendResult(success=False, error=str(error), retryable=False)
+        try:
+            message = await self._run_send_call(
+                chat_id,
+                self._bot.edit_message_checklist,
+                business_connection_id=connection_id,
+                chat_id=normalize_telegram_chat_id(chat_id),
+                message_id=normalized_message_id,
+                checklist=checklist,
+            )
+        except _TelegramSendCooldownExceeded as error:
+            return self._send_cooldown_failure(error)
+        except Exception as error:
+            return self._checklist_transport_failure(error, ambiguous_send=False)
+        returned_id = getattr(message, "message_id", normalized_message_id)
+        return SendResult(success=True, message_id=str(returned_id))
+
     async def send_or_update_status(
         self,
         chat_id: str,
@@ -6358,6 +6575,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    **self._business_connection_kwargs(metadata),
                 )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
@@ -6370,6 +6588,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    **self._business_connection_kwargs(metadata),
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -6387,6 +6606,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
+                    **self._business_connection_kwargs(metadata),
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -6415,6 +6635,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=truncated,
+                    **self._business_connection_kwargs(metadata),
                 )
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
@@ -6436,6 +6657,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        **self._business_connection_kwargs(metadata),
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -6543,7 +6765,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         message_id=int(message_id),
                         text=formatted,
                         parse_mode=ParseMode.MARKDOWN_V2,
-                    )
+                        **self._business_connection_kwargs(metadata),
+                        )
                 except Exception as fmt_err:
                     if "not modified" not in str(fmt_err).lower():
                         logger.warning(
@@ -6555,12 +6778,14 @@ class TelegramAdapter(BasePlatformAdapter):
                             chat_id=normalize_telegram_chat_id(chat_id),
                             message_id=int(message_id),
                             text=_strip_mdv2(first_chunk),
-                        )
+                            **self._business_connection_kwargs(metadata),
+                            )
             else:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=first_chunk,
+                    **self._business_connection_kwargs(metadata),
                 )
         except Exception as e:
             err_str = str(e).lower()
@@ -9206,6 +9431,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=normalize_telegram_chat_id(chat_id),
                 action="typing",
                 message_thread_id=message_thread_id,
+                **self._business_connection_kwargs(metadata),
             )
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         except Exception as e:
@@ -9217,6 +9443,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._bot.send_chat_action(
                         chat_id=normalize_telegram_chat_id(chat_id),
                         action="typing",
+                        **self._business_connection_kwargs(metadata),
                     )
                     self._telegram_typing_cooldown_until.pop(str(chat_id), None)
                     return
@@ -11881,6 +12108,12 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
+        business_connection_id = getattr(message, "business_connection_id", None)
+        event_metadata: Dict[str, Any] = {}
+        if isinstance(business_connection_id, str) and business_connection_id.strip():
+            business_connection_id = business_connection_id.strip()
+            source.business_connection_id = business_connection_id
+            event_metadata["telegram_business_connection_id"] = business_connection_id
         
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)
@@ -11938,6 +12171,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            metadata=event_metadata,
             timestamp=message.date,
         )
 

@@ -26558,6 +26558,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            business_connection_id = getattr(source, "business_connection_id", None)
+            if business_connection_id:
+                metadata = dict(metadata or {})
+                metadata["telegram_business_connection_id"] = str(
+                    business_connection_id
+                )
         return metadata
 
     def _thread_metadata_for_target(
