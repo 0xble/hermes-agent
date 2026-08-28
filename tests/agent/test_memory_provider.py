@@ -1,6 +1,7 @@
 """Tests for the memory provider interface, manager, and builtin provider."""
 
 import json
+import logging
 import threading
 import time
 import pytest
@@ -121,6 +122,38 @@ class InitializedToolProvider(FakeMemoryProvider):
         self._tools = list(self._tools_after_initialize)
 
 
+class FailedInitializedToolProvider(InitializedToolProvider):
+    """Provider that mutates its schemas before initialization fails."""
+
+    def initialize(self, session_id, **kwargs):
+        super().initialize(session_id, **kwargs)
+        raise RuntimeError("provider initialization failed")
+
+
+class GeneratorFailureToolProvider(FakeMemoryProvider):
+    """Provider whose post-initialize schema generator fails after yielding."""
+
+    def initialize(self, session_id, **kwargs):
+        super().initialize(session_id, **kwargs)
+
+    def get_tool_schemas(self):
+        if not self.initialized:
+            return []
+
+        def _schemas():
+            yield {"name": "partial_tool", "description": "partial", "parameters": {}}
+            raise RuntimeError("schema iteration failed")
+
+        return _schemas()
+
+
+class FalsyMemoryProvider(FakeMemoryProvider):
+    """Provider with unusual falsy behavior for conflict-routing coverage."""
+
+    def __bool__(self):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -236,6 +269,58 @@ class TestMemoryManager:
         advertised = {schema["name"] for schema in mgr.get_all_tool_schemas()}
         assert "clarify" not in advertised
         assert advertised == set(mgr.get_all_tool_names())
+
+    def test_initialize_failure_excludes_mutated_provider_tools(self):
+        """Schemas from a provider that failed initialization are untrusted."""
+        late = [{"name": "failed_tool", "description": "unsafe", "parameters": {}}]
+        mgr = MemoryManager()
+        provider = FailedInitializedToolProvider(after=late)
+        mgr.add_provider(provider)
+
+        mgr.initialize_all("session")
+
+        assert not mgr.has_tool("failed_tool")
+        assert "failed_tool" not in {schema["name"] for schema in mgr.get_all_tool_schemas()}
+
+    def test_schema_generator_failure_rolls_back_that_provider(self):
+        """A partial schema iteration must contribute no routes."""
+        good_schema = {"name": "good_tool", "description": "good", "parameters": {}}
+        mgr = MemoryManager()
+        mgr.add_provider(FakeMemoryProvider("builtin", tools=[good_schema]))
+        mgr.add_provider(GeneratorFailureToolProvider("external"))
+
+        mgr.initialize_all("session")
+
+        assert mgr.has_tool("good_tool")
+        assert not mgr.has_tool("partial_tool")
+        assert {schema["name"] for schema in mgr.get_all_tool_schemas()} == {"good_tool"}
+
+    def test_falsy_first_provider_keeps_conflict_precedence(self):
+        """Conflict resolution must use key membership, not provider truthiness."""
+        shared = {"name": "shared_tool", "description": "shared", "parameters": {}}
+        first = FalsyMemoryProvider("builtin", tools=[shared])
+        second = FakeMemoryProvider("external", tools=[shared])
+        mgr = MemoryManager()
+        mgr.add_provider(first)
+        mgr.add_provider(second)
+
+        mgr.initialize_all("session")
+
+        assert mgr._tool_to_provider["shared_tool"] is first
+
+    def test_initialize_logs_route_delta_counts_without_tool_names(self, caplog):
+        """Changed route counts are visible without exposing provider tool names at INFO."""
+        late = [{"name": "private_late_tool", "description": "late", "parameters": {}}]
+        mgr = MemoryManager()
+        mgr.add_provider(InitializedToolProvider(after=late))
+
+        with caplog.at_level(logging.INFO, logger="agent.memory_manager"):
+            mgr.initialize_all("session")
+
+        info_text = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
+        assert "added=1" in info_text
+        assert "removed=0" in info_text
+        assert "private_late_tool" not in info_text
 
 
 
