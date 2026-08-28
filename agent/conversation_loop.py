@@ -8799,9 +8799,10 @@ def run_conversation(
                     # or composes with the pending answer.
                     final_msg["_verification_candidate"] = True
                 append_message(messages, final_msg)
-                # Make an ordinary completed answer durable before leaving the
-                # loop. Provisional verification candidates are skipped by the
-                # flush and persisted only after finalization collapses them.
+                # Make every completed answer durable before leaving the loop.
+                # Provisional verification candidates are written here as
+                # crash-recovery rows, then finalization transactionally
+                # collapses them into the canonical answer.
                 # A session torn down before finalize_turn's _persist_session
                 # otherwise loses a reply the user already saw (#81641). Same
                 # contract as the tool-call exit (#49045) and the verify exits
