@@ -83,6 +83,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-059 | Active | `fix(memory): keep initialized provider tools routable`; `fix(memory): harden initialized provider routing` | Rebuild memory-provider tool routing after initialization and advertise only schemas that the manager can dispatch. |
 | HERMES-060 | Active | `fix(browser): reject guest profile for real-profile browsing` | Mirror only a real Chrome profile into the managed browser snapshot and normalize its copied Local State to launch `Default`. |
 | HERMES-061 | Active | `fix(desktop): compare shebang paths case-insensitively` | Recognize a venv-owned Python launcher on case-insensitive filesystems instead of prefixing it with a redundant interpreter. |
+| HERMES-062 | Active | `fix(telegram): normalize inbound checklists` | Convert native Telegram checklists into bounded agent-visible events and make unsupported message-like updates observable instead of silently dropping them. |
 
 ## Fork-only administrative subject exemptions
 
@@ -116,6 +117,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-062 — Normalize inbound Telegram checklists
+
+- **Independent hypothesis (2026-08-28):** Telegram delivers native checklist, `ChecklistTasksAdded`, and `ChecklistTasksDone` payloads as message-like updates, but `_register_handlers()` has no matching filter and `_build_message_event()` reads only ordinary text. The group-99 observer does not dispatch them, so a valid update is acknowledged and silently lost. The correction belongs at Telegram ingress: use PTB 22.8's typed checklist filters and objects, project bounded human-readable text plus structured metadata into one `MessageEvent`, preserve ordinary authorization/topic gates, treat collaboration status changes as observed context instead of unsolicited turns, and register a final group-0 `filters.ALL` guard that logs sanitized shape metadata for any future unmatched message without duplicating matched handlers or exposing content.
+- **Summary:** Normalizes initial checklists, added tasks, and done/undone task IDs through the existing Telegram event pipeline; disables gateway-command interpretation for generated text; preserves task IDs, completion attribution/timestamps, collaboration flags, and referenced checklist message identity; and surfaces future unsupported message-like updates through bounded metadata-only logs. Status updates remain observable even when Telegram omits the optional referenced checklist message.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_checklist_ingress.py`; `tests/gateway/test_gateway_platform_event_hook.py`; this record.
+- **Upstream tracking:** Canonical open issue #78718 tracks inbound checklist and checklist-service-message loss. Canonical open issue #78696 tracks the broader subscribed-but-unhandled Telegram update class. Open Rich Message PRs #63491, #81369, #94899, and #95292 independently demonstrate the same allowlist fallthrough for one content family but do not normalize checklists or establish a generic message guard. Upstream `main` at `3340bbbdad8368e7f3d9f6827d61692adbbd87d6` still drops the reproduced checklist update as of 2026-08-28.
+- **Upstream PR:** None found for inbound checklists. Related generic/rich-message PRs only: #63491, #81369, #94899, and #95292.
+- **Regression:** RED reproduced one real PTB 22.8 checklist matching only the group-99 observer. GREEN: `scripts/run_tests.sh tests/gateway/test_gateway_platform_event_hook.py tests/gateway/test_telegram*.py -q` passed `682` tests across `63` files; the focused checklist file passed `7` tests, including missing-reference status events and a slotted-message fallback; and a real PTB 22.8 canary proved the final guard handles `telegram.Message` without `__dict__` and reports only `dice`. `git diff --check`, bytecode compilation, Ruff, and manifest validation passed. Independent Claude autoreview found and the patch fixed the slotted-PTB `vars()` crash; confirmation review exited `0` with no P0/P1 findings.
+- **Published commit identity:** Stable subject `fix(telegram): normalize inbound checklists`; source, regressions, and this record ship together.
+- **Rollback:** Revert only `fix(telegram): normalize inbound checklists`, removing the checklist classifier/handler, final unmatched-message guard, focused regressions, and this record. Preserve existing text/media/location/topic handlers and the group-99 platform observer.
+- **Retirement:** Retire after a released upstream version uses typed PTB checklist objects to preserve equivalent content and metadata under existing authorization/session gates, treats status-only updates without unsolicited replies, and guarantees unmatched message-like updates cannot disappear silently, with equivalent regressions.
 
 ### HERMES-059 — Keep initialized memory-provider tools routable
 
