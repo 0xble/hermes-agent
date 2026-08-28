@@ -617,6 +617,16 @@ class TestSkillManageDispatcher:
         ):
             assert _background_review_create_allowed() is False
 
+    @pytest.mark.parametrize("value", ["", "fasle", "enabled", 1, [], {}])
+    def test_background_review_create_malformed_config_fails_closed(self, value):
+        from tools.skill_manager_tool import _background_review_create_allowed
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"background_review_allow_create": value}},
+        ):
+            assert _background_review_create_allowed() is False
+
     def test_background_review_create_config_failure_fails_closed(self):
         from tools.skill_manager_tool import _background_review_create_allowed
 
