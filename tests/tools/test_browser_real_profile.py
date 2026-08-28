@@ -670,6 +670,38 @@ class TestReviewBugFixes:
         (root / "Local State").write_text('{"profile": {"last_used": "Profile 9"}}')  # not present
         assert bc._last_used_profile(str(root)) == "Default"
 
+    def test_guest_last_used_falls_back_to_default(self, tmp_path):
+        import hermes_cli.browser_connect as bc
+        root = tmp_path / "d"
+        (root / "Default").mkdir(parents=True)
+        (root / "Guest Profile").mkdir(parents=True)
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Guest Profile"}}'
+        )
+        assert bc._last_used_profile(str(root)) == "Default"
+
+    def test_snapshot_normalizes_guest_last_used_for_launch(self, tmp_path, monkeypatch):
+        import json
+        import hermes_cli.browser_connect as bc
+
+        root = tmp_path / "d"
+        (root / "Default").mkdir(parents=True)
+        (root / "Guest Profile").mkdir(parents=True)
+        (root / "Default" / "Preferences").write_text("{}")
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Guest Profile", '
+            '"last_active_profiles": ["Guest Profile"]}}'
+        )
+        home = tmp_path / "hh"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(root))
+
+        assert err is None
+        state = json.loads((home / "browser-profile" / "chrome" / "Local State").read_text())
+        assert state["profile"]["last_used"] == "Default"
+        assert state["profile"]["last_active_profiles"] == ["Default"]
+
     def test_last_used_reads_local_state(self, tmp_path):
         import hermes_cli.browser_connect as bc
         root = tmp_path / "d"

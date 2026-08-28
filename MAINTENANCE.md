@@ -79,6 +79,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-056 | Active | `fix(skills): trust configured symlink farms` | Stop false skill-security warnings for symlink entries inside explicitly configured external skill roots while preserving warnings for local/profile symlink escapes. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
 | HERMES-057 | Active | `fix(cron): enforce total run budgets` | Bound each opted-in cron fire by one total wall-clock deadline while preserving the separate inactivity watchdog. |
+| HERMES-060 | Active | `fix(browser): reject guest profile for real-profile browsing` | Mirror only a real Chrome profile into the managed browser snapshot and normalize its copied Local State to launch `Default`. |
 
 ## Fork-only administrative subject exemptions
 
@@ -109,6 +110,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-060 — Reject guest profile for real-profile browsing
+
+- **Independent hypothesis (2026-08-27):** Chrome can persist `profile.last_used = Guest Profile` after a guest window. The real-profile snapshot then chooses or relaunches the guest profile even though Hermes mirrors the selected profile into `Default`; Chrome guest mode refuses `Target.createTarget`, so the managed browser cannot create a tab. The correction belongs at snapshot selection and copied-Local-State normalization: reject guest and system profiles as sources, fall back to `Default`, and atomically point the managed copy at `Default` without mutating the user's source profile.
+- **Summary:** Excludes Chrome's guest and system profiles from real-profile selection and normalizes the copied snapshot's `profile.last_used` and `last_active_profiles` fields to `Default`, preserving the source browser profile unchanged.
+- **Surfaces:** `hermes_cli/browser_connect.py`; `tests/tools/test_browser_real_profile.py`; this record.
+- **Upstream tracking:** Upstream `main` at `00bbfc690060d1323ddb2f065297c7425cb71c26` still trusts any existing `profile.last_used` directory and copies Local State without normalizing guest mode. No matching upstream issue or pull request was found after targeted repository and GitHub searches on 2026-08-28.
+- **Upstream PR:** None checked 2026-08-28.
+- **Regression:** `.venv/bin/python -m pytest tests/tools/test_browser_real_profile.py -q`; focused cases prove guest selection falls back to `Default`, the managed snapshot rewrites guest activation to `Default`, and the source Local State remains untouched.
+- **Published commit identity:** Stable subject `fix(browser): reject guest profile for real-profile browsing`; source, regression, and manifest ship together.
+- **Rollback:** Revert only `fix(browser): reject guest profile for real-profile browsing`, removing the guest/system rejection, copied-state normalizer, focused regressions, and this record. Preserve snapshot security, profile-copy exclusions, and all unrelated browser authorization behavior.
+- **Retirement:** Retire after a released upstream version rejects non-browsable guest/system profiles for managed real-profile snapshots, normalizes the copied launch state without mutating the source profile, and passes equivalent focused coverage.
 
 ### HERMES-057 — Enforce total cron run budgets
 
