@@ -588,9 +588,44 @@ def _last_used_profile(src: str) -> str:
         last = ((state.get("profile") or {}).get("last_used")) or "Default"
     except (OSError, ValueError, AttributeError):
         last = "Default"
-    if not isinstance(last, str) or not os.path.isdir(os.path.join(src, last)):
+    if (
+        not isinstance(last, str)
+        or last in {"Guest Profile", "System Profile"}
+        or not os.path.isdir(os.path.join(src, last))
+    ):
         return "Default"
     return last
+
+
+def _normalize_snapshot_local_state(dst: str) -> None:
+    """Force the managed copy to launch its mirrored ``Default`` profile.
+
+    Chrome can persist ``profile.last_used = Guest Profile`` after a guest
+    window. Keeping that value in the managed copy launches guest mode, where
+    CDP refuses ``Target.createTarget``. The snapshot always mirrors the chosen
+    real profile into ``Default``, so its Local State must point there too.
+    """
+    import json
+
+    path = os.path.join(dst, "Local State")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            return
+        profile = state.get("profile")
+        if not isinstance(profile, dict):
+            profile = {}
+            state["profile"] = profile
+        profile["last_used"] = "Default"
+        if "last_active_profiles" in profile:
+            profile["last_active_profiles"] = ["Default"]
+        tmp = f"{path}.hermes-tmp-{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"))
+        os.replace(tmp, path)
+    except (OSError, ValueError, AttributeError) as exc:
+        logger.debug("real-profile snapshot: could not normalize Local State: %s", exc)
 
 
 def _secure_snapshot_root(path: str) -> None:
@@ -1001,6 +1036,7 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
         if os.path.isfile(ls_src):
             try:
                 shutil.copy2(ls_src, ls_dst)
+                _normalize_snapshot_local_state(dst)
             except OSError as e:
                 logger.debug("real-profile snapshot: skipped Local State: %s", e)
 
