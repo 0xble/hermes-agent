@@ -144,7 +144,6 @@ class TestResetSemanticsPreserved:
 
 
 class TestStrikesPersistFromEveryVerdictSite:
-    
 
     def test_no_op_compaction_branch_does_not_strike(self, tmp_path):
         """The insufficient-messages branch is a structural no-op (#93022).
