@@ -1173,11 +1173,16 @@ async def _send_via_adapter(
 
                 from gateway.platforms.base import should_send_media_as_audio
 
-                send_result = await adapter.send(
-                    chat_id=chat_id,
-                    content=chunk,
-                    metadata=metadata,
-                )
+                if chunk.strip():
+                    send_result = await adapter.send(
+                        chat_id=chat_id,
+                        content=chunk,
+                        metadata=metadata,
+                    )
+                else:
+                    from types import SimpleNamespace
+
+                    send_result = SimpleNamespace(success=True, message_id=None, error=None)
                 outcome = {"send": send_result, "media_delivered": 0, "media_error": None}
                 if not getattr(send_result, "success", False) or not media_files:
                     return outcome
