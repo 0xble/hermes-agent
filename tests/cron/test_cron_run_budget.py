@@ -316,11 +316,13 @@ def test_continuously_active_agent_still_exhausts_total_budget(tmp_path, monkeyp
     now = {"value": 0.0}
 
     class NeverDone:
+        stopped = False
+
         def done(self):
-            return False
+            return self.stopped
 
         def result(self):
-            raise AssertionError("an unfinished future has no result")
+            raise AssertionError("the interrupted future result is not consumed")
 
     future = NeverDone()
 
@@ -346,11 +348,11 @@ def test_continuously_active_agent_still_exhausts_total_budget(tmp_path, monkeyp
         "request_hard_interrupt",
         lambda agent, reason: interrupts.append((agent, reason)),
     )
-    monkeypatch.setattr(
-        scheduler,
-        "_teardown_cron_agent",
-        lambda agent, job_id, **kwargs: teardowns.append((agent, job_id, kwargs)),
-    )
+    def teardown(agent, job_id, **kwargs):
+        teardowns.append((agent, job_id, kwargs))
+        future.stopped = True
+
+    monkeypatch.setattr(scheduler, "_teardown_cron_agent", teardown)
 
     deferred = []
     success, doc, response, error = scheduler.run_job(
