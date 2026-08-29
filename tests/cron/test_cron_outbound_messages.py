@@ -738,6 +738,23 @@ class TestLiveAdapterMedia:
         assert calls[2][2] == "/tmp/report.pdf"
         assert calls[3][2] == "/tmp/note.ogg"
 
+    def test_live_adapter_delivers_media_only_message(self, monkeypatch):
+        class MediaOnlyAdapter:
+            async def send(self, **_kwargs):
+                raise AssertionError("media-only delivery must not send empty text")
+
+            async def send_document(self, *, chat_id, file_path, metadata=None):
+                return SimpleNamespace(success=True, message_id="m-2", error=None)
+
+        result = self._send(
+            monkeypatch,
+            MediaOnlyAdapter(),
+            message="",
+            media_files=[("/tmp/report.pdf", False)],
+        )
+
+        assert result == {"success": True, "message_id": None, "media_delivered": 1}
+
     def test_live_adapter_media_failure_is_reported_not_silent(self, monkeypatch):
         from gateway.config import Platform
 
