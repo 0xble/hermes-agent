@@ -542,6 +542,7 @@ class AIAgent:
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
+        adaptive_reasoning: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -635,6 +636,7 @@ class AIAgent:
             reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
+            adaptive_reasoning=adaptive_reasoning,
             service_tier=service_tier,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
@@ -9567,6 +9569,13 @@ class AIAgent:
                 self,
                 turn_reasoning_config,
                 source="explicit" if isinstance(turn_reasoning_config, dict) else "baseline",
+            )
+            from agent.adaptive_reasoning import begin_adaptive_reasoning_turn
+
+            begin_adaptive_reasoning_turn(
+                self,
+                user_message,
+                moa_config=moa_config,
             )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task

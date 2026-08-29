@@ -56,7 +56,7 @@ class TestCLIQuickCommands:
             "effort": "high",
         }
         assert cli._pending_agent_seed == "Fix this\nand verify it"
-        cprint.assert_called_once_with("🧠 Reasoning: High for this turn.")
+        cprint.assert_called_once_with("🧠 Reasoning: High for this turn")
 
     def test_bare_reasoning_alias_remains_session_scoped(self):
         cli = self._make_cli(

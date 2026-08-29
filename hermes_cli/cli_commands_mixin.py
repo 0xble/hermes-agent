@@ -3900,6 +3900,7 @@ class CLICommandsMixin:
             return
 
         self.reasoning_config = parsed
+        self._session_reasoning_override = True
         self.agent = None  # Force agent re-init with new reasoning config
 
         if explicit_global and save_config_value("agent.reasoning_effort", arg):

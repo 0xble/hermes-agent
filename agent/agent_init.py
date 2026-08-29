@@ -585,6 +585,7 @@ def init_agent(
     reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
+    adaptive_reasoning: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
@@ -963,6 +964,10 @@ def init_agent(
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+    from agent.adaptive_reasoning import parse_adaptive_reasoning_config
+
+    agent.adaptive_reasoning = parse_adaptive_reasoning_config(adaptive_reasoning)
+    agent.reasoning_user_override = False
     # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.

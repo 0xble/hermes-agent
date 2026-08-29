@@ -101,6 +101,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
 
         save_config.assert_not_called()
         self.assertEqual(stub.reasoning_config, {"enabled": True, "effort": "high"})
+        self.assertTrue(stub._session_reasoning_override)
         self.assertIsNone(stub.agent)
 
     def test_effort_with_prompt_queues_one_turn_without_mutating_session(self):
@@ -117,6 +118,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
             )
 
         self.assertEqual(stub.reasoning_config, baseline)
+        self.assertFalse(hasattr(stub, "_session_reasoning_override"))
         self.assertIs(stub.agent, original_agent)
         self.assertEqual(
             stub._pending_turn_reasoning_config,
@@ -126,7 +128,7 @@ class TestHandleReasoningCommand(unittest.TestCase):
             stub._pending_agent_seed,
             "Fix the parser\nand keep the newline",
         )
-        cprint.assert_called_once_with("🧠 Reasoning: High for this turn.")
+        cprint.assert_called_once_with("🧠 Reasoning: High for this turn")
 
 
     def test_new_session_clears_session_reasoning_override(self):

@@ -6499,6 +6499,14 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        from agent.adaptive_reasoning import parse_adaptive_reasoning_config
+
+        agent.adaptive_reasoning = parse_adaptive_reasoning_config(
+            (ctx.user_config.get("agent") or {}).get("adaptive_reasoning")
+        )
+        agent.reasoning_user_override = (
+            self._runner._session_reasoning_override_active(ctx.session_key)
+        )
         agent.service_tier = self._runner._service_tier
         # Merge, never overwrite: init-time request overrides (e.g. a custom
         # provider's extra_body merged at agent construction) must survive
@@ -10409,6 +10417,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # overrides; a SessionState field reset cannot cross sessions.
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
+        )
+
+    def _session_reasoning_override_active(self, session_key: Optional[str]) -> bool:
+        """Return whether this session has an explicit reasoning selection."""
+        if not session_key:
+            return False
+        state = self._peek_session_state(session_key)
+        return (
+            state is not None
+            and state.conversation.reasoning_override is not None
         )
 
     def _resolve_session_service_tier(

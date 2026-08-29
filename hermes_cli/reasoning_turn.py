@@ -73,5 +73,5 @@ def parse_reasoning_turn(raw_args: str) -> ReasoningTurnRequest | None:
         effort=effort,
         reasoning_config={"enabled": True, "effort": effort},
         prompt=prompt,
-        notice=f"🧠 Reasoning: {label} for this turn.",
+        notice=f"🧠 Reasoning: {label} for this turn",
     )
