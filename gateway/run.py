@@ -18092,6 +18092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "profile": self._handle_profile_command,
             "update": self._handle_update_command,
             "version": self._handle_version_command,
+            "title": self._handle_title_command,
         }
 
     async def _dispatch_busy_slash_command(

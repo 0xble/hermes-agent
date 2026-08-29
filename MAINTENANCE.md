@@ -94,6 +94,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-070 | Active | `feat(agent): allow pre_llm_call hooks to set turn reasoning`; `fix(agent): isolate turn reasoning overrides`; `feat(reasoning): support one-turn slash prompts`; `feat(reasoning): add deterministic adaptive effort`; `fix(agent): preserve reasoning transport test doubles`; `fix(reasoning): adapt from provider default baseline`; `test(reasoning): cover provider default baseline`; `fix(reasoning): preserve global effort command`; `test(reasoning): prove remaining control invariants`; `feat(reasoning): add adaptive shadow decisions` | Add task-local one-turn reasoning prompts, existing-alias inheritance, and deterministic opt-in adaptive effort without prompt or history mutation. |
 | HERMES-071 | Active | `feat: add model-callable set_goal tool`; `feat: enable self-starting model goals`; `fix: enforce model goal activation authority`; `docs: clarify model goal activation surfaces`; `test(goals): align activation authority regressions`; `fix(goals): reject negated activation spans`; `fix(goals): keep activation direct across toolsets` | Let the model activate the existing persistent goal loop only from exact, non-negated current-turn authorization, with session, turn, revision, persistence, replacement, continuation, and toolset-isolation fences. |
 | HERMES-072 | Active | `fix(gateway): prevent ten-turn worker starvation` | Keep an eleventh long-running gateway turn from silently waiting behind the historical ten-worker executor ceiling while preserving a bounded process-level pool. |
+| HERMES-073 | Active | `fix(gateway): dispatch title while busy` | Let `/title` inspect or rename the current session immediately without interrupting an active turn. |
 
 ## Fork-only administrative subject exemptions
 
@@ -132,6 +133,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-073 — Dispatch `/title` during active gateway turns
+
+- **Independent hypothesis (2026-08-29):** `/title` only reads or writes session metadata and schedules the existing Telegram topic rename, but its registry entry inherits `busy_policy="reject"`. Both active-session guards therefore recognize the command yet route it to the generic mid-turn rejection before `_handle_title_command` can run. The correction belongs in the declarative busy-command contract: mark `/title` dispatchable and map it to its existing handler, without interrupting the agent, queueing command text, or broadening any other command's policy. Bare `/title` should remain a read and `/title <name>` should preserve existing sanitization, uniqueness, persistence, and topic-rename behavior.
+- **Summary:** Permit the existing `/title` handler to run through the gateway's non-interrupting busy-dispatch path for both title reads and explicit renames. No configuration, schema, migration, or CLI behavior changes.
+- **Surfaces:** `hermes_cli/commands.py`; `gateway/run.py`; `tests/gateway/test_title_command.py`; this record.
+- **Upstream tracking:** Open issue #98152 reports the exact gap. Upstream `main` at `4209d371aa1bb8840ce8447555bdd863a1a96c38` still declares `/title` with the default reject policy and falls through to the generic busy rejection. Merged PR #39289 routes Desktop slash commands out of the input queue but does not make `/title` dispatchable; issues/PRs #5057, #6252, #10116, and #10370 cover adjacent busy-command loss or toggles, not this contract.
+- **Upstream PR:** None found for immediate mid-turn `/title` dispatch as of 2026-08-29.
+- **Regression:** `venv/bin/python -m pytest tests/gateway/test_title_command.py tests/hermes_cli/test_busy_policy_invariants.py -q`; focused coverage must prove the registry declares non-interrupting dispatch and the real busy dispatcher invokes `_handle_title_command` without interruption or queueing.
+- **Published commit identity:** Stable subject `fix(gateway): dispatch title while busy`; source, focused regression, and this record ship together.
+- **Rollback:** Revert only `fix(gateway): dispatch title while busy`, restoring `/title` to the generic mid-turn rejection and removing the focused busy-dispatch regression plus this record. Session titles and previously stored metadata remain unchanged.
+- **Retirement:** Retire after a released upstream version dispatches both bare and named `/title` commands through the active gateway guard without interrupting or queueing the current turn, while preserving existing title validation, persistence, and Telegram topic renaming with equivalent regressions.
 
 ### HERMES-067 — Add contextual background spawns
 

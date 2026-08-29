@@ -132,6 +132,32 @@ class TestHandleTitleCommand:
 # ---------------------------------------------------------------------------
 
 
+class TestBusyTitleCommand:
+    """Verify /title is safe to dispatch while a gateway turn is active."""
+
+    @pytest.mark.asyncio
+    async def test_title_dispatches_while_agent_is_running(self):
+        """Busy gateway turns execute /title instead of rejecting or queueing it."""
+        from hermes_cli.commands import resolve_command
+
+        runner = _make_runner()
+        runner._handle_title_command = AsyncMock(return_value="title updated")
+        event = _make_event(text="/title Research task")
+        command = resolve_command("title")
+
+        assert command is not None
+        assert command.busy_policy == "dispatch"
+        result = await runner._dispatch_busy_slash_command(
+            event,
+            command,
+            "telegram:12345:67890",
+            event.source,
+        )
+
+        assert result == "title updated"
+        runner._handle_title_command.assert_awaited_once_with(event)
+
+
 class TestTitleInHelp:
     """Verify /title appears in help text and known commands."""
 
