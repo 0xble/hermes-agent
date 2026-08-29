@@ -718,9 +718,9 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
 
 
 def bundle_non_core_tools(toolset_name: str) -> Set[str]:
-    """Return a ``hermes-*`` bundle's platform-specific tools, excluding core.
+    """Return a ``hermes-*`` bundle's platform-specific tools, excluding shared tools.
 
-    Platform bundles are defined as ``_HERMES_CORE_TOOLS + [platform extras]``.
+    Platform bundles are defined as ``_HERMES_INTERACTIVE_TOOLS + [platform extras]``.
     When a bundle name appears in ``disabled_toolsets``, subtracting the whole
     bundle would strip core tools (terminal, read_file, …) shared by every
     other enabled toolset, emptying the model's tool list (#33924). This
@@ -733,7 +733,11 @@ def bundle_non_core_tools(toolset_name: str) -> Set[str]:
     ``includes`` pass is sufficient. Unknown/garbage names fall back to the
     full resolution minus core — never re-introducing the core wipe.
     """
-    core = set(_HERMES_CORE_TOOLS)
+    # Messaging bundles share the interactive surface as well as the original
+    # core. Treating ``set_goal`` as a platform-owned delta meant that disabling
+    # an unrelated platform bundle silently stripped goal activation from the
+    # still-enabled platform and could also flip tool-search assembly tiers.
+    core = set(_HERMES_INTERACTIVE_TOOLS)
     ts_def = get_toolset(toolset_name)
     if not (ts_def and "tools" in ts_def):
         return set(resolve_toolset(toolset_name)) - core

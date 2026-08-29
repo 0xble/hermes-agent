@@ -223,8 +223,11 @@ def _core_tool_names() -> frozenset[str]:
     and we don't want a hard cycle.
     """
     try:
-        from toolsets import _HERMES_CORE_TOOLS
-        return frozenset(_HERMES_CORE_TOOLS)
+        from toolsets import _HERMES_CORE_TOOLS, _HERMES_INTERACTIVE_TOOLS
+        # Interactive lifecycle tools such as ``set_goal`` are intentionally
+        # absent from cron/webhook defaults, but once a session enables them
+        # they are first-party direct controls, not catalog entries to defer.
+        return frozenset((*_HERMES_CORE_TOOLS, *_HERMES_INTERACTIVE_TOOLS))
     except Exception:
         return frozenset()
 
