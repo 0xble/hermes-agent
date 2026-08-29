@@ -2210,8 +2210,68 @@ class TestConcurrentToolExecution:
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
+                user_task=None,
             )
             assert result == "result"
+
+    def test_invoke_tool_forwards_current_user_request(self, agent):
+        messages = [
+            {"role": "user", "content": "Earlier request"},
+            {"role": "assistant", "content": "Earlier response"},
+            {"role": "user", "content": "Set a goal to implement this and validate it."},
+            {"role": "assistant", "content": "", "tool_calls": []},
+        ]
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            agent._invoke_tool(
+                "set_goal",
+                {"goal": "Implement this"},
+                "task-1",
+                messages=messages,
+            )
+
+        assert mock_hfc.call_args.kwargs["user_task"] == (
+            "Set a goal to implement this and validate it."
+        )
+
+    def test_invoke_tool_activates_goal_through_live_registry(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        import tools.goal_tool  # noqa: F401
+        from hermes_cli import goals
+
+        getattr(goals, "_DB_CACHE").clear()
+        agent.session_id = "live-set-goal"
+        agent.valid_tool_names = {"set_goal"}
+        messages = [
+            {"role": "user", "content": "Set a goal to implement this and validate it."},
+            {"role": "assistant", "content": "", "tool_calls": []},
+        ]
+
+        result = json.loads(
+            agent._invoke_tool(
+                "set_goal",
+                {
+                    "goal": "Implement this and validate it",
+                    "contract": {"verification": "Focused tests pass"},
+                },
+                "task-1",
+                messages=messages,
+            )
+        )
+
+        assert result["success"] is True
+        state = goals.GoalManager(agent.session_id).state
+        assert state is not None
+        assert state.status == "active"
+        assert state.contract.verification == "Focused tests pass"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
