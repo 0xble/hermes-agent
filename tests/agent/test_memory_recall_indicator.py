@@ -54,21 +54,21 @@ def test_no_providers_returns_empty_string():
 
 def test_single_memory_is_singular():
     mgr = MemoryManager()
-    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
-    assert mgr.describe_recall() == "🧠 Hindsight — recalled 1 memory"
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1, glyph="💭")))
+    assert mgr.describe_recall() == "💭 Hindsight — recalled 1 memory"
 
 
 def test_multiple_memories_are_plural():
     mgr = MemoryManager()
-    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 3)))
-    assert mgr.describe_recall() == "🧠 Hindsight — recalled 3 memories"
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 3, glyph="💭")))
+    assert mgr.describe_recall() == "💭 Hindsight — recalled 3 memories"
 
 
 def test_zero_count_renders_generic():
     # count 0 = content injected but no discrete count (e.g. reflect synthesis).
     mgr = MemoryManager()
-    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 0)))
-    assert mgr.describe_recall() == "🧠 Hindsight — recalled relevant memory"
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 0, glyph="💭")))
+    assert mgr.describe_recall() == "💭 Hindsight — recalled relevant memory"
 
 
 def test_aggregates_multiple_providers():
@@ -76,15 +76,15 @@ def test_aggregates_multiple_providers():
     # builtin + one external to exercise the join path.
     mgr = MemoryManager()
     mgr.add_provider(_FakeProvider("builtin", RecallStatus("Notes", 2)))
-    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 5)))
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 5, glyph="💭")))
     result = mgr.describe_recall()
     assert "🧠 Notes — recalled 2 memories" in result
-    assert "🧠 Hindsight — recalled 5 memories" in result
+    assert "💭 Hindsight — recalled 5 memories" in result
 
 
 def test_failing_provider_is_skipped_not_fatal():
     mgr = MemoryManager()
     mgr.add_provider(_FakeProvider("builtin", None, raises=True))
-    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
+    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1, glyph="💭")))
     # The raising provider is swallowed; the healthy one still surfaces.
-    assert mgr.describe_recall() == "🧠 Hindsight — recalled 1 memory"
+    assert mgr.describe_recall() == "💭 Hindsight — recalled 1 memory"
