@@ -1826,9 +1826,23 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _active_reasoning_config(agent) -> dict | None:
+    """Resolve reasoning for real agents and lightweight transport test doubles."""
+    resolver = getattr(agent, "_current_reasoning_config", None)
+    if callable(resolver):
+        resolved = resolver()
+    else:
+        from agent.reasoning_context import get_turn_reasoning_config
+
+        resolved = get_turn_reasoning_config(agent) or getattr(
+            agent, "reasoning_config", None
+        )
+    return resolved if isinstance(resolved, dict) else None
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    reasoning_config = agent._current_reasoning_config()
+    reasoning_config = _active_reasoning_config(agent)
     if tools_for_api is None:
         tools_for_api = agent.tools
 
@@ -2999,7 +3013,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
-    reasoning_config = agent._current_reasoning_config()
+    reasoning_config = _active_reasoning_config(agent)
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (hermes chat -Q, oneshot, background
