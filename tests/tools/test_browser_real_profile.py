@@ -193,6 +193,14 @@ class TestRealProfileCdpLaunch:
     def _reset(self):
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
+        bt._real_profile_session_names.clear()
+        bt._real_profile_session_homes.clear()
+
+    @pytest.fixture(autouse=True)
+    def _clear_runtime_tracking(self):
+        self._reset()
+        yield
+        self._reset()
 
     def test_consent_off_is_noop(self):
         import tools.browser_tool as bt
