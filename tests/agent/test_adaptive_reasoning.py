@@ -123,6 +123,27 @@ def test_begin_applies_task_local_override_and_emits_notice():
         reset_turn_reasoning(token)
 
 
+def test_adaptive_uses_medium_when_reasoning_uses_provider_default():
+    agent = SimpleNamespace(
+        adaptive_reasoning={"enabled": True},
+        reasoning_config=None,
+        reasoning_user_override=False,
+        notices=[],
+    )
+    agent.notice_callback = agent.notices.append
+
+    token = begin_turn_reasoning(agent)
+    try:
+        decision = begin_adaptive_reasoning_turn(
+            agent, "Debug this failing parser and trace the exception"
+        )
+        assert decision is not None and decision.applied is True
+        active = get_turn_reasoning_config(agent)
+        assert active is not None and active["effort"] == "high"
+    finally:
+        reset_turn_reasoning(token)
+
+
 def test_explicit_turn_override_beats_adaptive():
     agent = _agent()
     token = begin_turn_reasoning(agent)
