@@ -65,7 +65,7 @@ Hermes drafts the objective and optional completion contract, activates it in th
 
 This is deliberately authorization-gated. An ordinary task, question, recommendation, or request to draft a possible goal does **not** authorize activation. A model-created goal also cannot silently replace an active or paused goal. Replacement requires explicit language such as "replace the active goal" in the current user turn.
 
-The `set_goal` tool is enabled by default only on interactive CLI and messaging sessions that own the goal continuation hook. It is excluded from cron and webhook defaults. Disable the `goal` toolset with `hermes tools` if you want slash-command-only activation.
+The `set_goal` tool is enabled by default only on interactive CLI, TUI/Desktop, and messaging sessions that own the goal continuation hook. Cron, webhooks, delegated agents, and batch runs are excluded. Disable the `goal` toolset with `hermes tools` if you want slash-command-only activation.
 
 ## Commands
 
