@@ -231,7 +231,7 @@ def test_prepare_reasoning_turn_event_preserves_multiline_prompt():
         "enabled": True,
         "effort": "high",
     }
-    assert event.turn_reasoning_notice == "🧠 Reasoning: High for this turn."
+    assert event.turn_reasoning_notice == "🧠 Reasoning: High for this turn"
 
 
 def test_gateway_quick_alias_inherits_reasoning_turn_semantics():

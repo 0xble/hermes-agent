@@ -13,7 +13,7 @@ def test_parse_reasoning_turn_preserves_multiline_prompt():
     assert request.effort == "high"
     assert request.reasoning_config == {"enabled": True, "effort": "high"}
     assert request.prompt == "Fix the parser\nand keep the newline"
-    assert request.notice == "🧠 Reasoning: High for this turn."
+    assert request.notice == "🧠 Reasoning: High for this turn"
 
 
 @pytest.mark.parametrize("raw", ["", "high", " high  ", "show", "reset"])

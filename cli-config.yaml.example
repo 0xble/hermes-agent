@@ -1230,6 +1230,15 @@ agent:
   service_tier: ""
   fast_auto_seconds: 60
 
+  # Opt-in deterministic adaptive reasoning. Rules are local and make no extra
+  # model request. Uncertain inputs keep reasoning_effort unchanged. By default
+  # it may only escalate and will never select "none". Set min_effort explicitly
+  # to permit deterministic downshift, for example "low".
+  adaptive_reasoning:
+    enabled: false
+    max_effort: "high"
+    min_effort: ""
+
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,
   # pirate, shakespeare, surfer, noir, uwu, philosopher, hype) are always
