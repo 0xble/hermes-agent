@@ -6764,6 +6764,13 @@ def run_job(
             name=f"cron-inactivity-{str(job_id)[:8]}",
             daemon=True,
         )
+
+        def _wait_for_cron_worker_exit() -> None:
+            """Keep this fire claimed until an interrupted worker actually exits."""
+            while not _cron_future.done():
+                _heartbeat_run_claim_if_due()
+                concurrent.futures.wait({_cron_future}, timeout=1.0)
+
         try:
             if _cron_inactivity_limit is not None:
                 # Daemon thread: kernel ``Event.wait`` timeout, independent of
@@ -6836,6 +6843,7 @@ def run_job(
             # the delivery lane.
             _teardown_cron_agent(agent, job_id)
             _agent_teardown_complete = True
+            _wait_for_cron_worker_exit()
             raise _total_run_budget_error(job_name, _total_run_budget)
 
         if _inactivity_timeout:
@@ -6860,6 +6868,9 @@ def run_job(
                 _cur_tool or "none",
             )
             request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+            _teardown_cron_agent(agent, job_id)
+            _agent_teardown_complete = True
+            _wait_for_cron_worker_exit()
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
