@@ -88,6 +88,10 @@ def _update(message, update_id=900):
     return SimpleNamespace(
         update_id=update_id,
         message=message,
+        edited_message=None,
+        edited_channel_post=None,
+        business_message=None,
+        edited_business_message=None,
         effective_message=message,
     )
 
@@ -260,6 +264,166 @@ def test_status_without_referenced_checklist_is_still_observed():
     event = adapter._observe_unmentioned_group_message.call_args.kwargs["event"]
     assert event.text == "Checklist updated:\nMarked done: #7"
     assert event.metadata["telegram_checklist"]["marked_as_done_task_ids"] == [7]
+    assert event.metadata["telegram_checklist"]["checklist_message_id"] is None
+
+
+def test_status_update_respects_message_routing_before_observation():
+    adapter = _adapter()
+    adapter._should_process_message = MagicMock(return_value=False)
+    adapter._should_observe_unmentioned_group_message = MagicMock(return_value=False)
+    original = _message(checklist=_checklist(tasks=[_task(1, "Venue")]))
+    service = _message(
+        chat=SimpleNamespace(
+            id=-100,
+            type="supergroup",
+            title="Launch team",
+            full_name=None,
+            is_forum=False,
+        ),
+        checklist_tasks_done=SimpleNamespace(
+            checklist_message=original,
+            marked_as_done_task_ids=[1],
+            marked_as_not_done_task_ids=[],
+        ),
+    )
+
+    asyncio.run(adapter._handle_checklist_message(_update(service, 906), None))
+
+    adapter._should_process_message.assert_called_once_with(service)
+    adapter._should_observe_unmentioned_group_message.assert_called_once_with(service)
+    adapter._observe_unmentioned_group_message.assert_not_called()
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_edited_business_checklist_is_observed_without_dispatch():
+    adapter = _adapter()
+    msg = _message(
+        business_connection_id="biz-A",
+        checklist=_checklist(tasks=[_task(1, "Venue", done=True)]),
+    )
+    update = _update(msg, 907)
+    update.message = None
+    update.edited_business_message = msg
+
+    asyncio.run(adapter._handle_checklist_message(update, None))
+
+    adapter.handle_message.assert_not_awaited()
+    adapter._observe_unmentioned_group_message.assert_called_once()
+    event = adapter._observe_unmentioned_group_message.call_args.kwargs["event"]
+    assert event.text == "Checklist edited: Launch\n- [x] #1 Venue"
+    assert event.metadata["telegram_checklist"]["kind"] == "checklist_edited"
+
+
+def test_edited_channel_checklist_is_observed_without_dispatch():
+    adapter = _adapter()
+    msg = _message(checklist=_checklist(tasks=[_task(1, "Venue", done=True)]))
+    update = _update(msg, 912)
+    update.message = None
+    update.edited_channel_post = msg
+
+    asyncio.run(adapter._handle_checklist_message(update, None))
+
+    adapter.handle_message.assert_not_awaited()
+    event = adapter._observe_unmentioned_group_message.call_args.kwargs["event"]
+    assert event.metadata["telegram_checklist"]["kind"] == "checklist_edited"
+
+
+def test_observed_checklist_status_persists_structured_metadata():
+    adapter = _adapter()
+    transcript_entries = []
+    adapter._session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(session_id="session-1"),
+        append_to_transcript=lambda session_id, entry: transcript_entries.append(entry),
+    )
+    adapter._observe_unmentioned_group_message = TelegramAdapter._observe_unmentioned_group_message.__get__(
+        adapter, TelegramAdapter
+    )
+    original = _message(checklist=_checklist(tasks=[_task(1, "Venue")]))
+    service = _message(
+        checklist_tasks_done=SimpleNamespace(
+            checklist_message=original,
+            marked_as_done_task_ids=[1],
+            marked_as_not_done_task_ids=[],
+        )
+    )
+
+    asyncio.run(adapter._handle_checklist_message(_update(service, 908), None))
+
+    assert len(transcript_entries) == 1
+    assert transcript_entries[0]["metadata"]["telegram_checklist"] == {
+        "kind": "tasks_done",
+        "title": "Launch",
+        "title_entities": [],
+        "tasks": [],
+        "others_can_add_tasks": None,
+        "others_can_mark_tasks_as_done": None,
+        "checklist_message_id": "77",
+        "marked_as_done_task_ids": [1],
+        "marked_as_not_done_task_ids": [],
+    }
+
+
+def test_malformed_inbound_task_ids_are_bounded_without_crashing():
+    adapter = _adapter()
+    msg = _message(
+        checklist=_checklist(
+            tasks=[
+                SimpleNamespace(
+                    id="not-an-integer",
+                    text="Venue",
+                    text_entities=[],
+                    completed_by_user=None,
+                    completed_by_chat=None,
+                    completion_date=None,
+                )
+            ]
+        )
+    )
+
+    asyncio.run(adapter._handle_checklist_message(_update(msg, 909), None))
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "Checklist: Launch\n- [ ] #? Venue"
+    task = event.metadata["telegram_checklist"]["tasks"][0]
+    assert task["id"] is None
+    assert task["id_invalid"] is True
+
+
+def test_malformed_done_ids_and_completion_dates_are_not_treated_as_state():
+    adapter = _adapter()
+    invalid_completion = SimpleNamespace(
+        id=1,
+        text="Venue",
+        text_entities=[],
+        completed_by_user=None,
+        completed_by_chat=None,
+        completion_date="not-a-date",
+    )
+    initial = _message(checklist=_checklist(tasks=[invalid_completion]))
+
+    asyncio.run(adapter._handle_checklist_message(_update(initial, 910), None))
+
+    initial_event = adapter.handle_message.await_args.args[0]
+    task = initial_event.metadata["telegram_checklist"]["tasks"][0]
+    assert task["completed"] is False
+    assert task["completion_date"] is None
+    assert task["completion_date_invalid"] is True
+
+    adapter.handle_message.reset_mock()
+    service = _message(
+        checklist_tasks_done=SimpleNamespace(
+            checklist_message=None,
+            marked_as_done_task_ids=["bad", 7],
+            marked_as_not_done_task_ids=[False, 8],
+        )
+    )
+    asyncio.run(adapter._handle_checklist_message(_update(service, 911), None))
+
+    event = adapter._observe_unmentioned_group_message.call_args.kwargs["event"]
+    metadata = event.metadata["telegram_checklist"]
+    assert metadata["marked_as_done_task_ids"] == [7]
+    assert metadata["marked_as_not_done_task_ids"] == [8]
+    assert metadata["invalid_task_id_counts"] == {"done": 1, "not_done": 1}
 
 
 def test_unmatched_guard_logs_shape_not_payload(caplog):
