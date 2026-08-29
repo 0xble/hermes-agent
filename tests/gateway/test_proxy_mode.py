@@ -198,7 +198,6 @@ class TestRunAgentViaProxy:
                         ],
                         source=source,
                         session_id="session-abc",
-                        turn_reasoning_config={"enabled": True, "effort": "high"},
                     )
 
         # Verify request URL
@@ -219,9 +218,6 @@ class TestRunAgentViaProxy:
 
         # Verify streaming is requested
         assert session.captured_json["stream"] is True
-        assert session.captured_json["model_options"] == {
-            "reasoning_effort": "high"
-        }
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"

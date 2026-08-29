@@ -542,7 +542,6 @@ class AIAgent:
         reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
-        adaptive_reasoning: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -636,7 +635,6 @@ class AIAgent:
             reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
-            adaptive_reasoning=adaptive_reasoning,
             service_tier=service_tier,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
@@ -8035,15 +8033,6 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
 
-    def _current_reasoning_config(self) -> dict | None:
-        """Return this turn's reasoning override or the configured fallback."""
-        from agent.reasoning_context import get_turn_reasoning_config
-
-        turn_config = get_turn_reasoning_config(self)
-        if isinstance(turn_config, dict):
-            return turn_config
-        return self.reasoning_config
-
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -9076,7 +9065,6 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         persist_user_platform_id: Optional[str] = None,
         moa_config: Optional[dict[str, Any]] = None,
-        turn_reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -9097,10 +9085,6 @@ class AIAgent:
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
-        )
-        from agent.reasoning_context import (
-            begin_turn_reasoning,
-            reset_turn_reasoning,
         )
         from hermes_cli.observability.relay_shared_metrics import (
             finish_task_run,
@@ -9134,7 +9118,6 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
-        reasoning_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -9565,18 +9548,6 @@ class AIAgent:
             # (which copy this Context into their thread) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
             token = set_conversation_context(self._conversation_root_id())
-            reasoning_token = begin_turn_reasoning(
-                self,
-                turn_reasoning_config,
-                source="explicit" if isinstance(turn_reasoning_config, dict) else "baseline",
-            )
-            from agent.adaptive_reasoning import begin_adaptive_reasoning_turn
-
-            begin_adaptive_reasoning_turn(
-                self,
-                user_message,
-                moa_config=moa_config,
-            )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
@@ -9719,8 +9690,6 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
-                    if reasoning_token is not None:
-                        reset_turn_reasoning(reasoning_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

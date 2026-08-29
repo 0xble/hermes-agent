@@ -3811,25 +3811,6 @@ class CLICommandsMixin:
         from cli import CLI_CONFIG, _ACCENT, _DIM, _RST, _cprint, _parse_reasoning_config, save_config_value
         parts = cmd.strip().split(maxsplit=1)
 
-        if len(parts) >= 2:
-            from hermes_cli.reasoning_turn import (
-                ReasoningTurnError,
-                parse_reasoning_turn,
-            )
-
-            try:
-                turn_request = parse_reasoning_turn(parts[1])
-            except ReasoningTurnError as exc:
-                _cprint(f"  {_DIM}(._.) {exc}{_RST}")
-                return
-            if turn_request is not None:
-                self._pending_turn_reasoning_config = dict(
-                    turn_request.reasoning_config
-                )
-                self._pending_agent_seed = turn_request.prompt
-                _cprint(turn_request.notice)
-                return
-
         if len(parts) < 2:
             # Show current state
             rc = self.reasoning_config
@@ -3900,7 +3881,6 @@ class CLICommandsMixin:
             return
 
         self.reasoning_config = parsed
-        self._session_reasoning_override = True
         self.agent = None  # Force agent re-init with new reasoning config
 
         if explicit_global and save_config_value("agent.reasoning_effort", arg):

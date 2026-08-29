@@ -5584,11 +5584,9 @@ class PluginManager:
         Returns a list of non-``None`` return values from callbacks.
 
         For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message and/or
-        turn-scoped model options::
+        context to inject into the current turn's user message::
 
             {"context": "recalled text..."}
-            {"reasoning_config": {"enabled": True, "effort": "high"}}
             "recalled text..."          # plain string, equivalent
 
         Context is ALWAYS injected into the user message, never the

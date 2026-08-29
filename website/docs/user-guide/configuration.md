@@ -1648,7 +1648,6 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 ```
 /reasoning                # Show current effort level and display state
 /reasoning high           # Set reasoning effort to high (this session only)
-/reasoning high Fix this  # Use high for this complete turn only
 /reasoning high --global  # Set effort and persist to config.yaml
 /reasoning none           # Disable reasoning (this session only)
 /reasoning show           # Show model thinking above each response
@@ -1657,38 +1656,6 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 
 Effort changes are session-scoped by default; add `--global` to save the
 new level as your `agent.reasoning_effort` default.
-
-Configured quick-command aliases inherit the same rule after expansion. For
-example, when `ttt` aliases `/reasoning high`, bare `/ttt` remains
-session-scoped while `/ttt Fix this` uses high only for that full tool-loop
-turn. The override covers retries, tool continuations, summaries, and provider
-fallback, then restores the session baseline even when the turn raises.
-
-#### Deterministic Adaptive Reasoning
-
-Adaptive reasoning is disabled by default. When enabled, a local deterministic
-policy may raise effort for clearly complex work. It does not make another LLM
-request, mutate the prompt or history, or persist a different session level.
-
-```yaml
-agent:
-  reasoning_effort: "medium"
-  adaptive_reasoning:
-    enabled: true
-    shadow: false
-    max_effort: "high"
-    min_effort: ""   # empty = escalation-only
-```
-
-Uncertain inputs abstain and keep the configured baseline. Automatic selection
-never chooses `none`. To allow deterministic downshift for clearly simple work,
-set `min_effort` explicitly, for example `"low"`. An explicit one-turn or
-session-scoped reasoning effort always wins over the adaptive policy.
-
-Set `shadow: true` to evaluate the policy without changing effective effort or
-emitting an adjustment notice. The structured decision callback includes the
-policy version, baseline, candidate and effective effort, reason codes, and
-shadow status.
 
 #### Per-Model Reasoning Overrides
 
@@ -1714,12 +1681,10 @@ There is no `hermes config set` support for `reasoning_overrides` keys — edit 
 
 **Resolution priority:**
 
-1. Explicit one-turn `/reasoning <level> <prompt>` override
-2. Session-scoped `/reasoning` override
-3. Adaptive selection, when enabled and confident
-4. Per-model override from `agent.reasoning_overrides` (spelling-tolerant)
-5. Global `agent.reasoning_effort`
-6. Provider default
+1. Session-scoped `/reasoning --session` override (gateway only)
+2. Per-model override from `agent.reasoning_overrides` (spelling-tolerant)
+3. Global `agent.reasoning_effort`
+4. Provider default
 
 The override applies automatically everywhere: CLI startup, messaging gateway, Desktop/TUI, cron jobs, `/model` mid-session switches, and fallback model activation.
 

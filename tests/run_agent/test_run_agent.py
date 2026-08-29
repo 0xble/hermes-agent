@@ -14,7 +14,6 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,12 +27,6 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
-from agent.reasoning_context import (
-    begin_turn_reasoning,
-    get_turn_reasoning_config,
-    reset_turn_reasoning,
-    set_turn_reasoning_config,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -54,18 +47,6 @@ def _make_tool_defs(*names: str) -> list:
         }
         for n in names
     ]
-
-
-@contextmanager
-def _turn_reasoning_override(agent, effort: str):
-    token = begin_turn_reasoning(agent)
-    try:
-        assert set_turn_reasoning_config(
-            agent, {"enabled": True, "effort": effort}
-        )
-        yield
-    finally:
-        reset_turn_reasoning(token)
 
 
 def test_is_destructive_command_treats_cp_as_mutating():
@@ -1579,22 +1560,6 @@ class TestBuildApiKwargs:
         assert reasoning["effort"] == "medium"
 
 
-    def test_reasoning_config_turn_override_wins(self, agent):
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        with _turn_reasoning_override(agent, "high"):
-            kwargs = agent._build_api_kwargs(
-                [{"role": "user", "content": "hi"}]
-            )
-
-        assert kwargs["extra_body"]["reasoning"] == {
-            "enabled": True,
-            "effort": "high",
-        }
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-
     def test_reasoning_not_sent_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "minimax/minimax-m2.5"
@@ -2913,54 +2878,6 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert "reasoning" not in kwargs.get("extra_body", {})
 
-    def test_summary_uses_turn_reasoning_override(self, agent):
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Summary"
-        )
-        agent._cached_system_prompt = "You are helpful."
-
-        with _turn_reasoning_override(agent, "high"):
-            result = agent._handle_max_iterations(
-                [{"role": "user", "content": "do stuff"}], 60
-            )
-
-        assert result == "Summary"
-        kwargs = agent.client.chat.completions.create.call_args.kwargs
-        assert kwargs["extra_body"]["reasoning"] == {
-            "enabled": True,
-            "effort": "high",
-        }
-
-    def test_summary_retry_uses_turn_reasoning_override(self, agent):
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(content=""),
-            _mock_response(content="Retry summary"),
-        ]
-        agent._cached_system_prompt = "You are helpful."
-
-        with _turn_reasoning_override(agent, "high"):
-            result = agent._handle_max_iterations(
-                [{"role": "user", "content": "do stuff"}], 60
-            )
-
-        assert result == "Retry summary"
-        request_kwargs = [
-            call.kwargs for call in agent.client.chat.completions.create.call_args_list
-        ]
-        assert len(request_kwargs) == 2
-        assert [call["extra_body"]["reasoning"] for call in request_kwargs] == [
-            {"enabled": True, "effort": "high"},
-            {"enabled": True, "effort": "high"},
-        ]
-
     def test_summary_request_removes_orphan_tool_result(self, agent):
         """Regression: max-iterations summary request must NOT contain
         orphan tool results (tool_call_id with no matching assistant tool_call)."""
@@ -3551,269 +3468,6 @@ class TestRunConversation:
         assert result["final_response"] == "No listeners"
         assert hook_checks == {"pre_api_request": 1, "post_api_request": 1}
         assert payload_counts == {"request": 0, "response": 0}
-
-    def test_explicit_reasoning_override_beats_hook_spans_tool_loop_and_resets(
-        self, agent
-    ):
-        self._setup_agent(agent)
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent.adaptive_reasoning = {"enabled": True, "max_effort": "xhigh"}
-        agent.reasoning_user_override = False
-        tool_call = _mock_tool_call(
-            name="web_search", arguments="{}", call_id="reasoning-contract-tool"
-        )
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(
-                content="",
-                finish_reason="tool_calls",
-                tool_calls=[tool_call],
-            ),
-            _mock_response(content="First answer", finish_reason="stop"),
-            _mock_response(content="Second answer", finish_reason="stop"),
-        ]
-
-        hook_calls = []
-        pre_llm_count = 0
-
-        def _hook(name, **kwargs):
-            nonlocal pre_llm_count
-            hook_calls.append((name, kwargs))
-            if name == "pre_llm_call":
-                pre_llm_count += 1
-                if pre_llm_count == 1:
-                    return [
-                        {
-                            "reasoning_config": {
-                                "enabled": True,
-                                "effort": "medium",
-                            }
-                        }
-                    ]
-            return []
-
-        with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch(
-                "hermes_cli.plugins.has_hook",
-                side_effect=lambda name: name == "pre_api_request",
-            ),
-            patch("hermes_cli.plugins.invoke_hook", side_effect=_hook),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            first_result = agent.run_conversation(
-                "use a tool",
-                turn_reasoning_config={"enabled": True, "effort": "high"},
-            )
-            assert get_turn_reasoning_config(agent) is None
-            second_result = agent.run_conversation(
-                "answer without a tool",
-                conversation_history=first_result["messages"],
-            )
-
-        assert first_result["final_response"] == "First answer"
-        assert second_result["final_response"] == "Second answer"
-
-        request_kwargs = [
-            call.kwargs for call in agent.client.chat.completions.create.call_args_list
-        ]
-        assert len(request_kwargs) == 3
-        assert [
-            call["extra_body"]["reasoning"] for call in request_kwargs[:2]
-        ] == [
-            {"enabled": True, "effort": "high"},
-            {"enabled": True, "effort": "high"},
-        ]
-        assert request_kwargs[2]["extra_body"]["reasoning"] == {
-            "enabled": True,
-            "effort": "low",
-        }
-
-        pre_llm_calls = [
-            kwargs for name, kwargs in hook_calls if name == "pre_llm_call"
-        ]
-        pre_request_calls = [
-            kwargs for name, kwargs in hook_calls if name == "pre_api_request"
-        ]
-        assert len(pre_llm_calls) == 2
-        assert len(pre_request_calls) == 3
-        assert all(
-            call["reasoning_config"] == {"enabled": True, "effort": "low"}
-            and call["reasoning_config"] is not agent.reasoning_config
-            for call in pre_llm_calls
-        )
-        first_turn_id = pre_llm_calls[0]["turn_id"]
-        second_turn_id = pre_llm_calls[1]["turn_id"]
-        assert first_turn_id != second_turn_id
-        assert [call["turn_id"] for call in pre_request_calls] == [
-            first_turn_id,
-            first_turn_id,
-            second_turn_id,
-        ]
-        assert get_turn_reasoning_config(agent) is None
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-
-    def test_adaptive_reasoning_spans_tool_loop_then_restores_baseline(self, agent):
-        self._setup_agent(agent)
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
-        agent.adaptive_reasoning = {"enabled": True, "max_effort": "xhigh"}
-        agent.reasoning_user_override = False
-        notices = []
-        agent.notice_callback = notices.append
-        tool_call = _mock_tool_call(
-            name="web_search", arguments="{}", call_id="adaptive-tool"
-        )
-        agent.client.chat.completions.create.side_effect = [
-            _mock_response(
-                content="",
-                finish_reason="tool_calls",
-                tool_calls=[tool_call],
-            ),
-            _mock_response(content="Debugged", finish_reason="stop"),
-            _mock_response(content="Hello", finish_reason="stop"),
-        ]
-
-        with (
-            patch("run_agent.handle_function_call", return_value="search result"),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            first_result = agent.run_conversation(
-                "Debug the production crash. error: connection refused"
-            )
-            assert get_turn_reasoning_config(agent) is None
-            second_result = agent.run_conversation(
-                "hello", conversation_history=first_result["messages"]
-            )
-
-        assert first_result["final_response"] == "Debugged"
-        assert second_result["final_response"] == "Hello"
-        request_kwargs = [
-            call.kwargs for call in agent.client.chat.completions.create.call_args_list
-        ]
-        assert [
-            call["extra_body"]["reasoning"]["effort"] for call in request_kwargs
-        ] == ["high", "high", "medium"]
-        assert len(notices) == 1
-        assert notices[0].text.startswith("🧠 Adaptive reasoning: Medium → High")
-        assert all(
-            "Adaptive reasoning:" not in str(message.get("content", ""))
-            for message in first_result["messages"]
-        )
-        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
-        assert get_turn_reasoning_config(agent) is None
-
-    def test_session_reasoning_override_beats_adaptive_reasoning(self, agent):
-        self._setup_agent(agent)
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "medium"}
-        agent.adaptive_reasoning = {"enabled": True, "max_effort": "xhigh"}
-        agent.reasoning_user_override = True
-        notices = []
-        agent.notice_callback = notices.append
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Baseline answer", finish_reason="stop"
-        )
-
-        with (
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation(
-                "Debug the production crash. error: connection refused"
-            )
-
-        assert result["final_response"] == "Baseline answer"
-        assert agent.client.chat.completions.create.call_args.kwargs["extra_body"][
-            "reasoning"
-        ]["effort"] == "medium"
-        assert notices == []
-        assert get_turn_reasoning_config(agent) is None
-
-    def test_non_dictionary_pre_llm_reasoning_override_uses_baseline(self, agent):
-        self._setup_agent(agent)
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Baseline answer", finish_reason="stop"
-        )
-
-        def _hook(name, **_kwargs):
-            if name == "pre_llm_call":
-                return [{"reasoning_config": "high"}]
-            return []
-
-        with (
-            patch("hermes_cli.plugins.invoke_hook", side_effect=_hook),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("ignore an invalid override")
-
-        assert result["final_response"] == "Baseline answer"
-        assert agent.client.chat.completions.create.call_args.kwargs["extra_body"][
-            "reasoning"
-        ] == {"enabled": True, "effort": "low"}
-        assert get_turn_reasoning_config(agent) is None
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-
-    def test_pre_llm_hook_exception_fails_open_to_reasoning_baseline(self, agent):
-        self._setup_agent(agent)
-        agent.provider = "openrouter"
-        agent.base_url = "https://openrouter.ai/api/v1"
-        agent.model = "anthropic/claude-sonnet-4-20250514"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent.client.chat.completions.create.return_value = _mock_response(
-            content="Baseline answer", finish_reason="stop"
-        )
-
-        def _hook(name, **_kwargs):
-            if name == "pre_llm_call":
-                raise RuntimeError("plugin failed")
-            return []
-
-        with (
-            patch("hermes_cli.plugins.invoke_hook", side_effect=_hook),
-            patch.object(agent, "_persist_session"),
-            patch.object(agent, "_save_trajectory"),
-            patch.object(agent, "_cleanup_task_resources"),
-        ):
-            result = agent.run_conversation("continue despite hook failure")
-
-        assert result["final_response"] == "Baseline answer"
-        assert agent.client.chat.completions.create.call_args.kwargs["extra_body"][
-            "reasoning"
-        ] == {"enabled": True, "effort": "low"}
-        assert get_turn_reasoning_config(agent) is None
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-
-    def test_turn_reasoning_override_clears_when_conversation_raises(self, agent):
-        agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
-
-        with (
-            patch(
-                "agent.conversation_loop.run_conversation",
-                side_effect=RuntimeError("boom"),
-            ),
-            pytest.raises(RuntimeError, match="boom"),
-        ):
-            agent.run_conversation("hello")
-
-        assert get_turn_reasoning_config(agent) is None
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
@@ -6182,22 +5836,6 @@ class TestBuildApiKwargsAnthropicMaxTokens:
                     mock_build.call_args[0],
                 ))
             assert kwargs.get("max_tokens") == 4096 or mock_build.call_args[1].get("max_tokens") == 4096
-
-    def test_turn_reasoning_override_passed_to_anthropic(self, agent):
-        agent.api_mode = "anthropic_messages"
-        agent.reasoning_config = {"enabled": True, "effort": "low"}
-
-        with (
-            _turn_reasoning_override(agent, "high"),
-            patch("agent.anthropic_adapter.build_anthropic_kwargs") as mock_build,
-        ):
-            mock_build.return_value = {"model": agent.model, "messages": []}
-            agent._build_api_kwargs([{"role": "user", "content": "test"}])
-
-        assert mock_build.call_args.kwargs["reasoning_config"] == {
-            "enabled": True,
-            "effort": "high",
-        }
 
 
 

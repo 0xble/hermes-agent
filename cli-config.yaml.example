@@ -1167,16 +1167,6 @@ agent:
   #   "claude-opus-4.6": "high"           # bare model name also works
   #   "deepseek/deepseek-v4-pro": "xhigh" # dots and dashes are interchangeable
   reasoning_overrides: {}
-
-  # Opt-in deterministic adaptive reasoning. Rules are local and make no extra
-  # model request. Uncertain inputs keep reasoning_effort unchanged. By default
-  # it may only escalate and will never select "none". Set min_effort explicitly
-  # to permit deterministic downshift, for example "low".
-  adaptive_reasoning:
-    enabled: false
-    shadow: false  # report decisions without changing effective effort
-    max_effort: "high"
-    min_effort: ""
   
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,

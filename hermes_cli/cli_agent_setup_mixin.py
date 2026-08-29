@@ -373,7 +373,6 @@ class CLIAgentSetupMixin:
             bool: True if successful, False otherwise
         """
         from cli import AIAgent, ChatConsole, _DIM, _RST, _accent_hex, _cprint, _prepare_deferred_agent_startup, logger
-        from cli import CLI_CONFIG
         if self.agent is not None:
             return True
 
@@ -538,9 +537,6 @@ class CLIAgentSetupMixin:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
-                adaptive_reasoning=CLI_CONFIG.get("agent", {}).get(
-                    "adaptive_reasoning"
-                ),
                 service_tier=self.service_tier,
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,
@@ -596,9 +592,6 @@ class CLIAgentSetupMixin:
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
-            self.agent.reasoning_user_override = bool(
-                getattr(self, "_session_reasoning_override", False)
-            )
             # Hydrate credits notices at session OPEN (parity with the TUI), so a
             # depletion / usage-band warning shows before the first message. The
             # notice_callback is bound above → _on_notice renders the line. Idempotent

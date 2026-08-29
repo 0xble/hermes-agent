@@ -378,16 +378,6 @@ DEFAULT_CONFIG = {
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
 
-        # Opt-in deterministic per-turn adjustment above/below the configured
-        # baseline. The default is escalation-only. Set min_effort explicitly
-        # to permit downshift; automatic "none" is never selected.
-        "adaptive_reasoning": {
-            "enabled": False,
-            "shadow": False,
-            "max_effort": "high",
-            "min_effort": "",
-        },
-
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name
