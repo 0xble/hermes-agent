@@ -1174,6 +1174,7 @@ agent:
   # to permit deterministic downshift, for example "low".
   adaptive_reasoning:
     enabled: false
+    shadow: false  # report decisions without changing effective effort
     max_effort: "high"
     min_effort: ""
   

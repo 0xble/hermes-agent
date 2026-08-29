@@ -1675,6 +1675,7 @@ agent:
   reasoning_effort: "medium"
   adaptive_reasoning:
     enabled: true
+    shadow: false
     max_effort: "high"
     min_effort: ""   # empty = escalation-only
 ```
@@ -1683,6 +1684,11 @@ Uncertain inputs abstain and keep the configured baseline. Automatic selection
 never chooses `none`. To allow deterministic downshift for clearly simple work,
 set `min_effort` explicitly, for example `"low"`. An explicit one-turn or
 session-scoped reasoning effort always wins over the adaptive policy.
+
+Set `shadow: true` to evaluate the policy without changing effective effort or
+emitting an adjustment notice. The structured decision callback includes the
+policy version, baseline, candidate and effective effort, reason codes, and
+shadow status.
 
 #### Per-Model Reasoning Overrides
 

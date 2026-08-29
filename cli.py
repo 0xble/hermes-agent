@@ -485,6 +485,7 @@ def load_cli_config() -> Dict[str, Any]:
             "reasoning_effort": "",
             "adaptive_reasoning": {
                 "enabled": False,
+                "shadow": False,
                 "max_effort": "high",
                 "min_effort": "",
             },

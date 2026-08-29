@@ -63,6 +63,30 @@ def test_shadow_decision_is_side_effect_free():
     assert config == {"enabled": True, "max_effort": "high"}
 
 
+def test_shadow_mode_reports_candidate_without_applying_or_notifying():
+    agent = _agent(config={"enabled": True, "shadow": True})
+    decisions = []
+    agent.adaptive_reasoning_decision_callback = decisions.append
+
+    token = begin_turn_reasoning(agent)
+    try:
+        decision = begin_adaptive_reasoning_turn(
+            agent, "Debug the production crash. error: connection refused"
+        )
+
+        assert decision is not None
+        assert decision.selected_effort == "high"
+        assert decision.effective_effort == "medium"
+        assert decision.baseline_effort == "medium"
+        assert decision.shadow is True
+        assert decision.applied is False
+        assert get_turn_reasoning_config(agent) is None
+        assert agent.notices == []
+        assert decisions == [decision]
+    finally:
+        reset_turn_reasoning(token)
+
+
 def test_uncertain_message_abstains_to_baseline():
     decision = select_adaptive_reasoning(
         "Can you take a look at this?", "medium", {"enabled": True}
@@ -125,6 +149,9 @@ def test_begin_applies_task_local_override_and_emits_notice():
             agent, "Debug the production crash. error: connection refused"
         )
         assert decision is not None and decision.applied
+        assert decision.baseline_effort == "medium"
+        assert decision.effective_effort == "high"
+        assert decision.shadow is False
         assert get_turn_reasoning_config(agent)["effort"] == "high"
         assert agent.reasoning_config["effort"] == "medium"
         assert len(agent.notices) == 1
