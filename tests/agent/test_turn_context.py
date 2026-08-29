@@ -252,6 +252,25 @@ def test_preflight_timeout_stops_turn_before_provider_boundary():
     provider_call.assert_not_called()
 
 
+def test_goal_control_revision_is_captured_at_turn_start(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    agent = _FakeAgent()
+    agent.valid_tool_names = {"set_goal"}
+
+    _build(agent)
+
+    assert agent._current_goal_control_revision == goals.get_goal_control_revision(
+        agent.session_id
+    )
+    goals._DB_CACHE.clear()
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

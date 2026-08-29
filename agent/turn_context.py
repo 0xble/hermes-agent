@@ -680,6 +680,32 @@ def build_turn_context(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    agent._current_goal_control_revision = None
+    valid_tool_names = getattr(agent, "valid_tool_names", set()) or set()
+    goal_enabled = "set_goal" in valid_tool_names
+    if not goal_enabled:
+        enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+        if enabled_toolsets is None:
+            goal_enabled = True
+        else:
+            try:
+                from toolsets import resolve_toolset
+
+                goal_enabled = any(
+                    "set_goal" in resolve_toolset(name)
+                    for name in enabled_toolsets
+                )
+            except Exception:
+                goal_enabled = False
+    if goal_enabled:
+        try:
+            from hermes_cli.goals import get_goal_control_revision
+
+            agent._current_goal_control_revision = get_goal_control_revision(
+                agent.session_id or ""
+            )
+        except Exception:
+            logger.warning("Failed to capture goal control revision", exc_info=True)
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.

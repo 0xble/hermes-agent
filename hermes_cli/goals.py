@@ -38,6 +38,7 @@ import re
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,9 +52,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
-_MODEL_GOAL_ACTIVATION_FENCE_TTL = 60 * 60
-_MODEL_GOAL_ACTIVATION_FENCES: Dict[Tuple[str, str], float] = {}
-_MODEL_GOAL_ACTIVATION_FENCES_LOCK = threading.Lock()
+_MODEL_GOAL_CONTROL_REVISIONS: Dict[str, int] = {}
+_MODEL_GOAL_CONTROL_LOCKS: Dict[str, threading.RLock] = {}
+_MODEL_GOAL_CONTROL_LOCKS_LOCK = threading.Lock()
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
 # before emitting the visible JSON — and the first /goal turn's prompt is
@@ -68,38 +69,68 @@ DEFAULT_JUDGE_MAX_TOKENS = 4096
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 
 
-def block_model_goal_activation(session_id: str, turn_id: str) -> None:
-    """Fence a running turn after an explicit user goal-control command."""
-    sid = str(session_id or "").strip()
-    tid = str(turn_id or "").strip()
-    if not sid or not tid:
-        return
-    now = time.monotonic()
-    with _MODEL_GOAL_ACTIVATION_FENCES_LOCK:
-        if len(_MODEL_GOAL_ACTIVATION_FENCES) >= 2048:
-            cutoff = now - _MODEL_GOAL_ACTIVATION_FENCE_TTL
-            stale = [key for key, created in _MODEL_GOAL_ACTIVATION_FENCES.items() if created < cutoff]
-            for key in stale:
-                _MODEL_GOAL_ACTIVATION_FENCES.pop(key, None)
-        _MODEL_GOAL_ACTIVATION_FENCES[(sid, tid)] = now
+def _goal_control_revision_key(session_id: str) -> str:
+    return f"goal-control-revision:{session_id}"
 
 
-def model_goal_activation_blocked(session_id: str, turn_id: str) -> bool:
-    """Return whether this exact in-flight turn lost activation authority."""
+def _goal_control_lock(session_id: str) -> threading.RLock:
+    with _MODEL_GOAL_CONTROL_LOCKS_LOCK:
+        return _MODEL_GOAL_CONTROL_LOCKS.setdefault(session_id, threading.RLock())
+
+
+def _read_goal_control_revision_unlocked(session_id: str) -> int:
+    revision = _MODEL_GOAL_CONTROL_REVISIONS.get(session_id, 0)
+    db = _get_session_db()
+    if db is not None:
+        try:
+            stored = int(db.get_meta(_goal_control_revision_key(session_id)) or 0)
+            revision = max(revision, stored)
+        except (TypeError, ValueError):
+            logger.warning("Goal control revision is invalid for %s", session_id)
+        except Exception as exc:
+            logger.debug("Goal control revision read failed: %s", exc)
+    _MODEL_GOAL_CONTROL_REVISIONS[session_id] = revision
+    return revision
+
+
+def get_goal_control_revision(session_id: str) -> int:
+    """Return the persisted revision guarding model goal activation."""
     sid = str(session_id or "").strip()
-    tid = str(turn_id or "").strip()
-    if not sid or not tid:
-        return False
-    now = time.monotonic()
-    key = (sid, tid)
-    with _MODEL_GOAL_ACTIVATION_FENCES_LOCK:
-        created = _MODEL_GOAL_ACTIVATION_FENCES.get(key)
-        if created is None:
-            return False
-        if now - created > _MODEL_GOAL_ACTIVATION_FENCE_TTL:
-            _MODEL_GOAL_ACTIVATION_FENCES.pop(key, None)
-            return False
-        return True
+    if not sid:
+        return 0
+    with _goal_control_lock(sid):
+        return _read_goal_control_revision_unlocked(sid)
+
+
+def advance_goal_control_revision(session_id: str) -> int:
+    """Invalidate authority captured by every earlier turn for this session."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return 0
+    with _goal_control_lock(sid):
+        revision = _read_goal_control_revision_unlocked(sid) + 1
+        _MODEL_GOAL_CONTROL_REVISIONS[sid] = revision
+        db = _get_session_db()
+        if db is not None:
+            try:
+                db.set_meta(_goal_control_revision_key(sid), str(revision))
+            except Exception as exc:
+                logger.warning(
+                    "Goal control revision %s for %s was not persisted: %s",
+                    revision,
+                    sid,
+                    exc,
+                )
+        return revision
+
+
+@contextmanager
+def guard_goal_activation(session_id: str, expected_revision: int):
+    """Serialize activation with user controls and validate turn authority."""
+    sid = str(session_id or "").strip()
+    lock = _goal_control_lock(sid)
+    with lock:
+        yield _read_goal_control_revision_unlocked(sid) == expected_revision
 
 
 # After this many consecutive judge *parse* failures (empty output / non-JSON),

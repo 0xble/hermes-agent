@@ -6032,7 +6032,7 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     the same backend told the model it was "chatting inside the Hermes desktop
     app". See the surface-capability rule in AGENTS.md.
     """
-    surfaces = {"project"}
+    surfaces = {"project", "goal"}
     if platform == "desktop":
         surfaces.add("desktop_ui")
     return surfaces

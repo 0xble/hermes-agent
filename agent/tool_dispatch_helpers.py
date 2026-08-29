@@ -856,4 +856,27 @@ __all__ = [
     "_detect_upstream_elision",
     "_maybe_append_elision_notice",
     "make_tool_result_message",
+    "latest_user_task_from_messages",
 ]
+
+def latest_user_task_from_messages(messages: Optional[list]) -> Optional[str]:
+    """Return the latest user-authored text from active request messages."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+            return text or None
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"text", "input_text"}:
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            joined = "\n".join(parts).strip()
+            return joined or None
+    return None

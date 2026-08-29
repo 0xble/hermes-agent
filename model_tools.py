@@ -1246,6 +1246,7 @@ def handle_function_call(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
+    goal_control_revision: Optional[int] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
@@ -1262,6 +1263,7 @@ def handle_function_call(
         function_args: Arguments for the function.
         task_id: Unique identifier for terminal/browser session isolation.
         user_task: The user's original task (for browser_snapshot context).
+        goal_control_revision: Goal-control revision captured when the turn began.
         enabled_tools: Tool names enabled for this session.  When provided,
                        execute_code uses this list to determine which sandbox
                        tools to generate.  Falls back to the process-global
@@ -1385,6 +1387,7 @@ def handle_function_call(
                 turn_id=turn_id,
                 api_request_id=api_request_id,
                 user_task=user_task,
+                goal_control_revision=goal_control_revision,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
@@ -1556,6 +1559,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        turn_id=turn_id,
+                        goal_control_revision=goal_control_revision,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

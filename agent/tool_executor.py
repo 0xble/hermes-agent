@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
+    latest_user_task_from_messages,
     make_tool_result_message,
 )
 from tools.terminal_tool import (
@@ -2536,6 +2537,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            user_task=latest_user_task_from_messages(messages),
+                            goal_control_revision=getattr(
+                                agent, "_current_goal_control_revision", None
+                            ),
                         )
 
                 (
@@ -2618,6 +2623,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            user_task=latest_user_task_from_messages(messages),
+                            goal_control_revision=getattr(
+                                agent, "_current_goal_control_revision", None
+                            ),
                         )
 
                 (

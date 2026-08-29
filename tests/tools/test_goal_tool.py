@@ -1,6 +1,8 @@
 """Model-callable standing-goal activation."""
 
 import json
+import threading
+
 import pytest
 
 
@@ -16,7 +18,18 @@ def isolated_goal_db(tmp_path, monkeypatch):
 
 
 def call_goal(**kwargs):
+    from hermes_cli.goals import get_goal_control_revision
     from tools.goal_tool import set_goal
+
+    session_id = kwargs.get("session_id", "")
+    if session_id:
+        kwargs.setdefault("turn_id", "turn-1")
+        kwargs.setdefault(
+            "goal_control_revision",
+            get_goal_control_revision(session_id),
+        )
+    if kwargs.get("user_task") is not None:
+        kwargs.setdefault("authorization_text", kwargs["user_task"])
     return json.loads(set_goal(**kwargs))
 
 
@@ -53,6 +66,64 @@ def test_activation_requires_explicit_authorization(isolated_goal_db, user_task)
     assert result["error_code"] == "explicit_goal_authorization_required"
 
 
+@pytest.mark.parametrize(
+    ("user_task", "authorization_text", "error_code"),
+    [
+        (
+            "Set a goal to implement this.\nThen validate it works.",
+            "Set a goal to implement this.",
+            None,
+        ),
+        (
+            "Set a goal to implement this, then validate it works!",
+            "Set a goal to implement this, then validate it works!",
+            None,
+        ),
+        (
+            "Set a goal to implement this.",
+            "Set a goal from an earlier turn.",
+            "authorization_not_in_current_turn",
+        ),
+        (
+            "Should this be a goal?",
+            "Should this be a goal?",
+            "explicit_goal_authorization_required",
+        ),
+        (
+            "Recommend whether to set a goal for this work.",
+            "set a goal",
+            "explicit_goal_authorization_required",
+        ),
+    ],
+)
+def test_authorization_span_and_direct_instruction(
+    isolated_goal_db,
+    user_task,
+    authorization_text,
+    error_code,
+):
+    result = call_goal(
+        goal="Implement and verify",
+        session_id=f"auth-span-{abs(hash(user_task))}",
+        user_task=user_task,
+        authorization_text=authorization_text,
+    )
+    assert result["success"] is (error_code is None)
+    if error_code is not None:
+        assert result["error_code"] == error_code
+
+
+def test_missing_turn_scope_fails_closed(isolated_goal_db):
+    result = call_goal(
+        goal="Implement and verify",
+        session_id="missing-turn",
+        turn_id="",
+        user_task="Set a goal to implement and verify.",
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "missing_turn_scope"
+
+
 def test_replacement_is_conspicuous(isolated_goal_db):
     from hermes_cli.goals import GoalManager
     GoalManager("replace").set("Keep this goal")
@@ -77,6 +148,8 @@ def test_replacement_is_conspicuous(isolated_goal_db):
     )
     assert replaced["success"] is True
     assert replaced["replaced_existing"] is True
+    assert replaced["replaced_goal"] == "Keep this goal"
+    assert replaced["goal"] == "New goal"
     state = GoalManager("replace").state
     assert state is not None and state.goal == "New goal"
 
@@ -110,18 +183,62 @@ def test_cached_manager_refreshes_after_tool_write(isolated_goal_db):
     assert cached.state is not None and cached.state.goal == "Visible to cached manager"
 
 
-def test_control_fence_blocks_stale_in_flight_activation(isolated_goal_db):
-    from hermes_cli.goals import block_model_goal_activation
+def test_persisted_control_revision_blocks_stale_activation(isolated_goal_db):
+    from hermes_cli import goals
+    from hermes_cli.goals import advance_goal_control_revision, get_goal_control_revision
 
-    block_model_goal_activation("fenced", "turn-1")
+    expected = get_goal_control_revision("fenced")
+    advance_goal_control_revision("fenced")
+    goals._MODEL_GOAL_CONTROL_REVISIONS.clear()
+    goals._DB_CACHE.clear()
     result = call_goal(
         goal="Must not reactivate",
         session_id="fenced",
         turn_id="turn-1",
+        goal_control_revision=expected,
         user_task="Set a goal to test the control fence.",
     )
     assert result["success"] is False
     assert result["error_code"] == "goal_activation_cancelled"
+
+
+def test_control_revision_race_preserves_later_user_action(isolated_goal_db):
+    from hermes_cli.goals import (
+        GoalManager,
+        advance_goal_control_revision,
+        get_goal_control_revision,
+    )
+
+    session_id = "race"
+    expected = get_goal_control_revision(session_id)
+    release = threading.Event()
+    finished = threading.Event()
+    result = {}
+
+    def delayed_activation():
+        release.wait(timeout=2)
+        result.update(
+            call_goal(
+                goal="Stale activation",
+                session_id=session_id,
+                turn_id="turn-1",
+                goal_control_revision=expected,
+                user_task="Set a goal to test stale activation.",
+            )
+        )
+        finished.set()
+
+    thread = threading.Thread(target=delayed_activation)
+    thread.start()
+    advance_goal_control_revision(session_id)
+    GoalManager(session_id).clear()
+    release.set()
+    assert finished.wait(timeout=2)
+    thread.join(timeout=2)
+
+    assert result["error_code"] == "goal_activation_cancelled"
+    state = GoalManager(session_id).state
+    assert state is None or state.status == "cleared"
 
 
 def test_surface_is_interactive_only_and_disableable():
@@ -135,9 +252,20 @@ def test_surface_is_interactive_only_and_disableable():
         )}
     assert "set_goal" in names(["hermes-cli"])
     assert "set_goal" in names(["hermes-telegram"])
-    assert "set_goal" in names(["coding"])
+    assert "set_goal" not in names(["coding"])
     assert "set_goal" not in names(["hermes-cron"])
     assert "set_goal" not in names(["hermes-telegram"], ["goal"])
+
+    definition = next(
+        item["function"]
+        for item in get_tool_definitions(
+            enabled_toolsets=["hermes-cli"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        if item["function"]["name"] == "set_goal"
+    )
+    assert definition["parameters"]["required"] == ["goal", "authorization_text"]
 
     from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS
 

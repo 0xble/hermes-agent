@@ -24,23 +24,28 @@ _REPLACEMENT_RE = re.compile(
     r"|\b(?:standing\s+|active\s+|current\s+)?goal\b.{0,80}\b(?:replace|overwrite|supersede|switch|change)\b)",
     re.IGNORECASE | re.DOTALL,
 )
+_NON_DIRECT_CONTEXT_RE = re.compile(
+    r"(?:\b(?:recommend|assess|evaluate|consider|decide|explain|discuss|suggest)\b"
+    r".{0,80}\b(?:whether|if)\b.{0,40}$"
+    r"|\bshould\s+(?:i|we|you|this|that|it)\b.{0,40}$)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _failure(error_code: str, message: str, **fields: Any) -> str:
     return tool_error(message, success=False, error_code=error_code, **fields)
 
 
-def _explicit_activation_requested(user_task: Optional[str]) -> bool:
-    text = user_task if isinstance(user_task, str) else ""
+def _explicit_activation_requested(text: str, prefix: str = "") -> bool:
     return bool(
         text.strip()
         and _ACTIVATION_RE.search(text)
         and not _NEGATED_ACTIVATION_RE.search(text)
+        and not _NON_DIRECT_CONTEXT_RE.search(prefix)
     )
 
 
-def _explicit_replacement_requested(user_task: Optional[str]) -> bool:
-    text = user_task if isinstance(user_task, str) else ""
+def _explicit_replacement_requested(text: str) -> bool:
     return bool(text.strip() and _REPLACEMENT_RE.search(text))
 
 
@@ -80,11 +85,13 @@ def set_goal_tool(
     *,
     session_id: str,
     user_task: Optional[str] = None,
+    authorization_text: Optional[str] = None,
     max_turns: Optional[int] = None,
     default_max_turns: Optional[int] = None,
     contract: Optional[Mapping[str, Any]] = None,
     replace_existing: bool = False,
     turn_id: Optional[str] = None,
+    goal_control_revision: Optional[int] = None,
 ) -> str:
     """Authoritatively activate a goal for the current interactive session."""
     sid = session_id.strip() if isinstance(session_id, str) else ""
@@ -93,17 +100,43 @@ def set_goal_tool(
             "missing_session_scope",
             "set_goal requires trusted active session scope",
         )
-    if not _explicit_activation_requested(user_task):
+    turn = str(turn_id or "").strip()
+    if not turn:
+        return _failure(
+            "missing_turn_scope",
+            "set_goal requires trusted active turn scope",
+        )
+    if goal_control_revision is None:
+        return _failure(
+            "missing_goal_control_revision",
+            "set_goal requires goal-control authority captured at turn start",
+        )
+    if (
+        isinstance(goal_control_revision, bool)
+        or not isinstance(goal_control_revision, int)
+        or goal_control_revision < 0
+    ):
+        return _failure(
+            "invalid_goal_control_revision",
+            "goal-control revision must be a non-negative integer",
+        )
+    task_text = user_task if isinstance(user_task, str) else ""
+    auth_text = authorization_text if isinstance(authorization_text, str) else ""
+    if not task_text.strip() or not auth_text.strip():
         return _failure(
             "explicit_goal_authorization_required",
             "The current user turn must explicitly ask Hermes to set, create, start, or activate a goal",
         )
-    from hermes_cli.goals import model_goal_activation_blocked
-
-    if model_goal_activation_blocked(sid, str(turn_id or "")):
+    auth_start = task_text.find(auth_text)
+    if auth_start < 0:
         return _failure(
-            "goal_activation_cancelled",
-            "A newer user goal-control command cancelled activation from this running turn",
+            "authorization_not_in_current_turn",
+            "authorization_text must be an exact span from the current user turn",
+        )
+    if not _explicit_activation_requested(auth_text, task_text[:auth_start]):
+        return _failure(
+            "explicit_goal_authorization_required",
+            "The quoted authorization must be a direct instruction to activate a goal",
         )
     if not isinstance(goal, str):
         return _failure("invalid_goal", "goal must be a string")
@@ -124,36 +157,53 @@ def set_goal_tool(
             f"max_turns ({turns}) exceeds configured goal budget ({default_turns})",
         )
 
+    has_existing = False
+    existing_goal = ""
     try:
-        from hermes_cli.goals import GoalContract, GoalManager, load_goal
+        from hermes_cli.goals import (
+            GoalContract,
+            GoalManager,
+            guard_goal_activation,
+            load_goal,
+        )
 
-        manager = GoalManager(session_id=sid, default_max_turns=default_turns)
-        existing = manager.state
-        has_existing = bool(existing and existing.status in {"active", "paused"})
-        existing_goal = existing.goal if existing is not None else ""
-        if has_existing and not replace_existing:
-            return _failure(
-                "active_goal_exists",
-                "An active or paused goal already exists. Ask explicitly to replace it, then set replace_existing=true.",
-                existing_goal=existing_goal,
+        with guard_goal_activation(sid, goal_control_revision) as authorized:
+            if not authorized:
+                return _failure(
+                    "goal_activation_cancelled",
+                    "A newer user goal-control command cancelled activation from this running turn",
+                )
+            manager = GoalManager(session_id=sid, default_max_turns=default_turns)
+            existing = manager.state
+            has_existing = bool(
+                existing and existing.status in {"active", "paused"}
             )
-        if has_existing and not _explicit_replacement_requested(user_task):
-            return _failure(
-                "explicit_replacement_authorization_required",
-                "Replacing an active or paused goal requires explicit replacement language in the current user turn",
-                existing_goal=existing_goal,
-            )
+            existing_goal = existing.goal if existing is not None else ""
+            if has_existing and not replace_existing:
+                return _failure(
+                    "active_goal_exists",
+                    "An active or paused goal already exists. Ask explicitly to replace it, then set replace_existing=true.",
+                    existing_goal=existing_goal,
+                )
+            if has_existing and not _explicit_replacement_requested(auth_text):
+                return _failure(
+                    "explicit_replacement_authorization_required",
+                    "Replacing an active or paused goal requires explicit replacement language in the quoted authorization",
+                    existing_goal=existing_goal,
+                )
 
-        goal_contract = GoalContract.from_dict(dict(contract or {}))
-        state = manager.set(goal_text, max_turns=turns, contract=goal_contract)
-        persisted = load_goal(sid)
-        persisted_ok = persisted is not None and persisted.to_json() == state.to_json()
-        if not persisted_ok:
-            return _failure(
-                "goal_persistence_failed",
-                "Goal activation was not confirmed by persistent readback",
-                persisted=False,
+            goal_contract = GoalContract.from_dict(dict(contract or {}))
+            state = manager.set(goal_text, max_turns=turns, contract=goal_contract)
+            persisted = load_goal(sid)
+            persisted_ok = (
+                persisted is not None and persisted.to_json() == state.to_json()
             )
+            if not persisted_ok:
+                return _failure(
+                    "goal_persistence_failed",
+                    "Goal activation was not confirmed by persistent readback",
+                    persisted=False,
+                )
     except Exception as exc:
         return _failure(
             "goal_activation_failed",
@@ -168,6 +218,8 @@ def set_goal_tool(
         goal=state.goal,
         max_turns=state.max_turns,
         replaced_existing=has_existing,
+        replaced_goal=existing_goal if has_existing else None,
+        authorization_text=auth_text,
         message="Goal set and active. Continue working toward it now.",
     )
 
@@ -196,6 +248,13 @@ SET_GOAL_SCHEMA = {
                 "type": "string",
                 "description": "A concise persistent outcome Hermes should achieve.",
             },
+            "authorization_text": {
+                "type": "string",
+                "description": (
+                    "Exact quoted span from the current user turn that directly "
+                    "authorizes activating or replacing a standing goal."
+                ),
+            },
             "max_turns": {
                 "type": "integer",
                 "minimum": 1,
@@ -221,7 +280,7 @@ SET_GOAL_SCHEMA = {
                 "default": False,
             },
         },
-        "required": ["goal"],
+        "required": ["goal", "authorization_text"],
     },
 }
 
@@ -232,12 +291,14 @@ registry.register(
     schema=SET_GOAL_SCHEMA,
     handler=lambda args, **kw: set_goal_tool(
         goal=args.get("goal", ""),
+        authorization_text=args.get("authorization_text"),
         max_turns=args.get("max_turns"),
         contract=args.get("contract"),
         replace_existing=bool(args.get("replace_existing", False)),
         session_id=kw.get("session_id", ""),
         user_task=kw.get("user_task"),
         turn_id=kw.get("turn_id"),
+        goal_control_revision=kw.get("goal_control_revision"),
         default_max_turns=kw.get("default_max_turns"),
     ),
     check_fn=check_goal_requirements,
