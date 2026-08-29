@@ -295,11 +295,14 @@ def begin_adaptive_reasoning_turn(
         return None
 
     reasoning = getattr(agent, "reasoning_config", None)
-    baseline = (
-        str(reasoning.get("effort") or "medium").strip().lower()
-        if isinstance(reasoning, dict) and reasoning.get("enabled") is not False
-        else ""
-    )
+    if reasoning is None:
+        # The established provider-default reasoning baseline is medium when
+        # no explicit configuration is present.
+        baseline = "medium"
+    elif isinstance(reasoning, dict) and reasoning.get("enabled") is not False:
+        baseline = str(reasoning.get("effort") or "medium").strip().lower()
+    else:
+        baseline = ""
     if baseline not in _EFFORT_RANK:
         return AdaptiveReasoningDecision(
             "medium", 0, ("abstain",), applied=False
