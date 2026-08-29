@@ -47,8 +47,8 @@ logger = logging.getLogger(__name__)
 # strict-mode failure propagation).
 PRE_COMPRESS_CHECKPOINT_API_VERSION = 2
 
-# Default glyph for the deterministic memory indicators. Providers override
-# per-status with their own brand mark (e.g. Hindsight uses "👁️").
+# Default glyph for deterministic memory indicators. Providers can override it
+# per status with a distinct mark, such as Hindsight's thought bubble.
 INDICATOR_GLYPH = "🧠"
 
 

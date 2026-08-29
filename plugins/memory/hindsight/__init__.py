@@ -92,9 +92,10 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # generic user-facing opt-in exists, so this stays unset unless the user sets it
 # via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
 _DEFAULT_RETAIN_SOURCE = ""
-# Use the generic brain mark for Hindsight's deterministic recall/retain
-# indicators rather than the provider-specific eye mark.
-_HINDSIGHT_GLYPH = "🧠"
+# Distinguish recalled Hindsight context from Hermes reasoning while retaining
+# the generic memory mark for the separate background-save indicator.
+_HINDSIGHT_RECALL_GLYPH = "💭"
+_HINDSIGHT_RETAIN_GLYPH = "🧠"
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -1353,7 +1354,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "allow_memory_mutations", "description": "Expose explicit, audited invalidation and restoration tools; does not enable automatic mutation", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
-            {"key": "recall_indicator", "description": "Show a '🧠 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "recall_indicator", "description": "Show a '💭 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '🧠 Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_attachments", "description": "Upload raw file attachments to Hindsight during automatic source retention. Default off because this reads and durably transmits the original file bytes.", "default": False},
@@ -2016,7 +2017,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._allow_memory_mutations = _coerce_bool(self._config.get("allow_memory_mutations", False), default=False)
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
-        # Hermes emits a "🧠 Hindsight — recalled N memories" status line so the
+        # Hermes emits a "💭 Hindsight — recalled N memories" status line so the
         # user SEES memory working, independent of whether the model mentions it.
         # Off switch for customer-facing agents that shouldn't surface internals.
         self._recall_indicator = bool(self._config.get("recall_indicator", True))
@@ -2267,7 +2268,7 @@ class HindsightMemoryProvider(MemoryProvider):
         """
         if not self._recall_indicator or not self._last_recall_returned:
             return None
-        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
+        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_RECALL_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # In synchronous mode prefetch() does a live recall each turn, so
@@ -2611,7 +2612,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if not self._retain_indicator or self._status_callback is None:
             return
         try:
-            self._status_callback(f"{_HINDSIGHT_GLYPH} Hindsight — saving to memory…")
+            self._status_callback(f"{_HINDSIGHT_RETAIN_GLYPH} Hindsight — saving to memory…")
         except Exception:
             logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
