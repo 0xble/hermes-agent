@@ -963,7 +963,6 @@ def init_agent(
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
-    agent._turn_reasoning_config = None
     # Per-provider reasoning_content echo opt-in (see _reasoning_echo_opt_in).
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.

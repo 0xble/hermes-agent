@@ -1378,7 +1378,6 @@ def build_turn_context(
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
-    agent._turn_reasoning_config = None
     configured_reasoning = getattr(agent, "reasoning_config", None)
     if isinstance(configured_reasoning, dict):
         configured_reasoning = dict(configured_reasoning)
@@ -1415,7 +1414,9 @@ def build_turn_context(
             _piece: str = ""
             if isinstance(r, dict):
                 if isinstance(r.get("reasoning_config"), dict):
-                    agent._turn_reasoning_config = dict(r["reasoning_config"])
+                    from agent.reasoning_context import set_turn_reasoning_config
+
+                    set_turn_reasoning_config(agent, r["reasoning_config"])
                 if r.get("context"):
                     _piece = str(r["context"])
             elif isinstance(r, str) and r.strip():

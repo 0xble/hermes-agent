@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,12 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.reasoning_context import (
+    begin_turn_reasoning,
+    get_turn_reasoning_config,
+    reset_turn_reasoning,
+    set_turn_reasoning_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +54,18 @@ def _make_tool_defs(*names: str) -> list:
         }
         for n in names
     ]
+
+
+@contextmanager
+def _turn_reasoning_override(agent, effort: str):
+    token = begin_turn_reasoning(agent)
+    try:
+        assert set_turn_reasoning_config(
+            agent, {"enabled": True, "effort": effort}
+        )
+        yield
+    finally:
+        reset_turn_reasoning(token)
 
 
 def test_is_destructive_command_treats_cp_as_mutating():
@@ -1565,9 +1584,10 @@ class TestBuildApiKwargs:
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "anthropic/claude-sonnet-4-20250514"
         agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
-
-        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        with _turn_reasoning_override(agent, "high"):
+            kwargs = agent._build_api_kwargs(
+                [{"role": "user", "content": "hi"}]
+            )
 
         assert kwargs["extra_body"]["reasoning"] == {
             "enabled": True,
@@ -2834,15 +2854,15 @@ class TestHandleMaxIterations:
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "anthropic/claude-sonnet-4-20250514"
         agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
         agent.client.chat.completions.create.return_value = _mock_response(
             content="Summary"
         )
         agent._cached_system_prompt = "You are helpful."
 
-        result = agent._handle_max_iterations(
-            [{"role": "user", "content": "do stuff"}], 60
-        )
+        with _turn_reasoning_override(agent, "high"):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 60
+            )
 
         assert result == "Summary"
         kwargs = agent.client.chat.completions.create.call_args.kwargs
@@ -2856,16 +2876,16 @@ class TestHandleMaxIterations:
         agent.base_url = "https://openrouter.ai/api/v1"
         agent.model = "anthropic/claude-sonnet-4-20250514"
         agent.reasoning_config = {"enabled": True, "effort": "low"}
-        agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
         agent.client.chat.completions.create.side_effect = [
             _mock_response(content=""),
             _mock_response(content="Retry summary"),
         ]
         agent._cached_system_prompt = "You are helpful."
 
-        result = agent._handle_max_iterations(
-            [{"role": "user", "content": "do stuff"}], 60
-        )
+        with _turn_reasoning_override(agent, "high"):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 60
+            )
 
         assert result == "Retry summary"
         request_kwargs = [
@@ -3520,7 +3540,7 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             first_result = agent.run_conversation("use a tool")
-            assert agent._turn_reasoning_config is None
+            assert get_turn_reasoning_config(agent) is None
             second_result = agent.run_conversation(
                 "answer without a tool",
                 conversation_history=first_result["messages"],
@@ -3565,7 +3585,7 @@ class TestRunConversation:
             first_turn_id,
             second_turn_id,
         ]
-        assert agent._turn_reasoning_config is None
+        assert get_turn_reasoning_config(agent) is None
         assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
     def test_non_dictionary_pre_llm_reasoning_override_uses_baseline(self, agent):
@@ -3595,7 +3615,7 @@ class TestRunConversation:
         assert agent.client.chat.completions.create.call_args.kwargs["extra_body"][
             "reasoning"
         ] == {"enabled": True, "effort": "low"}
-        assert agent._turn_reasoning_config is None
+        assert get_turn_reasoning_config(agent) is None
         assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
     def test_pre_llm_hook_exception_fails_open_to_reasoning_baseline(self, agent):
@@ -3625,7 +3645,7 @@ class TestRunConversation:
         assert agent.client.chat.completions.create.call_args.kwargs["extra_body"][
             "reasoning"
         ] == {"enabled": True, "effort": "low"}
-        assert agent._turn_reasoning_config is None
+        assert get_turn_reasoning_config(agent) is None
         assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
     def test_turn_reasoning_override_clears_when_conversation_raises(self, agent):
@@ -3640,7 +3660,7 @@ class TestRunConversation:
         ):
             agent.run_conversation("hello")
 
-        assert agent._turn_reasoning_config is None
+        assert get_turn_reasoning_config(agent) is None
 
     def test_content_with_tool_calls_stays_silent_for_non_cli_quiet_mode(self, agent):
         self._setup_agent(agent)
