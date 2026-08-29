@@ -96,7 +96,9 @@ class TestHandleBackgroundCommand:
         await asyncio.gather(*runner._background_tasks)
 
         runner._normalize_source_for_session_key.assert_called_once_with(event.source)
-        dispatched_source = runner._run_background_task.await_args.args[1]
+        await_call = runner._run_background_task.await_args
+        assert await_call is not None
+        dispatched_source = await_call.args[1]
         assert dispatched_source.thread_id == "42"
 
 
@@ -138,6 +140,7 @@ class TestRunBackgroundTask:
         runner = _make_runner()
         mock_adapter = AsyncMock()
         mock_adapter.send = AsyncMock()
+        mock_adapter.toolsets_for_source = MagicMock(return_value=None)
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
         runner.adapters[Platform.TELEGRAM] = mock_adapter
@@ -183,6 +186,61 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_contextual_spawn_passes_parent_history_and_identity(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.toolsets_for_source = MagicMock(return_value=None)
+        mock_adapter.extract_media = MagicMock(return_value=([], "Spawn result"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "Spawn result"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+            thread_id="42",
+        )
+        history = [
+            {"role": "user", "content": "parent question"},
+            {"role": "assistant", "content": "parent answer"},
+        ]
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={"checkpoints": {"enabled": False}},
+        ), patch("run_agent.AIAgent") as mock_agent:
+            instance = MagicMock()
+            instance.shutdown_memory_provider = MagicMock()
+            instance.close = MagicMock()
+            instance.run_conversation.return_value = {
+                "final_response": "Spawn result",
+                "messages": [],
+            }
+            mock_agent.return_value = instance
+
+            await runner._run_background_task(
+                "investigate",
+                source,
+                "spawn-child",
+                conversation_history=history,
+                parent_session_id="parent-1",
+                task_kind="spawn",
+                task_title="Spawn 1: investigate",
+            )
+
+        assert mock_agent.call_args.kwargs["session_id"] == "spawn-child"
+        assert mock_agent.call_args.kwargs["parent_session_id"] == "parent-1"
+        assert instance.run_conversation.call_args.kwargs["conversation_history"] == history
+        delivered = mock_adapter.send.call_args.kwargs.get("content", "")
+        assert "Spawn complete" in delivered
+        assert 'Child session: "Spawn 1: investigate"' in delivered
+        assert "spawn-child" not in delivered
 
 
 # ---------------------------------------------------------------------------

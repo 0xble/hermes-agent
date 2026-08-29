@@ -25,7 +25,7 @@ class TestBackgroundTaskProfileScope:
     def test_wraps_in_profile_scope_when_multiplex_active(self):
         runner = _make_runner(multiplex=True)
         inner = mock.AsyncMock(return_value=None)
-        runner._run_background_task_inner = inner
+        setattr(runner, "_run_background_task_inner", inner)
 
         source = mock.MagicMock()
         source.profile = "test_profile"

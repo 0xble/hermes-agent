@@ -88,6 +88,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-064 | Active | `feat(browser): add isolated named real-profile identities` | Bind exact local Chromium profiles to explicit browser identities with isolated snapshots, processes, CDP state, Browser Use daemons, and fail-closed selection. |
 | HERMES-065 | Active | `fix(telegram): degrade unsupported markdown link targets to display text`; `fix(session-search): scope session links to desktop surfaces`; `docs(maintenance): register session-link rendering patch` | Keep Desktop-only session references off non-Desktop surfaces and degrade Telegram-unsupported Markdown targets to readable labels. |
 | HERMES-066 | Active | `fix(gateway): normalize background topic sources` | Apply Telegram DM-topic recovery before background execution and session-scoped resolution. |
+| HERMES-066 | Active | `feat(gateway): add contextual background spawns` | Snapshot committed gateway context into a durable one-shot child without switching or contaminating the parent. |
 
 ## Fork-only administrative subject exemptions
 
@@ -124,6 +125,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-066 — Add contextual background spawns
+
+- **Independent hypothesis (2026-08-28):** `/background` is intentionally detached, while `/branch` copies context but changes the active routing entry. Operators need a third operation that snapshots the last complete parent turn, runs one prompt asynchronously in a durable child, leaves the parent active, and delivers the result outside the parent transcript. Reusing raw in-flight agent memory can copy incomplete tool-call sequences; giving the child the parent's gateway key can hijack recovery; injecting its assistant result into the parent can violate role alternation. The safe boundary is a committed transcript prefix copied into an explicitly marked, unkeyed branch child, with transport-only completion delivery.
+- **Summary:** Add gateway-only `/spawn <prompt>`. Normalize and pin the source, load the persisted parent transcript, trim any in-progress suffix after the last complete assistant response, create a durable child with `_branched_from` and `_spawned_from` lineage, copy the context sidecars, run the existing background rail with the child session and parent history, and leave the parent routing entry untouched. Peer fallback excludes unkeyed spawn children so they cannot become active accidentally; explicit `/resume` remains available. `/background`, `/bg`, and `/btw` remain detached.
+- **Surfaces:** `hermes_cli/commands.py`; `gateway/slash_commands.py`; `gateway/run.py`; `gateway/platforms/yuanbao.py`; `hermes_state.py`; `tests/gateway/test_spawn_command.py`; `tests/gateway/test_background_command.py`; `tests/gateway/test_multiplex_background_task_scope.py`; `tests/test_hermes_state.py`; `website/docs/reference/slash-commands.md`; `website/docs/user-guide/messaging/index.md`; `website/docs/user-guide/messaging/telegram.md`; this record.
+- **Upstream tracking:** Open PR #6159 by ProgramCaiCai proposes `/spawn` from current context. Open issue #22191 covers later Telegram reply-based continuation. This patch independently reworks the feature for current async DB, busy-command dispatch, session-lineage, and routing-recovery architecture instead of cherry-picking the stale implementation.
+- **Upstream PR:** Related open PR #6159.
+- **Regression:** `python -m pytest tests/gateway/test_spawn_command.py tests/gateway/test_background_command.py tests/test_hermes_state.py::test_gateway_peer_fallback_ignores_contextual_spawn_children -q`; focused RED proofs covered missing command/handler, incomplete-context trimming, fail-closed copy, parent non-switching, contextual agent inputs, and routing fallback selecting the spawn child before the exclusion.
+- **Published commit identity:** Stable subject `feat(gateway): add contextual background spawns`; credit the originating upstream design in this record and the commit trailer.
+- **Rollback:** Revert only `feat(gateway): add contextual background spawns`, removing `/spawn`, its child-session marker/filter, runner context parameters, regressions, and this record. Preserve HERMES-065 and detached `/background` behavior.
+- **Retirement:** Retire after released upstream ships a contextual asynchronous fork that snapshots only valid committed history, records durable independent lineage, cannot hijack gateway routing, does not inject assistant-only output into the parent, and has equivalent failure and busy-dispatch coverage.
 
 ### HERMES-062 — Normalize inbound Telegram checklists
 

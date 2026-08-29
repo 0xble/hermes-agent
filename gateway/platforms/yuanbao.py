@@ -1788,7 +1788,7 @@ class OwnerCommandMiddleware(InboundMiddleware):
     ALLOWLIST: frozenset = frozenset({
         "/new", "/reset", "/retry", "/undo", "/stop",
         "/approve", "/deny", "/bg",
-        "/btw", "/queue", "/q",
+        "/btw", "/spawn", "/queue", "/q",
     })
 
     @staticmethod
