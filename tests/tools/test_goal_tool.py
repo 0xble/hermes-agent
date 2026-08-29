@@ -94,6 +94,21 @@ def test_activation_requires_explicit_authorization(isolated_goal_db, user_task)
             "set a goal",
             "explicit_goal_authorization_required",
         ),
+        (
+            "Don't change the goal.",
+            "Don't change the goal.",
+            "explicit_goal_authorization_required",
+        ),
+        (
+            "Never replace my goal.",
+            "Never replace my goal.",
+            "explicit_goal_authorization_required",
+        ),
+        (
+            "Do not set a goal for this.",
+            "set a goal for this",
+            "explicit_goal_authorization_required",
+        ),
     ],
 )
 def test_authorization_span_and_direct_instruction(

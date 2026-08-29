@@ -16,7 +16,8 @@ _ACTIVATION_RE = re.compile(
 )
 _NEGATED_ACTIVATION_RE = re.compile(
     r"\b(?:do\s+not|don't|dont|never|without)\b.{0,48}"
-    r"\b(?:set|create|start|activate|establish|make)\b",
+    r"\b(?:set|create|start|activate|establish|make|replace|overwrite|"
+    r"supersede|switch|change)\b",
     re.IGNORECASE | re.DOTALL,
 )
 _REPLACEMENT_RE = re.compile(
@@ -36,17 +37,38 @@ def _failure(error_code: str, message: str, **fields: Any) -> str:
     return tool_error(message, success=False, error_code=error_code, **fields)
 
 
-def _explicit_activation_requested(text: str, prefix: str = "") -> bool:
+def _explicit_activation_requested(
+    text: str, prefix: str = "", context: Optional[str] = None
+) -> bool:
     return bool(
         text.strip()
         and _ACTIVATION_RE.search(text)
-        and not _NEGATED_ACTIVATION_RE.search(text)
+        and not _NEGATED_ACTIVATION_RE.search(context or text)
         and not _NON_DIRECT_CONTEXT_RE.search(prefix)
     )
 
 
-def _explicit_replacement_requested(text: str) -> bool:
-    return bool(text.strip() and _REPLACEMENT_RE.search(text))
+def _explicit_replacement_requested(text: str, context: Optional[str] = None) -> bool:
+    return bool(
+        text.strip()
+        and _REPLACEMENT_RE.search(text)
+        and not _NEGATED_ACTIVATION_RE.search(context or text)
+    )
+
+
+def _authorization_sentence(user_task: str, span_start: int, span_length: int) -> str:
+    """Return the sentence containing a model-selected authorization span."""
+    sentence_start = max(
+        user_task.rfind(separator, 0, span_start) for separator in ".!?\n"
+    ) + 1
+    after_span = span_start + span_length
+    sentence_ends = [
+        position
+        for separator in ".!?\n"
+        if (position := user_task.find(separator, after_span)) >= 0
+    ]
+    sentence_end = min(sentence_ends) + 1 if sentence_ends else len(user_task)
+    return user_task[sentence_start:sentence_end]
 
 
 def _normalize_max_turns(max_turns: Optional[int]) -> Optional[int]:
@@ -133,7 +155,10 @@ def set_goal_tool(
             "authorization_not_in_current_turn",
             "authorization_text must be an exact span from the current user turn",
         )
-    if not _explicit_activation_requested(auth_text, task_text[:auth_start]):
+    auth_context = _authorization_sentence(task_text, auth_start, len(auth_text))
+    if not _explicit_activation_requested(
+        auth_text, task_text[:auth_start], auth_context
+    ):
         return _failure(
             "explicit_goal_authorization_required",
             "The quoted authorization must be a direct instruction to activate a goal",
@@ -185,7 +210,9 @@ def set_goal_tool(
                     "An active or paused goal already exists. Ask explicitly to replace it, then set replace_existing=true.",
                     existing_goal=existing_goal,
                 )
-            if has_existing and not _explicit_replacement_requested(auth_text):
+            if has_existing and not _explicit_replacement_requested(
+                auth_text, auth_context
+            ):
                 return _failure(
                     "explicit_replacement_authorization_required",
                     "Replacing an active or paused goal requires explicit replacement language in the quoted authorization",

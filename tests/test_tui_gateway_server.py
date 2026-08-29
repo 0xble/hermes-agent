@@ -2586,7 +2586,12 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
 
     monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding", "figma"])
 
-    assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
+    assert server._load_enabled_toolsets("tui") == [
+        "coding",
+        "figma",
+        "goal",
+        "project",
+    ]
 
 
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
