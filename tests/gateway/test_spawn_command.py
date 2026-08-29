@@ -165,6 +165,12 @@ async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active
             "role": "assistant",
             "content": "first answer",
             "api_content": "cached-provider-shape",
+            "finish_reason": "stop",
+            "platform_message_id": "platform-2",
+            "observed": True,
+            "effect_disposition": "unknown",
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "test"},
             "timestamp": 2.0,
         },
         {"role": "user", "content": "active question", "timestamp": 3.0},
@@ -214,10 +220,17 @@ async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active
         ("assistant", "first answer"),
     ]
     assert copied_rows[1]["api_content"] == "cached-provider-shape"
+    assert copied_rows[1]["finish_reason"] == "stop"
+    assert copied_rows[1]["platform_message_id"] == "platform-2"
+    assert copied_rows[1]["observed"] is True
+    assert copied_rows[1]["effect_disposition"] == "unknown"
+    assert copied_rows[1]["display_kind"] == "internal_notification"
+    assert copied_rows[1]["display_metadata"] == {"source": "test"}
 
     spawn_kwargs = runner._run_background_task.await_args.kwargs
     assert spawn_kwargs["prompt"] == "investigate this"
     assert spawn_kwargs["source"].thread_id == "42"
+    assert spawn_kwargs["event_message_id"] is None
     assert spawn_kwargs["task_id"] == child_session_id
     assert spawn_kwargs["parent_session_id"] == "parent-1"
     assert spawn_kwargs["task_kind"] == "spawn"
@@ -288,7 +301,17 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
             cwd="/tmp/project",
         )
         db.append_message("parent-1", "user", "parent question")
-        db.append_message("parent-1", "assistant", "parent answer")
+        db.append_message(
+            "parent-1",
+            "assistant",
+            "parent answer",
+            finish_reason="stop",
+            platform_message_id="platform-parent-answer",
+            observed=True,
+            effect_disposition="unknown",
+            display_kind="internal_notification",
+            display_metadata={"source": "integration"},
+        )
         history = db.get_messages_as_conversation("parent-1")
 
         runner = GatewayRunner.__new__(GatewayRunner)
@@ -317,6 +340,7 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
         child = db.get_session(child_id)
         assert child is not None
         child_messages = db.get_messages_as_conversation(child_id)
+        child_rows = db.get_messages(child_id)
         parent = db.get_session("parent-1")
         parent_messages = db.get_messages_as_conversation("parent-1")
 
@@ -335,5 +359,63 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
             ("user", "parent question"),
             ("assistant", "parent answer"),
         ]
+        child_answer = child_rows[1]
+        assert child_answer["finish_reason"] == "stop"
+        assert child_answer["platform_message_id"] == "platform-parent-answer"
+        assert bool(child_answer["observed"]) is True
+        assert child_answer["effect_disposition"] == "unknown"
+        assert child_answer["display_kind"] == "internal_notification"
+        assert child_answer["display_metadata"] == {"source": "integration"}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_agent_failure_ends_real_spawn_child(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            "spawn-real-failure",
+            "telegram",
+            model="parent-model",
+            parent_session_id=None,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="42",
+            model_config={"_spawned_from": "parent-1"},
+        )
+        runner = GatewayRunner.__new__(GatewayRunner)
+        object.__setattr__(
+            runner, "config", SimpleNamespace(multiplex_profiles=False)
+        )
+        runner._session_db = AsyncSessionDB(db)
+        setattr(
+            runner,
+            "_resolve_session_agent_runtime",
+            MagicMock(return_value=("test-model", {"api_key": None})),
+        )
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="42",
+        )
+
+        await runner._run_background_task(
+            "test prompt",
+            source,
+            "spawn-real-failure",
+            task_kind="spawn",
+        )
+
+        child = db.get_session("spawn-real-failure")
+        assert child is not None
+        assert child["ended_at"] is not None
+        assert child["end_reason"] == "spawn_no_credentials"
     finally:
         db.close()
