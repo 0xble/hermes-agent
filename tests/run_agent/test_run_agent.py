@@ -3640,6 +3640,10 @@ class TestRunConversation:
         ] == ["high", "high", "medium"]
         assert len(notices) == 1
         assert notices[0].text.startswith("🧠 Adaptive reasoning: Medium → High")
+        assert all(
+            "Adaptive reasoning:" not in str(message.get("content", ""))
+            for message in first_result["messages"]
+        )
         assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
         assert get_turn_reasoning_config(agent) is None
 
