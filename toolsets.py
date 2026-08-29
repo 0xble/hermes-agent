@@ -420,7 +420,7 @@ TOOLSETS = {
             "browser_exec",
             "todo_list", "memory",
             "session_search", "clarify",
-            "execute_code", "delegate_task", "set_goal",
+            "execute_code", "delegate_task",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,
