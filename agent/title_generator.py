@@ -61,6 +61,8 @@ AuxiliaryRouteCallback = Callable[[dict], None]
 # Character cap for the title input at the provider boundary, enforced here
 # as the final boundary regardless of the caller's excerpting.
 MAX_TITLE_INPUT_CHARS = 1000
+MAX_TITLE_ATTACHMENT_PARTS = 4
+_TITLE_ATTACHMENT_PART_TYPES = frozenset({"image", "image_url", "input_image"})
 
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
@@ -618,6 +620,36 @@ def _clean_title(
     return title or None
 
 
+def _title_attachment_parts(title_context: Any) -> list[dict]:
+    if not isinstance(title_context, list):
+        return []
+    return [
+        dict(part)
+        for part in title_context
+        if isinstance(part, dict)
+        and str(part.get("type") or "").lower() in _TITLE_ATTACHMENT_PART_TYPES
+    ][:MAX_TITLE_ATTACHMENT_PARTS]
+
+
+def _title_request_content(user_snippet: str, title_context: Any) -> Any:
+    """Build bounded provider content without mutating the opening turn."""
+    attachments = _title_attachment_parts(title_context)
+    if not attachments:
+        return user_snippet
+
+    text = user_snippet or "Use the attached content to identify the concrete topic."
+    return [{"type": "text", "text": text}, *attachments]
+
+
+def _attachment_context_rejected(exc: BaseException) -> bool:
+    if isinstance(exc, (TypeError, ValueError)):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in {400, 415, 422}
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -626,6 +658,7 @@ def generate_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     avoid_titles: Optional[list[str]] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
+    title_context: Any = None,
 ) -> Optional[str]:
     """Generate a session title from bounded title context.
 
@@ -665,7 +698,8 @@ def generate_title(
     # over the user's visible instruction.
     summarized_user_message = _summarize_user_message(user_message)
     user_snippet = summarized_user_message[:MAX_TITLE_INPUT_CHARS]
-    if not user_snippet.strip():
+    has_attachments = bool(_title_attachment_parts(title_context))
+    if not user_snippet.strip() and not has_attachments:
         return None
 
     language = _title_language()
@@ -676,13 +710,12 @@ def generate_title(
         avoid_titles=avoid_titles,
     )
 
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": user_snippet},
-    ]
-
-    try:
-        response = call_llm(
+    def _request_title(content: Any):
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ]
+        return call_llm(
             task="title_generation",
             messages=messages,
             # The visible title is only a handful of tokens, but thinking-capable
@@ -696,6 +729,23 @@ def generate_title(
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
             require_complete_response=True,
         )
+
+    user_content = _title_request_content(user_snippet, title_context)
+
+    try:
+        try:
+            response = _request_title(user_content)
+        except Exception as first_error:
+            if (
+                not isinstance(user_content, list)
+                or not user_snippet.strip()
+                or not _attachment_context_rejected(first_error)
+            ):
+                raise
+            logger.info(
+                "Title route rejected attachment context; retrying with text only"
+            )
+            response = _request_title(user_snippet)
         choice = response.choices[0]
         finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
@@ -893,6 +943,7 @@ def choose_topic_icon(
     *,
     recent_emojis: Optional[list[str]] = None,
     instructions: str = "",
+    title_context: Any = None,
 ) -> Optional[str]:
     """Choose a varied semantic Telegram topic emoji from a live allowlist.
 
@@ -951,14 +1002,15 @@ def choose_topic_icon(
             " Follow these trusted operator instructions when they do not conflict "
             f"with the allowed-list and semantic-fit rules: {bounded_instructions}"
         )
+    icon_user_text = (
+        f"Title: {str(title or '')[:120]}\n"
+        f"Opening request: {str(user_message or '')[:500]}"
+    )
     messages = [
         {"role": "system", "content": prompt},
         {
             "role": "user",
-            "content": (
-                f"Title: {str(title or '')[:120]}\n"
-                f"Opening request: {str(user_message or '')[:500]}"
-            ),
+            "content": _title_request_content(icon_user_text, title_context),
         },
     ]
 
@@ -1166,6 +1218,7 @@ def auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
+    title_context: Any = None,
 ) -> None:
     """Generate and store the model title for a session.
 
@@ -1194,6 +1247,7 @@ def auto_title_session(
             title_callback=title_callback,
             runtime_validator=runtime_validator,
             route_callback=route_callback,
+            title_context=title_context,
         )
     except Exception as e:
         # WARNING (not debug) so operators see it in agent.log; the message
@@ -1220,6 +1274,7 @@ def _auto_title_session(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
+    title_context: Any = None,
 ) -> None:
     """Body of :func:`auto_title_session` — see its docstring."""
     if not session_db or not session_id:
@@ -1262,6 +1317,7 @@ def _auto_title_session(
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
         route_callback=route_callback,
+        title_context=title_context,
     )
     source = "llm"
     if not title:
@@ -1382,6 +1438,7 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
+    title_context: Any = None,
 ) -> None:
     """Title a session from its opening message: instant, then upgraded.
 
@@ -1392,7 +1449,8 @@ def maybe_auto_title(
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
     """
-    if not session_db or not session_id or not user_message:
+    has_attachments = bool(_title_attachment_parts(title_context))
+    if not session_db or not session_id or (not user_message and not has_attachments):
         return
 
     # Count the real questions behind us to detect the opening turn.
@@ -1409,7 +1467,7 @@ def maybe_auto_title(
     if user_msg_count >= 1 and not _session_is_untitled(session_db, session_id):
         return
 
-    if not is_titleable_user_message(user_message):
+    if user_message and not is_titleable_user_message(user_message):
         return
 
     # Config read comes after the cheap guards so the file isn't touched on
@@ -1418,22 +1476,26 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
-    apply_instant_title(session_db, session_id, user_message, title_callback)
+    if user_message:
+        apply_instant_title(session_db, session_id, user_message, title_callback)
 
     # Context vars carry the active Hermes profile and runtime provenance. A
     # plain daemon thread starts with an empty context and can read the wrong
     # profile's config or credentials.
     context = copy_context()
+    worker_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+        "runtime_validator": runtime_validator,
+        "route_callback": route_callback,
+    }
+    if title_context is not None:
+        worker_kwargs["title_context"] = title_context
     thread = threading.Thread(
         target=context.run,
         args=(auto_title_session, session_db, session_id, user_message),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-            "runtime_validator": runtime_validator,
-            "route_callback": route_callback,
-        },
+        kwargs=worker_kwargs,
         daemon=True,
         name="auto-title",
     )

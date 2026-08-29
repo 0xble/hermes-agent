@@ -5843,15 +5843,23 @@ class TurnRunner:
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
             if self._runner._is_telegram_topic_lane(source):
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm"
-                    and self._runner._schedule_telegram_topic_title_rename(
+                def _schedule_telegram_title(title: str, title_source: str):
+                    if title_source != "llm":
+                        return False
+                    rename_kwargs: dict[str, Any] = {
+                        "user_message": getattr(ctx, "message", "") or "",
+                    }
+                    title_context = getattr(agent, "_opening_title_context", None)
+                    if title_context is not None:
+                        rename_kwargs["title_context"] = title_context
+                    return self._runner._schedule_telegram_topic_title_rename(
                         source,
                         session_id,
                         title,
-                        user_message=getattr(ctx, "message", "") or "",
+                        **rename_kwargs,
                     )
-                )
+
+                agent._on_session_title = _schedule_telegram_title
             elif self._runner._is_discord_auto_thread_lane(source) or (
                 self._runner._is_relay_discord_channel_lane(source)
             ):
@@ -25500,6 +25508,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         title: str,
         user_message: str,
+        title_context: Any = None,
     ) -> Optional[str]:
         """Serialize icon selection per chat so recent-history rotation is race-free."""
         history_key = str(source.chat_id)
@@ -25536,11 +25545,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             async with entry["lock"]:
+                if title_context is None:
+                    return await self._select_telegram_topic_icon_id_unlocked(
+                        adapter,
+                        source,
+                        title,
+                        user_message,
+                    )
                 return await self._select_telegram_topic_icon_id_unlocked(
                     adapter,
                     source,
                     title,
                     user_message,
+                    title_context=title_context,
                 )
         finally:
             entry["users"] = max(0, int(entry.get("users", 1)) - 1)
@@ -25672,6 +25689,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         title: str,
         user_message: str,
+        title_context: Any = None,
     ) -> Optional[str]:
         """Resolve an allowed full-size topic icon when the operator opts in."""
         extra = self._telegram_topic_extra(source, adapter)
@@ -25803,6 +25821,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from agent.title_generator import choose_topic_icon
 
             choose_kwargs: dict[str, Any] = {"recent_emojis": recent_icons}
+            if title_context is not None:
+                choose_kwargs["title_context"] = title_context
             icon_instructions = str(extra.get("topic_icon_instructions") or "").strip()
             if icon_instructions:
                 choose_kwargs["instructions"] = icon_instructions
@@ -25876,6 +25896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         title: str,
         user_message: str = "",
+        title_context: Any = None,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
@@ -25965,6 +25986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source,
             topic_name,
             user_message,
+            title_context,
         )
         if session_db is not None:
             try:
@@ -26087,6 +26109,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         title: str,
         user_message: str = "",
+        title_context: Any = None,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source):
@@ -26127,6 +26150,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_id,
                 title,
                 user_message=user_message,
+                title_context=title_context,
             ),
             loop,
             logger=logger,
