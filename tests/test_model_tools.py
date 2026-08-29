@@ -437,6 +437,7 @@ class TestDisabledToolsetsPlatformBundle:
             f"Tools lost after disabling hermes-yuanbao: "
             f"{names_telegram - names_no_yuanbao}"
         )
+        assert "set_goal" in names_no_yuanbao
 
     def test_disabling_platform_bundle_removes_own_tools(self):
         """Disabling hermes-discord should remove discord-specific tools."""
