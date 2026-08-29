@@ -634,13 +634,14 @@ def _last_used_profile(src: str) -> str:
     return last
 
 
-def _normalize_snapshot_local_state(dst: str) -> None:
-    """Force the managed copy to launch its mirrored ``Default`` profile.
+def _normalize_snapshot_local_state(dst: str, source_profile: str) -> None:
+    """Launch ``Default`` with the selected source profile's identity metadata.
 
     Chrome can persist ``profile.last_used = Guest Profile`` after a guest
     window. Keeping that value in the managed copy launches guest mode, where
     CDP refuses ``Target.createTarget``. The snapshot always mirrors the chosen
-    real profile into ``Default``, so its Local State must point there too.
+    real profile into ``Default``, so its Local State must point there and its
+    sole ``info_cache`` entry must describe the mirrored source profile.
     """
     import json
 
@@ -654,6 +655,11 @@ def _normalize_snapshot_local_state(dst: str) -> None:
         if not isinstance(profile, dict):
             profile = {}
             state["profile"] = profile
+        info_cache = profile.get("info_cache")
+        if isinstance(info_cache, dict):
+            source_entry = info_cache.get(source_profile) or info_cache.get("Default")
+            if isinstance(source_entry, dict):
+                profile["info_cache"] = {"Default": source_entry}
         profile["last_used"] = "Default"
         if "last_active_profiles" in profile:
             profile["last_active_profiles"] = ["Default"]
@@ -1099,7 +1105,7 @@ def snapshot_real_profile(
         if os.path.isfile(ls_src):
             try:
                 shutil.copy2(ls_src, ls_dst)
-                _normalize_snapshot_local_state(dst)
+                _normalize_snapshot_local_state(dst, source_profile)
             except OSError as e:
                 logger.debug("real-profile snapshot: skipped Local State: %s", e)
 
@@ -1209,6 +1215,75 @@ def cleanup_real_profile_snapshots() -> None:
             logger.info("real-profile: removed snapshot store %s (consent off)", root)
     except OSError as e:
         logger.debug("real-profile cleanup failed for %s: %s", root, e)
+
+
+def stop_snapshot_browser_processes(snapshot_root: str) -> int:
+    """Stop directly launched Chromium trees rooted in ``snapshot_root``.
+
+    The match is intentionally strict: exact installed browser executable,
+    dynamic remote debugging, ``Default`` profile, and a user-data-dir below
+    Hermes' snapshot root. This recovers cleanup after a gateway crash without
+    risking the user's live browser profile.
+    """
+    import psutil
+
+    root = os.path.realpath(snapshot_root)
+    executables = {
+        os.path.normcase(os.path.realpath(path))
+        for browser in _CHROMIUM_BROWSERS
+        if (path := chromium_executable(browser))
+    }
+    if not executables:
+        return 0
+
+    owned_roots = []
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            if not cmdline or any(arg.startswith("--type=") for arg in cmdline):
+                continue
+            if "--remote-debugging-port=0" not in cmdline:
+                continue
+            if "--profile-directory=Default" not in cmdline:
+                continue
+            data_arg = next(
+                (arg for arg in cmdline if arg.startswith("--user-data-dir=")),
+                None,
+            )
+            if data_arg is None:
+                continue
+            data_dir = os.path.realpath(data_arg.split("=", 1)[1])
+            try:
+                if os.path.commonpath([root, data_dir]) != root:
+                    continue
+            except ValueError:
+                continue
+            executable = os.path.normcase(os.path.realpath(proc.exe()))
+            if executable not in executables:
+                continue
+            owned_roots.append(proc)
+        except (psutil.Error, OSError, ValueError):
+            continue
+
+    for root_proc in owned_roots:
+        try:
+            tree = root_proc.children(recursive=True) + [root_proc]
+        except psutil.Error:
+            tree = [root_proc]
+        for proc in tree:
+            try:
+                proc.terminate()
+            except psutil.Error:
+                pass
+        _, alive = psutil.wait_procs(tree, timeout=5.0)
+        for proc in alive:
+            try:
+                proc.kill()
+            except psutil.Error:
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=5.0)
+    return len(owned_roots)
 
 
 def get_chrome_debug_candidates(system: str) -> list[str]:
