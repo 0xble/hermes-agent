@@ -18334,6 +18334,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or _goal_verb in {"wait", "gate"}
         )
         if _is_control:
+            if _goal_arg in {"pause", "clear", "stop", "done"}:
+                try:
+                    from hermes_cli.goals import block_model_goal_activation
+
+                    running_agent = self._running_agents.get(quick_key)
+                    block_model_goal_activation(
+                        getattr(running_agent, "session_id", "") or "",
+                        getattr(running_agent, "_current_turn_id", "") or "",
+                    )
+                except Exception:
+                    logger.debug("goal activation fence failed", exc_info=True)
             return await self._handle_goal_command(event)
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 

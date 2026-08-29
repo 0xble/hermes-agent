@@ -53,6 +53,20 @@ What you'll see:
 4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
 5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
 
+## Natural-language activation
+
+On interactive sessions, you can explicitly ask Hermes to create and start a goal without typing `/goal`:
+
+```
+Set a goal to implement this feature, validate it end to end, and stop if deployment is required.
+```
+
+Hermes drafts the objective and optional completion contract, activates it in the current session, and starts the first concrete step in the same turn. The write is reported as successful only after the persisted state is read back. The normal post-turn judge and continuation loop then take over.
+
+This is deliberately authorization-gated. An ordinary task, question, recommendation, or request to draft a possible goal does **not** authorize activation. A model-created goal also cannot silently replace an active or paused goal. Replacement requires explicit language such as "replace the active goal" in the current user turn.
+
+The `set_goal` tool is enabled by default only on interactive CLI and messaging sessions that own the goal continuation hook. It is excluded from cron and webhook defaults. Disable the `goal` toolset with `hermes tools` if you want slash-command-only activation.
+
 ## Commands
 
 | Command | What it does |

@@ -51,6 +51,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
+_MODEL_GOAL_ACTIVATION_FENCE_TTL = 60 * 60
+_MODEL_GOAL_ACTIVATION_FENCES: Dict[Tuple[str, str], float] = {}
+_MODEL_GOAL_ACTIVATION_FENCES_LOCK = threading.Lock()
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
 # before emitting the visible JSON — and the first /goal turn's prompt is
@@ -63,6 +66,42 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response + recent messages we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+
+
+def block_model_goal_activation(session_id: str, turn_id: str) -> None:
+    """Fence a running turn after an explicit user goal-control command."""
+    sid = str(session_id or "").strip()
+    tid = str(turn_id or "").strip()
+    if not sid or not tid:
+        return
+    now = time.monotonic()
+    with _MODEL_GOAL_ACTIVATION_FENCES_LOCK:
+        if len(_MODEL_GOAL_ACTIVATION_FENCES) >= 2048:
+            cutoff = now - _MODEL_GOAL_ACTIVATION_FENCE_TTL
+            stale = [key for key, created in _MODEL_GOAL_ACTIVATION_FENCES.items() if created < cutoff]
+            for key in stale:
+                _MODEL_GOAL_ACTIVATION_FENCES.pop(key, None)
+        _MODEL_GOAL_ACTIVATION_FENCES[(sid, tid)] = now
+
+
+def model_goal_activation_blocked(session_id: str, turn_id: str) -> bool:
+    """Return whether this exact in-flight turn lost activation authority."""
+    sid = str(session_id or "").strip()
+    tid = str(turn_id or "").strip()
+    if not sid or not tid:
+        return False
+    now = time.monotonic()
+    key = (sid, tid)
+    with _MODEL_GOAL_ACTIVATION_FENCES_LOCK:
+        created = _MODEL_GOAL_ACTIVATION_FENCES.get(key)
+        if created is None:
+            return False
+        if now - created > _MODEL_GOAL_ACTIVATION_FENCE_TTL:
+            _MODEL_GOAL_ACTIVATION_FENCES.pop(key, None)
+            return False
+        return True
+
+
 # After this many consecutive judge *parse* failures (empty output / non-JSON),
 # the loop auto-pauses and points the user at the goal_judge config. API /
 # transport errors do NOT count toward this — those are transient. This guards
@@ -1465,6 +1504,22 @@ class GoalManager:
                 return None if self._state is None or self._state.status == "cleared" else self._state
         if state is None:
             return self._state
+        if self._state is not None:
+            if state.to_json() == self._state.to_json():
+                return None if self._state.status == "cleared" else self._state
+            local_revision = max(
+                self._state.created_at,
+                self._state.last_turn_at,
+                self._state.updated_at,
+            )
+            stored_revision = max(state.created_at, state.last_turn_at, state.updated_at)
+            # Public callers historically mutate nested state (for example,
+            # gate retry limits) before the next manager operation. An equal
+            # persisted revision is therefore an older snapshot, not evidence
+            # that the local mutation should be discarded. Model-tool writes
+            # use a fresh updated_at and still win this comparison.
+            if stored_revision <= local_revision:
+                return None if self._state.status == "cleared" else self._state
         self._state = None if state.status == "cleared" else state
         return self._state
 
