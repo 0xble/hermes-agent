@@ -943,6 +943,39 @@ async def test_auto_topic_icon_uses_secondary_transport_profile_config():
 
 
 @pytest.mark.asyncio
+async def test_auto_topic_icon_forwards_attachment_context():
+    runner = _make_runner()
+    adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
+    runner.config.platforms[Platform.TELEGRAM].extra.update(
+        {
+            "auto_topic_icons": True,
+            "preserve_manual_topic_icons": False,
+        }
+    )
+    adapter.get_forum_topic_icon_options.return_value = [
+        {"emoji": "🎨", "custom_emoji_id": "palette-id"}
+    ]
+    title_context = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        }
+    ]
+
+    with patch("agent.title_generator.choose_topic_icon", return_value="🎨") as choose:
+        selected = await runner._select_telegram_topic_icon_id(
+            adapter,
+            _make_source(thread_id="42"),
+            "Hermes Attachment Topics",
+            "Autofix this",
+            title_context=title_context,
+        )
+
+    assert selected == "palette-id"
+    assert choose.call_args.kwargs["title_context"] == title_context
+
+
+@pytest.mark.asyncio
 async def test_auto_topic_icon_selection_remembers_recent_choices_per_chat():
     runner = _make_runner()
     adapter = cast(Any, runner.adapters[Platform.TELEGRAM])

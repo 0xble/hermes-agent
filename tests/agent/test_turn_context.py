@@ -486,6 +486,26 @@ def test_prologue_titles_the_surfaces_a_person_reads(platform):
     assert _title_turn(platform).called
 
 
+def test_prologue_forwards_image_only_opening_context_to_titler():
+    from agent import turn_context
+
+    content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        }
+    ]
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            _TitlingAgent("telegram"),
+            [{"role": "user", "content": content}],
+        )
+
+    titler.assert_called_once()
+    assert titler.call_args.args[2] == ""
+    assert titler.call_args.kwargs["title_context"] == content
+
+
 @pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
 def test_prologue_does_not_title_machine_driven_runs(platform):
     """Cron names its own session after the job, and nobody opens a subagent's.

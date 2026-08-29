@@ -272,15 +272,17 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         from agent.message_content import flatten_message_text
         from agent.title_generator import maybe_auto_title
 
-        # The turn's own user message, as text. Multimodal turns flatten to
-        # their text parts; an image-only turn yields "" and is skipped, since
-        # there is nothing to title from.
+        # Preserve the opening content for the auxiliary titler. The visible
+        # text still drives the free deterministic title, while bounded native
+        # attachments can inform the model upgrade.
+        user_content: Any = None
         user_text = ""
         for msg in reversed(messages or []):
             if isinstance(msg, dict) and msg.get("role") == "user":
-                user_text = flatten_message_text(msg.get("content")).strip()
+                user_content = msg.get("content")
+                user_text = flatten_message_text(user_content).strip()
                 break
-        if not user_text:
+        if not user_text and not isinstance(user_content, list):
             return
 
         # The session row is created lazily on the first persist, which happens
@@ -298,6 +300,10 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         # (a stale request would reload an unloaded Ollama model, #19027).
         _model = getattr(agent, "model", None)
         _provider = getattr(agent, "provider", None)
+
+        agent._opening_title_context = (
+            user_content if isinstance(user_content, list) else None
+        )
 
         maybe_auto_title(
             session_db,
@@ -320,6 +326,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 getattr(agent, "model", None) == _model
                 and getattr(agent, "provider", None) == _provider
             ),
+            title_context=user_content,
         )
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
