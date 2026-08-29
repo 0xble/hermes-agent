@@ -3488,7 +3488,7 @@ class TestRunConversation:
         assert hook_checks == {"pre_api_request": 1, "post_api_request": 1}
         assert payload_counts == {"request": 0, "response": 0}
 
-    def test_pre_llm_reasoning_override_spans_tool_loop_and_resets_next_turn(
+    def test_explicit_reasoning_override_beats_hook_spans_tool_loop_and_resets(
         self, agent
     ):
         self._setup_agent(agent)
@@ -3522,7 +3522,7 @@ class TestRunConversation:
                         {
                             "reasoning_config": {
                                 "enabled": True,
-                                "effort": "high",
+                                "effort": "medium",
                             }
                         }
                     ]
@@ -3539,7 +3539,10 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            first_result = agent.run_conversation("use a tool")
+            first_result = agent.run_conversation(
+                "use a tool",
+                turn_reasoning_config={"enabled": True, "effort": "high"},
+            )
             assert get_turn_reasoning_config(agent) is None
             second_result = agent.run_conversation(
                 "answer without a tool",
