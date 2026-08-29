@@ -21,6 +21,10 @@ def test_parse_reasoning_turn_abstains_without_prompt(raw):
     assert parse_reasoning_turn(raw) is None
 
 
+def test_parse_reasoning_turn_abstains_for_persistent_global_change():
+    assert parse_reasoning_turn("high --global") is None
+
+
 def test_parse_reasoning_turn_rejects_disabled_effort():
     with pytest.raises(ReasoningTurnError, match="disabled"):
         parse_reasoning_turn("none answer this")
