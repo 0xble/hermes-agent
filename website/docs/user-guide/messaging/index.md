@@ -212,6 +212,7 @@ platform network disconnect as an event-loop failure.
 | `/rollback [number]` | List or restore filesystem checkpoints |
 | `/bg <prompt>` | Run a prompt in a separate background session |
 | `/btw <question>` | Ask a side question about the current conversation without interrupting it |
+| `/spawn <prompt>` | Fork the current committed context into a one-shot background session |
 | `/reload-mcp` | Reload MCP servers from config |
 | `/update` | Update Hermes Agent to the latest version |
 | `/help` | Show available commands |
@@ -514,6 +515,18 @@ Each `/bg` prompt spawns a **separate agent instance** that runs asynchronously:
 - **Same configuration** — inherits your model, provider, toolsets, reasoning settings, and provider routing from the current gateway setup.
 - **Non-blocking** — your main chat stays fully interactive. Send messages, run other commands, or start more background tasks while it works.
 - **Result delivery** — when the task finishes, the result is sent back to the **same chat or channel** where you issued the command, prefixed with "✅ Background task complete". If it fails, you'll see "❌ Background task failed" with the error.
+
+### Contextual Spawns
+
+Use `/spawn` when the side task needs the current conversation instead of a detached prompt:
+
+```
+/spawn Verify the diagnosis above against the current source and report any counterexample
+```
+
+`/spawn` snapshots the persisted transcript through the last complete assistant response, copies it into a durable child session, and runs the new prompt there. The parent chat stays active and its transcript is not modified by the child result. If the parent agent is currently working, partial tool calls and unfinished output are excluded from the snapshot.
+
+The child has a generated `Spawn ...` title and can be resumed explicitly later. It does not receive the parent's gateway routing key, so ordinary messages continue in the parent. Use `/background`, `/bg`, or `/btw` when the task is self-contained and does not need the current transcript.
 
 ### Background Process Notifications
 

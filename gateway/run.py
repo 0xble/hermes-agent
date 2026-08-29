@@ -18049,6 +18049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "agents": self._handle_agents_command,
             "bg": self._handle_background_command,
             "btw": self._handle_btw_command,
+            "spawn": self._handle_spawn_command,
             "kanban": self._handle_kanban_command,
             "subgoal": self._handle_subgoal_command,
             "heartbeat": self._handle_heartbeat_command,
@@ -19559,7 +19560,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "diff":
             return await self._handle_diff_command(event)
-
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
             if not queue_payload:
@@ -24721,6 +24721,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        parent_session_id: Optional[str] = None,
+        task_kind: str = "background",
+        task_title: Optional[str] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -24732,12 +24736,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                conversation_history, parent_session_id, task_kind, task_title,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                conversation_history, parent_session_id, task_kind, task_title,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -24783,12 +24789,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        parent_session_id: Optional[str] = None,
+        task_kind: str = "background",
+        task_title: Optional[str] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
         media_urls = media_urls or []
         media_types = media_types or []
+        task_label = "Spawn" if task_kind == "spawn" else "Background task"
+        task_identity = task_title or task_id
+        task_reference = (
+            f'Child session: "{task_identity}"\n' if task_kind == "spawn" else ""
+        )
 
         adapter = self._adapter_for_source(source)
         if not adapter:
@@ -24806,7 +24821,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    f"❌ {task_label} {task_identity} failed: no provider credentials configured.",
                     metadata=_thread_metadata,
                 )
                 return
@@ -24867,6 +24882,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
+                    parent_session_id=cast(str, parent_session_id),
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
@@ -24882,6 +24898,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
+                        conversation_history=conversation_history or [],
                         task_id=task_id,
                     )
                 finally:
@@ -24893,9 +24910,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
-            # Background tasks start a fresh conversation (no prior history),
-            # so history_offset=0: every message in the run belongs to this
-            # turn. Mirrors the repair on the main turn path.
+            # Repair against this run's returned messages. Detached tasks have
+            # an empty history; contextual spawns carry a committed prefix but
+            # repair_explicit_computer_use_media_paths only rewrites paths that
+            # are explicitly evidenced by the returned transcript.
             if response:
                 response = repair_explicit_computer_use_media_paths(
                     response,
@@ -24909,8 +24927,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                prompt_preview = " ".join(prompt.split())
+                preview = prompt_preview[:60] + (
+                    "..." if len(prompt_preview) > 60 else ""
+                )
+                header = (
+                    f'✅ {task_label} complete\nPrompt: "{preview}"\n'
+                    f"{task_reference}\n"
+                )
 
                 if text_content:
                     await adapter.send(
@@ -24976,10 +25000,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                prompt_preview = " ".join(prompt.split())
+                preview = prompt_preview[:60] + (
+                    "..." if len(prompt_preview) > 60 else ""
+                )
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=(
+                        f'✅ {task_label} complete\nPrompt: "{preview}"\n'
+                        f"{task_reference}\n(No response generated)"
+                    ),
                     metadata=_thread_metadata,
                 )
 
@@ -24988,7 +25018,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
+                    content=f"❌ {task_label} {task_identity} failed: {e}",
                     metadata=_thread_metadata,
                 )
             except Exception:

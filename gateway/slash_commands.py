@@ -3636,10 +3636,8 @@ class GatewaySlashCommandsMixin:
         if not prompt:
             return t("gateway.background.usage")
 
-        source = await asyncio.to_thread(
-            self._normalize_source_for_session_key,
-            event.source,
-        )
+        normalize_source = getattr(self, "_normalize_source_for_session_key")
+        source = await asyncio.to_thread(normalize_source, event.source)
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
 
         event_message_id = self._reply_anchor_for_event(event)
@@ -3759,6 +3757,171 @@ class GatewaySlashCommandsMixin:
         _task.add_done_callback(self._background_tasks.discard)
 
         return t("gateway.btw.started", preview=preview)
+
+    @staticmethod
+    def _completed_spawn_history(history: list[dict]) -> list[dict]:
+        """Return the transcript through the last completed assistant turn.
+
+        A busy-session `/spawn` may race with persistence of the foreground
+        turn. Never copy its partial user/tool sequence into the child. A final
+        assistant response has no pending tool calls and either carries visible
+        content or a terminal finish reason.
+        """
+        terminal_reasons = {"stop", "end_turn", "completed"}
+        for index in range(len(history) - 1, -1, -1):
+            message = history[index]
+            if message.get("role") != "assistant" or message.get("tool_calls"):
+                continue
+            finish_reason = str(message.get("finish_reason") or "").strip().lower()
+            if finish_reason and finish_reason not in terminal_reasons:
+                continue
+            content = message.get("content")
+            if content not in (None, "", []) or finish_reason in terminal_reasons:
+                return history[: index + 1]
+        return []
+
+    async def _handle_spawn_command(self, event: MessageEvent) -> str:
+        """Fork committed context into a durable one-shot background child."""
+        import json as _json
+        import uuid as _uuid
+
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return "Usage: /spawn <prompt>"
+        session_db = getattr(self, "_session_db", None)
+        if not session_db:
+            from hermes_state import format_session_db_unavailable
+
+            return format_session_db_unavailable(
+                prefix=t("gateway.shared.session_db_unavailable_prefix")
+            )
+
+        normalize_source = getattr(self, "_normalize_source_for_session_key")
+        source = await asyncio.to_thread(normalize_source, event.source)
+        current_entry = await self.async_session_store.get_or_create_session(source)
+        parent_session_id = current_entry.session_id
+        raw_history = await self.async_session_store.load_transcript(parent_session_id)
+        history = self._completed_spawn_history(raw_history)
+        if not history:
+            return "There is no completed conversation to spawn from."
+
+        now = datetime.now()
+        child_session_id = (
+            f"spawn_{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        )
+        one_line_prompt = " ".join(prompt.split())
+        preview = one_line_prompt[:60] + (
+            "..." if len(one_line_prompt) > 60 else ""
+        )
+        child_title = f"Spawn {now.strftime('%H:%M:%S.%f')[:-3]}: {preview}"
+
+        origin = current_entry.origin or source
+        try:
+            origin_json = _json.dumps(origin.to_dict())
+        except Exception:
+            origin_json = None
+
+        parent_row = None
+        try:
+            parent_row = await session_db.get_session(parent_session_id)
+        except Exception:
+            logger.debug("Could not load parent metadata for spawn", exc_info=True)
+        parent_row = parent_row if isinstance(parent_row, dict) else {}
+
+        try:
+            await session_db.create_session(
+                session_id=child_session_id,
+                source=source.platform.value if source.platform else "gateway",
+                model=parent_row.get("model"),
+                model_config={
+                    "_branched_from": parent_session_id,
+                    "_spawned_from": parent_session_id,
+                    "_spawn_mode": "one_shot",
+                },
+                parent_session_id=parent_session_id,
+                user_id=source.user_id,
+                # An unkeyed child can be resumed explicitly but can never win
+                # the gateway's active routing-key lookup over its parent.
+                session_key=None,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                origin_json=origin_json,
+                display_name=current_entry.display_name,
+                cwd=parent_row.get("cwd"),
+                profile_name=parent_row.get("profile_name"),
+                git_repo_root=parent_row.get("git_repo_root"),
+            )
+        except Exception as exc:
+            logger.error("Failed to create spawn session: %s", exc)
+            return "❌ Spawn failed: could not create the child session."
+
+        rows = [
+            {
+                "role": message.get("role", "user"),
+                "content": message.get("content"),
+                "tool_name": message.get("tool_name") or message.get("name"),
+                "tool_calls": message.get("tool_calls"),
+                "tool_call_id": message.get("tool_call_id"),
+                "finish_reason": message.get("finish_reason"),
+                "reasoning": message.get("reasoning"),
+                "reasoning_content": message.get("reasoning_content"),
+                "reasoning_details": message.get("reasoning_details"),
+                "codex_reasoning_items": message.get("codex_reasoning_items"),
+                "codex_message_items": message.get("codex_message_items"),
+                "api_content": extract_api_content_sidecar(message),
+                "timestamp": message.get("timestamp"),
+            }
+            for message in history
+        ]
+        try:
+            await session_db.append_messages_batch(
+                child_session_id,
+                rows,
+                chunk_rows=500,
+            )
+        except Exception as exc:
+            logger.error("Failed to copy spawn context: %s", exc)
+            try:
+                await session_db.end_session(
+                    child_session_id,
+                    end_reason="spawn_copy_failed",
+                )
+            except Exception:
+                logger.debug("Failed to finalize incomplete spawn", exc_info=True)
+            return "❌ Spawn failed: could not copy the parent context."
+
+        try:
+            await session_db.set_session_title(child_session_id, child_title)
+        except Exception:
+            logger.debug("Could not title spawn session", exc_info=True)
+
+        media_urls = list(event.media_urls) if event.media_urls else []
+        media_types = list(event.media_types) if event.media_types else []
+        run_background_task = getattr(self, "_run_background_task")
+        reply_anchor_for_event = getattr(self, "_reply_anchor_for_event")
+        background_tasks = getattr(self, "_background_tasks")
+        task = asyncio.create_task(
+            run_background_task(
+                prompt=prompt,
+                source=source,
+                task_id=child_session_id,
+                event_message_id=reply_anchor_for_event(event),
+                media_urls=media_urls,
+                media_types=media_types,
+                conversation_history=history,
+                parent_session_id=parent_session_id,
+                task_kind="spawn",
+                task_title=child_title,
+            )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+        return (
+            f'🔀 Spawn started\nPrompt: "{preview}"\n'
+            f'Child session: "{child_title}"'
+        )
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast

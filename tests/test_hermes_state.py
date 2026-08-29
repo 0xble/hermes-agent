@@ -4320,6 +4320,45 @@ def test_gateway_session_peer_round_trip_and_recovery(db):
     assert recovered["id"] == "gw-session"
 
 
+def test_gateway_peer_fallback_ignores_contextual_spawn_children(db):
+    """An unkeyed /spawn child must not hijack the parent's routing lane."""
+    peer = {
+        "user_id": "user-1",
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+        "thread_id": "42",
+    }
+    db.create_session(
+        "gw-parent",
+        "telegram",
+        session_key="agent:main:telegram:dm:chat-1:42",
+        **peer,
+    )
+    db.append_message("gw-parent", "user", "parent context")
+    db.create_session(
+        "spawn-child",
+        "telegram",
+        model_config={
+            "_branched_from": "gw-parent",
+            "_spawned_from": "gw-parent",
+        },
+        parent_session_id="gw-parent",
+        **peer,
+    )
+    db.append_message("spawn-child", "user", "spawn work")
+
+    recovered = db.find_latest_gateway_session_for_peer(
+        source="telegram",
+        user_id="user-1",
+        session_key="stale-or-missing-key",
+        chat_id="chat-1",
+        chat_type="dm",
+        thread_id="42",
+    )
+
+    assert recovered["id"] == "gw-parent"
+
+
 @pytest.mark.parametrize(
     "persisted_session_key",
     ["agent:main:telegram:dm:chat-1", None],
