@@ -386,6 +386,7 @@ DEFAULT_CONFIG = {
         # to permit downshift; automatic "none" is never selected.
         "adaptive_reasoning": {
             "enabled": False,
+            "shadow": False,
             "max_effort": "high",
             "min_effort": "",
         },

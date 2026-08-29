@@ -8,7 +8,7 @@ or changes the session baseline.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from agent.reasoning_context import (
@@ -116,6 +116,9 @@ class AdaptiveReasoningDecision:
     policy_version: str = POLICY_VERSION
     applied: bool = False
     reason_label: str = ""
+    baseline_effort: str = ""
+    effective_effort: str = ""
+    shadow: bool = False
 
 
 def parse_adaptive_reasoning_config(raw: Any) -> dict[str, Any] | None:
@@ -128,6 +131,8 @@ def parse_adaptive_reasoning_config(raw: Any) -> dict[str, Any] | None:
         max_effort = "high"
 
     parsed: dict[str, Any] = {"enabled": True, "max_effort": max_effort}
+    if raw.get("shadow") is True:
+        parsed["shadow"] = True
     min_effort = str(raw.get("min_effort") or "").strip().lower()
     if min_effort in _ADAPTIVE_LEVELS and (
         _EFFORT_RANK[min_effort] <= _EFFORT_RANK[max_effort]
@@ -268,7 +273,7 @@ def _emit_notice(agent: Any, decision: AdaptiveReasoningDecision, baseline: str)
     from agent.credits_tracker import AgentNotice
 
     before = baseline.capitalize()
-    after = decision.selected_effort.capitalize()
+    after = (decision.effective_effort or decision.selected_effort).capitalize()
     callback(
         AgentNotice(
             text=(
@@ -281,6 +286,17 @@ def _emit_notice(agent: Any, decision: AdaptiveReasoningDecision, baseline: str)
             key=NOTICE_KEY,
         )
     )
+
+
+def _emit_decision(agent: Any, decision: AdaptiveReasoningDecision) -> None:
+    """Publish structured policy evidence without retaining it on the agent."""
+    callback = getattr(agent, "adaptive_reasoning_decision_callback", None)
+    if not callable(callback):
+        return
+    try:
+        callback(decision)
+    except Exception:
+        return
 
 
 def begin_adaptive_reasoning_turn(
@@ -312,12 +328,35 @@ def begin_adaptive_reasoning_turn(
         getattr(agent, "reasoning_user_override", False)
         or get_turn_reasoning_source(agent) == "explicit"
     ):
-        return AdaptiveReasoningDecision(
-            baseline, 0, ("explicit-override",), applied=False
+        decision = AdaptiveReasoningDecision(
+            baseline,
+            0,
+            ("explicit-override",),
+            applied=False,
+            baseline_effort=baseline,
+            effective_effort=baseline,
         )
+        _emit_decision(agent, decision)
+        return decision
 
     decision = select_adaptive_reasoning(_extract_text(user_message), baseline, cfg)
+    if cfg.get("shadow") is True:
+        decision = replace(
+            decision,
+            applied=False,
+            baseline_effort=baseline,
+            effective_effort=baseline,
+            shadow=True,
+        )
+        _emit_decision(agent, decision)
+        return decision
     if not decision.applied:
+        decision = replace(
+            decision,
+            baseline_effort=baseline,
+            effective_effort=baseline,
+        )
+        _emit_decision(agent, decision)
         return decision
 
     installed = set_turn_reasoning_config(
@@ -326,11 +365,21 @@ def begin_adaptive_reasoning_turn(
         source="adaptive",
     )
     if not installed:
-        return AdaptiveReasoningDecision(
+        decision = AdaptiveReasoningDecision(
             baseline,
             decision.score,
             ("precedence-abstain",),
             applied=False,
+            baseline_effort=baseline,
+            effective_effort=baseline,
         )
+        _emit_decision(agent, decision)
+        return decision
+    decision = replace(
+        decision,
+        baseline_effort=baseline,
+        effective_effort=decision.selected_effort,
+    )
+    _emit_decision(agent, decision)
     _emit_notice(agent, decision, baseline)
     return decision
