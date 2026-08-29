@@ -672,14 +672,15 @@ class TestRegisterHandlers:
         app = MagicMock()
         a._register_handlers(app)
 
-        # Nine core handlers (including DM topic status, checklist ingress,
-        # the final unmatched-message guard, and the inline command picker)
-        # plus the gateway_platform_event observer alone in group 99, so it
-        # observes alongside rather than displacing the core handlers.
+        # Ten core handlers (including DM topic status, checklist and Rich
+        # Message ingress, the final unmatched-message guard, and the inline
+        # command picker) plus the gateway_platform_event observer alone in
+        # group 99, so it observes alongside rather than displacing the core
+        # handlers.
         calls = app.add_handler.call_args_list
-        assert len(calls) == 10
+        assert len(calls) == 11
         assert len([c for c in calls if c.kwargs.get("group") == 99]) == 1
-        assert len([c for c in calls if not c.kwargs]) == 9
+        assert len([c for c in calls if not c.kwargs]) == 10
 
     def test_rebuild_re_registers_observer(self):
         """A second call on a fresh app (e.g. a future rebuild) re-registers
@@ -691,7 +692,7 @@ class TestRegisterHandlers:
         a._register_handlers(first_app)
         a._register_handlers(rebuilt_app)  # the rebuild path
 
-        assert rebuilt_app.add_handler.call_count == 10
+        assert rebuilt_app.add_handler.call_count == 11
         assert len(self._observer_calls(rebuilt_app)) == 1
 
     def test_transient_init_rebuild_uses_shared_registration(self, monkeypatch):

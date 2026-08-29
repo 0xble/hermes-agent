@@ -18,6 +18,7 @@ import html as _html
 import re
 import threading
 import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
@@ -25,6 +26,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 logger = logging.getLogger(__name__)
 
 from agent.deadline import run_bounded_async
+from plugins.platforms.telegram.rich_messages import project_rich_message
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -4826,6 +4828,14 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TelegramMessageHandler(
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message
+        ))
+        # PTB 22.8 predates Bot API 10.1 RichMessage support, so rich-only
+        # messages live in Message.api_kwargs and match none of PTB's built-in
+        # filters. Keep this after ordinary text/media handlers so a mixed
+        # future payload still follows the established richer handler first.
+        app.add_handler(TelegramMessageHandler(
+            self._rich_message_filter(),
+            self._handle_rich_message,
         ))
         # Keep this last in group 0. PTB dispatches only the first matching
         # handler per group, so known message families are processed normally
@@ -10118,6 +10128,7 @@ class TelegramAdapter(BasePlatformAdapter):
             yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
             yield from cls._checklist_text_sources(message)
+            yield from cls._rich_message_text_sources(message)
 
         for source_text, entities in _iter_sources():
             for entity in entities:
@@ -10185,6 +10196,7 @@ class TelegramAdapter(BasePlatformAdapter):
             yield getattr(message, "text", None) or "", getattr(message, "entities", None) or []
             yield getattr(message, "caption", None) or "", getattr(message, "caption_entities", None) or []
             yield from self._checklist_text_sources(message)
+            yield from self._rich_message_text_sources(message)
 
         # Telegram parses mentions server-side and emits MessageEntity objects
         # (type=mention for @username, type=text_mention for @FirstName targeting
@@ -10292,11 +10304,18 @@ class TelegramAdapter(BasePlatformAdapter):
     def _message_matches_mention_patterns(self, message: Message) -> bool:
         if not self._mention_patterns:
             return False
-        checklist_text = [text for text, _entities in self._checklist_text_sources(message)]
+        structured_text = [
+            text
+            for source in (
+                self._checklist_text_sources(message),
+                self._rich_message_text_sources(message),
+            )
+            for text, _entities in source
+        ]
         for candidate in (
             getattr(message, "text", None),
             getattr(message, "caption", None),
-            *checklist_text,
+            *structured_text,
         ):
             if not candidate:
                 continue
@@ -10638,12 +10657,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 "timestamp": observed_at.astimezone(timezone.utc).isoformat(),
                 "observed": True,
             }
-            checklist_metadata = event.metadata.get("telegram_checklist")
-            if checklist_metadata is not None:
-                # Observe-only checklist updates never enter the normal gateway
-                # dispatch path. Persist their structured projection alongside
-                # the text so exact task IDs and state changes survive.
-                entry["metadata"] = {"telegram_checklist": checklist_metadata}
+            structured_metadata = {
+                key: event.metadata[key]
+                for key in ("telegram_checklist", "telegram_rich_message")
+                if event.metadata.get(key) is not None
+            }
+            if structured_metadata:
+                # Observe-only structured messages never enter the normal
+                # gateway dispatch path. Persist bounded metadata alongside the
+                # text so their source shape survives.
+                entry["metadata"] = structured_metadata
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             store.append_to_transcript(session_entry.session_id, entry)
@@ -10902,6 +10925,70 @@ class TelegramAdapter(BasePlatformAdapter):
                 str(getattr(task, "text", "") or ""),
                 getattr(task, "text_entities", None) or [],
             )
+
+    @staticmethod
+    def _inbound_rich_message_payload(message: Any) -> tuple[Any, Optional[str]]:
+        """Return a native/future or PTB-api_kwargs RichMessage payload."""
+        native = getattr(message, "rich_message", None)
+        native_type = type(native)
+        if isinstance(native, Mapping) or (
+            native is not None
+            and native_type.__module__.startswith("telegram")
+            and callable(getattr(native, "to_dict", None))
+        ):
+            return native, "attribute"
+        api_kwargs = getattr(message, "api_kwargs", None)
+        getter = getattr(api_kwargs, "get", None)
+        if callable(getter):
+            payload = getter("rich_message")
+            if payload is not None:
+                return payload, "api_kwargs"
+        return None, None
+
+    @classmethod
+    def _rich_message_text_sources(cls, message: Any):
+        """Yield bounded Rich Message text for existing group mention gates."""
+        payload, _source = cls._inbound_rich_message_payload(message)
+        if payload is None:
+            return
+        projection = project_rich_message(payload)
+        if projection.text:
+            yield projection.text, []
+
+    @classmethod
+    def _is_rich_message_update(cls, message: Any) -> bool:
+        """Match only rich-only messages not owned by existing handlers."""
+        if message is None:
+            return False
+        if getattr(message, "text", None) or getattr(message, "caption", None):
+            return False
+        for attr in ("photo", "document", "video", "audio", "voice", "sticker"):
+            if getattr(message, attr, None):
+                return False
+        payload, _source = cls._inbound_rich_message_payload(message)
+        if payload is None:
+            return False
+        mapping = payload if isinstance(payload, dict) else None
+        if mapping is None:
+            getter = getattr(payload, "get", None)
+            if callable(getter):
+                try:
+                    return getter("blocks") is not None
+                except Exception:
+                    return False
+            return getattr(payload, "blocks", None) is not None
+        return mapping.get("blocks") is not None
+
+    @classmethod
+    def _rich_message_filter(cls):
+        """Build a PTB filter lazily so optional imports remain import-safe."""
+        adapter_cls = cls
+
+        class _RichMessageFilter(filters.MessageFilter):
+            def filter(self, message: Message) -> bool:
+                return adapter_cls._is_rich_message_update(message)
+
+        return _RichMessageFilter(name="RichMessage")
 
     @staticmethod
     def _checklist_entity_metadata(entities: Any) -> List[Dict[str, Any]]:
@@ -11218,6 +11305,72 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(api_kwargs, dict):
             fields.update(str(key) for key, value in api_kwargs.items() if _present(value))
         return sorted(fields)[:32]
+
+    async def _handle_rich_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Normalize one inbound Bot API Rich Message into the text pipeline."""
+        message = self._effective_update_message(update)
+        if message is None or not self._is_rich_message_update(message):
+            return
+        if not self._is_user_authorized_from_message(message):
+            logger.warning(
+                "[Telegram] Blocked unauthorized Rich Message user %s in chat %s",
+                getattr(getattr(message, "from_user", None), "id", None),
+                getattr(getattr(message, "chat", None), "id", None),
+            )
+            return
+
+        payload, source = self._inbound_rich_message_payload(message)
+        projection = project_rich_message(payload)
+        if not projection.text:
+            logger.warning(
+                "[Telegram] Rich Message has no readable content update_id=%s "
+                "message_id=%s chat_type=%s block_count=%s block_types=%s",
+                getattr(update, "update_id", None),
+                getattr(message, "message_id", None),
+                str(getattr(getattr(message, "chat", None), "type", "unknown"))[:32],
+                projection.block_count,
+                list(projection.block_types),
+            )
+            return
+
+        should_process = self._should_process_message(message)
+        should_observe = (
+            not should_process
+            and self._should_observe_unmentioned_group_message(message)
+        )
+        if not should_process and not should_observe:
+            return
+
+        event = self._build_message_event(
+            message,
+            MessageType.TEXT,
+            update_id=getattr(update, "update_id", None),
+        )
+        event.text = self._clean_bot_trigger_text(projection.text)
+        event.metadata["telegram_rich_message"] = {
+            "block_count": projection.block_count,
+            "block_types": list(projection.block_types),
+            "source": source,
+            "truncated": projection.truncated,
+        }
+
+        if should_observe:
+            self._observe_unmentioned_group_message(
+                message,
+                MessageType.TEXT,
+                update_id=getattr(update, "update_id", None),
+                event=event,
+            )
+            return
+
+        await self._ensure_forum_commands(message)
+        await self._cache_replied_media(message, event)
+        event = self._apply_telegram_group_observe_attribution(event)
+        self._enqueue_text_event(event)
 
     async def _handle_unmatched_message(
         self,
@@ -12086,72 +12239,15 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
     @classmethod
-    def _flatten_rich_inline_text(cls, value: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            return "".join(cls._flatten_rich_inline_text(item) for item in value)
-        if isinstance(value, dict):
-            text = value.get("text")
-            if text is not None:
-                return cls._flatten_rich_inline_text(text)
-            children = value.get("children")
-            if children is not None:
-                return cls._flatten_rich_inline_text(children)
-        return ""
-
-    @classmethod
-    def _flatten_rich_blocks(cls, blocks: Any) -> str:
-        """Best-effort plaintext flattener for Bot API rich-message blocks."""
-        if not isinstance(blocks, list):
-            return ""
-
-        lines: List[str] = []
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-
-            block_type = block.get("type")
-            if block_type == "list":
-                for item in block.get("items", []):
-                    if not isinstance(item, dict):
-                        continue
-                    item_text = cls._flatten_rich_blocks(item.get("blocks"))
-                    if not item_text:
-                        continue
-                    label = item.get("label")
-                    item_lines = item_text.splitlines()
-                    if not item_lines:
-                        continue
-                    first_line = item_lines[0]
-                    if label:
-                        first_line = f"{label} {first_line}".strip()
-                    lines.append(first_line)
-                    lines.extend(item_lines[1:])
-                continue
-
-            text = cls._flatten_rich_inline_text(block.get("text"))
-            if text:
-                lines.extend(text.splitlines())
-
-        return "\n".join(line.rstrip() for line in lines if line)
-
-    @classmethod
     def _extract_rich_reply_text(cls, reply_to_message: Any) -> Optional[str]:
-        """Return plaintext echoed by Telegram's rich_message reply payload."""
+        """Return bounded Markdown echoed by Telegram's rich_message reply."""
         try:
-            api_kwargs = getattr(reply_to_message, "api_kwargs", None)
-            getter = getattr(api_kwargs, "get", None)
-            if not callable(getter):
+            rich_message, _source = cls._inbound_rich_message_payload(
+                reply_to_message
+            )
+            if rich_message is None:
                 return None
-            rich_message = getter("rich_message")
-            rich_getter = getattr(rich_message, "get", None)
-            if not callable(rich_getter):
-                return None
-            text = cls._flatten_rich_blocks(rich_getter("blocks")).strip()
+            text = project_rich_message(rich_message).text.strip()
             return text or None
         except Exception:
             return None
