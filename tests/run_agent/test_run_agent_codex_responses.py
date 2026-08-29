@@ -11,6 +11,11 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
 from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+from agent.reasoning_context import (
+    begin_turn_reasoning,
+    reset_turn_reasoning,
+    set_turn_reasoning_config,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -345,11 +350,16 @@ def test_build_api_kwargs_codex(monkeypatch):
 def test_build_api_kwargs_codex_uses_turn_reasoning_override(monkeypatch):
     agent = _build_agent(monkeypatch)
     agent.reasoning_config = {"enabled": True, "effort": "low"}
-    agent._turn_reasoning_config = {"enabled": True, "effort": "high"}
-
-    kwargs = agent._build_api_kwargs(
-        [{"role": "user", "content": "hello"}]
-    )
+    token = begin_turn_reasoning(agent)
+    try:
+        assert set_turn_reasoning_config(
+            agent, {"enabled": True, "effort": "high"}
+        )
+        kwargs = agent._build_api_kwargs(
+            [{"role": "user", "content": "hello"}]
+        )
+    finally:
+        reset_turn_reasoning(token)
 
     assert kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}

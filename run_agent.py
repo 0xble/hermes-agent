@@ -8280,7 +8280,9 @@ class AIAgent:
 
     def _current_reasoning_config(self) -> dict | None:
         """Return this turn's reasoning override or the configured fallback."""
-        turn_config = getattr(self, "_turn_reasoning_config", None)
+        from agent.reasoning_context import get_turn_reasoning_config
+
+        turn_config = get_turn_reasoning_config(self)
         if isinstance(turn_config, dict):
             return turn_config
         return self.reasoning_config
@@ -9375,6 +9377,10 @@ class AIAgent:
             set_conversation_context,
         )
         from agent.prompt_cache_scope import declared_conversation_scope_safe
+        from agent.reasoning_context import (
+            begin_turn_reasoning,
+            reset_turn_reasoning,
+        )
         from hermes_cli.observability.relay_shared_metrics import (
             finish_task_run,
             start_task_run,
@@ -9415,6 +9421,7 @@ class AIAgent:
         # otherwise — the 4 red cross-process lease tests on PR #97158).
         affinity_token = None
         acct_token = None
+        reasoning_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -9850,6 +9857,7 @@ class AIAgent:
             affinity_token = set_affinity_scope(
                 declared_conversation_scope_safe(self)
             )
+            reasoning_token = begin_turn_reasoning(self)
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
@@ -10004,7 +10012,8 @@ class AIAgent:
                         _review_queue.note_turn_finished()
                     except Exception:
                         pass
-                    self._turn_reasoning_config = None
+                    if reasoning_token is not None:
+                        reset_turn_reasoning(reasoning_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
