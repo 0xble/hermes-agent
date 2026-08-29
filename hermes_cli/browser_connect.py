@@ -565,9 +565,46 @@ _AUTH_REFRESH_PROFILE_FILES = (
     "Preferences",
 )
 
-def real_profile_copy_dir(browser: str) -> str:
-    """Return the hermes-owned snapshot dir for ``browser``'s real profile."""
-    return str(get_hermes_home() / "browser-profile" / browser)
+def real_profile_copy_dir(
+    browser: str,
+    identity: str | None = None,
+    source_profile: str = "",
+) -> str:
+    """Return the Hermes-owned snapshot dir for a legacy or named profile.
+
+    Named identities use an opaque digest so operator aliases are exposed to
+    the model without leaking them through host paths or process arguments.
+    The browser remains a path component so changing an identity's configured
+    browser cannot reuse a snapshot created from another Chromium family.
+    """
+    if identity is None:
+        return str(get_hermes_home() / "browser-profile" / browser)
+    from hermes_cli.browser_identity import browser_identity_runtime_key
+
+    key = browser_identity_runtime_key(identity, browser, source_profile)
+    return str(get_hermes_home() / "browser-profile" / "identities" / key / browser)
+
+
+def _validate_explicit_source_profile(src: str, source_profile: str) -> str | None:
+    """Validate a configured profile as one real, direct child of ``src``."""
+    if (
+        not source_profile
+        or source_profile in {".", "..", "Guest Profile", "System Profile"}
+        or "/" in source_profile
+        or "\\" in source_profile
+    ):
+        return "source_profile must be a direct, non-guest profile directory"
+    candidate = os.path.join(src, source_profile)
+    if os.path.islink(candidate):
+        return f"configured source profile {source_profile!r} must not be a symlink"
+    if not os.path.isdir(candidate):
+        return f"configured source profile {source_profile!r} was not found in {src}"
+    try:
+        if os.path.dirname(os.path.realpath(candidate)) != os.path.realpath(src):
+            return "source_profile must be a direct child of the browser data directory"
+    except OSError:
+        return f"configured source profile {source_profile!r} could not be resolved"
+    return None
 
 
 def _last_used_profile(src: str) -> str:
@@ -954,8 +991,14 @@ def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool
     )
 
 
-def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | None, str | None]:
-    """Snapshot ``browser``'s real ACTIVE profile into the hermes copy dir.
+def snapshot_real_profile(
+    browser: str,
+    src: str | None = None,
+    *,
+    source_profile: str | None = None,
+    identity: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Snapshot one real profile into an isolated Hermes copy directory.
 
     Copies only what the launched browser needs: the user-data-dir's
     ``Local State`` plus the auth-bearing files of the profile the user
@@ -979,10 +1022,21 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
             f"profile directory for '{browser}' was not found ({src!r}). "
             "Launch that browser at least once, or turn browser.use_real_profile off."
         )
-    source_profile, resolve_err = _resolve_source_profile(src)
-    if resolve_err or not source_profile:
-        return None, resolve_err
-    dst = real_profile_copy_dir(browser)
+    if source_profile is not None:
+        profile_error = _validate_explicit_source_profile(src, source_profile)
+        if profile_error:
+            return None, profile_error
+    else:
+        # Legacy, unconfigured behavior: preserve the explicit profile pin,
+        # then fall back to active-profile detection when no pin is configured.
+        source_profile, resolve_err = _resolve_source_profile(src)
+        if resolve_err or not source_profile:
+            return None, resolve_err
+    dst = real_profile_copy_dir(
+        browser,
+        identity=identity,
+        source_profile=source_profile if identity is not None else "",
+    )
     # Fast lock probe BEFORE any copy: a running browser holds the cookie DB
     # deny-all (Windows), and a blocking file op on it can hang the launch for
     # minutes. On POSIX this never trips (no mandatory locking) so
@@ -1017,17 +1071,26 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     # Only a copy that previously COMPLETED counts as populated. A half-written
     # tree (no marker) is treated as absent and rebuilt — otherwise a torn first
     # copy poisons freshness forever and only ever gets auth overlays.
-    populated = os.path.isfile(marker)
+    populated = False
+    try:
+        if os.path.isfile(marker):
+            with open(marker, encoding="utf-8", errors="replace") as fh:
+                populated = fh.read().strip() == source_profile
+    except OSError:
+        populated = False
     try:
         os.makedirs(dst, exist_ok=True)
-        # Secure the snapshot dir AND its browser-profile parent on EVERY
-        # launch: a failed first attempt or an older-build dir must still
-        # converge to owner-only perms; the parent enumerates every browser we
-        # hold cookies for.
-        parent = os.path.dirname(dst)
-        if parent:
-            _secure_snapshot_root(parent)
-        _secure_snapshot_root(dst)
+        # Secure every ancestor inside the credential store on EVERY launch.
+        # Named identities add two levels (identities/<opaque-key>) above the
+        # browser dir, and leaving either at a permissive umask would expose the
+        # snapshot layout even though the cookie files themselves sit deeper.
+        snapshot_root = str(get_hermes_home() / "browser-profile")
+        secured_paths = [snapshot_root]
+        if identity is not None:
+            secured_paths.append(os.path.join(snapshot_root, "identities"))
+        secured_paths.extend((os.path.dirname(dst), dst))
+        for secure_path in dict.fromkeys(path for path in secured_paths if path):
+            _secure_snapshot_root(secure_path)
 
         # Base user-data-dir file the browser reads at startup. Cheap; always
         # re-synced so last_used etc. stay current.

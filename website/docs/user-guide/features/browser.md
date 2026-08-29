@@ -211,6 +211,42 @@ browser:
 A pin naming a profile directory that doesn't exist fails closed with a
 fixable message — it never silently falls back to the last-used profile.
 
+To pin several named identities to exact Chromium profile directories, configure
+them explicitly:
+
+```yaml
+browser:
+  use_real_profile: true
+  real_profile_identities:
+    personal:
+      browser: chrome
+      source_profile: Default
+    work:
+      browser: chrome
+      source_profile: "Profile 3"
+  default_identity: personal
+  require_identity: false
+```
+
+With named identities configured, Hermes never reads `profile.last_used`.
+`browser_exec(identity="work", ...)` and
+`browser_navigate(identity="work", ...)` select the exact configured profile.
+When `require_identity` is `false`, an omitted identity uses
+`default_identity`. When it is `true`, every `browser_exec` call and every
+session-establishing `browser_navigate` call must provide an identity, even if a
+default is configured. Unknown identities and attempts to switch an existing
+named session or browser task to another identity fail without falling back.
+
+Each identity has its own opaque snapshot directory, Chromium process, CDP
+endpoint/cache, lock, and Browser Use daemon namespace. Identity aliases are
+visible to the agent, but source paths and profile internals remain local
+configuration. Named identities are supported only by the local real-profile
+Chromium path. Explicit CDP, Camofox, and cloud backends fail closed rather than
+opening a signed-out or wrong-principal browser; under a cloud configuration,
+pass `local: true` to `browser_exec` to opt into the configured local identity.
+Changing an identity's browser or source profile creates a new isolated runtime
+key instead of reusing the old browser process.
+
 When you turn the toggle back off, Hermes deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied
 credentials don't linger after you revoke consent.

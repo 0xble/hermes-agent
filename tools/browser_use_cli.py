@@ -4,12 +4,14 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +25,138 @@ BACKEND_DISABLED = "off"
 
 # Cloud daemon names become the BU_NAME env var
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_browser_exec_identity_lock = threading.Lock()
+_browser_exec_identity_bindings: dict[str, str] = {}
+_browser_exec_identity_daemons: dict[str, str] = {}
+_browser_exec_identity_daemon_homes: dict[str, str] = {}
+_LEGACY_BROWSER_BINDING = "__legacy__"
+
+
+def _browser_exec_binding_key(session: str) -> str:
+    from hermes_constants import hermes_home_key
+
+    return f"{hermes_home_key()}\0{session or '__default__'}"
+
+
+def _browser_exec_runtime_owner(identity) -> str:
+    if identity is None:
+        return _LEGACY_BROWSER_BINDING
+    from hermes_cli.browser_identity import browser_identity_scope_key
+
+    return browser_identity_scope_key(identity.runtime_key)
+
+
+def _identity_daemon_name(identity, session: str) -> str | None:
+    if identity is None:
+        return None
+    binding_key = _browser_exec_binding_key(session)
+    session_digest = hashlib.sha256(binding_key.encode("utf-8")).hexdigest()[:12]
+    return f"rp_{_browser_exec_runtime_owner(identity)}_{session_digest}"
+
+
+def _check_browser_exec_identity_binding(identity, session: str) -> str | None:
+    binding_key = _browser_exec_binding_key(session)
+    owner = _browser_exec_runtime_owner(identity)
+    with _browser_exec_identity_lock:
+        previous = _browser_exec_identity_bindings.get(binding_key)
+    if previous is not None and previous != owner:
+        return (
+            "browser session is already bound to another identity; use a new "
+            "session name instead of switching cookie jars"
+        )
+    return None
+
+
+def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str | None]:
+    """Bind a Browser Use session immutably and return its opaque daemon name."""
+    binding_key = _browser_exec_binding_key(session)
+    owner = _browser_exec_runtime_owner(identity)
+    with _browser_exec_identity_lock:
+        previous = _browser_exec_identity_bindings.get(binding_key)
+        if previous is not None and previous != owner:
+            return None, (
+                "browser session is already bound to another identity; use a new "
+                "session name instead of switching cookie jars"
+            )
+        _browser_exec_identity_bindings[binding_key] = owner
+        daemon_name = _identity_daemon_name(identity, session)
+        if daemon_name:
+            from hermes_constants import hermes_home_key
+
+            _browser_exec_identity_daemons[daemon_name] = owner
+            _browser_exec_identity_daemon_homes[daemon_name] = hermes_home_key()
+    return daemon_name, None
+
+
+def _reload_browser_exec_daemons_for_runtime(
+    runtime_key: str | None = None,
+    *,
+    home_key: str | None = None,
+) -> bool:
+    """Stop identity-owned Browser Use daemons so a new CDP is picked up."""
+    with _browser_exec_identity_lock:
+        targets = {
+            name: owner
+            for name, owner in _browser_exec_identity_daemons.items()
+            if (runtime_key is None or owner == runtime_key)
+            and (
+                home_key is None
+                or _browser_exec_identity_daemon_homes.get(name) == home_key
+            )
+        }
+    if not targets:
+        return True
+    cmd = _find_cli()
+    if not cmd:
+        logger.warning("could not stop Browser Use identity daemons: CLI unavailable")
+        return False
+    all_stopped = True
+    for name, owner in targets.items():
+        env = _base_subprocess_env()
+        env["BU_NAME"] = name
+        try:
+            proc = subprocess.run(
+                [*cmd, "--reload"],
+                input="",
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("could not stop Browser Use identity daemon %s: %s", name, exc)
+            all_stopped = False
+            continue
+        if getattr(proc, "returncode", 0) != 0:
+            logger.warning(
+                "could not stop Browser Use identity daemon %s (exit %s): %s",
+                name,
+                proc.returncode,
+                (getattr(proc, "stderr", "") or "").strip(),
+            )
+            all_stopped = False
+            continue
+        with _browser_exec_identity_lock:
+            if _browser_exec_identity_daemons.get(name) == owner:
+                _browser_exec_identity_daemons.pop(name, None)
+                _browser_exec_identity_daemon_homes.pop(name, None)
+    return all_stopped
+
+
+def _close_all_browser_exec_identity_daemons(*, all_profiles: bool = False) -> None:
+    """Stop named daemons in the active profile, or every profile at exit."""
+    from hermes_constants import hermes_home_key
+
+    active_home = None if all_profiles else hermes_home_key()
+    if _reload_browser_exec_daemons_for_runtime(home_key=active_home):
+        with _browser_exec_identity_lock:
+            if all_profiles:
+                _browser_exec_identity_bindings.clear()
+            else:
+                prefix = f"{active_home}\0"
+                for key in tuple(_browser_exec_identity_bindings):
+                    if key.startswith(prefix):
+                        _browser_exec_identity_bindings.pop(key, None)
 
 # Internal marker set by _resolve_backend_cdp on the env dict when the
 # resolved browser is EXCLUSIVE to this named session (per-name provider
@@ -660,7 +794,11 @@ def _real_profile_consented() -> bool:
         return False
 
 
-def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
+def _resolve_real_profile_cdp(
+    env: dict,
+    force_local: bool,
+    identity=None,
+) -> Optional[str]:
     """Point the harness at the user's real-profile copy-browser when consented.
 
     With ``browser.use_real_profile`` on, local browsing must mean the user's
@@ -684,8 +822,18 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     silently downgraded to a throwaway browser), else None.
     """
     if not _real_profile_consented():
+        if identity is not None:
+            return (
+                "named browser identities require browser.use_real_profile: true; "
+                "Hermes will not fall back to a signed-out browser"
+            )
         return None
+    browser_cfg = _read_browser_cfg()
+    if identity is not None and str(browser_cfg.get("cloud_provider") or "").lower() == "camofox":
+        return "named browser identities are incompatible with the Camofox backend"
     if env.get("BU_CDP_WS") or env.get("BU_CDP_URL"):
+        if identity is not None:
+            return "named browser identities are incompatible with BU_CDP_URL/BU_CDP_WS"
         return None
 
     try:
@@ -700,9 +848,15 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
 
     try:
         if _get_cdp_override_raw():
+            if identity is not None:
+                return (
+                    "named browser identities are incompatible with browser.cdp_url or "
+                    "BROWSER_CDP_URL"
+                )
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        if identity is not None:
+            return f"could not verify browser CDP override compatibility: {exc}"
 
     if not force_local:
         # Only auto-upgrade genuinely-local attaches; any cloud path (provider
@@ -710,13 +864,36 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
         # model passes local=true.
         try:
             if _get_cloud_provider() is not None:
+                if identity is not None:
+                    return (
+                        "named browser identities require local=true when a cloud browser "
+                        "provider is configured"
+                    )
                 return None
-        except Exception:
+        except Exception as exc:
+            if identity is not None:
+                return f"could not verify local browser backend compatibility: {exc}"
             return None
-        if is_legacy_browser_use_cloud_config(_read_browser_cfg()):
+        if is_legacy_browser_use_cloud_config(browser_cfg):
+            if identity is not None:
+                return (
+                    "named browser identities require local=true when Browser Use cloud "
+                    "is configured"
+                )
             return None
 
-    cdp, err = _real_profile_cdp()
+    try:
+        cdp, err = (
+            _real_profile_cdp(identity.alias)
+            if identity is not None
+            else _real_profile_cdp()
+        )
+    except Exception as exc:
+        from hermes_cli.browser_identity import BrowserIdentityError
+
+        if isinstance(exc, BrowserIdentityError):
+            return str(exc)
+        raise
     if err:
         return err
     if cdp:
@@ -730,6 +907,7 @@ def browser_exec(
     timeout_s: int = _DEFAULT_TIMEOUT_S,
     task_id: Optional[str] = None,
     local: bool = False,
+    identity: str = "",
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
@@ -741,6 +919,25 @@ def browser_exec(
     if blocked:
         return tool_error(blocked)
 
+    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+    try:
+        resolved_identity = resolve_browser_identity(identity)
+    except BrowserIdentityError as exc:
+        return tool_error(str(exc))
+
+    if session and not _SESSION_RE.match(session):
+        return tool_error(
+            f"Invalid session name {session!r}: use 1-64 letters, digits, "
+            "dashes, or underscores (e.g. 'r7k2')."
+        )
+
+    binding_error = _check_browser_exec_identity_binding(resolved_identity, session)
+    if binding_error:
+        return tool_error(binding_error)
+
+    daemon_name = _identity_daemon_name(resolved_identity, session)
+
     cmd = _find_cli()
     if not cmd:
         return tool_error(
@@ -751,19 +948,20 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
-    if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(
-                f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                "dashes, or underscores (e.g. 'r7k2')."
-            )
+    if daemon_name:
+        env["BU_NAME"] = daemon_name
+    elif session:
         env["BU_NAME"] = session
     # Real-profile consent: on a local backend this upgrades the attach to
     # the user's default browser (profile snapshot, logins included); with
     # local=True it forces that even under a cloud backend. Runs BEFORE
     # provider resolution so a real-profile hit short-circuits the cloud
     # path via the BU_CDP_* env contract.
-    rp_err = _resolve_real_profile_cdp(env, force_local=bool(local))
+    rp_err = _resolve_real_profile_cdp(
+        env,
+        force_local=bool(local),
+        identity=resolved_identity,
+    )
     if rp_err:
         return tool_error(rp_err)
     if local and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS")):
@@ -787,6 +985,12 @@ def browser_exec(
     backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
     if backend_err:
         return tool_error(backend_err)
+
+    # Bind only after routing succeeds. A failed cloud/CDP/consent preflight
+    # must not poison the user-visible session name for a later valid retry.
+    _, binding_error = _bind_browser_exec_identity(resolved_identity, session)
+    if binding_error:
+        return tool_error(binding_error)
 
     # On a SHARED browser (local Chrome / CDP override) a fresh named daemon
     # attaches to the first existing page — the same page a sibling daemon
@@ -855,6 +1059,8 @@ def browser_exec(
         result["workspace"] = workspace
     if session:
         result["session"] = session
+    if resolved_identity is not None:
+        result["identity"] = resolved_identity.alias
     stderr = (proc.stderr or "").strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
@@ -1000,6 +1206,11 @@ def _dynamic_schema_overrides() -> dict:
     # caller memoizes on config.yaml mtime, so toggling consent changes the
     # schema on the next session rather than mid-conversation.
     if _real_profile_consented():
+        from hermes_cli.browser_identity import (
+            configured_identity_aliases,
+            read_browser_identity_config,
+        )
+
         props = dict(BROWSER_EXEC_SCHEMA["parameters"]["properties"])
         props["local"] = {
             "type": "boolean",
@@ -1013,7 +1224,25 @@ def _dynamic_schema_overrides() -> dict:
             ),
             "default": False,
         }
-        overrides["parameters"] = {**BROWSER_EXEC_SCHEMA["parameters"], "properties": props}
+        cfg = read_browser_identity_config()
+        aliases = configured_identity_aliases(cfg)
+        if aliases:
+            props["identity"] = {
+                "type": "string",
+                "enum": list(aliases),
+                "description": (
+                    "Configured local real-profile browser identity. The session is "
+                    "immutably bound to it and cannot later switch cookie jars."
+                ),
+            }
+        required = list(BROWSER_EXEC_SCHEMA["parameters"].get("required") or [])
+        if aliases and cfg.get("require_identity") is True and "identity" not in required:
+            required.append("identity")
+        overrides["parameters"] = {
+            **BROWSER_EXEC_SCHEMA["parameters"],
+            "properties": props,
+            "required": required,
+        }
     return overrides
 
 
@@ -1063,6 +1292,7 @@ registry.register(
         timeout_s=args.get("timeout_s", _DEFAULT_TIMEOUT_S),
         task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
+        identity=args.get("identity", "") or "",
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

@@ -641,6 +641,14 @@ DEFAULT_CONFIG = {
         # real-profile local session even under a cloud browser backend. Toggle
         # in the desktop Settings → Browser section.
         "use_real_profile": False,
+        # Optional named mappings to exact Chrome/Chromium profile directories.
+        # Once configured, browser entry tools resolve an explicit identity or
+        # default_identity and never consult Chromium's mutable last_used.
+        "real_profile_identities": {},
+        "default_identity": "",
+        # Strict mode ignores default_identity and requires identity on every
+        # browser_exec / browser_navigate session-entry call.
+        "require_identity": False,
         # When real-profile browsing needs the browser closed (Windows: a
         # running Chrome/Edge/Brave locks its cookie DB deny-all, so it must be
         # fully quit before its profile can be copied), arm the "offer to close
