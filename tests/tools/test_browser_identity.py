@@ -205,6 +205,53 @@ class TestIdentitySnapshots:
         assert not (Path(personal) / "Default" / "Cache").exists()
         assert not (Path(lpg) / "Default" / "Cache").exists()
 
+    def test_snapshot_local_state_carries_the_selected_profile_identity(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+
+        source = self._source(tmp_path / "source")
+        (source / "Local State").write_text(
+            json.dumps(
+                {
+                    "profile": {
+                        "last_used": "Profile 1",
+                        "last_active_profiles": ["Profile 1"],
+                        "info_cache": {
+                            "Default": {
+                                "name": "Personal",
+                                "user_name": "personal@example.test",
+                            },
+                            "Profile 1": {
+                                "name": "LPG",
+                                "user_name": "lpg@example.test",
+                            },
+                        },
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "home")
+
+        snapshot, err = bc.snapshot_real_profile(
+            "chrome",
+            src=str(source),
+            source_profile="Profile 1",
+            identity="lpg",
+        )
+
+        assert err is None and snapshot is not None
+        state = json.loads((Path(snapshot) / "Local State").read_text())
+        profile = state["profile"]
+        assert profile["last_used"] == "Default"
+        assert profile["last_active_profiles"] == ["Default"]
+        assert profile["info_cache"] == {
+            "Default": {
+                "name": "LPG",
+                "user_name": "lpg@example.test",
+            }
+        }
+
     def test_missing_exact_profile_fails_without_default_fallback(
         self, tmp_path, monkeypatch
     ):
@@ -644,16 +691,42 @@ class TestBuiltInIdentityRouting:
 
 class TestNamedRealProfileProcesses:
     @pytest.fixture(autouse=True)
-    def _clear_runtime_tracking(self):
+    def _clear_runtime_tracking(self, monkeypatch):
         import tools.browser_tool as bt
+
+        next_port = iter(range(9301, 9400))
+        real_popen = subprocess.Popen
+
+        def fake_popen(argv, **_kwargs):
+            data_arg = next(
+                (arg for arg in argv if arg.startswith("--user-data-dir=")), None
+            )
+            if data_arg is None:
+                return real_popen(argv, **_kwargs)
+            data_dir = data_arg.split("=", 1)[1]
+            os.makedirs(data_dir, exist_ok=True)
+            port = next(next_port)
+            with open(os.path.join(data_dir, "DevToolsActivePort"), "w") as handle:
+                handle.write(f"{port}\n/devtools/browser/hermes\n")
+            proc = Mock(pid=port)
+            proc.poll.return_value = None
+            return proc
 
         bt._real_profile_cdp_cache.clear()
         bt._real_profile_session_names.clear()
         bt._real_profile_session_homes.clear()
+        bt._real_profile_browser_processes.clear()
+        monkeypatch.setattr(
+            "hermes_cli.browser_connect.chromium_executable",
+            lambda _browser: "/opt/chrome",
+        )
+        monkeypatch.setattr(bt.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(bt, "_cdp_http_ready", lambda _url: True)
         yield
         bt._real_profile_cdp_cache.clear()
         bt._real_profile_session_names.clear()
         bt._real_profile_session_homes.clear()
+        bt._real_profile_browser_processes.clear()
 
     def test_runtime_resources_are_scoped_to_active_hermes_home(
         self, tmp_path, monkeypatch
@@ -770,6 +843,64 @@ class TestNamedRealProfileProcesses:
         assert err is None and result == fresh
         assert closed == [session_name]
         assert bt._real_profile_cdp_cache[cache_key] == fresh
+
+    def test_recovers_direct_browser_before_snapshot_overlay(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+        import tools.browser_tool as bt
+
+        home = tmp_path / "home"
+        source = tmp_path / "source"
+        snapshot = home / "browser-profile" / "identities" / "opaque" / "chrome"
+        source.mkdir()
+        snapshot.mkdir(parents=True)
+        (snapshot / "DevToolsActivePort").write_text(
+            "9355\n/devtools/browser/recovered\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        attached = []
+
+        monkeypatch.setattr(
+            "hermes_cli.browser_identity.read_browser_identity_config",
+            lambda: _browser_cfg(),
+        )
+        monkeypatch.setattr(bt, "_use_real_profile", lambda: True)
+        monkeypatch.setattr(bc, "real_profile_data_dir", lambda _browser: str(source))
+        monkeypatch.setattr(
+            bc, "real_profile_copy_dir", lambda *_args, **_kwargs: str(snapshot)
+        )
+        monkeypatch.setattr(
+            bc,
+            "snapshot_real_profile",
+            lambda *_args, **_kwargs: pytest.fail(
+                "must not overlay a snapshot while its browser is live"
+            ),
+        )
+        monkeypatch.setattr(bt, "_agent_browser_get_cdp", lambda _name: None)
+        monkeypatch.setattr(bt, "_cdp_http_ready", lambda endpoint: endpoint.endswith("9355"))
+        monkeypatch.setattr(bt, "_cdp_owned_by_data_dir", lambda *_args: True)
+        monkeypatch.setattr(bt, "_reload_browser_use_runtime", lambda _key: True)
+        monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
+
+        def attach(argv, **_kwargs):
+            attached.append(argv)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(bt.subprocess, "run", attach)
+        monkeypatch.setattr(
+            bt.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: pytest.fail("must not launch a second browser"),
+        )
+
+        result, err = bt._real_profile_cdp("lpg")
+
+        assert err is None
+        assert result == "http://127.0.0.1:9355"
+        assert len(attached) == 1
+        assert "--cdp" in attached[0]
+        assert "9355" in attached[0]
 
     def test_exact_identities_get_distinct_snapshot_process_and_cache_resources(
         self, tmp_path, monkeypatch
