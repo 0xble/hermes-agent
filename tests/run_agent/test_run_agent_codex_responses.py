@@ -11,11 +11,6 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
 from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
-from agent.reasoning_context import (
-    begin_turn_reasoning,
-    reset_turn_reasoning,
-    set_turn_reasoning_config,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -345,43 +340,6 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["timeout"] > 0
     assert "max_tokens" not in kwargs
     assert "extra_body" not in kwargs
-
-
-def test_build_api_kwargs_codex_uses_turn_reasoning_override(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    agent.reasoning_config = {"enabled": True, "effort": "low"}
-    token = begin_turn_reasoning(agent)
-    try:
-        assert set_turn_reasoning_config(
-            agent, {"enabled": True, "effort": "high"}
-        )
-        kwargs = agent._build_api_kwargs(
-            [{"role": "user", "content": "hello"}]
-        )
-    finally:
-        reset_turn_reasoning(token)
-
-    assert kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
-    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-
-
-def test_turn_reasoning_override_is_clamped_by_provider_capability(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    agent.model = "gpt-5.5"
-    agent.reasoning_config = {"enabled": True, "effort": "low"}
-    token = begin_turn_reasoning(agent)
-    try:
-        assert set_turn_reasoning_config(
-            agent, {"enabled": True, "effort": "max"}
-        )
-        kwargs = agent._build_api_kwargs(
-            [{"role": "user", "content": "hello"}]
-        )
-    finally:
-        reset_turn_reasoning(token)
-
-    assert kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
-    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
 
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):

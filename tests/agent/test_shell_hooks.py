@@ -59,28 +59,6 @@ class TestParseResponse:
 
 
 
-    def test_pre_llm_call_reasoning_config_passthrough(self):
-        r = shell_hooks._parse_response(
-            "pre_llm_call",
-            '{"reasoning_config": {"enabled": true, "effort": "high"}}',
-        )
-        assert r == {"reasoning_config": {"enabled": True, "effort": "high"}}
-
-    def test_pre_llm_call_context_and_reasoning_config_passthrough(self):
-        r = shell_hooks._parse_response(
-            "pre_llm_call",
-            '{"context": "remember this", '
-            '"reasoning_config": {"enabled": true, "effort": "high"}}',
-        )
-        assert r == {
-            "context": "remember this",
-            "reasoning_config": {"enabled": True, "effort": "high"},
-        }
-
-
-
-
-
 
 
 
@@ -286,35 +264,6 @@ class TestCallbackSubprocess:
         cb = shell_hooks._make_callback(spec)
         result = cb(tool_name="write_file", args={"path": "/unsafe"})
         assert result == {"action": "modify", "args": {"path": "/safe"}}
-
-    def test_pre_llm_call_reasoning_override_flows_through_subprocess(
-        self, tmp_path
-    ):
-        script = _write_script(
-            tmp_path,
-            "reasoning.sh",
-            "#!/usr/bin/env bash\n"
-            'printf \'{"reasoning_config": '
-            '{"enabled": true, "effort": "high"}}\\n\'\n',
-        )
-        spec = shell_hooks.ShellHookSpec(
-            event="pre_llm_call", command=str(script)
-        )
-        callback = shell_hooks._make_callback(spec)
-
-        result = callback(
-            session_id="s1",
-            user_message="use high reasoning",
-            conversation_history=[],
-            is_first_turn=True,
-            model="gpt-5.6",
-            reasoning_config={"enabled": True, "effort": "low"},
-            platform="cli",
-        )
-
-        assert result == {
-            "reasoning_config": {"enabled": True, "effort": "high"}
-        }
 
     def test_modify_claude_code_parsing(self, tmp_path):
         """Shell hook returning Claude-Code modify is normalised."""

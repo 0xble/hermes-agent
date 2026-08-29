@@ -494,12 +494,6 @@ def load_cli_config() -> Dict[str, Any]:
             "system_prompt": "",
             "prefill_messages_file": "",
             "reasoning_effort": "",
-            "adaptive_reasoning": {
-                "enabled": False,
-                "shadow": False,
-                "max_effort": "high",
-                "min_effort": "",
-            },
             "service_tier": "",
             # Built-in personalities live in hermes_cli.personality
             # (BUILTIN_PERSONALITIES) — the single owner. Entries here are
@@ -5592,7 +5586,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # depth without touching the worker profile's config.yaml. An
         # unparseable level is ignored with a warning rather than silently
         # swapping in the default — same contract as the config path.
-        self._session_reasoning_override = False
         if reasoning is not None and str(reasoning).strip():
             _cli_reasoning = _parse_reasoning_config(reasoning)
             if _cli_reasoning is None:
@@ -5602,7 +5595,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             else:
                 self.reasoning_config = _cli_reasoning
-                self._session_reasoning_override = True
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -10490,7 +10482,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # forward.  Re-derive model/provider and service tier from config.yaml
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
-        self._session_reasoning_override = False
         self._pending_one_turn_model_restore = None
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
@@ -16960,13 +16951,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(
-        self,
-        message,
-        images: Optional[list] = None,
-        voice_input: bool = False,
-        turn_reasoning_config: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
+    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -17328,7 +17313,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
-                        turn_reasoning_config=turn_reasoning_config,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -21231,16 +21215,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        turn_reasoning_config = getattr(
-                            self, "_pending_turn_reasoning_config", None
-                        )
-                        self._pending_turn_reasoning_config = None
-                        self.chat(
-                            user_input,
-                            images=submit_images or None,
-                            voice_input=is_voice_input,
-                            turn_reasoning_config=turn_reasoning_config,
-                        )
+                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

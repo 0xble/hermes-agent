@@ -39,40 +39,6 @@ class TestCLIQuickCommands:
         printed = self._printed_plain(cli.console.print.call_args[0][0])
         assert printed == "daily-note"
 
-    def test_reasoning_alias_inherits_one_turn_prompt_semantics(self):
-        cli = self._make_cli(
-            {"ttt": {"type": "alias", "target": "/reasoning high"}}
-        )
-        cli.reasoning_config = {"enabled": True, "effort": "medium"}
-        cli.show_reasoning = False
-
-        with patch("cli._cprint") as cprint:
-            result = cli.process_command("/ttt Fix this\nand verify it")
-
-        assert result is True
-        assert cli.reasoning_config == {"enabled": True, "effort": "medium"}
-        assert cli._pending_turn_reasoning_config == {
-            "enabled": True,
-            "effort": "high",
-        }
-        assert cli._pending_agent_seed == "Fix this\nand verify it"
-        cprint.assert_called_once_with("🧠 Reasoning: High for this turn")
-
-    def test_bare_reasoning_alias_remains_session_scoped(self):
-        cli = self._make_cli(
-            {"ttt": {"type": "alias", "target": "/reasoning high"}}
-        )
-        cli.reasoning_config = {"enabled": True, "effort": "medium"}
-        cli.show_reasoning = False
-
-        with patch("cli._cprint"):
-            result = cli.process_command("/ttt")
-
-        assert result is True
-        assert cli.reasoning_config == {"enabled": True, "effort": "high"}
-        assert cli.agent is None
-        assert not hasattr(cli, "_pending_agent_seed")
-
     def test_exec_command_uses_chat_console_when_tui_is_live(self):
         cli = self._make_cli({"dn": {"type": "exec", "command": "echo daily-note"}})
         cli._app = object()
