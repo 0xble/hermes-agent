@@ -134,6 +134,75 @@ def test_plain_text_send_forwards_business_connection_id():
     assert bot.send_message.await_args.kwargs["business_connection_id"] == "biz-A"
 
 
+def test_business_routing_reaches_control_messages():
+    adapter = _adapter()
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=89))
+    )
+    adapter._bot = bot
+
+    async def _run(cooldown_chat_id, send_fn, *args, **kwargs):
+        return await send_fn(*args, **kwargs)
+
+    adapter._run_send_call = _run
+
+    result = asyncio.run(
+        adapter.send_update_prompt(
+            "123",
+            "Continue?",
+            metadata={"telegram_business_connection_id": "biz-A"},
+        )
+    )
+
+    assert result.success is True
+    assert bot.send_message.await_args.kwargs["business_connection_id"] == "biz-A"
+
+
+def test_business_routing_reaches_media_messages(tmp_path):
+    adapter = _adapter()
+    bot = SimpleNamespace(
+        send_document=AsyncMock(return_value=SimpleNamespace(message_id=90))
+    )
+    adapter._bot = bot
+    document = tmp_path / "evidence.txt"
+    document.write_text("evidence")
+
+    async def _run(cooldown_chat_id, send_fn, *args, **kwargs):
+        return await send_fn(*args, **kwargs)
+
+    adapter._run_send_call = _run
+
+    result = asyncio.run(
+        adapter.send_document(
+            "123",
+            str(document),
+            metadata={"telegram_business_connection_id": "biz-A"},
+        )
+    )
+
+    assert result.success is True
+    assert bot.send_document.await_args.kwargs["business_connection_id"] == "biz-A"
+
+
+def test_business_turn_skips_draft_api_that_cannot_route_connection():
+    adapter = _adapter()
+    bot = SimpleNamespace(send_message_draft=AsyncMock(return_value=True))
+    adapter._bot = bot
+
+    result = asyncio.run(
+        adapter.send_draft(
+            "123",
+            1,
+            "working",
+            metadata={"telegram_business_connection_id": "biz-A"},
+        )
+    )
+
+    assert result.success is False
+    assert result.error == "business_drafts_unsupported"
+    bot.send_message_draft.assert_not_awaited()
+
+
 class _InputChecklistTask:
     def __init__(self, task_id, text):
         self.id = task_id
@@ -256,6 +325,50 @@ def test_checklist_validation_rejects_duplicate_ids_before_transport(monkeypatch
     assert result.retryable is False
     assert "unique" in result.error
     bot.send_checklist.assert_not_awaited()
+
+
+@pytest.mark.parametrize("reply_to", [True, 0, -1, 1.5, "1.5", ""])
+def test_send_checklist_rejects_invalid_reply_message_ids(reply_to):
+    adapter = _adapter()
+    bot = SimpleNamespace(send_checklist=AsyncMock())
+    adapter._bot = bot
+
+    result = asyncio.run(
+        adapter.send_checklist(
+            "123",
+            "Launch",
+            [{"id": 1, "text": "Venue"}],
+            business_connection_id="biz-A",
+            reply_to=reply_to,
+        )
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert "positive" in result.error
+    bot.send_checklist.assert_not_awaited()
+
+
+@pytest.mark.parametrize("message_id", [True, 0, -1, 1.5, "1.5", ""])
+def test_edit_checklist_rejects_invalid_message_ids(message_id):
+    adapter = _adapter()
+    bot = SimpleNamespace(edit_message_checklist=AsyncMock())
+    adapter._bot = bot
+
+    result = asyncio.run(
+        adapter.edit_checklist(
+            "123",
+            message_id,
+            "Launch",
+            [{"id": 1, "text": "Venue"}],
+            business_connection_id="biz-A",
+        )
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert "positive" in result.error
+    bot.edit_message_checklist.assert_not_awaited()
 
 
 def test_edit_checklist_forwards_connection_and_returns_message_id(monkeypatch):

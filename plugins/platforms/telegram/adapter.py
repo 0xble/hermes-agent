@@ -1676,7 +1676,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     @classmethod
-    def _thread_kwargs_for_send(
+    def _topic_kwargs_for_send(
         cls,
         chat_id: str,
         thread_id: Optional[str],
@@ -1684,24 +1684,7 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int] = None,
         reply_to_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Return Telegram send kwargs for forum and direct-message topic routing.
-
-        Supergroup/forum topics use ``message_thread_id``. True Bot API Direct
-        Messages topics can opt in with explicit ``direct_messages_topic_id``
-        metadata. Hermes-created private-chat topic lanes are marked with
-        ``telegram_dm_topic_reply_fallback``. Live replies send the private
-        topic thread id together with a reply anchor. Synthetic/resumed sends
-        without an anchor (loop wakeups, background-process notifications,
-        queued follow-ups after a gateway restart) prefer the Hermes topic's
-        ``message_thread_id`` so they stay in the active topic lane (#87051);
-        ``direct_messages_topic_id`` is only used when no topic thread
-        resolves, since the native DM-topic id does not match the Hermes
-        topic lane and can render the message in a different chat lane.
-
-        When ``reply_to_mode`` is ``"off"``, the reply anchor is suppressed for
-        DM topic fallback sends while preserving the ``message_thread_id`` so
-        the message still lands in the correct topic.
-        """
+        """Return Telegram forum and direct-message topic routing kwargs."""
         if metadata and metadata.get("telegram_dm_topic_reply_fallback"):
             if reply_to_mode == "off":
                 return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
@@ -1733,6 +1716,26 @@ class TelegramAdapter(BasePlatformAdapter):
             }
         return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
 
+    @classmethod
+    def _thread_kwargs_for_send(
+        cls,
+        chat_id: str,
+        thread_id: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to_message_id: Optional[int] = None,
+        reply_to_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return topic plus Telegram Business routing for persistent sends."""
+        route = cls._topic_kwargs_for_send(
+            chat_id,
+            thread_id,
+            metadata,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_mode=reply_to_mode,
+        )
+        route.update(cls._business_connection_kwargs(metadata))
+        return route
+
     def _thread_kwargs_for_draft(
         self,
         chat_id: str,
@@ -1756,6 +1759,10 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_message_id=reply_to_id,
             reply_to_mode=getattr(self, "_reply_to_mode", None),
         )
+        # PTB 22.8's send_message_draft does not accept this Bot API routing
+        # parameter. Business turns therefore skip animated business routing
+        # here and rely on the final persistent send, which does support it.
+        kwargs.pop("business_connection_id", None)
         return {k: v for k, v in kwargs.items() if v is not None}
 
     @classmethod
@@ -6050,7 +6057,6 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
-                                **self._business_connection_kwargs(metadata),
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -6067,7 +6073,6 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
-                                    **self._business_connection_kwargs(metadata),
                                 )
                             else:
                                 raise
@@ -6267,6 +6272,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return InputChecklist, InputChecklistTask
 
+    @staticmethod
+    def _positive_message_id(value: Any, field_name: str) -> int:
+        """Normalize a Telegram message ID without lossy numeric coercion."""
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a positive Telegram message ID")
+        if isinstance(value, int):
+            normalized = value
+        elif isinstance(value, str) and value.isdecimal():
+            normalized = int(value)
+        else:
+            raise ValueError(f"{field_name} must be a positive Telegram message ID")
+        if normalized <= 0:
+            raise ValueError(f"{field_name} must be a positive Telegram message ID")
+        return normalized
+
     def _build_input_checklist(
         self,
         title: str,
@@ -6387,11 +6407,14 @@ class TelegramAdapter(BasePlatformAdapter):
         }
         if reply_to is not None:
             try:
-                kwargs["reply_to_message_id"] = int(reply_to)
-            except (TypeError, ValueError):
+                kwargs["reply_to_message_id"] = self._positive_message_id(
+                    reply_to,
+                    "reply_to",
+                )
+            except ValueError as error:
                 return SendResult(
                     success=False,
-                    error="reply_to must be a Telegram message ID",
+                    error=str(error),
                     retryable=False,
                 )
         try:
@@ -6437,7 +6460,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=False,
             )
         try:
-            normalized_message_id = int(message_id)
+            normalized_message_id = self._positive_message_id(message_id, "message_id")
             checklist = self._build_input_checklist(
                 title,
                 tasks,
@@ -7011,6 +7034,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="not_connected")
+        if self._business_connection_kwargs(metadata):
+            # PTB 22.8 exposes no business_connection_id for send_message_draft.
+            # Calling it without the discriminator can misroute or reject a
+            # Business turn. Fail closed so streaming uses the persistent
+            # send/edit path, which is connection-aware.
+            return SendResult(
+                success=False,
+                error="business_drafts_unsupported",
+                retryable=False,
+            )
 
         # Rich draft fast-path (Bot API 10.1 sendRichMessageDraft): render the
         # streaming preview with the same raw markdown the final
@@ -10531,12 +10564,23 @@ class TelegramAdapter(BasePlatformAdapter):
             event = event or self._build_message_event(message, msg_type, update_id=update_id)
             shared_source = self._telegram_group_observe_shared_source(event.source)
             session_entry = store.get_or_create_session(shared_source)
+            observed_at = event.timestamp
+            if not isinstance(observed_at, datetime):
+                observed_at = datetime.now(tz=timezone.utc)
+            elif observed_at.tzinfo is None:
+                observed_at = observed_at.replace(tzinfo=timezone.utc)
             entry = {
                 "role": "user",
                 "content": self._telegram_group_observe_attributed_text(event),
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "timestamp": observed_at.astimezone(timezone.utc).isoformat(),
                 "observed": True,
             }
+            checklist_metadata = event.metadata.get("telegram_checklist")
+            if checklist_metadata is not None:
+                # Observe-only checklist updates never enter the normal gateway
+                # dispatch path. Persist their structured projection alongside
+                # the text so exact task IDs and state changes survive.
+                entry["metadata"] = {"telegram_checklist": checklist_metadata}
             if event.message_id:
                 entry["message_id"] = str(event.message_id)
             store.append_to_transcript(session_entry.session_id, entry)
@@ -10833,22 +10877,35 @@ class TelegramAdapter(BasePlatformAdapter):
             "name": str(name) if name else "",
         }
 
+    @staticmethod
+    def _normalized_checklist_id(value: Any) -> Optional[int]:
+        """Return a valid positive checklist task ID, otherwise ``None``."""
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return None
+        return value
+
     @classmethod
     def _checklist_task_metadata(cls, task: Any) -> Dict[str, Any]:
         completion_date = getattr(task, "completion_date", None)
         completed_by_user = getattr(task, "completed_by_user", None)
         completed_by_chat = getattr(task, "completed_by_chat", None)
         completion_is_real = False
-        if completion_date is not None:
+        completion_date_invalid = False
+        completion_date_text = None
+        if isinstance(completion_date, datetime):
             try:
                 # PTB uses a zero Unix timestamp datetime as the sentinel for
                 # an incomplete task. A truthiness check marks that task done.
                 completion_is_real = float(completion_date.timestamp()) > 0
-            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
-                completion_is_real = bool(completion_date)
+                completion_date_text = completion_date.isoformat()
+            except (OSError, OverflowError, TypeError, ValueError):
+                completion_date_invalid = True
+        elif completion_date is not None:
+            completion_date_invalid = True
         completed = bool(completed_by_user or completed_by_chat or completion_is_real)
-        return {
-            "id": int(getattr(task, "id")),
+        task_id = cls._normalized_checklist_id(getattr(task, "id", None))
+        metadata = {
+            "id": task_id,
             "text": str(getattr(task, "text", "") or "")[:100],
             "text_entities": cls._checklist_entity_metadata(
                 getattr(task, "text_entities", None)
@@ -10856,25 +10913,29 @@ class TelegramAdapter(BasePlatformAdapter):
             "completed": completed,
             "completed_by_user": cls._checklist_actor_metadata(completed_by_user),
             "completed_by_chat": cls._checklist_actor_metadata(completed_by_chat),
-            "completion_date": (
-                completion_date.isoformat()
-                if completion_date is not None and hasattr(completion_date, "isoformat")
-                else None
-            ),
+            "completion_date": completion_date_text,
         }
+        if task_id is None:
+            metadata["id_invalid"] = True
+        if completion_date_invalid:
+            metadata["completion_date_invalid"] = True
+        return metadata
 
     @classmethod
     def _checklist_task_line(cls, task: Any) -> str:
         item = cls._checklist_task_metadata(task)
+        task_id = item["id"] if item["id"] is not None else "?"
         return (
             f"- [{'x' if item['completed'] else ' '}] "
-            f"#{item['id']} {item['text']}"
+            f"#{task_id} {item['text']}"
         ).rstrip()
 
     def _build_checklist_event(
         self,
         message: Message,
         update_id: Optional[int] = None,
+        *,
+        edited: bool = False,
     ) -> MessageEvent:
         """Build one bounded text projection plus lossless checklist metadata."""
         event = self._build_message_event(
@@ -10893,11 +10954,13 @@ class TelegramAdapter(BasePlatformAdapter):
         if added is not None:
             kind = "tasks_added"
             tasks = list(getattr(added, "tasks", None) or [])
-            checklist_message = getattr(added, "checklist_message", None) or message
+            checklist_message = getattr(added, "checklist_message", None)
         elif done is not None:
             kind = "tasks_done"
-            checklist_message = getattr(done, "checklist_message", None) or message
+            checklist_message = getattr(done, "checklist_message", None)
         elif checklist is not None:
+            if edited:
+                kind = "checklist_edited"
             tasks = list(getattr(checklist, "tasks", None) or [])
 
         title = str(getattr(checklist, "title", "") or "")[:255]
@@ -10923,18 +10986,37 @@ class TelegramAdapter(BasePlatformAdapter):
         if kind == "checklist":
             lines = [f"Checklist: {title}" if title else "Checklist:"]
             lines.extend(self._checklist_task_line(task) for task in tasks[:30])
+        elif kind == "checklist_edited":
+            lines = [f"Checklist edited: {title}" if title else "Checklist edited:"]
+            lines.extend(self._checklist_task_line(task) for task in tasks[:30])
         elif kind == "tasks_added":
             lines = [f"Checklist updated: {title}" if title else "Checklist updated:", "Added:"]
             lines.extend(self._checklist_task_line(task) for task in tasks[:30])
         else:
-            done_ids = [int(value) for value in list(
+            raw_done_ids = list(
                 getattr(done, "marked_as_done_task_ids", None) or []
-            )[:30]]
-            undone_ids = [int(value) for value in list(
+            )[:30]
+            raw_undone_ids = list(
                 getattr(done, "marked_as_not_done_task_ids", None) or []
-            )[:30]]
+            )[:30]
+            done_ids = [
+                task_id
+                for value in raw_done_ids
+                if (task_id := self._normalized_checklist_id(value)) is not None
+            ]
+            undone_ids = [
+                task_id
+                for value in raw_undone_ids
+                if (task_id := self._normalized_checklist_id(value)) is not None
+            ]
             metadata["marked_as_done_task_ids"] = done_ids
             metadata["marked_as_not_done_task_ids"] = undone_ids
+            invalid_counts = {
+                "done": len(raw_done_ids) - len(done_ids),
+                "not_done": len(raw_undone_ids) - len(undone_ids),
+            }
+            if any(invalid_counts.values()):
+                metadata["invalid_task_id_counts"] = invalid_counts
             lines = [f"Checklist updated: {title}" if title else "Checklist updated:"]
             if done_ids:
                 lines.append("Marked done: " + ", ".join(f"#{value}" for value in done_ids))
@@ -10961,6 +11043,11 @@ class TelegramAdapter(BasePlatformAdapter):
             getattr(message, "checklist_tasks_added", None) is not None
             or getattr(message, "checklist_tasks_done", None) is not None
         )
+        is_edited = bool(
+            getattr(update, "edited_message", None) is message
+            or getattr(update, "edited_channel_post", None) is message
+            or getattr(update, "edited_business_message", None) is message
+        )
         if self._checklist_from_message(message) is None and not is_status:
             logger.warning(
                 "[%s] Telegram checklist handler received no checklist payload "
@@ -10978,14 +11065,21 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
-        event = self._build_checklist_event(message, update_id=update.update_id)
-        if is_status:
-            self._observe_unmentioned_group_message(
-                message,
-                MessageType.TEXT,
-                update_id=update.update_id,
-                event=event,
-            )
+        event = self._build_checklist_event(
+            message,
+            update_id=update.update_id,
+            edited=is_edited,
+        )
+        if is_status or is_edited:
+            if self._should_process_message(
+                message
+            ) or self._should_observe_unmentioned_group_message(message):
+                self._observe_unmentioned_group_message(
+                    message,
+                    MessageType.TEXT,
+                    update_id=update.update_id,
+                    event=event,
+                )
             return
 
         if not self._should_process_message(message):
