@@ -202,7 +202,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("btw", "Ask a side question about the current conversation without interrupting it", "Session",
                args_hint="<question>", busy_policy="dispatch"),
     CommandDef("spawn", "Fork the current context into a one-shot background session", "Session",
-               args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
+               aliases=("side",), args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
                desktop="messaging"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),

@@ -98,10 +98,12 @@ def _runner(*, history=None, copy_error=None):
     return runner, async_store
 
 
-def test_spawn_command_is_gateway_dispatchable():
-    command = resolve_command("spawn")
+@pytest.mark.parametrize("name", ["spawn", "side"])
+def test_spawn_command_is_gateway_dispatchable(name):
+    command = resolve_command(name)
 
     assert command is not None
+    assert command.name == "spawn"
     assert command.gateway_only is True
     assert command.busy_policy == "dispatch"
 
