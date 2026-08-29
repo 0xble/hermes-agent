@@ -365,6 +365,25 @@ def test_build_api_kwargs_codex_uses_turn_reasoning_override(monkeypatch):
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
 
 
+def test_turn_reasoning_override_is_clamped_by_provider_capability(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.5"
+    agent.reasoning_config = {"enabled": True, "effort": "low"}
+    token = begin_turn_reasoning(agent)
+    try:
+        assert set_turn_reasoning_config(
+            agent, {"enabled": True, "effort": "max"}
+        )
+        kwargs = agent._build_api_kwargs(
+            [{"role": "user", "content": "hello"}]
+        )
+    finally:
+        reset_turn_reasoning(token)
+
+    assert kwargs["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+
+
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(

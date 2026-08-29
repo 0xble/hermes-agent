@@ -50,6 +50,19 @@ def test_decision_is_deterministic_explainable_and_versioned():
     assert first.applied is True
 
 
+def test_shadow_decision_is_side_effect_free():
+    config = {"enabled": True, "max_effort": "high"}
+    decision = select_adaptive_reasoning(
+        "Debug the production crash. error: connection refused",
+        "medium",
+        config,
+    )
+
+    assert decision.selected_effort == "high"
+    assert decision.reason_codes == ("debugging", "error-evidence", "production")
+    assert config == {"enabled": True, "max_effort": "high"}
+
+
 def test_uncertain_message_abstains_to_baseline():
     decision = select_adaptive_reasoning(
         "Can you take a look at this?", "medium", {"enabled": True}
