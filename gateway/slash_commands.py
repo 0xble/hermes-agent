@@ -39,6 +39,7 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    transcript_message_append_fields,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -3625,6 +3626,17 @@ class GatewaySlashCommandsMixin:
             )
         return f"```diff\n{diff}{note}\n```"
 
+    def _background_reply_anchor(
+        self, event: MessageEvent, source: SessionSource
+    ) -> str | None:
+        """Return an anchor only when it belongs to the normalized route."""
+        raw_thread = str(getattr(event.source, "thread_id", None) or "")
+        normalized_thread = str(getattr(source, "thread_id", None) or "")
+        if raw_thread != normalized_thread:
+            return None
+        reply_anchor_for_event = getattr(self, "_reply_anchor_for_event")
+        return reply_anchor_for_event(event)
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /bg <prompt> — run a prompt in a separate background session.
 
@@ -3640,7 +3652,7 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(normalize_source, event.source)
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
 
-        event_message_id = self._reply_anchor_for_event(event)
+        event_message_id = self._background_reply_anchor(event, source)
 
         # Forward image/audio attachments so the background agent can see them.
         media_urls = list(event.media_urls) if event.media_urls else []
@@ -3857,21 +3869,7 @@ class GatewaySlashCommandsMixin:
             return "❌ Spawn failed: could not create the child session."
 
         rows = [
-            {
-                "role": message.get("role", "user"),
-                "content": message.get("content"),
-                "tool_name": message.get("tool_name") or message.get("name"),
-                "tool_calls": message.get("tool_calls"),
-                "tool_call_id": message.get("tool_call_id"),
-                "finish_reason": message.get("finish_reason"),
-                "reasoning": message.get("reasoning"),
-                "reasoning_content": message.get("reasoning_content"),
-                "reasoning_details": message.get("reasoning_details"),
-                "codex_reasoning_items": message.get("codex_reasoning_items"),
-                "codex_message_items": message.get("codex_message_items"),
-                "api_content": extract_api_content_sidecar(message),
-                "timestamp": message.get("timestamp"),
-            }
+            transcript_message_append_fields(message)
             for message in history
         ]
         try:
@@ -3899,14 +3897,13 @@ class GatewaySlashCommandsMixin:
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
         run_background_task = getattr(self, "_run_background_task")
-        reply_anchor_for_event = getattr(self, "_reply_anchor_for_event")
         background_tasks = getattr(self, "_background_tasks")
         task = asyncio.create_task(
             run_background_task(
                 prompt=prompt,
                 source=source,
                 task_id=child_session_id,
-                event_message_id=reply_anchor_for_event(event),
+                event_message_id=self._background_reply_anchor(event, source),
                 media_urls=media_urls,
                 media_types=media_types,
                 conversation_history=history,

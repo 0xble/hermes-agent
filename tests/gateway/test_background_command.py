@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -82,6 +83,7 @@ class TestHandleBackgroundCommand:
         """A stripped Telegram topic command dispatches with its recovered topic."""
         runner = _make_runner()
         event = _make_event(text="/background rename this topic")
+        event.message_id = "9001"
         recovered = SessionSource(
             platform=Platform.TELEGRAM,
             user_id="12345",
@@ -100,6 +102,7 @@ class TestHandleBackgroundCommand:
         assert await_call is not None
         dispatched_source = await_call.args[1]
         assert dispatched_source.thread_id == "42"
+        assert await_call.kwargs["event_message_id"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +112,26 @@ class TestHandleBackgroundCommand:
 
 class TestRunBackgroundTask:
     """Tests for GatewayRunner._run_background_task (the actual execution)."""
+
+    def test_recovered_dm_topic_without_anchor_stays_on_topic(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        runner = _make_runner()
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            chat_type="dm",
+            thread_id="42",
+        )
+
+        metadata = runner._thread_metadata_for_source(source, None)
+
+        assert metadata is not None
+        assert "telegram_reply_to_message_id" not in metadata
+        assert TelegramAdapter._thread_kwargs_for_send(
+            "67890", "42", metadata, reply_to_message_id=None
+        ) == {"message_thread_id": 42}
 
 
     @pytest.mark.asyncio
@@ -133,6 +156,117 @@ class TestRunBackgroundTask:
         mock_adapter.send.assert_called_once()
         call_args = mock_adapter.send.call_args
         assert "failed" in call_args[1].get("content", call_args[0][1] if len(call_args[0]) > 1 else "").lower()
+
+    @pytest.mark.asyncio
+    async def test_spawn_without_adapter_ends_child(self):
+        runner = _make_runner()
+        runner._session_db = SimpleNamespace(end_session=AsyncMock())
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        await runner._run_background_task(
+            "test prompt", source, "spawn-no-adapter", task_kind="spawn"
+        )
+
+        runner._session_db.end_session.assert_awaited_once_with(
+            "spawn-no-adapter", end_reason="spawn_no_adapter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_without_credentials_ends_child(self):
+        runner = _make_runner()
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._session_db = SimpleNamespace(end_session=AsyncMock())
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": None},
+        ):
+            await runner._run_background_task(
+                "test prompt", source, "spawn-no-creds", task_kind="spawn"
+            )
+
+        runner._session_db.end_session.assert_awaited_once_with(
+            "spawn-no-creds", end_reason="spawn_no_credentials"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_spawn_ends_child_and_propagates_cancellation(self):
+        runner = _make_runner()
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        adapter.toolsets_for_source = MagicMock(return_value=None)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._session_db = SimpleNamespace(end_session=AsyncMock())
+        runner._enrich_message_with_vision = AsyncMock(
+            side_effect=asyncio.CancelledError()
+        )
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        with (
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={"api_key": "test-key"},
+            ),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await runner._run_background_task(
+                "test prompt",
+                source,
+                "spawn-cancelled",
+                media_urls=["image.png"],
+                media_types=["image/png"],
+                task_kind="spawn",
+            )
+
+        runner._session_db.end_session.assert_awaited_once_with(
+            "spawn-cancelled", end_reason="spawn_cancelled"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_agent_startup_failure_ends_child(self):
+        runner = _make_runner()
+        adapter = AsyncMock()
+        adapter.send = AsyncMock()
+        adapter.toolsets_for_source = MagicMock(return_value=None)
+        runner.adapters[Platform.TELEGRAM] = adapter
+        runner._session_db = SimpleNamespace(end_session=AsyncMock())
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+        )
+
+        with (
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={"api_key": "test-key"},
+            ),
+            patch("gateway.run._load_gateway_config", return_value={}),
+            patch("run_agent.AIAgent", side_effect=RuntimeError("startup failed")),
+        ):
+            await runner._run_background_task(
+                "test prompt", source, "spawn-startup-failed", task_kind="spawn"
+            )
+
+        runner._session_db.end_session.assert_awaited_once_with(
+            "spawn-startup-failed", end_reason="spawn_failed"
+        )
 
     @pytest.mark.asyncio
     async def test_successful_task_sends_result(self):

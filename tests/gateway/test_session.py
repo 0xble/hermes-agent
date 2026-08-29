@@ -25,6 +25,36 @@ from gateway.session import (
 normalize_whatsapp_identifier = canonical_whatsapp_identifier
 
 
+def test_append_transcript_message_preserves_canonical_metadata(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("session-1", "test")
+        store = object.__new__(SessionStore)
+        store._db = db
+        message = {
+            "role": "assistant",
+            "content": "summary",
+            "finish_reason": "stop",
+            "effect_disposition": "unknown",
+            "_compressed_summary": True,
+            "display_kind": "internal_notification",
+            "display_metadata": {"source": "test"},
+        }
+
+        store._append_transcript_message("session-1", message)
+
+        row = db.get_messages("session-1")[0]
+        assert row["role"] == "assistant"
+        assert row["content"] == "summary"
+        assert row["finish_reason"] == "stop"
+        assert row["effect_disposition"] == "unknown"
+        assert bool(row["_compressed_summary"]) is True
+        assert row["display_kind"] == "internal_notification"
+        assert row["display_metadata"] == {"source": "test"}
+    finally:
+        db.close()
+
+
 class TestSessionSourceRoundtrip:
     def test_full_roundtrip(self):
         source = SessionSource(

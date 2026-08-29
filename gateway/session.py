@@ -97,6 +97,34 @@ from .whatsapp_identity import (
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
 
+
+def transcript_message_append_fields(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Map one transcript message to SessionDB append fields."""
+    is_assistant = message.get("role") == "assistant"
+    return {
+        "role": message.get("role", "unknown"),
+        "content": message.get("content"),
+        "tool_name": message.get("tool_name") or message.get("name"),
+        "tool_calls": message.get("tool_calls"),
+        "tool_call_id": message.get("tool_call_id"),
+        "finish_reason": message.get("finish_reason"),
+        "reasoning": message.get("reasoning") if is_assistant else None,
+        "reasoning_content": message.get("reasoning_content") if is_assistant else None,
+        "reasoning_details": message.get("reasoning_details") if is_assistant else None,
+        "codex_reasoning_items": message.get("codex_reasoning_items") if is_assistant else None,
+        "codex_message_items": message.get("codex_message_items") if is_assistant else None,
+        "platform_message_id": (
+            message.get("platform_message_id") or message.get("message_id")
+        ),
+        "observed": bool(message.get("observed")),
+        "effect_disposition": message.get("effect_disposition"),
+        "_compressed_summary": bool(message.get("_compressed_summary")),
+        "timestamp": message.get("timestamp"),
+        "api_content": extract_api_content_sidecar(message),
+        "display_kind": message.get("display_kind"),
+        "display_metadata": message.get("display_metadata"),
+    }
+
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
 # filenames in agent_runtime_helpers). Any value that could escape the
@@ -4205,29 +4233,7 @@ class SessionStore:
             )
         _db.append_message(
             session_id=session_id,
-            role=message.get("role", "unknown"),
-            content=message.get("content"),
-            tool_name=message.get("tool_name"),
-            tool_calls=message.get("tool_calls"),
-            tool_call_id=message.get("tool_call_id"),
-            reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
-            reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
-            reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
-            codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
-            codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
-            platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
-            observed=bool(message.get("observed")),
-            timestamp=message.get("timestamp"),
-            # api_content sidecar: the exact bytes sent to the API for
-            # this message (prompt-cache-stable replay). Must survive
-            # any gateway-side persistence path or the next turn's
-            # replay diverges at this row.
-            api_content=extract_api_content_sidecar(message),
-            # Presentation typing (e.g. "internal_notification" for
-            # self-injected async-delegation/background notification turns,
-            # #82888). DB-only; stripped from provider-bound payloads.
-            display_kind=message.get("display_kind"),
-            display_metadata=message.get("display_metadata"),
+            **transcript_message_append_fields(message),
         )
 
     # Maximum in-memory pending messages per session before dropping the

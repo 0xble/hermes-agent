@@ -24804,10 +24804,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task_reference = (
             f'Child session: "{task_identity}"\n' if task_kind == "spawn" else ""
         )
+        agent_finished = False
+
+        async def finalize_spawn_failure(reason: str) -> None:
+            if task_kind != "spawn":
+                return
+            session_db = getattr(self, "_session_db", None)
+            end_session = getattr(session_db, "end_session", None)
+            if end_session is None:
+                return
+            try:
+                await end_session(task_id, end_reason=reason)
+            except Exception:
+                logger.warning(
+                    "Could not finalize failed spawn session %s",
+                    task_id,
+                    exc_info=True,
+                )
 
         adapter = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            await finalize_spawn_failure("spawn_no_adapter")
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
@@ -24819,6 +24837,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
+                await finalize_spawn_failure("spawn_no_credentials")
                 await adapter.send(
                     source.chat_id,
                     f"❌ {task_label} {task_identity} failed: no provider credentials configured.",
@@ -24905,6 +24924,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
+            agent_finished = True
 
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
@@ -25013,7 +25033,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata=_thread_metadata,
                 )
 
+        except asyncio.CancelledError:
+            if not agent_finished:
+                await finalize_spawn_failure("spawn_cancelled")
+            raise
         except Exception as e:
+            if not agent_finished:
+                await finalize_spawn_failure("spawn_failed")
             logger.exception("Background task %s failed", task_id)
             try:
                 await adapter.send(
