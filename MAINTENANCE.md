@@ -92,6 +92,8 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-068 | Active | `fix(telegram): normalize inbound rich messages` | Convert Telegram Bot API Rich Messages into bounded Markdown events under the existing authorization, topic, and observation gates. |
 | HERMES-069 | Active | `fix(browser): preserve real-profile authentication` | Launch each isolated profile snapshot with its matching installed browser and attach automation over verified CDP without mock-keychain flags. |
 | HERMES-070 | Active | `feat(agent): allow pre_llm_call hooks to set turn reasoning`; `fix(agent): isolate turn reasoning overrides`; `feat(reasoning): support one-turn slash prompts`; `feat(reasoning): add deterministic adaptive effort`; `fix(agent): preserve reasoning transport test doubles`; `fix(reasoning): adapt from provider default baseline`; `test(reasoning): cover provider default baseline`; `fix(reasoning): preserve global effort command`; `test(reasoning): prove remaining control invariants`; `feat(reasoning): add adaptive shadow decisions` | Add task-local one-turn reasoning prompts, existing-alias inheritance, and deterministic opt-in adaptive effort without prompt or history mutation. |
+| HERMES-071 | Active | `feat: add model-callable set_goal tool`; `feat: enable self-starting model goals`; `fix: enforce model goal activation authority`; `docs: clarify model goal activation surfaces`; `test(goals): align activation authority regressions` | Let the model activate the existing persistent goal loop only from exact current-turn authorization, with session, turn, revision, persistence, replacement, and continuation fences. |
+| HERMES-072 | Active | `fix(gateway): prevent ten-turn worker starvation` | Keep an eleventh long-running gateway turn from silently waiting behind the historical ten-worker executor ceiling while preserving a bounded process-level pool. |
 
 ## Fork-only administrative subject exemptions
 
@@ -838,6 +840,28 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_gateway_restart_loop.py -q`; config-default and documentation validation; broader local CI before publication.
 - **Rollback:** Set `security.gateway_lifecycle_guard: true` before reverting `feat(gateway): make lifecycle guard configurable`; restart externally and rerun the focused lifecycle tests. Never revert while relying on an in-process restart command for activation.
 - **Retirement:** Retire after released upstream provides a default-on, fail-closed operator opt-out that governs the CLI, terminal, and cron paths consistently and passes the fork regressions.
+
+### HERMES-071 — Activate persistent goals from an explicitly authorized model turn
+
+- **Hypothesis:** Hermes already owns persistent, session-scoped goals, but the model cannot activate that loop as a tool. A narrow `set_goal` surface can reuse the existing manager safely only when the current user turn contains exact activation language and trusted runtime context supplies the session, turn, and goal-control revision.
+- **Summary:** Adds the `set_goal` tool, exact-span authorization and replacement checks, turn/revision race fencing, persistence readback, immediate same-turn continuation, and gateway/TUI/CLI exposure through the existing goal system. It does not add model-callable pause, clear, completion, or subgoal controls.
+- **Surfaces:** `tools/goal_tool.py`; `hermes_cli/goals.py`; goal-aware tool dispatch and runtime helpers; gateway and TUI toolsets; goal documentation; focused authority, persistence, and end-to-end regressions.
+- **Upstream tracking:** Source-associated PR #24477 supplied the initial model-callable goal concept and authorship. The maintained patch narrows it with exact current-turn authority, control-revision fencing, persistence readback, replacement controls, and immediate continuation. No released equivalent is present in the maintained base as of 2026-08-29.
+- **Upstream PR:** Source/associated: #24477. No additional direct PR identified after checked 2026-08-29.
+- **Regression:** Before publication, run the goal tool, activation fence, run-agent, turn-context, TUI toolset, and gateway goal suites through `scripts/run_tests.sh`, plus full repository CI.
+- **Rollback:** Revert the HERMES-071 subjects together, remove `set_goal` from toolsets and release inventory, and preserve the existing user-driven `/goal` manager and persisted goal data.
+- **Retirement:** Retire after released upstream provides equivalent exact-turn authority, race fencing, persistence readback, replacement safety, and same-turn kickoff across CLI, TUI/Desktop, and gateway surfaces.
+
+### HERMES-072 — Prevent silent gateway worker starvation after ten long turns
+
+- **Hypothesis:** Gateway agent turns occupy one executor worker for their complete lifetime while session admission is uncapped by default. The hard-coded ten-worker pool therefore queues an eleventh long turn invisibly until an earlier turn exits. A bounded 32-worker I/O pool removes the observed ten-turn cliff without making execution unbounded.
+- **Summary:** Raises the gateway-owned blocking executor ceiling from 10 to 32 and adds a deterministic regression that holds ten workers while proving the eleventh starts promptly. Existing FIFO `/steer` fallback regressions separately prove that a steer arriving before agent construction is preserved as the next turn.
+- **Surfaces:** `gateway/run.py`; `tests/gateway/test_gateway_executor_capacity.py`; existing `/steer` and queue regressions.
+- **Upstream tracking:** No released equivalent is present in the maintained base, and no direct issue or PR was identified after checked 2026-08-29.
+- **Upstream PR:** None after checked 2026-08-29.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_gateway_executor_capacity.py tests/gateway/test_steer_fifo_overwrite.py tests/gateway/test_steer_command.py tests/gateway/test_queue_consumption.py -q` passed 10 tests with 0 failures; full gateway and repository CI remain required before publication.
+- **Rollback:** Revert `fix(gateway): prevent ten-turn worker starvation`; the prior ten-worker bound returns without changing session or queue data.
+- **Retirement:** Retire after released upstream removes the silent ten-turn queue cliff through equivalent bounded capacity or explicit admission behavior and passes the held-worker regression.
 
 ## Upstream association and feedback contract
 
