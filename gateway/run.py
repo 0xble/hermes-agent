@@ -7163,6 +7163,10 @@ class TurnRunner:
                 )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
+            if ctx.turn_reasoning_config is not None:
+                _conversation_kwargs["turn_reasoning_config"] = (
+                    ctx.turn_reasoning_config
+                )
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             # Thread the platform-side inbound message id onto the persisted
@@ -18366,6 +18370,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_args = raw_args.strip() if isinstance(raw_args, str) else ""
         return f"{target} {user_args}".strip()
 
+    def _prepare_reasoning_turn_event(self, event: MessageEvent):
+        """Convert an expanded one-turn /reasoning command into agent input."""
+        from hermes_cli.commands import resolve_command
+        from hermes_cli.reasoning_turn import parse_reasoning_turn
+
+        command = event.get_command()
+        resolved = resolve_command(command) if command else None
+        if resolved is None or resolved.name != "reasoning":
+            return None
+
+        request = parse_reasoning_turn(event.get_command_args() or "")
+        if request is None:
+            return None
+
+        event.text = request.prompt
+        event.turn_reasoning_config = dict(request.reasoning_config)
+        event.turn_reasoning_notice = request.notice
+        return request
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -18585,6 +18608,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _alias_text = self._quick_command_alias_text(event)
         if _alias_text is not None:
             event.text = _alias_text
+
+        from hermes_cli.reasoning_turn import ReasoningTurnError
+
+        try:
+            self._prepare_reasoning_turn_event(event)
+        except ReasoningTurnError as exc:
+            return f"❌ {exc}"
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
@@ -22479,6 +22509,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            if event.turn_reasoning_notice:
+                _notice_adapter = self._adapter_for_source(source)
+                if _notice_adapter is not None:
+                    try:
+                        await _notice_adapter.send(
+                            source.chat_id,
+                            event.turn_reasoning_notice,
+                            metadata=self._thread_metadata_for_source(
+                                source,
+                                self._reply_anchor_for_event(event),
+                            ),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not deliver one-turn reasoning notice",
+                            exc_info=True,
+                        )
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -22515,6 +22563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                turn_reasoning_config=event.turn_reasoning_config,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -30581,6 +30630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        turn_reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -30667,6 +30717,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "messages": api_messages,
             "stream": True,
         }
+        if turn_reasoning_config and turn_reasoning_config.get("enabled") is not False:
+            effort = turn_reasoning_config.get("effort")
+            if effort:
+                body["model_options"] = {"reasoning_effort": effort}
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
@@ -30874,6 +30928,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        turn_reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -30895,6 +30950,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                turn_reasoning_config=turn_reasoning_config,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -30909,6 +30965,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                turn_reasoning_config=turn_reasoning_config,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -31053,6 +31110,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        turn_reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31077,6 +31135,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                turn_reasoning_config=turn_reasoning_config,
             )
 
         from run_agent import AIAgent
@@ -31363,6 +31422,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            turn_reasoning_config=turn_reasoning_config,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

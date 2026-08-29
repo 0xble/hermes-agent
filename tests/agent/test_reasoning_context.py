@@ -84,3 +84,24 @@ def test_turn_reasoning_is_owned_and_nested_scope_restores():
         reset_turn_reasoning(outer)
 
     assert get_turn_reasoning_config(first_owner) is None
+
+
+def test_explicit_turn_reasoning_cannot_be_overridden_by_lower_priority_source():
+    owner = object()
+    token = begin_turn_reasoning(
+        owner,
+        {"enabled": True, "effort": "high"},
+        source="explicit",
+    )
+    try:
+        assert not set_turn_reasoning_config(
+            owner,
+            {"enabled": True, "effort": "low"},
+            source="adaptive",
+        )
+        assert get_turn_reasoning_config(owner) == {
+            "enabled": True,
+            "effort": "high",
+        }
+    finally:
+        reset_turn_reasoning(token)
