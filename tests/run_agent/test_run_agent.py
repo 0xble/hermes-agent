@@ -2211,6 +2211,7 @@ class TestConcurrentToolExecution:
                 disabled_toolsets=agent.disabled_toolsets,
                 tool_request_middleware_trace=[],
                 user_task=None,
+                goal_control_revision=None,
             )
             assert result == "result"
 
@@ -2249,6 +2250,8 @@ class TestConcurrentToolExecution:
 
         getattr(goals, "_DB_CACHE").clear()
         agent.session_id = "live-set-goal"
+        agent._current_turn_id = "turn-live-set-goal"
+        agent._current_goal_control_revision = 0
         agent.valid_tool_names = {"set_goal"}
         messages = [
             {"role": "user", "content": "Set a goal to implement this and validate it."},
@@ -2260,6 +2263,7 @@ class TestConcurrentToolExecution:
                 "set_goal",
                 {
                     "goal": "Implement this and validate it",
+                    "authorization_text": "Set a goal to implement this and validate it.",
                     "contract": {"verification": "Focused tests pass"},
                 },
                 "task-1",
