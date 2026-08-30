@@ -1622,12 +1622,6 @@ def _close_all_real_profile_runtimes(*, all_profiles: bool = False) -> None:
     for key in selected_keys:
         _stop_real_profile_browser(key)
         _real_profile_cdp_cache.pop(key, None)
-    try:
-        from hermes_cli.browser_connect import stop_snapshot_browser_processes
-
-        stop_snapshot_browser_processes(str(get_hermes_home() / "browser-profile"))
-    except Exception as exc:
-        logger.debug("Could not clean recovered real-profile browsers: %s", exc)
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -1942,9 +1936,6 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
         if recovered:
             attach_error = _attach_agent_browser_to_cdp(session_name, recovered)
             if attach_error:
-                from hermes_cli.browser_connect import stop_snapshot_browser_processes
-
-                stop_snapshot_browser_processes(copy_dir)
                 return None, f"browser.use_real_profile is on, but {attach_error}"
             _real_profile_cdp_cache[cache_key] = recovered
             _track_real_profile_session(cache_key, session_name)
@@ -2005,6 +1996,13 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
             "--no-first-run",
             "--no-default-browser-check",
             "--no-startup-window",
+            # The snapshot carries the user's authenticated profile state. Keep
+            # the clone out of Chrome Sync and background update/network loops
+            # so agent activity cannot leak into or contend with the live
+            # profile's account state.
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
         ]
         # Keep the copied profile in the background by default. New headless
         # mode reads the browser's normal cookie store, while the auth loss this

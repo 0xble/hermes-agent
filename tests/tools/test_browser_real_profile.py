@@ -410,6 +410,9 @@ class TestRealProfileCdpLaunch:
         assert f"--user-data-dir={tmp_path}" in chrome_argv
         assert "--profile-directory=Default" in chrome_argv
         assert "--remote-debugging-port=0" in chrome_argv
+        assert "--disable-sync" in chrome_argv
+        assert "--disable-background-networking" in chrome_argv
+        assert "--disable-component-update" in chrome_argv
         assert not any("mock-keychain" in arg for arg in chrome_argv)
         assert not any("password-store" in arg for arg in chrome_argv)
         agent_argv = captured["agent_argv"]
@@ -449,6 +452,35 @@ class TestRealProfileCdpLaunch:
         assert err and "attach failed" in err
         chrome_proc.terminate.assert_called_once()
         chrome_proc.wait.assert_called()
+        self._reset()
+
+    def test_recovered_attach_failure_does_not_terminate_another_process_browser(
+        self, tmp_path
+    ):
+        import tools.browser_tool as bt
+
+        self._reset()
+        recovered = "http://127.0.0.1:41000"
+        stop = Mock()
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
+             patch.object(bt, "_owned_profile_cdp", return_value=recovered), \
+             patch.object(
+                 bt,
+                 "_attach_agent_browser_to_cdp",
+                 return_value="attach failed",
+             ), \
+             patch(
+                 "hermes_cli.browser_connect.stop_snapshot_browser_processes",
+                 stop,
+             ):
+            cdp, err = bt._real_profile_cdp()
+
+        assert cdp is None
+        assert err and "attach failed" in err
+        stop.assert_not_called()
         self._reset()
 
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
@@ -825,11 +857,19 @@ class TestReviewBugFixes:
         import hermes_cli.browser_connect as bc
 
         root = tmp_path / "d"
-        (root / "Default").mkdir(parents=True)
-        (root / "Default" / "Preferences").write_text("{}")
+        (root / "Profile 2").mkdir(parents=True)
+        (root / "Profile 2" / "Preferences").write_text("{}")
+        source_entry = {"name": "Work", "is_using_default_name": False}
         (root / "Local State").write_text(
-            '{"profile": {"last_used": "Default", '
-            '"last_active_profiles": ["Default"]}}'
+            json.dumps(
+                {
+                    "profile": {
+                        "last_used": "Profile 2",
+                        "last_active_profiles": ["Profile 2"],
+                        "info_cache": {"Profile 2": source_entry},
+                    }
+                }
+            )
         )
         home = tmp_path / "hh"
         local_state = home / "browser-profile" / "chrome" / "Local State"
@@ -854,6 +894,8 @@ class TestReviewBugFixes:
         assert direct_writes == 1
         state = json.loads(local_state.read_text())
         assert state["profile"]["last_used"] == "Default"
+        assert state["profile"]["last_active_profiles"] == ["Default"]
+        assert state["profile"]["info_cache"] == {"Default": source_entry}
 
     def test_last_used_reads_local_state(self, tmp_path):
         import hermes_cli.browser_connect as bc

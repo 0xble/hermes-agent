@@ -774,10 +774,16 @@ class TestNamedRealProfileProcesses:
             "_agent_browser_close_session",
             lambda name, **_kwargs: closed.append(name),
         )
+        swept_roots = []
+        monkeypatch.setattr(
+            "hermes_cli.browser_connect.stop_snapshot_browser_processes",
+            lambda root: swept_roots.append(root),
+        )
 
         bt._close_all_real_profile_runtimes()
 
         assert closed == [session_a]
+        assert swept_roots == []
         assert key_a not in bt._real_profile_cdp_cache
         assert bt._real_profile_cdp_cache[key_b] == "http://127.0.0.1:9301"
         assert bt._real_profile_session_names == {key_b: session_b}

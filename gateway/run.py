@@ -18409,12 +18409,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.commands import resolve_command
         from hermes_cli.reasoning_turn import parse_reasoning_turn
 
-        command = event.get_command()
+        get_command = getattr(event, "get_command", None)
+        if not callable(get_command):
+            return None
+        command_value = get_command()
+        command = command_value if isinstance(command_value, str) else None
         resolved = resolve_command(command) if command else None
         if resolved is None or resolved.name != "reasoning":
             return None
 
-        request = parse_reasoning_turn(event.get_command_args() or "")
+        get_command_args = getattr(event, "get_command_args", None)
+        raw_value = get_command_args() if callable(get_command_args) else ""
+        raw_args = raw_value if isinstance(raw_value, str) else ""
+        request = parse_reasoning_turn(raw_args)
         if request is None:
             return None
 
