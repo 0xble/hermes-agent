@@ -7,7 +7,7 @@ name: Install & Update E2E
 # scripts/dev-sandbox.sh, then applies one update route and requires the
 # checkout to land on this commit with a working `hermes`.
 #
-# The starting versions are chosen at runtime from the repo's release tags
+# The starting versions are chosen at runtime from canonical upstream release tags
 # (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a spread between.
 # A hardcoded list would stop covering the newest release the day after it
 # ships, and would pin an "oldest" that nobody still runs.
@@ -15,9 +15,11 @@ name: Install & Update E2E
 # Triggers:
 #   * every 12 hours, so upstream drift (a new uv, a Node bump, a PyPI change)
 #     surfaces on a schedule rather than in someone's review cycle;
-#   * when a release tag is created -- the moment the set of versions users can
-#     update FROM changes, and the moment a broken updater would strand them;
 #   * manually, where you can pick the route and how many releases to sample.
+#
+# This is a standalone mirror: canonical release-tag pushes happen upstream and
+# cannot trigger this repository. Scheduled and manual runs therefore operate on
+# fork main; the scheduled run discovers new canonical tags directly.
 #
 # Deliberately NOT on pull_request: a leg takes ~11 minutes of real toolchain
 # installation, and the matrix multiplies that. Updating is release-shaped work,
@@ -40,11 +42,6 @@ on:
   schedule:
     # Every 12 hours, off the hour to avoid the top-of-hour runner crunch.
     - cron: '20 7,19 * * *'
-  push:
-    tags:
-      # Release tags only: the repo also carries backup/* and one-off tags.
-      - 'v[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: read
@@ -58,24 +55,38 @@ jobs:
   # by both route matrices, so the two routes cover the same set.
   pick-releases:
     name: Pick release tags
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
-      # This job only reads tag names and runs one script, so take the cheap
-      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
-      # -- they are the whole input, and the default shallow checkout has none.
+      # This job only runs one script, so take the cheap checkout: no blobs
+      # (filter), no other files (sparse), and no origin tags. This standalone
+      # mirror carries archive tags, not the canonical release namespace.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: main
           filter: blob:none
-          fetch-tags: true
+          fetch-tags: false
+          persist-credentials: false
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
-      - id: pick
+      # Fetch only canonical release tags into this ephemeral checkout. The
+      # forced refspec makes canonical upstream win over any stale/conflicting
+      # local v* tag without adding a remote or mirroring tags into fork origin.
+      - name: Fetch canonical release tags
         run: |
           set -euo pipefail
-          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          git fetch --force --no-tags --filter=blob:none \
+            https://github.com/NousResearch/hermes-agent.git \
+            '+refs/tags/v*:refs/tags/v*'
+      - id: pick
+        env:
+          TAG_COUNT: ${{ inputs.tag-count || 5 }}
+        run: |
+          set -euo pipefail
+          tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"
           echo "Testing updates from: $tags"
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
