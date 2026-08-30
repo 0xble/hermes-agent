@@ -14,9 +14,11 @@ import asyncio
 import importlib
 import inspect as _inspect
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,6 +36,7 @@ async def _fire_post_delivery_cb(cb):
         await result
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.session import SessionSource
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +298,140 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+@pytest.mark.asyncio
+async def test_failed_run_keeps_progress_breadcrumbs(monkeypatch, tmp_path):
+    class BreadcrumbFailingAgent(FailingAgent):
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            callback = self.tool_progress_callback
+            assert callback is not None
+            callback("tool.started", "terminal", "pwd", {})
+            time.sleep(0.4)
+            callback("tool.started", "terminal", "ls", {})
+            time.sleep(0.4)
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "failed": True,
+                "error": "simulated provider failure",
+            }
+
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch, BreadcrumbFailingAgent, cleanup_on=True,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    session_key = "agent:main:telegram:group:-1001"
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001"),
+        session_id="sess-failed-cleanup",
+        session_key=session_key,
+    )
+
+    assert result["failed"] is True
+    assert adapter.sent, "failed run should leave visible progress"
+    callback = adapter.pop_post_delivery_callback(session_key)
+    if callback is not None:
+        await _fire_post_delivery_cb(callback)
+        await asyncio.sleep(0.05)
+    assert adapter.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_uses_replacement_after_mid_turn_adapter_swap(
+    monkeypatch, tmp_path,
+):
+    """The turn-retained adapter must edit and clean up through its replacement."""
+    config = PlatformConfig(enabled=True, token="test-token")
+    retired = TelegramAdapter(config)
+    live = TelegramAdapter(config)
+    retired._rich_send_disabled = True
+    live._rich_send_disabled = True
+    retired._RECONNECT_WAIT_SECONDS = 0.2
+    retired._RECONNECT_POLL_INTERVAL = 0.01
+
+    first_progress_sent = threading.Event()
+    replacement_edit_seen = threading.Event()
+
+    async def _send_first_progress(**kwargs):
+        first_progress_sent.set()
+        return MagicMock(message_id=701)
+
+    async def _edit_on_replacement(**kwargs):
+        replacement_edit_seen.set()
+        return MagicMock(message_id=701)
+
+    retired_bot = MagicMock()
+    retired_bot.send_message = AsyncMock(side_effect=_send_first_progress)
+    retired._bot = retired_bot
+    retired.send_typing = AsyncMock()
+    retired.stop_typing = AsyncMock()
+
+    live_bot = MagicMock()
+    live_bot.send_message = AsyncMock(return_value=MagicMock(message_id=702))
+    live_bot.edit_message_text = AsyncMock(side_effect=_edit_on_replacement)
+    live_bot.delete_message = AsyncMock(return_value=True)
+    live._bot = live_bot
+    live.send_typing = AsyncMock()
+    live.stop_typing = AsyncMock()
+
+    runner = _make_runner(retired)
+    retired.gateway_runner = runner
+    live.gateway_runner = runner
+
+    class AdapterSwapAgent:
+        def __init__(self, **kwargs):
+            self.tool_progress_callback = kwargs.get("tool_progress_callback")
+            self.tools = []
+
+        def run_conversation(self, message, conversation_history=None, task_id=None):
+            callback = self.tool_progress_callback
+            assert callback is not None
+            callback("tool.started", "terminal", "pwd", {})
+            assert first_progress_sent.wait(3), "initial progress was not sent"
+
+            retired._bot = None
+            runner.adapters[retired.platform] = live
+            callback("tool.started", "terminal", "ls", {})
+            assert replacement_edit_seen.wait(3), "replacement did not receive edit"
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    gateway_run = _install_fakes(
+        monkeypatch, AdapterSwapAgent, cleanup_on=True,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    session_key = "agent:main:telegram:group:-1001"
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="-1001"),
+        session_id="sess-replacement-cleanup",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    assert retired_bot.send_message.await_count == 1
+    assert live_bot.send_message.await_count == 0
+    assert live_bot.edit_message_text.await_count >= 1
+
+    callback = retired.pop_post_delivery_callback(session_key)
+    assert callable(callback)
+    await _fire_post_delivery_cb(callback)
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if live_bot.delete_message.await_count:
+            break
+
+    live_bot.delete_message.assert_awaited_once_with(
+        chat_id=-1001,
+        message_id=701,
+    )

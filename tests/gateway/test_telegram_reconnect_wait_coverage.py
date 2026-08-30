@@ -108,6 +108,39 @@ async def test_shared_guard_delegates_immediately_when_replacement_already_live(
     live._bot.edit_message_text.assert_awaited()
 
 
+def test_replacement_lookup_uses_the_same_secondary_profile_registry():
+    retired = _make_adapter()
+    retired._bot = None
+    retired.set_owner_profile("reviewer")
+    same_profile = _make_adapter()
+    same_profile.set_owner_profile("reviewer")
+    same_profile._bot = _connected_bot()
+    primary = _make_adapter()
+    primary._bot = _connected_bot()
+    runner = MagicMock()
+    runner.adapters = {retired.platform: primary}
+    runner._profile_adapters = {
+        "reviewer": {retired.platform: same_profile},
+    }
+    retired.gateway_runner = runner
+
+    assert retired._replacement_telegram_adapter() is same_profile
+
+
+def test_replacement_lookup_never_falls_back_to_primary_for_secondary():
+    retired = _make_adapter()
+    retired._bot = None
+    retired.set_owner_profile("reviewer")
+    primary = _make_adapter()
+    primary._bot = _connected_bot()
+    runner = MagicMock()
+    runner.adapters = {retired.platform: primary}
+    runner._profile_adapters = {}
+    retired.gateway_runner = runner
+
+    assert retired._replacement_telegram_adapter() is None
+
+
 @pytest.mark.asyncio
 async def test_shared_guard_timeout_is_retryable_not_connected():
     adapter = _make_adapter()
@@ -136,6 +169,57 @@ async def test_shared_guard_permanent_fatal_fails_immediately_without_wait():
     assert result.success is False
     assert result.error == "Not connected"
     assert result.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_delete_message_delegates_immediately_to_replacement():
+    old = _make_adapter()
+    old._bot = None
+    live = _make_adapter()
+    live_bot = _connected_bot()
+    live_bot.delete_message = AsyncMock(return_value=True)
+    live._bot = live_bot
+    runner = MagicMock()
+    runner.adapters = {old.platform: live}
+    old.gateway_runner = runner
+    old._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait when replacement is already live")
+    )
+
+    deleted = await old.delete_message("123", "7")
+
+    assert deleted is True
+    live_bot.delete_message.assert_awaited_once_with(chat_id=123, message_id=7)
+
+
+@pytest.mark.asyncio
+async def test_delete_message_waits_for_same_adapter_reconnection():
+    adapter = _make_adapter()
+    adapter._bot = None
+    restored_bot = _connected_bot()
+    restored_bot.delete_message = AsyncMock(return_value=True)
+
+    async def restore_bot() -> None:
+        await asyncio.sleep(0.12)
+        adapter._bot = restored_bot
+
+    asyncio.get_running_loop().create_task(restore_bot())
+    deleted = await adapter.delete_message("123", "7")
+
+    assert deleted is True
+    restored_bot.delete_message.assert_awaited_once_with(chat_id=123, message_id=7)
+
+
+@pytest.mark.asyncio
+async def test_delete_message_permanent_fatal_fails_without_waiting():
+    adapter = _make_adapter()
+    adapter._bot = None
+    adapter._set_fatal_error("telegram_auth_error", "invalid token", retryable=False)
+    adapter._wait_for_reconnection = AsyncMock(
+        side_effect=AssertionError("must not wait on permanent fatal")
+    )
+
+    assert await adapter.delete_message("123", "7") is False
 
 
 # ---------------------------------------------------------------------------
