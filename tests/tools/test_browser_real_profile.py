@@ -1264,3 +1264,47 @@ class TestWindowsLockedProfileCopy:
         dst, err = bc.snapshot_real_profile("chrome", src=str(root))
         assert dst is None
         assert err and "login data" in err.lower() and "close" in err.lower()
+
+    def test_copy_auth_file_bounded_when_locked_falls_back_to_raw(self, tmp_path, monkeypatch):
+        """A wedged source DB (running Chrome holds Login Data exclusively on
+        POSIX too) must abort the online backup within the deadline and fall
+        through to the raw copy instead of hanging the launch forever (#96646).
+
+        Regression: CPython's sqlite3.Connection.backup() retries SQLITE_BUSY
+        indefinitely when no progress callback bounds it, so the old unbounded
+        source.backup(out) never returned and the raw-copy fallback was
+        unreachable — this test times out rather than failing fast on the
+        old code.
+        """
+        import hermes_cli.browser_connect as bc
+        import sqlite3
+        import time
+        monkeypatch.setattr(bc, "_AUTH_BACKUP_TIMEOUT_SECONDS", 0.5)
+        src = str(tmp_path / "Login Data")
+        con = sqlite3.connect(src)
+        con.execute("create table logins(x)")
+        con.execute("insert into logins values(1)")
+        con.commit()
+        # Hold the exclusive SQLite lock the way a running Chrome does.
+        con.execute("BEGIN EXCLUSIVE")
+        try:
+            dst = str(tmp_path / "out" / "Login Data")
+            started = time.monotonic()
+            ok = bc._copy_auth_file(src, dst)
+            elapsed = time.monotonic() - started
+            assert elapsed < 5.0, (
+                f"_copy_auth_file took {elapsed:.1f}s on a locked source — "
+                "the backup is no longer deadline-bounded"
+            )
+            # On POSIX the raw-copy fallback needs no SQLite locks, so the
+            # copy still lands and the launch can proceed.
+            assert ok is True
+            assert os.path.isfile(dst)
+            check = sqlite3.connect(dst)
+            try:
+                assert check.execute("select count(*) from logins").fetchone()[0] == 1
+            finally:
+                check.close()
+        finally:
+            con.rollback()
+            con.close()
