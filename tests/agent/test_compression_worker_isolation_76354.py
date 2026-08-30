@@ -66,6 +66,19 @@ def _build_agent_with_db(db: SessionDB, session_id: str, **compressor_kwargs):
     return agent
 
 
+def _wait_for_compression_workers(timeout: float = 5.0) -> None:
+    """Wait until the shared compression pool has released this file's jobs."""
+    import agent.conversation_compression as compression
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with compression._compress_admission_lock:
+            if compression._compress_admitted_count == 0:
+                return
+        time.sleep(0.02)
+    raise AssertionError("compression worker did not finish before test teardown")
+
+
 def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -128,6 +141,8 @@ def test_f3_mutating_engine_cannot_touch_live_transcript_after_timeout(
     while time.time() < deadline and db.get_compression_lock_holder(session_id):
         time.sleep(0.02)
     assert live == baseline
+    _wait_for_compression_workers()
+    db.close()
 
 
 def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_blocked(
@@ -314,6 +329,8 @@ def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
     assert post_release_rows == pre_release_rows
     assert agent.session_id == session_id
     db.release_compression_lock(session_id, new_holder)
+    _wait_for_compression_workers()
+    db.close()
 
 
 def test_f5_session_contextvar_rebound_after_rotation(
@@ -356,3 +373,5 @@ def test_f5_session_contextvar_rebound_after_rotation(
         )
     finally:
         clear_session_vars(tokens)
+        _wait_for_compression_workers()
+        db.close()
