@@ -96,6 +96,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-072 | Active | `fix(gateway): prevent ten-turn worker starvation` | Keep an eleventh long-running gateway turn from silently waiting behind the historical ten-worker executor ceiling while preserving a bounded process-level pool. |
 | HERMES-073 | Active | `fix(gateway): dispatch title while busy` | Let `/title` inspect or rename the current session immediately without interrupting an active turn. |
 | HERMES-074 | Active | `fix(gateway): scope out-of-turn compression dedup reset to the live session task` | Reset post-compression file and skill dedup state under the live session row ID for both manual and hygiene compression. |
+| HERMES-075 | Active | `feat(gateway): configure restart continuation policy` | Resolve restart recovery from a global `ask` or `continue` policy with platform overrides and adapter safety constraints. |
 
 ## Fork-only administrative subject exemptions
 
@@ -135,6 +136,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-075 — Configure restart continuation policy
+
+- **Independent hypothesis (2026-08-29):** Restart recovery currently overloads `BasePlatformAdapter.interactive_resume` with two independent meanings: whether a platform has a human reply channel and whether an empty startup recovery turn should ask or continue. This prevents an operator from selecting automatic continuation globally or per platform without misclassifying an interactive adapter such as Telegram as non-interactive. The correction belongs in gateway policy resolution, above adapter capability defaults and below explicit per-platform configuration.
+- **Summary:** Add an opt-in global `gateway.restart_resume_policy` (`ask` or `continue`), allow `gateway.platforms.<name>.extra.restart_resume_policy` to override it, preserve non-interactive adapters' safe continue-only behavior, and generate platform-neutral continuation guidance. The upstream default remains unchanged when no policy is configured.
+- **Surfaces:** `gateway/config.py`; `gateway/run.py`; `tests/gateway/test_restart_resume_policy.py`; `tests/gateway/test_restart_resume_pending.py`; `website/docs/user-guide/messaging/index.md`; this record.
+- **Upstream tracking:** Open issue #9673 requests automatic continuation without a new user message. Existing upstream restart recovery and `interactive_resume` capability provide session preservation, startup scheduling, freshness, authorization, duplicate-run, restart-loop, and replay safeguards but no operator-selectable interactive-platform continuation policy.
+- **Upstream PR:** None found for a global restart-continuation policy with platform overrides as of 2026-08-29. Closed PR #9328 proposed a different global-recent-transcript design; merged recovery work and PR #65783 preserve ask-first behavior for interactive adapters.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_restart_resume_policy.py tests/gateway/test_restart_resume_pending.py -q`; focused coverage must prove platform override > global policy > adapter default, non-interactive safety, platform-neutral continue guidance, validation, and the startup recovery path.
+- **Expected published commit identity:** Stable subject `feat(gateway): configure restart continuation policy`; source, focused regressions, docs, and this record ship together.
+- **Rollback:** Revert only `feat(gateway): configure restart continuation policy`, remove `gateway.restart_resume_policy` and per-platform overrides from configuration, restore `interactive_resume`-only guidance selection, and remove the HERMES-075 tests and documentation. No schema or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version provides a documented global ask/continue restart-recovery policy with per-platform overrides, safe adapter capability handling, automatic continuation without a new user message, and equivalent replay/freshness/authorization/loop regressions.
 
 ### HERMES-074 — Scope compression dedup resets to the live session row
 
