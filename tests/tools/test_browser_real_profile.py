@@ -817,6 +817,44 @@ class TestReviewBugFixes:
         assert state["profile"]["last_used"] == "Default"
         assert state["profile"]["last_active_profiles"] == ["Default"]
 
+    def test_snapshot_normalizes_local_state_only_through_atomic_replace(
+        self, tmp_path, monkeypatch
+    ):
+        import builtins
+        import json
+        import hermes_cli.browser_connect as bc
+
+        root = tmp_path / "d"
+        (root / "Default").mkdir(parents=True)
+        (root / "Default" / "Preferences").write_text("{}")
+        (root / "Local State").write_text(
+            '{"profile": {"last_used": "Default", '
+            '"last_active_profiles": ["Default"]}}'
+        )
+        home = tmp_path / "hh"
+        local_state = home / "browser-profile" / "chrome" / "Local State"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        real_open = builtins.open
+        direct_writes = 0
+
+        def reject_second_direct_write(path, mode="r", *args, **kwargs):
+            nonlocal direct_writes
+            if os.fspath(path) == os.fspath(local_state) and any(
+                flag in mode for flag in "wxa"
+            ):
+                direct_writes += 1
+                if direct_writes > 1:
+                    raise AssertionError("Local State must be replaced atomically")
+            return real_open(path, mode, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=reject_second_direct_write):
+            dst, err = bc.snapshot_real_profile("chrome", src=str(root))
+
+        assert err is None and dst is not None
+        assert direct_writes == 1
+        state = json.loads(local_state.read_text())
+        assert state["profile"]["last_used"] == "Default"
+
     def test_last_used_reads_local_state(self, tmp_path):
         import hermes_cli.browser_connect as bc
         root = tmp_path / "d"
