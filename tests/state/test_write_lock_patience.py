@@ -91,13 +91,18 @@ class TestTranscriptWritePatience:
             target=_hold_write_lock, args=(db.db_path, 2.0, started)
         )
         holder.start()
+        original_timeout_ms = db._conn.execute("PRAGMA busy_timeout").fetchone()[0]
         try:
             assert started.wait(5.0)
+            attempted_at = time.monotonic()
             with pytest.raises(sqlite3.OperationalError) as excinfo:
                 db.set_meta("k", "v")  # routine write, short patience
+            elapsed = time.monotonic() - attempted_at
         finally:
             holder.join(timeout=10.0)
         assert not holder.is_alive()
+        assert elapsed < 1.0
+        assert db._conn.execute("PRAGMA busy_timeout").fetchone()[0] == original_timeout_ms
         text = str(excinfo.value)
         assert "another Hermes process" in text
         assert "healthy" in text

@@ -100,6 +100,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-075 | Active | `feat(gateway): configure restart continuation policy` | Resolve restart recovery from a global `ask` or `continue` policy with platform overrides and adapter safety constraints. |
 | HERMES-076 | Active | `fix(telegram): extend the reconnect-wait guard from send() to every other send_*/edit_message call`; `fix(telegram): keep cleanup on replacement adapter` | Keep an in-flight Telegram turn's edits, prompts, media sends, and successful progress cleanup on the connected replacement adapter after reconnect. |
 | HERMES-078 | Active | `feat(reasoning): restore one-turn slash prompts` | Run `/reasoning <level> <prompt>` and configured aliases such as `/ttt <prompt>` at an explicit effort for exactly one complete turn without restoring adaptive classification. |
+| HERMES-079 | Active | `fix(state): enforce application write patience` | Keep SQLite's connection busy handler from overrunning the application-level write-patience deadline. |
 
 ## Fork-only administrative subject exemptions
 
@@ -141,6 +142,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-079 — Enforce application write patience
+
+- **Independent hypothesis (2026-08-30):** `_execute_write()` measures a total application patience deadline, but `BEGIN IMMEDIATE` first enters SQLite's connection-level busy handler. A competing writer can therefore hold the call inside SQLite beyond the configured patience window, preventing the jitter/deadline loop from raising the intended lock-attribution error and making sub-second activity-write budgets ineffective. The correction belongs at transaction acquisition: make only `BEGIN IMMEDIATE` non-blocking, restore the configured busy timeout before the transaction body, and leave retry timing under the existing application loop.
+- **Summary:** Temporarily set the connection busy timeout to zero while acquiring the write transaction, restore it before invoking the write callback, roll back if timeout restoration fails after acquisition, and preserve the existing randomized retry, lock attribution, malformed-database recovery, compression-lease, and commit/rollback contracts.
+- **Surfaces:** `hermes_state.py`; `tests/state/test_write_lock_patience.py`; this record.
+- **Upstream tracking:** Existing upstream issue #74478 tracks lost session persistence under legitimate multi-process SQLite contention. Upstream `main` at `26350357d76e4508c8df9304a3374bdc5a6f6220` carries the application patience loop but still lets SQLite's busy handler overrun short budgets.
+- **Upstream PR:** None confirmed for bounding `BEGIN IMMEDIATE` by the application patience deadline as of 2026-08-30.
+- **Regression:** `scripts/run_tests.sh tests/state/test_write_lock_patience.py -q`; the exhausted-patience case must raise the attributed `OperationalError` in under one second while a two-second competing lock remains held, and the connection's configured busy timeout must be restored afterward. The complete file must continue proving long-lock survival for transcript-critical writes and uncontended performance.
+- **Expected published commit identity:** Stable subject `fix(state): enforce application write patience`; source, regression, and this record ship together.
+- **Rollback:** Revert only `fix(state): enforce application write patience`, restoring connection-level waiting during `BEGIN IMMEDIATE` and removing the elapsed-time and timeout-restoration assertions plus this record. No schema or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version proves that SQLite lock acquisition cannot outlive routine, transcript, or activity patience budgets, preserves attributed exhaustion errors and configured busy timeouts, and passes equivalent long-lock and short-budget regressions.
 
 ### HERMES-075 — Configure restart continuation policy
 
