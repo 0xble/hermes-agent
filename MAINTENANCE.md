@@ -135,6 +135,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `docs(maintenance): register reasoning controls patch` | Maintenance-only manifest registration for HERMES-070; no additional shipped behavior. |
 | `docs(fork): register upstream compression reset candidate` | Maintenance-only registration of the reviewed upstream HERMES-074 candidate; no additional shipped behavior. |
 | `fix(reconcile): preserve atomic browser profile normalization` | Patch-neutral rebase repair removing a duplicate non-atomic Local State rewrite while preserving upstream atomic replacement and the fork's selected-profile identity metadata; also reconciles stale manifest subjects exposed by rewritten history. |
+| `fix(reconcile): restore fork integration contracts` | Patch-neutral rebase repair keeping duck-typed gateway events safe and updating existing test seams for current reasoning and credential reader contracts; no additional shipped behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 

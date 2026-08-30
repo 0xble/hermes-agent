@@ -284,6 +284,7 @@ class TestPortalBodyFields:
             _oauth_1m_beta_disabled=False,
             _get_transport=lambda: transport,
             _prepare_anthropic_messages_for_api=lambda msgs: msgs,
+            _current_reasoning_config=lambda: None,
             _anthropic_preserve_dots=lambda: False,
         )
         return build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
