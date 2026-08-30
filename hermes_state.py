@@ -5864,13 +5864,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # close() ran while this writer was still unwinding
                         # (#94736) — reopen instead of dying on None.execute.
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn = self._conn
+                    if conn is None:
+                        raise RuntimeError("SessionDB connection is closed")
+                    # SQLite's connection-level busy handler must not run its
+                    # own deterministic wait inside BEGIN IMMEDIATE: that wait
+                    # can outlive this operation's application-level patience
+                    # budget before our jitter/deadline loop gets control. Make
+                    # lock acquisition non-blocking, then restore the configured
+                    # timeout before executing the transaction body.
+                    timeout_row = conn.execute("PRAGMA busy_timeout").fetchone()
+                    configured_timeout_ms = (
+                        int(timeout_row[0]) if timeout_row and timeout_row[0] is not None else 0
+                    )
+                    override_busy_timeout = configured_timeout_ms != 0
+                    if override_busy_timeout:
+                        conn.execute("PRAGMA busy_timeout=0")
+                    began_transaction = False
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        conn.execute("BEGIN IMMEDIATE")
+                        began_transaction = True
+                    finally:
+                        if override_busy_timeout:
+                            try:
+                                conn.execute(
+                                    f"PRAGMA busy_timeout={configured_timeout_ms}"
+                                )
+                            except BaseException as restore_exc:
+                                if began_transaction:
+                                    try:
+                                        conn.rollback()
+                                    except Exception:
+                                        pass
+                                raise RuntimeError(
+                                    "failed to restore the SQLite busy timeout"
+                                ) from restore_exc
+                    try:
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
