@@ -19,10 +19,9 @@
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
 #
-# Reads tags from the local checkout, so it needs one fetched with tags
-# (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
-# checkout has no tags and this exits non-zero rather than silently emitting an
-# empty matrix.
+# Reads tags from the local checkout, so its caller must fetch the intended
+# release-tag namespace first. A checkout without release tags exits non-zero
+# rather than silently emitting an empty matrix.
 #
 # Only vYYYY.M.D[.N] release tags are considered; the repo also carries
 # backup/* and one-off tags that are not releases.
@@ -75,8 +74,8 @@ mapfile -t tags < <(
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then
   echo "error: no release tags found in $REPO" >&2
-  echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
-  echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
+  echo '       Fetch the canonical v* release-tag namespace before running' >&2
+  echo '       this local-only picker.' >&2
   exit 1
 fi
 

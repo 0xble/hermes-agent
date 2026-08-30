@@ -140,6 +140,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `test(uv): tolerate legacy no-config semantics` | Test-host compatibility for older uv releases that keep project `pyproject.toml` configuration active under `UV_NO_CONFIG`; no shipped Hermes behavior. |
 | `test(compression): close worker-owned state handles` | Deterministic test teardown for compression timeout regressions; waits for worker completion and closes temporary `SessionDB` handles on the owning test thread without changing shipped behavior. |
 | `test(reconcile): align compaction prompt rebuild contract` | Rebase reconciliation preserving HERMES-025's would-grow outcome, accepting upstream's live prompt rebuild, and replacing source-introspection checks with behavioral coverage; also advances the history gate to this run's rebased pre-change commit, without changing shipped Hermes behavior. |
+| `fix(ci): source install E2E tags from upstream` | Standalone-mirror CI repair that reads canonical release tags without mirroring them into fork origin; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
