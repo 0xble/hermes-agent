@@ -97,6 +97,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-073 | Active | `fix(gateway): dispatch title while busy` | Let `/title` inspect or rename the current session immediately without interrupting an active turn. |
 | HERMES-074 | Active | `fix(gateway): scope out-of-turn compression dedup reset to the live session task` | Reset post-compression file and skill dedup state under the live session row ID for both manual and hygiene compression. |
 | HERMES-075 | Active | `feat(gateway): configure restart continuation policy` | Resolve restart recovery from a global `ask` or `continue` policy with platform overrides and adapter safety constraints. |
+| HERMES-076 | Active | `fix(telegram): extend the reconnect-wait guard from send() to every other send_*/edit_message call`; `fix(telegram): keep cleanup on replacement adapter` | Keep an in-flight Telegram turn's edits, prompts, media sends, and successful progress cleanup on the connected replacement adapter after reconnect. |
 
 ## Fork-only administrative subject exemptions
 
@@ -136,7 +137,6 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
-
 ### HERMES-075 — Configure restart continuation policy
 
 - **Independent hypothesis (2026-08-29):** Restart recovery currently overloads `BasePlatformAdapter.interactive_resume` with two independent meanings: whether a platform has a human reply channel and whether an empty startup recovery turn should ask or continue. This prevents an operator from selecting automatic continuation globally or per platform without misclassifying an interactive adapter such as Telegram as non-interactive. The correction belongs in gateway policy resolution, above adapter capability defaults and below explicit per-platform configuration.
@@ -148,6 +148,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subject `feat(gateway): configure restart continuation policy`; source, focused regressions, docs, and this record ship together.
 - **Rollback:** Revert only `feat(gateway): configure restart continuation policy`, remove `gateway.restart_resume_policy` and per-platform overrides from configuration, restore `interactive_resume`-only guidance selection, and remove the HERMES-075 tests and documentation. No schema or persistent-data rollback is required.
 - **Retirement:** Retire after a released upstream version provides a documented global ask/continue restart-recovery policy with per-platform overrides, safe adapter capability handling, automatic continuation without a new user message, and equivalent replay/freshness/authorization/loop regressions.
+
+### HERMES-076 — Keep active Telegram turns on the replacement adapter
+
+- **Independent hypothesis (2026-08-29):** Telegram's reconnect watcher can replace a disconnected adapter object while an active turn still closes over the retired object. Ordinary `send()` delegates to the connected replacement, but `edit_message()` returns non-retryable `Not connected` and `delete_message()` returns `False` before resolving the live adapter. The gateway therefore disables accumulated progress edits, sends later progress and heartbeat updates as separate messages, and invokes successful-final cleanup on the retired adapter, leaving temporary messages behind. The correction belongs in the Telegram adapter contract so every retained caller remains replacement-aware without gateway-specific lookups.
+- **Summary:** Import the reviewed shared reconnect/delegation guard from upstream PR #95624 with original author attribution, resolve replacements only from the same owning profile's adapter registry, extend the same contract to `delete_message()` while preserving its boolean result, and prove a turn can edit and clean up through the connected replacement. No schema, configuration, credential, or persistent-state migration.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_reconnect_wait_coverage.py`; `tests/gateway/test_run_cleanup_progress.py`; this record.
+- **Upstream tracking:** Canonical issue #98228. Open PR #95624 directly implements replacement-aware `edit_message()` and other outbound methods at reviewed head `76f1a984baee711a37d15d36c0091a304aef076b`; its focused tests passed in a network-disabled sandbox, but that head is conflicting with current upstream and does not cover `delete_message()` or the progress-cleanup lifecycle. Issues/PRs #27828 and #28485 cover retryable same-adapter edit errors, while #91834 and #94498 established replacement reconnect and ordinary-send delegation.
+- **Upstream PR:** Direct partial implementation: #95624. No competing PR while it remains active; the missing deletion and lifecycle evidence were reported on that PR and linked to #98228.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_reconnect_wait_coverage.py tests/gateway/test_telegram_send_reconnect_wait.py tests/gateway/test_run_cleanup_progress.py -q`; RED proof on the selected base produced 22 failures, including non-retryable stale edits, undelegated deletes, and every newly guarded outbound path. Focused coverage must prove immediate and mid-wait replacement delegation, retryable transient timeout, permanent-auth fail-closed behavior, successful cleanup through the replacement, failed-run breadcrumb retention, and unchanged final-delivery ownership.
+- **Published commit identity:** Stable subjects `fix(telegram): extend the reconnect-wait guard from send() to every other send_*/edit_message call` and `fix(telegram): keep cleanup on replacement adapter`; preserve `nftpoetrist <264138787+nftpoetrist@users.noreply.github.com>` as author of the imported PR commit.
+- **Rollback:** Revert `fix(telegram): keep cleanup on replacement adapter`, then revert `fix(telegram): extend the reconnect-wait guard from send() to every other send_*/edit_message call`, restoring method-local disconnected failures and removing only HERMES-076 tests and this record. No state or configuration rollback is required.
+- **Retirement:** Retire after a released upstream version delegates both `edit_message()` and `delete_message()` to the same connected replacement across an active turn, preserves permanent-fatal and method return contracts, and passes equivalent progress, heartbeat, cleanup, failed-run, and exactly-once final-delivery regressions. Remove the fork implementation rather than retaining parallel guards.
 
 ### HERMES-074 — Scope compression dedup resets to the live session row
 

@@ -1075,15 +1075,26 @@ class TelegramAdapter(BasePlatformAdapter):
     def _replacement_telegram_adapter(self) -> Optional["TelegramAdapter"]:
         """Return the live Telegram adapter if the reconnect watcher replaced us.
 
-        The background reconnect watcher builds a *new* adapter and puts it in
-        ``runner.adapters``. An in-flight ``send()`` still holds the old
-        instance whose ``_bot`` stays None. Waiting only on ``self._bot``
-        would miss that replacement and still drop the final reply.
+        The background reconnect watcher builds a *new* adapter and installs it
+        in the owning profile's registry. An in-flight caller still holds the old
+        instance whose ``_bot`` stays None. Waiting only on ``self._bot`` would
+        miss that replacement; looking only in ``runner.adapters`` would route a
+        secondary profile through the primary profile's bot.
         """
         runner = getattr(self, "gateway_runner", None)
-        adapters = getattr(runner, "adapters", None) or {}
+        owner_profile = getattr(self, "_owner_profile", None)
+        if owner_profile:
+            profile_maps = getattr(runner, "_profile_adapters", None) or {}
+            adapters = profile_maps.get(owner_profile, {}) or {}
+        else:
+            adapters = getattr(runner, "adapters", None) or {}
         live = adapters.get(self.platform)
-        if live is not None and live is not self and getattr(live, "_bot", None):
+        if (
+            live is not None
+            and live is not self
+            and getattr(live, "_bot", None)
+            and getattr(live, "_owner_profile", None) == owner_profile
+        ):
             return live
         return None
 
@@ -6653,6 +6664,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
         # lists, task lists, <details>, block math) and rich is available,
@@ -7084,7 +7096,15 @@ class TelegramAdapter(BasePlatformAdapter):
         caller leaves the preview in place and logs at debug level.
         """
         if not self._bot:
-            return False
+            outcome = await self._await_reconnection_or_delegate(
+                "delete_message", chat_id, message_id,
+            )
+            if outcome is self._RECONNECT_FAILED:
+                return False
+            if outcome is not None:
+                return bool(outcome)
+            if not self._bot:
+                return False
         try:
             await self._bot.delete_message(
                 chat_id=normalize_telegram_chat_id(chat_id),
@@ -7253,6 +7273,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         message_thread_id = kwargs.get("message_thread_id")
         chat_id = kwargs.get("chat_id")
         try:
@@ -7309,6 +7330,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             if outcome is not None:
                 return outcome
+        assert self._bot is not None
         try:
             default_hint = f" (default: {default})" if default else ""
             text = self.format_message(f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}")
@@ -7380,6 +7402,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             text = self._format_exec_approval(command, description, smart_denied)
 
@@ -7460,6 +7483,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             preview = self.format_message(self._truncate_preview(message, 3800))
 
@@ -7535,6 +7559,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
@@ -7625,6 +7650,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             from hermes_cli.providers import get_label
         except ImportError:
@@ -7711,6 +7737,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             buttons = []
             for i, choice in enumerate(choices):
@@ -8928,6 +8955,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         _transcoded_voice_path: Optional[str] = None
         try:
             if not os.path.exists(audio_path):
@@ -9259,6 +9287,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             if not os.path.exists(image_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Image", image_path))
@@ -9367,6 +9396,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
@@ -9433,6 +9463,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             if not os.path.exists(video_path):
                 return SendResult(success=False, error=self._missing_media_path_error("Video", video_path))
@@ -9499,6 +9530,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         from tools.url_safety import is_safe_url
         if not is_safe_url(image_url):
             logger.warning("[%s] Blocked unsafe image URL (SSRF protection)", self.name)
@@ -9610,6 +9642,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return outcome
 
+        assert self._bot is not None
         try:
             _anim_thread = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
