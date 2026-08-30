@@ -266,6 +266,19 @@ def _normalize_notice_delivery(value: Any, default: str = "public") -> str:
     return default
 
 
+def _normalize_restart_resume_policy(
+    value: Any, *, allow_none: bool, key: str
+) -> Optional[str]:
+    """Validate restart recovery policy without silently changing intent."""
+    if value is None and allow_none:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"ask", "continue"}:
+            return normalized
+    raise ValueError(f"{key} must be 'ask' or 'continue'")
+
+
 def _ensure_platform_extra_dict(platforms_data: dict, name: str) -> tuple[dict, dict]:
     """Get-or-create ``platforms_data[name]`` and its nested ``extra`` dict.
 
@@ -955,6 +968,10 @@ class GatewayConfig:
     
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
+    # Empty-message restart recovery policy for adapters that can either ask
+    # the user or continue autonomously. None preserves each adapter's native
+    # safety default. Per-platform ``extra.restart_resume_policy`` wins.
+    restart_resume_policy: Optional[str] = None
     # Drop outbound "silence narration" messages (e.g. *(silent)*, 🔇, a bare
     # ".") pre-send. These are model hallucinations emitted when a persona has
     # nothing actionable to say; in bot-to-bot channels they mirror back and
@@ -1035,6 +1052,20 @@ class GatewayConfig:
     profile_routes: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        self.restart_resume_policy = _normalize_restart_resume_policy(
+            self.restart_resume_policy,
+            allow_none=True,
+            key="restart_resume_policy",
+        )
+        for platform, platform_config in self.platforms.items():
+            if "restart_resume_policy" in platform_config.extra:
+                platform_config.extra["restart_resume_policy"] = (
+                    _normalize_restart_resume_policy(
+                        platform_config.extra.get("restart_resume_policy"),
+                        allow_none=False,
+                        key=f"platforms.{platform.value}.extra.restart_resume_policy",
+                    )
+                )
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
         )
@@ -1145,6 +1176,7 @@ class GatewayConfig:
             "sessions_dir": str(self.sessions_dir),
             "write_sessions_json": self.write_sessions_json,
             "always_log_local": self.always_log_local,
+            "restart_resume_policy": self.restart_resume_policy,
             "filter_silence_narration": self.filter_silence_narration,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
@@ -1328,6 +1360,7 @@ class GatewayConfig:
             sessions_dir=sessions_dir,
             write_sessions_json=_coerce_bool(data.get("write_sessions_json"), True),
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
+            restart_resume_policy=data.get("restart_resume_policy"),
             filter_silence_narration=_coerce_bool(
                 data.get("filter_silence_narration"), True
             ),
@@ -1541,6 +1574,11 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
             elif isinstance(gateway_section, dict) and "always_log_local" in gateway_section:
                 gw_data["always_log_local"] = gateway_section["always_log_local"]
+
+            if "restart_resume_policy" in yaml_cfg:
+                gw_data["restart_resume_policy"] = yaml_cfg["restart_resume_policy"]
+            elif isinstance(gateway_section, dict) and "restart_resume_policy" in gateway_section:
+                gw_data["restart_resume_policy"] = gateway_section["restart_resume_policy"]
 
             # write_sessions_json: top-level wins; nested gateway.* fallback
             # (matches the gateway.streaming precedence pattern).

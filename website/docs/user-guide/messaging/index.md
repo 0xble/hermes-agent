@@ -149,6 +149,28 @@ hermes gateway setup        # Interactive setup for all messaging platforms
 
 This walks you through configuring each platform with arrow-key selection, shows which platforms are already configured, and offers to start/restart the gateway when done.
 
+## Restart continuation policy
+
+When a running turn is interrupted by a gateway restart, Hermes preserves the session and schedules one recovery turn after startup. Interactive adapters ask what to do next by default. Set a global policy to continue eligible interrupted work automatically:
+
+```yaml
+gateway:
+  restart_resume_policy: continue  # ask | continue
+```
+
+A platform override takes precedence over the global policy:
+
+```yaml
+gateway:
+  restart_resume_policy: ask
+  platforms:
+    telegram:
+      extra:
+        restart_resume_policy: continue
+```
+
+Adapters without an interactive reply channel always continue, even when the global preference is `ask`. Existing freshness, authorization, duplicate-run, restart-loop, and recorded-tool-result protections remain active. The policy applies only to sessions Hermes explicitly marked for recovery; it does not scan arbitrary recent conversations.
+
 ## Gateway Commands
 
 ```bash

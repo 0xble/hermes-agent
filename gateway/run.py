@@ -1527,11 +1527,23 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
+    """Resolve platform override, global preference, then adapter-safe default."""
+    if not bool(getattr(adapter, "interactive_resume", True)):
+        return "continue"
+    extra = getattr(getattr(adapter, "config", None), "extra", {})
+    if isinstance(extra, dict) and "restart_resume_policy" in extra:
+        return str(extra["restart_resume_policy"])
+    configured = getattr(config, "restart_resume_policy", None)
+    return str(configured) if configured is not None else "ask"
+
+
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
     *,
-    interactive: bool = True,
+    interactive: Optional[bool] = None,
+    restart_resume_policy: Optional[str] = None,
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
@@ -1556,6 +1568,9 @@ def build_resume_recovery_note(
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
+    policy = restart_resume_policy or ("continue" if interactive is False else "ask")
+    if policy not in {"ask", "continue"}:
+        raise ValueError("restart_resume_policy must be 'ask' or 'continue'")
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus "
@@ -1565,7 +1580,7 @@ def build_resume_recovery_note(
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
         )
-    elif interactive:
+    elif policy == "ask":
         resume_guidance = (
             "Report to the user that the session was restored "
             "successfully and ask what they would like to do next."
@@ -1576,9 +1591,9 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
+            "No new user message is attached to this recovery turn, "
             "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "or ask what to do next. Review the conversation history and "
             "CONTINUE the interrupted task to completion."
         )
         tail_guidance = (
@@ -1601,6 +1616,7 @@ def _prepare_resume_pending_message(
     message: Optional[str],
     *,
     interactive: bool = True,
+    restart_resume_policy: Optional[str] = None,
 ) -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
@@ -1615,6 +1631,7 @@ def _prepare_resume_pending_message(
     """
     recovery_message = build_resume_recovery_note(
         reason, message or "", interactive=interactive,
+        restart_resume_policy=restart_resume_policy,
     )
     persist_message = (
         message if isinstance(message, str) and message.strip() else recovery_message
@@ -7060,11 +7077,11 @@ class TurnRunner:
             # present to answer and an acknowledgement would silently
             # abandon the task (#57056).
             _resume_adapter = self._runner._adapter_for_source(ctx.source)
-            _interactive_resume = bool(
-                getattr(_resume_adapter, "interactive_resume", True)
+            _restart_resume_policy = resolve_restart_resume_policy(
+                self._runner.config, _resume_adapter
             )
             ctx.message, _persist_user_message_override = _prepare_resume_pending_message(
-                _reason, ctx.message, interactive=_interactive_resume,
+                _reason, ctx.message, restart_resume_policy=_restart_resume_policy,
             )
         elif _has_fresh_tool_tail:
             _persist_user_message_override = ctx.message
@@ -7109,8 +7126,8 @@ class TurnRunner:
             ctx.message = build_resume_recovery_note(
                 _sn_reason,
                 "",
-                interactive=bool(
-                    getattr(_sn_adapter, "interactive_resume", True)
+                restart_resume_policy=resolve_restart_resume_policy(
+                    self._runner.config, _sn_adapter
                 ),
             )
 
