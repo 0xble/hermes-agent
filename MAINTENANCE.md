@@ -136,10 +136,12 @@ These exact subjects are fork-only history but do not define independently retir
 | `docs(fork): register upstream compression reset candidate` | Maintenance-only registration of the reviewed upstream HERMES-074 candidate; no additional shipped behavior. |
 | `fix(reconcile): preserve atomic browser profile normalization` | Patch-neutral rebase repair removing a duplicate non-atomic Local State rewrite while preserving upstream atomic replacement and the fork's selected-profile identity metadata; also reconciles stale manifest subjects exposed by rewritten history. |
 | `fix(reconcile): restore fork integration contracts` | Patch-neutral rebase repair keeping duck-typed gateway events safe and updating existing test seams for current reasoning and credential reader contracts; no additional shipped behavior. |
+| `test(uv): tolerate legacy no-config semantics` | Test-host compatibility for older uv releases that keep project `pyproject.toml` configuration active under `UV_NO_CONFIG`; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
 ### HERMES-075 — Configure restart continuation policy
 
 - **Independent hypothesis (2026-08-29):** Restart recovery currently overloads `BasePlatformAdapter.interactive_resume` with two independent meanings: whether a platform has a human reply channel and whether an empty startup recovery turn should ask or continue. This prevents an operator from selecting automatic continuation globally or per platform without misclassifying an interactive adapter such as Telegram as non-interactive. The correction belongs in gateway policy resolution, above adapter capability defaults and below explicit per-platform configuration.
