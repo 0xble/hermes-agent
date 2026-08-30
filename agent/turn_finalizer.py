@@ -213,12 +213,31 @@ def _collapse_verification_candidates(messages, final_response, agent) -> bool:
             canonical_index = index
             break
 
-    for index in reversed(candidate_indices):
-        if index == canonical_index:
-            continue
-        messages.pop(index)
-        if index < canonical_index:
-            canonical_index -= 1
+    if has_later_protocol_rows:
+        for index in reversed(candidate_indices):
+            messages.pop(index)
+        canonical = {
+            "role": "assistant",
+            "content": final_response,
+        }
+        stamp_message_timestamp(canonical)
+        messages.append(canonical)
+    else:
+        canonical_index = last_candidate
+        for index in reversed(candidate_indices[:-1]):
+            messages.pop(index)
+            if index < canonical_index:
+                canonical_index -= 1
+        canonical = messages[canonical_index]
+        canonical["content"] = final_response
+        canonical.pop("_verification_candidate", None)
+        canonical.pop("_db_persisted", None)
+        # The candidate may already have been flushed under its provisional
+        # content. Treat the canonical rewrite as a fresh row; retaining the
+        # old durable id lets transcript repair resolve it back to the receipt
+        # text before replace_messages publishes the collapsed transcript.
+        canonical.pop("_row_id", None)
+        stamp_message_timestamp(canonical)
 
     canonical = messages[canonical_index]
     canonical["content"] = final_response
@@ -601,6 +620,7 @@ def finalize_turn(
                 messages,
                 active_only=True,
             )
+
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
