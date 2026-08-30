@@ -2814,6 +2814,18 @@ def _get_platform_tools(
     for ts_key in enabled_toolsets:
         claimed.update(resolve_toolset(ts_key))
     skip = configurable_keys | plugin_ts_keys | platform_default_keys
+    # A recently shipped toolset can be intentionally absent from the saved
+    # platform list after the picker has offered it. Some of those toolsets
+    # (currently ``goal``) are not ordinary configurable entries, so the
+    # non-configurable recovery pass below must honor the same decline record
+    # as _enable_recently_shipped_toolsets instead of silently adding them back.
+    _known_builtin = (config.get("known_builtin_toolsets") or {}).get(platform)
+    if isinstance(_known_builtin, list):
+        skip |= (
+            {str(ts) for ts in _known_builtin}
+            & _RECENTLY_SHIPPED_TOOLSETS
+            - enabled_toolsets
+        )
     skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
     skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}
     for ts_key, ts_def in TOOLSETS.items():
@@ -3015,7 +3027,8 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     if not isinstance(config.get("known_builtin_toolsets"), dict):
         config["known_builtin_toolsets"] = {}
     config["known_builtin_toolsets"][platform] = sorted(
-        ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS
+        {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+        | _RECENTLY_SHIPPED_TOOLSETS
     )
 
     # Reconcile with agent.disabled_toolsets. _get_platform_tools() applies
