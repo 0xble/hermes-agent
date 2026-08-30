@@ -529,6 +529,37 @@ class TestPreflightCompression:
             COMPACTION_DEFERRED_STATUS,
         )
 
+    def test_compress_context_survives_tool_refresh_failure(self, agent):
+        """A failed dynamic-tool refresh must not block the live prompt rebuild."""
+        agent.compression_enabled = False
+        messages = [{"role": "user", "content": "hello"}]
+        compacted = [
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}
+        ]
+
+        with (
+            patch.object(agent.context_compressor, "compress", return_value=compacted),
+            patch(
+                "agent.conversation_compression._refresh_agent_tool_definitions",
+                side_effect=RuntimeError("refresh failed"),
+            ) as refresh_tools,
+            patch.object(
+                agent,
+                "_build_system_prompt",
+                return_value="rebuilt after refresh failure",
+            ) as build_prompt,
+        ):
+            compressed, prompt = agent._compress_context(
+                messages,
+                "system prompt",
+                force=True,
+            )
+
+        assert compressed[0] == compacted[0]
+        assert prompt == "rebuilt after refresh failure"
+        refresh_tools.assert_called_once_with(agent)
+        build_prompt.assert_called_once_with("system prompt")
+
     def test_compress_context_emits_deferred_terminal_status_for_would_grow(
         self, agent
     ):
@@ -546,6 +577,11 @@ class TestPreflightCompression:
         with (
             patch.object(agent.context_compressor, "compress", side_effect=_compress),
             patch.object(agent, "commit_memory_session"),
+            patch.object(
+                agent,
+                "_build_system_prompt",
+                return_value="rebuilt system prompt",
+            ) as build_prompt,
             patch(
                 "agent.conversation_compression.estimate_messages_tokens_rough",
                 side_effect=[10, 20],
@@ -558,7 +594,8 @@ class TestPreflightCompression:
             )
 
         assert compressed is messages
-        assert prompt == "You are helpful."
+        assert prompt == "rebuilt system prompt"
+        build_prompt.assert_called_once_with("system prompt")
         assert agent.context_compressor._ineffective_compression_count == 1
         event_names = [event for event, _ in events]
         assert "warn" not in event_names
@@ -664,9 +701,11 @@ class TestPreflightCompression:
         agent._memory_enabled = True
         agent._user_profile_enabled = False
         agent._memory_manager = None
-        agent._cached_system_prompt = (
-            "cached system prompt\n\n<memory>same facts</memory>"
-        )
+        original_prompt = "cached system prompt\n\n<memory>same facts</memory>"
+        rebuilt_prompt = "".join([original_prompt[:10], original_prompt[10:]])
+        assert rebuilt_prompt == original_prompt
+        assert rebuilt_prompt is not original_prompt
+        agent._cached_system_prompt = original_prompt
         memory_store = MagicMock()
         memory_store.format_for_system_prompt.return_value = "<memory>same facts</memory>"
         agent._memory_store = memory_store
@@ -680,7 +719,7 @@ class TestPreflightCompression:
             patch.object(
                 agent,
                 "_build_system_prompt",
-                return_value="cached system prompt\n\n<memory>same facts</memory>",
+                return_value=rebuilt_prompt,
             ) as build_prompt,
         ):
             _, new_system_prompt = agent._compress_context(
@@ -689,8 +728,8 @@ class TestPreflightCompression:
                 approx_tokens=1234,
             )
 
-        assert new_system_prompt is agent._cached_system_prompt
-        assert new_system_prompt == "cached system prompt\n\n<memory>same facts</memory>"
+        assert new_system_prompt is original_prompt
+        assert agent._cached_system_prompt is original_prompt
         build_prompt.assert_called_once()
         memory_store.load_from_disk.assert_called_once()
 
