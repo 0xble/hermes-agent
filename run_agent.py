@@ -8278,6 +8278,12 @@ class AIAgent:
         from agent.chat_completion_helpers import build_api_kwargs
         return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
 
+    def _current_reasoning_config(self) -> dict | None:
+        """Return this task's explicit turn override or the session baseline."""
+        from agent.reasoning_context import turn_reasoning_context
+
+        return turn_reasoning_context.current(self) or self.reasoning_config
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -8427,7 +8433,7 @@ class AIAgent:
         """
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
         return resolve_lmstudio_effort(
-            self.reasoning_config,
+            self._current_reasoning_config(),
             self._lmstudio_reasoning_options_cached(),
         )
 
@@ -8442,11 +8448,12 @@ class AIAgent:
         if not supported_efforts:
             return None
 
-        if self.reasoning_config and isinstance(self.reasoning_config, dict):
-            if self.reasoning_config.get("enabled") is False:
+        reasoning_config = self._current_reasoning_config()
+        if reasoning_config and isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
                 return None
             requested_effort = str(
-                self.reasoning_config.get("effort", "medium")
+                reasoning_config.get("effort", "medium")
             ).strip().lower()
         else:
             requested_effort = "medium"
@@ -9337,6 +9344,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         persist_user_platform_id: Optional[str] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_reasoning_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -9345,6 +9353,7 @@ class AIAgent:
         # instrumentation for the same session. Foreground priority is retained
         # if the review does not acknowledge within the bounded deadline (#84423).
         from agent.background_review import cancel_background_review_for_live_turn
+        from agent.reasoning_context import turn_reasoning_context
 
         cancel_background_review_for_live_turn(self)
 
@@ -9408,6 +9417,7 @@ class AIAgent:
         # otherwise — the 4 red cross-process lease tests on PR #97158).
         affinity_token = None
         acct_token = None
+        reasoning_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -9843,6 +9853,9 @@ class AIAgent:
             affinity_token = set_affinity_scope(
                 declared_conversation_scope_safe(self)
             )
+            reasoning_token = turn_reasoning_context.begin(
+                self, turn_reasoning_config
+            )
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
@@ -9997,6 +10010,8 @@ class AIAgent:
                         _review_queue.note_turn_finished()
                     except Exception:
                         pass
+                    if reasoning_token is not None:
+                        turn_reasoning_context.end(reasoning_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
