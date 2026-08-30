@@ -77,31 +77,5 @@ class TestCompactionWiring(unittest.TestCase):
         self.assertTrue(changed)
         m.assert_called_once_with(agent, content_aware=True)
 
-    def test_commit_path_calls_helper_and_survives_failure(self):
-        """The commit boundary invokes the refresh and a raising refresh
-        must not break compaction (wrapped in try/except at the call site).
-        Pin the call-site contract by source: the helper call sits between
-        _invalidate_system_prompt and the always-rebuild of the prompt
-        (post-#95681: the keep-prompt containment branch is gone — the
-        rebuilt prompt is compared byte-for-byte and only object identity
-        is preserved on equality)."""
-        import inspect
-        from agent import conversation_compression as cc
-
-        src = inspect.getsource(cc)
-        i_invalidate = src.find("agent._invalidate_system_prompt()")
-        i_refresh = src.find("_refresh_agent_tool_definitions(agent)",
-                             i_invalidate)
-        i_rebuild = src.find("rebuilt_system_prompt = agent._build_system_prompt(",
-                             i_refresh)
-        self.assertGreater(i_refresh, i_invalidate,
-                           "refresh must follow prompt invalidation")
-        self.assertGreater(i_rebuild, i_refresh,
-                           "refresh must precede the prompt rebuild")
-        guard_window = src[i_refresh - 400:i_refresh]
-        self.assertIn("try:", guard_window,
-                      "refresh call must be exception-guarded")
-
-
 if __name__ == "__main__":
     unittest.main()

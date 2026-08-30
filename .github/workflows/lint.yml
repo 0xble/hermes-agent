@@ -174,7 +174,7 @@ jobs:
         run: |
           python scripts/validate_maintenance_manifest.py \
             --upstream-ref canonical-upstream/main \
-            --history-baseline-subject 'docs(maintenance): register element-token schema patch'
+            --history-baseline-subject 'test(compression): close worker-owned state handles'
 
   windows-footguns:
     # Static guardrails on Windows-unsafe Python primitives — os.kill(pid, 0),
