@@ -546,7 +546,9 @@ Use `/spawn` or its `/side` alias when the side task needs the current conversat
 /spawn Verify the diagnosis above against the current source and report any counterexample
 ```
 
-`/spawn` and `/side` snapshot the persisted transcript through the last complete assistant response, copy it into a durable child session, and run the new prompt there. The parent chat stays active and its transcript is not modified by the child result. If the parent agent is currently working, partial tool calls and unfinished output are excluded from the snapshot.
+`/spawn` and `/side` copy the newest provider-valid transcript checkpoint into a durable child session and run the new prompt there. When the parent is idle, that checkpoint ends at the last complete assistant response. During an active turn, Hermes can also fork after a complete assistant tool-call block and all matching tool results have persisted. If the current tool batch is still running, one `🔀 Spawn queued` status is posted and then edited to `🔀 Spawn started` when the checkpoint becomes safe. Partial tool calls and unfinished output are never copied.
+
+If the active turn stops before any safe checkpoint is available, the same status is edited to `⚠️ Spawn aborted` and no child is created. The parent chat stays active and its transcript is not modified by the child result.
 
 The child has a generated `Spawn ...` title and can be resumed explicitly later. It does not receive the parent's gateway routing key, so ordinary messages continue in the parent. Use `/background`, `/bg`, or `/btw` when the task is self-contained and does not need the current transcript.
 
