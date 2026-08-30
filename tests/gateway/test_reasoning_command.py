@@ -218,3 +218,32 @@ class TestLoadShowReasoningCoercion:
             'display:\n  show_reasoning: true\n',
         ) is True
 
+
+def test_gateway_quick_alias_prepares_one_turn_reasoning_prompt():
+    runner = _make_runner()
+    runner.config = {
+        "quick_commands": {
+            "ttt": {"type": "alias", "target": "/reasoning high"}
+        }
+    }
+    event = _make_event("/ttt Fix this\nand verify it")
+
+    event.text = runner._quick_command_alias_text(event)
+    request = runner._prepare_reasoning_turn_event(event)
+
+    assert request is not None
+    assert event.text == "Fix this\nand verify it"
+    assert event.turn_reasoning_config == {
+        "enabled": True,
+        "effort": "high",
+    }
+    assert event.turn_reasoning_notice == "🧠 Reasoning: High for this turn."
+
+
+def test_gateway_bare_reasoning_effort_remains_session_scoped():
+    runner = _make_runner()
+    event = _make_event("/reasoning high")
+
+    assert runner._prepare_reasoning_turn_event(event) is None
+    assert event.text == "/reasoning high"
+

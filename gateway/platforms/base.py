@@ -2534,6 +2534,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Explicit reasoning override consumed by this event's turn only.
+    turn_reasoning_config: Optional[Dict[str, Any]] = None
+    turn_reasoning_notice: Optional[str] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the

@@ -1599,6 +1599,25 @@ class TestBuildApiKwargs:
         assert agent._github_models_reasoning_extra_body() == {"effort": "xhigh"}
 
 
+def test_turn_reasoning_override_reaches_direct_summary_helpers(agent, monkeypatch):
+    from agent.reasoning_context import turn_reasoning_context
+
+    agent.reasoning_config = {"enabled": True, "effort": "medium"}
+    agent.model = "gpt-5.5"
+    monkeypatch.setattr(agent, "_lmstudio_reasoning_options_cached", lambda: ["low", "medium", "high"])
+    token = turn_reasoning_context.begin(
+        agent, {"enabled": True, "effort": "high"}
+    )
+    try:
+        assert agent._github_models_reasoning_extra_body() == {"effort": "high"}
+        assert agent._resolve_lmstudio_summary_reasoning_effort() == "high"
+    finally:
+        turn_reasoning_context.end(token)
+
+    assert agent._github_models_reasoning_extra_body() == {"effort": "medium"}
+    assert agent._resolve_lmstudio_summary_reasoning_effort() == "medium"
+
+
 
 
     def test_qwen_portal_formats_messages_and_metadata(self, agent):
@@ -2782,6 +2801,31 @@ class TestHandleMaxIterations:
         assert isinstance(result, str)
         assert len(result) > 0
         assert "summary" in result.lower()
+
+    def test_summary_uses_turn_reasoning_override(self, agent, monkeypatch):
+        from agent.reasoning_context import turn_reasoning_context
+
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent._cached_system_prompt = "You are helpful."
+        monkeypatch.setattr(agent, "_supports_reasoning_extra_body", lambda: True)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Summary"
+        )
+        token = turn_reasoning_context.begin(
+            agent, {"enabled": True, "effort": "high"}
+        )
+        try:
+            assert agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 60
+            ) == "Summary"
+        finally:
+            turn_reasoning_context.end(token)
+
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert kwargs["extra_body"]["reasoning"] == {
+            "enabled": True,
+            "effort": "high",
+        }
 
     def test_summary_retries_share_relay_identity(self, agent):
         agent.client.chat.completions.create.side_effect = [
