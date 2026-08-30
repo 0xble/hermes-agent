@@ -106,3 +106,21 @@ async def test_distinct_status_keys_do_not_collide(adapter):
     assert adapter._status_message_ids[("chat-1", "model-switch")] == "200"
 
 
+@pytest.mark.asyncio
+async def test_request_scoped_status_keys_keep_cache_bounded(adapter):
+    adapter._STATUS_MESSAGE_IDS_MAX = 4
+    adapter._status_message_ids = {
+        ("chat-1", f"spawn:{index}"): str(index)
+        for index in range(4)
+    }
+    adapter.send.return_value = SendResult(success=True, message_id="new")
+
+    await adapter.send_or_update_status("chat-1", "spawn:new", "started")
+
+    assert list(adapter._status_message_ids) == [
+        ("chat-1", "spawn:2"),
+        ("chat-1", "spawn:3"),
+        ("chat-1", "spawn:new"),
+    ]
+
+

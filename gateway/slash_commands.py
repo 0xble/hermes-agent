@@ -31,6 +31,7 @@ from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
+from agent.message_sanitization import tool_call_id_variants, tool_result_id_variants
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
@@ -55,6 +56,11 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+
+# Busy /spawn polls only while the owning foreground turn is active. Tool-call
+# and tool-result rows are persisted incrementally, so a short interval keeps
+# the status responsive without coupling the gateway loop to agent internals.
+_SPAWN_CHECKPOINT_POLL_SECONDS = 0.2
 
 
 def _clean_str(value: Any) -> str:
@@ -3792,11 +3798,297 @@ class GatewaySlashCommandsMixin:
                 return history[: index + 1]
         return []
 
-    async def _handle_spawn_command(self, event: MessageEvent) -> str:
-        """Fork committed context into a durable one-shot background child."""
-        import json as _json
-        import uuid as _uuid
+    @classmethod
+    def _active_turn_spawn_history(cls, history: list[dict]) -> list[dict]:
+        """Return the newest provider-valid checkpoint in the active user turn.
 
+        A final assistant response is already a normal committed checkpoint. While
+        the turn is still running, an assistant tool-call block becomes safe only
+        after every declared call has a matching, immediately-following tool
+        result. The child may then append its own user prompt: Hermes' replay
+        repair explicitly preserves the valid ``assistant(tool_calls) → tool →
+        user`` redirect shape.
+        """
+        last_user_index = -1
+        for index in range(len(history) - 1, -1, -1):
+            if history[index].get("role") == "user":
+                last_user_index = index
+                break
+        if last_user_index < 0:
+            return []
+
+        completed = cls._completed_spawn_history(history)
+        completed_end = len(completed) - 1
+
+        latest_tool_call_index = -1
+        for index in range(len(history) - 1, last_user_index, -1):
+            message = history[index]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                latest_tool_call_index = index
+                break
+        if completed_end > last_user_index and completed_end > latest_tool_call_index:
+            return completed
+        if latest_tool_call_index < 0:
+            return []
+
+        assistant_message = history[latest_tool_call_index]
+        call_groups = [
+            tool_call_id_variants(tool_call)
+            for tool_call in assistant_message.get("tool_calls") or []
+        ]
+        if not call_groups or any(not group for group in call_groups):
+            return []
+
+        result_groups: list[frozenset[str]] = []
+        checkpoint_end = latest_tool_call_index + 1
+        while (
+            checkpoint_end < len(history)
+            and history[checkpoint_end].get("role") == "tool"
+        ):
+            result_groups.append(
+                tool_result_id_variants(
+                    history[checkpoint_end].get("tool_call_id")
+                )
+            )
+            checkpoint_end += 1
+
+        if len(result_groups) != len(call_groups) or any(
+            not group for group in result_groups
+        ):
+            return []
+
+        assignments: list[int] = []
+        for result_group in result_groups:
+            candidates = [
+                index
+                for index, call_group in enumerate(call_groups)
+                if call_group & result_group
+            ]
+            if len(candidates) != 1:
+                return []
+            assignments.append(candidates[0])
+        if sorted(assignments) != list(range(len(call_groups))):
+            return []
+        return history[:checkpoint_end]
+
+    @staticmethod
+    def _spawn_prompt_preview(prompt: str) -> str:
+        one_line_prompt = " ".join(prompt.split())
+        return one_line_prompt[:60] + (
+            "..." if len(one_line_prompt) > 60 else ""
+        )
+
+    async def _send_spawn_status(
+        self,
+        event: MessageEvent,
+        source,
+        status_key: str,
+        text: str,
+    ) -> bool:
+        """Send or edit one spawn lifecycle bubble when the adapter supports it."""
+        adapter_for_source = getattr(self, "_adapter_for_source", None)
+        adapter: Any = (
+            adapter_for_source(source) if callable(adapter_for_source) else None
+        )
+        if adapter is None:
+            return False
+        anchor = getattr(self, "_reply_anchor_for_event")(event)
+        metadata = getattr(self, "_thread_metadata_for_source")(source, anchor)
+        try:
+            sender = getattr(adapter, "send_or_update_status", None)
+            if callable(sender):
+                result = await sender(
+                    source.chat_id,
+                    status_key,
+                    text,
+                    metadata=metadata,
+                )
+            else:
+                result = await adapter.send(
+                    source.chat_id,
+                    text,
+                    metadata=metadata,
+                )
+            return bool(getattr(result, "success", True))
+        except Exception:
+            logger.warning("Could not deliver spawn status", exc_info=True)
+            return False
+
+    @staticmethod
+    async def _drain_spawn_task(task: asyncio.Task):
+        """Wait for a spawn-owned operation despite repeated caller cancellation."""
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Re-raise the owner's original cancellation after the durable
+                # operation or terminal status delivery has actually finished.
+                continue
+        return task.result()
+
+    async def _await_spawn_operation(self, operation):
+        """Run a durable spawn operation to completion before propagating cancellation."""
+        task = asyncio.create_task(operation)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await self._drain_spawn_task(task)
+            except asyncio.CancelledError:
+                pass
+            raise
+
+    async def _send_terminal_spawn_status(
+        self,
+        event: MessageEvent,
+        source,
+        status_key: str,
+        text: str,
+        lifecycle: dict[str, Any],
+    ) -> bool:
+        """Claim and completely deliver the waiter's one terminal status."""
+        lifecycle["terminal"] = True
+        delivery = asyncio.create_task(
+            self._send_spawn_status(event, source, status_key, text)
+        )
+        return bool(await self._drain_spawn_task(delivery))
+
+    def _spawn_turn_status(
+        self,
+        session_key: str,
+        expected_run_generation: int,
+    ) -> tuple[bool, bool]:
+        """Return whether this is the same run generation and whether it is active."""
+        state_reader = getattr(self, "_peek_session_state", None)
+        if callable(state_reader):
+            state: Any = state_reader(session_key)
+            if state is None:
+                return False, False
+            generation = getattr(state.persistent, "run_generation", None)
+            if generation != expected_run_generation:
+                return False, False
+            return True, state.turn.agent is not None
+        running_reader = getattr(self, "_is_session_running", None)
+        active = bool(running_reader(session_key)) if callable(running_reader) else False
+        return active, active
+
+    async def _wait_for_active_turn_spawn(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        parent_entry,
+        session_key: str,
+        expected_run_generation: int,
+        status_key: str,
+        prompt: str,
+        lifecycle: dict[str, Any],
+    ) -> None:
+        """Wait for one safe active-turn checkpoint, then launch the child."""
+        aborted = (
+            "⚠️ Spawn aborted: the current turn stopped before its "
+            "context could be copied. Nothing was changed."
+        )
+        try:
+            while True:
+                same_turn, _active = self._spawn_turn_status(
+                    session_key,
+                    expected_run_generation,
+                )
+                if not same_turn:
+                    await self._send_terminal_spawn_status(
+                        event, source, status_key, aborted, lifecycle
+                    )
+                    return
+
+                try:
+                    raw_history = await self.async_session_store.load_transcript(
+                        parent_entry.session_id
+                    )
+                    history = self._active_turn_spawn_history(raw_history)
+                except Exception:
+                    logger.warning(
+                        "Could not read active-turn spawn checkpoint", exc_info=True
+                    )
+                    history = []
+
+                same_turn, active = self._spawn_turn_status(
+                    session_key,
+                    expected_run_generation,
+                )
+                if not same_turn:
+                    await self._send_terminal_spawn_status(
+                        event, source, status_key, aborted, lifecycle
+                    )
+                    return
+
+                if history:
+                    try:
+                        started = await self._launch_spawn_from_history(
+                            event=event,
+                            source=source,
+                            current_entry=parent_entry,
+                            prompt=prompt,
+                            history=history,
+                        )
+                    except Exception:
+                        logger.exception("Unexpected active-turn spawn launch failure")
+                        started = "❌ Spawn failed: could not start the child session."
+                    await self._send_terminal_spawn_status(
+                        event, source, status_key, started, lifecycle
+                    )
+                    return
+
+                if not active:
+                    await self._send_terminal_spawn_status(
+                        event, source, status_key, aborted, lifecycle
+                    )
+                    return
+                await asyncio.sleep(_SPAWN_CHECKPOINT_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+    async def _cancel_spawn_waiters(self) -> None:
+        """Cancel and drain queued spawn waiters while transports are available."""
+        statuses = getattr(self, "_spawn_waiter_statuses", {})
+        entries = [
+            (waiter, statuses.get(waiter))
+            for waiter in list(getattr(self, "_spawn_waiter_tasks", set()))
+            if not waiter.done()
+        ]
+        cancelled_entries = [
+            (waiter, lifecycle)
+            for waiter, lifecycle in entries
+            if waiter.cancel()
+        ]
+        if cancelled_entries:
+            await asyncio.gather(
+                *(waiter for waiter, _lifecycle in cancelled_entries),
+                return_exceptions=True,
+            )
+        aborted = (
+            "⚠️ Spawn aborted: the current turn stopped before its "
+            "context could be copied. Nothing was changed."
+        )
+        for _waiter, lifecycle in cancelled_entries:
+            if lifecycle is None or lifecycle.get("terminal"):
+                continue
+            await self._send_terminal_spawn_status(
+                lifecycle["event"],
+                lifecycle["source"],
+                lifecycle["status_key"],
+                aborted,
+                lifecycle,
+            )
+
+    async def _handle_spawn_command(
+        self,
+        event: MessageEvent,
+        *,
+        active_session_key: Optional[str] = None,
+        active_run_generation: Optional[int] = None,
+    ) -> str:
+        """Fork committed or safely checkpointed context into a one-shot child."""
         prompt = event.get_command_args().strip()
         if not prompt:
             return "Usage: /spawn <prompt>"
@@ -3808,23 +4100,152 @@ class GatewaySlashCommandsMixin:
                 prefix=t("gateway.shared.session_db_unavailable_prefix")
             )
 
+        aborted = (
+            "⚠️ Spawn aborted: the current turn stopped before its "
+            "context could be copied. Nothing was changed."
+        )
+        run_generation = active_run_generation
+        if active_session_key is not None:
+            if run_generation is None:
+                return aborted
+            same_turn, _active = self._spawn_turn_status(
+                active_session_key,
+                run_generation,
+            )
+            if not same_turn:
+                return aborted
+
         normalize_source = getattr(self, "_normalize_source_for_session_key")
         source = await asyncio.to_thread(normalize_source, event.source)
         current_entry = await self.async_session_store.get_or_create_session(source)
-        parent_session_id = current_entry.session_id
-        raw_history = await self.async_session_store.load_transcript(parent_session_id)
+        raw_history = await self.async_session_store.load_transcript(
+            current_entry.session_id
+        )
+
+        if active_session_key is not None:
+            assert run_generation is not None
+            same_turn, active = self._spawn_turn_status(
+                active_session_key,
+                run_generation,
+            )
+            if not same_turn:
+                return aborted
+            history = self._active_turn_spawn_history(raw_history)
+            if history:
+                return await self._launch_spawn_from_history(
+                    event=event,
+                    source=source,
+                    current_entry=current_entry,
+                    prompt=prompt,
+                    history=history,
+                )
+            if not active:
+                return aborted
+
+            preview = self._spawn_prompt_preview(prompt)
+            status_key = (
+                f"spawn:{source.chat_id}:{source.thread_id or ''}:"
+                f"{event.message_id or time.time_ns()}"
+            )
+            queued = (
+                f'🔀 Spawn queued: "{preview}"\n'
+                "Waiting for the current tool step to finish."
+            )
+            queued_sent = await self._send_spawn_status(
+                event, source, status_key, queued
+            )
+            lifecycle: dict[str, Any] = {
+                "event": event,
+                "source": source,
+                "status_key": status_key,
+                "terminal": False,
+            }
+            waiter = asyncio.create_task(
+                self._wait_for_active_turn_spawn(
+                    event=event,
+                    source=source,
+                    parent_entry=current_entry,
+                    session_key=active_session_key,
+                    expected_run_generation=run_generation,
+                    status_key=status_key,
+                    prompt=prompt,
+                    lifecycle=lifecycle,
+                )
+            )
+            background_tasks = getattr(self, "_background_tasks")
+            background_tasks.add(waiter)
+            waiter.add_done_callback(background_tasks.discard)
+            spawn_waiters = getattr(self, "_spawn_waiter_tasks", None)
+            if spawn_waiters is None:
+                spawn_waiters = set()
+                self._spawn_waiter_tasks = spawn_waiters
+            spawn_waiters.add(waiter)
+            waiter.add_done_callback(spawn_waiters.discard)
+            spawn_statuses = getattr(self, "_spawn_waiter_statuses", None)
+            if spawn_statuses is None:
+                spawn_statuses = {}
+                self._spawn_waiter_statuses = spawn_statuses
+            spawn_statuses[waiter] = lifecycle
+            waiter.add_done_callback(lambda task: spawn_statuses.pop(task, None))
+            return "" if queued_sent else queued
+
         history = self._completed_spawn_history(raw_history)
         if not history:
-            return "There is no completed conversation to spawn from."
+            return (
+                "No completed conversation to spawn from. Wait for the current "
+                "turn to finish, then try again."
+            )
+        return await self._launch_spawn_from_history(
+            event=event,
+            source=source,
+            current_entry=current_entry,
+            prompt=prompt,
+            history=history,
+        )
 
+    @staticmethod
+    async def _finalize_incomplete_spawn(
+        session_db,
+        child_session_id: str,
+        end_reason: str,
+    ) -> None:
+        """Cancellation-resistant finalization for an unowned child."""
+        try:
+            finalization = asyncio.create_task(
+                session_db.end_session(
+                    child_session_id,
+                    end_reason=end_reason,
+                )
+            )
+            await GatewaySlashCommandsMixin._drain_spawn_task(finalization)
+        except asyncio.CancelledError:
+            logger.warning(
+                "Spawn child finalization was internally cancelled for %s",
+                child_session_id,
+            )
+        except Exception:
+            logger.debug("Failed to finalize incomplete spawn", exc_info=True)
+
+    async def _launch_spawn_from_history(
+        self,
+        *,
+        event: MessageEvent,
+        source,
+        current_entry,
+        prompt: str,
+        history: list[dict],
+    ) -> str:
+        """Create and start a durable spawn from an already-safe history prefix."""
+        import json as _json
+        import uuid as _uuid
+
+        session_db = getattr(self, "_session_db")
+        parent_session_id = current_entry.session_id
         now = datetime.now()
         child_session_id = (
             f"spawn_{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
         )
-        one_line_prompt = " ".join(prompt.split())
-        preview = one_line_prompt[:60] + (
-            "..." if len(one_line_prompt) > 60 else ""
-        )
+        preview = self._spawn_prompt_preview(prompt)
         child_title = f"Spawn {now.strftime('%H:%M:%S.%f')[:-3]}: {preview}"
 
         origin = current_entry.origin or source
@@ -3840,8 +4261,8 @@ class GatewaySlashCommandsMixin:
             logger.debug("Could not load parent metadata for spawn", exc_info=True)
         parent_row = parent_row if isinstance(parent_row, dict) else {}
 
-        try:
-            await session_db.create_session(
+        creation = asyncio.create_task(
+            session_db.create_session(
                 session_id=child_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=parent_row.get("model"),
@@ -3864,33 +4285,64 @@ class GatewaySlashCommandsMixin:
                 profile_name=parent_row.get("profile_name"),
                 git_repo_root=parent_row.get("git_repo_root"),
             )
+        )
+        try:
+            await asyncio.shield(creation)
+        except asyncio.CancelledError:
+            # create_session runs off-loop. Drain the database worker before
+            # ending the child so a late commit cannot reactivate an orphan.
+            try:
+                await self._drain_spawn_task(creation)
+            except asyncio.CancelledError:
+                logger.debug("Spawn child creation was internally cancelled")
+            except Exception:
+                logger.debug("Spawn child creation failed while cancelling", exc_info=True)
+            await self._finalize_incomplete_spawn(
+                session_db,
+                child_session_id,
+                "spawn_launch_cancelled",
+            )
+            raise
         except Exception as exc:
             logger.error("Failed to create spawn session: %s", exc)
             return "❌ Spawn failed: could not create the child session."
 
-        rows = [
-            transcript_message_append_fields(message)
-            for message in history
-        ]
+        rows = [transcript_message_append_fields(message) for message in history]
         try:
-            await session_db.append_messages_batch(
-                child_session_id,
-                rows,
-                chunk_rows=500,
+            await self._await_spawn_operation(
+                session_db.append_messages_batch(
+                    child_session_id,
+                    rows,
+                    chunk_rows=500,
+                )
             )
+        except asyncio.CancelledError:
+            await self._finalize_incomplete_spawn(
+                session_db,
+                child_session_id,
+                "spawn_launch_cancelled",
+            )
+            raise
         except Exception as exc:
             logger.error("Failed to copy spawn context: %s", exc)
-            try:
-                await session_db.end_session(
-                    child_session_id,
-                    end_reason="spawn_copy_failed",
-                )
-            except Exception:
-                logger.debug("Failed to finalize incomplete spawn", exc_info=True)
+            await self._finalize_incomplete_spawn(
+                session_db,
+                child_session_id,
+                "spawn_copy_failed",
+            )
             return "❌ Spawn failed: could not copy the parent context."
 
         try:
-            await session_db.set_session_title(child_session_id, child_title)
+            await self._await_spawn_operation(
+                session_db.set_session_title(child_session_id, child_title)
+            )
+        except asyncio.CancelledError:
+            await self._finalize_incomplete_spawn(
+                session_db,
+                child_session_id,
+                "spawn_launch_cancelled",
+            )
+            raise
         except Exception:
             logger.debug("Could not title spawn session", exc_info=True)
 

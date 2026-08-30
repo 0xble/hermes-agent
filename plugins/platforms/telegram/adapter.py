@@ -731,6 +731,10 @@ class TelegramAdapter(BasePlatformAdapter):
     # so a 10–20s blip delivers now. Same idea as QQBot._wait_for_reconnection.
     _RECONNECT_WAIT_SECONDS = 15.0
     _RECONNECT_POLL_INTERVAL = 0.5
+    # Status keys can be request-scoped (for example queued /spawn lifecycle
+    # bubbles), so bound the edit-target cache instead of assuming a small fixed
+    # vocabulary of callback names.
+    _STATUS_MESSAGE_IDS_MAX = 256
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -6629,6 +6633,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
+            if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
+                # Dict insertion order gives a cheap FIFO bound. Drop half so a
+                # sustained status stream does not trim on every subsequent send.
+                for stale in list(self._status_message_ids)[
+                    : self._STATUS_MESSAGE_IDS_MAX // 2
+                ]:
+                    self._status_message_ids.pop(stale, None)
             self._status_message_ids[key] = str(result.message_id)
         return result
 

@@ -203,7 +203,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<question>", busy_policy="dispatch"),
     CommandDef("spawn", "Fork the current context into a one-shot background session", "Session",
                aliases=("side",), args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
-               desktop="messaging"),
+               busy_handler="spawn", desktop="messaging"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",

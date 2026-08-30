@@ -16413,6 +16413,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
+            # Stop queued active-turn spawns before draining their parent turns.
+            # Otherwise a parent can publish a checkpoint during shutdown and
+            # let a child launch just before platform teardown.
+            cancel_spawn_waiters = getattr(self, "_cancel_spawn_waiters", None)
+            if cancel_spawn_waiters is not None:
+                await cancel_spawn_waiters()
+
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
@@ -18121,6 +18128,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "new": self._busy_new_command,
                 "queue": self._busy_queue_command,
                 "steer": self._busy_steer_command,
+                "spawn": self._busy_spawn_command,
                 "egress": self._busy_egress_command,
                 "goal": self._busy_goal_command,
                 "loop": self._busy_loop_command,
@@ -18189,6 +18197,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.proxy_cli import format_status_text
 
         return format_status_text()
+
+    async def _busy_spawn_command(self, event: MessageEvent, quick_key: str, source):
+        """Queue /spawn against the next provider-valid active-turn checkpoint."""
+        state = self._peek_session_state(quick_key)
+        run_generation = int(state.persistent.run_generation)
+        return await self._handle_spawn_command(
+            event,
+            active_session_key=quick_key,
+            active_run_generation=run_generation,
+        )
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # /stop must hard-kill the session when an agent is running.
