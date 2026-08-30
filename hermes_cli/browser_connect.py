@@ -724,14 +724,22 @@ _SQLITE_AUTH_DBS = frozenset({
     "Cookies", "Login Data", "Login Data For Account", "Web Data",
 })
 
+# Total time budget for one auth-DB online-backup before falling through to
+# the raw-copy path. A running Chrome holds Login Data / Web Data with
+# exclusive SQLite locks, and CPython's backup() retries SQLITE_BUSY forever
+# without a bound — 10 s matches the backup walker's default (#96646).
+_AUTH_BACKUP_TIMEOUT_SECONDS = 10.0
+
 
 def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     """Copy one auth file, lock-aware. Returns True on success.
 
-    For SQLite DBs (Cookies/Login Data/…), use the online-backup API so the
-    copy works even while the browser holds the file's write lock (Windows).
-    Everything else is a plain copy. A DB whose backup fails falls through to a
-    raw copy attempt; only if BOTH fail do we report failure to the caller.
+    For SQLite DBs (Cookies/Login Data/…), use a deadline-bounded online
+    backup so the copy works even while the browser holds the file's write
+    lock (Windows) and never hangs on a wedged source (POSIX, running
+    Chrome). Everything else is a plain copy. A DB whose backup fails falls
+    through to a raw copy attempt; only if BOTH fail do we report failure to
+    the caller.
     """
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
     if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
@@ -747,21 +755,45 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
             f"file:{src_file}?mode=ro",
         ):
             try:
-                import sqlite3
+                # The online-backup API must be bounded: CPython's backup()
+                # retries SQLITE_BUSY forever unless a progress callback
+                # interrupts it, and a running Chrome holds Login Data / Web
+                # Data exclusively on POSIX too — so a plain source.backup(out)
+                # hangs the launch until the tool times out (#96646). Reuse the
+                # bounded family helper from the backup walker
+                # (#82042/#92495/#84475): read-only connect, deadline-bounded
+                # progress callback, fail-closed False. On failure the raw-copy
+                # fallback below runs — file-level copies don't need SQLite's
+                # cross-process locks on POSIX.
+                from hermes_cli.backup import _safe_copy_db
 
-                # Short busy timeout so a truly wedged DB fails fast rather
-                # than hanging the launch.
-                source = sqlite3.connect(uri, uri=True, timeout=5)
-                try:
-                    out = sqlite3.connect(dst_file)
+                if "immutable=1" in uri:
+                    # The immutable snapshot path cannot participate in the
+                    # source browser's lock negotiation, so it remains the
+                    # fastest first attempt for live macOS profiles.
+                    import sqlite3
+
+                    source = sqlite3.connect(uri, uri=True, timeout=0)
                     try:
-                        with out:
-                            source.backup(out)
+                        out = sqlite3.connect(dst_file)
+                        try:
+                            with out:
+                                source.backup(out)
+                        finally:
+                            out.close()
                     finally:
-                        out.close()
-                finally:
-                    source.close()
-                return True
+                        source.close()
+                    return True
+                if _safe_copy_db(
+                    Path(src_file),
+                    Path(dst_file),
+                    timeout_seconds=_AUTH_BACKUP_TIMEOUT_SECONDS,
+                ):
+                    return True
+                logger.debug(
+                    "real-profile: bounded sqlite-backup of %s failed; trying raw copy",
+                    src_file,
+                )
             except Exception as e:
                 logger.debug("real-profile: sqlite-backup of %s failed (%s); trying next mode",
                              src_file, e)
