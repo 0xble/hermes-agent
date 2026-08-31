@@ -16,7 +16,7 @@ import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlig
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { detectArtifact } from '@/lib/artifact-detect'
-import { ExternalLink, normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
+import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
@@ -327,17 +327,6 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   }
 
   const text = childrenToText(children)
-
-  // Markdown consumes the square brackets in `[1](url)`, but those brackets
-  // are part of a citation marker's visible identity. Keep numeric authored
-  // links compact and render the complete marker instead of a bare `1`.
-  if (/^\d+$/u.test(text)) {
-    return (
-      <ExternalLink className={cn('wrap-anywhere', className)} href={target} title={target} {...props}>
-        [{text}]
-      </ExternalLink>
-    )
-  }
 
   // Bare autolink → inline rich embed when a provider matches. Labeled links
   // (`[watch](url)`) stay plain. Desktop only (webview / iframe renderers).
