@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 from datetime import datetime
 from types import SimpleNamespace
@@ -68,7 +69,10 @@ def _runner(*, history=None, copy_error=None):
         )
     )
     runner._run_background_task = AsyncMock()
-    side_adapter = SimpleNamespace(handle_message=AsyncMock())
+    side_adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
+        supports_code_blocks=True,
+    )
     object.__setattr__(runner, "_side_adapter", side_adapter)
     runner._adapter_for_source = MagicMock(return_value=side_adapter)
 
@@ -244,8 +248,11 @@ async def test_side_clones_only_the_last_completed_turn_and_keeps_parent_active(
     assert side_event.source.thread_id == "42"
     assert side_event.metadata["gateway_session_id"] == child_session_id
     assert side_event.metadata["gateway_explicit_session_route"] is True
-    assert "Side started" in result
-    assert "Reply to continue this side." in result
+    side_id = child_session_id.rsplit("_", 1)[-1]
+    assert result == (
+        f"↗️ Side `{side_id}` started\n"
+        "*Reply here to continue*"
+    )
 
 
 @pytest.mark.asyncio
@@ -463,6 +470,7 @@ async def test_busy_side_queues_then_edits_status_at_tool_checkpoint():
     runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "42"})
     status_adapter = SimpleNamespace(
         handle_message=AsyncMock(),
+        supports_code_blocks=True,
         send_or_update_status=AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="status-1")
         )
@@ -484,10 +492,13 @@ async def test_busy_side_queues_then_edits_status_at_tool_checkpoint():
     queued_call, started_call = status_adapter.send_or_update_status.await_args_list
     assert queued_call.args[1] == started_call.args[1]
     assert queued_call.args[2] == (
-        '🔀 Side queued: "change the icon to a brain"\n'
-        "Waiting for the current tool step to finish."
+        '↗️ Side queued: "change the icon to a brain"\n'
+        "*Waiting for the current tool step to finish.*"
     )
-    assert started_call.args[2].startswith("🔀 Side started:")
+    assert re.fullmatch(
+        r"↗️ Side `[0-9a-f]{6}` started\n\*Reply here to continue\*",
+        started_call.args[2],
+    )
     copied_rows = runner._session_db.append_messages_batch.await_args.args[1]
     assert [row["role"] for row in copied_rows] == ["user", "assistant", "tool"]
     assert status_adapter.handle_message.await_count == 1
@@ -525,6 +536,7 @@ async def test_busy_side_edits_queued_status_to_safe_abort():
     runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "42"})
     status_adapter = SimpleNamespace(
         handle_message=AsyncMock(),
+        supports_code_blocks=True,
         send_or_update_status=AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="status-1")
         )
@@ -606,7 +618,10 @@ async def test_busy_side_uses_final_checkpoint_after_same_turn_releases():
         active_run_generation=7,
     )
 
-    assert result.startswith("🔀 Side started:")
+    assert re.fullmatch(
+        r"↗️ Side `[0-9a-f]{6}` started\n\*Reply here to continue\*",
+        result,
+    )
     runner._session_db.create_session.assert_awaited_once()
     await asyncio.gather(*runner._background_tasks)
     assert getattr(runner, "_side_adapter").handle_message.await_count == 1
@@ -871,7 +886,10 @@ async def test_side_persists_a_real_independent_child(tmp_path):
             bind_session_route=AsyncMock(return_value=SimpleNamespace(session_id="side-child")),
             close_session_route=AsyncMock(return_value="side-child"),
         )
-        side_adapter = SimpleNamespace(handle_message=AsyncMock())
+        side_adapter = SimpleNamespace(
+            handle_message=AsyncMock(),
+            supports_code_blocks=True,
+        )
         runner._adapter_for_source = MagicMock(return_value=side_adapter)
 
         await runner._handle_side_command(_event())

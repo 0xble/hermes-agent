@@ -35,6 +35,11 @@ from agent.message_sanitization import tool_call_id_variants, tool_result_id_var
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.side_notifications import (
+    format_side_queued,
+    format_side_started,
+    side_rich_text_supported,
+)
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
@@ -4215,9 +4220,13 @@ class GatewaySlashCommandsMixin:
                 f"side:{source.chat_id}:{source.thread_id or ''}:"
                 f"{event.message_id or time.time_ns()}"
             )
-            queued = (
-                f'🔀 Side queued: "{preview}"\n'
-                "Waiting for the current tool step to finish."
+            adapter_for_source = getattr(self, "_adapter_for_source", None)
+            delivery_adapter = (
+                adapter_for_source(source) if callable(adapter_for_source) else None
+            )
+            queued = format_side_queued(
+                preview,
+                rich_text=side_rich_text_supported(delivery_adapter),
             )
             queued_sent = await self._send_side_status(
                 event, source, status_key, queued
@@ -4503,9 +4512,9 @@ class GatewaySlashCommandsMixin:
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
-        return (
-            f'🔀 Side started: "{preview}"\n'
-            "Reply to continue this side."
+        return format_side_started(
+            child_session_id,
+            rich_text=side_rich_text_supported(adapter),
         )
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
