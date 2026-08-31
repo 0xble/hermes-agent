@@ -105,7 +105,6 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-081 | Active | `fix(gateway): preserve progress across transient previews` | Keep accumulated tool progress in one editable message across retracted previews while placing later tools below content that becomes durable. |
 | HERMES-082 | Active | `fix(gateway): fence synthetic continuation effects` | Keep internal continuation turns from creating new control-plane effects or quoting unrelated Telegram DM-topic messages. |
 | HERMES-083 | Active | `fix(reconcile): restore side and internal-turn contracts` | Preserve continuable side routing and internal-notification provenance across upstream async API changes. |
-| HERMES-084 | Active | `fix(desktop): keep citation brackets visible` | Render numeric Markdown citation links as bracketed references instead of bare numbers. |
 
 ## Fork-only administrative subject exemptions
 
@@ -152,18 +151,6 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
-
-### HERMES-084 — Keep citation brackets visible
-
-- **Independent hypothesis (2026-08-31):** Assistant responses correctly carry citations as ordinary numeric Markdown links such as `[1](url)`. Markdown parsing necessarily consumes the source brackets, and Desktop's shared external-link renderer forwards the remaining numeric label unchanged, so the visible result is a bare `1`. The correction belongs at Desktop's Markdown-link presentation boundary, where a numeric external-link label can be rendered as `[1]` without changing the URL, ordinary authored link labels, code, math, transcripts, or other Hermes surfaces.
-- **Summary:** Detect numeric authored external-link labels at Desktop's Markdown renderer, bypass ordinary pretty-link enrichment, and render the complete bracketed marker while retaining the exact target and link behavior. Non-numeric authored labels keep the existing path.
-- **Surfaces:** `apps/desktop/src/components/assistant-ui/markdown-text.tsx`; `apps/desktop/src/components/assistant-ui/markdown-text.citations.test.tsx`; this record.
-- **Upstream tracking:** No released, merged, open, closed, or draft upstream item found for this exact Desktop rendering defect as of 2026-08-31. Open RFC #85106 proposes first-class provider-neutral citation annotations and explicitly notes that Desktop strips unlinked numeric prose markers, but it does not preserve brackets on already-linked Markdown citations. Open issue #87729 independently establishes that the complete visible citation label must include both square brackets, but its scope is Telegram source-list resolution rather than Desktop rendering.
-- **Upstream PR:** Open PR #87732 implements bracket-preserving clickable citations for Telegram only and does not touch Desktop. Open PR #83509 changes grounded-citations source-list formatting, not inline Desktop citation rendering. Neither is an equivalent implementation or retirement candidate.
-- **Regression:** `npm run test:ui -- src/components/assistant-ui/markdown-text.citations.test.tsx`; the UI-level test must fail before the patch because the accessible link name and visible text are `1`, then pass with `[1]` while preserving the exact `href`.
-- **Expected published commit identity:** Stable subject `fix(desktop): keep citation brackets visible`; source, regression, and this record ship together.
-- **Rollback:** Revert only `fix(desktop): keep citation brackets visible`, restoring bare numeric external-link labels and removing the focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
-- **Retirement:** Retire after a released upstream version preserves brackets around numeric Markdown citation links at the rendered Desktop boundary with equivalent URL and non-citation-link regressions.
 
 ### HERMES-083 — Restore side and internal-turn contracts
 
