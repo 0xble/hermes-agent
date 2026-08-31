@@ -8224,7 +8224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         failure after recording that recoverable state so ``__init__`` can
         record ``_session_db_init_error`` for the #88235 broadcast.
         """
-        from hermes_state import AsyncSessionDB, _default_db_path
+        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path
         from gateway.session_db_recovery import RecoverableHandleCache
 
         path = Path(_default_db_path())
@@ -8257,7 +8257,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 wrapper = AsyncSessionDB(borrowed)
                 # close_all_session_db_handles() must not close what the store
                 # owns; the store's own sweep already does, and it runs first.
-                wrapper.__dict__["_hermes_borrowed_handle"] = True
+                #
+                # Set defensively: the marker is an optimisation for that
+                # sweep, so a wrapper that cannot carry it (a lightweight test
+                # double, __slots__) must not turn a healthy borrow into a
+                # cached open failure. Symmetric with the read side, which
+                # already tolerates a missing __dict__ via getattr.
+                try:
+                    wrapper.__dict__["_hermes_borrowed_handle"] = True
+                except AttributeError:
+                    pass
                 return wrapper
             if store is not None:
                 # The store exists and its handle is unavailable (failed open
@@ -8266,11 +8275,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # unavailability the store is already reporting.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                # SessionStore owns one SessionDB per active profile scope.
-                # Reuse it rather than opening a second writer and reader pool.
-                return AsyncSessionDB(
-                    self._resolve_shared_session_db(self.session_store)
-                )
+                # No store wired at all (lightweight runners): open a
+                # standalone handle. HERMES-011's single-owner rule is about
+                # not opening a SECOND handle beside the store's; with no
+                # store there is no duplicate to avoid, and the borrow-or-
+                # raise branches above already cover every case where one
+                # exists.
+                return AsyncSessionDB(SessionDB())
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise

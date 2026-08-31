@@ -738,8 +738,16 @@ class TestLightpandaSessionLifecycle:
     def test_emergency_cleanup_stops_all_lightpanda(self, monkeypatch):
         bt = self.bt
         bt._cleanup_done = False
+        # Upstream patches tools.browser_tool._terminate_real_profile_chrome
+        # here to suppress side effects. This fork supersedes that global
+        # Popen list with per-identity tracking (HERMES-064), so the symbol
+        # does not exist and patching it raises AttributeError. Real-profile
+        # browsers are still reaped on this path — cleanup_all_browsers()
+        # calls _close_all_real_profile_runtimes(all_profiles=True), which
+        # stops each tracked process — and cleanup_all_browsers is already
+        # patched below, so the suppression this line provided is covered.
+        # The assertion under test is unchanged.
         with patch("tools.browser_lightpanda.stop_all_lightpanda") as stop_all, \
-             patch("tools.browser_tool._terminate_real_profile_chrome"), \
              patch("tools.browser_tool.cleanup_all_browsers"), \
              patch("tools.browser_tool._reap_orphaned_browser_sessions"):
             bt._emergency_cleanup_all_sessions()

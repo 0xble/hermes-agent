@@ -880,3 +880,22 @@ class TestPhysicalCorruptionAcceptance:
         assert contents[0] == "before stomp"
         assert contents[-1] == "healed after stomp"
         assert len(contents) == 52
+
+    def test_bare_malformed_error_never_enters_fts_fail_open(
+        self, db, tmp_path, monkeypatch
+    ):
+        """A bare malformed-image error is structural, not FTS-scoped.
+
+        Superseded the fork's older "attribution-unknown keeps the historical
+        fail-open path" assertion during the 2026-08-31 upstream
+        reconciliation. Upstream's `_is_fts_write_corruption_error` now
+        requires either SQLITE_CORRUPT_VTAB or an `fts5:` corrupt-structure
+        message, so a bare error is rejected before attribution runs at all.
+        That is strictly safer and serves this class's own purpose better:
+        marking FTS stale on damage we cannot attribute is what drove the
+        rebuild/watchdog crash-loop against a corrupt ephemeral lease btree.
+        """
+        monkeypatch.setattr(db, "_fts_structure_is_corrupt", lambda: None)
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        assert db._enter_fts_fail_open(exc) is False
+        assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) is None
