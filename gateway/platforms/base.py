@@ -3264,11 +3264,14 @@ class BasePlatformAdapter(ABC):
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
         # One-shot callbacks to fire after the main response is delivered.
-        # Keyed by session_key. Values are either a bare callback (legacy) or
-        # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
-        # deliveries generation-aware and avoid stale runs clearing callbacks
-        # registered by a fresher run for the same session.
+        # Generation-less registrations retain the legacy session-keyed map.
+        # Generation-owned registrations use a separate (session, generation)
+        # map so a queued turn can register before the prior turn's delivery
+        # finally block without replacing that prior turn's callback.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        self._post_delivery_callbacks_by_generation: Dict[
+            tuple[str, int], Callable
+        ] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning profile for a multiplexed secondary adapter, installed by
@@ -5703,27 +5706,36 @@ class BasePlatformAdapter(ABC):
         if not session_key or not callable(callback):
             return
 
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            if isinstance(existing, tuple) and len(existing) == 2:
-                existing_gen, existing_cb = existing
-            else:
-                existing_gen, existing_cb = None, existing
-            # Stale-generation registrations never overwrite a fresher slot.
-            if (
-                existing_gen is not None
-                and generation is not None
-                and int(generation) < int(existing_gen)
+        owned_callbacks = getattr(
+            self, "_post_delivery_callbacks_by_generation", None
+        )
+        if owned_callbacks is None:
+            owned_callbacks = {}
+            self._post_delivery_callbacks_by_generation = owned_callbacks
+
+        callback_key: tuple[str, int] | None = None
+        if generation is None:
+            existing = self._post_delivery_callbacks.get(session_key)
+        else:
+            owned_generation = int(generation)
+            callback_key = (session_key, owned_generation)
+            existing = owned_callbacks.get(callback_key)
+
+            # A genuinely stale run must not create a new lane after a newer
+            # generation already owns this session. An existing older lane is
+            # still allowed to chain callbacks because its delivery may be
+            # unwinding concurrently with the queued newer turn.
+            if existing is None and any(
+                key_session == session_key and key_generation > owned_generation
+                for key_session, key_generation in owned_callbacks
             ):
                 return
-            # Same-or-newer generation: chain with the existing callback so
-            # both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None
-                or generation is None
-                or int(existing_gen) == int(generation)
-            ):
-                _prev = existing_cb
+
+        if existing is not None:
+            # Same generation (or the legacy generation-less lane): chain with
+            # the existing callback so both fire in registration order.
+            if callable(existing):
+                _prev = existing
                 _new = callback
 
                 async def _chained() -> None:
@@ -5745,10 +5757,10 @@ class BasePlatformAdapter(ABC):
 
                 callback = _chained
 
-        if generation is None:
+        if callback_key is None:
             self._post_delivery_callbacks[session_key] = callback
         else:
-            self._post_delivery_callbacks[session_key] = (int(generation), callback)
+            owned_callbacks[callback_key] = callback
 
     def pop_post_delivery_callback(
         self,
@@ -5759,9 +5771,37 @@ class BasePlatformAdapter(ABC):
         """Pop a deferred callback, optionally requiring generation ownership."""
         if not session_key:
             return None
+        owned_callbacks = getattr(
+            self, "_post_delivery_callbacks_by_generation", None
+        )
+        if owned_callbacks is None:
+            owned_callbacks = {}
+            self._post_delivery_callbacks_by_generation = owned_callbacks
+        if generation is not None:
+            callback = owned_callbacks.pop(
+                (session_key, int(generation)), None
+            )
+            if callback is not None:
+                return callback if callable(callback) else None
+
         entry = self._post_delivery_callbacks.get(session_key)
         if entry is None:
+            if generation is None:
+                owned_keys = [
+                    key
+                    for key in owned_callbacks
+                    if key[0] == session_key
+                ]
+                # Preserve the old generation-less pop behavior when exactly
+                # one owned callback exists. With multiple generations, a pop
+                # without ownership is ambiguous and must not consume either.
+                if len(owned_keys) == 1:
+                    callback = owned_callbacks.pop(owned_keys[0])
+                    return callback if callable(callback) else None
             return None
+
+        # Backward compatibility for callers/tests that populated the legacy
+        # map directly with the former ``(generation, callback)`` value shape.
         if isinstance(entry, tuple) and len(entry) == 2:
             entry_generation, callback = entry
             if generation is not None and int(entry_generation) != int(generation):
@@ -6781,6 +6821,7 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
         delivery_receipt_tasks: set[asyncio.Future] = set()
+        callback_generation: int | None = None
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6860,6 +6901,18 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            # Snapshot ownership immediately after the handler returns. A
+            # queued follow-up is spawned later in this method, before the
+            # current task reaches ``finally``; it reuses the active-session
+            # event and binds its newer generation there. Reading from that
+            # shared event only in ``finally`` therefore attributes the first
+            # turn's callbacks to the follow-up and strands the first turn's
+            # progress cleanup.
+            callback_generation = getattr(
+                interrupt_event,
+                "_hermes_run_generation",
+                None,
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -7498,23 +7551,18 @@ class BasePlatformAdapter(ABC):
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #
-            # Snapshot the callback generation HERE (after the agent has run),
-            # not at the top of this task.  _hermes_run_generation is set on
-            # the interrupt event by GatewayRunner._bind_adapter_run_generation
-            # during _handle_message_with_agent — which happens DURING the
-            # self._message_handler(event) await above.  Snapshotting earlier
-            # always captured None, which bypassed the generation-ownership
-            # check in pop_post_delivery_callback and let stale runs fire a
-            # fresher run's callbacks.
-            _callback_generation = getattr(
-                interrupt_event,
-                "_hermes_run_generation",
-                None,
-            )
+            # If the handler failed before the normal post-handler snapshot,
+            # retain the best available ownership for exception cleanup.
+            if callback_generation is None:
+                callback_generation = getattr(
+                    interrupt_event,
+                    "_hermes_run_generation",
+                    None,
+                )
             if hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,
-                    generation=_callback_generation,
+                    generation=callback_generation,
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
