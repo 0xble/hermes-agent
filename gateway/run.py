@@ -3171,6 +3171,12 @@ from gateway.delivery import (
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
 )
+from gateway.side_notifications import (
+    format_side_closed,
+    side_response_parts,
+    side_rich_text_supported,
+    side_root_from_route,
+)
 from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
@@ -6301,6 +6307,13 @@ class TurnRunner:
                             on_missing_cursor="raise",
                         )
                     )
+                    _side_initial = ""
+                    _side_suffix = ""
+                    if ctx.side_delivery_callback is not None:
+                        _side_initial, _side_suffix = side_response_parts(
+                            side_root_from_route(ctx.session_key or ""),
+                            rich_text=side_rich_text_supported(_adapter),
+                        )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
@@ -6313,16 +6326,8 @@ class TurnRunner:
                         ),
                         on_before_finalize=_pause_typing_before_finalize,
                         on_delivery=ctx.side_delivery_callback,
-                        initial_text=(
-                            "🔀 Side response\n\n"
-                            if ctx.side_delivery_callback is not None
-                            else ""
-                        ),
-                        final_suffix=(
-                            "\n\nReply to continue this side."
-                            if ctx.side_delivery_callback is not None
-                            else ""
-                        ),
+                        initial_text=_side_initial,
+                        final_suffix=_side_suffix,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                     )
@@ -7785,6 +7790,24 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+
+
+def _stream_consumer_delivered_exact_final(consumer, final_text: str) -> bool:
+    """Confirm that a local stream consumer delivered this exact final payload."""
+    if consumer is None or not final_text:
+        return False
+    if not (
+        getattr(consumer, "final_response_sent", False)
+        or getattr(consumer, "final_content_delivered", False)
+    ):
+        return False
+    matcher = getattr(consumer, "delivered_final_matches", None)
+    if not callable(matcher):
+        return False
+    try:
+        return matcher(final_text) is True
+    except Exception:
+        return False
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -19867,7 +19890,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and event.get_command_args().strip().lower() == "close"
         ):
             closed = await self._close_side_route(_quick_key, source)
-            return "🔀 Side closed." if closed else "This side is already closed."
+            side_root = (
+                _event_metadata.get("gateway_side_root_session_id")
+                or side_root_from_route(_quick_key)
+            )
+            return (
+                format_side_closed(
+                    side_root,
+                    rich_text=side_rich_text_supported(
+                        self._adapter_for_source(source)
+                    ),
+                )
+                if closed
+                else "This side is already closed."
+            )
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
         if (
@@ -24112,10 +24148,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and response
                     and not agent_result.get("already_sent")
                 ):
-                    response = (
-                        f"🔀 Side response\n\n{response}"
-                        "\n\nReply to continue this side."
+                    _side_initial, _side_suffix = side_response_parts(
+                        event_metadata.get("gateway_side_root_session_id")
+                        or side_root_from_route(session_key),
+                        rich_text=side_rich_text_supported(
+                            self._adapter_for_source(source)
+                        ),
                     )
+                    response = f"{_side_initial}{response}{_side_suffix}"
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -32313,6 +32353,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
+        _side_initial = ""
+        _side_suffix = ""
         _scfg = getattr(getattr(self, "config", None), "streaming", None)
         if _scfg is None:
             from gateway.config import StreamingConfig
@@ -32343,6 +32385,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_missing_cursor="fallback",
                         )
                     )
+                    if side_delivery_callback is not None:
+                        _side_initial, _side_suffix = side_response_parts(
+                            side_root_from_route(session_key or ""),
+                            rich_text=side_rich_text_supported(_adapter),
+                        )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
@@ -32350,16 +32397,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
                         on_delivery=side_delivery_callback,
-                        initial_text=(
-                            "🔀 Side response\n\n"
-                            if side_delivery_callback is not None
-                            else ""
-                        ),
-                        final_suffix=(
-                            "\n\nReply to continue this side."
-                            if side_delivery_callback is not None
-                            else ""
-                        ),
+                        initial_text=_side_initial,
+                        final_suffix=_side_suffix,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
                     )
@@ -32495,6 +32534,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
+        _proxy_delivered_final = full_response
+        if side_delivery_callback is not None and _stream_consumer is not None:
+            _proxy_delivered_final = (
+                f"{_side_initial}{full_response}{_side_suffix}"
+            )
+        _proxy_already_sent = _stream_consumer_delivered_exact_final(
+            _stream_consumer,
+            _proxy_delivered_final,
+        )
+
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
@@ -32506,6 +32555,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "already_sent": _proxy_already_sent,
         }
 
     # ------------------------------------------------------------------

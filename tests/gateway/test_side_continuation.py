@@ -259,18 +259,22 @@ async def test_resume_inside_side_cannot_rebind_another_session():
 
 
 def test_side_stream_final_is_wrapped_once():
+    from gateway.side_notifications import side_response_parts
     from gateway.stream_consumer import GatewayStreamConsumer
 
+    initial_text, final_suffix = side_response_parts(
+        "side_20260831_004611_3f45e1"
+    )
     consumer = GatewayStreamConsumer(
         adapter=SimpleNamespace(),
         chat_id="chat",
-        initial_text="🔀 Side response\n\n",
-        final_suffix="\n\nReply to continue this side.",
+        initial_text=initial_text,
+        final_suffix=final_suffix,
     )
     consumer.finish("answer")
     _, final_text = consumer._queue.get_nowait()
     assert final_text == (
-        "🔀 Side response\n\nanswer\n\nReply to continue this side."
+        "↗️ Side `3f45e1`\nanswer\n*Reply here to continue*"
     )
 
 

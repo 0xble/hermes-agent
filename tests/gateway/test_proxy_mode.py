@@ -1,5 +1,7 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -225,6 +227,73 @@ class TestRunAgentViaProxy:
 
         # Verify response was assembled
         assert result["final_response"] == "Hello world"
+
+    @pytest.mark.asyncio
+    async def test_streamed_side_response_is_marked_already_sent(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.streaming = StreamingConfig(enabled=True)
+        runner._adapter_for_source = MagicMock(
+            return_value=SimpleNamespace(supports_code_blocks=True)
+        )
+        runner._build_stream_consumer_config = MagicMock(
+            return_value=(MagicMock(), False)
+        )
+        source = _make_source()
+        resp = _FakeSSEResponse(
+            status=200,
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"content":"Side answer"}}]}\n\n'
+                "data: [DONE]\n\n"
+            ],
+        )
+
+        class _FakeConsumer:
+            def __init__(self, **kwargs):
+                self.initial_text = kwargs["initial_text"]
+                self.final_suffix = kwargs["final_suffix"]
+                self.text = ""
+                self.final_response_sent = False
+                self.final_content_delivered = False
+                self.delivered = ""
+                self.done = asyncio.Event()
+
+            async def run(self):
+                await self.done.wait()
+
+            def on_delta(self, text):
+                self.text += text
+
+            def finish(self):
+                self.delivered = f"{self.initial_text}{self.text}{self.final_suffix}"
+                self.final_response_sent = True
+                self.final_content_delivered = True
+                self.done.set()
+
+            def delivered_final_matches(self, text):
+                return text == self.delivered
+
+        with (
+            patch("gateway.run._load_gateway_config", return_value={}),
+            _patch_aiohttp(_FakeSession(resp)),
+            patch("aiohttp.ClientTimeout"),
+            patch("gateway.stream_consumer.GatewayStreamConsumer", _FakeConsumer),
+        ):
+            result = await runner._run_agent_via_proxy(
+                message="question",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="side_20260831_004611_3f45e1",
+                session_key=(
+                    "agent:main:matrix:group:room:side:"
+                    "side_20260831_004611_3f45e1"
+                ),
+                side_delivery_callback=AsyncMock(),
+            )
+
+        assert result["already_sent"] is True
+        assert result["final_response"] == "Side answer"
 
 
     @pytest.mark.asyncio
