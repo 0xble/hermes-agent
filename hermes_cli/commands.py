@@ -201,9 +201,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<prompt>", busy_policy="dispatch"),
     CommandDef("btw", "Ask a side question about the current conversation without interrupting it", "Session",
                args_hint="<question>", busy_policy="dispatch"),
-    CommandDef("spawn", "Fork the current context into a one-shot background session", "Session",
-               aliases=("side",), args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
-               busy_handler="spawn", desktop="messaging"),
+    CommandDef("side", "Fork the current context into a continuable side session", "Session",
+               args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
+               busy_handler="side", desktop="messaging"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1481,9 +1481,9 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-#   - spawn: contextual background fork; reached via /hermes spawn on Slack so
+#   - side: contextual continuable fork; reached via /hermes side on Slack so
 #     the new gateway command does not displace an existing native slash.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "spawn"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "side"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

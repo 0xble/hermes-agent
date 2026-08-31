@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -215,6 +216,32 @@ class TestCommandBypassActiveSession:
         )
         assert any("handled:btw" in r for r in adapter.sent_responses), (
             "/btw response was not sent back to the user"
+        )
+
+    @pytest.mark.asyncio
+    async def test_busy_side_close_uses_cancelling_handoff(self):
+        """Closing a working side must cancel its turn and discard queued input."""
+        adapter = _make_adapter()
+        side_key = "agent:main:telegram:dm:12345:side:child"
+        event = _make_event("/side close")
+        event.metadata.update({
+            "gateway_session_key": side_key,
+            "gateway_session_id": "child",
+            "gateway_session_strict": True,
+            "gateway_explicit_session_route": True,
+        })
+        object.__setattr__(
+            adapter,
+            "gateway_runner",
+            SimpleNamespace(_prepare_side_reply_route=AsyncMock()),
+        )
+        adapter._dispatch_active_session_command = AsyncMock()
+        adapter._active_sessions[side_key] = asyncio.Event()
+
+        await adapter.handle_message(event)
+
+        adapter._dispatch_active_session_command.assert_awaited_once_with(
+            event, side_key, "side", discard_pending=True
         )
 
     @pytest.mark.asyncio

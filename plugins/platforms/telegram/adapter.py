@@ -731,7 +731,7 @@ class TelegramAdapter(BasePlatformAdapter):
     # so a 10–20s blip delivers now. Same idea as QQBot._wait_for_reconnection.
     _RECONNECT_WAIT_SECONDS = 15.0
     _RECONNECT_POLL_INTERVAL = 0.5
-    # Status keys can be request-scoped (for example queued /spawn lifecycle
+    # Status keys can be request-scoped (for example queued /side lifecycle
     # bubbles), so bound the edit-target cache instead of assuming a small fixed
     # vocabulary of callback names.
     _STATUS_MESSAGE_IDS_MAX = 256
@@ -9143,7 +9143,7 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images natively via Telegram's media group API.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
@@ -9156,9 +9156,11 @@ class TelegramAdapter(BasePlatformAdapter):
         the base adapter's per-image loop.
         """
         if not self._bot:
-            return
+            return []
         if not images:
-            return
+            return []
+
+        results: List[SendResult] = []
 
         try:
             from telegram import InputMediaPhoto
@@ -9167,8 +9169,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(
+                chat_id, images, metadata, human_delay
+            )
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -9181,12 +9184,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Animations: route through the base default (per-image send_animation)
         if animations:
-            await super().send_multiple_images(
-                chat_id, animations, metadata, human_delay=human_delay,
+            results.extend(
+                await super().send_multiple_images(
+                    chat_id, animations, metadata, human_delay=human_delay,
+                )
             )
 
         if not photos:
-            return
+            return results
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -9241,7 +9246,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
@@ -9256,6 +9261,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                for sent_message in sent_messages or []:
+                    sent_id = getattr(sent_message, "message_id", None)
+                    if sent_id is not None:
+                        results.append(SendResult(success=True, message_id=str(sent_id)))
             except _TelegramSendCooldownExceeded:
                 raise
             except Exception as e:
@@ -9265,8 +9274,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                await super().send_multiple_images(
-                    chat_id, chunk, metadata, human_delay=human_delay,
+                results.extend(
+                    await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay,
+                    )
                 )
             finally:
                 for fh in opened_files:
@@ -9274,6 +9285,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         fh.close()
                     except Exception:
                         pass
+        return results
 
     async def send_image_file(
         self,

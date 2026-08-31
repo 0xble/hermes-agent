@@ -903,7 +903,7 @@ Shows the current topic's binding: session title, session ID, and hints for `/ne
 - Root-lobby reminders are rate-limited to one message per 30 seconds per chat — a user who forgets topic mode is on and types ten prompts in the root won't get ten replies
 - BotFather setup screenshots are rate-limited to one send per 5 minutes per chat — repeated `/topic` attempts while Threads Settings are still disabled won't re-upload the same image
 - `/bg <prompt>` started inside a topic delivers its result back to the same topic; background sessions don't trigger auto-rename of the owning topic
-- `/spawn <prompt>` and its `/side` alias fork that topic's newest safe session checkpoint into a durable child and deliver the one-shot result back to the same topic without rebinding it; while the parent is busy, Telegram edits one queued status bubble when the next complete tool checkpoint becomes available
+- `/side <prompt>` forks that topic's newest safe session checkpoint into a continuable normal session without rebinding the topic; while the parent is busy, Telegram edits one queued status bubble when the next complete tool checkpoint becomes available, and replies to the started status or a side response continue the side
 - `/topic` itself is gated by the bot's user authorization check — unauthorized DMs get a refusal instead of activation
 
 ### Disabling multi-session mode

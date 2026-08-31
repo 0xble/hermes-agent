@@ -14189,6 +14189,78 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def record_side_message_binding(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        user_id: Optional[str],
+        message_id: str,
+        side_route_key: str,
+        side_root_session_id: str,
+    ) -> None:
+        """Bind one delivered platform message to a continuable side route."""
+        values = (
+            str(platform or ""),
+            str(chat_id or ""),
+            str(thread_id or ""),
+            str(user_id or ""),
+            str(message_id or ""),
+            str(side_route_key or ""),
+            str(side_root_session_id or ""),
+            time.time(),
+        )
+        if not all((values[0], values[1], values[3], values[4], values[5], values[6])):
+            raise ValueError(
+                "side message binding requires platform, chat, user, message, route, and root"
+            )
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO side_message_bindings (
+                       platform, chat_id, thread_id, user_id, message_id,
+                       side_route_key, side_root_session_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(platform, chat_id, thread_id, user_id, message_id)
+                   DO UPDATE SET
+                       side_route_key = excluded.side_route_key,
+                       side_root_session_id = excluded.side_root_session_id,
+                       created_at = excluded.created_at""",
+                values,
+            )
+
+        self._execute_write(_do)
+
+    def resolve_side_message_binding(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: Optional[str],
+        user_id: Optional[str],
+        message_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a reply anchor inside its exact authorization/delivery scope."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT b.side_route_key, b.side_root_session_id, b.created_at,
+                          s.ended_at, s.end_reason
+                     FROM side_message_bindings b
+                     LEFT JOIN sessions s ON s.id = b.side_root_session_id
+                    WHERE b.platform = ? AND b.chat_id = ? AND b.thread_id = ?
+                      AND b.user_id = ? AND b.message_id = ?
+                    LIMIT 1""",
+                (
+                    str(platform or ""),
+                    str(chat_id or ""),
+                    str(thread_id or ""),
+                    str(user_id or ""),
+                    str(message_id or ""),
+                ),
+            ).fetchone()
+        return dict(row) if row else None
+
     # =========================================================================
     # Export and cleanup
     # =========================================================================

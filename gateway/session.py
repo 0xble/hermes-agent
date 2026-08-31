@@ -3809,6 +3809,85 @@ class SessionStore:
             self._save()
             return entry
 
+    def bind_session_route(
+        self,
+        session_key: str,
+        target_session_id: str,
+        source: SessionSource,
+        *,
+        display_name: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
+        """Bind an additional route to an open session without moving another route.
+
+        This is the nonexclusive counterpart to ``switch_session``. It exists
+        for continuable side conversations whose delivery source remains the
+        parent chat while conversation state uses an independent serialized
+        lane. The target row must already exist and remain open.
+        """
+        if not session_key or not target_session_id or source is None:
+            return None
+        db = self._db
+        if db:
+            try:
+                getter = getattr(db, "get_session", None)
+                if not callable(getter):
+                    return None
+                row = getter(target_session_id)
+            except Exception:
+                logger.warning("Could not validate detached route target", exc_info=True)
+                return None
+            if not isinstance(row, dict) or row.get("ended_at") is not None:
+                return None
+
+        now = _now()
+        entry = SessionEntry(
+            session_key=session_key,
+            session_id=target_session_id,
+            created_at=now,
+            updated_at=now,
+            origin=source,
+            display_name=display_name or source.chat_name,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+        with self._lock:
+            self._ensure_loaded_locked()
+            current = self._entries.get(session_key)
+            if current is not None and current.session_id != target_session_id:
+                return None
+            self._entries[session_key] = entry
+            self._save()
+
+        if db:
+            self._record_gateway_session_peer(
+                target_session_id,
+                session_key,
+                source,
+                display_name=entry.display_name,
+                include_compression_ancestors=True,
+            )
+        return entry
+
+    def close_session_route(
+        self,
+        session_key: str,
+        *,
+        end_reason: str = "side_closed",
+    ) -> Optional[str]:
+        """Close one nonexclusive route and its current session without touching peers."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.pop(session_key, None)
+            if entry is None:
+                return None
+            self._save()
+        db = self._db
+        if db:
+            ender = getattr(db, "end_session", None)
+            if callable(ender):
+                ender(entry.session_id, end_reason=end_reason)
+        return entry.session_id
+
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 

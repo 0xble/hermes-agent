@@ -93,6 +93,7 @@ class TurnContext:
     # be the replied-to message on Slack/Mattermost/Buzz or None for Telegram
     # topics. Used to stamp platform_message_id on the persisted user turn.
     inbound_message_id: Optional[str] = None
+    side_delivery_callback: Optional[Callable[[list[str]], Any]] = None
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None

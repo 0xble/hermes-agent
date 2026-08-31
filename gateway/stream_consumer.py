@@ -241,6 +241,9 @@ class GatewayStreamConsumer:
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
+        on_delivery: Optional[Callable[[list[str]], Any]] = None,
+        initial_text: str = "",
+        final_suffix: str = "",
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
     ):
@@ -260,6 +263,8 @@ class GatewayStreamConsumer:
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
+        self._on_delivery = on_delivery
+        self._delivery_tasks: set[asyncio.Future] = set()
         self._initial_reply_to_id = initial_reply_to_id
 
         # Per-turn identifier: uniquely identifies this consumer's stream turn.
@@ -270,11 +275,13 @@ class GatewayStreamConsumer:
         self._turn_id = str(uuid.uuid4())
 
         self._queue: queue.Queue = queue.Queue()
-        self._accumulated = ""
+        self._initial_text = str(initial_text or "")
+        self._final_suffix = str(final_suffix or "")
+        self._accumulated = self._initial_text
         # Full segment text mirror of ``_accumulated`` that is NOT truncated
         # when overflow splits seal head chunks.  Used to record a reconciliable
         # turn-final payload for multi-message deliveries (#78541).
-        self._stream_ledger = ""
+        self._stream_ledger = self._accumulated
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
@@ -1048,6 +1055,10 @@ class GatewayStreamConsumer:
         (interrupt/error paths) call ``finish()`` bare — legacy behavior.
         """
         if final_text is not None:
+            if self._initial_text and not final_text.startswith(self._initial_text):
+                final_text = self._initial_text + final_text
+            if self._final_suffix and not final_text.endswith(self._final_suffix):
+                final_text += self._final_suffix
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
 
@@ -1323,10 +1334,15 @@ class GatewayStreamConsumer:
                             )
                             if _streamed_something and not self._turn_split_delivery:
                                 _final_payload = self._clean_for_display(item[1])
+                                if (
+                                    self._initial_text
+                                    and not _final_payload.startswith(self._initial_text)
+                                ):
+                                    _final_payload = self._initial_text + _final_payload
                                 _visible = self._clean_for_display(self._accumulated)
                                 if _final_payload and _final_payload != _visible:
-                                    self._accumulated = item[1]
-                                    self._stream_ledger = item[1]
+                                    self._accumulated = _final_payload
+                                    self._stream_ledger = _final_payload
                             elif _streamed_something and self._turn_split_delivery:
                                 # Split delivery + authoritative final (review
                                 # r2, finding 3): wholesale adoption would
@@ -1999,6 +2015,8 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
+            if self._delivery_tasks:
+                await asyncio.gather(*tuple(self._delivery_tasks), return_exceptions=True)
             # Safety net: if run() exits (normal return, cancellation, or
             # exception) while a _FLUSH barrier is still queued or was consumed
             # but not yet signaled, wake any waiters now. Without this a caller
@@ -2801,8 +2819,17 @@ class GatewayStreamConsumer:
         """Record a real preview message id for finalization cleanup."""
         if message_id and message_id != "__no_edit__":
             message_id = str(message_id)
+            is_new = message_id not in self._preview_message_ids
             self._preview_message_ids.add(message_id)
             self._segment_preview_message_ids.add(message_id)
+            if is_new and self._on_delivery is not None:
+                try:
+                    outcome = self._on_delivery([message_id])
+                    if inspect.isawaitable(outcome):
+                        task = asyncio.ensure_future(outcome)
+                        self._delivery_tasks.add(task)
+                except Exception:
+                    logger.debug("Stream delivery receipt callback failed", exc_info=True)
 
     def _track_preview_ids_from_result(self, result: Any) -> None:
         """Record every message id a send/edit result exposes: the primary id

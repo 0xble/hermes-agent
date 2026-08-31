@@ -434,6 +434,7 @@ class TestSignalRecipientResolution:
         result = await adapter.send(chat_id="+15551230000", content="hello")
 
         assert result.success is True
+        assert result.raw_response["message_ids"] == ["1234567890"]
         assert captured[0]["method"] == "listContacts"
         assert captured[1]["method"] == "send"
         assert captured[1]["params"]["recipient"] == ["68680952-6d86-45bc-85e0-1a4d186d53ee"]

@@ -480,6 +480,23 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
+-- Durable reply routing for continuable /side conversations. A
+-- platform message names one child inside its originating identity scope.
+CREATE TABLE IF NOT EXISTS side_message_bindings (
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT NOT NULL,
+    side_route_key TEXT NOT NULL,
+    side_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (platform, chat_id, thread_id, user_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_side_message_bindings_route
+ON side_message_bindings(side_route_key);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
