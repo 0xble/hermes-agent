@@ -7145,6 +7145,7 @@ class BasePlatformAdapter(ABC):
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
+                                parse_flood_retry_after,
                             )
 
                             if getattr(result, "success", False):
@@ -7164,7 +7165,32 @@ class BasePlatformAdapter(ABC):
                                 # Signal a second transactional sweep only when a
                                 # new live adapter is already installed; atomic
                                 # claiming makes concurrent signals idempotent.
-                                if _delivery_error == "send_path_degraded":
+                                _flood_wait = parse_flood_retry_after(
+                                    _delivery_error
+                                )
+                                if _flood_wait is not None:
+                                    # Retryable, but not yet — the server named
+                                    # the wait. Park a coalesced sweep for when
+                                    # it elapses instead of leaving a completed
+                                    # answer terminally failed with attempts=0
+                                    # (three answers, one 12.5KB, were lost this
+                                    # way during a 67-minute Telegram ban).
+                                    _defer = getattr(
+                                        getattr(self, "gateway_runner", None),
+                                        "_schedule_deferred_obligation_redelivery",
+                                        None,
+                                    )
+                                    if callable(_defer):
+                                        _defer(
+                                            event.source.platform,
+                                            profile=getattr(
+                                                delivery_adapter,
+                                                "_owner_profile",
+                                                None,
+                                            ),
+                                            delay=_flood_wait,
+                                        )
+                                elif _delivery_error == "send_path_degraded":
                                     _live_adapter = self._final_delivery_adapter(
                                         event.source
                                     )

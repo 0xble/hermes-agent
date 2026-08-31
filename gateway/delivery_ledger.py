@@ -86,6 +86,46 @@ RECONNECTED_MARKER = (
 # adapter reconnected.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 
+# Platform flood-control rejections carry their own wait in the error string
+# (``flood_control:3459``), so they can never match a fixed allowlist by
+# equality. They are also the MOST retryable class the ledger sees: the server
+# states exactly when to come back. Treating them as terminal meant a penalty
+# outliving the send's short retry budget destroyed a completed answer that
+# this ledger exists to protect — observed as three rows stuck in ``failed``
+# with ``attempts=0`` after a 67-minute Telegram ban.
+FLOOD_CONTROL_ERROR_PREFIX = "flood_control:"
+
+
+def parse_flood_retry_after(error: Any) -> Optional[float]:
+    """Seconds to wait from a ``flood_control:<wait>`` error, else None.
+
+    Tolerates a missing/garbage suffix by returning None rather than raising:
+    the caller then falls back to its own bounded schedule instead of losing
+    the obligation.
+    """
+    text = str(error or "").strip().lower()
+    if not text.startswith(FLOOD_CONTROL_ERROR_PREFIX):
+        return None
+    raw = text[len(FLOOD_CONTROL_ERROR_PREFIX):].strip()
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if wait != wait or wait in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    return max(0.0, wait)
+
+
+def is_runtime_retryable(error: Any) -> bool:
+    """True when a failed row may be re-claimed by the live process.
+
+    Exact-match allowlist plus the parameterised flood-control class.
+    """
+    text = str(error or "").strip().lower()
+    if text in _RUNTIME_RETRYABLE_ERRORS:
+        return True
+    return parse_flood_retry_after(text) is not None
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
@@ -458,7 +498,7 @@ def sweep_failed_for_runtime(
             # process-start matching prevents PID reuse from stealing work.
             if owner_pid != pid or owner_started_at != started:
                 continue
-            if str(last_error or "").strip().lower() not in _RUNTIME_RETRYABLE_ERRORS:
+            if not is_runtime_retryable(last_error):
                 continue
             owner_guard = (oid, owner_pid, owner_started_at)
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -490,6 +530,9 @@ def sweep_failed_for_runtime(
                     "profile": adapter_profile,
                     "runtime_recovery": True,
                     "attempts": attempts + 1,
+                    # Carried so a release can restore the row's own failure
+                    # class instead of flattening it to send_path_degraded.
+                    "last_error": last_error,
                 })
     return claimed
 

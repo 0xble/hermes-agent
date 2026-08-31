@@ -7902,6 +7902,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # trimmed opportunistically in send_progress_messages so a
         # long-lived gateway can't accumulate an entry per chat forever.
         self._progress_edit_clock: Dict[str, float] = {}
+        # Deferred delivery-ledger sweeps, keyed "platform:profile".
+        # A flood-control rejection is retryable but NOT yet: the server names
+        # the wait. Re-driving the ledger before it elapses would spend the
+        # obligation's bounded attempt budget on a call the platform is
+        # guaranteed to reject, and extend the penalty. One coalesced timer per
+        # adapter identity replaces the failed row's lost redelivery.
+        self._deferred_obligation_sweeps: Dict[str, asyncio.Task] = {}
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The
@@ -13395,6 +13402,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._claim_pending_obligations()
         )
 
+    def _schedule_deferred_obligation_redelivery(
+        self,
+        platform: Platform,
+        *,
+        profile: Optional[str] = None,
+        delay: float,
+    ) -> None:
+        """Re-drive this identity's failed obligations once a wait elapses.
+
+        The reconnect sweep cannot help a flood-controlled send: nothing
+        disconnects, so no reconnect fires and the row stays ``failed``
+        forever in a live process. Startup recovery cannot help either — it
+        deliberately ignores rows owned by a live gateway.
+
+        Coalesced per adapter identity: a pending timer that already fires no
+        earlier than this one is left alone, so a burst of rejections inside
+        one penalty window schedules one sweep, not one per lost answer.
+        Best-effort by the ledger's contract — a failure here must never
+        block a send.
+        """
+        key = "%s:%s" % (
+            getattr(platform, "value", platform),
+            profile or "default",
+        )
+        delay = max(0.0, float(delay))
+        # Bound the wait so a hostile or garbled retry_after cannot park an
+        # answer indefinitely; the ledger's staleness/attempt caps still apply.
+        try:
+            from gateway.delivery_ledger import STALE_AFTER_SECONDS
+        except Exception:
+            STALE_AFTER_SECONDS = 24 * 60 * 60
+        delay = min(delay, float(STALE_AFTER_SECONDS))
+        existing = self._deferred_obligation_sweeps.get(key)
+        if existing is not None and not existing.done():
+            existing_at = getattr(existing, "_hermes_sweep_at", None)
+            if existing_at is not None and existing_at <= time.monotonic() + delay:
+                return
+            existing.cancel()
+
+        async def _run_after_delay() -> None:
+            try:
+                # +1s so we wake just OUTSIDE the server's stated window
+                # rather than racing its boundary.
+                await asyncio.sleep(delay + 1.0)
+                await self._redeliver_failed_obligations_for_platform(
+                    platform, profile=profile,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "deferred delivery-ledger sweep failed for %s", key,
+                    exc_info=True,
+                )
+            finally:
+                if self._deferred_obligation_sweeps.get(key) is task:
+                    self._deferred_obligation_sweeps.pop(key, None)
+
+        try:
+            task = asyncio.create_task(_run_after_delay())
+        except RuntimeError:
+            # No running loop (bare/test runner) — nothing to schedule.
+            return
+        task._hermes_sweep_at = time.monotonic() + delay
+        self._deferred_obligation_sweeps[key] = task
+
     async def _redeliver_failed_obligations_for_platform(
         self,
         platform: Platform,
@@ -13446,7 +13519,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await asyncio.to_thread(
                     release_runtime_claim,
                     row["obligation_id"],
-                    "send_path_degraded",
+                    # Preserve the row's own failure class. Relabelling a
+                    # flood-controlled row as send_path_degraded would make
+                    # the next reconnect sweep re-send it INSIDE the penalty
+                    # window, which is exactly what extends the ban.
+                    str(row.get("last_error") or "send_path_degraded"),
                 )
             except Exception:
                 logger.debug(
