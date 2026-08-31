@@ -234,7 +234,7 @@ platform network disconnect as an event-loop failure.
 | `/rollback [number]` | List or restore filesystem checkpoints |
 | `/bg <prompt>` | Run a prompt in a separate background session |
 | `/btw <question>` | Ask a side question about the current conversation without interrupting it |
-| `/spawn <prompt>` (alias: `/side`) | Fork the current committed context into a one-shot background session |
+| `/side <prompt>` | Fork the current safe context into a continuable side session |
 | `/reload-mcp` | Reload MCP servers from config |
 | `/update` | Update Hermes Agent to the latest version |
 | `/help` | Show available commands |
@@ -538,19 +538,19 @@ Each `/bg` prompt spawns a **separate agent instance** that runs asynchronously:
 - **Non-blocking** — your main chat stays fully interactive. Send messages, run other commands, or start more background tasks while it works.
 - **Result delivery** — when the task finishes, the result is sent back to the **same chat or channel** where you issued the command, prefixed with "✅ Background task complete". If it fails, you'll see "❌ Background task failed" with the error.
 
-### Contextual Spawns
+### Side Sessions
 
-Use `/spawn` or its `/side` alias when the side task needs the current conversation instead of a detached prompt:
+Use `/side` when a parallel conversation needs the current context instead of a detached prompt:
 
 ```
-/spawn Verify the diagnosis above against the current source and report any counterexample
+/side Verify the diagnosis above against the current source and report any counterexample
 ```
 
-`/spawn` and `/side` copy the newest provider-valid transcript checkpoint into a durable child session and run the new prompt there. When the parent is idle, that checkpoint ends at the last complete assistant response. During an active turn, Hermes can also fork after a complete assistant tool-call block and all matching tool results have persisted. If the current tool batch is still running, one `🔀 Spawn queued` status is posted and then edited to `🔀 Spawn started` when the checkpoint becomes safe. Partial tool calls and unfinished output are never copied.
+`/side` copies the newest provider-valid transcript checkpoint into a durable normal session and runs the new prompt through the same session pipeline as an ordinary turn. It retains normal tools, skills, Hindsight processing, delegation, approvals, accounting, compression, and recovery. When the parent is idle, the checkpoint ends at the last complete assistant response. During an active turn, Hermes can also fork after a complete assistant tool-call block and all matching tool results have persisted. If the current tool batch is still running, one `🔀 Side queued` status is posted and then edited to `🔀 Side started` when the checkpoint becomes safe. Partial tool calls and unfinished output are never copied.
 
-If the active turn stops before any safe checkpoint is available, the same status is edited to `⚠️ Spawn aborted` and no child is created. The parent chat stays active and its transcript is not modified by the child result.
+Reply directly to a side response or its started status to continue that side. Hermes resolves the reply through an exact platform, chat, topic, and user binding, then follows the side route's current session tip. Ordinary messages still go to the parent session. Compression and parent resets do not rebind or close the side. Reply with `/side close` to close only that side.
 
-The child has a generated `Spawn ...` title and can be resumed explicitly later. It does not receive the parent's gateway routing key, so ordinary messages continue in the parent. Use `/background`, `/bg`, or `/btw` when the task is self-contained and does not need the current transcript.
+If the active turn stops before any safe checkpoint is available, the same status is edited to `⚠️ Side aborted` and no child is created. The parent chat stays active and its transcript is not modified by side responses. Use `/background`, `/bg`, or `/btw` when the task is self-contained and does not need the current transcript.
 
 ### Background Process Notifications
 

@@ -1,4 +1,4 @@
-"""Gateway contextual /spawn command regressions."""
+"""Gateway contextual /side command regressions."""
 
 import asyncio
 import json
@@ -17,7 +17,7 @@ from hermes_cli.commands import resolve_command
 from hermes_state import AsyncSessionDB, SessionDB
 
 
-def _event(text: str = "/spawn investigate this") -> MessageEvent:
+def _event(text: str = "/side investigate this") -> MessageEvent:
     return MessageEvent(
         text=text,
         source=SessionSource(
@@ -68,6 +68,9 @@ def _runner(*, history=None, copy_error=None):
         )
     )
     runner._run_background_task = AsyncMock()
+    side_adapter = SimpleNamespace(handle_message=AsyncMock())
+    object.__setattr__(runner, "_side_adapter", side_adapter)
+    runner._adapter_for_source = MagicMock(return_value=side_adapter)
 
     sync_store = MagicMock()
     async_store = SimpleNamespace(
@@ -75,6 +78,8 @@ def _runner(*, history=None, copy_error=None):
         get_or_create_session=AsyncMock(return_value=_parent_entry()),
         load_transcript=AsyncMock(return_value=history or []),
         switch_session=AsyncMock(),
+        bind_session_route=AsyncMock(return_value=SimpleNamespace(session_id="side-child")),
+        close_session_route=AsyncMock(return_value="side-child"),
     )
     runner.session_store = sync_store
     runner._async_session_store = async_store
@@ -100,15 +105,14 @@ def _runner(*, history=None, copy_error=None):
     return runner, async_store
 
 
-@pytest.mark.parametrize("name", ["spawn", "side"])
-def test_spawn_command_is_gateway_dispatchable(name):
-    command = resolve_command(name)
+def test_side_command_is_gateway_dispatchable():
+    command = resolve_command("side")
 
     assert command is not None
-    assert command.name == "spawn"
+    assert command.name == "side"
     assert command.gateway_only is True
     assert command.busy_policy == "dispatch"
-    assert command.busy_handler == "spawn"
+    assert command.busy_handler == "side"
 
 
 @pytest.mark.parametrize(
@@ -123,7 +127,7 @@ def test_spawn_command_is_gateway_dispatchable(name):
         "function_call",
     ],
 )
-def test_spawn_snapshot_excludes_provisional_assistant_turns(finish_reason):
+def test_side_snapshot_excludes_provisional_assistant_turns(finish_reason):
     history = [
         {"role": "user", "content": "completed question"},
         {
@@ -139,34 +143,34 @@ def test_spawn_snapshot_excludes_provisional_assistant_turns(finish_reason):
         },
     ]
 
-    assert GatewayRunner._completed_spawn_history(history) == history[:2]
+    assert GatewayRunner._completed_side_history(history) == history[:2]
 
 
 @pytest.mark.asyncio
-async def test_spawn_requires_a_prompt():
+async def test_side_requires_a_prompt():
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._session_db = object()
 
-    result = await runner._handle_spawn_command(_event("/spawn"))
+    result = await runner._handle_side_command(_event("/side"))
 
-    assert result == "Usage: /spawn <prompt>"
+    assert result == "Usage: /side <prompt>"
 
 
 @pytest.mark.asyncio
-async def test_spawn_requires_a_completed_parent_turn():
+async def test_side_requires_a_completed_parent_turn():
     runner, _store = _runner(history=[{"role": "user", "content": "pending"}])
 
-    result = await runner._handle_spawn_command(_event())
+    result = await runner._handle_side_command(_event())
 
     assert result == (
-        "No completed conversation to spawn from. Wait for the current turn "
+        "No completed conversation to fork. Wait for the current turn "
         "to finish, then try again."
     )
     runner._session_db.create_session.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active():
+async def test_side_clones_only_the_last_completed_turn_and_keeps_parent_active():
     history = [
         {"role": "user", "content": "first question", "timestamp": 1.0},
         {
@@ -198,7 +202,7 @@ async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active
     runner, store = _runner(history=history)
     event = _event()
 
-    result = await runner._handle_spawn_command(event)
+    result = await runner._handle_side_command(event)
     await asyncio.gather(*runner._background_tasks)
 
     runner._normalize_source_for_session_key.assert_called_once_with(event.source)
@@ -207,18 +211,18 @@ async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active
 
     create_kwargs = runner._session_db.create_session.await_args.kwargs
     child_session_id = create_kwargs["session_id"]
-    assert child_session_id.startswith("spawn_")
+    assert child_session_id.startswith("side_")
     assert create_kwargs["parent_session_id"] == "parent-1"
     assert create_kwargs["model"] == "parent-model"
-    assert create_kwargs["session_key"] is None
+    assert create_kwargs["session_key"].endswith(f":side:{child_session_id}")
     assert create_kwargs["thread_id"] == "42"
     assert create_kwargs["cwd"] == "/tmp/project"
     assert create_kwargs["profile_name"] == "default"
     assert create_kwargs["git_repo_root"] == "/tmp/project"
     assert create_kwargs["model_config"] == {
         "_branched_from": "parent-1",
-        "_spawned_from": "parent-1",
-        "_spawn_mode": "one_shot",
+        "_side_from": "parent-1",
+        "_side_root": child_session_id,
     }
     assert json.loads(create_kwargs["origin_json"])["thread_id"] == "42"
 
@@ -235,42 +239,35 @@ async def test_spawn_clones_only_the_last_completed_turn_and_keeps_parent_active
     assert copied_rows[1]["display_kind"] == "internal_notification"
     assert copied_rows[1]["display_metadata"] == {"source": "test"}
 
-    spawn_kwargs = runner._run_background_task.await_args.kwargs
-    assert spawn_kwargs["prompt"] == "investigate this"
-    assert spawn_kwargs["source"].thread_id == "42"
-    assert spawn_kwargs["event_message_id"] is None
-    assert spawn_kwargs["task_id"] == child_session_id
-    assert spawn_kwargs["parent_session_id"] == "parent-1"
-    assert spawn_kwargs["task_kind"] == "spawn"
-    task_title = spawn_kwargs["task_title"]
-    assert task_title.startswith("Spawn ")
-    assert task_title.endswith(": investigate this")
-    assert spawn_kwargs["conversation_history"] == history[:2]
-    assert "Spawn started" in result
-    assert f'Child session: "{task_title}"' in result
-    assert child_session_id not in result
+    side_event = getattr(runner, "_side_adapter").handle_message.call_args.args[0]
+    assert side_event.text == "investigate this"
+    assert side_event.source.thread_id == "42"
+    assert side_event.metadata["gateway_session_id"] == child_session_id
+    assert side_event.metadata["gateway_explicit_session_route"] is True
+    assert "Side started" in result
+    assert "Reply to continue this side." in result
 
 
 @pytest.mark.asyncio
-async def test_spawn_fails_closed_when_context_copy_fails():
+async def test_side_fails_closed_when_context_copy_fails():
     history = [
         {"role": "user", "content": "question"},
         {"role": "assistant", "content": "answer"},
     ]
     runner, _store = _runner(history=history, copy_error=RuntimeError("db locked"))
 
-    result = await runner._handle_spawn_command(_event())
+    result = await runner._handle_side_command(_event())
 
-    assert result == "❌ Spawn failed: could not copy the parent context."
+    assert result == "❌ Side failed: could not copy the parent context."
     runner._run_background_task.assert_not_called()
     runner._session_db.end_session.assert_awaited_once()
-    assert runner._session_db.end_session.await_args.kwargs["end_reason"] == "spawn_copy_failed"
+    assert runner._session_db.end_session.await_args.kwargs["end_reason"] == "side_copy_failed"
 
 
 @pytest.mark.asyncio
-async def test_spawn_dispatches_while_parent_agent_is_busy():
+async def test_side_dispatches_while_parent_agent_is_busy():
     runner, _store = _runner(history=[])
-    runner._handle_spawn_command = AsyncMock(return_value="spawned")
+    runner._handle_side_command = AsyncMock(return_value="sideed")
     runner._peek_session_state = MagicMock(
         return_value=SimpleNamespace(
             persistent=SimpleNamespace(run_generation=7),
@@ -280,20 +277,20 @@ async def test_spawn_dispatches_while_parent_agent_is_busy():
 
     result = await runner._dispatch_busy_slash_command(
         event,
-        resolve_command("spawn"),
+        resolve_command("side"),
         "telegram:parent",
         event.source,
     )
 
-    assert result == "spawned"
-    runner._handle_spawn_command.assert_awaited_once_with(
+    assert result == "sideed"
+    runner._handle_side_command.assert_awaited_once_with(
         event,
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
 
 
-def test_active_turn_spawn_checkpoint_requires_every_tool_result():
+def test_active_turn_side_checkpoint_requires_every_tool_result():
     pending = [
         {"role": "user", "content": "current question"},
         {
@@ -308,12 +305,12 @@ def test_active_turn_spawn_checkpoint_requires_every_tool_result():
         {"role": "tool", "tool_call_id": "call-1", "content": "first result"},
     ]
 
-    assert GatewayRunner._active_turn_spawn_history(pending) == []
+    assert GatewayRunner._active_turn_side_history(pending) == []
 
     complete = pending + [
         {"role": "tool", "tool_call_id": "call-2", "content": "second result"}
     ]
-    assert GatewayRunner._active_turn_spawn_history(complete) == complete
+    assert GatewayRunner._active_turn_side_history(complete) == complete
 
 
 @pytest.mark.parametrize(
@@ -350,7 +347,7 @@ def test_active_turn_spawn_checkpoint_requires_every_tool_result():
         ),
     ],
 )
-def test_active_turn_spawn_checkpoint_rejects_non_bijective_tool_results(
+def test_active_turn_side_checkpoint_rejects_non_bijective_tool_results(
     tool_calls,
     tool_results,
 ):
@@ -365,10 +362,10 @@ def test_active_turn_spawn_checkpoint_rejects_non_bijective_tool_results(
         *tool_results,
     ]
 
-    assert GatewayRunner._active_turn_spawn_history(history) == []
+    assert GatewayRunner._active_turn_side_history(history) == []
 
 
-def test_active_turn_spawn_checkpoint_accepts_codex_call_id_alias():
+def test_active_turn_side_checkpoint_accepts_codex_call_id_alias():
     history = [
         {"role": "user", "content": "current question"},
         {
@@ -386,10 +383,10 @@ def test_active_turn_spawn_checkpoint_accepts_codex_call_id_alias():
         {"role": "tool", "tool_call_id": "call-1", "content": "result"},
     ]
 
-    assert GatewayRunner._active_turn_spawn_history(history) == history
+    assert GatewayRunner._active_turn_side_history(history) == history
 
 
-def test_active_turn_checkpoint_accepts_spawn_prompt_without_repair():
+def test_active_turn_checkpoint_accepts_side_prompt_without_repair():
     history = [
         {"role": "user", "content": "current question"},
         {
@@ -403,7 +400,7 @@ def test_active_turn_checkpoint_accepts_spawn_prompt_without_repair():
             ],
         },
         {"role": "tool", "tool_call_id": "call-1", "content": "result"},
-        {"role": "user", "content": "spawn prompt"},
+        {"role": "user", "content": "side prompt"},
     ]
     original = [dict(message) for message in history]
 
@@ -411,13 +408,13 @@ def test_active_turn_checkpoint_accepts_spawn_prompt_without_repair():
     assert history == original
 
 
-def test_active_turn_spawn_checkpoint_prefers_completed_assistant_response():
+def test_active_turn_side_checkpoint_prefers_completed_assistant_response():
     history = [
         {"role": "user", "content": "current request"},
         {"role": "assistant", "content": "done", "finish_reason": "stop"},
     ]
 
-    assert GatewayRunner._active_turn_spawn_history(history) == history
+    assert GatewayRunner._active_turn_side_history(history) == history
 
 
 def test_active_turn_checkpoint_waits_for_work_after_intermediate_response():
@@ -437,11 +434,11 @@ def test_active_turn_checkpoint_waits_for_work_after_intermediate_response():
         },
     ]
 
-    assert GatewayRunner._active_turn_spawn_history(history) == []
+    assert GatewayRunner._active_turn_side_history(history) == []
 
 
 @pytest.mark.asyncio
-async def test_busy_spawn_queues_then_edits_status_at_tool_checkpoint():
+async def test_busy_side_queues_then_edits_status_at_tool_checkpoint():
     pending = [
         {"role": "user", "content": "current question"},
         {
@@ -465,14 +462,15 @@ async def test_busy_spawn_queues_then_edits_status_at_tool_checkpoint():
     runner._peek_session_state = MagicMock(return_value=active_state)
     runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "42"})
     status_adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
         send_or_update_status=AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="status-1")
         )
     )
     runner._adapter_for_source = MagicMock(return_value=status_adapter)
 
-    result = await runner._handle_spawn_command(
-        _event('/spawn change the icon to a brain'),
+    result = await runner._handle_side_command(
+        _event('/side change the icon to a brain'),
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
@@ -486,18 +484,20 @@ async def test_busy_spawn_queues_then_edits_status_at_tool_checkpoint():
     queued_call, started_call = status_adapter.send_or_update_status.await_args_list
     assert queued_call.args[1] == started_call.args[1]
     assert queued_call.args[2] == (
-        '🔀 Spawn queued: "change the icon to a brain"\n'
+        '🔀 Side queued: "change the icon to a brain"\n'
         "Waiting for the current tool step to finish."
     )
-    assert started_call.args[2].startswith("🔀 Spawn started\n")
+    assert started_call.args[2].startswith("🔀 Side started:")
     copied_rows = runner._session_db.append_messages_batch.await_args.args[1]
     assert [row["role"] for row in copied_rows] == ["user", "assistant", "tool"]
-    spawn_kwargs = runner._run_background_task.await_args.kwargs
-    assert spawn_kwargs["conversation_history"] == complete
+    assert status_adapter.handle_message.await_count == 1
+    side_event = status_adapter.handle_message.await_args.args[0]
+    assert side_event.text == "change the icon to a brain"
+    assert side_event.metadata["gateway_explicit_session_route"] is True
 
 
 @pytest.mark.asyncio
-async def test_busy_spawn_edits_queued_status_to_safe_abort():
+async def test_busy_side_edits_queued_status_to_safe_abort():
     pending = [
         {"role": "user", "content": "current question"},
         {
@@ -524,14 +524,15 @@ async def test_busy_spawn_edits_queued_status_to_safe_abort():
     )
     runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "42"})
     status_adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
         send_or_update_status=AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="status-1")
         )
     )
     runner._adapter_for_source = MagicMock(return_value=status_adapter)
 
-    result = await runner._handle_spawn_command(
-        _event('/spawn change the icon to a brain'),
+    result = await runner._handle_side_command(
+        _event('/side change the icon to a brain'),
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
@@ -542,7 +543,7 @@ async def test_busy_spawn_edits_queued_status_to_safe_abort():
     assert status_adapter.send_or_update_status.await_count == 2
     aborted = status_adapter.send_or_update_status.await_args_list[1].args[2]
     assert aborted == (
-        "⚠️ Spawn aborted: the current turn stopped before its context could "
+        "⚠️ Side aborted: the current turn stopped before its context could "
         "be copied. Nothing was changed."
     )
     runner._session_db.create_session.assert_not_awaited()
@@ -550,7 +551,7 @@ async def test_busy_spawn_edits_queued_status_to_safe_abort():
 
 
 @pytest.mark.asyncio
-async def test_busy_spawn_aborts_if_turn_generation_changes_during_context_read():
+async def test_busy_side_aborts_if_turn_generation_changes_during_context_read():
     complete = [
         {"role": "user", "content": "current question"},
         {"role": "assistant", "content": "done", "finish_reason": "stop"},
@@ -568,14 +569,14 @@ async def test_busy_spawn_aborts_if_turn_generation_changes_during_context_read(
         side_effect=[generation_7, generation_8]
     )
 
-    result = await runner._handle_spawn_command(
-        _event('/spawn change the icon to a brain'),
+    result = await runner._handle_side_command(
+        _event('/side change the icon to a brain'),
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
 
     assert result == (
-        "⚠️ Spawn aborted: the current turn stopped before its context could "
+        "⚠️ Side aborted: the current turn stopped before its context could "
         "be copied. Nothing was changed."
     )
     runner._session_db.create_session.assert_not_awaited()
@@ -583,7 +584,7 @@ async def test_busy_spawn_aborts_if_turn_generation_changes_during_context_read(
 
 
 @pytest.mark.asyncio
-async def test_busy_spawn_uses_final_checkpoint_after_same_turn_releases():
+async def test_busy_side_uses_final_checkpoint_after_same_turn_releases():
     complete = [
         {"role": "user", "content": "current question"},
         {"role": "assistant", "content": "done", "finish_reason": "stop"},
@@ -599,19 +600,20 @@ async def test_busy_spawn_uses_final_checkpoint_after_same_turn_releases():
     )
     runner._peek_session_state = MagicMock(side_effect=[active, released])
 
-    result = await runner._handle_spawn_command(
-        _event('/spawn change the icon to a brain'),
+    result = await runner._handle_side_command(
+        _event('/side change the icon to a brain'),
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
 
-    assert result.startswith("🔀 Spawn started\n")
+    assert result.startswith("🔀 Side started:")
     runner._session_db.create_session.assert_awaited_once()
-    runner._run_background_task.assert_called_once()
+    await asyncio.gather(*runner._background_tasks)
+    assert getattr(runner, "_side_adapter").handle_message.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_spawn_cancellation_finalizes_created_child_before_worker_registration():
+async def test_side_cancellation_finalizes_created_child_before_worker_registration():
     history = [
         {"role": "user", "content": "parent request"},
         {"role": "assistant", "content": "done", "finish_reason": "stop"},
@@ -620,12 +622,12 @@ async def test_spawn_cancellation_finalizes_created_child_before_worker_registra
     runner._session_db.append_messages_batch.side_effect = asyncio.CancelledError
 
     with pytest.raises(asyncio.CancelledError):
-        await runner._handle_spawn_command(_event('/spawn do the side task'))
+        await runner._handle_side_command(_event('/side do the side task'))
 
     runner._session_db.create_session.assert_awaited_once()
     runner._session_db.end_session.assert_awaited_once()
     assert runner._session_db.end_session.await_args.kwargs == {
-        "end_reason": "spawn_launch_cancelled"
+        "end_reason": "side_launch_cancelled"
     }
     runner._run_background_task.assert_not_called()
 
@@ -648,7 +650,7 @@ async def test_cancel_during_to_thread_creation_drains_before_finalizing(tmp_pat
         original_create = db.create_session
 
         def delayed_create(session_id, *args, **kwargs):
-            if str(session_id).startswith("spawn_"):
+            if str(session_id).startswith("side_"):
                 child_ids.append(session_id)
                 create_started.set()
                 release_create.wait(timeout=5)
@@ -682,7 +684,7 @@ async def test_cancel_during_to_thread_creation_drains_before_finalizing(tmp_pat
             ),
         )
 
-        launch = asyncio.create_task(runner._handle_spawn_command(_event()))
+        launch = asyncio.create_task(runner._handle_side_command(_event()))
         assert await asyncio.to_thread(create_started.wait, 5)
         launch.cancel()
         release_create.set()
@@ -693,7 +695,7 @@ async def test_cancel_during_to_thread_creation_drains_before_finalizing(tmp_pat
         child = db.get_session(child_ids[0])
         assert child is not None
         assert child["ended_at"] is not None
-        assert child["end_reason"] == "spawn_launch_cancelled"
+        assert child["end_reason"] == "side_launch_cancelled"
         runner._run_background_task.assert_not_called()
     finally:
         release_create.set()
@@ -701,9 +703,10 @@ async def test_cancel_during_to_thread_creation_drains_before_finalizing(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_cancel_spawn_waiters_does_not_abort_waiter_it_did_not_cancel():
+async def test_cancel_side_waiters_does_not_abort_waiter_it_did_not_cancel():
     runner, _store = _runner(history=[])
     status_adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
         send_or_update_status=AsyncMock(return_value=SimpleNamespace(success=True))
     )
     runner._adapter_for_source = MagicMock(return_value=status_adapter)
@@ -716,39 +719,39 @@ async def test_cancel_spawn_waiters_does_not_abort_waiter_it_did_not_cancel():
             return False
 
     waiter = CompletedRace()
-    runner._spawn_waiter_tasks = {waiter}
-    runner._spawn_waiter_statuses = {
+    runner._side_waiter_tasks = {waiter}
+    runner._side_waiter_statuses = {
         waiter: {
             "event": _event(),
             "source": _event().source,
-            "status_key": "spawn:test",
+            "status_key": "side:test",
             "terminal": True,
         }
     }
 
-    await runner._cancel_spawn_waiters()
+    await runner._cancel_side_waiters()
 
     status_adapter.send_or_update_status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_spawn_finalization_drains_through_repeated_cancellation():
+async def test_side_finalization_drains_through_repeated_cancellation():
     end_started = asyncio.Event()
     release_end = asyncio.Event()
     ended = False
 
     async def end_session(_session_id, *, end_reason):
         nonlocal ended
-        assert end_reason == "spawn_launch_cancelled"
+        assert end_reason == "side_launch_cancelled"
         end_started.set()
         await release_end.wait()
         ended = True
 
     finalization = asyncio.create_task(
-        GatewayRunner._finalize_incomplete_spawn(
+        GatewayRunner._finalize_incomplete_side(
             SimpleNamespace(end_session=end_session),
-            "spawn-child",
-            "spawn_launch_cancelled",
+            "side-child",
+            "side_launch_cancelled",
         )
     )
     await end_started.wait()
@@ -764,7 +767,7 @@ async def test_spawn_finalization_drains_through_repeated_cancellation():
 
 
 @pytest.mark.asyncio
-async def test_cancel_spawn_waiters_edits_queued_status_before_shutdown():
+async def test_cancel_side_waiters_edits_queued_status_before_shutdown():
     pending = [
         {"role": "user", "content": "current question"},
         {
@@ -788,38 +791,39 @@ async def test_cancel_spawn_waiters_edits_queued_status_before_shutdown():
     runner._peek_session_state = MagicMock(return_value=active)
     runner._thread_metadata_for_source = MagicMock(return_value={"thread_id": "42"})
     status_adapter = SimpleNamespace(
+        handle_message=AsyncMock(),
         send_or_update_status=AsyncMock(return_value=SimpleNamespace(success=True))
     )
     runner._adapter_for_source = MagicMock(return_value=status_adapter)
 
-    result = await runner._handle_spawn_command(
-        _event('/spawn change the icon to a brain'),
+    result = await runner._handle_side_command(
+        _event('/side change the icon to a brain'),
         active_session_key="telegram:parent",
         active_run_generation=7,
     )
-    await runner._cancel_spawn_waiters()
+    await runner._cancel_side_waiters()
 
     assert result == ""
     assert status_adapter.send_or_update_status.await_count == 2
     assert status_adapter.send_or_update_status.await_args_list[1].args[2] == (
-        "⚠️ Spawn aborted: the current turn stopped before its context could "
+        "⚠️ Side aborted: the current turn stopped before its context could "
         "be copied. Nothing was changed."
     )
-    assert not runner._spawn_waiter_tasks
-    assert not runner._spawn_waiter_statuses
+    assert not runner._side_waiter_tasks
+    assert not runner._side_waiter_statuses
 
 
 @pytest.mark.asyncio
-async def test_spawn_appears_in_gateway_help():
+async def test_side_appears_in_gateway_help():
     runner, _store = _runner(history=[])
 
     result = await runner._handle_help_command(_event("/help"))
 
-    assert "/spawn" in result
+    assert "/side" in result
 
 
 @pytest.mark.asyncio
-async def test_spawn_persists_a_real_independent_child(tmp_path):
+async def test_side_persists_a_real_independent_child(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session(
@@ -864,14 +868,17 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
             _store=store,
             get_or_create_session=AsyncMock(return_value=_parent_entry()),
             load_transcript=AsyncMock(return_value=history),
+            bind_session_route=AsyncMock(return_value=SimpleNamespace(session_id="side-child")),
+            close_session_route=AsyncMock(return_value="side-child"),
         )
+        side_adapter = SimpleNamespace(handle_message=AsyncMock())
+        runner._adapter_for_source = MagicMock(return_value=side_adapter)
 
-        await runner._handle_spawn_command(_event())
+        await runner._handle_side_command(_event())
         await asyncio.gather(*runner._background_tasks)
 
-        await_call = runner._run_background_task.await_args
-        assert await_call is not None
-        child_id = await_call.kwargs["task_id"]
+        side_event = side_adapter.handle_message.await_args.args[0]
+        child_id = side_event.metadata["gateway_session_id"]
         child = db.get_session(child_id)
         assert child is not None
         child_messages = db.get_messages_as_conversation(child_id)
@@ -886,10 +893,12 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
             ("assistant", "parent answer"),
         ]
         assert child["parent_session_id"] == "parent-1"
-        assert child["title"] == await_call.kwargs["task_title"]
-        assert child["session_key"] is None
+        assert child["title"].startswith("Side ")
+        assert child["session_key"].endswith(f":side:{child_id}")
         assert child["cwd"] == "/tmp/project"
-        assert json.loads(child["model_config"])["_spawned_from"] == "parent-1"
+        model_config = json.loads(child["model_config"])
+        assert model_config["_side_from"] == "parent-1"
+        assert model_config["_side_root"] == child_id
         assert [(m["role"], m["content"]) for m in child_messages] == [
             ("user", "parent question"),
             ("assistant", "parent answer"),
@@ -901,56 +910,5 @@ async def test_spawn_persists_a_real_independent_child(tmp_path):
         assert child_answer["effect_disposition"] == "unknown"
         assert child_answer["display_kind"] == "internal_notification"
         assert child_answer["display_metadata"] == {"source": "integration"}
-    finally:
-        db.close()
-
-
-@pytest.mark.asyncio
-async def test_pre_agent_failure_ends_real_spawn_child(tmp_path):
-    db = SessionDB(db_path=tmp_path / "state.db")
-    try:
-        db.create_session(
-            "spawn-real-failure",
-            "telegram",
-            model="parent-model",
-            parent_session_id=None,
-            user_id="12345",
-            chat_id="67890",
-            chat_type="dm",
-            thread_id="42",
-            model_config={"_spawned_from": "parent-1"},
-        )
-        runner = GatewayRunner.__new__(GatewayRunner)
-        object.__setattr__(
-            runner, "config", SimpleNamespace(multiplex_profiles=False)
-        )
-        runner._session_db = AsyncSessionDB(db)
-        setattr(
-            runner,
-            "_resolve_session_agent_runtime",
-            MagicMock(return_value=("test-model", {"api_key": None})),
-        )
-        adapter = AsyncMock()
-        adapter.send = AsyncMock()
-        runner.adapters = {Platform.TELEGRAM: adapter}
-        source = SessionSource(
-            platform=Platform.TELEGRAM,
-            user_id="12345",
-            chat_id="67890",
-            chat_type="dm",
-            thread_id="42",
-        )
-
-        await runner._run_background_task(
-            "test prompt",
-            source,
-            "spawn-real-failure",
-            task_kind="spawn",
-        )
-
-        child = db.get_session("spawn-real-failure")
-        assert child is not None
-        assert child["ended_at"] is not None
-        assert child["end_reason"] == "spawn_no_credentials"
     finally:
         db.close()
