@@ -102,6 +102,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-078 | Active | `feat(reasoning): restore one-turn slash prompts` | Run `/reasoning <level> <prompt>` and configured aliases such as `/ttt <prompt>` at an explicit effort for exactly one complete turn without restoring adaptive classification. |
 | HERMES-079 | Active | `fix(state): enforce application write patience` | Keep SQLite's connection busy handler from overrunning the application-level write-patience deadline. |
 | HERMES-080 | Active | `fix(browser): support durable managed profiles (#14)` | Let an isolated real-profile snapshot become an independently authenticated durable browser after its initial seed instead of overlaying source-profile authentication files on every relaunch. |
+| HERMES-081 | Active | `fix(gateway): preserve progress across transient previews` | Keep accumulated tool progress in one editable message across retracted previews while placing later tools below content that becomes durable. |
 
 ## Fork-only administrative subject exemptions
 
@@ -146,6 +147,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-081 — Preserve progress across transient previews
+
+- **Independent hypothesis (2026-08-30):** The progress sender treats an untyped stream reset as proof that a persistent assistant entry exists. Telegram streaming can expose a provisional preview and later retract it, or can delay the platform send while a subsequent tool starts. Clearing the progress anchor at the provisional signal fragments accumulated work into one message per tool; delaying the reset without pausing later tools instead places those tools above content that eventually becomes durable. The correction requires a correlated lifecycle boundary: open provisionally before asynchronous delivery can be overtaken, then commit or retract only the matching boundary after the platform outcome is known.
+- **Summary:** Replace the `__reset__` sentinel with typed provisional, durable, and retracted content-boundary events carrying stable IDs. Buffer tool updates while a boundary is provisional; replay them into the existing progress message after confirmed retraction, or into a new progress message below confirmed durable content. Native draft frames and filtered or empty segments cannot commit a durable split. Slow sends, overflow continuations, cancellation drains, and failed preview deletion preserve ordering conservatively and idempotently.
+- **Surfaces:** `gateway/progress_events.py`; `gateway/run.py`; `gateway/stream_consumer.py`; `tests/gateway/test_run_progress_topics.py`; `tests/gateway/test_stream_consumer.py`; `tests/gateway/test_stream_consumer_draft.py`; `tests/gateway/test_stream_consumer_silence.py`; this record.
+- **Upstream tracking:** Open issue #99026 documents Telegram DM-topic progress fragmentation under accumulated grouping.
+- **Upstream PR:** Open PR #99073 implements the same typed boundary lifecycle and carries equivalent regressions.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_stream_consumer.py tests/gateway/test_stream_consumer_draft.py tests/gateway/test_stream_consumer_silence.py tests/gateway/test_stream_consumer_tool_progress.py tests/gateway/test_run_progress_topics.py`; `scripts/run_tests.sh tests/gateway/test_run_cleanup_progress.py tests/gateway/test_run_progress_interrupt.py tests/gateway/test_telegram_progress_edit_transient.py tests/gateway/test_telegram_polling_progress.py`; focused coverage must prove one accumulated progress send across a retracted preview, a new progress send below durable content, slow-send ordering, overflow boundary correlation, filtered-segment retraction, draft-frame non-commit, conservative handling of failed deletion, cancellation draining, cleanup, and Telegram edit recovery.
+- **Expected published commit identity:** Stable subject `fix(gateway): preserve progress across transient previews`; source, regressions, and this record ship together.
+- **Rollback:** Revert only `fix(gateway): preserve progress across transient previews`, remove `gateway/progress_events.py`, restore the stream consumer's `on_new_message` callback and gateway `__reset__` handling, remove the HERMES-081 regressions, index row, and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version includes PR #99073 or equivalent correlated durable/retracted boundary semantics and passes all HERMES-081 regressions. Remove the fork implementation and duplicate tests rather than retaining parallel reset paths.
 
 ### HERMES-080 — Add durable managed profile refresh mode
 
