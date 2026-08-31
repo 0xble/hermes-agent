@@ -641,6 +641,13 @@ DEFAULT_CONFIG = {
         # real-profile local session even under a cloud browser backend. Toggle
         # in the desktop Settings → Browser section.
         "use_real_profile": False,
+        # Source-profile refresh policy for the isolated managed snapshot.
+        # "launch" preserves the historical behavior: Cookies/Login Data/Web
+        # Data/Preferences/Local State are overlaid from the normal profile on
+        # every managed-browser relaunch. "initial" seeds the snapshot once,
+        # then treats it as an independently authenticated durable browser so
+        # application-written cookies and web storage survive every relaunch.
+        "real_profile_refresh": "launch",
         # Optional named mappings to exact Chrome/Chromium profile directories.
         # Once configured, browser entry tools resolve an explicit identity or
         # default_identity and never consult Chromium's mutable last_used.

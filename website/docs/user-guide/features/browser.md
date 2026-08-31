@@ -180,11 +180,35 @@ same Safe Storage keychain identity; Hermes does not launch these snapshots with
 mock-keychain or basic-password-store switches. Your live browser profile is
 **never opened directly**: the snapshot is a separate directory, so it doesn't
 fight your running browser for the profile lock and it sidesteps Chrome 136+'s
-block on remote-debugging the default profile directory. The auth files
-(cookies/logins/preferences) are re-synced from your real profile whenever a
-fresh session is launched, so logins you do in your own browser show up in the
-agent's session. Only the active profile is copied — other Chrome profiles are
-never snapshotted.
+block on remote-debugging the default profile directory.
+
+By default, `browser.real_profile_refresh` is `launch`: Cookies, Login Data, Web
+Data, Preferences, and Local State are overlaid from the selected normal profile
+whenever Hermes must launch a fresh managed browser process. This compatibility
+mode does not refresh Local Storage, Session Storage, or IndexedDB, so applications
+whose authentication spans those stores may remain signed out.
+
+Set the policy to `initial` to make the managed snapshot a durable independent
+browser after its first successful seed:
+
+```yaml
+browser:
+  use_real_profile: true
+  real_profile_refresh: initial
+```
+
+In `initial` mode, later launches reuse the completed snapshot without reading,
+locking, or overlaying the normal profile. Logins completed inside the headed
+Hermes-managed browser, including cookies, Local Storage, Session Storage, and
+IndexedDB written by the application, persist across browser and gateway restarts.
+Switching an existing snapshot from `launch` to `initial` adopts its current
+state; authenticate any missing applications inside that managed browser. Use
+`launch` only when normal-profile cookie refreshes are more important than
+preserving independent managed-browser login state. Neither mode opens or controls
+the live normal browser profile.
+
+Only the selected profile is copied during the initial seed. Other Chrome profiles
+are never snapshotted.
 
 The snapshot browser runs **headless** by default, so it stays in the background
 without stealing focus. Chrome's new headless mode reads the normal cookie store,
