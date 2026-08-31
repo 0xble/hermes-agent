@@ -3308,6 +3308,27 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Shared per-CHAT typing budget, keyed by chat_id.
+        # _keep_typing runs per SESSION but platforms rate-limit per CHAT, and
+        # Telegram DM topics all share one chat_id — so N concurrent sessions
+        # multiplied the sendChatAction rate by N against a ~1 msg/s per-chat
+        # envelope until the platform issued a multi-hour flood penalty. The
+        # progress-edit consumer already solved this with a shared clock
+        # (gateway/run.py ``_progress_edit_clock``); typing needs the same
+        # bound.
+        #
+        # A single shared interval is the WRONG shape here, though: a progress
+        # bubble is an idempotent state update (a stale one is harmless), while
+        # typing is a decaying lease the platform expires after ~5s and which
+        # is rendered per THREAD. Round-robining one clock across N threads
+        # would refresh each bubble every N*interval and kill all of them.
+        #
+        # So: keep the per-thread refresh cadence, bound the CHAT's aggregate
+        # rate, and SHED tick that cannot afford budget rather than queueing it.
+        # Typing is cosmetic — it is the correct traffic to drop first under
+        # pressure, ahead of progress edits and far ahead of the final answer.
+        self._typing_chat_next_allowed: Dict[str, float] = {}
+        self._typing_chat_state_max = 4096
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5461,10 +5482,64 @@ class BasePlatformAdapter(ABC):
 
         return paths, cleaned
 
+    # Minimum seconds between ANY two typing refreshes in one chat, across
+    # every session sharing it. Platform typing status expires after ~5s, so a
+    # 4.0s per-thread cadence with a 1.0s chat floor keeps up to ~4 concurrent
+    # threads visibly typing and sheds ticks beyond that instead of spending
+    # the chat's whole rate budget on a cosmetic indicator.
+    _TYPING_CHAT_MIN_GAP_S = 1.0
+
+    def _claim_typing_chat_budget(
+        self, chat_id: str, interval: float | None = None,
+    ) -> bool:
+        """Reserve this chat's next typing slot, or shed the tick.
+
+        Returns True when the caller may send a typing refresh now. Returns
+        False when another session in the same chat sent one too recently —
+        the caller must DROP this tick, not wait for it, so a busy chat
+        degrades to fewer live bubbles rather than an escalating flood
+        penalty that silences the chat entirely.
+
+        The floor is ``min(_TYPING_CHAT_MIN_GAP_S, interval)``, never the bare
+        constant. The invariant this enforces is "a chat's aggregate typing
+        rate never exceeds what ONE session at the configured cadence would
+        produce alone" — which is the actual goal, and which a fixed constant
+        gets wrong in both directions. Coarser than the interval, it would
+        shed a LONE session's ticks and kill the indicator for a single user
+        who deliberately configured a fast refresh. Finer, it would let
+        concurrent sessions stack above the single-session rate, which is the
+        bug. Deriving it from the caller's own interval is correct at every
+        cadence and leaves the production case (1.0s floor under a 4.0s
+        interval, so ~4 concurrent threads keep live bubbles) unchanged.
+        """
+        budget = getattr(self, "_typing_chat_next_allowed", None)
+        if budget is None:
+            # Bare/legacy adapters built without __init__ keep working
+            # unthrottled rather than losing their typing indicator.
+            return True
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return True
+        key = str(chat_id)
+        if now < budget.get(key, 0.0):
+            return False
+        gap = float(self._TYPING_CHAT_MIN_GAP_S)
+        if interval is not None:
+            gap = min(gap, max(0.0, float(interval)))
+        budget[key] = now + gap
+        # Opportunistic trim: drop chats whose reservation is long expired.
+        # Bounded work, no background task (mirrors _progress_edit_clock).
+        if len(budget) > self._typing_chat_state_max:
+            cutoff = now - 300.0
+            for stale in [k for k, v in budget.items() if v < cutoff]:
+                budget.pop(stale, None)
+        return True
+
     async def _keep_typing(
         self,
         chat_id: str,
-        interval: float = 2.0,
+        interval: float = 4.0,
         metadata=None,
         stop_event: asyncio.Event | None = None,
     ) -> None:
@@ -5496,7 +5571,10 @@ class BasePlatformAdapter(ABC):
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                if (
+                    chat_id not in self._typing_paused
+                    and self._claim_typing_chat_budget(chat_id, interval)
+                ):
                     try:
                         await asyncio.wait_for(
                             self.send_typing(chat_id, metadata=metadata),

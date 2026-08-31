@@ -9747,9 +9747,38 @@ class TelegramAdapter(BasePlatformAdapter):
         self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         return False
 
+    def _chat_in_send_cooldown(self, chat_id: Any) -> bool:
+        """True while this chat is inside a published flood-control window.
+
+        ``_send_cooldown_until`` is the per-chat gate that every ``send()`` and
+        edit already honours. ``send_chat_action`` bypassed it entirely: its
+        only guard was ``_typing_in_cooldown``, a private dict written solely
+        by ``_record_typing_cooldown`` from this method's own exception
+        handlers. So a chat under a known multi-thousand-second penalty kept
+        taking a typing call every couple of seconds per active session —
+        pure API pressure against a bot the server had already told us to back
+        off from, on the one path the cooldown did not cover.
+
+        Reads ``time.monotonic()`` deliberately: ``_send_cooldown_until``
+        stores monotonic deadlines, while ``_typing_in_cooldown`` works in
+        loop time. They are the same clock in practice on CPython but that is
+        not contractual, and mixing them would silently mis-gate.
+        """
+        cooldowns = getattr(self, "_send_cooldown_until", None)
+        if not cooldowns:
+            return False
+        until = cooldowns.get(str(chat_id))
+        if until is None:
+            return False
+        return time.monotonic() < float(until or 0.0)
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
-        if not self._bot or self._typing_in_cooldown(chat_id):
+        if (
+            not self._bot
+            or self._typing_in_cooldown(chat_id)
+            or self._chat_in_send_cooldown(chat_id)
+        ):
             return
 
         _is_dm_topic: bool = False
