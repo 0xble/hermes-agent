@@ -695,159 +695,120 @@ class TestLiveAdapterMedia:
 
         return asyncio.run(_run())
 
-    def test_live_adapter_delivers_media_attachments(self, monkeypatch):
-        from gateway.config import Platform
 
-        calls = []
+    # NOTE ON SCOPE (2026-08-31): the fork's private media implementation was
+    # retired in favour of upstream's shared ``_send_live_adapter_media``,
+    # which owns caption splitting, video/voice routing, per-descriptor
+    # validation and the inherited-no-op guard, and is covered by
+    # tests/tools/test_send_message_target_parse.py. Routing assertions that
+    # merely re-tested that shared implementation were removed rather than
+    # ported, per the fork patch lifecycle ("adapt or delete duplicate tests").
+    # What remains here is the behaviour still owned by this fork: the
+    # ambiguous partial-delivery report, and album batching.
+
+    def test_partial_media_failure_reports_ambiguity_not_success(self, monkeypatch, tmp_path):
+        """Text delivered + media failed must be an ambiguous error naming the
+        partial delivery, never a verified success and never ``pre_send``.
+
+        This is the contract the outbound ledger depends on: a send that
+        half-landed must not be retried as if nothing happened, nor recorded
+        as fully delivered.
+        """
+        good = tmp_path / "chart.png"
+        good.write_bytes(b"\x89PNG\r\n\x1a\n")
+        bad = tmp_path / "report.pdf"
+        bad.write_bytes(b"%PDF-1.4")
 
         class MediaAdapter:
-            async def send(self, *, chat_id, content, metadata=None):
-                calls.append(("send", chat_id, content))
-                return SimpleNamespace(success=True, message_id="m-1", error=None)
+            async def send(self, chat_id, content, metadata=None, **kw):
+                return SimpleNamespace(success=True, message_id="m-text", error=None)
 
-            async def send_multiple_images(self, *, chat_id, images, metadata=None):
-                calls.append(("images", chat_id, tuple(images)))
-                return SimpleNamespace(success=True, message_id="m-2", error=None)
+            async def send_image_file(self, chat_id, path, **kw):
+                return SimpleNamespace(success=True, message_id="m-img", error=None)
 
-            async def send_voice(self, *, chat_id, audio_path, metadata=None):
-                calls.append(("voice", chat_id, audio_path))
-                return SimpleNamespace(success=True, message_id="m-3", error=None)
-
-            async def send_document(self, *, chat_id, file_path, metadata=None):
-                calls.append(("document", chat_id, file_path))
-                return SimpleNamespace(success=True, message_id="m-4", error=None)
-
-        adapter = MediaAdapter()
-        result = self._send(
-            monkeypatch,
-            adapter,
-            message="report attached",
-            media_files=[
-                ("/tmp/chart.png", False),
-                ("/tmp/report.pdf", False),
-                ("/tmp/note.ogg", True),
-            ],
-        )
-
-        assert result["success"] is True
-        assert result["message_id"] == "m-1"
-        assert result["media_delivered"] == 3
-        kinds = [c[0] for c in calls]
-        assert kinds == ["send", "images", "document", "voice"]
-        assert calls[1][2] == (("file:///tmp/chart.png", ""),)
-        assert calls[2][2] == "/tmp/report.pdf"
-        assert calls[3][2] == "/tmp/note.ogg"
-
-    def test_live_adapter_delivers_media_only_message(self, monkeypatch):
-        class MediaOnlyAdapter:
-            async def send(self, **_kwargs):
-                raise AssertionError("media-only delivery must not send empty text")
-
-            async def send_document(self, *, chat_id, file_path, metadata=None):
-                return SimpleNamespace(success=True, message_id="m-2", error=None)
-
-        result = self._send(
-            monkeypatch,
-            MediaOnlyAdapter(),
-            message="",
-            media_files=[("/tmp/report.pdf", False)],
-        )
-
-        assert result == {"success": True, "message_id": None, "media_delivered": 1}
-
-    def test_live_adapter_media_failure_is_reported_not_silent(self, monkeypatch):
-        from gateway.config import Platform
-
-        class FailingMediaAdapter:
-            async def send(self, *, chat_id, content, metadata=None):
-                return SimpleNamespace(success=True, message_id="m-1", error=None)
-
-            async def send_document(self, *, chat_id, file_path, metadata=None):
+            async def send_document(self, chat_id, path, **kw):
                 return SimpleNamespace(
                     success=False, message_id=None, error="document upload rejected"
                 )
 
-        adapter = FailingMediaAdapter()
         result = self._send(
             monkeypatch,
-            adapter,
+            MediaAdapter(),
             message="report attached",
-            media_files=[("/tmp/report.pdf", False)],
+            media_files=[(str(good), False), (str(bad), False)],
         )
 
         assert "error" in result
-        assert "media" in result["error"]
         assert "document upload rejected" in result["error"]
-        # Text already reached the platform: the failure must stay ambiguous
-        # (no pre_send marker) and surface what was delivered.
+        # Ambiguous, not pre_send: the text already reached the platform.
         assert result.get("delivery_stage") != "pre_send"
-        assert result["message_id"] == "m-1"
-        assert result["media_delivered"] == 0
+        assert result["message_id"] == "m-text"
+        # The count ships under a name that cannot be misread as success.
+        assert result["media_partial_count"] == 1
+        assert "media_delivered" not in result
 
-    def test_live_adapter_force_document_routes_images_as_documents(self, monkeypatch):
-        from gateway.config import Platform
+    def test_media_failure_before_any_delivery_is_not_ambiguous(self, monkeypatch, tmp_path):
+        """No text and no media delivered is a plain failure, not a partial."""
+        bad = tmp_path / "report.pdf"
+        bad.write_bytes(b"%PDF-1.4")
 
-        calls = []
+        class MediaAdapter:
+            async def send(self, chat_id, content, metadata=None, **kw):
+                return SimpleNamespace(success=True, message_id=None, error=None)
 
-        class DocAdapter:
-            async def send(self, *, chat_id, content, metadata=None):
-                return SimpleNamespace(success=True, message_id="m-1", error=None)
+            async def send_document(self, chat_id, path, **kw):
+                return SimpleNamespace(
+                    success=False, message_id=None, error="document upload rejected"
+                )
 
-            async def send_document(self, *, chat_id, file_path, metadata=None):
-                calls.append(("document", file_path))
-                return SimpleNamespace(success=True, message_id="m-2", error=None)
-
-        adapter = DocAdapter()
         result = self._send(
             monkeypatch,
-            adapter,
-            message="lossless attached",
-            media_files=[("/tmp/diagram.png", False)],
-            force_document=True,
+            MediaAdapter(),
+            message="",
+            media_files=[(str(bad), False)],
         )
 
-        assert result["success"] is True
-        assert result["media_delivered"] == 1
-        assert calls == [("document", "/tmp/diagram.png")]
+        assert "error" in result
+        assert "media_partial_count" not in result
+        assert "media_delivered" not in result
 
-    def test_none_returning_media_senders_count_as_delivered(self, monkeypatch):
-        """Real adapters type send_multiple_images (and some senders) -> None.
+    def test_multi_image_send_is_batched_as_one_album(self, monkeypatch, tmp_path):
+        """Album batching is fork-owned and must survive the upstream helper.
 
-        A None result is success (failures raise or return success=False);
-        treating it as failure aborts remaining attachments and records an
-        ambiguous ledger result for a delivery that actually succeeded.
+        Upstream delivers each descriptor individually. On Telegram that turns
+        a 3-image album into 3 separate messages, so batching is preserved for
+        adapters that implement ``send_multiple_images`` natively.
         """
+        paths = []
+        for name in ("a.png", "b.png", "c.png"):
+            f = tmp_path / name
+            f.write_bytes(b"\x89PNG\r\n\x1a\n")
+            paths.append(str(f))
+
         calls = []
 
-        class NoneReturningAdapter:
-            async def send(self, *, chat_id, content, metadata=None):
-                return SimpleNamespace(success=True, message_id="m-1", error=None)
+        class BatchingAdapter:
+            async def send(self, chat_id, content, metadata=None, **kw):
+                calls.append("send")
+                return SimpleNamespace(success=True, message_id="m-text", error=None)
 
-            async def send_multiple_images(self, *, chat_id, images, metadata=None):
-                calls.append(("images", tuple(images)))
-                return None
+            async def send_multiple_images(self, chat_id, images, metadata=None, **kw):
+                calls.append("images")
+                return [SimpleNamespace(success=True, message_id="m-album", error=None)]
 
-            async def send_video(self, *, chat_id, video_path, metadata=None):
-                calls.append(("video", video_path))
-                return None
+            async def send_image_file(self, chat_id, path, **kw):
+                calls.append("image")
+                return SimpleNamespace(success=True, message_id="m-img", error=None)
 
-            async def send_document(self, *, chat_id, file_path, metadata=None):
-                calls.append(("document", file_path))
-                return SimpleNamespace(success=True, message_id="m-2", error=None)
-
-        adapter = NoneReturningAdapter()
         result = self._send(
             monkeypatch,
-            adapter,
-            message="album attached",
-            media_files=[
-                ("/tmp/chart.png", False),
-                ("/tmp/demo.mp4", False),
-                ("/tmp/report.pdf", False),
-            ],
+            BatchingAdapter(),
+            message="three charts",
+            media_files=[(p, False) for p in paths],
         )
 
         assert result["success"] is True
-        assert result["media_delivered"] == 3
-        assert [c[0] for c in calls] == ["images", "video", "document"]
-        assert calls[1][1] == "/tmp/demo.mp4"
+        assert result["media_delivered"] is True
+        # One batched album call, not three individual image sends.
+        assert calls.count("images") == 1
+        assert calls.count("image") == 0
