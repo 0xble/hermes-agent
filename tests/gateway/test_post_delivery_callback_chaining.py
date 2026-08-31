@@ -17,7 +17,13 @@ import inspect
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.session import SessionSource
 
 
 class _MinAdapter(BasePlatformAdapter):
@@ -79,6 +85,49 @@ class TestPostDeliveryCallbackChaining:
         _invoke(cb)
         assert fired == ["A", "B", "C"]
 
+    def test_newer_generation_does_not_replace_pending_older_generation(
+        self, adapter
+    ):
+        """A queued turn may register before the prior turn's finally block."""
+        fired = []
+        adapter.register_post_delivery_callback(
+            "s", lambda: fired.append("first"), generation=1
+        )
+        adapter.register_post_delivery_callback(
+            "s", lambda: fired.append("second"), generation=2
+        )
+
+        first_cb = adapter.pop_post_delivery_callback("s", generation=1)
+        second_cb = adapter.pop_post_delivery_callback("s", generation=2)
+
+        assert first_cb is not None
+        assert second_cb is not None
+        _invoke(first_cb)
+        _invoke(second_cb)
+        assert fired == ["first", "second"]
+
+    def test_same_generation_still_chains_in_registration_order(self, adapter):
+        fired = []
+        adapter.register_post_delivery_callback(
+            "s", lambda: fired.append("A"), generation=4
+        )
+        adapter.register_post_delivery_callback(
+            "s", lambda: fired.append("B"), generation=4
+        )
+
+        callback = adapter.pop_post_delivery_callback("s", generation=4)
+
+        assert callback is not None
+        _invoke(callback)
+        assert fired == ["A", "B"]
+
+    def test_new_stale_generation_is_rejected(self, adapter):
+        adapter.register_post_delivery_callback("s", lambda: None, generation=5)
+        adapter.register_post_delivery_callback("s", lambda: None, generation=4)
+
+        assert ("s", 4) not in adapter._post_delivery_callbacks_by_generation
+        assert ("s", 5) in adapter._post_delivery_callbacks_by_generation
+
 
 class TestPostDeliveryCallbackAsyncChaining:
     """When an async callback is chained, the wrapper must await it.
@@ -101,4 +150,64 @@ class TestPostDeliveryCallbackAsyncChaining:
         cb = adapter.pop_post_delivery_callback("s")
         _invoke(cb)
         assert fired == ["sync", "async"]
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_fires_each_turns_generation_callback(adapter):
+    """A handoff must not overwrite the guard generation or callback slot.
+
+    ``_process_message_background`` starts an already-queued follow-up before
+    the first task enters its post-delivery ``finally`` block. The follow-up
+    therefore binds a newer generation on the shared active-session event and
+    registers its callback while the first callback is still pending.
+    """
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="1234",
+        chat_type="private",
+        thread_id="77",
+    )
+    first_event = MessageEvent(
+        text="first",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="1",
+    )
+    second_event = MessageEvent(
+        text="second",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="2",
+    )
+    session_key = "agent:main:telegram:dm:1234:77"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    fired = []
+
+    async def _handler(event):
+        guard = adapter._active_sessions[session_key]
+        if event.text == "first":
+            guard._hermes_run_generation = 1
+            adapter.register_post_delivery_callback(
+                session_key, lambda: fired.append("first"), generation=1
+            )
+            adapter._pending_messages[session_key] = second_event
+            return "first done"
+
+        guard._hermes_run_generation = 2
+        adapter.register_post_delivery_callback(
+            session_key, lambda: fired.append("second"), generation=2
+        )
+        return "second done"
+
+    adapter.set_message_handler(_handler)
+
+    await adapter._process_message_background(first_event, session_key)
+    for _ in range(100):
+        if len(fired) == 2:
+            break
+        await asyncio.sleep(0.01)
+
+    assert fired == ["first", "second"]
+    assert adapter._post_delivery_callbacks == {}
+    assert adapter._post_delivery_callbacks_by_generation == {}
 

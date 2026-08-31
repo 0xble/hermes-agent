@@ -107,6 +107,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-083 | Active | `fix(reconcile): restore side and internal-turn contracts` | Preserve continuable side routing and internal-notification provenance across upstream async API changes. |
 | HERMES-084 | Active | `fix(gateway): bound per-chat typing indicator traffic` | Bound the typing indicator's per-CHAT API rate across concurrent sessions and quiesce it during a flood window. |
 | HERMES-085 | Active | `fix(gateway): defer flood-controlled delivery obligations` | Treat a platform flood rejection as a timed deferral rather than a terminal delivery failure. |
+| HERMES-086 | Active | `fix(gateway): preserve queued-turn cleanup callbacks` | Keep each completed turn's temporary progress cleanup when a queued follow-up starts before the prior delivery task unwinds. |
 
 ## Fork-only administrative subject exemptions
 
@@ -153,6 +154,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-086 — Preserve queued-turn cleanup callbacks
+
+- **Independent hypothesis (2026-08-31):** The affected Telegram topic retained heartbeat message `163768` (`⏳ Working — 9 min — receiving stream response`) below the completed answer even though `display.platforms.telegram.cleanup_progress: true`. The same run received an internal watch-pattern follow-up while busy, and the gateway logged a queued-follow-up handoff immediately before the final response. `BasePlatformAdapter` stored only one post-delivery callback per session and read callback ownership from the shared active-session event inside `finally`; the queued turn could therefore overwrite both the older callback slot and the event's generation before the older delivery task popped it. The correction belongs in the shared delivery lifecycle, not Telegram deletion or progress rendering.
+- **Summary:** Store generation-owned post-delivery callbacks in independent `(session, generation)` lanes, retain same-generation chaining and stale-registration rejection, snapshot ownership immediately after the message handler returns, and pop that immutable turn-local generation after delivery. Generation-less legacy callbacks and directly populated legacy tuple entries retain their previous behavior. Queued turns may start before prior delivery cleanup without stranding either turn's callback.
+- **Surfaces:** `gateway/platforms/base.py`; `tests/gateway/test_post_delivery_callback_chaining.py`; this record.
+- **Upstream tracking:** Merged PR #21186 introduced opt-in progress cleanup but uses the single session callback slot. Closed issue #21611 and closed PR #12565 cover adjacent final-delivery ownership races; #12565 moved the generation read after agent execution but still reads the shared event only in `finally`. No upstream issue or PR was found for preserving two simultaneously pending callback generations as of 2026-08-31.
+- **Upstream PR:** Open PRs #31931 and #60088 make generationed pops consume unowned raw callbacks but retain one session slot, so they do not prevent a newer queued turn from replacing an older owned callback. Open PR #16553 defers watch notifications and can avoid one trigger, but it does not cover ordinary queued follow-ups and its review identifies async callback-chain loss. Closed PR #47859 adds delayed cleanup state for background delivery, but does not isolate callback generations or the shared-event ownership snapshot. None is an equivalent retirement candidate.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_run_cleanup_progress.py tests/gateway/test_status_command.py tests/gateway/test_run_progress_topics.py tests/gateway/test_active_session_text_merge.py -q`; the focused callback file must fail before the patch with the older generation missing and the queued-handoff case firing only the newer callback, then pass with both callbacks firing once in turn order and both registries empty.
+- **Expected published commit identity:** Stable subject `fix(gateway): preserve queued-turn cleanup callbacks`; source, regressions, and this record ship together.
+- **Rollback:** Revert only `fix(gateway): preserve queued-turn cleanup callbacks`, restore the single per-session callback slot and the late shared-event generation read, remove the focused regressions, index row, and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version preserves callbacks for overlapping queued delivery generations, snapshots callback ownership before a follow-up can rebind shared session state, and passes equivalent same-generation chaining, stale-registration, queued-handoff, progress-cleanup, and final-delivery regressions.
 
 ### HERMES-085 — Defer flood-controlled delivery obligations
 
