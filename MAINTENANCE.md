@@ -143,6 +143,8 @@ These exact subjects are fork-only history but do not define independently retir
 | `test(compression): close worker-owned state handles` | Deterministic test teardown for compression timeout regressions; waits for worker completion and closes temporary `SessionDB` handles on the owning test thread without changing shipped behavior. |
 | `test(reconcile): align compaction prompt rebuild contract` | Rebase reconciliation preserving HERMES-025's would-grow outcome, accepting upstream's live prompt rebuild, and replacing source-introspection checks with behavioral coverage; also advances the history gate to this run's rebased pre-change commit, without changing shipped Hermes behavior. |
 | `fix(ci): source install E2E tags from upstream (#11)` | Standalone-mirror CI repair that reads canonical release tags without mirroring them into fork origin; no shipped Hermes behavior. |
+| `fix(ci): right-size private fork workflows (#12)` | Fork-administrative CI policy only: removes upstream operations, path-gates retained checks, and validates candidates from a trusted default-branch `pull_request_target` workflow with exact action and reusable-workflow allowlists; no shipped Hermes behavior. |
+| `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
