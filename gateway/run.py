@@ -8413,7 +8413,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 wrapper = AsyncSessionDB(borrowed)
                 # close_all_session_db_handles() must not close what the store
                 # owns; the store's own sweep already does, and it runs first.
-                wrapper.__dict__["_hermes_borrowed_handle"] = True
+                #
+                # Set defensively: the marker is an optimisation for that
+                # sweep, so a wrapper that cannot carry it (a lightweight test
+                # double, __slots__) must not turn a healthy borrow into a
+                # cached open failure. Symmetric with the read side, which
+                # already tolerates a missing __dict__ via getattr.
+                try:
+                    wrapper.__dict__["_hermes_borrowed_handle"] = True
+                except AttributeError:
+                    pass
                 return wrapper
             if store is not None:
                 # The store exists and its handle is unavailable (failed open
