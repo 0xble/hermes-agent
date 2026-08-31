@@ -933,6 +933,31 @@ def _real_profile_autoclose() -> bool:
     return False
 
 
+_REAL_PROFILE_REFRESH_MODES = frozenset({"launch", "initial"})
+
+
+def _real_profile_refresh_mode() -> tuple[str | None, str | None]:
+    """Return the configured source refresh mode, failing closed if invalid."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        raw = (
+            browser_cfg.get("real_profile_refresh", "launch")
+            if isinstance(browser_cfg, dict)
+            else "launch"
+        )
+    except Exception as e:
+        logger.debug("could not read real_profile_refresh: %s", e)
+        return "launch", None
+    mode = raw.strip().lower() if isinstance(raw, str) else ""
+    if mode not in _REAL_PROFILE_REFRESH_MODES:
+        allowed = ", ".join(sorted(_REAL_PROFILE_REFRESH_MODES))
+        return None, f"browser.real_profile_refresh must be one of: {allowed}"
+    return mode, None
+
+
 def _processes_holding_profile(src: str):
     """Yield (psutil.Process) instances holding the user-data-dir ``src`` open.
 
@@ -1049,11 +1074,64 @@ def snapshot_real_profile(
     succeeds; a torn/interrupted first copy (disk full, Ctrl+C) therefore never
     looks "already populated" on the next run — it is redone from scratch.
 
-    Auth files are re-synced on every call so fresh logins from the user's own
-    browsing show up. Locked-file copy errors are tolerated best-effort.
+    With ``browser.real_profile_refresh: launch`` (the compatibility default),
+    auth files are re-synced on every call. With ``initial``, a completed
+    snapshot becomes an independently authenticated durable browser and is
+    reused without reading or overlaying the source profile.
 
     Returns ``(copy_dir, None)`` on success, ``(None, error)`` on failure.
     """
+    refresh_mode, refresh_error = _real_profile_refresh_mode()
+    if refresh_error:
+        return None, refresh_error
+
+    # Durable managed profiles must not depend on the normal browser after the
+    # initial seed. Resolve their identity-owned destination and completion
+    # marker before touching the source profile, which may be unavailable or
+    # locked on later launches.
+    if refresh_mode == "initial":
+        # An explicit argument or configured pin is part of the requested
+        # identity. A changed pin must not silently adopt the old snapshot. With
+        # no pin, the completion marker is the durable source-of-truth after the
+        # first active-profile seed.
+        durable_requested_profile = source_profile or _real_profile_pin()
+        durable_dst = real_profile_copy_dir(
+            browser,
+            identity=identity,
+            source_profile=(durable_requested_profile or "")
+            if identity is not None
+            else "",
+        )
+        durable_marker = os.path.join(durable_dst, _SNAPSHOT_DONE_MARKER)
+        durable_source_profile = ""
+        try:
+            if os.path.isfile(durable_marker):
+                with open(durable_marker, encoding="utf-8", errors="replace") as fh:
+                    durable_source_profile = fh.read().strip()
+        except OSError:
+            durable_source_profile = ""
+        marker_matches = bool(durable_source_profile) and (
+            durable_requested_profile is None
+            or durable_source_profile == durable_requested_profile
+        )
+        if marker_matches and os.path.isdir(os.path.join(durable_dst, "Default")):
+            snapshot_root = str(get_hermes_home() / "browser-profile")
+            secured_paths = [snapshot_root]
+            if identity is not None:
+                secured_paths.append(os.path.join(snapshot_root, "identities"))
+            secured_paths.extend((os.path.dirname(durable_dst), durable_dst))
+            for secure_path in dict.fromkeys(
+                path for path in secured_paths if path
+            ):
+                _secure_snapshot_root(secure_path)
+            for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                try:
+                    os.unlink(os.path.join(durable_dst, leftover))
+                except OSError:
+                    pass
+            _secure_snapshot_contents(durable_dst)
+            return durable_dst, None
+
     src = src or real_profile_data_dir(browser)
     if not src or not os.path.isdir(src):
         return None, (

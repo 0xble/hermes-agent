@@ -10,6 +10,7 @@ import json
 import os
 import ntpath
 import subprocess
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -132,6 +133,144 @@ class TestSnapshotRealProfile:
         assert err2 is None and dst2 == dst
         assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "sqlite-cookies-v2"
         assert copy_history.read_text() == "agent-session-history"
+
+    def test_initial_refresh_mode_reuses_managed_state_without_source(
+        self, tmp_path, monkeypatch
+    ):
+        import shutil
+
+        import hermes_cli.browser_connect as bc
+        import hermes_cli.config as config
+
+        src = self._make_profile(tmp_path / "real")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(
+            config,
+            "read_raw_config",
+            lambda: {"browser": {"real_profile_refresh": "initial"}},
+        )
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None and dst is not None
+        managed_cookies = Path(dst) / "Default" / "Cookies"
+        managed_cookies.write_text("managed-session")
+        managed_local_storage = Path(dst) / "Default" / "Local Storage" / "leveldb"
+        managed_indexed_db = (
+            Path(dst) / "Default" / "IndexedDB" / "https_app.example_0.indexeddb.leveldb"
+        )
+        managed_local_storage.mkdir(parents=True)
+        managed_indexed_db.mkdir(parents=True)
+        (managed_local_storage / "000003.log").write_text("managed-local-storage")
+        (managed_indexed_db / "000003.log").write_text("managed-indexed-db")
+        shutil.rmtree(src)
+
+        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
+
+        assert err2 is None and dst2 == dst
+        assert managed_cookies.read_text() == "managed-session"
+        assert (managed_local_storage / "000003.log").read_text() == "managed-local-storage"
+        assert (managed_indexed_db / "000003.log").read_text() == "managed-indexed-db"
+
+    def test_initial_refresh_mode_preserves_named_identity_state(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+        import hermes_cli.config as config
+
+        src = self._make_profile(tmp_path / "real")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(
+            config,
+            "read_raw_config",
+            lambda: {"browser": {"real_profile_refresh": "initial"}},
+        )
+        dst, err = bc.snapshot_real_profile(
+            "chrome",
+            src=str(src),
+            source_profile="Default",
+            identity="lpg",
+        )
+        assert err is None and dst is not None
+        managed_cookies = Path(dst) / "Default" / "Cookies"
+        managed_cookies.write_text("lpg-managed-session")
+        (src / "Default" / "Cookies").write_text("source-session-v2")
+        monkeypatch.setattr(
+            bc,
+            "_profile_is_locked",
+            lambda *_args: (_ for _ in ()).throw(
+                AssertionError("durable relaunch must not probe the source profile")
+            ),
+        )
+
+        dst2, err2 = bc.snapshot_real_profile(
+            "chrome",
+            src=str(src),
+            source_profile="Default",
+            identity="lpg",
+        )
+
+        assert err2 is None and dst2 == dst
+        assert managed_cookies.read_text() == "lpg-managed-session"
+
+    def test_initial_refresh_mode_reseeds_when_legacy_pin_changes(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+        import hermes_cli.config as config
+
+        src = self._make_profile(tmp_path / "real")
+        alternate = src / "Profile 1"
+        (alternate / "Network").mkdir(parents=True)
+        (alternate / "Cookies").write_text("profile-one-cookies")
+        (alternate / "Network" / "Cookies").write_text("profile-one-network")
+        (alternate / "Preferences").write_text("profile-one-preferences")
+        home = tmp_path / "hermes-home"
+        browser_cfg = {
+            "real_profile_refresh": "initial",
+            "real_profile_pin": "Default",
+        }
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(config, "read_raw_config", lambda: {"browser": browser_cfg})
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None and dst is not None
+        assert (Path(dst) / bc._SNAPSHOT_DONE_MARKER).read_text() == "Default"
+
+        browser_cfg["real_profile_pin"] = "Profile 1"
+        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
+
+        assert err2 is None and dst2 == dst
+        assert dst2 is not None
+        assert (Path(dst2) / bc._SNAPSHOT_DONE_MARKER).read_text() == "Profile 1"
+        assert (
+            Path(dst2) / "Default" / "Cookies"
+        ).read_text() == "profile-one-cookies"
+
+    def test_invalid_refresh_mode_fails_closed_before_profile_access(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.browser_connect as bc
+        import hermes_cli.config as config
+
+        monkeypatch.setattr(
+            config,
+            "read_raw_config",
+            lambda: {"browser": {"real_profile_refresh": "sometimes"}},
+        )
+
+        dst, err = bc.snapshot_real_profile(
+            "chrome", src=str(tmp_path / "missing-source")
+        )
+
+        assert dst is None
+        assert err == "browser.real_profile_refresh must be one of: initial, launch"
+
+    def test_real_profile_refresh_default_is_launch(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["browser"]["real_profile_refresh"] == "launch"
 
     def test_missing_source_fails_closed(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
