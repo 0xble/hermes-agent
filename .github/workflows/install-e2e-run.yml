@@ -29,11 +29,6 @@ on:
         required: false
         type: string
         default: refs/heads/main
-      runner:
-        description: 'Runner label.'
-        required: false
-        type: string
-        default: ubuntu-latest
       timeout-minutes:
         description: 'Job timeout. A cold run installs real toolchains twice.'
         required: false
@@ -46,7 +41,7 @@ permissions:
 jobs:
   e2e:
     name: ${{ inputs.route }} from ${{ inputs.install-ref }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:

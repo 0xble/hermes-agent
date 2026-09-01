@@ -102,7 +102,11 @@ from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
-from agent.turn_finalizer import finalize_turn, _merge_verification_candidate
+from agent.turn_finalizer import (
+    finalize_turn,
+    _merge_verification_candidate,
+    _verification_candidate_replaces_pending,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -8664,14 +8668,35 @@ def run_conversation(
                     # Track whether this candidate was already streamed so the
                     # finalizer can mark the turn previewed only if the
                     # candidate is actually reused as the final response.
-                    _pending_verification_response = _merge_verification_candidate(
-                        _pending_verification_response,
+                    _previous_pending_response = _pending_verification_response
+                    _candidate_replaces_pending = (
+                        _verification_candidate_replaces_pending(
+                            _previous_pending_response,
+                            final_response,
+                        )
+                    )
+                    _merged_pending_response = _merge_verification_candidate(
+                        _previous_pending_response,
                         final_response,
                     )
-                    _pending_verification_response_previewed = (
-                        _pending_verification_response_previewed
-                        or agent._interim_content_was_streamed(final_response or "")
+                    _candidate_composed_pending = bool(
+                        _previous_pending_response
+                        and _merged_pending_response != _previous_pending_response
+                        and _merged_pending_response != final_response
                     )
+                    _pending_verification_response = _merged_pending_response
+                    _candidate_previewed = agent._interim_content_was_streamed(
+                        final_response or ""
+                    )
+                    if _candidate_composed_pending:
+                        _pending_verification_response_previewed = False
+                    elif _candidate_replaces_pending:
+                        _pending_verification_response_previewed = _candidate_previewed
+                    else:
+                        _pending_verification_response_previewed = (
+                            _pending_verification_response_previewed
+                            or _candidate_previewed
+                        )
                     final_response = None
                     continue
 
@@ -8732,14 +8757,35 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
-                    _pending_verification_response = _merge_verification_candidate(
-                        _pending_verification_response,
+                    _previous_pending_response = _pending_verification_response
+                    _candidate_replaces_pending = (
+                        _verification_candidate_replaces_pending(
+                            _previous_pending_response,
+                            final_response,
+                        )
+                    )
+                    _merged_pending_response = _merge_verification_candidate(
+                        _previous_pending_response,
                         final_response,
                     )
-                    _pending_verification_response_previewed = (
-                        _pending_verification_response_previewed
-                        or agent._interim_content_was_streamed(final_response or "")
+                    _candidate_composed_pending = bool(
+                        _previous_pending_response
+                        and _merged_pending_response != _previous_pending_response
+                        and _merged_pending_response != final_response
                     )
+                    _pending_verification_response = _merged_pending_response
+                    _candidate_previewed = agent._interim_content_was_streamed(
+                        final_response or ""
+                    )
+                    if _candidate_composed_pending:
+                        _pending_verification_response_previewed = False
+                    elif _candidate_replaces_pending:
+                        _pending_verification_response_previewed = _candidate_previewed
+                    else:
+                        _pending_verification_response_previewed = (
+                            _pending_verification_response_previewed
+                            or _candidate_previewed
+                        )
                     final_response = None
                     continue
 

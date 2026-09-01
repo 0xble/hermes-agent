@@ -2,8 +2,8 @@ name: Detect affected areas
 description: >-
   Classify a PR's changed files into CI work lanes (python, frontend, site,
   scan, deps, mcp_catalog) so the orchestrator can conditionally call only
-  the sub-workflows a PR can affect. Outputs are always "true" on push/dispatch
-  events and fail open (everything "true") when the diff cannot be computed.
+  the sub-workflows a PR or main push can affect. Classification fails open
+  (everything "true") when the immutable compare cannot be computed.
 
 inputs:
   github-token:
@@ -76,15 +76,15 @@ runs:
         GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
-        if [ "$EVENT_NAME" = "pull_request" ]; then
+        # PRs and main pushes both have immutable before/after SHAs. Classify
+        # both so a docs-only merge does not expand into every product lane.
+        # Other callers fail open by leaving CHANGED empty.
+        if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "push" ]; then
           # Use the compare endpoint with the pinned base/head SHAs from the
           # event payload instead of the "current PR files" endpoint. The SHAs
           # are frozen at trigger time, so the file list is deterministic even
@@ -94,18 +94,15 @@ runs:
           # freshly-pushed HEAD would otherwise silently fall open (all lanes
           # run — safe, but wasteful and it masks the API failure).
           #
-          # `.files[]?` (null-safe): with --paginate, a PR more than 100
-          # commits ahead of its merge-base paginates the compare, and pages
-          # after the first carry `files: null` — bare `.files[]` makes jq
-          # die with "cannot iterate over: null", which fails every retry
-          # and forces the fail-open path (seen on stacked PRs). The full
-          # file list (up to the API's 300-file cap) is on page one.
+          # The compare endpoint caps `files` at 300 even when `total_files` is
+          # larger. compare_files.py rejects any incomplete or malformed
+          # response so this action takes the safe fail-open path instead of
+          # silently skipping lanes affected only by omitted files.
           CHANGED=""
           for i in 1 2 3; do
             if CHANGED="$(gh api \
-              --paginate \
-              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]?.filename')"; then
+              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" |
+              python3 scripts/ci/compare_files.py)"; then
               break
             fi
             if [ "$i" = 3 ]; then

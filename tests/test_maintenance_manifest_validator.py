@@ -261,14 +261,23 @@ def test_history_validation_accepts_same_commit_registration(tmp_path):
     assert validate_manifest(manifest, history_baseline=baseline) == []
 
 
-def test_ci_validates_pull_request_head_instead_of_synthetic_merge():
+def test_trusted_policy_validates_immutable_pull_request_head():
     workflow = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "lint.yml"
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "fork-policy.yml"
     ).read_text(encoding="utf-8")
 
-    assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
-    assert "git fetch --no-tags --filter=blob:none canonical-upstream main" in workflow
-    assert "--depth=1 canonical-upstream" not in workflow
+    assert "pull_request_target:" in workflow
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
+    assert "path: trusted-policy" in workflow
+    assert "path: candidate" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "python3 trusted-policy/scripts/validate_maintenance_manifest.py" in workflow
+    assert "trusted-policy/scripts/ci/validate_workflow_policy.py" in workflow
+    assert "candidate/scripts/" not in workflow
+    assert "main:refs/remotes/canonical-upstream/main" in workflow
 
 
 def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_path):

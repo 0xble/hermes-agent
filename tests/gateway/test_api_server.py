@@ -393,6 +393,30 @@ class TestAgentExecution:
         )
 
     @pytest.mark.asyncio
+    async def test_internal_run_marks_agent_and_persisted_message(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="[ASYNC DELEGATION BATCH COMPLETE]",
+                conversation_history=[],
+                session_id="wake-session",
+                internal_notification=True,
+            )
+
+        assert mock_agent._current_turn_is_internal is True
+        mock_agent.run_conversation.assert_called_once_with(
+            user_message="[ASYNC DELEGATION BATCH COMPLETE]",
+            conversation_history=[],
+            task_id="wake-session",
+            persist_user_display_kind="internal_notification",
+        )
+
+    @pytest.mark.asyncio
     async def test_run_agent_sets_and_clears_process_ownership_markers(self, adapter):
         """#76188 review: this surface runs its own agent lifecycle outside
         TurnRunner, so it needs its own baseline snapshot/clear — verify the
@@ -978,6 +1002,33 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_internal_wake_header_reaches_agent_turn_authority(self, adapter):
+        adapter._api_key = "test-key"
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer test-key",
+                        "X-Hermes-Session-Id": "wake-session",
+                        "X-Hermes-Internal-Notification": "1",
+                    },
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "wake"}],
+                        "stream": False,
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["internal_notification"] is True
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)

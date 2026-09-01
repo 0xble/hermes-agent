@@ -23,8 +23,8 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import logging
-import logging
 import os
+import re
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -182,6 +182,7 @@ def _record_kanban_budget_exhausted(
         )
 
 
+
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
@@ -197,21 +198,26 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
 
 def _collapse_verification_candidates(messages, final_response, agent) -> bool:
     """Collapse provisional verification answers into one canonical assistant row."""
+    turn_user_indices = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "user"
+    ]
+    turn_start_index = turn_user_indices[-1] if turn_user_indices else -1
     candidate_indices = [
         index
         for index, message in enumerate(messages)
-        if isinstance(message, dict) and message.get("_verification_candidate")
+        if (
+            index > turn_start_index
+            and isinstance(message, dict)
+            and message.get("_verification_candidate")
+        )
     ]
     if not candidate_indices or not final_response:
         return False
 
-    first_candidate = candidate_indices[0]
-    canonical_index = candidate_indices[-1]
-    for index in range(len(messages) - 1, first_candidate - 1, -1):
-        message = messages[index]
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            canonical_index = index
-            break
+    last_candidate = candidate_indices[-1]
+    has_later_protocol_rows = last_candidate < len(messages) - 1
 
     if has_later_protocol_rows:
         for index in reversed(candidate_indices):
@@ -239,11 +245,6 @@ def _collapse_verification_candidates(messages, final_response, agent) -> bool:
         canonical.pop("_row_id", None)
         stamp_message_timestamp(canonical)
 
-    canonical = messages[canonical_index]
-    canonical["content"] = final_response
-    canonical.pop("_verification_candidate", None)
-    canonical.pop("_db_persisted", None)
-    stamp_message_timestamp(canonical)
     agent._db_flush_scan_prefix = None
     return True
 
@@ -798,10 +799,15 @@ def finalize_turn(
                 and _message.get("content") == _canonical_response_before_output_transform
             ):
                 _message["content"] = final_response
-                _message.pop("_db_persisted", None)
                 agent._db_flush_scan_prefix = None
                 try:
-                    agent._persist_session(messages, conversation_history)
+                    if getattr(agent, "_session_db", None) is not None and agent.session_id:
+                        agent._session_db.replace_messages(
+                            agent.session_id,
+                            messages,
+                            active_only=True,
+                        )
+                    agent._save_session_log(messages)
                 except Exception as _persist_transform_err:
                     _cleanup_errors.append(
                         f"persist_transformed_response: {_persist_transform_err}"
@@ -938,7 +944,7 @@ def finalize_turn(
             "health (`hermes doctor`), then send your message again"
         )
         # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|compression|turn_lease|corrupt|replaced|disk|unknown>'.
+        # 'session_persistence_failed:<locked|compression|turn_lease|disk|unknown>'.
         # Never clobber a failure_reason another path already stamped.
         if "failure_reason" not in result:
             _cause = getattr(agent, "_last_persistence_error_cause", None)

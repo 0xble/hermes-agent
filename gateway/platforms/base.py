@@ -158,7 +158,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         tid = str(thread_id)
         if tid and tid not in {"", "1"}:
             metadata["direct_messages_topic_id"] = tid
-        anchor = reply_to_message_id or getattr(source, "message_id", None)
+        # A SessionSource can outlive the event that created it. Falling back
+        # to source.message_id here can therefore resurrect a stale anchor
+        # from a concurrent /side lane after _reply_anchor_for_event()
+        # deliberately returned None for an internal continuation. Callers
+        # that own a live user event pass its anchor explicitly.
+        anchor = reply_to_message_id
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
     return metadata
@@ -195,7 +200,18 @@ def _reply_anchor_for_event(event) -> str | None:
         # SlackAdapter._resolve_thread_ts() treat it as a thread anchor and
         # reply in a (nonexistent) thread anyway.
         return None
-    if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
+    if (
+        platform == "telegram"
+        and thread_id
+        and getattr(source, "chat_type", None) == "dm"
+    ):
+        # Internal continuations do not carry new user authority and must not
+        # inherit a user-message quote anchor.  A reused anchor can belong to a
+        # concurrently active /side lane in the same DM topic, making an
+        # unrelated parent continuation appear to answer the side command.
+        # Route synthetic output by the immutable topic id alone.
+        if getattr(event, "internal", False):
+            return None
         # Reply to the triggering user message. Replying to Telegram's earlier
         # topic seed/anchor can render the bot response outside the active lane.
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)

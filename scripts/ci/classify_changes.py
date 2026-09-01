@@ -36,7 +36,9 @@ never per-PR.
 Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
 
-* An empty diff, or any ``.github/`` change, runs everything.
+* An empty diff, or any ``.github/`` change, runs everything. CI changes are
+  rare and must exercise every preserved lane plus the always-required fork
+  policy gate.
 * ``python`` is a denylist: skipped only when *every* file is provably prose
   or a frontend-only package; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
