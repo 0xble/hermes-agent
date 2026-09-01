@@ -125,6 +125,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(title): remove duplicate hashlib import` | Mechanical duplicate-import cleanup only; no independently retireable behavior. |
 | `fix(deps): clear known lockfile vulnerabilities` | Security-only updates to Electron, nanoid, h2, and hpack; no fork-owned product contract. |
 | `fix(ci): enforce patch history without code-scanning dependency` | Fork-governance and CI reporting enforcement only; no shipped Hermes behavior. |
+| `fix(ci): let the isolated Python suite finish on standard runners` | Fork CI wall-clock policy only; no shipped Hermes behavior. |
 | `fix(deps): align desktop Electron build pin` | Mechanical build metadata alignment for the reviewed Electron security update. |
 | `fix(ci): preserve OSV findings without code scanning` | CI artifact and review-status routing repair only; no shipped Hermes behavior. |
 | `fix(ci): validate patch history at PR head` | GitHub Actions synthetic-merge avoidance for maintenance validation only; no shipped Hermes behavior. |
