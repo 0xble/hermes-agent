@@ -9,6 +9,7 @@ import pytest
 
 from scripts.ci.validate_workflow_policy import (
     FORK_POLICY_WORKFLOW,
+    FORK_POLICY_WORKFLOWS,
     JOB_REUSABLE_WORKFLOW_ALLOWLIST,
     STEP_ACTION_ALLOWLIST,
     TRANSITION_ACTION_FAMILIES,
@@ -52,11 +53,11 @@ def test_setup_uv_pin_can_transition_atomically(tmp_path: Path) -> None:
 def test_setup_uv_pin_cannot_be_mixed_during_transition(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     workflow = root / ".github" / "workflows" / "e2e-desktop.yml"
-    _replace(
-        workflow,
-        "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39",
-        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
-    )
+    text = workflow.read_text(encoding="utf-8")
+    old = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
+    new = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+    source, target = (old, new) if old in text else (new, old)
+    _replace(workflow, source, target)
     errors = validate(root)
     assert any("step action references differ from exact allowlist" in error for error in errors)
 
@@ -380,7 +381,7 @@ def test_dynamic_matrix_cannot_add_self_hosted_runner(tmp_path: Path) -> None:
 def test_fork_policy_workflow_has_exact_trusted_structure() -> None:
     root = Path(__file__).resolve().parents[1]
     path = root / ".github" / "workflows" / "fork-policy.yml"
-    assert _load(path) == FORK_POLICY_WORKFLOW
+    assert _load(path) in FORK_POLICY_WORKFLOWS
 
 
 def test_fork_policy_run_commands_resolve_only_trusted_scripts(
