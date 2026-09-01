@@ -82,11 +82,11 @@ def test_grouped_action_pins_can_transition_atomically(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     replacements = {
         "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342":
-            "cachix/install-nix-action@85e5c75b53ca5db16c97cf3e39a7b0c0957cc3ee",
+            "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24",
         "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2":
-            "google/osv-scanner-action/osv-scanner-action@16f4ae80dd08301c99ae0752242105e3e31bc41d",
+            "google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67",
         "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf":
-            "hadolint/hadolint-action@39592fc4fb640fc194270a28a70721384e13f5a6",
+            "hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387",
     }
     for workflow in (root / ".github" / "workflows").glob("*.y*"):
         text = workflow.read_text(encoding="utf-8")

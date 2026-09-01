@@ -159,6 +159,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): stage setup-uv policy transition` | Fork-administrative workflow policy update that admits exactly one of the reviewed old and new setup-uv pins during an atomic dependency migration; no shipped Hermes behavior. |
 | `fix(ci): stage remaining action policy transitions` | Fork-administrative workflow policy update that admits only atomic reviewed transitions for checkout, Hadolint, Cachix, and OSV pins; no shipped Hermes behavior. |
 | `fix(tests): make the macOS CUA launch assertion platform-stable` | Test-only CI stabilization: pins the macOS branch in a Darwin-specific CUA command assertion so Linux full-suite lanes exercise the intended code path; no shipped Hermes behavior. |
+| `fix(ci): correct reviewed grouped action pins` | Fork-administrative correction aligning the transition allowlist with the exact Dependabot heads for Hadolint, Cachix, and OSV; no shipped Hermes behavior. |
 | `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
