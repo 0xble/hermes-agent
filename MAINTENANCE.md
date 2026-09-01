@@ -127,7 +127,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(title): remove duplicate hashlib import` | Mechanical duplicate-import cleanup only; no independently retireable behavior. |
 | `fix(deps): clear known lockfile vulnerabilities` | Security-only updates to Electron, nanoid, h2, and hpack; no fork-owned product contract. |
 | `fix(ci): enforce patch history without code-scanning dependency` | Fork-governance and CI reporting enforcement only; no shipped Hermes behavior. |
-| `fix(ci): let the isolated Python suite finish on standard runners` | Fork CI wall-clock policy only; no shipped Hermes behavior. |
+| `fix(ci): let the isolated Python suite finish on standard runners (#20)` | Fork CI wall-clock policy only; no shipped Hermes behavior. |
 | `fix(deps): align desktop Electron build pin` | Mechanical build metadata alignment for the reviewed Electron security update. |
 | `fix(ci): preserve OSV findings without code scanning` | CI artifact and review-status routing repair only; no shipped Hermes behavior. |
 | `fix(ci): validate patch history at PR head` | GitHub Actions synthetic-merge avoidance for maintenance validation only; no shipped Hermes behavior. |
@@ -162,12 +162,19 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): stage setup-uv policy transition` | Fork-administrative workflow policy update that admits exactly one of the reviewed old and new setup-uv pins during an atomic dependency migration; no shipped Hermes behavior. |
 | `fix(ci): stage remaining action policy transitions` | Fork-administrative workflow policy update that admits only atomic reviewed transitions for checkout, Hadolint, Cachix, and OSV pins; no shipped Hermes behavior. |
 | `fix(tests): make the macOS CUA launch assertion platform-stable` | Test-only CI stabilization: pins the macOS branch in a Darwin-specific CUA command assertion so Linux full-suite lanes exercise the intended code path; no shipped Hermes behavior. |
-| `fix(ci): correct reviewed grouped action pins` | Fork-administrative correction aligning the transition allowlist with the exact Dependabot heads for Hadolint, Cachix, and OSV; no shipped Hermes behavior. |
-| `fix(ci): keep workflow policy tests transition-aware` | Test-only fork-policy coverage updated to validate either exact reviewed migration endpoint; no shipped Hermes behavior. |
+| `fix(ci): correct reviewed grouped action pins (#24)` | Fork-administrative correction aligning the transition allowlist with the exact Dependabot heads for Hadolint, Cachix, and OSV; no shipped Hermes behavior. |
+| `fix(ci): keep workflow policy tests transition-aware (#26)` | Test-only fork-policy coverage updated to validate either exact reviewed migration endpoint; no shipped Hermes behavior. |
 | `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 | `chore(actions)(deps): bump astral-sh/setup-uv from 8.2.0 to 10.0.1` | Automated pinned GitHub Action dependency refresh; no shipped Hermes behavior. |
 | `chore(actions)(deps): bump actions/checkout from 6.0.2 to 7.0.1` | Automated pinned GitHub Action dependency refresh with the documented v7 fork-data opt-in on the exact trusted policy workflow; no shipped Hermes behavior. |
 | `chore(actions)(deps): bump the actions-minor-patch group across 1 directory with 3 updates` | Automated pinned GitHub Action dependency refresh for the reviewed Hadolint, Cachix, and OSV SHAs; no shipped Hermes behavior. |
+| `fix(ci): reconcile post-merge history baseline` | Fork-administrative history reconciliation after concurrent reviewed merges advanced `main`; no shipped Hermes behavior. |
+| `Merge pull request #3 from 0xble/dependabot/github_actions/astral-sh/setup-uv-9.0.0` | GitHub-authored merge wrapper around the already-registered setup-uv dependency refresh; no additional behavior. |
+| `Merge pull request #5 from 0xble/dependabot/github_actions/actions/checkout-7.0.1` | GitHub-authored merge wrapper around the already-registered checkout dependency refresh; no additional behavior. |
+| `Merge pull request #13 from 0xble/dependabot/github_actions/actions-minor-patch-f5d4e90336` | GitHub-authored merge wrapper around the already-registered grouped action refresh; no additional behavior. |
+| `Merge pull request #17 from 0xble/feat/goal-tool-parity` | GitHub-authored merge wrapper around the indexed goal-control patch; no additional behavior. |
+| `Merge pull request #18 from 0xble/fix/duplicate-topic-titles-100002` | GitHub-authored merge wrapper around the indexed Telegram topic-label patch; no additional behavior. |
+| `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
