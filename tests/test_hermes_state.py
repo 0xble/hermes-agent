@@ -2324,6 +2324,55 @@ class TestTitleLineage:
         """With no existing sessions, base title is returned as-is."""
         assert db.get_next_title_in_lineage("my project") == "my project"
 
+    def test_set_session_title_in_lineage_allocates_unique_alias(self, db):
+        db.create_session("first", "telegram")
+        db.create_session("second", "telegram")
+        db.set_session_title("first", "Shared Topic")
+
+        stored = db.set_session_title_in_lineage("second", "Shared Topic")
+
+        assert stored == "Shared Topic #2"
+        assert db.get_session_title("second") == "Shared Topic #2"
+        assert db.get_session_title_source("second") == db.TITLE_SOURCE_USER
+
+    def test_set_session_title_in_lineage_bounds_long_alias(self, db):
+        base = "x" * db.MAX_TITLE_LENGTH
+        db.create_session("first", "telegram")
+        db.create_session("second", "telegram")
+        db.set_session_title("first", base)
+
+        stored = db.set_session_title_in_lineage("second", base)
+
+        assert stored.endswith(" #2")
+        assert len(stored) == db.MAX_TITLE_LENGTH
+
+    def test_set_session_title_in_lineage_serializes_concurrent_claims(self, db):
+        from concurrent.futures import ThreadPoolExecutor
+
+        session_ids = [f"topic-{index}" for index in range(6)]
+        for session_id in session_ids:
+            db.create_session(session_id, "telegram")
+
+        with ThreadPoolExecutor(max_workers=len(session_ids)) as pool:
+            stored = list(
+                pool.map(
+                    lambda session_id: db.set_session_title_in_lineage(
+                        session_id, "Shared Topic"
+                    ),
+                    session_ids,
+                )
+            )
+
+        assert len(set(stored)) == len(session_ids)
+        assert set(stored) == {
+            "Shared Topic",
+            "Shared Topic #2",
+            "Shared Topic #3",
+            "Shared Topic #4",
+            "Shared Topic #5",
+            "Shared Topic #6",
+        }
+
 
 
 
