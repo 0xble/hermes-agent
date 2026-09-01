@@ -153,6 +153,8 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |
 | `fix(ci): advance maintenance baseline after v0.21.0 replay` | Fork-administrative history reconciliation after the replay changed commit identities; no shipped Hermes behavior. |
+| `chore: remove reintroduced case-colliding contributor entries` | Repository hygiene after the replay restored two case-colliding contributor markers; no shipped Hermes behavior. |
+| `fix(ci): advance maintenance baseline after contributor cleanup` | Fork-administrative history reconciliation after the case-collision cleanup; no shipped Hermes behavior. |
 | `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
