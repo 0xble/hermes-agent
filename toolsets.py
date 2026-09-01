@@ -222,7 +222,7 @@ TOOLSETS = {
     },
 
     "goal": {
-        "description": "Set a persistent per-session goal for autonomous continuation",
+        "description": "Inspect and control a persistent per-session goal",
         "tools": ["set_goal"],
         "includes": []
     },

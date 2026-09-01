@@ -61,11 +61,13 @@ On interactive sessions, you can explicitly ask Hermes to create and start a goa
 Set a goal to implement this feature, validate it end to end, and stop if deployment is required.
 ```
 
-Hermes drafts the objective and optional completion contract, activates it in the current session, and starts the first concrete step in the same turn. The write is reported as successful only after the persisted state is read back. The normal post-turn judge and continuation loop then take over.
+Hermes uses one `set_goal` tool for the complete goal lifecycle. It can inspect status, show contracts, set or draft a goal, pause or resume it, clear it, park or release waits, and list or mutate subgoals and quality gates. Mutations require exact authorization from the current user turn; read-only inspection does not. Writes are reported as successful only after persistent readback.
+
+When Hermes writes a goal, it keeps the headline to one concise outcome. Objective proof belongs in `verification`, non-negotiable limits belong in `constraints` and `boundaries`, and the exact stopping condition belongs in `stop_when`. Effective goals omit personas, generic exhortations, duplicated requirements, implementation diaries, speculative edge cases, and repository rules already supplied elsewhere.
 
 This is deliberately authorization-gated. An ordinary task, question, recommendation, or request to draft a possible goal does **not** authorize activation. A model-created goal also cannot silently replace an active or paused goal. Replacement requires explicit language such as "replace the active goal" in the current user turn.
 
-The `set_goal` tool is enabled by default only on interactive CLI, TUI/Desktop, and messaging sessions that own the goal continuation hook. Cron, webhooks, delegated agents, and batch runs are excluded. Disable the `goal` toolset with `hermes tools` if you want slash-command-only activation.
+The `set_goal` tool is enabled by default only on interactive CLI, TUI/Desktop, and messaging sessions that own the goal continuation hook. Cron, webhooks, delegated agents, and batch runs are excluded. Synthetic turns may inspect goal state but cannot mutate it. Disable the `goal` toolset with `hermes tools` if you want slash-command-only control.
 
 ## Commands
 

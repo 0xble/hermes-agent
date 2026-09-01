@@ -3182,6 +3182,15 @@ class GatewaySlashCommandsMixin:
         if not args:
             return f"{mgr.status_line()}\n{mgr.render_subgoals()}"
 
+        # User-authored mutations supersede authority captured by an earlier
+        # running model turn for this session.
+        try:
+            from hermes_cli.goals import advance_goal_control_revision
+
+            advance_goal_control_revision(mgr.session_id)
+        except Exception:
+            logger.debug("subgoal control fence failed", exc_info=True)
+
         tokens = args.split(None, 1)
         verb = tokens[0].lower()
         rest = tokens[1].strip() if len(tokens) > 1 else ""
