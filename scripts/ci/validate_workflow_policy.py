@@ -182,7 +182,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
                         "--history-baseline-subject "
-                        "'fix(ci): source install E2E tags from upstream (#11)'"
+                        "'fix(ci): advance maintenance baseline after v0.21.0 replay'"
                     ),
                 },
                 {
