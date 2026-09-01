@@ -159,7 +159,8 @@ These exact subjects are fork-only history but do not define independently retir
 | `test(reconcile): align compaction prompt rebuild contract` | Rebase reconciliation preserving HERMES-025's would-grow outcome, accepting upstream's live prompt rebuild, and replacing source-introspection checks with behavioral coverage; also advances the history gate to this run's rebased pre-change commit, without changing shipped Hermes behavior. |
 | `fix(ci): source install E2E tags from upstream (#11)` | Standalone-mirror CI repair that reads canonical release tags without mirroring them into fork origin; no shipped Hermes behavior. |
 | `fix(ci): reconcile browser headed patch history` | Maintenance-baseline reconciliation for squash-added PR suffixes plus a Linux-only test-fixture display; no shipped Hermes behavior. |
-| `fix(ci): reconcile rich paragraph squash history (#35)` | Maintenance-baseline reconciliation after GitHub squashed the HERMES-095 structural fix and appended `(#34)`; no shipped Hermes behavior. |
+| `fix(ci): reconcile rich paragraph squash history (#35) (#35)` | Maintenance-baseline reconciliation after GitHub added a duplicate `(#35)` suffix; no shipped behavior. |
+| `fix(ci): reconcile rich paragraph squash baseline (#36)` | Final maintenance-baseline reconciliation for HERMES-095; no shipped behavior. |
 | `fix(ci): align browser headed policy fixture` | Administrative synchronization of the exact trusted-workflow fixture with the browser-headed history baseline; no shipped Hermes behavior. |
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |
