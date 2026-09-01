@@ -3286,6 +3286,27 @@ def terminal_tool(
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
+        # Advisory policy: Git accepts worktrees anywhere, but arbitrary sibling
+        # and temporary locations are difficult for agents to inventory and clean.
+        # Detect direct `git worktree add` calls before execution, then return the
+        # warning alongside the command result without blocking legitimate uses.
+        command_policy_cwd = _resolve_command_cwd(
+            workdir=workdir,
+            default_cwd=cwd,
+            session_key=session_key,
+            env_type=env_type,
+        )
+        try:
+            from tools.worktree_path_guard import nonstandard_worktree_add_warning
+
+            worktree_path_warning = nonstandard_worktree_add_warning(
+                command,
+                command_policy_cwd,
+            )
+        except Exception:
+            logger.debug("worktree path guard failed", exc_info=True)
+            worktree_path_warning = None
+
         # Prepare command for execution
         pty_disabled_reason = None
         effective_pty = pty
@@ -3346,6 +3367,8 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if worktree_path_warning:
+                    result_data["warning"] = worktree_path_warning
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
@@ -3865,6 +3888,8 @@ def terminal_tool(
                 result_dict["sudo_auth_failed"] = True
             if sudo_cache_cleared:
                 result_dict["sudo_cache_cleared"] = True
+            if worktree_path_warning:
+                result_dict["warning"] = worktree_path_warning
 
             return json.dumps(result_dict, ensure_ascii=False)
 

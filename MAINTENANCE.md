@@ -112,6 +112,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-088 | Active | `fix(gateway): silence redundant process notifications`; `fix(gateway): preserve watch notification text` | Let model-facing gateway process telemetry reconcile silently without leaking the control contract into CLI, TUI, or Desktop output. |
 | HERMES-089 | Active | `fix(telegram): separate duplicate topic labels from session aliases` | Allow Telegram topics to share a visible label while preserving unique, deterministic internal session aliases. |
 | HERMES-090 | Active | `feat(gateway): merge side context into main` | Import one frozen, provenance-marked side-session delta into its originating main route without joining their future timelines. |
+| HERMES-091 | Active | `feat(terminal): warn on nonstandard worktree paths` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 
 ## Fork-only administrative subject exemptions
 
@@ -179,6 +180,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-091 — Warn on nonstandard worktree paths
+
+- **Independent hypothesis (2026-09-01):** A live inventory found worktrees spread across `/private/tmp`, `~/Worktrees`, and `~/.hermes/hermes-agent-worktrees`. Those locations were accepted by Git but escaped Hermes's `.worktrees/` lifecycle, obscured source/runtime ownership, and accumulated redundant or abandoned trees.
+- **Summary:** Inspect direct agent terminal commands for `git worktree add`, resolve literal destinations across shell separators, `git -C`, common wrappers, options, and traversal, then attach a non-blocking warning when the destination does not contain a `.worktrees` folder. Preserve legitimate external worktree use while making the repository-owned convention visible in both foreground and background tool results.
+- **Surfaces:** `tools/worktree_path_guard.py`; `tools/terminal_tool.py`; `tests/tools/test_worktree_path_guard.py`; this record.
+- **Upstream tracking:** Not yet filed upstream as of 2026-09-01. Hermes's native `-w`, `/worktree new`, and Kanban worktree paths already use repository-local `.worktrees/`; this patch adds advisory coverage for manual terminal commands.
+- **Upstream PR:** None as of 2026-09-01. The maintained-fork PR is the only published implementation currently tracked.
+- **Regression:** `python -m pytest -q tests/tools/test_worktree_path_guard.py tests/tools/test_terminal_tool.py tests/tools/test_terminal_bounded_execute.py tests/tools/test_terminal_task_cwd.py tests/tools/test_terminal_output_transform_hook.py`; coverage must prove compliant paths remain silent, absolute and relative external paths warn, traversal cannot escape an apparent `.worktrees` path, shell separators and common wrappers remain visible, heredoc data does not create false positives, and successful foreground worktree creation returns the advisory warning.
+- **Expected published commit identity:** Stable subject `feat(terminal): warn on nonstandard worktree paths`; source, focused regressions, and this lifecycle record ship together.
+- **Rollback:** Revert only `feat(terminal): warn on nonstandard worktree paths`, remove the path guard, terminal result field, focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after released upstream Hermes provides equivalent advisory or enforcement for direct agent-created worktrees outside `.worktrees/`, including shell traversal and wrapper coverage, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-089 — Separate duplicate Telegram topic labels from session aliases
 
