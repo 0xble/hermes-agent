@@ -18557,7 +18557,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or _goal_verb in {"wait", "gate"}
         )
         if _is_control:
-            if _goal_arg in {"pause", "clear", "stop", "done"}:
+            _goal_mutates = (
+                _goal_arg in {"pause", "resume", "clear", "stop", "done", "unwait"}
+                or _goal_verb == "wait"
+                or (_goal_verb == "gate" and _goal_arg not in {"gate", "gate list"})
+            )
+            if _goal_mutates:
                 try:
                     from hermes_cli.goals import advance_goal_control_revision
 
