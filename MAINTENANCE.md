@@ -112,7 +112,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-088 | Active | `fix(gateway): silence redundant process notifications`; `fix(gateway): preserve watch notification text` | Let model-facing gateway process telemetry reconcile silently without leaking the control contract into CLI, TUI, or Desktop output. |
 | HERMES-089 | Active | `fix(telegram): separate duplicate topic labels from session aliases` | Allow Telegram topics to share a visible label while preserving unique, deterministic internal session aliases. |
 | HERMES-090 | Active | `feat(gateway): merge side context into main` | Import one frozen, provenance-marked side-session delta into its originating main route without joining their future timelines. |
-| HERMES-091 | Active | `feat(browser): choose headed mode per exec session` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
+| HERMES-091 | Active | `feat(browser): choose headed mode per exec session (#28)` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
 
 ## Fork-only administrative subject exemptions
 
@@ -154,6 +154,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `test(compression): close worker-owned state handles` | Deterministic test teardown for compression timeout regressions; waits for worker completion and closes temporary `SessionDB` handles on the owning test thread without changing shipped behavior. |
 | `test(reconcile): align compaction prompt rebuild contract` | Rebase reconciliation preserving HERMES-025's would-grow outcome, accepting upstream's live prompt rebuild, and replacing source-introspection checks with behavioral coverage; also advances the history gate to this run's rebased pre-change commit, without changing shipped Hermes behavior. |
 | `fix(ci): source install E2E tags from upstream (#11)` | Standalone-mirror CI repair that reads canonical release tags without mirroring them into fork origin; no shipped Hermes behavior. |
+| `fix(ci): reconcile browser headed patch history` | Maintenance-baseline reconciliation for squash-added PR suffixes plus a Linux-only test-fixture display; no shipped Hermes behavior. |
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |
 | `fix(ci): advance maintenance baseline after v0.21.0 replay` | Fork-administrative history reconciliation after the replay changed commit identities; no shipped Hermes behavior. |
@@ -1163,8 +1164,8 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Upstream tracking:** [Issue #100428](https://github.com/NousResearch/hermes-agent/issues/100428) tracks the missing per-session control.
 - **Upstream PR:** [#100468](https://github.com/NousResearch/hermes-agent/pull/100468) carries the generic upstream implementation.
 - **Regression:** `uv run --extra dev pytest -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves schema routing, true and false overrides, configured fallback, identity isolation, live-runtime conflict refusal, backend/display rejection, durable mode recovery, and cleanup behavior.
-- **Published commit identity:** Stable subject `feat(browser): choose headed mode per exec session`.
-- **Rollback:** Revert `feat(browser): choose headed mode per exec session`, removing the schema argument, runtime mode tracking, focused regressions, documentation, and this record while preserving existing real-profile identity isolation and the global `browser.headed` setting.
+- **Published commit identity:** Stable subject `feat(browser): choose headed mode per exec session (#28)`.
+- **Rollback:** Revert `feat(browser): choose headed mode per exec session (#28)`, removing the schema argument, runtime mode tracking, focused regressions, documentation, and this record while preserving existing real-profile identity isolation and the global `browser.headed` setting.
 - **Retirement:** Retire after released upstream ships equivalent per-call or per-session managed-local headed control with identity-safe reuse conflicts, durable mode recovery, and runtime-effective cleanup, and the regression contract passes against that release.
 
 ## Automatic synchronization

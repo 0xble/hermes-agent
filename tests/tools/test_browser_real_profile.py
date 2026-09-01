@@ -482,10 +482,12 @@ class TestRealProfileCdpLaunch:
         [(True, False, False), (False, True, True)],
     )
     def test_explicit_headed_launch_overrides_config(
-        self, tmp_path, headed, configured, expect_headless
+        self, tmp_path, monkeypatch, headed, configured, expect_headless
     ):
         import tools.browser_tool as bt
         self._reset()
+        if headed:
+            monkeypatch.setenv("DISPLAY", ":99")
         captured = {}
         proc = Mock(return_value=None, returncode=0, stdout="", stderr="")
 
