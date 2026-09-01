@@ -114,6 +114,98 @@ class TestEffectiveHeadedPersistence:
              patch.object(bt, "_is_headed_mode", return_value=True):
             assert bt._preserve_browser_between_turns() is False
 
+    def test_recovers_identity_headed_marker_after_process_restart(self, tmp_path):
+        from types import SimpleNamespace
+
+        import tools.browser_tool as bt
+
+        identity = SimpleNamespace(
+            alias="personal",
+            browser="chrome",
+            source_profile="Default",
+            runtime_key="identity-key",
+        )
+        (tmp_path / ".hermes-browser-mode").write_text("headed", encoding="utf-8")
+        with (
+            patch(
+                "hermes_cli.browser_identity.read_browser_identity_config",
+                return_value={"real_profile_identities": {"personal": {}}},
+            ),
+            patch(
+                "hermes_cli.browser_identity.configured_identity_aliases",
+                return_value=("personal",),
+            ),
+            patch(
+                "hermes_cli.browser_identity.resolve_browser_identity",
+                return_value=identity,
+            ),
+            patch(
+                "hermes_cli.browser_connect.real_profile_copy_dir",
+                return_value=str(tmp_path),
+            ),
+            patch.object(
+                bt,
+                "_owned_profile_cdp",
+                return_value="http://127.0.0.1:41000",
+            ),
+            patch.object(bt, "_is_headed_mode", return_value=False),
+        ):
+            assert bt._preserve_browser_between_turns() is True
+        _, _, cache_key = bt._real_profile_runtime_resources(identity)
+        assert bt._real_profile_cdp_cache[cache_key] == "http://127.0.0.1:41000"
+        assert bt._real_profile_headed_modes[cache_key] is True
+        assert bt._real_profile_browser_processes[cache_key] == (None, str(tmp_path))
+        with patch(
+            "hermes_cli.browser_connect.stop_snapshot_browser_processes",
+            return_value=True,
+        ) as stop_snapshot:
+            bt._stop_real_profile_browser(cache_key)
+        stop_snapshot.assert_called_once_with(str(tmp_path))
+        assert cache_key not in bt._real_profile_browser_processes
+
+    def test_invalid_mode_marker_does_not_claim_headless(self, tmp_path):
+        import tools.browser_tool as bt
+
+        (tmp_path / ".hermes-browser-mode").write_text("invalid", encoding="utf-8")
+        assert bt._read_real_profile_headed_mode(str(tmp_path)) is None
+        with (
+            patch(
+                "hermes_cli.browser_identity.read_browser_identity_config",
+                return_value={},
+            ),
+            patch(
+                "hermes_cli.browser_identity.configured_identity_aliases",
+                return_value=(),
+            ),
+            patch(
+                "hermes_cli.browser_connect.detect_default_chromium",
+                return_value="chrome",
+            ),
+            patch(
+                "hermes_cli.browser_connect.real_profile_copy_dir",
+                return_value=str(tmp_path),
+            ),
+            patch.object(
+                bt,
+                "_owned_profile_cdp",
+                return_value="http://127.0.0.1:41000",
+            ),
+            patch.object(bt, "_is_headed_mode", return_value=False),
+        ):
+            assert bt._preserve_browser_between_turns() is True
+
+    def test_recovery_error_preserves_unknown_runtime(self):
+        import tools.browser_tool as bt
+
+        with (
+            patch(
+                "hermes_cli.browser_identity.read_browser_identity_config",
+                side_effect=RuntimeError("unavailable"),
+            ),
+            patch.object(bt, "_is_headed_mode", return_value=False),
+        ):
+            assert bt._preserve_browser_between_turns() is True
+
 
 # ---------------------------------------------------------------------------
 # --headed flag injection in local mode

@@ -529,6 +529,40 @@ class TestRealProfileCdpLaunch:
         assert "already running headless" in err
         self._reset()
 
+    def test_omitted_reuses_unknown_mode_without_claiming_config(self, tmp_path):
+        import tools.browser_tool as bt
+
+        self._reset()
+        _, _, cache_key = bt._real_profile_runtime_resources(None)
+        with (
+            patch.object(bt, "_use_real_profile", return_value=True),
+            patch(
+                "hermes_cli.browser_connect.detect_default_chromium",
+                return_value="chrome",
+            ),
+            patch(
+                "hermes_cli.browser_connect.real_profile_copy_dir",
+                return_value=str(tmp_path),
+            ),
+            patch.object(
+                bt,
+                "_agent_browser_get_cdp",
+                return_value="http://127.0.0.1:41000",
+            ),
+            patch.object(bt, "_cdp_http_ready", return_value=True),
+            patch.object(bt, "_cdp_on_data_dir", return_value=True),
+            patch.object(bt, "_is_headed_mode", return_value=True),
+        ):
+            cdp, err = bt._real_profile_cdp(headed=None)
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        assert bt._real_profile_cdp_cache[cache_key] == cdp
+        assert cache_key not in bt._real_profile_headed_modes
+        assert bt._real_profile_browser_processes[cache_key] == (None, str(tmp_path))
+        with patch.object(bt, "_cdp_http_ready", return_value=True):
+            assert bt._preserve_browser_between_turns() is True
+        self._reset()
+
     def test_reuses_only_session_on_our_copy_dir(self, tmp_path):
         """A live session on a DIFFERENT dir (stale/throwaway) is closed, not reused."""
         import tools.browser_tool as bt
