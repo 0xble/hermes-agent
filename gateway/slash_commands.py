@@ -5888,18 +5888,19 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self._session_entry_for_event(event, source=source)
         session_id = session_entry.session_id
+        session_db = getattr(self, "_session_db", None)
 
-        if not self._session_db:
+        if not session_db:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
         # Ensure session exists in SQLite DB (it may only exist in session_store
         # if this is the first command in a new session)
-        existing_title = await self._session_db.get_session_title(session_id)
+        existing_title = await session_db.get_session_title(session_id)
         if existing_title is None:
             # Session doesn't exist in DB yet — create it
             try:
-                await self._session_db.create_session(
+                await session_db.create_session(
                     session_id=session_id,
                     source=source.platform.value if source.platform else "unknown",
                     user_id=source.user_id,
@@ -5923,33 +5924,86 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.shared.warn_passthrough", error=e)
             if not sanitized:
                 return t("gateway.title.empty_after_clean")
-            # Set the title
+            # Telegram topic labels are platform display names, while session
+            # titles are resumable aliases and must remain unique. Let topics
+            # share a visible label by reserving a unique #N session alias.
             try:
-                if await self._session_db.set_session_title(session_id, sanitized):
+                topic_lane_check = getattr(self, "_is_telegram_topic_lane", None)
+                is_telegram_topic = bool(topic_lane_check) and await asyncio.to_thread(
+                    topic_lane_check, source
+                )
+                if is_telegram_topic:
+                    stored_title = await session_db.set_session_title_in_lineage(
+                        session_id, sanitized
+                    )
+                    title_set = stored_title is not None
+                else:
+                    title_set = await session_db.set_session_title(
+                        session_id, sanitized
+                    )
+                    stored_title = sanitized if title_set else None
+
+                if title_set:
                     # Propagate the user-chosen title to the visible Telegram
                     # forum topic name too. Auto-generated titles already rename
                     # the topic; without this, /title only updated the DB title
                     # and the topic kept its auto-assigned name. No-ops off
                     # Telegram topic lanes and when auto-rename is disabled.
-                    schedule_rename = getattr(
-                        self, "_schedule_telegram_topic_title_rename", None
+                    topic_rename_failed = False
+                    rename_now = getattr(
+                        self, "_rename_telegram_topic_for_session_title", None
                     )
-                    if callable(schedule_rename):
+                    if is_telegram_topic and callable(rename_now):
                         try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                            rename_call = rename_now(
+                                source, session_id, sanitized
+                            )
+                            rename_landed = (
+                                await rename_call
+                                if inspect.isawaitable(rename_call)
+                                else rename_call
+                            )
+                            # None is an intentional no-op (for example, when
+                            # operator-managed topic renames are disabled).
+                            topic_rename_failed = rename_landed is False
                         except Exception:
+                            topic_rename_failed = True
                             logger.debug(
                                 "Failed to rename Telegram topic from /title",
                                 exc_info=True,
                             )
-                    return t("gateway.title.set_to", title=sanitized)
+                    else:
+                        # Compatibility fallback for older/third-party runners.
+                        schedule_rename = getattr(
+                            self, "_schedule_telegram_topic_title_rename", None
+                        )
+                        if callable(schedule_rename):
+                            try:
+                                await asyncio.to_thread(
+                                    schedule_rename, source, session_id, sanitized
+                                )
+                            except Exception:
+                                topic_rename_failed = is_telegram_topic
+                                logger.debug(
+                                    "Failed to rename Telegram topic from /title",
+                                    exc_info=True,
+                                )
+                    response = t("gateway.title.set_to", title=sanitized)
+                    if stored_title != sanitized:
+                        response += f"\nInternal session alias: {stored_title}"
+                    if topic_rename_failed:
+                        response += (
+                            "\n⚠️ The session alias was updated, but the Telegram "
+                            "topic name was not changed."
+                        )
+                    return response
                 else:
                     return t("gateway.title.not_found")
             except ValueError as e:
                 return t("gateway.shared.warn_passthrough", error=e)
         else:
             # Show the current title and session ID
-            title = await self._session_db.get_session_title(session_id)
+            title = await session_db.get_session_title(session_id)
             if title:
                 return t("gateway.title.current_with_title", session_id=session_id, title=title)
             else:
