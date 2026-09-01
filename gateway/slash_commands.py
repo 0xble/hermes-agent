@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -4307,6 +4308,74 @@ class GatewaySlashCommandsMixin:
             history=history,
         )
 
+    async def _handle_merge_command(self, event: MessageEvent) -> str:
+        """Import this side's committed delta into its originating main route."""
+        metadata = getattr(event, "metadata", None) or {}
+        side_root_id = str(metadata.get("gateway_side_root_session_id") or "").strip()
+        if not metadata.get("gateway_explicit_session_route") or not side_root_id:
+            return "Reply to a side-session message with `/merge`."
+
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return "❌ Merge failed: session storage is unavailable."
+        try:
+            side_row = await session_db.get_session(side_root_id)
+        except Exception:
+            logger.exception("Could not load side metadata for merge")
+            return "❌ Merge failed: could not load the side session."
+        side_row = side_row if isinstance(side_row, dict) else {}
+        raw_config = side_row.get("model_config")
+        try:
+            config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            config = {}
+        parent_route = str(config.get("_side_parent_route") or "").strip()
+        if not parent_route:
+            side_route = str(metadata.get("gateway_session_key") or "")
+            suffix = f":side:{side_root_id}"
+            if side_route.endswith(suffix):
+                parent_route = side_route[:-len(suffix)]
+        if not parent_route:
+            return "❌ Merge failed: the originating main route is unavailable."
+
+        parent_entry = await self.async_session_store.lookup_by_session_key(parent_route)
+        if parent_entry is None:
+            return "❌ Merge failed: the originating main route is no longer active."
+        is_running = getattr(self, "_is_session_running", None)
+        if callable(is_running) and is_running(parent_route):
+            return "⏳ Main is still running. Wait for its current response, then retry `/merge`."
+
+        try:
+            result = await session_db.merge_side_context(
+                destination_session_id=parent_entry.session_id,
+                side_root_session_id=side_root_id,
+                command_text=event.text or "/merge",
+            )
+        except ValueError as exc:
+            return f"❌ Merge failed: {exc}."
+        except Exception:
+            logger.exception("Side context merge failed")
+            return "❌ Merge failed: the context import did not commit."
+
+        evict = getattr(self, "_evict_cached_agent", None)
+        if callable(evict):
+            evict(parent_route)
+        # The completion is a main-route anchor. Replies to older side messages
+        # still resolve through their durable bindings and continue the side.
+        for key in (
+            "gateway_session_key",
+            "gateway_session_id",
+            "gateway_session_strict",
+            "gateway_explicit_session_route",
+            "gateway_side_root_session_id",
+        ):
+            metadata.pop(key, None)
+        event.metadata = metadata
+        if result.get("status") == "already_merged":
+            cutoff = result.get("source_cutoff_message_id")
+            return f"↩️ Side context is already merged through `{side_root_id}:{cutoff}`."
+        return str(result.get("message") or "↩️ Side context merged into main.")
+
     @staticmethod
     async def _finalize_incomplete_side(
         session_db,
@@ -4378,6 +4447,8 @@ class GatewaySlashCommandsMixin:
                     "_branched_from": parent_session_id,
                     "_side_from": parent_session_id,
                     "_side_root": child_session_id,
+                    "_side_parent_route": parent_route_key,
+                    "_side_fork_message_count": len(history),
                 },
                 parent_session_id=parent_session_id,
                 user_id=source.user_id,

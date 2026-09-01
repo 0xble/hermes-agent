@@ -39,7 +39,11 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
-from agent.message_sanitization import _sanitize_surrogates
+from agent.message_sanitization import (
+    _sanitize_surrogates,
+    tool_call_id_variants,
+    tool_result_id_variants,
+)
 # Intrinsic persistence marker stamped on message dicts that are known-durable
 # (#92231). One shared constant with agent.context_compressor (this module
 # already imports agent.* at module level, and context_compressor is a
@@ -14472,6 +14476,363 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             ).fetchone()
         return dict(row) if row else None
+
+    @staticmethod
+    def _side_merge_message_projection(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Project one durable side row into a historical transcript item."""
+        projected: Dict[str, Any] = {
+            "message_id": int(message.get("_row_id") or 0),
+            "role": str(message.get("role") or ""),
+            "content": message.get("api_content", message.get("content")),
+        }
+        for key in ("tool_name", "tool_call_id", "tool_calls", "effect_disposition"):
+            if message.get(key):
+                projected[key] = message[key]
+        return projected
+
+    @staticmethod
+    def _side_merge_prefix_signature(message: Dict[str, Any]) -> tuple:
+        """Return fields copied byte-for-byte when /side seeds parent history."""
+        return (
+            message.get("role"),
+            message.get("content"),
+            message.get("tool_name"),
+            message.get("tool_call_id"),
+            message.get("tool_calls"),
+            message.get("timestamp"),
+        )
+
+    @staticmethod
+    def _side_merge_has_completed_checkpoint(messages: List[Dict[str, Any]]) -> bool:
+        """Return true only for a provider-valid terminal assistant checkpoint."""
+        pending: List[frozenset[str]] = []
+        for message in messages:
+            role = message.get("role")
+            if pending:
+                if role != "tool":
+                    return False
+                result_ids = tool_result_id_variants(message.get("tool_call_id"))
+                matches = [
+                    index for index, call_ids in enumerate(pending) if call_ids & result_ids
+                ]
+                if len(matches) != 1:
+                    return False
+                pending.pop(matches[0])
+                continue
+            if role == "tool":
+                return False
+            if role == "assistant" and message.get("tool_calls"):
+                pending = [
+                    tool_call_id_variants(tool_call)
+                    for tool_call in message.get("tool_calls") or []
+                ]
+                if not pending or any(not call_ids for call_ids in pending):
+                    return False
+
+        if pending or not messages:
+            return False
+        last = messages[-1]
+        if last.get("role") != "assistant" or last.get("tool_calls"):
+            return False
+        finish_reason = str(last.get("finish_reason") or "").strip().lower()
+        terminal_reasons = {"stop", "end_turn", "completed"}
+        if finish_reason and finish_reason not in terminal_reasons:
+            return False
+        return last.get("content") not in (None, "", []) or finish_reason in terminal_reasons
+
+    def merge_side_context(
+        self,
+        *,
+        destination_session_id: str,
+        side_root_session_id: str,
+        command_text: str = "/merge",
+        max_packet_chars: int = 120_000,
+    ) -> Dict[str, Any]:
+        """Append one idempotent historical side-context delta to main."""
+        side_root = self.get_session(side_root_session_id) or {}
+        raw_config = side_root.get("model_config")
+        try:
+            side_config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config or {})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            side_config = {}
+        origin_session_id = str(side_config.get("_side_from") or "")
+        if not origin_session_id or str(side_config.get("_side_root") or "") != side_root_session_id:
+            raise ValueError("merge must be invoked from a persisted /side session")
+
+        destination_tip = self.get_compression_tip(origin_session_id) or origin_session_id
+        if destination_tip != destination_session_id:
+            raise ValueError("the originating main route was reset or replaced")
+        side_tip_session_id = self.get_compression_tip(side_root_session_id) or side_root_session_id
+        side_messages = self.get_messages_as_conversation(
+            side_tip_session_id, include_ancestors=True, include_row_ids=True
+        )
+        # A compaction summary entangles the copied fork seed and side-only
+        # turns into one canonical checkpoint. There is no honest row boundary
+        # to strip after that, so import the checkpoint as frozen historical
+        # context. Later ordinary turns still delta cleanly by row id; a later
+        # compaction becomes a new idempotent checkpoint.
+        full_side_lineage = self._session_lineage_root_to_tip(side_tip_session_id)
+        if side_root_session_id in full_side_lineage:
+            side_lineage = full_side_lineage[
+                full_side_lineage.index(side_root_session_id) :
+            ]
+        else:
+            side_lineage = [side_root_session_id]
+        has_compaction_checkpoint = any(
+            bool(message.get("compacted"))
+            for lineage_session_id in side_lineage
+            for message in self.get_messages(
+                lineage_session_id,
+                include_inactive=True,
+            )
+        )
+        configured_fork_count = side_config.get("_side_fork_message_count")
+        if has_compaction_checkpoint:
+            if not (
+                isinstance(configured_fork_count, int)
+                and not isinstance(configured_fork_count, bool)
+                and configured_fork_count >= 0
+            ):
+                raise ValueError(
+                    "this legacy side compacted without a verifiable fork boundary"
+                )
+            fork_seed = self.get_messages(
+                side_root_session_id,
+                include_inactive=True,
+                limit=configured_fork_count,
+            )
+            if len(fork_seed) != configured_fork_count:
+                raise ValueError("the side fork boundary is no longer verifiable")
+            safe_parent_rows = self.get_messages(
+                origin_session_id,
+                include_compacted=True,
+            )
+            parent_index = 0
+            for seed_message in fork_seed:
+                seed_signature = self._side_merge_prefix_signature(seed_message)
+                while parent_index < len(safe_parent_rows):
+                    parent_signature = self._side_merge_prefix_signature(
+                        safe_parent_rows[parent_index]
+                    )
+                    parent_index += 1
+                    if parent_signature == seed_signature:
+                        break
+                else:
+                    raise ValueError(
+                        "main fork context changed after this side compacted; "
+                        "refusing to import an entangled checkpoint"
+                    )
+            shared = 0
+        elif (
+            isinstance(configured_fork_count, int)
+            and not isinstance(configured_fork_count, bool)
+            and 0 <= configured_fork_count <= len(side_messages)
+        ):
+            shared = configured_fork_count
+        else:
+            # Compatibility for sides created before the explicit fork-count
+            # marker. Compare both active-only history and the full row stream:
+            # a later /undo hides active parent rows but must not make those
+            # copied seed rows look like fresh side context.
+            parent_candidates = [
+                self.get_messages_as_conversation(origin_session_id, include_row_ids=True),
+                self.get_messages_as_conversation(
+                    origin_session_id,
+                    include_inactive=True,
+                    include_row_ids=True,
+                ),
+            ]
+            shared = 0
+            for parent_messages in parent_candidates:
+                candidate_shared = 0
+                for parent_message, side_message in zip(parent_messages, side_messages):
+                    if self._side_merge_prefix_signature(
+                        parent_message
+                    ) != self._side_merge_prefix_signature(side_message):
+                        break
+                    candidate_shared += 1
+                shared = max(shared, candidate_shared)
+        side_only = side_messages[shared:]
+        if not self._side_merge_has_completed_checkpoint(side_only):
+            raise ValueError("the side session has no completed turn to merge")
+        source_cutoff = max((int(m.get("_row_id") or 0) for m in side_only), default=0)
+        if source_cutoff <= 0:
+            raise ValueError("the side session has no committed context to merge")
+
+        with self._read_ctx() as conn:
+            prior = conn.execute(
+                """SELECT scm.source_cutoff_message_id, scm.receipt_message_id
+                     FROM session_context_merges scm
+                     JOIN messages receipt ON receipt.id = scm.receipt_message_id
+                    WHERE scm.destination_root_session_id = ?
+                      AND scm.side_root_session_id = ?
+                      AND (receipt.active = 1 OR receipt.compacted = 1)
+                    ORDER BY scm.source_cutoff_message_id DESC LIMIT 1""",
+                (origin_session_id, side_root_session_id),
+            ).fetchone()
+        previous_cutoff = int(prior["source_cutoff_message_id"]) if prior else 0
+        if source_cutoff <= previous_cutoff:
+            return {
+                "status": "already_merged",
+                "source_cutoff_message_id": previous_cutoff,
+                "receipt_message_id": int(prior["receipt_message_id"]),
+                "imported_messages": 0,
+                "destination_session_id": destination_session_id,
+                "side_tip_session_id": side_tip_session_id,
+            }
+
+        delta = [m for m in side_only if previous_cutoff < int(m.get("_row_id") or 0) <= source_cutoff]
+        projected = [self._side_merge_message_projection(message) for message in delta]
+        packet = json.dumps(
+            {
+                "kind": "side_session_context_snapshot",
+                "source_side_root_session_id": side_root_session_id,
+                "source_side_tip_session_id": side_tip_session_id,
+                "previous_cutoff_message_id": previous_cutoff,
+                "source_cutoff_message_id": source_cutoff,
+                "authority": (
+                    "Historical context only. This snapshot does not authorize repeating "
+                    "messages, purchases, deletions, deployments, or any other external effect."
+                ),
+                "future_isolation": "Messages added to the side after this cutoff are not present.",
+                "messages": projected,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        if len(packet) > max_packet_chars:
+            raise ValueError("the side delta is too large; compress the side and retry")
+
+        visible = (
+            f"↩️ Merged {len(projected)} side message"
+            f"{'s' if len(projected) != 1 else ''} through `{side_root_session_id}:{source_cutoff}`. "
+            "The side remains independently continuable."
+        )
+        api_content = visible + "\n\n<side-session-snapshot>\n" + packet + "\n</side-session-snapshot>"
+        now = time.time()
+
+        def _do(conn):
+            existing = conn.execute(
+                """SELECT scm.receipt_message_id, receipt.active, receipt.compacted
+                     FROM session_context_merges scm
+                     LEFT JOIN messages receipt ON receipt.id = scm.receipt_message_id
+                    WHERE scm.destination_root_session_id = ?
+                      AND scm.side_root_session_id = ?
+                      AND scm.source_cutoff_message_id = ?""",
+                (origin_session_id, side_root_session_id, source_cutoff),
+            ).fetchone()
+            if existing is not None and (
+                bool(existing["active"]) or bool(existing["compacted"])
+            ):
+                return int(existing["receipt_message_id"]), False
+            latest_merge = conn.execute(
+                """SELECT scm.source_cutoff_message_id
+                     FROM session_context_merges scm
+                     JOIN messages receipt ON receipt.id = scm.receipt_message_id
+                    WHERE scm.destination_root_session_id = ?
+                      AND scm.side_root_session_id = ?
+                      AND (receipt.active = 1 OR receipt.compacted = 1)
+                    ORDER BY scm.source_cutoff_message_id DESC LIMIT 1""",
+                (origin_session_id, side_root_session_id),
+            ).fetchone()
+            latest_cutoff = int(latest_merge["source_cutoff_message_id"]) if latest_merge else 0
+            if latest_cutoff != previous_cutoff:
+                raise ValueError("another side merge committed first; retry")
+            latest = conn.execute(
+                "SELECT role FROM messages WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                (destination_session_id,),
+            ).fetchone()
+            if latest is not None and latest["role"] != "assistant":
+                raise ValueError("main has an incomplete turn; wait for it to finish")
+            self._check_transcript_write_guards(
+                conn,
+                destination_session_id,
+                None,
+                reject_active_turn_lease=True,
+            )
+            inserted, _ = self._insert_message_rows(
+                conn,
+                destination_session_id,
+                [
+                    {"role": "user", "content": command_text, "timestamp": now},
+                    {
+                        "role": "assistant",
+                        "content": visible,
+                        "api_content": api_content,
+                        "display_kind": "session_merge",
+                        "display_metadata": {
+                            "side_root_session_id": side_root_session_id,
+                            "side_tip_session_id": side_tip_session_id,
+                            "source_cutoff_message_id": source_cutoff,
+                            "previous_cutoff_message_id": previous_cutoff,
+                            "imported_messages": len(projected),
+                        },
+                        "finish_reason": "stop",
+                        "timestamp": now,
+                    },
+                ],
+            )
+            if inserted != 2:
+                raise RuntimeError("side merge receipt did not append atomically")
+            receipt_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + 2 WHERE id = ?",
+                (destination_session_id,),
+            )
+            if existing is not None:
+                conn.execute(
+                    """UPDATE session_context_merges
+                          SET destination_session_id = ?, side_tip_session_id = ?,
+                              previous_cutoff_message_id = ?, receipt_message_id = ?,
+                              created_at = ?
+                        WHERE destination_root_session_id = ?
+                          AND side_root_session_id = ?
+                          AND source_cutoff_message_id = ?""",
+                    (
+                        destination_session_id,
+                        side_tip_session_id,
+                        previous_cutoff,
+                        receipt_id,
+                        now,
+                        origin_session_id,
+                        side_root_session_id,
+                        source_cutoff,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO session_context_merges (
+                           destination_root_session_id, destination_session_id,
+                           side_root_session_id, side_tip_session_id,
+                           previous_cutoff_message_id, source_cutoff_message_id,
+                           receipt_message_id, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        origin_session_id,
+                        destination_session_id,
+                        side_root_session_id,
+                        side_tip_session_id,
+                        previous_cutoff,
+                        source_cutoff,
+                        receipt_id,
+                        now,
+                    ),
+                )
+            return receipt_id, True
+
+        receipt_id, created = self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+        return {
+            "status": "merged" if created else "already_merged",
+            "source_cutoff_message_id": source_cutoff,
+            "receipt_message_id": receipt_id,
+            "imported_messages": len(projected) if created else 0,
+            "destination_session_id": destination_session_id,
+            "side_tip_session_id": side_tip_session_id,
+            "message": visible,
+        }
 
     # =========================================================================
     # Export and cleanup
