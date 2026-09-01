@@ -77,7 +77,6 @@ _INTERNAL_TURN_ALWAYS_BLOCKED = frozenset({
     "hindsight_restore",
     "hindsight_retain",
     "send_message",
-    "set_goal",
     "skill_manage",
 })
 
@@ -90,6 +89,8 @@ def _internal_turn_effect_block(agent, function_name: str, function_args: dict) 
     normalized_name = str(function_name or "").strip()
     action = str((function_args or {}).get("action") or "").strip().lower()
     blocked = normalized_name in _INTERNAL_TURN_ALWAYS_BLOCKED
+    if normalized_name == "set_goal":
+        blocked = action not in {"status", "show", "subgoal_list", "gate_list"}
     if normalized_name == "memory" and (function_args or {}).get("operations"):
         blocked = True
     if not blocked:

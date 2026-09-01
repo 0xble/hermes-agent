@@ -1,4 +1,4 @@
-"""A mid-turn /goal clear or pause advances the control revision."""
+"""Mid-turn user goal mutations advance the model-control revision."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,7 +7,13 @@ import pytest
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["clear", "pause", "stop", "done"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "clear", "pause", "stop", "done", "resume", "unwait", "wait 123 build",
+        "gate add true", "gate remove 1", "gate clear",
+    ],
+)
 async def test_busy_goal_control_advances_the_persisted_revision(
     command,
     tmp_path,
