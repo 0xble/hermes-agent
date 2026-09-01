@@ -47,7 +47,7 @@ jobs:
           candidate/MAINTENANCE.md
           --upstream-ref canonical-upstream/main
           --history-baseline-subject
-          'fix(ci): reconcile rich paragraph patch history'
+          'fix(ci): reconcile rich paragraph squash history (#35)'
       - name: Install pinned uv for trusted workflow policy
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:
