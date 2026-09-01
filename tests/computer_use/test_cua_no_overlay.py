@@ -233,6 +233,8 @@ class TestEmbeddedDaemonOverlayFlag:
         status = MagicMock(returncode=0)
 
         with patch.object(
+            cua_backend.sys, "platform", "darwin",
+        ), patch.object(
             cua_backend,
             "_resolve_mcp_invocation",
             return_value=("/usr/bin/cua-driver", ["mcp"]),
