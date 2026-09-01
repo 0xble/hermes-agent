@@ -153,7 +153,7 @@ def test_install_e2e_sources_only_canonical_release_tags(tmp_path: Path) -> None
 
     trigger_block = workflow.split("permissions:", 1)[0]
     assert "  workflow_dispatch:" in trigger_block
-    assert "  schedule:" in trigger_block
+    assert "  schedule:" not in trigger_block
     assert "  push:" not in trigger_block
     assert "if: github.ref == 'refs/heads/main'" in workflow
 
@@ -172,11 +172,11 @@ def test_install_e2e_manual_tag_count_is_shell_safe() -> None:
     picker = re.search(
         r"(?m)^      - id: pick\n"
         r"        env:\n"
-        r"          TAG_COUNT: \$\{\{ inputs\.tag-count \|\| 5 \}\}\n"
+        r"          TAG_COUNT: \$\{\{ inputs\.mode == 'full' && inputs\.tag-count \|\| '1' \}\}\n"
         r"        run: \|\n(?P<body>(?:          [^\n]*\n)+)",
         workflow,
     )
-    assert picker, "manual tag count must enter the picker through TAG_COUNT"
+    assert picker, "manual mode and tag count must enter the picker through TAG_COUNT"
     run_block = "\n".join(
         line[10:] for line in picker.group("body").splitlines()
     )

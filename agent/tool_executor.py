@@ -57,6 +57,63 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+# Synthetic gateway turns are continuations, not new user authorization.  Keep
+# control-plane mutations behind a real user-authored turn even when a model
+# reinterprets old context after compression or an async completion.  This is a
+# deliberately narrow, deterministic boundary: read-only inspection remains
+# available, as do reversible project-local tools needed to finish background
+# work.  Expand only with an explicit effect-intent contract.
+_INTERNAL_TURN_BLOCKED_ACTIONS = {
+    "cronjob": frozenset({"create", "update", "pause", "resume", "remove", "run"}),
+    "memory": frozenset({"add", "replace", "remove"}),
+    "computer_use": frozenset({
+        "click", "double_click", "right_click", "middle_click", "drag",
+        "scroll", "type", "key", "set_value", "focus_app",
+    }),
+}
+_INTERNAL_TURN_ALWAYS_BLOCKED = frozenset({
+    "delegate_task",
+    "hindsight_invalidate",
+    "hindsight_restore",
+    "hindsight_retain",
+    "send_message",
+    "set_goal",
+    "skill_manage",
+})
+
+
+def _internal_turn_effect_block(agent, function_name: str, function_args: dict) -> str | None:
+    """Reject new control-plane effects from synthetic continuation turns."""
+    if not bool(getattr(agent, "_current_turn_is_internal", False)):
+        return None
+
+    normalized_name = str(function_name or "").strip()
+    action = str((function_args or {}).get("action") or "").strip().lower()
+    blocked = normalized_name in _INTERNAL_TURN_ALWAYS_BLOCKED
+    if normalized_name == "memory" and (function_args or {}).get("operations"):
+        blocked = True
+    if not blocked:
+        blocked = action in _INTERNAL_TURN_BLOCKED_ACTIONS.get(
+            normalized_name, frozenset()
+        )
+    if not blocked:
+        return None
+
+    detail = f" action={action!r}" if action else ""
+    logger.warning(
+        "Blocked synthetic-turn control-plane mutation: tool=%s%s session=%s turn=%s",
+        normalized_name,
+        detail,
+        getattr(agent, "session_id", "") or "",
+        getattr(agent, "_current_turn_id", "") or "",
+    )
+    return (
+        "Internal notification turns cannot initiate control-plane mutations. "
+        f"Tool {normalized_name!r}{detail} was not executed. A new user-authored "
+        "instruction is required."
+    )
+
+
 def _pairing_tool_call_id(tool_call: Any) -> str:
     """Return the canonical id used by the persisted assistant message."""
     return coalesce_tool_call_id(tool_call)
@@ -638,8 +695,12 @@ def _run_agent_tool_execution_middleware(
                 return
             begin_execution(callback)
 
-        block_message = scope_block
+        block_message = scope_block or _internal_turn_effect_block(
+            agent, function_name, final_args
+        )
         block_error_type = "tool_scope_block"
+        if block_message is not None and scope_block is None:
+            block_error_type = "internal_turn_effect_block"
         if block_message is None:
             block_error_type = "plugin_block"
 

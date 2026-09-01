@@ -77,6 +77,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
 
     async def handler(request):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
+        seen["internal"] = request.headers.get("X-Hermes-Internal-Notification")
         seen["auth"] = request.headers.get("Authorization")
         seen["body"] = await request.json()
         return web.json_response({"choices": [{"message": {"content": "ok"}}]})
@@ -91,6 +92,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
 
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
+    assert seen["internal"] == "1"
     assert seen["auth"] == "Bearer sekrit"
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [

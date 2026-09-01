@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from run_agent import AIAgent
+from run_agent import AIAgent, _is_ephemeral_scaffolding
+from agent.turn_finalizer import (
+    _collapse_verification_candidates,
+    _compose_verification_receipt_with_answer,
+)
 
 
 def _response(content="composed report"):
@@ -295,6 +299,139 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     agent._handle_max_iterations.assert_not_called()
 
 
+def test_replacement_candidate_resets_preview_state(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([_response("candidate one"), _response("candidate two")])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._interim_content_was_streamed = lambda text: text == "candidate one"
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", "verify it again"],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == "candidate two"
+    assert result["response_previewed"] is False
+
+
+def test_composed_candidate_is_not_marked_previewed_when_only_parts_streamed(
+    agent, monkeypatch
+):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    receipt = "Fresh verification from this turn passes."
+    answers = iter([_response("substantive answer"), _response(receipt)])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._interim_content_was_streamed = lambda _text: True
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", "verify it again"],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == (
+        "substantive answer\n\n## Verification\n\n" + receipt
+    )
+    assert result["response_previewed"] is False
+
+
+def test_candidate_collapse_appends_after_later_tool_protocol_rows():
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": "candidate",
+            "_verification_candidate": True,
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ]
+    fake_agent = SimpleNamespace(_db_flush_scan_prefix=[])
+
+    _collapse_verification_candidates(messages, "canonical answer", fake_agent)
+
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[1]["tool_calls"]
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "canonical answer"
+    assert set(messages[-1]) == {"role", "content", "timestamp"}
+    assert fake_agent._db_flush_scan_prefix is None
+
+
+def test_candidate_collapse_ignores_stale_candidates_from_prior_turns():
+    messages = [
+        {"role": "user", "content": "old task"},
+        {
+            "role": "assistant",
+            "content": "crash-durable old answer",
+            "_verification_candidate": True,
+        },
+        {"role": "user", "content": "new task"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    original = [dict(message) for message in messages]
+    fake_agent = SimpleNamespace(_db_flush_scan_prefix=[])
+
+    collapsed = _collapse_verification_candidates(
+        messages,
+        "new answer",
+        fake_agent,
+    )
+
+    assert collapsed is False
+    assert messages == original
+    assert fake_agent._db_flush_scan_prefix == []
+
+
+def test_receipt_only_verification_response_keeps_pending_answer(agent, monkeypatch):
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([
+        _response("Implemented the requested change."),
+        _response("Fresh verification from this turn passes:\n\n`pnpm run lint`"),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", None],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == (
+        "Implemented the requested change.\n\n"
+        "## Verification\n\n"
+        "Fresh verification from this turn passes:\n\n`pnpm run lint`"
+    )
+    assert result["completed"] is True
+    agent._handle_max_iterations.assert_not_called()
+
+
 def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
     agent, monkeypatch, tmp_path
 ):
@@ -351,8 +488,13 @@ def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
 
 
 def test_verification_composition_persists_transformed_canonical_response(
-    agent, monkeypatch
+    agent, monkeypatch, tmp_path
 ):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "transformed-state.db")
+    db.create_session(session_id=agent.session_id, source="cli")
+    agent._session_db = db
     agent.max_iterations = 2
     agent.iteration_budget.max_total = 2
     answers = iter(
@@ -362,7 +504,7 @@ def test_verification_composition_persists_transformed_canonical_response(
         ]
     )
     agent._interruptible_api_call = lambda _kwargs: next(answers)
-    agent._persist_session = MagicMock()
+
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
 
     def transform(text, **_kwargs):
@@ -380,8 +522,13 @@ def test_verification_composition_persists_transformed_canonical_response(
 
     assert result["final_response"].endswith("[guarded]")
     assert result["messages"][-1]["content"] == result["final_response"]
-    persisted_messages = agent._persist_session.call_args_list[-1].args[0]
+    persisted_messages = db.get_messages(agent.session_id)
+    assert [message["role"] for message in persisted_messages] == [
+        "user",
+        "assistant",
+    ]
     assert persisted_messages[-1]["content"] == result["final_response"]
+    db.close()
 
 
 def test_multiple_verification_retries_publish_each_candidate_once(agent, monkeypatch):

@@ -150,7 +150,10 @@ class TestWorkerTeardownOnCeiling:
             worker=stuck_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
+            # Keep the idle budget well outside the total ceiling so a busy
+            # full-suite runner cannot starve this worker long enough to turn
+            # the intended ceiling-path test into an idle-timeout race.
+            idle_timeout_seconds=2.0,
             total_ceiling_seconds=0.3,
             fence=fence,
             stall_fallback=False,

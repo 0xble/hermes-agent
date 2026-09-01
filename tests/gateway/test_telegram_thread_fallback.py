@@ -24,7 +24,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     _thread_metadata_for_source,
 )
-from gateway.session import build_session_key
+from gateway.session import SessionSource, build_session_key
 
 
 # ── Fake telegram.error hierarchy ──────────────────────────────────────
@@ -136,6 +136,52 @@ def _make_adapter():
     adapter._polling_error_callback_ref = None
     adapter.platform = Platform.TELEGRAM
     return adapter
+
+
+def test_internal_dm_topic_event_never_reuses_a_user_reply_anchor():
+    """Synthetic parent continuations must not quote a concurrent side command."""
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="2027045491",
+        thread_id="162936",
+        chat_type="dm",
+        user_id="2027045491",
+        message_id="65097",
+    )
+    event = MessageEvent(
+        text="[ASYNC DELEGATION BATCH COMPLETE]",
+        source=source,
+        message_id="65066",
+        reply_to_message_id="65066",
+        internal=True,
+    )
+
+    reply_anchor = _reply_anchor_for_event(event)
+    assert reply_anchor is None
+    metadata = _thread_metadata_for_source(source, reply_anchor)
+    assert metadata == {
+        "thread_id": "162936",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "162936",
+    }
+
+
+def test_real_dm_topic_event_keeps_its_triggering_message_anchor():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="2027045491",
+        thread_id="162936",
+        chat_type="dm",
+        user_id="2027045491",
+    )
+    event = MessageEvent(
+        text="Please pause it",
+        source=source,
+        message_id="65097",
+        internal=False,
+    )
+
+    assert _reply_anchor_for_event(event) == "65097"
 
 
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():

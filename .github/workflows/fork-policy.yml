@@ -1,0 +1,56 @@
+name: Trusted fork policy
+
+# pull_request_target makes GitHub load this definition from the default branch.
+# Candidate content is data only: no candidate action, script, manifest, or hook
+# is executed by this workflow.
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    name: Validate candidate with trusted policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted default-branch policy
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted-policy
+          persist-credentials: false
+      - name: Checkout immutable candidate as data
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch canonical upstream history into candidate checkout
+        run: >-
+          git -C candidate fetch --no-tags --filter=blob:none
+          https://github.com/NousResearch/hermes-agent.git
+          refs/heads/main:refs/remotes/canonical-upstream/main
+      - name: Validate maintained patch history with trusted code
+        run: >-
+          python3 trusted-policy/scripts/validate_maintenance_manifest.py
+          candidate/MAINTENANCE.md
+          --upstream-ref canonical-upstream/main
+          --history-baseline-subject
+          'fix(ci): source install E2E tags from upstream (#11)'
+      - name: Install pinned uv for trusted workflow policy
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+      - name: Validate candidate workflow surface with trusted code
+        run: >-
+          uv run --script trusted-policy/scripts/ci/validate_workflow_policy.py
+          --root candidate

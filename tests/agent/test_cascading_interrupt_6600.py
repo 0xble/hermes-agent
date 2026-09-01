@@ -53,19 +53,22 @@ def test_non_streaming_cancel_does_not_surface_network_error():
 
     create_calls = {"n": 0}
     fake_client = MagicMock()
+    request_aborted = threading.Event()
 
     def _create(**kwargs):
         create_calls["n"] += 1
         # Simulate the main thread firing an interrupt mid-call, then the
         # force-close raising a transport error on this worker.
         agent._interrupt_requested = True
-        time.sleep(0.3)  # let the poll loop observe the interrupt + force-close
+        assert request_aborted.wait(timeout=5.0)
         raise httpx.RemoteProtocolError("peer closed connection")
 
     fake_client.chat.completions.create.side_effect = _create
     agent._create_request_openai_client.return_value = fake_client
     agent._close_request_openai_client = MagicMock()
-    agent._abort_request_openai_client = MagicMock()
+    agent._abort_request_openai_client = MagicMock(
+        side_effect=lambda *_args, **_kwargs: request_aborted.set()
+    )
 
     t0 = time.time()
     with pytest.raises(InterruptedError):
@@ -116,18 +119,22 @@ def test_anthropic_non_streaming_stale_aborts_request_client_not_shared():
     agent._create_request_anthropic_client = MagicMock(return_value=request_client)
     agent._abort_request_anthropic_client = MagicMock()
     agent._close_request_anthropic_client = MagicMock()
+    worker_release = threading.Event()
 
     def _create(_api_kwargs, *, client):
         assert client is request_client
-        # Outlive the 0.05s stale timeout AND the worker join (2.0s) so the
-        # stale detector surfaces its TimeoutError.
-        time.sleep(2.5)
+        # Remain blocked until the stale detector has exhausted its bounded
+        # join and surfaced TimeoutError, independent of runner load.
+        assert worker_release.wait(timeout=5.0)
         return object()
 
     agent._anthropic_messages_create = MagicMock(side_effect=_create)
 
-    with pytest.raises(TimeoutError):
-        cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    try:
+        with pytest.raises(TimeoutError):
+            cch.interruptible_api_call(agent, {"model": "x", "messages": []})
+    finally:
+        worker_release.set()
 
     # Shared client untouched from the poll thread.
     agent._anthropic_client.close.assert_not_called()
