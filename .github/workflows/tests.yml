@@ -13,11 +13,17 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
-    # Standard private-repository runner. The per-file runner still parallelizes
-    # within the available CPU budget without paid larger-runner labels.
+    name: Run tests (${{ matrix.slice }}/4)
+    # Four standard runners each execute a deterministic quarter of the
+    # per-file-isolated suite. Two workers per runner avoid the scheduler
+    # contention that makes strict timing regressions flaky, while keeping the
+    # complete lane within a practical wall-clock bound.
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: [1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -87,16 +93,12 @@ jobs:
         # in its own freshly-spawned `python -m pytest <file>` subprocess
         # with bounded parallelism. No xdist, no shared workers, no
         # module-level state leakage between files.
-        #
-        # No --files: the runner discovers the suite itself. The discovered
-        # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          # Pass sharding only to the outer runner. Exporting it would leak
+          # into tests that spawn the runner against temporary probe files.
+          scripts/run_tests.sh --slice "${{ matrix.slice }}/4" -j 2
         env:
-          # Match the standard ubuntu-latest CPU allocation; excess subprocesses
-          # only add memory pressure and scheduler contention.
-          HERMES_TEST_WORKERS: 4
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
