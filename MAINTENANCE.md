@@ -113,6 +113,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-089 | Active | `fix(telegram): separate duplicate topic labels from session aliases` | Allow Telegram topics to share a visible label while preserving unique, deterministic internal session aliases. |
 | HERMES-090 | Active | `feat(gateway): merge side context into main` | Import one frozen, provenance-marked side-session delta into its originating main route without joining their future timelines. |
 | HERMES-091 | Active | `feat(browser): choose headed mode per exec session (#28)` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
+| HERMES-092 | Active | `fix(browser): recover persisted headed mode after restart` | Recover identity-scoped live runtime mode after gateway restart so cleanup never falls back to a contradictory global default. |
 
 ## Fork-only administrative subject exemptions
 
@@ -1168,6 +1169,18 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Published commit identity:** Stable subject `feat(browser): choose headed mode per exec session (#28)`.
 - **Rollback:** Revert `feat(browser): choose headed mode per exec session (#28)`, removing the schema argument, runtime mode tracking, focused regressions, documentation, and this record while preserving existing real-profile identity isolation and the global `browser.headed` setting.
 - **Retirement:** Retire after released upstream ships equivalent per-call or per-session managed-local headed control with identity-safe reuse conflicts, durable mode recovery, and runtime-effective cleanup, and the regression contract passes against that release.
+
+### HERMES-092 — Recover browser runtime mode after gateway restart
+
+- **Independent hypothesis (2026-09-01):** A managed browser may outlive the gateway process, but the per-identity runtime cache does not. Cleanup must rediscover only active-profile snapshot processes, validate their owned CDP endpoints, and read an exact persisted mode instead of falling back to a potentially contradictory global setting.
+- **Summary:** Recovers headed/headless mode for live identity-scoped managed snapshots after process restart. Exact `headed` and `headless` markers repopulate active-profile runtime bookkeeping; missing or malformed markers preserve the live runtime rather than guessing and destroying it.
+- **Surfaces:** `tools/browser_tool.py`; `tests/tools/test_browser_headed_mode.py`; this record.
+- **Upstream tracking:** [Issue #100428](https://github.com/NousResearch/hermes-agent/issues/100428) tracks per-session headed control and its lifecycle contract.
+- **Upstream PR:** [#100468](https://github.com/NousResearch/hermes-agent/pull/100468) carries the generic recovery fix and focused regressions.
+- **Regression:** `uv run --extra dev pytest -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves identity-scoped restart recovery, exact marker parsing, malformed-marker preservation, configured fallback, and existing headed-control behavior.
+- **Published commit identity:** Stable subject `fix(browser): recover persisted headed mode after restart`.
+- **Rollback:** Revert `fix(browser): recover persisted headed mode after restart`, removing restart-time mode rediscovery and its focused regressions while retaining HERMES-091's per-call argument and in-process runtime tracking.
+- **Retirement:** Retire with HERMES-091 after released upstream provides equivalent per-session headed control plus restart-safe effective-mode recovery and the combined regression contract passes.
 
 ## Automatic synchronization
 
