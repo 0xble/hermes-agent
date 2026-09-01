@@ -15,6 +15,8 @@ import yaml
 
 CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 SETUP_UV_ACTION = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
+SETUP_UV_ACTION_NEXT = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+SETUP_UV_ACTION_FAMILY = frozenset({SETUP_UV_ACTION, SETUP_UV_ACTION_NEXT})
 
 WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
     "ci.yaml": frozenset({"pull_request", "push"}),
@@ -104,7 +106,7 @@ STEP_ACTION_ALLOWLIST = frozenset(
         "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
         "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        SETUP_UV_ACTION,
+        *SETUP_UV_ACTION_FAMILY,
         "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342",
         "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",
         "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf",
@@ -198,6 +200,22 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "--root candidate"
                     ),
                 },
+            ],
+        }
+    },
+}
+FORK_POLICY_WORKFLOW_NEXT: dict[str, Any] = {
+    **FORK_POLICY_WORKFLOW,
+    "jobs": {
+        "policy": {
+            **FORK_POLICY_WORKFLOW["jobs"]["policy"],
+            "steps": [
+                *FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][:4],
+                {
+                    **FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][4],
+                    "uses": SETUP_UV_ACTION_NEXT,
+                },
+                *FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][5:],
             ],
         }
     },
@@ -467,14 +485,22 @@ def validate(root: Path) -> list[str]:
         step_actions, reusable_workflows = _references(data)
         seen_step_actions.update(step_actions)
         seen_reusable_workflows.update(reusable_workflows)
-        if name == "fork-policy.yml" and data != FORK_POLICY_WORKFLOW:
+        if name == "fork-policy.yml" and data not in (
+            FORK_POLICY_WORKFLOW,
+            FORK_POLICY_WORKFLOW_NEXT,
+        ):
             errors.append("fork-policy.yml: trusted workflow structure differs from exact policy")
 
-    if seen_step_actions != set(STEP_ACTION_ALLOWLIST):
+    stable_step_actions = set(STEP_ACTION_ALLOWLIST) - set(SETUP_UV_ACTION_FAMILY)
+    missing_step_actions = stable_step_actions - seen_step_actions
+    unexpected_step_actions = seen_step_actions - set(STEP_ACTION_ALLOWLIST)
+    setup_uv_actions = seen_step_actions & set(SETUP_UV_ACTION_FAMILY)
+    if missing_step_actions or unexpected_step_actions or len(setup_uv_actions) != 1:
         errors.append(
             "step action references differ from exact allowlist: "
-            f"missing={sorted(set(STEP_ACTION_ALLOWLIST) - seen_step_actions)}, "
-            f"extra={sorted(seen_step_actions - set(STEP_ACTION_ALLOWLIST))}"
+            f"missing={sorted(missing_step_actions)}, "
+            f"extra={sorted(unexpected_step_actions)}, "
+            f"setup_uv={sorted(setup_uv_actions)}"
         )
     if seen_reusable_workflows != set(JOB_REUSABLE_WORKFLOW_ALLOWLIST):
         errors.append(

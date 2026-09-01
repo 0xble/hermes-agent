@@ -10,6 +10,7 @@ import pytest
 from scripts.ci.validate_workflow_policy import (
     FORK_POLICY_WORKFLOW,
     JOB_REUSABLE_WORKFLOW_ALLOWLIST,
+    SETUP_UV_ACTION_FAMILY,
     STEP_ACTION_ALLOWLIST,
     WORKFLOW_PERMISSIONS,
     WORKFLOW_TRIGGERS,
@@ -36,6 +37,28 @@ def _replace(path: Path, old: str, new: str) -> None:
 def test_repository_workflow_policy_passes() -> None:
     root = Path(__file__).resolve().parents[1]
     assert validate(root) == []
+
+
+def test_setup_uv_pin_can_transition_atomically(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    old = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
+    new = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
+    for workflow in (root / ".github" / "workflows").glob("*.y*"):
+        text = workflow.read_text(encoding="utf-8")
+        workflow.write_text(text.replace(old, new), encoding="utf-8")
+    assert validate(root) == []
+
+
+def test_setup_uv_pin_cannot_be_mixed_during_transition(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    workflow = root / ".github" / "workflows" / "e2e-desktop.yml"
+    _replace(
+        workflow,
+        "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39",
+        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
+    )
+    errors = validate(root)
+    assert any("step action references differ from exact allowlist" in error for error in errors)
 
 
 def test_ci_inherits_osv_actions_read_permission() -> None:
@@ -449,5 +472,7 @@ def test_action_and_reusable_reference_allowlists_are_exact() -> None:
         step_actions.update(actions)
         reusable_workflows.update(reusable)
 
-    assert step_actions == set(STEP_ACTION_ALLOWLIST)
+    stable_allowlist = set(STEP_ACTION_ALLOWLIST) - set(SETUP_UV_ACTION_FAMILY)
+    assert step_actions - set(SETUP_UV_ACTION_FAMILY) == stable_allowlist
+    assert len(step_actions & set(SETUP_UV_ACTION_FAMILY)) == 1
     assert reusable_workflows == set(JOB_REUSABLE_WORKFLOW_ALLOWLIST)
