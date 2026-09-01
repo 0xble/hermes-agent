@@ -10,8 +10,8 @@ import pytest
 from scripts.ci.validate_workflow_policy import (
     FORK_POLICY_WORKFLOW,
     JOB_REUSABLE_WORKFLOW_ALLOWLIST,
-    SETUP_UV_ACTION_FAMILY,
     STEP_ACTION_ALLOWLIST,
+    TRANSITION_ACTION_FAMILIES,
     WORKFLOW_PERMISSIONS,
     WORKFLOW_TRIGGERS,
     _load,
@@ -59,6 +59,41 @@ def test_setup_uv_pin_cannot_be_mixed_during_transition(tmp_path: Path) -> None:
     )
     errors = validate(root)
     assert any("step action references differ from exact allowlist" in error for error in errors)
+
+
+def test_checkout_pin_can_transition_with_explicit_fork_data_opt_in(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    old = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    new = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+    for workflow in (root / ".github" / "workflows").glob("*.y*"):
+        text = workflow.read_text(encoding="utf-8")
+        workflow.write_text(text.replace(old, new), encoding="utf-8")
+    fork_policy = root / ".github" / "workflows" / "fork-policy.yml"
+    _replace(
+        fork_policy,
+        "          fetch-depth: 0\n          persist-credentials: false\n",
+        "          fetch-depth: 0\n          persist-credentials: false\n"
+        "          allow-unsafe-pr-checkout: true\n",
+    )
+    assert validate(root) == []
+
+
+def test_grouped_action_pins_can_transition_atomically(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    replacements = {
+        "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342":
+            "cachix/install-nix-action@85e5c75b53ca5db16c97cf3e39a7b0c0957cc3ee",
+        "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2":
+            "google/osv-scanner-action/osv-scanner-action@16f4ae80dd08301c99ae0752242105e3e31bc41d",
+        "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf":
+            "hadolint/hadolint-action@39592fc4fb640fc194270a28a70721384e13f5a6",
+    }
+    for workflow in (root / ".github" / "workflows").glob("*.y*"):
+        text = workflow.read_text(encoding="utf-8")
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        workflow.write_text(text, encoding="utf-8")
+    assert validate(root) == []
 
 
 def test_ci_inherits_osv_actions_read_permission() -> None:
@@ -472,7 +507,9 @@ def test_action_and_reusable_reference_allowlists_are_exact() -> None:
         step_actions.update(actions)
         reusable_workflows.update(reusable)
 
-    stable_allowlist = set(STEP_ACTION_ALLOWLIST) - set(SETUP_UV_ACTION_FAMILY)
-    assert step_actions - set(SETUP_UV_ACTION_FAMILY) == stable_allowlist
-    assert len(step_actions & set(SETUP_UV_ACTION_FAMILY)) == 1
+    transition_actions = set().union(*TRANSITION_ACTION_FAMILIES)
+    stable_allowlist = set(STEP_ACTION_ALLOWLIST) - transition_actions
+    assert step_actions - transition_actions == stable_allowlist
+    for family in TRANSITION_ACTION_FAMILIES:
+        assert len(step_actions & set(family)) == 1
     assert reusable_workflows == set(JOB_REUSABLE_WORKFLOW_ALLOWLIST)

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import re
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,36 @@ from typing import Any
 import yaml
 
 CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+CHECKOUT_ACTION_NEXT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+CHECKOUT_ACTION_FAMILY = frozenset({CHECKOUT_ACTION, CHECKOUT_ACTION_NEXT})
 SETUP_UV_ACTION = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
 SETUP_UV_ACTION_NEXT = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
 SETUP_UV_ACTION_FAMILY = frozenset({SETUP_UV_ACTION, SETUP_UV_ACTION_NEXT})
+CACHIX_ACTION_FAMILY = frozenset(
+    {
+        "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342",
+        "cachix/install-nix-action@85e5c75b53ca5db16c97cf3e39a7b0c0957cc3ee",
+    }
+)
+OSV_ACTION_FAMILY = frozenset(
+    {
+        "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",
+        "google/osv-scanner-action/osv-scanner-action@16f4ae80dd08301c99ae0752242105e3e31bc41d",
+    }
+)
+HADOLINT_ACTION_FAMILY = frozenset(
+    {
+        "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf",
+        "hadolint/hadolint-action@39592fc4fb640fc194270a28a70721384e13f5a6",
+    }
+)
+TRANSITION_ACTION_FAMILIES = (
+    CHECKOUT_ACTION_FAMILY,
+    SETUP_UV_ACTION_FAMILY,
+    CACHIX_ACTION_FAMILY,
+    OSV_ACTION_FAMILY,
+    HADOLINT_ACTION_FAMILY,
+)
 
 WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
     "ci.yaml": frozenset({"pull_request", "push"}),
@@ -101,15 +129,15 @@ STEP_ACTION_ALLOWLIST = frozenset(
         "./.github/actions/retry",
         "actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809",
         "actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809",
-        CHECKOUT_ACTION,
+        *CHECKOUT_ACTION_FAMILY,
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
         "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
         "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         *SETUP_UV_ACTION_FAMILY,
-        "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342",
-        "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",
-        "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf",
+        *CACHIX_ACTION_FAMILY,
+        *OSV_ACTION_FAMILY,
+        *HADOLINT_ACTION_FAMILY,
         "ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38",
         "nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569",
     }
@@ -204,22 +232,22 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
         }
     },
 }
-FORK_POLICY_WORKFLOW_NEXT: dict[str, Any] = {
-    **FORK_POLICY_WORKFLOW,
-    "jobs": {
-        "policy": {
-            **FORK_POLICY_WORKFLOW["jobs"]["policy"],
-            "steps": [
-                *FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][:4],
-                {
-                    **FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][4],
-                    "uses": SETUP_UV_ACTION_NEXT,
-                },
-                *FORK_POLICY_WORKFLOW["jobs"]["policy"]["steps"][5:],
-            ],
-        }
-    },
-}
+def _fork_policy_variant(checkout_action: str, setup_uv_action: str) -> dict[str, Any]:
+    policy = deepcopy(FORK_POLICY_WORKFLOW)
+    steps = policy["jobs"]["policy"]["steps"]
+    steps[0]["uses"] = checkout_action
+    steps[1]["uses"] = checkout_action
+    if checkout_action == CHECKOUT_ACTION_NEXT:
+        steps[1]["with"]["allow-unsafe-pr-checkout"] = "true"
+    steps[4]["uses"] = setup_uv_action
+    return policy
+
+
+FORK_POLICY_WORKFLOWS = tuple(
+    _fork_policy_variant(checkout_action, setup_uv_action)
+    for checkout_action in CHECKOUT_ACTION_FAMILY
+    for setup_uv_action in SETUP_UV_ACTION_FAMILY
+)
 
 # Match publication commands even when global options or a Rust toolchain pin
 # appear between the executable and subcommand. Escaped newlines are folded
@@ -485,22 +513,28 @@ def validate(root: Path) -> list[str]:
         step_actions, reusable_workflows = _references(data)
         seen_step_actions.update(step_actions)
         seen_reusable_workflows.update(reusable_workflows)
-        if name == "fork-policy.yml" and data not in (
-            FORK_POLICY_WORKFLOW,
-            FORK_POLICY_WORKFLOW_NEXT,
-        ):
+        if name == "fork-policy.yml" and data not in FORK_POLICY_WORKFLOWS:
             errors.append("fork-policy.yml: trusted workflow structure differs from exact policy")
 
-    stable_step_actions = set(STEP_ACTION_ALLOWLIST) - set(SETUP_UV_ACTION_FAMILY)
+    transition_actions = set().union(*TRANSITION_ACTION_FAMILIES)
+    stable_step_actions = set(STEP_ACTION_ALLOWLIST) - transition_actions
     missing_step_actions = stable_step_actions - seen_step_actions
     unexpected_step_actions = seen_step_actions - set(STEP_ACTION_ALLOWLIST)
-    setup_uv_actions = seen_step_actions & set(SETUP_UV_ACTION_FAMILY)
-    if missing_step_actions or unexpected_step_actions or len(setup_uv_actions) != 1:
+    transition_selections = {
+        sorted(family)[0].split("@")[0]: sorted(seen_step_actions & set(family))
+        for family in TRANSITION_ACTION_FAMILIES
+    }
+    invalid_transitions = {
+        name: selected
+        for name, selected in transition_selections.items()
+        if len(selected) != 1
+    }
+    if missing_step_actions or unexpected_step_actions or invalid_transitions:
         errors.append(
             "step action references differ from exact allowlist: "
             f"missing={sorted(missing_step_actions)}, "
             f"extra={sorted(unexpected_step_actions)}, "
-            f"setup_uv={sorted(setup_uv_actions)}"
+            f"transitions={invalid_transitions}"
         )
     if seen_reusable_workflows != set(JOB_REUSABLE_WORKFLOW_ALLOWLIST):
         errors.append(
