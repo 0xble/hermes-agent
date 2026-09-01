@@ -164,6 +164,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): keep workflow policy tests transition-aware` | Test-only fork-policy coverage updated to validate either exact reviewed migration endpoint; no shipped Hermes behavior. |
 | `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 | `chore(actions)(deps): bump astral-sh/setup-uv from 8.2.0 to 10.0.1` | Automated pinned GitHub Action dependency refresh; no shipped Hermes behavior. |
+| `chore(actions)(deps): bump actions/checkout from 6.0.2 to 7.0.1` | Automated pinned GitHub Action dependency refresh with the documented v7 fork-data opt-in on the exact trusted policy workflow; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
