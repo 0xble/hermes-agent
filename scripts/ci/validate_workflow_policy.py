@@ -200,8 +200,12 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                 },
                 {
                     "name": "Fetch canonical upstream history into candidate checkout",
+                    "env": {"GITHUB_TOKEN": "${{ github.token }}"},
                     "run": (
-                        "git -C candidate fetch --no-tags --filter=blob:none "
+                        "git -C candidate "
+                        "-c \"http.https://github.com/.extraheader=AUTHORIZATION: basic "
+                        "$(printf 'x-access-token:%s' \\\"$GITHUB_TOKEN\\\" | base64 -w0)\" "
+                        "fetch --no-tags --filter=blob:none "
                         "https://github.com/NousResearch/hermes-agent.git "
                         "refs/heads/main:refs/remotes/canonical-upstream/main"
                     ),
@@ -212,7 +216,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
                         "--history-baseline-subject "
-                        "'fix(ci): reconcile browser headed patch history'"
+                        "'fix(ci): reconcile rich paragraph squash baseline (#36)'"
                     ),
                 },
                 {

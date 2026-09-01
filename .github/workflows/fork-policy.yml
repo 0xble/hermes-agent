@@ -37,8 +37,12 @@ jobs:
           # Candidate contents are inspected as data by trusted default-branch code.
           allow-unsafe-pr-checkout: true
       - name: Fetch canonical upstream history into candidate checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: >-
-          git -C candidate fetch --no-tags --filter=blob:none
+          git -C candidate
+          -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' \"$GITHUB_TOKEN\" | base64 -w0)"
+          fetch --no-tags --filter=blob:none
           https://github.com/NousResearch/hermes-agent.git
           refs/heads/main:refs/remotes/canonical-upstream/main
       - name: Validate maintained patch history with trusted code
