@@ -21,19 +21,21 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout trusted default-branch policy
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: trusted-policy
           persist-credentials: false
       - name: Checkout immutable candidate as data
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
+          # Candidate contents are inspected as data by trusted default-branch code.
+          allow-unsafe-pr-checkout: true
       - name: Fetch canonical upstream history into candidate checkout
         run: >-
           git -C candidate fetch --no-tags --filter=blob:none
