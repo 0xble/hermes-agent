@@ -157,6 +157,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): advance maintenance baseline after contributor cleanup` | Fork-administrative history reconciliation after the case-collision cleanup; no shipped Hermes behavior. |
 | `fix(ci): let the complete Python suite finish on standard runners` | Fork-administrative CI budget only: raises the existing standard-runner timeout after an exact-head run reached 72.6% before its 45-minute cancellation; no shipped Hermes behavior. |
 | `fix(ci): stage setup-uv policy transition` | Fork-administrative workflow policy update that admits exactly one of the reviewed old and new setup-uv pins during an atomic dependency migration; no shipped Hermes behavior. |
+| `fix(ci): stage remaining action policy transitions` | Fork-administrative workflow policy update that admits only atomic reviewed transitions for checkout, Hadolint, Cachix, and OSV pins; no shipped Hermes behavior. |
 | `fix(reconcile): align fork subjects after upstream refresh` | Patch-neutral maintenance reconciliation after rebasing: preserves upstream timeout classification, removes whitespace introduced by conflict replay, and aligns registered subjects with the already-published squash commits. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
