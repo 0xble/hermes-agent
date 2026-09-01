@@ -58,7 +58,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-033 | Retired | `fix(compression): report LCM safe deferrals`; `fix(compression): classify LCM no-op as deferred`; `fix(compression): classify anti-growth rejection as deferred`; `fix(compression): defer automatic retries after growth rejection`; `fix(compression): preserve context engine compatibility`; `fix(compression): reconcile rejected-compaction API`; `revert(compression): retire LCM patch family` | Historical LCM compatibility and deferral patch family, removed after LCM was retired from the Personal Hermes runtime. |
 | HERMES-032 | Active | `fix(doctor): make state db advisory retention aware`; `fix(reconcile): preserve cron and doctor contracts` | Make large-state diagnostics distinguish configured retention from actionable retention or FTS problems. |
 | HERMES-034 | Active | `feat(telegram): configure rich message routing mode` | Add explicit adaptive, always-attempt, and legacy-only Telegram Rich Message routing modes. |
-| HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing`; `fix(telegram): repair transport safety regressions` | Guard that outbound Telegram payloads preserve the author's paragraph boundaries exactly, after the earlier NBSP spacing expansion was removed. |
+| HERMES-035 | Active | `fix(telegram): remove excessive paragraph spacing`; `fix(telegram): repair transport safety regressions` | Keep legacy/plain Telegram payloads free of transport-wide paragraph expansion; Rich Message rendering is tracked separately by HERMES-095. |
 | HERMES-036 | Active | `feat(cron): allow local memory opt-in`; `test(cron): verify local USER memory writes`; `fix(reconcile): preserve cron and doctor contracts` | Let individual cron jobs opt into the local file-backed memory toolset without activating external memory providers. |
 | HERMES-037 | Active | `fix(clarify): explain decisions before prompts`; `fix(gateway): preserve clarify decision context`; `fix(gateway): transform clarify context before delivery` | Keep decision context in normal assistant prose before interactive clarify prompts. |
 | HERMES-038 | Active | `feat(hindsight): use brain indicator glyph`; `feat(hindsight): use thought recall indicator` | Use the thought indicator only when Hindsight supplied retrieved context. |
@@ -116,6 +116,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-092 | Active | `fix(browser): recover persisted headed mode after restart` | Recover identity-scoped live runtime mode after gateway restart so cleanup never falls back to a contradictory global default. |
 | HERMES-093 | Active | `fix(gateway): keep restart notices scoped and accurate` | Keep restart notices out of unrelated Telegram DM parent lanes, mark them interim, and describe automatic continuation accurately. |
 | HERMES-094 | Active | `feat(gateway): apply inference controls mid-turn` | Let `/fast` and `/reasoning` update the live gateway agent so the next model request, including a later request in the same tool loop, uses the new session setting without interrupting the in-flight request. |
+| HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages. |
 
 ## Fork-only administrative subject exemptions
 
@@ -184,6 +185,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-095 — Render Telegram Rich Message paragraph spacing
+
+- **Independent hypothesis (2026-09-01):** The original side response and a normal main-session response each retained six `\\n\\n` paragraph boundaries in `state/rich_sent_index.json`, proving Hermes generated and sent the blank lines through `sendRichMessage`; Telegram iOS rendered both responses with no clearly visible blank row. The side wrapper therefore could not explain the normal response. Upstream `_rich_normalize_linebreaks()` hardened isolated newlines but deliberately left paragraph breaks raw, and its regression asserted payload bytes rather than the rendered contract.
+- **Summary:** In Rich Message Markdown only, convert a prose `\\n{2,}` boundary into one non-breaking-space row bounded by idempotent Markdown hard breaks. Leave structural boundaries, backtick and tilde fences, tables, details, block math, blockquotes, lists, headings, and indented continuations without inserted spacers. Count the normalized Markdown against Telegram's 32,768-character Rich Message limit before choosing the rich path. Legacy MarkdownV2 and plain sends retain HERMES-035's exact source-boundary contract.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_rich_newlines.py`; this record.
+- **Upstream tracking:** NousResearch/hermes-agent#100664 documents the user-visible rendering gap and distinguishes it from the isolated-newline fix in #46070 / PR #50196.
+- **Upstream PR:** Open PR #100686 carries the source and focused regressions. The fork mirrors that reviewed implementation while upstream maintainers retain merge authority.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_rich_messages.py tests/gateway/test_telegram_format.py tests/gateway/test_telegram_send_draft_format.py -q`; coverage must prove one prose spacer, repeated-boundary collapse, idempotence, structural-block preservation, inline angle-bracket prose, normalized-length fallback, and unchanged shared rich send/edit/draft payload construction. Activation additionally requires a live Telegram iOS comparison after promotion.
+- **Expected published commit identity:** Stable subject `fix(telegram): render rich prose paragraph spacing`; source, focused regressions, and this record ship together.
+- **Rollback:** Revert only `fix(telegram): render rich prose paragraph spacing`, remove HERMES-095's index row and record, and restore HERMES-035's transport-wide wording. As an immediate runtime mitigation, set `gateway.platforms.telegram.extra.rich_messages: auto` or `never`, then promote and restart through the normal release path.
+- **Retirement:** Retire after PR #100686, or an equivalent implementation, is merged and released upstream, preserves one visible prose spacer without structural-block regressions, passes equivalent regressions, and succeeds in live Telegram iOS QA. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-093 — Keep restart notices scoped and accurate
 
@@ -1007,12 +1020,12 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Rollback:** Set `rich_drafts: false`; set `rich_messages: true` or `auto` for adaptive routing; or revert the patch and restart externally. Do not force-push over the current fork/remote divergence.
 - **Retirement:** Retire after released upstream exposes equivalent validated routing modes across config, system guidance, adapter behavior, backward-compatible booleans, and the focused Rich Message regressions.
 
-### HERMES-035 — Preserve exact Telegram paragraph boundaries
+### HERMES-035 — Preserve exact legacy Telegram paragraph boundaries
 
-- **Summary:** The original patch expanded Markdown paragraph boundaries with an explicit non-breaking-space line at the Telegram transport boundary. That expansion made ordinary paragraphs excessively tall and was removed by `fix(telegram): remove excessive paragraph spacing`; the remaining fork surface is the regression guard `tests/gateway/test_telegram_visual_spacing.py`, which pins the inverted contract: the outbound Bot API payload preserves the author's paragraph boundaries exactly, with no NBSP or other spacing normalization re-added. (Record corrected 2026-08-27; it previously still described the retired expansion as active behavior.)
+- **Summary:** The original patch expanded every Markdown paragraph boundary with an explicit non-breaking-space line at the Telegram transport boundary. That transport-wide expansion made ordinary paragraphs excessively tall and was removed by `fix(telegram): remove excessive paragraph spacing`; the remaining fork surface is the regression guard `tests/gateway/test_telegram_visual_spacing.py`, which pins the narrower contract that legacy MarkdownV2 and plain Bot API payloads preserve the author's paragraph boundaries exactly. HERMES-095 owns the separate Rich Message renderer correction and inserts exactly one hard-broken spacer row only between prose paragraphs. (Record narrowed 2026-09-01 after the live Rich Message renderer failure was isolated.)
 - **Surfaces:** `tests/gateway/test_telegram_visual_spacing.py` (test-only guard; no shipped adapter delta remains).
-- **Upstream tracking:** Upstream never carried the NBSP expansion, so the guard asserts upstream-equivalent behavior. No upstream action required.
-- **Upstream PR:** None; not an upstream product divergence after the expansion was removed (checked 2026-08-27).
+- **Upstream tracking:** Upstream never carried the retired transport-wide NBSP expansion, so the legacy/plain guard remains upstream-equivalent. Rich Message paragraph rendering is tracked in issue #100664.
+- **Upstream PR:** PR #100686 covers only the Rich Message renderer correction; it does not alter this legacy/plain contract.
 - **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py`.
 - **Rollback:** Delete the test file; there is no adapter code to revert.
 - **Retirement:** Retire (delete the guard) once an upstream-owned test pins the same exact-paragraph-boundary payload contract.
