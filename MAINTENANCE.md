@@ -110,6 +110,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-086 | Active | `fix(gateway): preserve queued-turn cleanup callbacks` | Keep each completed turn's temporary progress cleanup when a queued follow-up starts before the prior delivery task unwinds. |
 | HERMES-087 | Active | `fix(skills): stop duplicating root skill names` | Classify root-level skills under `general` so the prompt does not suggest invalid self-qualified lookups. |
 | HERMES-088 | Active | `fix(gateway): silence redundant process notifications`; `fix(gateway): preserve watch notification text` | Let model-facing gateway process telemetry reconcile silently without leaking the control contract into CLI, TUI, or Desktop output. |
+| HERMES-089 | Active | `fix(telegram): separate duplicate topic labels from session aliases` | Allow Telegram topics to share a visible label while preserving unique, deterministic internal session aliases. |
 
 ## Fork-only administrative subject exemptions
 
@@ -170,6 +171,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-089 — Separate duplicate Telegram topic labels from session aliases
+
+- **Independent hypothesis (2026-08-31):** Telegram permits separate topics to share one visible name, but `/title` writes that name through Hermes's globally unique resumable session alias before scheduling the platform rename. A collision therefore rejects a valid Telegram label even though live routing uses chat and thread IDs. Removing title uniqueness would instead make title-based resume and management ambiguous.
+- **Summary:** Keep the unique session-title index and non-Telegram collision behavior. On a Telegram topic lane, reserve the requested title or the next bounded `#N` lineage alias inside the existing serialized write transaction, then synchronously attempt the unsuffixed requested label on Telegram, report the internal alias when it differs, and surface platform rename failure as partial success.
+- **Surfaces:** `hermes_state.py`; `gateway/slash_commands.py`; `gateway/run.py`; focused state and Telegram title-lane regressions; this record.
+- **Upstream tracking:** Issue #100002. Related merged PR #49245 added `/title` topic synchronization; open PR #86198 covers reverse topic-name synchronization but does not resolve unique-title collisions.
+- **Upstream PR:** None before this patch is published.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_session_title_rename_lane.py tests/gateway/test_title_command.py tests/test_hermes_state.py -q`; the new tests cover visible-label preservation, internal alias allocation, maximum title length, user provenance, and concurrent claims. A sabotage run with lineage conflict resolution disabled fails all three state allocation cases.
+- **Rollback:** Revert `fix(telegram): separate duplicate topic labels from session aliases`, removing `set_session_title_in_lineage`, the Telegram-only `/title` branch, focused regressions, index row, and this record. Preserve the unique title index and ordinary exact-title setter.
+- **Retirement:** Retire after released upstream preserves unique internal aliases while allowing duplicate visible Telegram topic labels, allocates collisions without races, keeps non-Telegram behavior unchanged, and passes equivalent focused regressions.
 
 ### HERMES-088 — Silence redundant process notifications
 

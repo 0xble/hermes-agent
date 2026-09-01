@@ -10591,13 +10591,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchone()
         return row is not None
 
-    def _set_session_title(
+    def _next_title_in_lineage_locked(
+        self, conn, base_title: str, session_id: str
+    ) -> str:
+        """Choose a bounded free lineage alias inside the active write transaction."""
+        match = re.match(r"^(.*?) #(\d+)$", base_title)
+        base = match.group(1) if match else base_title
+        number = 2
+        while True:
+            suffix = f" #{number}"
+            prefix = base[: self.MAX_TITLE_LENGTH - len(suffix)].rstrip()
+            candidate = f"{prefix}{suffix}"
+            conflict = conn.execute(
+                "SELECT 1 FROM sessions WHERE title = ? AND id != ?",
+                (candidate, session_id),
+            ).fetchone()
+            if conflict is None:
+                return candidate
+            number += 1
+
+    def _set_session_title_result(
         self,
         session_id: str,
         title: str,
         *,
         source: str,
-    ) -> bool:
+        conflict_policy: str = "error",
+    ) -> tuple[bool, Optional[str]]:
         """Write a title, enforcing provenance precedence.
 
         ``source`` is one of ``TITLE_SOURCE_{DERIVED,LLM,USER}``. A ``user``
@@ -10613,6 +10633,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cannot be clobbered by the late arrival.
         """
         title = self.sanitize_title(title)
+        if conflict_policy not in {"error", "lineage"}:
+            raise ValueError(f"invalid title conflict policy: {conflict_policy!r}")
         is_user = source == self.TITLE_SOURCE_USER
         new_rank = self._title_rank(source) if not is_user else None
 
@@ -10622,7 +10644,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
             if current is None:
-                return 0
+                return 0, None
             # The canonical Bot Chat's NAME is its identity: Bot Mode resolves
             # the forever-chat by exact-title lookup on every open, so renaming
             # the row orphans the entire conversation — the next click mints an
@@ -10645,8 +10667,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             if not is_user and current["title"] is not None:
                 if self._title_rank(current["title_source"]) >= new_rank:
-                    return 0
+                    return 0, current["title"]
 
+            selected_title = title
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
@@ -10674,6 +10697,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             "UPDATE sessions SET title = NULL WHERE id = ?",
                             (conflict_id,),
                         )
+                    elif conflict_policy == "lineage":
+                        selected_title = self._next_title_in_lineage_locked(
+                            conn, title, session_id
+                        )
                     else:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
@@ -10685,17 +10712,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET title = ?, title_source = ? "
                 "WHERE id = ? AND title IS ? AND title_source IS ?",
                 (
-                    title,
-                    source if title else None,
+                    selected_title,
+                    source if selected_title else None,
                     session_id,
                     current["title"],
                     current["title_source"],
                 ),
             )
-            return cursor.rowcount
+            return cursor.rowcount, selected_title
 
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
+        rowcount, stored_title = self._execute_write(_do)
+        return rowcount > 0, stored_title
+
+    def _set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str,
+    ) -> bool:
+        """Compatibility wrapper returning whether the title write landed."""
+        written, _stored_title = self._set_session_title_result(
+            session_id, title, source=source
+        )
+        return written
 
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set or update a session's title on the user's behalf.
@@ -10711,6 +10751,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._set_session_title(
             session_id, title, source=self.TITLE_SOURCE_USER
         )
+
+    def set_session_title_in_lineage(
+        self, session_id: str, title: str
+    ) -> Optional[str]:
+        """Set a user title, allocating a unique ``#N`` alias on collision.
+
+        The lookup and reservation share one write transaction, so concurrent
+        callers cannot claim the same alias. Returns the stored title, or None
+        when the session does not exist.
+        """
+        written, stored_title = self._set_session_title_result(
+            session_id,
+            title,
+            source=self.TITLE_SOURCE_USER,
+            conflict_policy="lineage",
+        )
+        return stored_title if written else None
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
         """Set an automatically generated title, honoring provenance precedence.

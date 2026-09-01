@@ -26324,10 +26324,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
         user_message: str = "",
         title_context: Any = None,
-    ) -> None:
-        """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
+    ) -> Optional[bool]:
+        """Best-effort rename of a Telegram topic, returning whether it landed."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
-            return
+            return False
 
         # Operator can fully disable per-topic auto-rename via
         # extra.disable_topic_auto_rename. Useful when topics are managed
@@ -26480,7 +26480,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **rename_kwargs,
                 )
                 await _mark_auto_icon()
-                return
+                return True
 
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) if bot is not None else None
@@ -26511,8 +26511,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     **edit_kwargs,
                 )
             await _mark_auto_icon()
+            return True
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            return False
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """Return True when operator disabled per-topic auto-rename for this Telegram chat.
