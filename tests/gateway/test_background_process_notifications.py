@@ -79,6 +79,26 @@ def _watch_event(session_id="proc_watch", thread_id="42"):
     }
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        _watch_event(),
+        {"type": "watch_disabled", "message": "Watch disabled"},
+        {"type": "watch_overflow_tripped", "message": "Watch overflowed"},
+        {"type": "watch_overflow_released", "message": "Watch resumed"},
+    ],
+    ids=["watch-match", "watch-disabled", "overflow", "overflow-released"],
+)
+def test_gateway_watch_formatter_uses_shared_process_contract(event):
+    from gateway.run import _format_gateway_process_notification
+    from tools.process_registry import format_process_notification
+
+    assert _format_gateway_process_notification(event) == format_process_notification(
+        event,
+        include_no_reply_contract=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _load_background_notifications_mode unit tests
 # ---------------------------------------------------------------------------
@@ -258,6 +278,7 @@ async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkey
     synth_event = adapter.handle_message.await_args.args[0]
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "proc_owner"
+    assert "respond exactly NO_REPLY" in synth_event.text
     assert completion_queue.qsize() == 1
     assert completion_queue.get_nowait() is async_event
 
