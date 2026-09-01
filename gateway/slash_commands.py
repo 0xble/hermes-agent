@@ -143,7 +143,7 @@ class GatewaySlashCommandsMixin:
     def _session_key_for_event(self, event: MessageEvent) -> str:
         """Resolve the conversation route, including a pinned side route."""
         metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route"):
+        if metadata.get("gateway_explicit_session_route") is True:
             pinned = str(metadata.get("gateway_session_key") or "").strip()
             if pinned:
                 return pinned
@@ -158,17 +158,20 @@ class GatewaySlashCommandsMixin:
     ):
         """Resolve a command's session without falling from a side into its parent."""
         metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route"):
+        if metadata.get("gateway_explicit_session_route") is True:
             session_key = self._session_key_for_event(event)
             entry = await self.async_session_store.lookup_by_session_key(session_key)
             expected_id = str(metadata.get("gateway_session_id") or "").strip()
             if entry is None or (expected_id and entry.session_id != expected_id):
                 raise RuntimeError("Pinned side session is no longer available")
             return entry
-        return await self.async_session_store.get_or_create_session(
-            source or event.source,
-            force_new=force_new,
-        )
+        effective_source = source or event.source
+        if force_new:
+            return await self.async_session_store.get_or_create_session(
+                effective_source,
+                force_new=True,
+            )
+        return await self.async_session_store.get_or_create_session(effective_source)
 
     def _session_entry_for_event_sync(
         self,
@@ -177,7 +180,7 @@ class GatewaySlashCommandsMixin:
         source: Optional[SessionSource] = None,
     ):
         metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route"):
+        if metadata.get("gateway_explicit_session_route") is True:
             session_store = getattr(self, "session_store")
             entry = session_store.lookup_by_session_key(
                 self._session_key_for_event(event)
@@ -4011,6 +4014,21 @@ class GatewaySlashCommandsMixin:
                 pass
             raise
 
+    async def _bind_side_route(
+        self,
+        side_route_key: str,
+        child_session_id: str,
+        source,
+        child_title: str,
+    ):
+        """Bind a side route through the async store's awaited API."""
+        return await self.async_session_store.bind_session_route(
+            side_route_key,
+            child_session_id,
+            source,
+            display_name=child_title,
+        )
+
     async def _send_terminal_side_status(
         self,
         event: MessageEvent,
@@ -4428,11 +4446,11 @@ class GatewaySlashCommandsMixin:
             logger.debug("Could not title side session", exc_info=True)
 
         binding = asyncio.create_task(
-            self.async_session_store.bind_session_route(
+            self._bind_side_route(
                 side_route_key,
                 child_session_id,
                 source,
-                display_name=child_title,
+                child_title,
             )
         )
         try:
@@ -5932,7 +5950,7 @@ class GatewaySlashCommandsMixin:
         """Handle /resume command - switch to a previous named session."""
         if (getattr(event, "metadata", None) or {}).get(
             "gateway_explicit_session_route"
-        ):
+        ) is True:
             return (
                 "Resume is unavailable inside a side because it could rebind "
                 "another conversation. Start a new side from the session you want instead."
@@ -5944,7 +5962,7 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(
             self._normalize_source_for_session_key, event.source
         )
-        session_key = self._session_key_for_event(event)
+        session_key = getattr(self, "_session_key_for_source")(source)
         raw_args = event.get_command_args().strip()
         try:
             parts = shlex.split(raw_args)
@@ -6144,7 +6162,12 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(
             self._normalize_source_for_session_key, event.source
         )
-        session_key = self._session_key_for_event(event)
+        event_metadata = getattr(event, "metadata", None) or {}
+        session_key = (
+            self._session_key_for_event(event)
+            if event_metadata.get("gateway_explicit_session_route") is True
+            else getattr(self, "_session_key_for_source")(source)
+        )
 
         # A cross-origin listing (`/sessions all`) is honored only for an
         # admin, mirroring the `/resume --all` override. `all` is just a parsed

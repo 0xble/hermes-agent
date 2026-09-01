@@ -18685,9 +18685,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._prepare_side_reply_route_scoped(event)
 
     async def _prepare_side_reply_route_scoped(self, event: MessageEvent) -> None:
-        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        raw_metadata = getattr(event, "metadata", None)
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         event.metadata = metadata
-        if metadata.get("gateway_explicit_session_route"):
+        if metadata.get("gateway_explicit_session_route") is True:
             return
         reply_id = str(getattr(event, "reply_to_message_id", None) or "").strip()
         source = getattr(event, "source", None)
@@ -19043,6 +19044,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Resolve replies to previously delivered side messages before any
+        # command-aware routing reads the event metadata. The resolver also
+        # normalizes test/internal events whose metadata is not a real mapping.
+        await self._prepare_side_reply_route(event)
 
         # Expand configured aliases after authorization and plugin rewriting,
         # but before any command-aware state gate. The base adapter separately

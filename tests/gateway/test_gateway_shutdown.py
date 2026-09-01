@@ -149,12 +149,12 @@ async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect()
 
 
 @pytest.mark.asyncio
-async def test_gateway_stop_cancels_spawn_waiters_before_parent_drain_and_disconnect():
+async def test_gateway_stop_cancels_side_waiters_before_parent_drain_and_disconnect():
     runner, adapter = make_restart_runner()
     call_order: list[str] = []
 
-    async def cancel_spawn_waiters():
-        call_order.append("spawn_cancel")
+    async def cancel_side_waiters():
+        call_order.append("side_cancel")
 
     async def drain_active_agents(*_args, **_kwargs):
         call_order.append("parent_drain")
@@ -163,14 +163,14 @@ async def test_gateway_stop_cancels_spawn_waiters_before_parent_drain_and_discon
     async def disconnect():
         call_order.append("disconnect")
 
-    runner._cancel_spawn_waiters = cancel_spawn_waiters
+    runner._cancel_side_waiters = cancel_side_waiters
     runner._drain_active_agents = drain_active_agents
     adapter.disconnect = disconnect
 
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
         await runner.stop()
 
-    assert call_order == ["spawn_cancel", "parent_drain", "disconnect"]
+    assert call_order == ["side_cancel", "parent_drain", "disconnect"]
 
 
 @pytest.mark.asyncio

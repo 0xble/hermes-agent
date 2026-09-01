@@ -5009,6 +5009,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_usermerge_floor_applied = False
         self._fts_enabled = False
         self._fts_stale = False
+        # One-shot guard for the in-place runtime FTS rebuild.
+        self._fts_runtime_rebuild_attempted = False
         self._trigram_available = False
         # CJK-bigram index (cjk_unicode61 loadable tokenizer). _fts_cjk_loaded:
         # extension present on the writer connection; _fts_cjk_available: the
@@ -6282,6 +6284,159 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except Exception:
                 pass
         return signalled
+
+    def _fts_structure_is_corrupt(self) -> Optional[bool]:
+        """Positively attribute a malformed error to the FTS shadow tables.
+
+        Runs FTS5's structure-only ``integrity-check`` (rank=1: internal
+        index consistency, no external-content comparison) against each
+        present FTS table. Returns True when any FTS structure is corrupt,
+        False when all present FTS structures verify clean, and None when the
+        probe itself cannot run (unsupported build, probe error) — callers
+        treat None as "attribution unknown" and preserve the historical
+        fail-open behavior. The result is cached briefly so repeated failing
+        writes do not re-scan the index.
+
+        Without this probe, a malformed page in ANY table was classified as
+        FTS corruption: the in-place rebuild then "succeeded" against healthy
+        indexes, the write failed again, and the process looped through
+        expensive rebuilds while the genuinely damaged object (e.g. an
+        ephemeral bookkeeping table) went undiagnosed.
+        """
+        now = time.monotonic()
+        cached = getattr(self, "_fts_probe_cache", None)
+        if cached is not None and now - cached[0] < self._FTS_PROBE_CACHE_SECONDS:
+            return cached[1]
+        result: Optional[bool] = None
+        try:
+            with self._lock:
+                present = [
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name IN ('messages_fts', 'messages_fts_trigram', "
+                        "'messages_fts_cjk')"
+                    ).fetchall()
+                ]
+                if not present:
+                    result = False
+                else:
+                    result = False
+                    for table in present:
+                        try:
+                            self._conn.execute(
+                                f"INSERT INTO {table}({table}, rank) "
+                                "VALUES('integrity-check', 1)"
+                            )
+                        except sqlite3.DatabaseError as probe_exc:
+                            if is_malformed_db_error(probe_exc) or (
+                                "corrupt" in str(probe_exc).lower()
+                            ):
+                                result = True
+                                break
+                            # The probe form itself was rejected (older FTS5):
+                            # attribution unknown.
+                            result = None
+                            break
+        except sqlite3.Error:
+            result = None
+        self._fts_probe_cache = (now, result)
+        return result
+
+    def _try_runtime_fts_rebuild(self, exc: sqlite3.DatabaseError) -> bool:
+        """One-shot in-place FTS rebuild after a corrupt-index write failure.
+
+        Returns True when a rebuild was performed and the failed write should
+        be retried; False when the error isn't the FTS-corruption class, FTS
+        is disabled, or a rebuild was already attempted for this instance.
+
+        Delegates to :meth:`rebuild_fts` (the FTS5 ``'rebuild'`` command —
+        index rewritten from the canonical messages table, zero message-row
+        mutation). Safe to call from ``_execute_write``'s except path: the
+        failed transaction was rolled back and ``self._lock`` released before
+        the exception propagated, and ``rebuild_fts`` re-acquires it.
+        E2E-verified: a corrupted ``messages_fts_data`` shadow table rejects
+        every append; after the in-place rebuild the same append succeeds and
+        search works again.
+        """
+        if self._fts_runtime_rebuild_attempted:
+            return False
+        if not self._fts_enabled:
+            return False
+        if not self._is_fts_write_corruption_error(exc):
+            return False
+        # A generic malformed error can originate in ANY table. Require the
+        # structure-only FTS probe to confirm the attribution before spending
+        # a rebuild; a clean probe means the damage lies elsewhere and the
+        # error must propagate for offline diagnosis (quick_check / dbstat)
+        # instead of looping through index rebuilds that cannot help.
+        msg = str(exc).lower()
+        if "fts5" not in msg:
+            probe = self._fts_structure_is_corrupt()
+            if probe is False:
+                logger.error(
+                    "state.db write failed with a malformed-database error, "
+                    "but the FTS indexes verify clean — the corruption is in "
+                    "another table. Skipping FTS rebuild; run PRAGMA "
+                    "quick_check and map damaged pages via dbstat for the "
+                    "offline repair."
+                )
+                return False
+        try:
+            db_size = os.path.getsize(self.db_path)
+        except OSError:
+            db_size = 0
+        if db_size > self._RUNTIME_FTS_REBUILD_MAX_DB_BYTES:
+            logger.warning(
+                "Deferring in-process FTS rebuild: state.db is %.1f GiB and "
+                "a runtime rebuild at this size starves concurrent turns and "
+                "risks a liveness-watchdog kill. Detaching FTS sync; the "
+                "next startup recovery or `hermes sessions optimize-storage` "
+                "owns the rebuild.",
+                db_size / (1024 ** 3),
+            )
+            return False
+        # Set the one-shot flag before the foreign-holder check: even when
+        # the rebuild is skipped, the fail-open path that follows persists
+        # the FTS_STALE_KEY marker so the next process startup will retry
+        # via _recover_stale_fts (which has its own holder guard). Setting
+        # the flag here also avoids re-running the expensive psutil scan on
+        # every subsequent corrupted write through this instance.
+        self._fts_runtime_rebuild_attempted = True
+        foreign_holders = self._foreign_state_db_holders()
+        if foreign_holders:
+            logger.warning(
+                "Skipping automatic state.db FTS rebuild while foreign "
+                "processes hold the database or WAL sidecars (%s); detaching "
+                "FTS sync so canonical writes can continue.",
+                foreign_holders,
+            )
+            return False
+        logger.warning(
+            "state.db write failed with an FTS-corruption error (%s) — "
+            "attempting one-shot in-place FTS rebuild; canonical message "
+            "rows are preserved.", exc,
+        )
+        try:
+            rebuilt = self.rebuild_fts()
+        except Exception as rebuild_exc:
+            logger.error(
+                "In-place FTS rebuild failed (%s); the database needs the "
+                "full offline repair path (repair_state_db_schema).",
+                rebuild_exc,
+            )
+            return False
+        if not rebuilt:
+            logger.error(
+                "In-place FTS rebuild made no progress; the database needs "
+                "the full offline repair path (repair_state_db_schema)."
+            )
+            return False
+        logger.warning(
+            "state.db FTS indexes rebuilt in place (%d); retrying the failed write.",
+            rebuilt,
+        )
+        return True
 
     def _enter_fts_fail_open(self, exc: sqlite3.DatabaseError) -> bool:
         """Detach corrupt FTS indexes so canonical writes can continue.
