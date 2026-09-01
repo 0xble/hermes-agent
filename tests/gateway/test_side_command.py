@@ -119,6 +119,17 @@ def test_side_command_is_gateway_dispatchable():
     assert command.busy_handler == "side"
 
 
+def test_merge_command_is_gateway_only_and_non_interrupting():
+    command = resolve_command("merge")
+    alias = resolve_command("fold")
+
+    assert command is not None
+    assert command.name == "merge"
+    assert command.gateway_only is True
+    assert command.busy_policy == "reject"
+    assert alias is command
+
+
 @pytest.mark.parametrize(
     "finish_reason",
     [
@@ -227,6 +238,8 @@ async def test_side_clones_only_the_last_completed_turn_and_keeps_parent_active(
         "_branched_from": "parent-1",
         "_side_from": "parent-1",
         "_side_root": child_session_id,
+        "_side_parent_route": _parent_entry().session_key,
+        "_side_fork_message_count": 2,
     }
     assert json.loads(create_kwargs["origin_json"])["thread_id"] == "42"
 
