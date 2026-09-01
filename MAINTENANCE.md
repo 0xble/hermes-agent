@@ -109,6 +109,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-085 | Active | `fix(gateway): defer flood-controlled delivery obligations` | Treat a platform flood rejection as a timed deferral rather than a terminal delivery failure. |
 | HERMES-086 | Active | `fix(gateway): preserve queued-turn cleanup callbacks` | Keep each completed turn's temporary progress cleanup when a queued follow-up starts before the prior delivery task unwinds. |
 | HERMES-087 | Active | `fix(skills): stop duplicating root skill names` | Classify root-level skills under `general` so the prompt does not suggest invalid self-qualified lookups. |
+| HERMES-088 | Active | `fix(gateway): silence redundant process notifications`; `fix(gateway): preserve watch notification text` | Let model-facing gateway process telemetry reconcile silently without leaking the control contract into CLI, TUI, or Desktop output. |
 
 ## Fork-only administrative subject exemptions
 
@@ -155,6 +156,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-088 — Silence redundant process notifications
+
+- **Independent hypothesis (2026-08-31):** A queued `watch_match` event for a background preview server was injected after the original Telegram turn as a synthetic user message. Although the event added no actionable information, it launched a second model run and repeated the already-delivered URL. Gateway logs and session state proved two model generations and two sends, not a Telegram transport retry.
+- **Summary:** Add an exact `NO_REPLY` reconciliation contract only to model-facing gateway process completion, watch, disabled-watch, and overflow notifications. Cover individual and coalesced completion paths, preserve substantive follow-ups and async delegation, retain the pre-refactor gateway watch payload, and keep the shared CLI, TUI, and Desktop formatter free of model-only control instructions.
+- **Surfaces:** `tools/process_registry.py`; `gateway/run.py`; `cli.py`; `tui_gateway/server.py`; focused process-notification regressions; this record.
+- **Upstream tracking:** NousResearch/hermes-agent#52694. The concrete one-process, one-watch-event reproduction is recorded at issue comment `5487953374`.
+- **Upstream PR:** Open PR #99941 carries the mirrored implementation. Fork updates must follow reviewed changes to that PR until it merges or closes, without auto-merging upstream.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_process_registry.py tests/gateway/test_background_process_notifications.py tests/gateway/test_completion_delivery.py tests/gateway/test_gateway_silence_tokens.py tests/cli/test_cli_async_delegation_delivery.py tests/test_tui_gateway_server.py -q`; coverage must prove exact silence-token handling for individual and batched gateway process telemetry, unchanged substantive output, unchanged async delegation, no control-contract leakage outside the gateway, and unchanged subagent-owned watch text.
+- **Expected published commit identity:** Stable subjects `fix(gateway): silence redundant process notifications` and `fix(gateway): preserve watch notification text`; source and focused regressions are mirrored from PR #99941, while this lifecycle record is fork-owned.
+- **Rollback:** Revert only `fix(gateway): preserve watch notification text` and `fix(gateway): silence redundant process notifications`, then remove the HERMES-088 index row and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version prevents non-actionable process telemetry from producing redundant public replies, preserves substantive process updates and async delegation, avoids control-contract leakage on non-gateway surfaces, and passes equivalent regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-087 — Stop duplicating root skill names
 
