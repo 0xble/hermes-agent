@@ -204,6 +204,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("side", "Fork the current context into a continuable side session", "Session",
                args_hint="<prompt>", gateway_only=True, busy_policy="dispatch",
                busy_handler="side", desktop="messaging"),
+    CommandDef("merge", "Import this side session's committed context into main", "Session",
+               aliases=("fold",), gateway_only=True, busy_policy="reject",
+               desktop="messaging"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1483,7 +1486,7 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     past the 50-cap and silently clamps /platform, breaking parity.
 #   - side: contextual continuable fork; reached via /hermes side on Slack so
 #     the new gateway command does not displace an existing native slash.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "side"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "side", "merge"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
