@@ -235,6 +235,7 @@ platform network disconnect as an event-loop failure.
 | `/bg <prompt>` | Run a prompt in a separate background session |
 | `/btw <question>` | Ask a side question about the current conversation without interrupting it |
 | `/side <prompt>` | Fork the current safe context into a continuable side session |
+| `/merge` (alias: `/fold`) | Reply to a side message and import its committed delta into main |
 | `/reload-mcp` | Reload MCP servers from config |
 | `/update` | Update Hermes Agent to the latest version |
 | `/help` | Show available commands |
@@ -549,6 +550,8 @@ Use `/side` when a parallel conversation needs the current context instead of a 
 `/side` copies the newest provider-valid transcript checkpoint into a durable normal session and runs the new prompt through the same session pipeline as an ordinary turn. It retains normal tools, skills, Hindsight processing, delegation, approvals, accounting, compression, and recovery. When the parent is idle, the checkpoint ends at the last complete assistant response. During an active turn, Hermes can also fork after a complete assistant tool-call block and all matching tool results have persisted. If the current tool batch is still running, one `🔀 Side queued` status is posted and then edited to `🔀 Side started` when the checkpoint becomes safe. Partial tool calls and unfinished output are never copied.
 
 Reply directly to a side response or its started status to continue that side. Hermes resolves the reply through an exact platform, chat, topic, and user binding, then follows the side route's current session tip. Ordinary messages still go to the parent session. Compression and parent resets do not rebind or close the side. Reply with `/side close` to close only that side.
+
+Reply to a completed side message with `/merge` (or `/fold`) to import that side's committed transcript delta into its originating main session. If the side has already compacted its history, Hermes imports that canonical checkpoint because its summary has combined fork and side context, then ordinary message deltas resume. If main rewound any copied fork context, Hermes refuses the entangled checkpoint instead of resurrecting stale rows. Hermes records a fixed source cutoff and a provenance-marked historical snapshot, then makes the merge confirmation a main-session reply anchor. The side remains independently continuable through its older reply anchors. Later side turns are not visible in main unless you merge again, and retries at the same cutoff do not duplicate context. Imported text is historical context, not renewed authorization to repeat messages, purchases, deletions, deployments, or other external effects. Merge waits for completed turns and fails closed if the originating main route was reset or replaced.
 
 If the active turn stops before any safe checkpoint is available, the same status is edited to `⚠️ Side aborted` and no child is created. The parent chat stays active and its transcript is not modified by side responses. Use `/background`, `/bg`, or `/btw` when the task is self-contained and does not need the current transcript.
 
