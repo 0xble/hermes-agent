@@ -771,6 +771,26 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
     if not _friendly_tool_labels:
         return build_tool_preview(tool_name, args, max_len=max_len)
 
+    if tool_name == "set_goal":
+        action = str(args.get("action") or "set").strip().lower()
+        verbs = {
+            "set": "Setting goal", "draft": "Drafting goal", "show": "Showing goal",
+            "status": "Checking goal status", "pause": "Pausing goal",
+            "resume": "Resuming goal", "clear": "Clearing goal", "wait": "Parking goal",
+            "unwait": "Releasing goal wait", "subgoal_list": "Listing subgoals",
+            "subgoal_add": "Adding subgoal", "subgoal_remove": "Removing subgoal",
+            "subgoal_clear": "Clearing subgoals", "gate_list": "Listing quality gates",
+            "gate_add": "Adding quality gate", "gate_remove": "Removing quality gate",
+            "gate_clear": "Clearing quality gates",
+        }
+        verb = verbs.get(action, "Managing goal")
+        preview_key = "goal" if action in {"set", "draft"} else (
+            "text" if action == "subgoal_add" else "command" if action == "gate_add" else None
+        )
+        preview = _oneline(str(args.get(preview_key) or "")) if preview_key else ""
+        label = f"{verb} {preview}".strip()
+        return _truncate_preview(label, max_len) if max_len else label
+
     verb = _TOOL_VERBS.get(tool_name)
     if not verb:
         return build_tool_preview(tool_name, args, max_len=max_len)
