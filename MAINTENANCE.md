@@ -114,6 +114,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-090 | Active | `feat(gateway): merge side context into main` | Import one frozen, provenance-marked side-session delta into its originating main route without joining their future timelines. |
 | HERMES-091 | Active | `feat(browser): choose headed mode per exec session (#28)` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
 | HERMES-092 | Active | `fix(browser): recover persisted headed mode after restart` | Recover identity-scoped live runtime mode after gateway restart so cleanup never falls back to a contradictory global default. |
+| HERMES-093 | Active | `fix(gateway): keep restart notices scoped and accurate` | Keep restart notices out of unrelated Telegram DM parent lanes, mark them interim, and describe automatic continuation accurately. |
 
 ## Fork-only administrative subject exemptions
 
@@ -182,6 +183,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-093 — Keep restart notices scoped and accurate
+
+- **Independent hypothesis (2026-09-01):** At 15:33 EDT, the gateway interrupted two active Telegram topic turns and correctly notified each topic, then independently broadcast the same interruption warning to the unthreaded Telegram home chat. The completed “Upcoming LPG Webinar Check” turn was not active, but Telegram's parent-chat lane surfaced that unthreaded broadcast below its completed answer. The screenshot therefore shows a redundant parent-scope home broadcast, not an interrupted webinar turn or failed resume. The same shutdown path also sends every advisory as an ordinary unmarked message even though it runs while streams are live, and its text always asks for a new message despite the configured `restart_resume_policy: continue` automatically resuming interrupted turns.
+- **Summary:** After a successful Telegram DM-topic notice, suppress only the unthreaded home-channel broadcast to the same private parent chat; forum/group parents, explicit home topics, and distinct home chats remain notified. Mark both active-session and home-channel advisories as interim sends so they cannot seal a live stream. Resolve the configured restart continuation policy per adapter: `continue` says Hermes will try to resume automatically, while `ask` retains the existing instruction to send a message.
+- **Surfaces:** `gateway/run.py`; `tests/gateway/test_restart_resume_pending.py`; `tests/gateway/test_restart_notification.py`; this record.
+- **Upstream tracking:** No released upstream implementation satisfies the complete contract as of 2026-09-01. Open PR #98445 independently fixes the interim-send contract and is backported exactly for that portion. Open PR #57164 suppresses only idle external-shutdown broadcasts. Open PR #71181 rate-limits repeated process-level broadcasts. None suppresses the redundant unthreaded parent broadcast or makes wording continuation-policy-aware.
+- **Upstream PR:** Open PR #98445 is the exact source for the interim-marker portion. No upstream PR covers the complete HERMES-093 contract before publication.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_restart_resume_pending.py tests/gateway/test_restart_notification.py tests/gateway/test_gateway_shutdown.py tests/gateway/test_interim_send_lanes.py tests/gateway/test_stream_final_contract.py -q`; focused cases must prove parent-scope suppression after a same-chat Telegram DM-topic notice, preservation of forum/group parent and explicit home-topic delivery, interim metadata on both send classes, automatic wording under `continue`, and the existing prompt under `ask`. Before implementation, the focused tests fail with two sends instead of one, absent `_interim_send`, and the stale manual-resume instruction.
+- **Expected published commit identity:** Stable subject `fix(gateway): keep restart notices scoped and accurate`; source, regressions, and this record ship together.
+- **Rollback:** Revert only `fix(gateway): keep restart notices scoped and accurate`; restore identical-target-only deduplication, unmarked shutdown sends, and the fixed manual-resume text, then remove the HERMES-093 index row and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version suppresses redundant unthreaded home broadcasts after same-parent Telegram DM-topic notices, preserves forum/group parent and explicit home-topic delivery, marks advisories interim, renders continuation-policy-aware instructions, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-089 — Separate duplicate Telegram topic labels from session aliases
 

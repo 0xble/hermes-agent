@@ -11942,15 +11942,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
+
+        def _notification_message(adapter: Any) -> str:
+            hint = "Your current task will be interrupted."
+            if self._restart_requested:
+                if resolve_restart_resume_policy(self.config, adapter) == "continue":
+                    hint += " I'll try to resume it automatically after restart."
+                else:
+                    hint += (
+                        " Send any message after restart and I'll try to resume "
+                        "where you left off."
+                    )
+            return f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
+        notified_dm_topic_parents: set[tuple[str, str]] = set()
         for session_key in active:
             source = None
             try:
@@ -11972,6 +11978,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                chat_type = getattr(source, "chat_type", None)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -11981,6 +11988,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+                chat_type = _parsed.get("chat_type")
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
@@ -12023,7 +12031,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await adapter.send(
+                    chat_id,
+                    _notification_message(adapter),
+                    metadata=_interim_metadata(metadata),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -12034,6 +12046,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                if (
+                    platform is Platform.TELEGRAM
+                    and chat_type == "dm"
+                    and thread_id is not None
+                ):
+                    notified_dm_topic_parents.add((platform_str, chat_id))
                 logger.info(
                     "Sent shutdown notification to active chat %s:%s",
                     platform_str, chat_id,
@@ -12057,7 +12075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # The per-active-session interrupt pings above are deliberately NOT
         # gated: on a drained shutdown they're empty by construction, and in the
         # force-interrupt (deadline-exceeded) case they carry the genuinely
-        # useful "your task was cut off, message me to resume" hint. The flag is
+        # useful interruption hint. The flag is
         # only honoured for a CURRENT-epoch marker (drain_notification_suppressed
         # reuses the NS-570 staleness check), so an orphaned marker can never
         # silence a fresh gateway's legitimate broadcast.
@@ -12096,6 +12114,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if dedup_key in notified:
                 continue
 
+            # Telegram's unthreaded private-chat target is the All Messages
+            # parent lane for every DM topic. Once an affected DM topic has been
+            # warned, a second parent-scoped advisory is redundant and can
+            # surface below an unrelated completed topic. Keep forum/group
+            # parents, explicit home topics, and distinct home chats unchanged.
+            if home.thread_id is None and (
+                platform.value,
+                str(home.chat_id),
+            ) in notified_dm_topic_parents:
+                logger.info(
+                    "Skipping redundant parent home-channel shutdown notification for %s:%s",
+                    platform.value,
+                    home.chat_id,
+                )
+                continue
+
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
@@ -12103,10 +12137,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                result = await adapter.send(
+                    str(home.chat_id),
+                    _notification_message(adapter),
+                    metadata=_interim_metadata(metadata),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",

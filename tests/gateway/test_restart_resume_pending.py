@@ -44,7 +44,12 @@ from gateway.run import (
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
 )
-from gateway.session import SessionEntry, SessionSource, SessionStore
+from gateway.session import (
+    SessionEntry,
+    SessionSource,
+    SessionStore,
+    build_session_key,
+)
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
@@ -866,6 +871,7 @@ async def test_warmup_disabled_by_nonpositive_timeout(monkeypatch):
 async def test_restart_notifies_home_channel_even_without_active_sessions():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    runner.config.restart_resume_policy = "continue"
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",
@@ -876,12 +882,81 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     assert adapter.sent == [
         "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "I'll try to resume it automatically after restart."
     ]
+    assert adapter.sent_calls[0][2] == {"_interim_send": True}
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_parent_home_notification_suppressed_after_topic_notice():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        chat_type="dm",
+        user_id="u1",
+        thread_id="topic-7",
+    )
+    source.message_id = "active-message"
+    session_key = build_session_key(source)
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        name="Ops Home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent_calls[0][2] == {
+        "thread_id": "topic-7",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "topic-7",
+        "telegram_reply_to_message_id": "active-message",
+        "_interim_send": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_restart_explicit_home_topic_still_notified_after_other_topic():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    session_key = "agent:main:telegram:group:999"
+    runner.session_store._entries[session_key] = MagicMock(
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="999",
+            chat_type="group",
+            user_id="u1",
+            thread_id="topic-7",
+        )
+    )
+    runner._running_agents[session_key] = MagicMock()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="999",
+        name="Ops Home",
+        thread_id="ops-topic",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent) == 2
+    assert adapter.sent_calls[0][2] == {
+        "thread_id": "topic-7",
+        "_interim_send": True,
+    }
+    assert adapter.sent_calls[1][2] == {
+        "thread_id": "ops-topic",
+        "_interim_send": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_restart_forum_topic_keeps_unthreaded_home_notice():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -904,8 +979,30 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
     await runner._notify_active_sessions_of_shutdown()
 
     assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert adapter.sent_calls[0][2] == {
+        "thread_id": "topic-7",
+        "_interim_send": True,
+    }
+    assert adapter.sent_calls[1][2] == {"_interim_send": True}
+
+
+@pytest.mark.asyncio
+async def test_restart_ask_policy_keeps_message_to_resume_hint():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner.config.restart_resume_policy = "ask"
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == [
+        "⚠️ Gateway restarting — Your current task will be interrupted. "
+        "Send any message after restart and I'll try to resume where you left off."
+    ]
 
 
 # ---------------------------------------------------------------------------
