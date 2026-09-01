@@ -10,12 +10,107 @@ ten minutes, so the throwaway can be the one that survives.
 from __future__ import annotations
 
 import types
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner, TurnRunner
 from gateway.session import SessionSource
+
+
+@pytest.mark.asyncio
+async def test_manual_telegram_title_collision_keeps_visible_label(tmp_path):
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("other-session", "telegram")
+    db.set_session_title("other-session", "Shared Topic")
+    db.create_session("current-session", "telegram")
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = AsyncSessionDB(db)
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=True)
+    entry = MagicMock(session_id="current-session", session_key="telegram:chat:thread")
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+    event = MessageEvent(text="/title Shared Topic", source=source)
+
+    result = await runner._handle_title_command(event)
+
+    assert db.get_session_title("current-session") == "Shared Topic #2"
+    runner._rename_telegram_topic_for_session_title.assert_awaited_once_with(
+        source, "current-session", "Shared Topic"
+    )
+    assert "Shared Topic #2" in result
+    assert "topic name was not changed" not in result
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_telegram_title_reports_platform_rename_failure(tmp_path):
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("current-session", "telegram")
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = AsyncSessionDB(db)
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=False)
+    entry = MagicMock(session_id="current-session", session_key="telegram:chat:thread")
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+
+    result = await runner._handle_title_command(
+        MessageEvent(text="/title Requested Topic", source=source)
+    )
+
+    assert db.get_session_title("current-session") == "Requested Topic"
+    assert "topic name was not changed" in result
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_telegram_title_allows_intentional_rename_noop(tmp_path):
+    from hermes_state import AsyncSessionDB, SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("current-session", "telegram")
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = AsyncSessionDB(db)
+    runner._is_telegram_topic_lane = lambda source: True
+    runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=None)
+    entry = MagicMock(session_id="current-session", session_key="telegram:chat:thread")
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        thread_id="thread-1",
+    )
+
+    result = await runner._handle_title_command(
+        MessageEvent(text="/title Operator Managed Topic", source=source)
+    )
+
+    assert db.get_session_title("current-session") == "Operator Managed Topic"
+    assert "topic name was not changed" not in result
+    db.close()
 
 
 def _attach(lane):
