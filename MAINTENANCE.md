@@ -116,7 +116,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-092 | Active | `fix(browser): recover persisted headed mode after restart` | Recover identity-scoped live runtime mode after gateway restart so cleanup never falls back to a contradictory global default. |
 | HERMES-093 | Active | `fix(gateway): keep restart notices scoped and accurate` | Keep restart notices out of unrelated Telegram DM parent lanes, mark them interim, and describe automatic continuation accurately. |
 | HERMES-094 | Active | `feat(gateway): apply inference controls mid-turn` | Let `/fast` and `/reasoning` update the live gateway agent so the next model request, including a later request in the same tool loop, uses the new session setting without interrupting the in-flight request. |
-| HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages. |
+| HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing (#32)`; `fix(telegram): preserve rich structural blocks` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages while preserving structural block contents byte for byte. |
 
 ## Fork-only administrative subject exemptions
 
@@ -159,6 +159,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `test(reconcile): align compaction prompt rebuild contract` | Rebase reconciliation preserving HERMES-025's would-grow outcome, accepting upstream's live prompt rebuild, and replacing source-introspection checks with behavioral coverage; also advances the history gate to this run's rebased pre-change commit, without changing shipped Hermes behavior. |
 | `fix(ci): source install E2E tags from upstream (#11)` | Standalone-mirror CI repair that reads canonical release tags without mirroring them into fork origin; no shipped Hermes behavior. |
 | `fix(ci): reconcile browser headed patch history` | Maintenance-baseline reconciliation for squash-added PR suffixes plus a Linux-only test-fixture display; no shipped Hermes behavior. |
+| `fix(ci): reconcile rich paragraph patch history` | Maintenance-baseline reconciliation for the squash-added PR suffix on HERMES-095; no shipped Hermes behavior. |
 | `fix(ci): align browser headed policy fixture` | Administrative synchronization of the exact trusted-workflow fixture with the browser-headed history baseline; no shipped Hermes behavior. |
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |

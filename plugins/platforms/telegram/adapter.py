@@ -638,11 +638,11 @@ def _rich_normalize_linebreaks(text: str) -> str:
         return text
 
     out: list[str] = []
-    # Split off protected regions (fenced code OR table blocks) and only inject
-    # hard breaks in the prose between them. Boundary newlines are handled by
-    # the original single-\n regex, which sees each prose run as a whole string.
+    # Split off every structural region whose internal newlines are meaningful,
+    # then normalize only the prose between them. Boundary newlines are handled
+    # by the single-newline regex on each prose run.
     pos = 0
-    for m in _RICH_PROTECTED_REGION_RE.finditer(text):
+    for m in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text):
         prose = _rich_materialize_prose_paragraphs(text[pos:m.start()])
         out.append(_RICH_SINGLE_LINEBREAK_RE.sub('  \n', prose))
         out.append(m.group(0))  # protected region kept verbatim

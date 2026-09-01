@@ -130,6 +130,20 @@ class TestRichMessageStructuralBoundaries:
         assert "\n\n" in md
 
     @pytest.mark.parametrize(
+        "content",
+        [
+            "<details>\n<summary>S</summary>\n\nFirst\n\nSecond\n\n</details>",
+            "$$\na = 1\n\nb = 2\n$$",
+            "\\[\na = 1\n\nb = 2\n\\]",
+            "~~~python\na = 1\n\nb = 2\n~~~",
+        ],
+    )
+    def test_protected_structural_regions_stay_byte_for_byte_raw(
+        self, adapter, content
+    ):
+        assert adapter._rich_message_payload(content)["markdown"] == content
+
+    @pytest.mark.parametrize(
         "second_paragraph",
         ["<https://example.com>", "<em>Inline HTML paragraph.</em>"],
     )
