@@ -112,6 +112,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-088 | Active | `fix(gateway): silence redundant process notifications`; `fix(gateway): preserve watch notification text` | Let model-facing gateway process telemetry reconcile silently without leaking the control contract into CLI, TUI, or Desktop output. |
 | HERMES-089 | Active | `fix(telegram): separate duplicate topic labels from session aliases` | Allow Telegram topics to share a visible label while preserving unique, deterministic internal session aliases. |
 | HERMES-090 | Active | `feat(gateway): merge side context into main` | Import one frozen, provenance-marked side-session delta into its originating main route without joining their future timelines. |
+| HERMES-091 | Active | `feat(browser): choose headed mode per exec session` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
 
 ## Fork-only administrative subject exemptions
 
@@ -1153,6 +1154,18 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 6. Verify the manifest row is `Active`; run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation so duplicate IDs, unindexed records, missing stable subjects, upstream-association fields, and fork-only patch coverage block publication. The unified `maintain-targets` dispatcher records the accepted result; it is not a substitute for repository validation.
 7. Ship the code and manifest together. A source patch without a complete record is not publishable.
 8. On every upstream rebase, inspect patch equivalence and associated issue/PR feedback; never resolve a conflict by retaining both private and upstream implementations.
+
+### HERMES-091 — Per-session headed control for browser_exec
+
+- **Independent hypothesis (2026-09-01):** `browser.headed` is process-wide configuration, but `browser_exec` sessions and managed real-profile runtimes are identity-scoped and persistent. Login handoff therefore needs a call-level request that binds the mode when a new managed runtime launches, rejects a conflicting live runtime without restarting it, records the effective mode per identity, and drives cleanup from that runtime state rather than the global default.
+- **Summary:** Adds optional `browser_exec(headed=...)` for Hermes-managed local real-profile browsing. Omission inherits `browser.headed`; explicit values bind new identity runtimes; mismatches fail closed; cloud, Lightpanda, and non-graphical headed launches return clear errors; the mode marker survives process handoff; and between-turn cleanup follows active runtime mode.
+- **Surfaces:** `tools/browser_use_cli.py`; `tools/browser_tool.py`; `agent/chat_completion_helpers.py`; focused browser-use, real-profile, identity, and headed-mode regressions; browser documentation; this record.
+- **Upstream tracking:** [Issue #100428](https://github.com/NousResearch/hermes-agent/issues/100428) tracks the missing per-session control.
+- **Upstream PR:** [#100468](https://github.com/NousResearch/hermes-agent/pull/100468) carries the generic upstream implementation.
+- **Regression:** `uv run --extra dev pytest -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves schema routing, true and false overrides, configured fallback, identity isolation, live-runtime conflict refusal, backend/display rejection, durable mode recovery, and cleanup behavior.
+- **Published commit identity:** Stable subject `feat(browser): choose headed mode per exec session`.
+- **Rollback:** Revert `feat(browser): choose headed mode per exec session`, removing the schema argument, runtime mode tracking, focused regressions, documentation, and this record while preserving existing real-profile identity isolation and the global `browser.headed` setting.
+- **Retirement:** Retire after released upstream ships equivalent per-call or per-session managed-local headed control with identity-safe reuse conflicts, durable mode recovery, and runtime-effective cleanup, and the regression contract passes against that release.
 
 ## Automatic synchronization
 

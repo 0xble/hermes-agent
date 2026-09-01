@@ -163,6 +163,9 @@ def _close_all_browser_exec_identity_daemons(*, all_profiles: bool = False) -> N
 # browser, or a named Browser Use cloud browser). Popped before the
 # subprocess launches — never exported to the CLI.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+# Proves that BU_CDP_* came from Hermes' managed real-profile launcher rather
+# than an operator-owned CDP endpoint. Never exported to the subprocess.
+_REAL_PROFILE_SENTINEL = "_HERMES_BU_REAL_PROFILE"
 
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
@@ -798,6 +801,7 @@ def _resolve_real_profile_cdp(
     env: dict,
     force_local: bool,
     identity=None,
+    headed: Optional[bool] = None,
 ) -> Optional[str]:
     """Point the harness at the user's real-profile copy-browser when consented.
 
@@ -884,9 +888,9 @@ def _resolve_real_profile_cdp(
 
     try:
         cdp, err = (
-            _real_profile_cdp(identity.alias)
+            _real_profile_cdp(identity.alias, headed=headed)
             if identity is not None
-            else _real_profile_cdp()
+            else _real_profile_cdp(headed=headed)
         )
     except Exception as exc:
         from hermes_cli.browser_identity import BrowserIdentityError
@@ -898,6 +902,7 @@ def _resolve_real_profile_cdp(
         return err
     if cdp:
         env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
+        env[_REAL_PROFILE_SENTINEL] = "1"
     return None
 
 
@@ -908,6 +913,7 @@ def browser_exec(
     task_id: Optional[str] = None,
     local: bool = False,
     identity: str = "",
+    headed: Optional[bool] = None,
 ):
     """Run Python code through the browser-use CLI, and return its output"""
     from tools.registry import tool_error, tool_result
@@ -948,6 +954,10 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
+    # Internal routing proof must come from this invocation, never the parent
+    # process environment.
+    env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+    env.pop(_REAL_PROFILE_SENTINEL, None)
     if daemon_name:
         env["BU_NAME"] = daemon_name
     elif session:
@@ -961,9 +971,16 @@ def browser_exec(
         env,
         force_local=bool(local),
         identity=resolved_identity,
+        headed=headed,
     )
     if rp_err:
         return tool_error(rp_err)
+    if headed is not None and not env.get(_REAL_PROFILE_SENTINEL):
+        return tool_error(
+            "headed can only control a Hermes-managed local real-profile browser. "
+            "Enable browser.use_real_profile and use a local backend (or pass "
+            "local=true under a cloud backend), then retry."
+        )
     if local and not (env.get("BU_CDP_URL") or env.get("BU_CDP_WS")):
         # local=True is only served by the real-profile route; anything else
         # (consent off — schema normally hidden, but be explicit; or an
@@ -998,6 +1015,7 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+    env.pop(_REAL_PROFILE_SENTINEL, None)
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
@@ -1271,6 +1289,15 @@ BROWSER_EXEC_SCHEMA = {
                 "description": f"Max seconds to wait for the code to finish (default {_DEFAULT_TIMEOUT_S}, max {_MAX_TIMEOUT_S}).",
                 "default": _DEFAULT_TIMEOUT_S,
             },
+            "headed": {
+                "type": "boolean",
+                "description": (
+                    "Override browser.headed when launching a new Hermes-managed "
+                    "local real-profile browser. Omit to use the configured default. "
+                    "An already-running browser must use the same mode. Unsupported "
+                    "for cloud browsers and non-graphical engines."
+                ),
+            },
         },
         "required": ["code"],
     },
@@ -1293,6 +1320,7 @@ registry.register(
         task_id=kw.get("task_id"),
         local=bool(args.get("local", False)),
         identity=args.get("identity", "") or "",
+        headed=args.get("headed"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,

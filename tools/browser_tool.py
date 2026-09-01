@@ -1527,6 +1527,7 @@ _REAL_PROFILE_SESSION = "hermes-real-profile"
 _real_profile_cdp_locks_guard = threading.Lock()
 _real_profile_cdp_locks: dict[str, threading.Lock] = {}
 _real_profile_cdp_cache: dict = {}
+_real_profile_headed_modes: dict[str, bool] = {}
 _real_profile_session_names: dict[str, str] = {}
 _real_profile_session_homes: dict[str, str] = {}
 _real_profile_browser_processes: dict[str, tuple[subprocess.Popen, str]] = {}
@@ -1622,6 +1623,7 @@ def _close_all_real_profile_runtimes(*, all_profiles: bool = False) -> None:
     for key in selected_keys:
         _stop_real_profile_browser(key)
         _real_profile_cdp_cache.pop(key, None)
+        _real_profile_headed_modes.pop(key, None)
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -1787,7 +1789,11 @@ def _agent_browser_close_session(session_name: str, *, timeout: float = 15.0) ->
         logger.debug("real-profile session close failed: %s", e)
 
 
-def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
+def _real_profile_cdp(
+    requested_identity: str | None = None,
+    *,
+    headed: Optional[bool] = None,
+) -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
     Snapshots the user's default-Chromium profile into a hermes-owned copy
@@ -1814,6 +1820,7 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
         except Exception as e:
             logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
         _real_profile_cdp_cache.clear()
+        _real_profile_headed_modes.clear()
         return None, None
 
     # Lightpanda cannot load a Chromium profile — agent-browser rejects
@@ -1828,6 +1835,8 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
             "browser.engine to 'auto' or 'chrome' to use real-profile browsing, "
             "or turn the toggle off."
         )
+
+    effective_headed = _is_headed_mode() if headed is None else headed
 
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
@@ -1851,6 +1860,27 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
 
     session_name, identity_lock, cache_key = _real_profile_runtime_resources(identity)
     scoped_runtime_key = cache_key.partition(":")[2] if identity is not None else ""
+
+    def mode_conflict() -> Optional[str]:
+        running_headed = _real_profile_headed_modes.get(cache_key)
+        if running_headed is None:
+            if headed is None:
+                return None
+            return (
+                "The Hermes real-profile browser is already running, but its "
+                "headed mode cannot be verified. Close it and retry to apply an "
+                "explicit headed value safely."
+            )
+        if running_headed == effective_headed:
+            return None
+        running = "headed" if running_headed else "headless"
+        requested = "headed" if effective_headed else "headless"
+        return (
+            f"The Hermes real-profile browser is already running {running}; "
+            f"it cannot be reused as {requested}. Close the existing browser "
+            "session or use the same headed value, then retry."
+        )
+
     process_lock = (
         BrowserIdentityProcessLock(scoped_runtime_key)
         if identity is not None
@@ -1861,6 +1891,8 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
         # Reuse a live copy-browser from an earlier call this process made.
         cached = _real_profile_cdp_cache.get(cache_key)
         if identity is None and cached and _cdp_http_ready(cached):
+            if conflict := mode_conflict():
+                return None, conflict
             return cached, None
 
         browser = identity.browser if identity is not None else detect_default_chromium()
@@ -1901,9 +1933,12 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
 
         if identity is not None and cached:
             if _cdp_owned_by_data_dir(cached, copy_dir):
+                if conflict := mode_conflict():
+                    return None, conflict
                 return cached, None
             _agent_browser_close_session(session_name)
         _real_profile_cdp_cache.pop(cache_key, None)
+        _real_profile_headed_modes.pop(cache_key, None)
         if identity is not None:
             # Browser Use daemons retain their original CDP attachment. Stop
             # them before relaunching this identity on a new endpoint.
@@ -1924,7 +1959,30 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
             )
         )
         if existing and existing_owned:
+            mode_file = Path(copy_dir, ".hermes-browser-mode")
+            existing_headed = None
+            try:
+                existing_headed = mode_file.read_text(encoding="utf-8").strip() == "headed"
+            except OSError:
+                pass
+            if existing_headed is None and headed is not None:
+                return None, (
+                    "The Hermes real-profile browser is already running, but its "
+                    "headed mode cannot be verified. Close it and retry to apply an "
+                    "explicit headed value safely."
+                )
+            if existing_headed is not None and existing_headed != effective_headed:
+                running = "headed" if existing_headed else "headless"
+                requested = "headed" if effective_headed else "headless"
+                return None, (
+                    f"The Hermes real-profile browser is already running {running}; "
+                    f"it cannot be reused as {requested}. Close the existing browser "
+                    "session or use the same headed value, then retry."
+                )
             _real_profile_cdp_cache[cache_key] = existing
+            _real_profile_headed_modes[cache_key] = (
+                effective_headed if existing_headed is None else existing_headed
+            )
             _track_real_profile_session(cache_key, session_name)
             return existing, None
         if existing:
@@ -1934,6 +1992,24 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
 
         recovered = _owned_profile_cdp(copy_dir)
         if recovered:
+            mode_file = Path(copy_dir, ".hermes-browser-mode")
+            recovered_headed = None
+            try:
+                recovered_headed = mode_file.read_text(encoding="utf-8").strip() == "headed"
+            except OSError:
+                pass
+            if recovered_headed is None and headed is not None:
+                return None, (
+                    "The Hermes real-profile browser is already running, but its "
+                    "headed mode cannot be verified. Close it and retry to apply an "
+                    "explicit headed value safely."
+                )
+            _real_profile_headed_modes[cache_key] = (
+                effective_headed if recovered_headed is None else recovered_headed
+            )
+            if conflict := mode_conflict():
+                _real_profile_headed_modes.pop(cache_key, None)
+                return None, conflict
             attach_error = _attach_agent_browser_to_cdp(session_name, recovered)
             if attach_error:
                 return None, f"browser.use_real_profile is on, but {attach_error}"
@@ -2011,11 +2087,26 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
         has_display = bool(
             os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
         )
-        wants_headed = _is_headed_mode() and (
+        wants_headed = effective_headed and (
             has_display or not sys.platform.startswith("linux")
         )
+        if headed is True and not wants_headed:
+            return None, (
+                "headed=true requires a graphical display, but no DISPLAY or "
+                "WAYLAND_DISPLAY is available on this Linux host."
+            )
         if not wants_headed:
             chrome_argv.append("--headless=new")
+        try:
+            Path(copy_dir, ".hermes-browser-mode").write_text(
+                "headed" if wants_headed else "headless",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            return None, (
+                "browser.use_real_profile is on, but mode state could not be saved: "
+                f"{exc}"
+            )
         try:
             chrome_proc = subprocess.Popen(
                 chrome_argv,
@@ -2074,6 +2165,7 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
                 "prove ownership of the identity snapshot; refusing the CDP attach"
             )
         _real_profile_cdp_cache[cache_key] = cdp
+        _real_profile_headed_modes[cache_key] = wants_headed
         _track_real_profile_session(cache_key, session_name)
         logger.info(
             "real-profile browser ready for %s%s at %s (%s)",
@@ -2083,6 +2175,26 @@ def _real_profile_cdp(requested_identity: str | None = None) -> tuple:
             copy_dir,
         )
         return cdp, None
+
+
+def _preserve_browser_between_turns() -> bool:
+    """Return whether this profile has a visible active local runtime."""
+    from hermes_constants import hermes_home_key
+
+    active_home = hermes_home_key()
+    live_runtime = False
+    for cache_key, cdp in tuple(_real_profile_cdp_cache.items()):
+        runtime_home = _real_profile_session_homes.get(cache_key)
+        if runtime_home is not None and runtime_home != active_home:
+            continue
+        if not _cdp_http_ready(cdp):
+            continue
+        live_runtime = True
+        if _real_profile_headed_modes.get(cache_key) is True:
+            return True
+    if live_runtime:
+        return False
+    return _is_headed_mode()
 
 
 def _url_is_private(url: str) -> bool:

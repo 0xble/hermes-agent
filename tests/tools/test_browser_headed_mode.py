@@ -12,10 +12,12 @@ import pytest
 
 
 def _reset_headed_cache():
-    """Reset the module-level headed-mode cache so tests start clean."""
+    """Reset headed-mode and active-runtime caches so tests start clean."""
     import tools.browser_tool as bt
     bt._cached_headed_mode = None
     bt._headed_mode_resolved = False
+    bt._real_profile_cdp_cache.clear()
+    bt._real_profile_headed_modes.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +67,7 @@ class TestCleanupTaskResourcesHeadedSkip:
     def test_headless_still_cleans_browser(self):
         from agent.chat_completion_helpers import cleanup_task_resources
         with (
-            patch("tools.browser_tool._is_headed_mode", return_value=False),
+            patch("tools.browser_tool._preserve_browser_between_turns", return_value=False),
             patch("run_agent.cleanup_vm"),
             patch("run_agent.cleanup_browser") as mock_cb,
             patch(
@@ -81,7 +83,7 @@ class TestCleanupTaskResourcesHeadedSkip:
         """Headed mode only affects the browser; VM teardown is untouched."""
         from agent.chat_completion_helpers import cleanup_task_resources
         with (
-            patch("tools.browser_tool._is_headed_mode", return_value=True),
+            patch("tools.browser_tool._preserve_browser_between_turns", return_value=True),
             patch("run_agent.cleanup_vm") as mock_vm,
             patch("run_agent.cleanup_browser"),
             patch(
@@ -91,6 +93,26 @@ class TestCleanupTaskResourcesHeadedSkip:
         ):
             cleanup_task_resources(_make_agent(), "task-x")
             mock_vm.assert_called_once_with("task-x")
+
+
+class TestEffectiveHeadedPersistence:
+    def test_explicit_headed_runtime_overrides_headless_config(self):
+        import tools.browser_tool as bt
+        _, _, cache_key = bt._real_profile_runtime_resources(None)
+        bt._real_profile_cdp_cache[cache_key] = "http://127.0.0.1:41000"
+        bt._real_profile_headed_modes[cache_key] = True
+        with patch.object(bt, "_cdp_http_ready", return_value=True), \
+             patch.object(bt, "_is_headed_mode", return_value=False):
+            assert bt._preserve_browser_between_turns() is True
+
+    def test_explicit_headless_runtime_overrides_headed_config(self):
+        import tools.browser_tool as bt
+        _, _, cache_key = bt._real_profile_runtime_resources(None)
+        bt._real_profile_cdp_cache[cache_key] = "http://127.0.0.1:41000"
+        bt._real_profile_headed_modes[cache_key] = False
+        with patch.object(bt, "_cdp_http_ready", return_value=True), \
+             patch.object(bt, "_is_headed_mode", return_value=True):
+            assert bt._preserve_browser_between_turns() is False
 
 
 # ---------------------------------------------------------------------------
