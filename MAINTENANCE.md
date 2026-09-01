@@ -117,6 +117,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-093 | Active | `fix(gateway): keep restart notices scoped and accurate` | Keep restart notices out of unrelated Telegram DM parent lanes, mark them interim, and describe automatic continuation accurately. |
 | HERMES-094 | Active | `feat(gateway): apply inference controls mid-turn` | Let `/fast` and `/reasoning` update the live gateway agent so the next model request, including a later request in the same tool loop, uses the new session setting without interrupting the in-flight request. |
 | HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing (#32)`; `fix(telegram): preserve rich structural blocks (#34)` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages while preserving structural block contents byte for byte. |
+| HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
 
 ## Fork-only administrative subject exemptions
 
@@ -237,6 +238,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subjects `fix(gateway): silence redundant process notifications` and `fix(gateway): preserve watch notification text`; source and focused regressions are mirrored from PR #99941, while this lifecycle record is fork-owned.
 - **Rollback:** Revert only `fix(gateway): preserve watch notification text` and `fix(gateway): silence redundant process notifications`, then remove the HERMES-088 index row and this record. No schema, configuration, or persistent-data rollback is required.
 - **Retirement:** Retire after a released upstream version prevents non-actionable process telemetry from producing redundant public replies, preserves substantive process updates and async delegation, avoids control-contract leakage on non-gateway surfaces, and passes equivalent regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
+
+### HERMES-096 — Await progress cleanup before follow-ups
+
+- **Independent hypothesis (2026-09-01):** A completed Telegram turn retained its consolidated tool-progress and `⏳ Working` bubbles after the final answer. The in-band pending-message path recursively started the queued follow-up before reaching the old cleanup-registration block, so no callback existed at the handoff boundary. The callback also returned before its scheduled deletion future completed. Adapter replacement could split callback ownership from the live deletion transport.
+- **Summary:** Register cleanup before pending-message inspection, make the callback await deletion, keep one callback owner across recursive queued turns, resolve the live adapter when deleting, and emit bounded completion, failure, cancellation, and failed-run skip telemetry.
+- **Surfaces:** `gateway/run.py`; `tests/gateway/test_run_cleanup_progress.py`; this record.
+- **Upstream tracking:** NousResearch/hermes-agent#100061. Fork recurrence: 0xble/hermes-agent#21 after merged fork PR #16.
+- **Upstream PR:** Open PR #100133 carries the complete implementation and regressions. Open PR #100125 overlaps on registration ordering and awaitable deletion but does not cover the full failed-delivery and adapter-replacement contract.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_post_delivery_callback_chaining.py tests/gateway/test_run_cleanup_progress.py tests/gateway/test_status_command.py tests/gateway/test_run_progress_topics.py tests/gateway/test_active_session_text_merge.py -q`; coverage must prove queued follow-ups wait for prior cleanup, replacement adapters preserve callback ownership while live deletion follows the replacement, failed first-response delivery defers both cleanup and the queued follow-up, failed runs retain breadcrumbs, and deletion outcomes are observable.
+- **Expected published commit identity:** Stable subject `fix(gateway): await progress cleanup before follow-ups`; source and focused regressions are mirrored from the linked upstream PR, while this lifecycle record is fork-owned.
+- **Rollback:** Revert only `fix(gateway): await progress cleanup before follow-ups`, then remove the HERMES-096 index row and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version preserves this queued-turn cleanup contract across adapter replacement and passes equivalent regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-087 — Stop duplicating root skill names
 

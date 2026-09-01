@@ -25230,8 +25230,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
-        """Deliver a queued response using the normal text+attachment split."""
+    ) -> bool:
+        """Deliver a queued response and report whether text delivery succeeded."""
+        _delivery_confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -25259,6 +25260,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            _delivery_confirmed = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -25269,18 +25271,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    _send_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
                     )
+                    _delivery_confirmed = bool(
+                        getattr(_send_result, "success", False)
+                    )
+                    if not _delivery_confirmed:
+                        return False
+            else:
+                _delivery_confirmed = True
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return _delivery_confirmed
 
         synthetic_event = MessageEvent(
             text="",
@@ -25293,6 +25302,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter,
             thread_metadata=metadata,
         )
+        return _delivery_confirmed
 
     async def _run_background_task(
         self,
@@ -31469,6 +31479,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
+        _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -31492,6 +31503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
+                _post_delivery_adapter=_post_delivery_adapter,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -31508,6 +31520,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
+                _post_delivery_adapter=_post_delivery_adapter,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -31654,6 +31667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
+        _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31915,6 +31929,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Adapter doesn't support deletion — silently disable.
             _cleanup_progress = False
             _cleanup_adapter = None
+        _cleanup_callback_adapter = cast(
+            Optional[BasePlatformAdapter],
+            _post_delivery_adapter or _cleanup_adapter,
+        )
         _cleanup_msg_ids: List[str] = []
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
@@ -32911,6 +32929,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
                     if callable(_mark_turn):
                         _mark_turn(session_key, run_generation)
+            # Register temporary-progress cleanup before inspecting the pending
+            # queue. A normal turn leaves this callback for the outer delivery
+            # lifecycle. An in-band queued turn pops it immediately after the
+            # first response is delivered and before recursive follow-up work
+            # begins. Registering only after this branch would be unreachable
+            # for queued turns because the recursive result returns early.
+            if (
+                _cleanup_progress
+                and _cleanup_adapter is not None
+                and _cleanup_callback_adapter is not None
+                and _cleanup_msg_ids
+                and session_key
+                and isinstance(response, dict)
+                and not response.get("failed")
+                and hasattr(_cleanup_adapter, "register_post_delivery_callback")
+            ):
+                _chat_id_snapshot = source.chat_id
+                _adapter_snapshot = _cleanup_adapter
+
+                async def _cleanup_temp_bubbles() -> None:
+                    # Snapshot at invocation rather than registration so a
+                    # heartbeat/status send that completes while final delivery
+                    # is in flight is included in this turn's cleanup set.
+                    _ids_snapshot = list(dict.fromkeys(_cleanup_msg_ids))
+                    _deleted_count = 0
+                    _failed_details: list[str] = []
+                    for _mid in _ids_snapshot:
+                        try:
+                            _delete_adapter = cast(
+                                BasePlatformAdapter,
+                                self._adapter_for_source(source) or _adapter_snapshot,
+                            )
+                            _deleted = await _delete_adapter.delete_message(
+                                _chat_id_snapshot, _mid
+                            )
+                        except asyncio.CancelledError:
+                            _completed_count = _deleted_count + len(_failed_details)
+                            logger.warning(
+                                "Temp bubble cleanup cancelled for session %s generation %s: "
+                                "requested=%d completed=%d remaining=%d",
+                                session_key,
+                                run_generation,
+                                len(_ids_snapshot),
+                                _completed_count,
+                                len(_ids_snapshot) - _completed_count,
+                            )
+                            raise
+                        except Exception as _cleanup_error:
+                            _failed_details.append(
+                                f"{_mid}:{type(_cleanup_error).__name__}"
+                            )
+                        else:
+                            if _deleted:
+                                _deleted_count += 1
+                            else:
+                                _failed_details.append(f"{_mid}:returned_false")
+                    if _failed_details:
+                        _shown_failures = _failed_details[:10]
+                        _omitted_failures = len(_failed_details) - len(_shown_failures)
+                        logger.warning(
+                            "Temp bubble cleanup failures for session %s generation %s: "
+                            "%s%s",
+                            session_key,
+                            run_generation,
+                            ", ".join(_shown_failures),
+                            (
+                                f" (+{_omitted_failures} more)"
+                                if _omitted_failures
+                                else ""
+                            ),
+                        )
+                    logger.info(
+                        "Temp bubble cleanup complete for session %s generation %s: "
+                        "requested=%d deleted=%d failed=%d",
+                        session_key,
+                        run_generation,
+                        len(_ids_snapshot),
+                        _deleted_count,
+                        len(_failed_details),
+                    )
+
+                try:
+                    _cleanup_callback_adapter.register_post_delivery_callback(
+                        session_key,
+                        _cleanup_temp_bubbles,
+                        generation=run_generation,
+                    )
+                except Exception as _rpe:
+                    logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+            elif (
+                _cleanup_progress
+                and _cleanup_msg_ids
+                and isinstance(response, dict)
+                and response.get("failed")
+            ):
+                logger.info(
+                    "Temp bubble cleanup skipped for session %s generation %s: "
+                    "reason=failed_run tracked=%d",
+                    session_key,
+                    run_generation,
+                    len(_cleanup_msg_ids),
+                )
 
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
@@ -33026,6 +33146,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
+                _callback_owner = cast(
+                    BasePlatformAdapter,
+                    _cleanup_callback_adapter or adapter,
+                )
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
@@ -33065,6 +33189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    _first_response_delivered = True
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
@@ -33082,24 +33207,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
-                                first_response,
-                                source=source,
-                                adapter=adapter,
-                                metadata=_status_thread_metadata,
-                                event_message_id=event_message_id,
-                                text_already_delivered=_already_streamed,
-                                deliver_media=not _delivery_result.get("failed"),
-                                stream_consumer=_sc,
+                            _first_response_delivered = (
+                                await self._deliver_queued_first_response(
+                                    first_response,
+                                    source=source,
+                                    adapter=adapter,
+                                    metadata=_status_thread_metadata,
+                                    event_message_id=event_message_id,
+                                    text_already_delivered=_already_streamed,
+                                    deliver_media=not _delivery_result.get("failed"),
+                                    stream_consumer=_sc,
+                                )
                             )
                         except Exception as e:
+                            _first_response_delivered = False
                             logger.warning("Failed to send first response before queued message: %s", e)
+                    if not _first_response_delivered and pending_event is not None:
+                        _pending_slot = getattr(adapter, "_pending_messages", None)
+                        if isinstance(_pending_slot, dict):
+                            _existing_pending = _pending_slot.get(session_key)
+                            if _existing_pending is not None:
+                                self._session_state(
+                                    session_key
+                                ).conversation.queued_events.insert(
+                                    0, _existing_pending
+                                )
+                            _pending_slot[session_key] = pending_event
+                        logger.warning(
+                            "Queued follow-up for session %s deferred because the "
+                            "first response was not delivered.",
+                            session_key or "?",
+                        )
+                        return result or {
+                            "final_response": response,
+                            "messages": history,
+                        }
+
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
                     # base.py's finally block) and call it.
-                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
-                        _bg_cb = adapter.pop_post_delivery_callback(
+                    if (
+                        getattr(
+                            type(_callback_owner),
+                            "pop_post_delivery_callback",
+                            None,
+                        )
+                        is not None
+                    ):
+                        _bg_cb = _callback_owner.pop_post_delivery_callback(
                             session_key,
                             generation=run_generation,
                         )
@@ -33110,8 +33266,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     await _bg_result
                             except Exception:
                                 pass
-                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
-                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                    elif hasattr(_callback_owner, "_post_delivery_callbacks"):
+                        _bg_cb = _callback_owner._post_delivery_callbacks.pop(
+                            session_key, None
+                        )
                         if callable(_bg_cb):
                             try:
                                 _bg_result = _bg_cb()
@@ -33220,6 +33378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    _post_delivery_adapter=_callback_owner,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -33471,52 +33630,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _transformed,
                     len(_final),
                 )
-
-        # Schedule deletion of tracked temporary progress bubbles after the
-        # final response lands. Failed runs skip this so bubbles remain as
-        # breadcrumbs for the user to see what work happened. Only fires on
-        # adapters that support ``delete_message`` (see init above); failures
-        # are swallowed — deletion is best-effort.
-        if (
-            _cleanup_progress
-            and _cleanup_adapter is not None
-            and _cleanup_msg_ids
-            and session_key
-            and isinstance(response, dict)
-            and not response.get("failed")
-            and hasattr(_cleanup_adapter, "register_post_delivery_callback")
-        ):
-            _ids_snapshot = list(_cleanup_msg_ids)
-            _chat_id_snapshot = source.chat_id
-            _adapter_snapshot = _cleanup_adapter
-            _loop_snapshot = asyncio.get_running_loop()
-
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
-
-            try:
-                _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
-                    _cleanup_temp_bubbles,
-                    generation=run_generation,
-                )
-            except Exception as _rpe:
-                logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
 
