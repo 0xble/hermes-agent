@@ -4390,6 +4390,9 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         return format_process_notification(
             evt,
             include_no_reply_contract=evt_type != "async_delegation",
+            # Preserve the gateway watch text exactly. The pre-refactor watch
+            # formatter did not expose subagent ownership attribution.
+            include_attribution=evt_type != "watch_match",
         )
 
     return None

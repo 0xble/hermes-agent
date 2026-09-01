@@ -96,7 +96,25 @@ def test_gateway_watch_formatter_uses_shared_process_contract(event):
     assert _format_gateway_process_notification(event) == format_process_notification(
         event,
         include_no_reply_contract=True,
+        include_attribution=event.get("type") != "watch_match",
     )
+
+
+def test_gateway_watch_formatter_preserves_pre_refactor_subagent_text(monkeypatch):
+    from gateway.run import _format_gateway_process_notification
+
+    event = _watch_event()
+    event["owner_task_id"] = "sa-child"
+    monkeypatch.setattr(
+        "tools.process_registry._delegation_attribution_line",
+        lambda _event: "Started by subagent reviewer (sa-child).",
+    )
+
+    text = _format_gateway_process_notification(event)
+
+    assert text is not None
+    assert "respond exactly NO_REPLY" in text
+    assert "Started by subagent" not in text
 
 
 # ---------------------------------------------------------------------------

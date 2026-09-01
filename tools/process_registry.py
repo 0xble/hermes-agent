@@ -3291,6 +3291,7 @@ def format_process_notification(
     evt: dict,
     *,
     include_no_reply_contract: bool = False,
+    include_attribution: bool = True,
 ) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
@@ -3300,7 +3301,7 @@ def format_process_notification(
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
-    _attribution = _delegation_attribution_line(evt)
+    _attribution = _delegation_attribution_line(evt) if include_attribution else None
 
     def _finalize(text: str) -> str:
         if include_no_reply_contract:
