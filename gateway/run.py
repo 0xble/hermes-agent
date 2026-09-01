@@ -18333,6 +18333,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "busy": self._handle_busy_command,
             "yolo": self._handle_yolo_command,
             "verbose": self._handle_verbose_command,
+            "reasoning": self._handle_reasoning_command,
+            "fast": self._handle_fast_command,
             "footer": self._handle_footer_command,
             "help": self._handle_help_command,
             "commands": self._handle_commands_command,

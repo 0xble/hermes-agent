@@ -115,6 +115,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-091 | Active | `feat(browser): choose headed mode per exec session (#28)` | Let browser_exec override headed mode per managed local identity runtime while preserving safe reuse and cleanup. |
 | HERMES-092 | Active | `fix(browser): recover persisted headed mode after restart` | Recover identity-scoped live runtime mode after gateway restart so cleanup never falls back to a contradictory global default. |
 | HERMES-093 | Active | `fix(gateway): keep restart notices scoped and accurate` | Keep restart notices out of unrelated Telegram DM parent lanes, mark them interim, and describe automatic continuation accurately. |
+| HERMES-094 | Active | `feat(gateway): apply inference controls mid-turn` | Let `/fast` and `/reasoning` update the live gateway agent so the next model request, including a later request in the same tool loop, uses the new session setting without interrupting the in-flight request. |
 
 ## Fork-only administrative subject exemptions
 
@@ -1194,6 +1195,18 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Published commit identity:** Stable subject `fix(browser): recover persisted headed mode after restart`.
 - **Rollback:** Revert `fix(browser): recover persisted headed mode after restart`, removing restart-time mode rediscovery and its focused regressions while retaining HERMES-091's per-call argument and in-process runtime tracking.
 - **Retirement:** Retire with HERMES-091 after released upstream provides equivalent per-session headed control plus restart-safe effective-mode recovery and the combined regression contract passes.
+
+### HERMES-094 — Apply inference controls during active gateway turns
+
+- **Independent hypothesis (2026-09-01):** Gateway busy dispatch rejects `/fast` and `/reasoning` before their normal handlers run. Both handlers already own session-scoped state, while the active `AIAgent` rebuilds request kwargs at each model-call boundary from live `request_overrides` and `reasoning_config`. The narrow correction is therefore to dispatch these controls while busy, update the same running agent object and session override without interrupting or rebuilding it, and leave the already-built request unchanged.
+- **Summary:** Provisional. Allow canonical `/fast` and `/reasoning` commands, including configured aliases, to execute during active gateway turns. Session changes must reach the live agent for the next model request, preserve unrelated request overrides, retain normal session/global persistence semantics, and never inject transcript text, interrupt the turn, or evict the active agent.
+- **Surfaces:** Expected: `hermes_cli/commands.py`; `gateway/run.py`; `gateway/slash_commands.py`; focused busy-command regressions; this record.
+- **Upstream tracking:** Closed PR #10116 originally proposed busy dispatch for `/fast` and `/reasoning`. Merged PR #12955 intentionally salvaged only `/yolo` and `/verbose` because the existing inference handlers affected a future message rather than the live agent. Merged PR #12334 owns the generic busy-command rejection boundary. Open PR #4665 proposes busy reasoning changes. Open issue #92185 and PR #92187 cover structured session options but explicitly reject busy mutation. No released upstream behavior satisfies the next-model-request contract as of 2026-09-01.
+- **Upstream PR:** Direct historical: #10116 (closed without merge). Related: #12955 and #12334 (merged), #4665 and #92187 (open). Brian explicitly requested no new upstream issue or PR.
+- **Regression:** Planned RED/GREEN gateway tests will drive `/fast fast`, `/fast normal`, `/reasoning high`, and `/reasoning reset` through the active-session command boundary; observe live-agent request/reasoning state, session overrides, preserved unrelated overrides, no active-agent eviction, and the unchanged current-request boundary.
+- **Published commit identity:** Expected stable subject `feat(gateway): apply inference controls mid-turn`; source, regressions, and this record must ship together.
+- **Rollback:** Revert only `feat(gateway): apply inference controls mid-turn`, restoring busy rejection for `/fast` and `/reasoning` and removing the focused regressions plus this record. Preserve existing idle session/global inference controls, one-turn reasoning prompts and aliases under HERMES-078, and TUI/Desktop live configuration behavior.
+- **Retirement:** Retire after a released upstream version dispatches both controls during active gateway turns, updates the live agent and session intent at the next request boundary without interrupt/rebuild/transcript mutation, preserves provider-specific fast overrides and reasoning reset/global semantics, and passes equivalent focused regressions.
 
 ## Automatic synchronization
 
