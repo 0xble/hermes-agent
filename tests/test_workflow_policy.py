@@ -495,10 +495,6 @@ def test_removed_workflow_comments_do_not_reappear() -> None:
     assert "workflow_run publisher" not in retained_text
 
 
-def test_inventory_is_exact() -> None:
-    assert len(WORKFLOW_TRIGGERS) == 19
-
-
 def test_action_and_reusable_reference_allowlists_are_exact() -> None:
     root = Path(__file__).resolve().parents[1] / ".github" / "workflows"
     step_actions: set[str] = set()

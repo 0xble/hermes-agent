@@ -47,6 +47,7 @@ TRANSITION_ACTION_FAMILIES = (
 )
 
 WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
+    "case-collision-check.yml": frozenset({"workflow_call"}),
     "ci.yaml": frozenset({"pull_request", "push"}),
     "docs-site-checks.yml": frozenset({"workflow_call"}),
     "docker-lint.yml": frozenset({"workflow_call"}),
@@ -61,6 +62,7 @@ WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
     "lockfile-diff.yml": frozenset({"workflow_call"}),
     "nix.yml": frozenset({"workflow_dispatch"}),
     "osv-scanner.yml": frozenset({"schedule", "workflow_call", "workflow_dispatch"}),
+    "profile-artifact-check.yml": frozenset({"workflow_call"}),
     "rust-tests.yml": frozenset({"workflow_call"}),
     "supply-chain-audit.yml": frozenset({"workflow_call"}),
     "tests-os.yml": frozenset({"workflow_call"}),
@@ -144,8 +146,10 @@ STEP_ACTION_ALLOWLIST = frozenset(
 )
 JOB_REUSABLE_WORKFLOW_ALLOWLIST = frozenset(
     {
+        "./.github/workflows/case-collision-check.yml",
         "./.github/workflows/docker-lint.yml",
         "./.github/workflows/docs-site-checks.yml",
+        "./.github/workflows/e2e-desktop.yml",
         "./.github/workflows/history-check.yml",
         "./.github/workflows/install-e2e-run.yml",
         "./.github/workflows/installer-tests.yml",
@@ -153,6 +157,7 @@ JOB_REUSABLE_WORKFLOW_ALLOWLIST = frozenset(
         "./.github/workflows/lint.yml",
         "./.github/workflows/lockfile-diff.yml",
         "./.github/workflows/osv-scanner.yml",
+        "./.github/workflows/profile-artifact-check.yml",
         "./.github/workflows/rust-tests.yml",
         "./.github/workflows/supply-chain-audit.yml",
         "./.github/workflows/tests-os.yml",
