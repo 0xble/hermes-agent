@@ -11579,23 +11579,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
 
     @staticmethod
-    def _resolve_shared_session_db(session_store):
-        """Return SessionStore's synchronous DB for the active profile scope.
-
-        SessionStore owns and caches one handle per resolved profile path.
-        Session search wraps that exact handle instead of opening a second
-        writer and reader pool. If the store deliberately degraded to JSONL
-        for this path, preserve that failure rather than pinning a replacement
-        across every multiplexed profile.
-        """
-        shared_db = getattr(session_store, "_db", None)
-        if shared_db is None:
-            raise RuntimeError(
-                "SessionStore has no SQLite handle for the active profile scope"
-            )
-        return shared_db
-
-    @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
         # noqa: SLF001 — intentional private access; runs off the event loop.
