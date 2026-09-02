@@ -166,6 +166,8 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): fetch trusted upstream through checkout` | Replaces the malformed shell-auth fetch with a pinned authenticated checkout and local history transfer; no shipped behavior. |
 | `fix(ci): align trusted upstream fetch regression` | Aligns the immutable-head regression with the pinned checkout and local history-transfer contract; no shipped behavior. |
 | `fix(ci): advance goal guidance maintenance baseline` | Advances trusted history validation past PR #40's GitHub-added squash suffix after the manifest was registered under the reviewed stable subject; no shipped behavior. |
+| `Merge pull request #27 from 0xble/fix/progress-cleanup-recurrence-21` | GitHub-generated merge commit for the reviewed HERMES-044 recurrence fix and its governance baseline; no additional shipped behavior. |
+| `fix(ci): advance merged progress cleanup baseline` | Advances trusted history validation past PR #27's GitHub merge commit after its maintained patch and governance repair were verified; no additional shipped behavior. |
 | `fix(ci): align browser headed policy fixture` | Administrative synchronization of the exact trusted-workflow fixture with the browser-headed history baseline; no shipped Hermes behavior. |
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |
