@@ -343,7 +343,21 @@ def test_schema_exposes_all_user_facing_actions_and_goal_writing_guidance():
         "subgoal_clear", "gate_list", "gate_add", "gate_remove", "gate_clear",
     }
     description = SET_GOAL_SCHEMA["description"]
-    for phrase in ("one concise outcome", "verification", "constraints", "boundaries", "stop_when"):
+    for phrase in (
+        "one durable multi-turn outcome",
+        "evidence-based finish line",
+        "Do not set a goal",
+        "one-turn answer or edit",
+        "read-only question",
+        "unrelated backlog",
+        "routine task tracking",
+        "unresolved user decisions",
+        "one concise end state",
+        "verification",
+        "constraints",
+        "boundaries",
+        "stop_when",
+    ):
         assert phrase in description
 
 

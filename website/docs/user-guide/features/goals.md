@@ -12,14 +12,30 @@ It's our take on the **Ralph loop**, directly inspired by [Codex CLI 0.128.0's `
 
 ## When to use it
 
-Use `/goal` for tasks where you want Hermes to iterate on its own without you re-prompting every turn:
+Use `/goal` when all three are true:
+
+1. The work has **one durable outcome** that will probably take several turns.
+2. The next useful step may depend on evidence Hermes discovers along the way.
+3. Hermes can **verify the finish line** and proceed within clear boundaries without waiting for unresolved decisions.
+
+Good examples:
 
 - "Fix every lint error in `src/` and verify `ruff check` passes"
 - "Port feature X from repo Y, including tests, and get CI green"
 - "Investigate why session IDs sometimes drift on mid-run compression and write up a report"
 - "Build a small CLI to rename files by their EXIF dates, then test it against the photos/ folder"
 
-Tasks where the agent does one turn and stops don't need `/goal`. Tasks where *you'd otherwise have to say "keep going" three times* are where this shines.
+The useful size is bigger than one prompt but smaller than an open-ended backlog. If you would otherwise have to say "keep going" after intermediate results, a goal may fit.
+
+### When not to use it
+
+- **One answer, explanation, review, or small edit:** use a normal prompt.
+- **A vague aspiration** such as "improve the code": define a measurable end state first.
+- **Unrelated work or routine task tracking:** use a task list or [Kanban](./kanban), not one goal loop.
+- **Work with unresolved product choices, missing access, or required approval:** clarify or plan first. Put a precise pause condition in `stop_when` if the work can proceed only up to that boundary.
+- **Work that should run on a schedule rather than continue this chat:** use [cron](./cron), not `/goal`.
+
+A goal should not be a persona, a project instruction file, a plan copied into state, or a way to make an agent loop on work it cannot verify. Persistence amplifies ambiguity: a bad goal wastes turns or encourages a false completion claim.
 
 ## Goals vs Kanban: which one do I want?
 
