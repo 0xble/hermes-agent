@@ -273,11 +273,12 @@ def test_trusted_policy_validates_immutable_pull_request_head():
     assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
     assert "path: trusted-policy" in workflow
     assert "path: candidate" in workflow
+    assert "path: canonical-upstream" in workflow
     assert "persist-credentials: false" in workflow
     assert "python3 trusted-policy/scripts/validate_maintenance_manifest.py" in workflow
     assert "trusted-policy/scripts/ci/validate_workflow_policy.py" in workflow
     assert "candidate/scripts/" not in workflow
-    assert "main:refs/remotes/canonical-upstream/main" in workflow
+    assert "HEAD:refs/remotes/canonical-upstream/main" in workflow
 
 
 def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_path):

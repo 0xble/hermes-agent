@@ -163,6 +163,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): reconcile rich paragraph squash baseline (#36)` | Final maintenance-baseline reconciliation for HERMES-095; no shipped behavior. |
 | `fix(ci): synchronize trusted fork policy` | Trusted policy/workflow synchronization and authenticated public-upstream fetch repair; no shipped behavior. |
 | `fix(ci): fetch trusted upstream through checkout` | Replaces the malformed shell-auth fetch with a pinned authenticated checkout and local history transfer; no shipped behavior. |
+| `fix(ci): align trusted upstream fetch regression` | Aligns the immutable-head regression with the pinned checkout and local history-transfer contract; no shipped behavior. |
 | `fix(ci): align browser headed policy fixture` | Administrative synchronization of the exact trusted-workflow fixture with the browser-headed history baseline; no shipped Hermes behavior. |
 | `fix(desktop): keep citation brackets visible` | Historical Desktop experiment that was exactly reverted during the v0.21.0 replay; no active fork behavior remains. |
 | `Revert "fix(desktop): keep citation brackets visible"` | Exact revert of the preceding Desktop experiment; restores upstream behavior and defines no independently retireable patch. |
