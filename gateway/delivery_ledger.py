@@ -164,7 +164,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            obligation_kind TEXT NOT NULL DEFAULT 'legacy',
+            turn_token TEXT
         )"""
     )
     columns = {
@@ -179,6 +181,27 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             # Concurrent first-use connections can both observe the old schema.
             if "duplicate column" not in str(exc).lower():
                 raise
+    if "obligation_kind" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE delivery_obligations ADD COLUMN "
+                "obligation_kind TEXT NOT NULL DEFAULT 'legacy'"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    if "turn_token" not in columns:
+        try:
+            conn.execute("ALTER TABLE delivery_obligations ADD COLUMN turn_token TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+    conn.execute(
+        """UPDATE delivery_obligations SET obligation_kind='control'
+           WHERE obligation_kind='legacy'
+             AND content LIKE '⏳ Gateway %'
+             AND (content LIKE '%restarting%' OR content LIKE '%shutting down%')"""
+    )
 
 
 @contextmanager
@@ -279,6 +302,8 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
     adapter_profile: Optional[str] = None,
+    obligation_kind: str = "agent_final",
+    turn_token: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -289,11 +314,12 @@ def record_obligation(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, adapter_profile,
+                obligation_kind, turn_token)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started, stored_profile),
+             pid, started, stored_profile, obligation_kind, turn_token),
         )
     _prune()
 
@@ -379,13 +405,14 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, adapter_profile
+                      owner_pid, owner_started_at, adapter_profile,
+                      obligation_kind, turn_token
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
-             adapter_profile) in rows:
+             adapter_profile, obligation_kind, turn_token) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -427,6 +454,8 @@ def sweep_recoverable(
                     "needs_marker": state != "pending",
                     "profile": adapter_profile,
                     "attempts": attempts + 1,
+                    "obligation_kind": obligation_kind,
+                    "turn_token": turn_token,
                 })
     return claimed
 
@@ -470,7 +499,8 @@ def sweep_failed_for_runtime(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
-                      owner_started_at, last_error, adapter_profile
+                      owner_started_at, last_error, adapter_profile,
+                      obligation_kind, turn_token
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""",
             (platform,),
@@ -488,6 +518,8 @@ def sweep_failed_for_runtime(
             owner_started_at,
             last_error,
             adapter_profile,
+            obligation_kind,
+            turn_token,
         ) in rows:
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
@@ -533,6 +565,8 @@ def sweep_failed_for_runtime(
                     # Carried so a release can restore the row's own failure
                     # class instead of flattening it to send_path_degraded.
                     "last_error": last_error,
+                    "obligation_kind": obligation_kind,
+                    "turn_token": turn_token,
                 })
     return claimed
 
