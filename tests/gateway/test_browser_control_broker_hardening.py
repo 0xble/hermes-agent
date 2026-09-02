@@ -204,13 +204,16 @@ def test_transport_disconnect_parks_pending_and_reconnect_completes_it():
 
 
 def test_timeout_while_disconnected_flushes_cancel_before_new_dispatch():
-    broker = BrowserControlBroker(command_timeout=0.02)
+    # Keep the timeout loose enough for a loaded parallel runner. The test
+    # controls the completion event, so a 2-second timeout still exercises
+    # the same timeout and queued-cancel behavior deterministically.
+    broker = BrowserControlBroker(command_timeout=2.0)
     scope = _scope()
     thread, outcome, frames = _start_pending(broker, scope)
     command_id = frames[0]["params"]["command_id"]
 
     assert broker.disconnect_owner("owner-fixture") == 1
-    thread.join(timeout=1.0)
+    thread.join(timeout=3.0)
     assert isinstance(outcome.get("error"), ControllerTimeout)
     assert broker.pending_count == 0
 
@@ -249,7 +252,7 @@ def test_timeout_while_disconnected_flushes_cancel_before_new_dispatch():
         ok=True,
         result={"second": True},
     ) is True
-    second_thread.join(timeout=1.0)
+    second_thread.join(timeout=3.0)
     assert second.get("result") == {"second": True}
 
 

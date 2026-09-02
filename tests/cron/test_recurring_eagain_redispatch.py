@@ -80,6 +80,7 @@ class TestEAGAINRecurringRedispatches:
         """
         import cron.scheduler as sched_mod
         state = {"n": 0}
+        real_popen = sched_mod.subprocess.Popen
 
         class _OkProc:
             def __init__(self, argv, **kwargs):
@@ -95,6 +96,11 @@ class TestEAGAINRecurringRedispatches:
                 return 0
 
         def fake_popen(argv, **kwargs):
+            # subprocess is a process-wide module object. Only consume the
+            # one-shot failure for this job's probe instead of whichever
+            # unrelated caller happens to spawn first.
+            if not any(str(arg).endswith("probe.py") for arg in argv):
+                return real_popen(argv, **kwargs)
             state["n"] += 1
             if state["n"] == 1:
                 raise OSError(11, "Resource temporarily unavailable")
