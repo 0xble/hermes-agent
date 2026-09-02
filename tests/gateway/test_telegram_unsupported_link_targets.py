@@ -57,6 +57,20 @@ class TestLegacyMarkdownV2LinkDegrade:
         result = self._adapter().format_message("See [Docs](https://example.com/x).")
         assert "[Docs](https://example.com/x)" in result
 
+    def test_numeric_https_link_keeps_complete_citation_marker_visible(self):
+        result = self._adapter().format_message(
+            "A grounded claim.[3](https://example.com/source)"
+        )
+        assert r"[\[3\]](https://example.com/source)" in result
+
+    def test_numeric_link_inside_multi_backtick_code_stays_literal(self):
+        text = "``x ` y [3](https://example.com/source)``"
+        assert self._adapter().format_message(text) == text
+
+    def test_numeric_link_inside_multiline_code_stays_literal(self):
+        text = "`line one\n[3](https://example.com/source)\nline three`"
+        assert self._adapter().format_message(text) == text
+
     def test_tg_link_stays_clickable(self):
         result = self._adapter().format_message("Open [settings](tg://settings).")
         assert "[settings](tg://settings)" in result
@@ -83,6 +97,12 @@ class TestRichMessageLinkDegrade:
         md = self._payload_markdown("See [Docs](https://example.com/x).")
         assert "[Docs](https://example.com/x)" in md
 
+    def test_numeric_https_link_keeps_complete_citation_marker_visible(self):
+        md = self._payload_markdown(
+            "A grounded claim.[3](https://example.com/source)"
+        )
+        assert r"A grounded claim.[\[3\]](https://example.com/source)" in md
+
 
 class TestDegradeHelper:
     """The shared outbound scrub used by both delivery paths."""
@@ -96,8 +116,24 @@ class TestDegradeHelper:
     def test_inline_code_span_untouched(self):
         assert _degrade_unsupported_markdown_links("see `[a](b)`") == "see `[a](b)`"
 
+    def test_multi_backtick_code_span_untouched(self):
+        text = "``x ` y [3](https://example.com/source)``"
+        assert _degrade_unsupported_markdown_links(text) == text
+
+    def test_multiline_code_span_untouched(self):
+        text = "`line one\n[3](https://example.com/source)\nline three`"
+        assert _degrade_unsupported_markdown_links(text) == text
+
     def test_fenced_code_block_untouched(self):
         text = "intro\n```\n[a](b)\n```\n"
+        assert _degrade_unsupported_markdown_links(text) == text
+
+    def test_tilde_fenced_code_block_untouched(self):
+        text = "intro\n~~~md\n[3](https://example.com)\n~~~\n"
+        assert _degrade_unsupported_markdown_links(text) == text
+
+    def test_indented_code_block_untouched(self):
+        text = "intro\n\n    [3](https://example.com)\n"
         assert _degrade_unsupported_markdown_links(text) == text
 
     def test_table_block_untouched(self):

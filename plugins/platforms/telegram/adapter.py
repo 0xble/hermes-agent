@@ -664,10 +664,17 @@ _MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)')
 _SUPPORTED_LINK_TARGET_RE = re.compile(r'(?i)^(?:https?://|tg://)\S+$')
 
 # Regions where link syntax is literal content rather than a link to degrade:
-# inline code spans, plus the fenced-code / pipe-table regions already matched
-# by _RICH_PROTECTED_REGION_RE.
+# inline code spans, every rich structural region, and indented code blocks.
+# The paragraph-protection expression includes both backtick and tilde fences,
+# tables, display math, and details blocks.
+_INLINE_CODE_SPAN_RE = re.compile(
+    r'(?P<inline_code_ticks>`+)(?!`)[\s\S]+?(?P=inline_code_ticks)(?!`)'
+)
 _LINK_SCRUB_PROTECT_RE = re.compile(
-    r'`[^`\n]+`|' + _RICH_PROTECTED_REGION_RE.pattern,
+    _INLINE_CODE_SPAN_RE.pattern
+    + r'|'
+    + _RICH_PARAGRAPH_PROTECTED_REGION_RE.pattern
+    + r'|(?:^(?: {4}|\t)[^\n]*(?:\n(?: {4}|\t)[^\n]*)*)',
     re.MULTILINE,
 )
 
@@ -690,7 +697,16 @@ def _degrade_unsupported_markdown_links(text: str) -> str:
         return text
 
     def _degrade(m):
-        return m.group(0) if _tg_link_target_supported(m.group(2)) else m.group(1)
+        display, target = m.group(1), m.group(2)
+        if not _tg_link_target_supported(target):
+            return display
+        # Markdown consumes the authored brackets in ``[3](url)`` and would
+        # otherwise show only a bare linked ``3``. Numeric link labels are
+        # citation markers, so keep the complete ``[3]`` marker visible and
+        # clickable in Telegram's rich Markdown parser.
+        if re.fullmatch(r'\d+', display):
+            return f'[\\[{display}\\]]({target})'
+        return m.group(0)
 
     out: list[str] = []
     pos = 0
@@ -9984,10 +10000,9 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
-        # 2) Protect inline code (`...`)
+        # 2) Protect inline code (`...` or matching multi-backtick spans)
         #    Escape \ inside inline code per MarkdownV2 spec.
-        text = re.sub(
-            r'(`[^`]+`)',
+        text = _INLINE_CODE_SPAN_RE.sub(
             lambda m: _ph(m.group(0).replace('\\', '\\\\')),
             text,
         )
@@ -9998,9 +10013,15 @@ class TelegramAdapter(BasePlatformAdapter):
         #    @session: references) degrade to the escaped display text so the
         #    raw bracket syntax is never exposed (#97497).
         def _convert_link(m):
-            display = _escape_mdv2(m.group(1))
+            authored_display = m.group(1)
+            display = _escape_mdv2(authored_display)
             if not _tg_link_target_supported(m.group(2)):
                 return _ph(display)
+            # Telegram renders the Markdown link label, not its source
+            # delimiters. Preserve both brackets as part of a numeric citation
+            # label instead of exposing a bare linked number.
+            if re.fullmatch(r'\d+', authored_display):
+                display = f'\\[{display}\\]'
             url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
