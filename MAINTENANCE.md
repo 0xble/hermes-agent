@@ -119,6 +119,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing (#32)`; `fix(telegram): preserve rich structural blocks (#34)` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages while preserving structural block contents byte for byte. |
 | HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
 | HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
+| HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
 
 ## Fork-only administrative subject exemptions
 
@@ -195,6 +196,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-098 — Keep Telegram citation brackets visible
+
+- **Independent hypothesis (2026-09-01):** The stored assistant response correctly contained ordinary numeric Markdown links such as `[3](url)`, but Markdown treats the source brackets as link delimiters and renders only the label `3`. Telegram's legacy MarkdownV2 formatter and Bot API rich-message payload both forwarded that numeric label unchanged, producing the bare blue numbers visible in the reported reply. A global model-output guard would mutate valid portable Markdown and couple every surface to Telegram presentation rules; the correction belongs in both outbound Telegram rendering paths.
+- **Summary:** At the Telegram presentation boundary, recognize an already-linked all-numeric label and escape an inner pair of brackets so Telegram renders the complete clickable marker `[3]`. Preserve ordinary authored links, unsupported-target degradation, code and table protection, URLs, persisted assistant text, and all non-Telegram surfaces.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_unsupported_link_targets.py`; this record.
+- **Upstream tracking:** Open issue #87729 and open PR #87732 establish the same complete-visible-marker requirement for standalone numeric references resolved through a Sources block. Their implementation does not cover the already-linked `[3](url)` shape reproduced here across both Telegram delivery paths.
+- **Upstream PR:** No upstream change was found that guards already-linked numeric citation labels in both legacy MarkdownV2 and Bot API rich-message output as of 2026-09-01.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_unsupported_link_targets.py tests/gateway/test_telegram_format.py tests/gateway/test_telegram_rich_newlines.py -q`; the two focused cases fail before the patch with `[3](url)` and pass with `[\\[3\\]](url)` in both outbound payloads, while ordinary links and unsupported targets retain their existing behavior.
+- **Expected published commit identity:** Stable subject `fix(telegram): keep citation brackets visible`; source, regressions, and this record ship together.
+- **Rollback:** Revert only `fix(telegram): keep citation brackets visible`, restoring bare numeric labels in both Telegram Markdown renderers, then remove the HERMES-098 index row and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after a released upstream version preserves the complete bracketed marker for already-linked numeric citations in both Telegram delivery paths and passes equivalent URL, ordinary-link, unsupported-target, code, and table regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-095 — Render Telegram Rich Message paragraph spacing
 
