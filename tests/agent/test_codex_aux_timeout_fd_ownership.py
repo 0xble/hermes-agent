@@ -22,17 +22,21 @@ import pytest
 from agent.auxiliary_client import _CodexCompletionsAdapter
 
 
-def _adapter_with_recording_client(stream):
+def _adapter_with_recording_client(
+    stream, shutdown_seen: threading.Event | None = None
+):
     """Build an adapter whose client records (action, thread) events.
 
     The nested ``_client._transport._pool._connections`` shape is what
     ``force_close_tcp_sockets`` traverses.
     """
     events = []
+    shutdown_event = shutdown_seen if shutdown_seen is not None else threading.Event()
 
     class _Sock:
         def shutdown(self, how):
             events.append(("shutdown", threading.get_ident()))
+            shutdown_event.set()
 
         def close(self):
             events.append(("sock.close", threading.get_ident()))
@@ -62,7 +66,7 @@ def _adapter_with_recording_client(stream):
         def close(self):
             events.append(("client.close", threading.get_ident()))
 
-    return _CodexCompletionsAdapter(_LeafClient(), "gpt-5.5"), events
+    return _CodexCompletionsAdapter(_LeafClient(), "gpt-5.5"), events, shutdown_event
 
 
 class TestCodexAuxiliaryTimeoutFdOwnership:
@@ -71,13 +75,19 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
         shutdown(); the real close() must land on the owning thread in the
         adapter's ``finally``."""
 
-        def _stalled():
-            deadline = time.monotonic() + 30.0
-            while time.monotonic() < deadline:
-                time.sleep(0.02)
-                yield SimpleNamespace(type="response.in_progress")
+        shutdown_seen = threading.Event()
 
-        adapter, events = _adapter_with_recording_client(_stalled())
+        def _stalled():
+            # Emit one keepalive so the watchdog is armed, then block the owner
+            # until the Timer has taken the shutdown path. The owner therefore
+            # cannot win the deadline race even on a loaded runner.
+            yield SimpleNamespace(type="response.in_progress")
+            assert shutdown_seen.wait(timeout=5.0)
+            yield SimpleNamespace(type="response.in_progress")
+
+        adapter, events, shutdown_seen = _adapter_with_recording_client(
+            _stalled(), shutdown_seen=shutdown_seen
+        )
         owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):
@@ -97,8 +107,7 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
                 timeout=300,
             )
 
-        # Give the daemon Timer thread a beat to finish its callback.
-        time.sleep(0.2)
+        assert shutdown_seen.wait(timeout=2.0), events
         actions = [a for a, _ in events]
         # Stranger thread (Timer) only shut the sockets down.
         shutdown_tids = {tid for a, tid in events if a == "shutdown"}
@@ -122,7 +131,7 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
             time.sleep(1.0)  # past the patched window; owner detects on next event
             yield SimpleNamespace(type="response.in_progress")
 
-        adapter, events = _adapter_with_recording_client(_one_keepalive_then_block())
+        adapter, events, _shutdown_seen = _adapter_with_recording_client(_one_keepalive_then_block())
         owner_tid = threading.get_ident()
 
         def _consume(stream, *, model, on_event):
