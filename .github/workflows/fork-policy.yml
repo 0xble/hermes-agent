@@ -36,15 +36,18 @@ jobs:
           persist-credentials: false
           # Candidate contents are inspected as data by trusted default-branch code.
           allow-unsafe-pr-checkout: true
+      - name: Checkout canonical upstream history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: canonical-upstream
+          fetch-depth: 0
+          persist-credentials: false
       - name: Fetch canonical upstream history into candidate checkout
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: >-
-          git -C candidate
-          -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' \"$GITHUB_TOKEN\" | base64 -w0)"
-          fetch --no-tags --filter=blob:none
-          https://github.com/NousResearch/hermes-agent.git
-          refs/heads/main:refs/remotes/canonical-upstream/main
+          git -C candidate fetch --no-tags ../canonical-upstream
+          HEAD:refs/remotes/canonical-upstream/main
       - name: Validate maintained patch history with trusted code
         run: >-
           python3 trusted-policy/scripts/validate_maintenance_manifest.py
