@@ -913,7 +913,9 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
+  // mutexPath is expandRemotePath() output. Assign it raw so $HOME expands;
+  // shq() here would pass the quote characters as part of the filename.
+  return `mutex_path=${mutexPath}; python3 -c ${shq(script)} "$mutex_path" ${shq(command)}`
 }
 
 /**

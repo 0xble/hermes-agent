@@ -120,6 +120,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
 | HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
+| HERMES-099 | Active | `fix(desktop): preserve expanded remote update mutex paths` | Keep the Desktop SSH lifecycle mutex inside the selected remote Hermes home instead of creating a quote-bearing relative path. |
 
 ## Fork-only administrative subject exemptions
 
@@ -193,6 +194,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-099 — Preserve expanded remote update mutex paths
+
+- **Independent hypothesis (2026-09-02):** `buildSpawnCommand()` passed `expandRemotePath()` output through `shq()` a second time before handing it to the Python mutex helper. The inner quote characters therefore became part of a relative filename. The Desktop test suite reproduced this by leaving `apps/desktop/'/var/.../.hermes-update-in-progress.mutex'` in the checkout while the intended temporary Hermes home had no mutex file.
+- **Summary:** Assign the already-safe expanded path as shell syntax, then pass the expanded variable as the Python helper's quoted argument. The advisory lock, close-on-exec behavior, detached backend contract, and update marker remain unchanged.
+- **Surfaces:** `apps/desktop/electron/remote-lifecycle.ts`; `apps/desktop/electron/remote-lifecycle.test.ts`; this record.
+- **Upstream tracking:** Frozen upstream cutoff `57d305d57f04ffb58fb8adef3657b166fa6e34a6` still double-quotes the expanded path and its test leaves the malformed mutex artifact on macOS. No released equivalent was identified.
+- **Upstream PR:** None identified at the frozen cutoff.
+- **Regression:** `cd apps/desktop && npm exec -- vitest run electron/remote-lifecycle.test.ts`; the real POSIX spawn-command test must read an empty mutex file from the selected temporary Hermes home and leave no quote-bearing path in the checkout.
+- **Expected published commit identity:** Stable subject `fix(desktop): preserve expanded remote update mutex paths`; source, regression, and this record ship together.
+- **Rollback:** Revert only the stable subject, remove HERMES-099's index row and record, and accept that Desktop SSH spawn serialization may lock an unintended relative path. No schema or persistent-data rollback is required.
+- **Retirement:** Retire after released upstream passes the expanded-home regression and no longer creates quote-bearing mutex paths. Remove the fork implementation and duplicate test rather than retaining parallel path handling.
 
 ### HERMES-098 — Keep Telegram citation brackets visible
 

@@ -854,6 +854,11 @@ done
     })
 
     await exec(command, { shell: '/bin/bash' })
+    assert.equal(
+      (await readFile(path.join(directory, 'home', '.hermes-update-in-progress.mutex'))).length,
+      0,
+      'the update mutex must use the expanded Hermes home rather than a quote-bearing relative path'
+    )
 
     for (let attempt = 0; attempt < 40; attempt += 1) {
       try {
