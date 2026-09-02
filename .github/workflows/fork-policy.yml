@@ -54,7 +54,7 @@ jobs:
           candidate/MAINTENANCE.md
           --upstream-ref canonical-upstream/main
           --history-baseline-subject
-          'fix(ci): align trusted upstream fetch regression'
+          'fix(ci): advance goal guidance maintenance baseline'
       - name: Install pinned uv for trusted workflow policy
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:

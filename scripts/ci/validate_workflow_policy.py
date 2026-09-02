@@ -222,7 +222,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
                         "--history-baseline-subject "
-                        "'fix(ci): align trusted upstream fetch regression'"
+                        "'fix(ci): advance goal guidance maintenance baseline'"
                     ),
                 },
                 {
