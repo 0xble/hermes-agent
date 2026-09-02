@@ -7197,6 +7197,10 @@ class BasePlatformAdapter(ABC):
                                     adapter_profile=getattr(
                                         delivery_adapter, "_owner_profile", None
                                     ),
+                                    obligation_kind="agent_final",
+                                    turn_token=getattr(
+                                        event, "_gateway_active_turn_token", None
+                                    ),
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
@@ -7472,6 +7476,29 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            _restart_queue_id = getattr(event, "_restart_inbox_queue_id", None)
+            if processing_ok and _restart_queue_id:
+                try:
+                    from gateway.restart_inbox import mark_delivered
+
+                    await asyncio.to_thread(mark_delivered, _restart_queue_id)
+                except Exception:
+                    logger.exception(
+                        "[%s] Could not finalize restart inbox row %s",
+                        self.name,
+                        _restart_queue_id,
+                    )
+            elif _restart_queue_id:
+                try:
+                    from gateway.restart_inbox import release_claim
+
+                    await asyncio.to_thread(release_claim, _restart_queue_id)
+                except Exception:
+                    logger.exception(
+                        "[%s] Could not release failed restart inbox row %s",
+                        self.name,
+                        _restart_queue_id,
+                    )
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let

@@ -10032,6 +10032,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
+    def _build_drain_busy_reply(self, *, queued: bool) -> EphemeralReply:
+        """Return a control-plane drain notice, never an agent final response."""
+        if queued:
+            return EphemeralReply(
+                f"⏳ Gateway {self._status_action_gerund()} — queued for the next "
+                "turn after it comes back."
+            )
+        return EphemeralReply(
+            f"⏳ Gateway is {self._status_action_gerund()} and is not accepting "
+            "another turn right now."
+        )
+
+    async def _persist_restart_inbox_event(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
+        """Durably accept drain-time inbound before promising it is queued."""
+        try:
+            from gateway.restart_inbox import record_event
+
+            adapter = self._adapter_for_source(event.source)
+            await asyncio.to_thread(
+                record_event,
+                session_key,
+                event,
+                getattr(adapter, "_owner_profile", None),
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Could not persist restart-drain inbound for %s; rejecting instead",
+                session_key,
+            )
+            return False
+
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
     ) -> bool:
@@ -11325,10 +11359,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                queued = await self._persist_restart_inbox_event(session_key, event)
+                message = self._build_drain_busy_reply(queued=queued)
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = self._build_drain_busy_reply(queued=False)
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -12996,6 +13030,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _drain_restart_inbox(self) -> int:
+        """Replay messages durably accepted by the previous draining process."""
+        try:
+            from gateway.restart_inbox import claim_recoverable
+
+            targets = {
+                (getattr(platform, "value", str(platform)), "default")
+                for platform in self.adapters
+            }
+            for profile, adapters in (getattr(self, "_profile_adapters", None) or {}).items():
+                targets.update(
+                    (getattr(platform, "value", str(platform)), str(profile))
+                    for platform in adapters
+                )
+            claimed = await asyncio.to_thread(
+                claim_recoverable, deliverable_targets=targets
+            )
+        except Exception:
+            logger.exception("Could not claim restart-drain inbox")
+            return 0
+
+        dispatched = 0
+        for row in claimed:
+            event = row["event"]
+            adapter: Any = self._adapter_for_source(event.source)
+            if adapter is None:
+                logger.warning(
+                    "Restart inbox claim %s has no live adapter; leaving for retry",
+                    row["queue_id"],
+                )
+                try:
+                    from gateway.restart_inbox import release_claim
+
+                    await asyncio.to_thread(release_claim, row["queue_id"])
+                except Exception:
+                    logger.exception(
+                        "Could not release restart inbox claim %s",
+                        row["queue_id"],
+                    )
+                continue
+            setattr(event, "_hermes_startup_restore_replay", True)
+            await adapter.handle_message(event)
+            dispatched += 1
+        return dispatched
+
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
         drained = 0
@@ -13150,8 +13229,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Warm the turn machinery BEFORE the queue drains: replayed (and
         # fresh) inbound turns must not build skeleton prompts (#99373).
         await self._await_startup_warmup()
+        durable_drained = await self._drain_restart_inbox()
         drained = await self._drain_startup_restore_queue()
         self._startup_restore_in_progress = False
+        if durable_drained:
+            logger.info(
+                "Dispatched %d durable restart-drain inbound message(s)",
+                durable_drained,
+            )
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -13269,8 +13354,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not session_key:
                 sendable.append(row)
                 continue
+            kind = row.get("obligation_kind") or "legacy"
+            if kind == "control":
+                # Busy/restart notices are owed messages, not proof that the
+                # interrupted agent turn completed. Redeliver without touching
+                # its recovery marker.
+                sendable.append(row)
+                continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                await self.async_session_store.clear_resume_pending_for_obligation(
+                    session_key,
+                    row.get("turn_token"),
+                    allow_legacy=kind == "legacy",
+                )
             except Exception:
                 logger.debug(
                     "clear_resume_pending failed for %s", session_key,
@@ -19636,12 +19732,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
+                    queue_during_drain = await self._persist_restart_inbox_event(
+                        _quick_key, event
+                    )
+                return self._build_drain_busy_reply(queued=queue_during_drain)
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -21085,6 +21179,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # token out of public metadata, transcripts, and platform payloads.
         setattr(event, "_gateway_active_turn_session_key", session_key)
         setattr(event, "_gateway_active_turn_token", token)
+        queue_id = getattr(event, "_restart_inbox_queue_id", None)
+        if queue_id:
+            try:
+                from gateway.restart_inbox import mark_handed_off
+
+                await asyncio.to_thread(mark_handed_off, queue_id)
+            except Exception:
+                logger.exception(
+                    "Could not hand restart inbox row %s to active-turn recovery",
+                    queue_id,
+                )
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:

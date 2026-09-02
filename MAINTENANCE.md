@@ -118,6 +118,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-094 | Active | `feat(gateway): apply inference controls mid-turn` | Let `/fast` and `/reasoning` update the live gateway agent so the next model request, including a later request in the same tool loop, uses the new session setting without interrupting the in-flight request. |
 | HERMES-095 | Active | `fix(telegram): render rich prose paragraph spacing (#32)`; `fix(telegram): preserve rich structural blocks (#34)` | Materialize one visible spacer row for prose paragraph boundaries only in Telegram Rich Messages while preserving structural block contents byte for byte. |
 | HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
+| HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
 
 ## Fork-only administrative subject exemptions
 
@@ -206,6 +207,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subject `fix(telegram): render rich prose paragraph spacing`; source, focused regressions, and this record ship together.
 - **Rollback:** Revert only `fix(telegram): render rich prose paragraph spacing`, remove HERMES-095's index row and record, and restore HERMES-035's transport-wide wording. As an immediate runtime mitigation, set `gateway.platforms.telegram.extra.rich_messages: auto` or `never`, then promote and restart through the normal release path.
 - **Retirement:** Retire after PR #100686, or an equivalent implementation, is merged and released upstream, preserves one visible prose spacer without structural-block regressions, passes equivalent regressions, and succeeds in live Telegram iOS QA. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
+
+### HERMES-097 — Make restart recovery run-correlated and durable
+
+- **Independent hypothesis (2026-09-01):** Delivery-ledger startup recovery cleared `resume_pending` for every claimed row, including restart/busy control notices. Seven of seven redelivered restart-control obligations in the live state database correlated with a missing five-minute auto-resume, while eleven of eleven equivalent notices that were not redelivered correlated with a successful resume. Separately, drain-time “queued” inbound lived only in adapter/runner memory and was discarded by process replacement.
+- **Summary:** Type delivery obligations, correlate final answers with the durable interrupted-turn token, classify historical restart notices as control rows, and clear recovery only for the matching final answer. Persist normalized drain-time inbound in a SQLite restart inbox before acknowledging it, replay it after startup resume ordering, and record its handoff only after active-turn recovery durably owns continuation. Drain status replies are ephemeral and never recorded as final answers.
+- **Surfaces:** `gateway/delivery_ledger.py`; `gateway/restart_inbox.py`; `gateway/session.py`; `gateway/run.py`; `gateway/platforms/base.py`; focused gateway tests; this record.
+- **Upstream tracking:** Open upstream PR #67078 proposes run-correlated crash-safe recovery but does not provide this fork's complete typed-control-obligation and durable drain-inbox contract.
+- **Upstream PR:** Open PR #67078 covers the run-token delivery subset. No upstream PR covers the complete HERMES-097 contract before publication.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_delivery_ledger.py tests/gateway/test_delivery_ledger_producer.py tests/gateway/test_restart_inbox.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_clean_shutdown_marker.py tests/gateway/test_active_turn_recovery.py -q`; live QA must prove a control obligation does not clear an interrupted turn, a queued drain message survives process replacement, and each path is dispatched once.
+- **Expected published commit identity:** Stable subject `fix(gateway): make restart recovery run-correlated and durable`; schema migration, source, regressions, and this record ship together.
+- **Rollback:** Revert the stable subject. The additive `delivery_obligations` columns and `restart_inbox` table may remain inert; do not drop them while an older gateway could still be reading `state.db`. Queued rows not yet handed off must be reconciled before rollback.
+- **Retirement:** Retire after released upstream ships run-token-correlated delivery recovery, typed control obligations, durable drain-time inbound replay, equivalent migration behavior, and end-to-end restart regressions. Remove the fork implementation and duplicate tests rather than retaining parallel state machines.
 
 ### HERMES-093 — Keep restart notices scoped and accurate
 

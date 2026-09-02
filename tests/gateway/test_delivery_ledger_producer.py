@@ -62,7 +62,8 @@ def _event(text="hello agent"):
 def _rows():
     with dl._connect() as conn:
         return conn.execute(
-            """SELECT obligation_id, state, content, adapter_profile
+            """SELECT obligation_id, state, content, adapter_profile,
+                      obligation_kind, turn_token
                FROM delivery_obligations"""
         ).fetchall()
 
@@ -103,13 +104,16 @@ class TestProducerHook:
     @pytest.mark.asyncio
     async def test_normal_turn_records_and_delivers(self):
         adapter = _Adapter()
-        await _run(adapter, _event())
+        event = _event()
+        setattr(event, "_gateway_active_turn_token", "turn-123")
+        await _run(adapter, event)
 
         assert adapter.sent == ["final answer"]
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        assert rows[0][4:] == ("agent_final", "turn-123")
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):

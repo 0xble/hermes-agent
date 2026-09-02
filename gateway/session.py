@@ -890,6 +890,7 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+    resume_turn_token: Optional[str] = None
 
     # Durable ownership marker for the agent turn currently executing on this
     # routing entry.  A normal unwind clears it with compare-and-swap semantics;
@@ -929,6 +930,7 @@ class SessionEntry:
             "suspended": self.suspended,
             "resume_pending": self.resume_pending,
             "resume_reason": self.resume_reason,
+            "resume_turn_token": self.resume_turn_token,
             "last_resume_marked_at": (
                 self.last_resume_marked_at.isoformat()
                 if self.last_resume_marked_at
@@ -1030,6 +1032,7 @@ class SessionEntry:
             suspended=data.get("suspended", False),
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
+            resume_turn_token=data.get("resume_turn_token"),
             last_resume_marked_at=last_resume_marked_at,
             active_turn_token=active_turn_token,
             active_turn_started_at=active_turn_started_at,
@@ -3499,13 +3502,18 @@ class SessionStore:
 
                 if not marker_is_stale and not entry.suspended:
                     if entry.resume_pending:
-                        # A drain-timeout marker is more specific than the
-                        # generic crash reason; preserve it and its freshness.
+                        # Preserve the stronger drain-timeout reason/freshness,
+                        # but advance ownership to the newly interrupted run.
+                        # Otherwise a stale final obligation from the first run
+                        # can clear recovery after a resumed run is interrupted.
+                        if entry.active_turn_token:
+                            entry.resume_turn_token = entry.active_turn_token
                         if entry.last_resume_marked_at is None:
                             entry.last_resume_marked_at = now
                     else:
                         entry.resume_pending = True
                         entry.resume_reason = "restart_interrupted"
+                        entry.resume_turn_token = entry.active_turn_token
                         # Freshness starts when recovery is discovered, not
                         # when a potentially hours-long turn began.
                         entry.last_resume_marked_at = now
@@ -3562,6 +3570,7 @@ class SessionStore:
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
+                entry.resume_turn_token = entry.active_turn_token
                 self._save()
                 return True
         return False
@@ -3583,6 +3592,32 @@ class SessionStore:
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
+            entry.resume_turn_token = None
+            self._save()
+            return True
+
+    def clear_resume_pending_for_obligation(
+        self,
+        session_key: str,
+        turn_token: Optional[str],
+        *,
+        allow_legacy: bool = False,
+    ) -> bool:
+        """Clear recovery only for the final response of the interrupted turn."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.resume_pending:
+                return True
+            expected = entry.resume_turn_token
+            matches = bool(expected and turn_token and expected == turn_token)
+            legacy_matches = bool(allow_legacy and not expected and not turn_token)
+            if not matches and not legacy_matches:
+                return True
+            entry.resume_pending = False
+            entry.resume_reason = None
+            entry.last_resume_marked_at = None
+            entry.resume_turn_token = None
             self._save()
             return True
 

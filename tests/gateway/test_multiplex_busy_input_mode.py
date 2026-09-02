@@ -240,10 +240,13 @@ async def test_busy_change_updates_only_routed_profile(tmp_path, monkeypatch):
 )
 async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     tmp_path,
+    monkeypatch,
     default_mode,
     secondary_mode,
     queued,
 ):
+    durable_record = MagicMock(return_value="queue-id")
+    monkeypatch.setattr("gateway.restart_inbox.record_event", durable_record)
     runner = _runner(default_mode=default_mode)
     adapter = await _load_profile_snapshot(
         runner,
@@ -256,7 +259,10 @@ async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     session_key = runner._session_key_for_source(event.source)
 
     assert await runner._handle_active_session_busy_message(event, session_key) is True
-    assert (session_key in adapter._pending_messages) is queued
+    assert session_key not in adapter._pending_messages
+    assert durable_record.called is queued
+    if queued:
+        assert durable_record.call_args.args[2] == "research"
 
 
 @pytest.mark.asyncio
@@ -265,6 +271,8 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
     monkeypatch,
 ):
     monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+    durable_record = MagicMock(return_value="queue-id")
+    monkeypatch.setattr("gateway.restart_inbox.record_event", durable_record)
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
         runner,
@@ -283,7 +291,9 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
 
     assert isinstance(response, str)
     assert "queued" in response
-    assert adapter._pending_messages[session_key] is event
+    assert session_key not in adapter._pending_messages
+    durable_record.assert_called_once()
+    assert durable_record.call_args.args[2] == "research"
     agent.interrupt.assert_not_called()
 
 
