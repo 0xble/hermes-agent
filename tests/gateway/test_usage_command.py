@@ -242,10 +242,13 @@ class TestUsageContextBreakdown:
         session_entry = MagicMock()
         session_entry.session_id = "sess-bd"
         runner.session_store.get_or_create_session.return_value = session_entry
-        runner.session_store.load_transcript.return_value = [
+        load_transcript = MagicMock(return_value=[
             {"role": "user", "content": "hi"},
-        ]
+        ])
+        runner.session_store.load_transcript = load_transcript
         event = MagicMock()
+        event.source = "telegram:12345"
+        runner._session_entry_for_event_sync = MagicMock(return_value=session_entry)
 
         fake_payload = {
             "categories": [
@@ -263,6 +266,12 @@ class TestUsageContextBreakdown:
         with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
              patch("agent.context_breakdown.compute_session_context_breakdown", return_value=fake_payload):
             result = await runner._handle_usage_command(event)
+
+        runner._session_entry_for_event_sync.assert_called_once_with(
+            event,
+            source=event.source,
+        )
+        load_transcript.assert_called_once_with("sess-bd")
 
         # Localized header + at least the two non-zero category labels appear,
         # each labelled as a percentage of the estimated total.

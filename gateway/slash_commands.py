@@ -1030,7 +1030,7 @@ class GatewaySlashCommandsMixin:
             # platforms). Fail-open: rendering errors never break /context.
             if has_agent:
                 breakdown = await asyncio.to_thread(
-                    self._context_breakdown_block, agent, source, expanded
+                    self._context_breakdown_block, agent, event, source, expanded
                 )
                 if breakdown:
                     lines.append("")
@@ -6664,7 +6664,13 @@ class GatewaySlashCommandsMixin:
             lines.append("Top up and manage billing in the browser — your balance updates here after.")
         return "\n".join(lines)
 
-    def _context_breakdown_block(self, agent, source, expanded: bool) -> list[str]:
+    def _context_breakdown_block(
+        self,
+        agent,
+        event: MessageEvent,
+        source: SessionSource,
+        expanded: bool,
+    ) -> list[str]:
         """Render the /context per-category block (plain text, no grid).
 
         Estimated (chars/4) — same engine as the desktop popover and /usage.
@@ -6705,7 +6711,12 @@ class GatewaySlashCommandsMixin:
         except Exception:
             return []
 
-    def _context_breakdown_lines(self, agent, source) -> list[str]:
+    def _context_breakdown_lines(
+        self,
+        agent,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> list[str]:
         """Render the per-category context breakdown for /usage.
 
         Estimated (chars/4) — same engine the desktop popover uses. Returns an
@@ -6888,7 +6899,7 @@ class GatewaySlashCommandsMixin:
             # prompt / tools / skills / memory slices read off the live agent;
             # the conversation slice is estimated from the session transcript.
             breakdown_lines = await asyncio.to_thread(
-                self._context_breakdown_lines, agent, source
+                self._context_breakdown_lines, agent, event, source
             )
             if breakdown_lines:
                 lines.append("")
