@@ -231,9 +231,43 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
 
 @pytest.mark.asyncio
 async def test_handler_preserves_inner_goal_marker_for_outer_hook(monkeypatch, tmp_path):
+    """One logical response must invoke goal continuation exactly once end to end."""
     runner = _setup_handler_runner(monkeypatch, tmp_path)
     source = _source()
     event = MessageEvent(text="Continue the goal.", source=source, message_id="m1")
+    runner._post_turn_goal_continuation = AsyncMock()
+    runner._post_turn_loop_completion = AsyncMock()
+    goal_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="goal-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+
+    async def _run_agent_after_inner_goal_hook(**kwargs):
+        # Model the inner hook that already judged this response.  The optional
+        # state holder is the fixed bridge; its absence exercises the old
+        # raw-result/finalized-result boundary without requiring the new API.
+        await runner._post_turn_goal_continuation(
+            session_entry=goal_entry,
+            source=source,
+            final_response="Partial progress.",
+        )
+        goal_state = kwargs.get("goal_post_turn_state")
+        if goal_state is not None:
+            goal_state["handled"] = True
+        return {
+            "final_response": "Partial progress.",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "_goal_post_turn_complete": True,
+        }
+
+    runner._run_agent = AsyncMock(side_effect=_run_agent_after_inner_goal_hook)
 
     response = await runner._handle_message_with_agent(
         event,
@@ -241,12 +275,8 @@ async def test_handler_preserves_inner_goal_marker_for_outer_hook(monkeypatch, t
         "agent:main:telegram:dm:12345",
         1,
     )
-
     assert response == "Partial progress."
-    assert event._goal_post_turn_complete is True
 
-    runner._post_turn_goal_continuation = AsyncMock()
-    runner._post_turn_loop_completion = AsyncMock()
     await runner._run_post_turn_hooks(
         agent_result=response,
         source=source,
@@ -254,5 +284,5 @@ async def test_handler_preserves_inner_goal_marker_for_outer_hook(monkeypatch, t
         event=event,
     )
 
-    runner._post_turn_goal_continuation.assert_not_awaited()
+    assert runner._post_turn_goal_continuation.await_count == 1
     assert not hasattr(event, "_goal_post_turn_complete")
