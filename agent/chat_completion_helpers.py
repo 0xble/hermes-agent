@@ -1970,13 +1970,18 @@ def _consume_ephemeral_reasoning_off(agent) -> bool:
 
 def _reasoning_config_for_wire(agent):
     """Effective per-turn reasoning config with one-shot and route constraints."""
-    cfg = agent._current_reasoning_config()
+    resolver = getattr(agent, "_current_reasoning_config", None)
+    cfg = (
+        resolver() if callable(resolver) else getattr(agent, "reasoning_config", None)
+    )
+    if not isinstance(cfg, dict):
+        cfg = None
     ephemeral_off = _consume_ephemeral_reasoning_off(agent)
     if getattr(agent, "_reasoning_disable_rejected", False):
         # The route rejects disables. Resend the effective non-disable config
         # so hooks still control this turn without retrying an unsupported
         # reasoning-off request.
-        if isinstance(cfg, dict) and (
+        if cfg is not None and (
             cfg.get("enabled") is False or cfg.get("effort") == "none"
         ):
             return None

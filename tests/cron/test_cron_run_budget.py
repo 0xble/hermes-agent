@@ -110,7 +110,7 @@ def test_model_tool_schema_exposes_total_run_budget():
 def test_model_tool_create_update_and_clear_run_budget(cron_store):
     import tools.cronjob_tools as cronjob_tools
 
-    handler = cronjob_tools.registry._tools["cronjob"].handler
+    handler = cronjob_tools.registry._tools["cronjob_manage"].handler
     created = json.loads(
         handler(
             {
