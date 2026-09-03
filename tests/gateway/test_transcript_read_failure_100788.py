@@ -22,6 +22,8 @@ Offline: SQLite on tmp_path only, no network.
 """
 
 import sqlite3
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -88,16 +90,36 @@ class TestSlashCommandsOnUnreadableTranscript:
         assert "unreadable" in HISTORY_UNREADABLE
         assert "not a new conversation" in HISTORY_UNREADABLE
 
-    def test_every_transcript_reading_handler_catches_the_error(self):
-        """No `await ...load_transcript(` in the mixin may be left uncaught."""
-        import inspect
-        import re
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler_name",
+        [
+            "_handle_retry_command",
+            "_handle_btw_command",
+            "_handle_compress_command_inner",
+            "_handle_branch_command",
+        ],
+    )
+    async def test_transcript_reading_handlers_surface_the_error(self, handler_name):
+        from gateway.slash_commands import HISTORY_UNREADABLE, GatewaySlashCommandsMixin
 
-        from gateway import slash_commands as sc
+        harness = SimpleNamespace(
+            _session_db=object(),
+            _session_entry_for_event=AsyncMock(
+                return_value=SimpleNamespace(session_id="broken-session")
+            ),
+            _session_key_for_event=lambda _event: "telegram:1",
+            async_session_store=SimpleNamespace(
+                load_transcript=AsyncMock(
+                    side_effect=TranscriptReadError("broken-session")
+                )
+            ),
+        )
+        event = SimpleNamespace(
+            source="telegram:1",
+            get_command_args=lambda: "question",
+        )
 
-        src = inspect.getsource(sc)
-        # Each awaited load_transcript must sit inside a try: whose handlers
-        # include TranscriptReadError within the following ~6 lines.
-        for m in re.finditer(r"await self\.async_session_store\.load_transcript\(", src):
-            window = src[m.end() : m.end() + 400]
-            assert "except TranscriptReadError" in window, src[m.start() - 200 : m.end() + 100]
+        result = await getattr(GatewaySlashCommandsMixin, handler_name)(harness, event)
+
+        assert result == HISTORY_UNREADABLE
