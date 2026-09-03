@@ -123,6 +123,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 | HERMES-100 | Active | `fix(agent): rotate credentials across transient retries` | Try one previously untried eligible logical account on each transient same-provider retry before crossing to the configured fallback. |
 | HERMES-101 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
+| HERMES-103 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Prevent singleton Codex auth recovery from overwriting independently added pooled accounts. |
 
 ## Fork-only administrative subject exemptions
 
@@ -200,10 +201,23 @@ These exact subjects are fork-only history but do not define independently retir
 | `Merge pull request #18 from 0xble/fix/duplicate-topic-titles-100002` | GitHub-authored merge wrapper around the indexed Telegram topic-label patch; no additional behavior. |
 | `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
 | `Merge remote-tracking branch 'origin/main' into fix/worktree-path-warning` | Task-owned integration of the current reviewed fork base into PR #25; no additional behavior beyond the indexed worktree advisory. |
+| `fix(ci): advance maintenance baseline after auth patch` | Repairs the history gate after PR #46 was merged without its patch record; the commit adds HERMES-103 and makes no shipped Hermes behavior change. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+### HERMES-103 — Isolate manually added Codex accounts
+
+- **Independent hypothesis (2026-09-03):** A rejected singleton Codex refresh recovered from the active CLI account and then replaced independently added `manual:device_code` pool entries under their old labels because the pool synchronized every manual entry without verifying singleton provenance.
+- **Summary:** Restrict singleton auth-store synchronization to the singleton-seeded manual account while preserving independently added pooled Codex credentials and the existing matched-token update path.
+- **Surfaces:** `agent/credential_pool.py`; `tests/agent/test_credential_pool.py`; this record.
+- **Upstream tracking:** Maintained-fork issue and PR #46 contain the reproduced incident, implementation, review resolution, and focused evidence. No upstream issue was filed before the fork fix landed.
+- **Upstream PR:** None as of 2026-09-03.
+- **Regression:** `python -m pytest tests/agent/test_credential_pool.py tests/hermes_cli/test_auth_codex_provider.py -q`; coverage must prove singleton recovery updates only the singleton-owned entry and does not overwrite independent manual credentials.
+- **Expected published commit identity:** Stable subject `fix(auth): isolate manually added Codex accounts (#46)`; the code and regression landed in PR #46, while this record repairs the omitted lifecycle registration.
+- **Rollback:** Revert `fix(auth): isolate manually added Codex accounts (#46)`, restoring broad manual-entry synchronization, then remove this index row and record. No schema or persistent-data migration rollback is required.
+- **Retirement:** Retire after released upstream preserves independently added Codex accounts during singleton auth recovery and passes equivalent credential-pool regressions.
+
 ### HERMES-100 — Rotate credentials across transient retries
 
 - **Independent hypothesis (2026-09-02):** Retrying a transient provider failure with the same credential can exhaust the bounded retry budget while another eligible account remains unused, and duplicate OAuth rows can make apparent rotation repeat the same logical account.
