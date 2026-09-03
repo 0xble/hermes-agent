@@ -39,7 +39,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
+from agent.display import KawaiiSpinner, _detect_tool_failure
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
@@ -2098,6 +2098,8 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    goal_activation_needs_work = False
+    goal_activation_grace_used = False
     length_continue_retries = 0
     # Total outer-loop exceptions this turn (#92450) — see _MAX_OUTER_LOOP_ERRORS.
     _outer_error_count = 0
@@ -7860,7 +7862,27 @@ def run_conversation(
                     except Exception:
                         pass
 
+                tool_result_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                activation_positions: Dict[str, int] = {}
+                concrete_positions: Dict[str, int] = {}
+                for position, call in enumerate(assistant_message.tool_calls or []):
+                    name = getattr(getattr(call, "function", None), "name", "")
+                    if name != "set_goal" and name in agent.valid_tool_names:
+                        concrete_positions[coalesce_tool_call_id(call)] = position
+                        continue
+                    if name != "set_goal":
+                        continue
+                    try:
+                        raw_args = call.function.arguments or "{}"
+                        call_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except (TypeError, json.JSONDecodeError):
+                        call_args = {}
+                    if isinstance(call_args, dict) and call_args.get(
+                        "action", "set"
+                    ) in {"set", "resume"}:
+                        activation_positions[coalesce_tool_call_id(call)] = position
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7870,6 +7892,61 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
+
+                tracked_positions = {**activation_positions, **concrete_positions}
+                tracked_names = {
+                    coalesce_tool_call_id(call): getattr(
+                        getattr(call, "function", None), "name", ""
+                    )
+                    for call in assistant_message.tool_calls or []
+                }
+                successful_positions: Dict[str, int] = {}
+                for message in messages[tool_result_start:]:
+                    call_id = str(message.get("tool_call_id", ""))
+                    if message.get("role") != "tool" or call_id not in tracked_positions:
+                        continue
+                    content = message.get("content")
+                    try:
+                        receipt = json.loads(content or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        receipt = None
+                    if isinstance(receipt, dict) and receipt.get("success") is False:
+                        continue
+                    failed_result, _ = _detect_tool_failure(
+                        tracked_names.get(call_id, ""),
+                        content,
+                    )
+                    if not failed_result:
+                        successful_positions[call_id] = tracked_positions[call_id]
+
+                successful_activations = [
+                    successful_positions[call_id]
+                    for call_id in activation_positions
+                    if call_id in successful_positions
+                ]
+                successful_concrete = [
+                    successful_positions[call_id]
+                    for call_id in concrete_positions
+                    if call_id in successful_positions
+                ]
+                if successful_activations:
+                    last_activation = max(successful_activations)
+                    goal_activation_needs_work = not any(
+                        position > last_activation for position in successful_concrete
+                    )
+                elif goal_activation_needs_work and successful_concrete:
+                    goal_activation_needs_work = False
+
+                if (
+                    goal_activation_needs_work
+                    and not goal_activation_grace_used
+                    and (
+                        api_call_count >= agent.max_iterations
+                        or agent.iteration_budget.remaining <= 0
+                    )
+                ):
+                    agent._budget_grace_call = True
+                    goal_activation_grace_used = True
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -8523,7 +8600,22 @@ def run_conversation(
                         agent._strip_think_blocks(final_response or "")
                     )
                 )
-                if _stall_continue_intent or (
+                _has_next_iteration = (
+                    api_call_count < agent.max_iterations
+                    and agent.iteration_budget.remaining > 0
+                )
+                _goal_activation_continue = (
+                    goal_activation_needs_work
+                    and any(name != "set_goal" for name in agent.valid_tool_names)
+                    and (_has_next_iteration or not goal_activation_grace_used)
+                )
+                if _goal_activation_continue and not _has_next_iteration:
+                    # A successful activation on the final ordinary model slot
+                    # still gets one chance to begin the requested work. This
+                    # extends, rather than shrinks, the configured budget.
+                    agent._budget_grace_call = True
+                    goal_activation_grace_used = True
+                if _stall_continue_intent or _goal_activation_continue or (
                     _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2

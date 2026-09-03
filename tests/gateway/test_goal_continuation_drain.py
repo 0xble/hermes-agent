@@ -196,6 +196,48 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
-    assert adapter._pending_messages[adapter_key].text.startswith(
-        "[Continuing toward your standing goal]"
+    queued = adapter._pending_messages[adapter_key]
+    assert queued.text.startswith("[Continuing toward your standing goal]")
+    assert queued.metadata["gateway_session_key"] == adapter_key
+    assert queued.metadata["gateway_session_id"] == session_entry.session_id
+    assert queued.metadata["gateway_explicit_session_route"] is True
+    assert "gateway_side_root_session_id" not in queued.metadata
+
+    adapter._pending_messages.clear()
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="earlier partial progress",
+            enqueue_continuation=False,
+            emit_status_notice=False,
+        )
+    assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_goal_manager_uses_explicit_side_session_route(hermes_home):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._warm_goals_session_db = AsyncMock()
+    side_entry = SimpleNamespace(session_id="side-goal-session")
+    runner._session_entry_for_event = AsyncMock(return_value=side_entry)
+    event = MessageEvent(
+        text="/goal status",
+        message_type=MessageType.TEXT,
+        source=_slack_thread_source(),
+        metadata={"gateway_explicit_session_route": True},
     )
+
+    manager, resolved = await runner._get_goal_manager_for_event(event)
+
+    assert resolved is side_entry
+    assert manager is not None
+    assert manager.session_id == side_entry.session_id

@@ -44,6 +44,12 @@ _NEGATED_MUTATION_RE = re.compile(
     r"\b(?:set|draft|start|activate|replace|pause|resume|clear|park|wait|unwait|add|remove)\b",
     re.IGNORECASE,
 )
+_NATURAL_AMENDMENT_RE = re.compile(
+    r"^\s*(?:also\b|and\s+also\b|make\s+sure\b|ensure\b|include\b|"
+    r"please\s+(?:also\b|make\s+sure\b|ensure\b|include\b))"
+    r"\s*[,;:\-]?\s+\S",
+    re.IGNORECASE,
+)
 _REPLACEMENT_RE = re.compile(
     r"(?:\b(?:replace|overwrite|supersede|switch|change)\b.{0,80}\b(?:standing\s+|active\s+|current\s+)?goal\b"
     r"|\b(?:standing\s+|active\s+|current\s+)?goal\b.{0,80}\b(?:replace|overwrite|supersede|switch|change)\b)",
@@ -223,6 +229,13 @@ def _authorized_action(
     else:
         pattern = _ACTION_AUTH_RE.get(action)
         ok = bool(pattern and pattern.search(auth_text))
+        if (
+            action == "subgoal_add"
+            and _NATURAL_AMENDMENT_RE.search(auth_text)
+            and "?" not in context
+            and not _NON_DIRECT_CONTEXT_RE.search(context)
+        ):
+            ok = True
     return ok, "", context
 
 
@@ -471,7 +484,15 @@ def set_goal_tool(
                 state = manager.refresh()
                 change = {"kind": "goal_unparked", "cleared": cleared}
             elif normalized_action == "subgoal_add":
-                added = manager.add_subgoal(text)
+                amendment_text = text or ""
+                if authorization_text and _NATURAL_AMENDMENT_RE.search(
+                    authorization_text
+                ):
+                    amendment_text = authorization_text.strip()
+                added = manager.add_subgoal(
+                    amendment_text,
+                    source_turn_id=turn_id or "",
+                )
                 if manager.state is not None:
                     expected_persisted_json = manager.state.to_json()
                 state = manager.refresh()
@@ -577,7 +598,73 @@ def set_goal_tool(
         )
 
 
-set_goal = set_goal_tool
+def _next_goal_actions(state: Any) -> list[str]:
+    if state is None or getattr(state, "status", "") in {"done", "cleared"}:
+        return ["status", "set", "draft"]
+    if getattr(state, "status", "") == "paused":
+        return ["status", "resume", "clear"]
+    return ["status", "subgoal_add", "gate_add", "wait", "pause", "clear"]
+
+
+def _failure_readback(
+    result: str,
+    *,
+    session_id: Optional[str],
+    action: str,
+    before_state_json: Optional[str],
+    before_state_known: bool,
+) -> str:
+    from hermes_cli.goals import get_goal_control_revision, load_goal
+
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if payload.get("success") is not False or action not in MUTATION_ACTIONS:
+        return result
+    try:
+        state = load_goal(str(session_id or "")) if session_id else None
+        persisted_state = _state_payload(state)
+        if persisted_state is not None:
+            persisted_state["goal_control_revision"] = get_goal_control_revision(
+                str(session_id)
+            )
+    except Exception as exc:
+        state = None
+        persisted_state = None
+        payload["readback_error"] = f"{type(exc).__name__}: {exc}"
+    current_state_json = state.to_json() if state is not None else None
+    payload["state_changed"] = (
+        current_state_json != before_state_json if before_state_known else None
+    )
+    payload["state"] = persisted_state
+    payload["persisted_state"] = persisted_state
+    payload["next_actions"] = _next_goal_actions(state)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def set_goal(*args: Any, **kwargs: Any) -> str:
+    action = str(kwargs.get("action") or "set").strip().lower()
+    session_id = kwargs.get("session_id")
+    before_state_json: Optional[str] = None
+    before_state_known = False
+    if action in MUTATION_ACTIONS and session_id:
+        try:
+            from hermes_cli.goals import load_goal
+
+            before_state = load_goal(str(session_id))
+            before_state_json = before_state.to_json() if before_state is not None else None
+            before_state_known = True
+        except Exception:
+            pass
+    return _failure_readback(
+        set_goal_tool(*args, **kwargs),
+        session_id=session_id,
+        action=action,
+        before_state_json=before_state_json,
+        before_state_known=before_state_known,
+    )
+
 
 
 def check_goal_requirements() -> bool:
@@ -596,7 +683,10 @@ SET_GOAL_SCHEMA = {
         "one concise end state; verification is objective proof; constraints are invariants; boundaries "
         "define scope; stop_when names a blocker requiring user input. Keep the path flexible. Omit "
         "personas, plans or implementation diaries, generic exhortations, duplicate requirements, "
-        "speculative edge cases, and repository rules supplied elsewhere. After setting, take the first "
+        "speculative edge cases, and repository rules supplied elsewhere. For an active goal, map an "
+        "unambiguous additive instruction such as 'also', 'make sure', 'ensure', or 'include' to "
+        "subgoal_add using that exact current-turn span; questions and negated goal mutations do not "
+        "authorize it. After setting, take the first "
         "concrete step in the same turn. Resume never resets the model's spent turn budget."
     ),
     "parameters": {
@@ -669,7 +759,7 @@ registry.register(
     name="set_goal",
     toolset="goal",
     schema=SET_GOAL_SCHEMA,
-    handler=lambda args, **kw: set_goal_tool(
+    handler=lambda args, **kw: set_goal(
         action=args.get("action", "set"),
         goal=args.get("goal", ""),
         authorization_text=args.get("authorization_text"),

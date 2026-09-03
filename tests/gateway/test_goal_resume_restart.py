@@ -123,6 +123,7 @@ _GW_KEY = "agent:main:discord:channel:goal-resume"
 
 class _FakeSessionEntry:
     session_id = _GW_SID
+    session_key = _GW_KEY
 
 
 class _FakeSessionStore:
@@ -134,6 +135,9 @@ class _FakeSessionStore:
 
     def _generate_session_key(self, source):
         return _GW_KEY
+
+    def lookup_by_session_key(self, session_key):
+        return self.entry
 
 
 class _FakeAdapter:
@@ -167,7 +171,43 @@ def _resume_event() -> MessageEvent:
     )
 
 
+def _side_event(text: str) -> MessageEvent:
+    event = _resume_event()
+    event.text = text
+    event.metadata = {
+        "gateway_session_key": f"{_GW_KEY}:side:side-root",
+        "gateway_session_id": _GW_SID,
+        "gateway_session_strict": True,
+        "gateway_explicit_session_route": True,
+        "gateway_side_root_session_id": "side-root",
+    }
+    return event
+
+
 class TestGatewayResumeRestartsWork:
+    @pytest.mark.asyncio
+    async def test_side_goal_set_preserves_pinned_route_on_kickoff(self, hermes_home):
+        runner, adapter = _make_runner()
+        event = _side_event("/goal ship side work")
+
+        await GatewayRunner._handle_goal_command(runner, event)
+
+        side_key = event.metadata["gateway_session_key"]
+        pending = adapter._pending_messages[side_key]
+        assert pending.metadata == event.metadata
+
+    @pytest.mark.asyncio
+    async def test_side_goal_resume_preserves_pinned_route(self, hermes_home):
+        runner, adapter = _make_runner()
+        _exhaust_budget(_GW_SID)
+        event = _side_event("/goal resume")
+
+        await GatewayRunner._handle_goal_command(runner, event)
+
+        side_key = event.metadata["gateway_session_key"]
+        pending = adapter._pending_messages[side_key]
+        assert pending.metadata == event.metadata
+
     @pytest.mark.asyncio
     async def test_resume_after_budget_exhaustion_enqueues_continuation(
         self, hermes_home
@@ -184,6 +224,10 @@ class TestGatewayResumeRestartsWork:
             "— otherwise the goal sits idle until the next real user message"
         )
         assert pending.text.startswith("[Continuing toward your standing goal]")
+        assert pending.metadata["gateway_session_key"] == _GW_KEY
+        assert pending.metadata["gateway_session_id"] == _GW_SID
+        assert pending.metadata["gateway_session_strict"] is True
+        assert pending.metadata["gateway_explicit_session_route"] is True
         # The pause/clear stale-work guard must recognize the queued turn as
         # a synthetic goal continuation so it can be cleaned up on /goal pause.
         assert GatewayRunner._is_goal_continuation_event(pending)

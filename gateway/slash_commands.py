@@ -2851,10 +2851,20 @@ class GatewaySlashCommandsMixin:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
                 _quick_key = self._session_key_for_event(event) if event.source else None
                 if prompt and adapter and _quick_key:
+                    continuation_metadata = dict(getattr(event, "metadata", None) or {})
+                    continuation_metadata.update(
+                        {
+                            "gateway_session_key": _quick_key,
+                            "gateway_session_id": session_entry.session_id,
+                            "gateway_session_strict": True,
+                            "gateway_explicit_session_route": True,
+                        }
+                    )
                     cont_event = MessageEvent(
                         text=prompt,
                         message_type=MessageType.TEXT,
                         source=event.source,
+                        metadata=continuation_metadata,
                         message_id=None,
                         channel_prompt=None,
                     )
@@ -2972,10 +2982,20 @@ class GatewaySlashCommandsMixin:
         _quick_key = self._session_key_for_event(event) if event.source else None
         if adapter and _quick_key:
             try:
+                kickoff_metadata = dict(getattr(event, "metadata", None) or {})
+                kickoff_metadata.update(
+                    {
+                        "gateway_session_key": _quick_key,
+                        "gateway_session_id": session_entry.session_id,
+                        "gateway_session_strict": True,
+                        "gateway_explicit_session_route": True,
+                    }
+                )
                 kickoff_event = MessageEvent(
                     text=state.goal,
                     message_type=MessageType.TEXT,
                     source=event.source,
+                    metadata=kickoff_metadata,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
                 )

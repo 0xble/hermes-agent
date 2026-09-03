@@ -23188,6 +23188,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if event_metadata.get("gateway_explicit_session_route")
                     else None
                 ),
+                goal_session_entry=session_entry,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -24311,13 +24312,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /goal reply claims the goal was set.
         await self._warm_goals_session_db("goal manager")
         try:
-            # Session lookups on behalf of an internal event must not advance
-            # the user-activity clock that drives idle/daily reset policy
-            # (same class as the wake fix in _handle_message_with_agent).
-            session_entry = await self.async_session_store.get_or_create_session(
-                event.source,
-                touch_activity=not bool(getattr(event, "internal", False)),
-            )
+            metadata = getattr(event, "metadata", None) or {}
+            if metadata.get("gateway_explicit_session_route") is True:
+                session_entry = await self._session_entry_for_event(event)
+            else:
+                # Internal lookups must not advance the user activity clock.
+                session_entry = await self.async_session_store.get_or_create_session(
+                    event.source,
+                    touch_activity=not bool(getattr(event, "internal", False)),
+                )
         except Exception as exc:
             logger.debug("goal manager: session lookup failed: %s", exc)
             return None, None
@@ -24440,7 +24443,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
-    async def _send_goal_status_notice(self, source: Any, message: str) -> None:
+    async def _send_goal_status_notice(
+        self,
+        source: Any,
+        message: str,
+        *,
+        route_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Send a /goal judge status line back to the originating chat/thread."""
         adapter = self._adapter_for_source(source)
         if not adapter:
@@ -24458,8 +24467,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "goal continuation: status send failed: %s",
                 getattr(result, "error", "unknown error"),
             )
+        elif result is not None and route_metadata:
+            message_id = getattr(result, "message_id", None)
+            if message_id:
+                status_event = MessageEvent(
+                    text=message,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    metadata=route_metadata,
+                    message_id=message_id,
+                )
+                await self._record_side_delivery(status_event, [str(message_id)])
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self,
+        source: Any,
+        message: str,
+        *,
+        session_key: Optional[str] = None,
+        route_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The gateway message handler returns the agent response to the platform
@@ -24476,14 +24503,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _deliver() -> None:
             try:
-                await self._send_goal_status_notice(source, message)
+                await self._send_goal_status_notice(
+                    source,
+                    message,
+                    route_metadata=route_metadata,
+                )
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
 
-        try:
-            session_key = self._session_key_for_source(source)
-        except Exception:
-            session_key = None
+        if not session_key:
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = None
 
         if session_key and hasattr(adapter, "register_post_delivery_callback"):
             try:
@@ -24508,6 +24540,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        session_key: Optional[str] = None,
+        enqueue_continuation: bool = True,
+        emit_status_notice: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -24563,6 +24598,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 background_processes=_bg_procs,
             ),
         )
+        pinned_metadata: Dict[str, Any] = {}
+        if session_key:
+            pinned_metadata = {
+                "gateway_session_key": session_key,
+                "gateway_session_id": session_entry.session_id,
+                "gateway_session_strict": True,
+                "gateway_explicit_session_route": True,
+            }
+            side_root = side_root_from_route(session_key)
+            if ":side:" in session_key and side_root:
+                pinned_metadata["gateway_side_root_session_id"] = side_root
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
@@ -24571,10 +24617,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # would show "✓ Goal achieved" before the answer itself. Registering
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
-        if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+        if msg and source is not None and emit_status_notice:
+            await self._defer_goal_status_notice_after_delivery(
+                source,
+                msg,
+                session_key=session_key,
+                route_metadata=pinned_metadata,
+            )
 
-        if not decision.get("should_continue"):
+        if not decision.get("should_continue") or not enqueue_continuation:
             return
 
         prompt = decision.get("continuation_prompt") or ""
@@ -24585,12 +24636,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # flight preempts the continuation naturally.
         try:
             adapter = self._adapter_for_source(source)
-            _quick_key = self._session_key_for_source(source)
+            _quick_key = session_key or self._session_key_for_source(source)
             if adapter and _quick_key:
+                continuation_metadata = pinned_metadata or {
+                    "gateway_session_key": _quick_key,
+                    "gateway_session_id": session_entry.session_id,
+                    "gateway_session_strict": True,
+                    "gateway_explicit_session_route": True,
+                }
                 cont_event = MessageEvent(
                     text=prompt,
                     message_type=MessageType.TEXT,
                     source=source,
+                    metadata=continuation_metadata,
                     message_id=None,
                     channel_prompt=None,
                 )
@@ -24609,23 +24667,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Run goal and loop bookkeeping after an agent turn returns."""
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
 
+        event_metadata = getattr(event, "metadata", None) or {}
+        explicit_route = event_metadata.get("gateway_explicit_session_route") is True
         try:
-            session_entry = await self.async_session_store.get_or_create_session(
-                source,
-                touch_activity=not is_internal,
-            )
+            if explicit_route:
+                session_entry = await self._session_entry_for_event(event)
+            else:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    source,
+                    touch_activity=not is_internal,
+                )
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
 
         # Empty interrupted/errored responses must not drive /goal, but an
         # in-flight /loop tick still needs to be released and rescheduled.
-        if final_text.strip():
+        goal_already_handled = bool(
+            isinstance(agent_result, dict)
+            and agent_result.get("_goal_post_turn_complete")
+        )
+        if isinstance(agent_result, dict):
+            agent_result.pop("_goal_post_turn_complete", None)
+        if final_text.strip() and not goal_already_handled:
             try:
                 await self._post_turn_goal_continuation(
                     session_entry=session_entry,
                     source=source,
                     final_response=final_text,
+                    session_key=(
+                        self._session_key_for_event(event) if explicit_route else None
+                    ),
                 )
             except Exception as exc:
                 logger.debug("goal continuation hook failed: %s", exc)
@@ -31585,6 +31657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
+        goal_session_entry: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -31609,6 +31682,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
                 _post_delivery_adapter=_post_delivery_adapter,
+                goal_session_entry=goal_session_entry,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -31626,6 +31700,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
                 _post_delivery_adapter=_post_delivery_adapter,
+                goal_session_entry=goal_session_entry,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -31773,6 +31848,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
+        goal_session_entry: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -33226,6 +33302,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending_event = None
                 pending = None
 
+            next_goal_entry = goal_session_entry
+            if pending_event is not None:
+                try:
+                    next_goal_entry = await self._session_entry_for_event(pending_event)
+                except Exception:
+                    logger.warning("Could not resolve queued goal route", exc_info=True)
+            same_goal_session_pending = bool(
+                (pending_event or pending)
+                and next_goal_entry is not None
+                and getattr(next_goal_entry, "session_id", None) == session_id
+            )
+            if result and goal_session_entry is not None:
+                final_text = self._final_text_for_post_turn_hooks(result, None)
+                if final_text.strip():
+                    await self._post_turn_goal_continuation(
+                        session_entry=goal_session_entry,
+                        source=source,
+                        final_response=final_text,
+                        session_key=session_key,
+                        enqueue_continuation=not same_goal_session_pending,
+                        emit_status_notice=not same_goal_session_pending,
+                    )
+                result["_goal_post_turn_complete"] = True
+
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
@@ -33392,13 +33492,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_session_id = session_id
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(
+                        getattr(next_goal_entry, "session_id", session_id)
+                    ):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",
@@ -33410,10 +33513,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # _run_agent below consumes them under next_session_key.
                     # The write and consume keys must match or the images drop.
                     try:
-                        next_session_key = self._session_key_for_source(next_source)
+                        next_session_key = self._session_key_for_event(pending_event)
+                        if next_goal_entry is not None:
+                            next_session_id = next_goal_entry.session_id
                     except Exception:
                         logger.debug(
-                            "Queued follow-up session-key resolution failed; reusing %s",
+                            "Queued follow-up session resolution failed; reusing %s",
                             session_key or "?",
                             exc_info=True,
                         )
@@ -33469,14 +33574,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # follow-up.  Use the same (session_key, session_id) the
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
-                await self._refresh_agent_cache_message_count(session_key, session_id)
+                await self._refresh_agent_cache_message_count(
+                    next_session_key, next_session_id
+                )
 
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,
                     source=next_source,
-                    session_id=session_id,
+                    session_id=next_session_id,
                     session_key=next_session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
@@ -33484,6 +33591,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                     _post_delivery_adapter=_callback_owner,
+                    goal_session_entry=next_goal_entry,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

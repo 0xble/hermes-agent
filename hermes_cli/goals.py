@@ -223,12 +223,17 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
     "most recent response, and — when present — a list of background "
-    "processes the agent has running. Decide one of three verdicts.\n\n"
+    "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
-    "- The response clearly shows the final deliverable was produced, OR\n"
-    "- The response explains the goal is unachievable / blocked / needs "
-    "user input (treat this as DONE with reason describing the block).\n\n"
+    "- The response clearly shows the final deliverable was produced.\n"
+    "DONE requires the deliverable to actually exist. If the response only "
+    "explains why the goal cannot be reached, the verdict is BLOCKED, not DONE.\n\n"
+    "BLOCKED — the goal cannot currently be satisfied as stated:\n"
+    "- The response shows a genuine external dependency, required user input, "
+    "or no valid path to the deliverable.\n"
+    "Return BLOCKED with the concrete dependency or input needed. BLOCKED is "
+    "resumable and is never completion.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -250,6 +255,7 @@ JUDGE_SYSTEM_PROMPT = (
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -273,7 +279,7 @@ JUDGE_USER_PROMPT_TEMPLATE = (
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Is the goal satisfied — done, continue, or wait?"
+    "Is the goal satisfied — done, blocked, continue, or wait?"
 )
 
 # Used when the user has added /subgoal criteria. The judge must
@@ -291,8 +297,9 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "is NOT done — return CONTINUE, BLOCKED for a genuine external or "
+    "user-input dependency, or WAIT if blocked on a listed background "
+    "process.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -317,11 +324,11 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
-    "- If the response explains the work is blocked / unachievable / needs "
-    "user input (e.g. the stated Stop condition was hit), treat it as DONE "
-    "with the reason describing the block.\n"
+    "- If the response explains a genuine external dependency, required user "
+    "input, or the stated Stop condition was hit, return BLOCKED with the "
+    "concrete dependency or input needed.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
-    "Is the goal satisfied per its completion contract — done, continue, or wait?"
+    "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
 
 
@@ -638,6 +645,8 @@ class GoalState:
     # them into the verdict. Backwards-compatible: defaults to empty so
     # old state_meta rows load unchanged.
     subgoals: List[str] = field(default_factory=list)
+    # Trusted turn IDs for additive requirements, aligned with ``subgoals``.
+    subgoal_sources: List[str] = field(default_factory=list)
     # Wait barrier: when the agent is blocked on long-running async work
     # (CI poller, build, test run, deploy, rate-limit cooldown) the goal loop
     # PARKS instead of being re-poked every turn into busy-work. Two barrier
@@ -680,9 +689,19 @@ class GoalState:
     def from_json(cls, raw: str) -> "GoalState":
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
+        raw_sources = data.get("subgoal_sources") or []
+        if not isinstance(raw_sources, list):
+            raw_sources = []
         subgoals: List[str] = []
+        subgoal_sources: List[str] = []
         if isinstance(raw_subgoals, list):
-            subgoals = [str(s).strip() for s in raw_subgoals if str(s).strip()]
+            for index, value in enumerate(raw_subgoals):
+                text = str(value).strip()
+                if not text:
+                    continue
+                subgoals.append(text)
+                source = raw_sources[index] if index < len(raw_sources) else ""
+                subgoal_sources.append(str(source or ""))
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -696,6 +715,7 @@ class GoalState:
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
             subgoals=subgoals,
+            subgoal_sources=subgoal_sources,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
@@ -1002,6 +1022,19 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "… [truncated]"
 
 
+def _head_tail(text: str, limit: int) -> str:
+    """Keep both the start and conclusion of long judge inputs."""
+    if not text or len(text) <= limit:
+        return text or ""
+    marker = "\n… [middle omitted] …\n"
+    remaining = limit - len(marker)
+    if remaining < 2:
+        return text[:limit]
+    head = (remaining + 1) // 2
+    tail = remaining - head
+    return text[:head] + marker + text[-tail:]
+
+
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with ``pid`` is currently alive.
 
@@ -1049,6 +1082,29 @@ def _session_waiting(session_id: str) -> bool:
 
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+_EXPLICIT_INCOMPLETION_RE = re.compile(
+    r"(?:^|[.!?]\s+|,\s+but\s+)(?:[-*]\s*)?(?:"
+    r"(?:i|we)\s+(?:still\s+need\s+to\s+(?:complete|finish|verify|test|run|"
+    r"implement|fix|deploy|land|publish|write|build)|have\s+not\s+(?:yet\s+)?"
+    r"(?:completed|finished|verified)|haven't\s+(?:completed|finished|verified)|"
+    r"have\s+yet\s+to|could\s+not\s+(?:complete|finish|verify)|"
+    r"cannot\s+yet\s+(?:complete|confirm|verify))\b|"
+    r"(?:required\s+work|(?:the\s+)?requirements?|the\s+(?:work|task)|"
+    r"the\s+required\s+[\w -]{1,60})\s+"
+    r"(?:is|are|remains?)\s+(?:incomplete|unfinished|to\s+be\s+done)\b|"
+    r"that\s+work\s+remains\b"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _concluding_statement(text: str) -> str:
+    """Return the last non-empty sentence or list item from a response."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    statements = re.split(r"(?<=[.!?])\s+", lines[-1])
+    return statements[-1]
 
 
 def _goal_judge_max_tokens() -> int:
@@ -1156,16 +1212,22 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     verdict_raw = data.get("verdict")
     if isinstance(verdict_raw, str):
         verdict = verdict_raw.strip().lower()
-    else:
+        if verdict not in {"done", "blocked", "continue", "wait"}:
+            return "continue", f"judge returned unknown verdict: {verdict!r}", True, None
+    elif "done" in data:
         done_val = data.get("done")
         if isinstance(done_val, str):
-            done = done_val.strip().lower() in {"true", "yes", "1", "done"}
+            normalized = done_val.strip().lower()
+            if normalized not in {"true", "yes", "1", "done", "false", "no", "0", "continue"}:
+                return "continue", "judge returned invalid legacy done value", True, None
+            done = normalized in {"true", "yes", "1", "done"}
+        elif isinstance(done_val, bool):
+            done = done_val
         else:
-            done = bool(done_val)
+            return "continue", "judge returned invalid legacy done value", True, None
         verdict = "done" if done else "continue"
-
-    if verdict not in {"done", "continue", "wait"}:
-        verdict = "continue"
+    else:
+        return "continue", "judge reply omitted verdict", True, None
 
     if verdict != "wait":
         return verdict, reason, False, None
@@ -1197,7 +1259,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
     # Wait with no usable target — can't park on nothing; treat as continue.
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", f"{reason} (wait verdict had no target — continuing)", True, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -1327,7 +1389,7 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE.format(
             goal=_truncate(goal, 2000),
             contract_block=_truncate(contract_block, 2500),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            response=_head_tail(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
         )
@@ -1338,14 +1400,14 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
             goal=_truncate(goal, 2000),
             subgoals_block=_truncate(subgoals_block, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            response=_head_tail(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
         )
     else:
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
             goal=_truncate(goal, 2000),
-            response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            response=_head_tail(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
             background_block=background_block,
             current_time=current_time,
         )
@@ -1374,6 +1436,11 @@ def judge_goal(
         raw = ""
 
     verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
+    if verdict == "done" and _EXPLICIT_INCOMPLETION_RE.search(
+        _concluding_statement(last_response)
+    ):
+        verdict = "continue"
+        reason = "agent response explicitly reports incomplete work"
     logger.info(
         "goal judge: verdict=%s reason=%s%s",
         verdict, _truncate(reason, 120),
@@ -1694,7 +1761,7 @@ class GoalManager:
 
     # --- /subgoal user controls ---------------------------------------
 
-    def add_subgoal(self, text: str) -> str:
+    def add_subgoal(self, text: str, *, source_turn_id: str = "") -> str:
         """Append a user-added criterion to the active goal. Requires
         ``has_goal()``; raises ``RuntimeError`` otherwise.
 
@@ -1706,6 +1773,7 @@ class GoalManager:
         if not text:
             raise ValueError("subgoal text is empty")
         self._state.subgoals.append(text)
+        self._state.subgoal_sources.append(str(source_turn_id or ""))
         self._touch_state(self._state)
         self._persist_state(self._state)
         return text
@@ -1720,6 +1788,8 @@ class GoalManager:
                 f"index out of range (1..{len(self._state.subgoals)})"
             )
         removed = self._state.subgoals.pop(idx)
+        if idx < len(self._state.subgoal_sources):
+            self._state.subgoal_sources.pop(idx)
         self._touch_state(self._state)
         self._persist_state(self._state)
         return removed
@@ -1730,6 +1800,7 @@ class GoalManager:
             raise RuntimeError("no active goal")
         prev = len(self._state.subgoals)
         self._state.subgoals = []
+        self._state.subgoal_sources = []
         self._touch_state(self._state)
         self._persist_state(self._state)
         return prev
@@ -2053,7 +2124,7 @@ class GoalManager:
           - ``status``: current goal status after update
           - ``should_continue``: bool — caller should fire another turn
           - ``continuation_prompt``: str or None
-          - ``verdict``: "done" | "continue" | "wait" | "skipped" | "inactive"
+          - ``verdict``: "done" | "blocked" | "continue" | "wait" | "skipped" | "inactive"
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
@@ -2168,6 +2239,23 @@ class GoalManager:
                 "verdict": "wait",
                 "reason": reason,
                 "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
+            }
+
+        if verdict == "blocked":
+            state.status = "paused"
+            state.paused_reason = f"blocked: {reason}"
+            self._touch_state(state)
+            self._persist_state(state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "blocked",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal blocked — {reason}. "
+                    "Use /goal resume when the blocker is resolved, or /goal clear to stop."
+                ),
             }
 
         if verdict == "done":
@@ -2434,6 +2522,18 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        if verdict == "blocked":
+            _log(f"kanban goal loop: task {task_id} judged blocked ({reason})")
+            try:
+                block_fn(reason)
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_by_judge",
+                "turns_used": turns_used,
+                "reason": reason,
+            }
 
         if verdict == "done":
             if nudged_to_finalize:

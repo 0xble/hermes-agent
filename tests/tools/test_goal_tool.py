@@ -395,6 +395,93 @@ def test_read_actions_and_mutation_parity(isolated_goal_db):
         assert call_goal(action=action, session_id="parity", user_task=request, **kwargs)["success"] is True
 
 
+def test_natural_additive_requirement_updates_goal_with_turn_provenance(
+    isolated_goal_db,
+):
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("amend").set("Ship parser")
+    result = call_goal(
+        action="subgoal_add",
+        session_id="amend",
+        user_task="Also test recent cases.",
+        text="Test recent cases",
+    )
+    assert result["success"] is True
+    state = GoalManager("amend").state
+    assert state is not None
+    assert state.subgoals == ["Also test recent cases."]
+    assert state.subgoal_sources == ["turn-1"]
+
+
+def test_natural_amendment_question_is_not_authorization(isolated_goal_db):
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("amend-question").set("Ship parser")
+    result = call_goal(
+        action="subgoal_add",
+        session_id="amend-question",
+        user_task="Also, should we test recent cases?",
+        text="Test recent cases",
+    )
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_goal_authorization_required"
+
+    partial = call_goal(
+        action="subgoal_add",
+        session_id="amend-question",
+        user_task="Also, should we test recent cases?",
+        authorization_text="Also",
+        text="Also",
+    )
+    assert partial["success"] is False
+    assert partial["error_code"] == "explicit_goal_authorization_required"
+
+
+def test_failed_mutation_returns_authoritative_persisted_state(isolated_goal_db):
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("readback").set("Keep active goal")
+    result = call_goal(
+        action="subgoal_remove",
+        session_id="readback",
+        user_task="Remove subgoal 99 from the active goal.",
+        index=99,
+    )
+    assert result["success"] is False
+    assert result["state_changed"] is False
+    assert result["state"]["goal"] == "Keep active goal"
+    assert result["persisted_state"]["goal"] == "Keep active goal"
+    assert result["persisted_state"]["status"] == "active"
+
+
+def test_failed_persistence_readback_ignores_dirty_manager_state(
+    isolated_goal_db, monkeypatch
+):
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("dirty-readback").set("Original goal")
+    real_persist = GoalManager._persist_state
+
+    def fail_subgoal_persist(self, state):
+        if state.subgoals:
+            raise RuntimeError("simulated write failure")
+        return real_persist(self, state)
+
+    monkeypatch.setattr(GoalManager, "_persist_state", fail_subgoal_persist)
+    result = call_goal(
+        action="subgoal_add",
+        session_id="dirty-readback",
+        user_task="Also test recovery.",
+        text="Test recovery",
+    )
+
+    assert result["success"] is False
+    assert result["state_changed"] is False
+    assert result["state"]["subgoals"] == []
+    assert result["persisted_state"]["subgoals"] == []
+
+
 @pytest.mark.parametrize(
     "authorization",
     [

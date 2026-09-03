@@ -46,6 +46,22 @@ class TestParseJudgeResponse:
         assert reason == "all good"
         assert wait is None
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            '{"reason": "missing verdict"}',
+            '{"verdict": "finished", "reason": "unknown verdict"}',
+            '{"done": null, "reason": "invalid legacy value"}',
+            '{"verdict": "wait", "reason": "missing wait target"}',
+        ],
+    )
+    def test_schema_invalid_reply_counts_as_parse_failure(self, payload):
+        from hermes_cli.goals import _parse_judge_response
+
+        verdict, _reason, parse_failed, _wait = _parse_judge_response(payload)
+        assert verdict == "continue"
+        assert parse_failed is True
+
 
 
 
@@ -96,6 +112,76 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_explicit_incompletion_overrides_done(self):
+        from hermes_cli import goals
+
+        response = (
+            "I completed the main task, but I have not yet completed "
+            "the required Hermes inventory. That work remains."
+        )
+        judge_reply = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "achieved"}'))]
+        )
+        with patch("agent.auxiliary_client.call_llm", return_value=judge_reply):
+            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", response)
+        assert verdict == "continue"
+        assert "explicitly reports incomplete work" in reason
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "The task was not complete yesterday, but it is fully done now.",
+            "The task is not complete without tests; all tests passed, so it is done.",
+            "We could not complete deployment yesterday because credentials were missing. Today we deployed successfully and verified production health.",
+            "It is false that the work remains incomplete; everything is done.",
+            'The regression test asserts that "task remains incomplete" is detected. All work is done.',
+            "Done. I still need to thank you for the request.",
+            "Everything required is complete. If you still need to inspect details, use /status.",
+        ],
+    )
+    def test_incidental_incompletion_language_does_not_override_done(self, response):
+        from hermes_cli import goals
+
+        judge_reply = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "achieved"}'))]
+        )
+        with patch("agent.auxiliary_client.call_llm", return_value=judge_reply):
+            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", response)
+        assert verdict == "done"
+        assert reason == "achieved"
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "I haven't completed the required inventory.",
+            "The required inventory is incomplete.",
+            "The required inventory remains to be done.",
+            "I have yet to complete the inventory.",
+            "Required work is unfinished.",
+            "The requirements remain incomplete.",
+        ],
+    )
+    def test_explicit_current_incompletion_overrides_done(self, response):
+        from hermes_cli import goals
+
+        judge_reply = MagicMock(
+            choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "achieved"}'))]
+        )
+        with patch("agent.auxiliary_client.call_llm", return_value=judge_reply):
+            verdict, reason, _, _wd, _tf = goals.judge_goal("goal", response)
+        assert verdict == "continue"
+        assert "explicitly reports incomplete work" in reason
+
+    def test_response_excerpt_preserves_head_and_tail(self):
+        from hermes_cli.goals import _head_tail
+
+        text = "HEAD" + ("x" * 100) + "TAIL"
+        excerpt = _head_tail(text, 30)
+        assert excerpt.startswith("HEAD")
+        assert excerpt.endswith("TAIL")
+        assert len(excerpt) == 30
+        assert len(_head_tail(text, 10)) == 10
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
@@ -116,6 +202,33 @@ class TestGoalManager:
         assert mgr.is_active()
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
+
+    def test_blocked_verdict_pauses_without_completing(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="blocked-sid", default_max_turns=5)
+        mgr.set("ship the thing")
+        with patch.object(
+            goals,
+            "judge_goal",
+            return_value=("blocked", "need production access", False, None, False),
+        ):
+            decision = mgr.evaluate_after_turn("I need production access.")
+
+        assert decision["verdict"] == "blocked"
+        assert decision["status"] == "paused"
+        assert decision["should_continue"] is False
+        state = mgr.state
+        assert state is not None
+        assert state.status == "paused"
+        assert state.last_verdict == "blocked"
+        assert state.paused_reason == "blocked: need production access"
+
+        resumed = mgr.resume(reset_budget=False)
+        assert resumed is not None
+        assert resumed.status == "active"
+        assert resumed.turns_used == 1
 
 
 
@@ -245,6 +358,22 @@ class TestGoalStateSubgoalsBackcompat:
         state = GoalState.from_json(legacy)
         assert state.goal == "do a thing"
         assert state.subgoals == []
+        assert state.subgoal_sources == []
+
+    def test_blank_legacy_subgoal_keeps_source_alignment(self):
+        from hermes_cli.goals import GoalState
+
+        state = GoalState.from_json(
+            json.dumps(
+                {
+                    "goal": "do a thing",
+                    "subgoals": ["  ", "real"],
+                    "subgoal_sources": ["turn-empty", "turn-real"],
+                }
+            )
+        )
+        assert state.subgoals == ["real"]
+        assert state.subgoal_sources == ["turn-real"]
 
 
 class TestMigrateGoalToSession:
@@ -277,9 +406,11 @@ class TestGoalManagerSubgoals:
         from hermes_cli.goals import GoalManager
         mgr = GoalManager(session_id="sub-add")
         mgr.set("main goal")
-        text = mgr.add_subgoal("  use bullet points  ")
+        text = mgr.add_subgoal("  use bullet points  ", source_turn_id="turn-7")
         assert text == "use bullet points"
+        assert mgr.state is not None
         assert mgr.state.subgoals == ["use bullet points"]
+        assert mgr.state.subgoal_sources == ["turn-7"]
 
 
     def test_remove_subgoal_out_of_range(self, hermes_home):
