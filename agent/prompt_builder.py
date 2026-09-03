@@ -1200,12 +1200,13 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-# Cache the backend probe result per process so we only pay the probe cost
-# on the first prompt build of a session. Keyed by (env_type, cwd_hint) so
-# a mid-process backend switch rebuilds the string. Kept in-module (not on
-# disk) because the probe captures live backend state that may change
-# across Hermes restarts.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+# Cache the backend probe result per process so we only pay the remote command
+# cost once per scoped backend identity. The key includes the active profile,
+# task cwd, and non-secret connection/runtime selectors so one multiplexed
+# process never reuses another profile or backend's observed user/home/cwd.
+# Kept in-module because the probe captures live state that may change across
+# Hermes restarts.
+_BACKEND_PROBE_CACHE: dict[tuple[object, ...], str] = {}
 
 
 def _windows_marketing_version() -> str:
@@ -1279,12 +1280,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     operate on a different machine than the host Hermes runs on.
     """
     from agent.runtime_cwd import resolve_tool_cwd
-
-    cwd_hint = _tenv_read()
-    cache_key = (env_type, cwd_hint)
-    cached = _BACKEND_PROBE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached or None
+    from hermes_constants import get_hermes_home
 
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
@@ -1292,12 +1288,36 @@ def _probe_remote_backend(env_type: str) -> str | None:
         from tools.terminal_tool import _create_environment, _get_env_config  # type: ignore
     except Exception as e:
         logger.debug("Backend probe unavailable (import failed): %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
     env = None
+    cache_key: tuple[object, ...] | None = None
     try:
         config = _get_env_config()
+        cwd_hint = resolve_tool_cwd()
+        docker_env = config.get("docker_env")
+        if not isinstance(docker_env, dict):
+            docker_env = {}
+        cache_key = (
+            str(get_hermes_home()),
+            env_type,
+            cwd_hint,
+            config.get("ssh_host"),
+            config.get("ssh_user"),
+            config.get("ssh_port"),
+            config.get("docker_image"),
+            config.get("singularity_image"),
+            config.get("modal_image"),
+            config.get("daytona_image"),
+            config.get("vercel_runtime"),
+            config.get("modal_mode"),
+            config.get("docker_run_as_host_user"),
+            docker_env.get("HOME"),
+            docker_env.get("USER"),
+        )
+        cached = _BACKEND_PROBE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached or None
         # Build the environment the same way tools/terminal_tool.py does for a
         # live command: select the backend image, then assemble ssh/container
         # config from the env-derived dict. (There is no `get_environment`
@@ -1374,7 +1394,8 @@ def _probe_remote_backend(env_type: str) -> str | None:
             return None
     except Exception as e:
         logger.debug("Backend probe failed: %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
+        if cache_key is not None:
+            _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
     finally:
         # The probe only needs a one-shot `uname`; without teardown the

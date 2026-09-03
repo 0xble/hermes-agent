@@ -1455,10 +1455,30 @@ def _cron_next_run_matches_expr(
     if not expr or not _ensure_croniter() or croniter is None:
         return True
     try:
-        # The last occurrence at-or-before the stored instant: base croniter
+        scheduled = (
+            next_run_dt.astimezone(_effective_cron_timezone(timezone))
+            if timezone
+            else next_run_dt
+        )
+    except Exception:
+        return True
+    return _cron_wall_clock_matches_expr(schedule, scheduled)
+
+
+def _cron_wall_clock_matches_expr(
+    schedule: Dict[str, Any],
+    scheduled: datetime,
+) -> bool:
+    """Whether ``scheduled`` is on the cron lattice in its current wall clock."""
+    if schedule.get("kind") != "cron":
+        return True
+    expr = schedule.get("expr")
+    if not expr or not _ensure_croniter() or croniter is None:
+        return True
+    try:
+        # The last occurrence at-or-before the stored wall clock: base croniter
         # a second past it so an exact occurrence is included, then compare
         # at second granularity (croniter returns second-precision datetimes).
-        scheduled = next_run_dt.astimezone(_effective_cron_timezone(timezone))
         base = scheduled + timedelta(seconds=1)
         prev = croniter(str(expr), base).get_prev(datetime)
         return abs((prev - scheduled).total_seconds()) < 1.0
@@ -1511,8 +1531,8 @@ def _classify_stale_cron_next_run(
     wall_clock_shifted = (
         raw_next_run_dt.replace(tzinfo=None) != next_run_dt.replace(tzinfo=None)
     )
-    if wall_clock_shifted and _cron_next_run_matches_expr(
-        schedule, raw_next_run_dt, timezone
+    if wall_clock_shifted and _cron_wall_clock_matches_expr(
+        schedule, raw_next_run_dt
     ):
         return STALE_CRON_TIMEZONE_MIGRATION
     return STALE_CRON_EXPR_EDIT

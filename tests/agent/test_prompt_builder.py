@@ -871,6 +871,80 @@ class TestEnvironmentHints:
         assert "Linux 6.8.0" in line
         assert "root" in line
 
+    def test_probe_remote_backend_cache_is_scoped_to_task_cwd(self, monkeypatch, tmp_path):
+        """Concurrent gateway/cron workdirs must not share a probe cache entry."""
+        import agent.prompt_builder as _pb
+        import agent.runtime_cwd as _runtime_cwd
+        import tools.terminal_tool as _tt
+
+        current = {"cwd": str(tmp_path / "one")}
+        calls = []
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                calls.append(current["cwd"])
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
+                        "cwd=/workspace\nuser=root\n"
+                    ),
+                }
+
+        monkeypatch.setattr(
+            _runtime_cwd, "resolve_tool_cwd", lambda: current["cwd"]
+        )
+        monkeypatch.setattr(_tt, "_get_env_config", lambda: {})
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _FakeEnv())
+        _pb._clear_backend_probe_cache()
+
+        assert _pb._probe_remote_backend("docker") is not None
+        assert _pb._probe_remote_backend("docker") is not None
+        current["cwd"] = str(tmp_path / "two")
+        assert _pb._probe_remote_backend("docker") is not None
+
+        assert calls == [str(tmp_path / "one"), str(tmp_path / "two")]
+
+    def test_probe_remote_backend_cache_is_scoped_to_backend_identity(
+        self, monkeypatch
+    ):
+        """Different SSH targets with the same cwd must not share observations."""
+        import agent.prompt_builder as _pb
+        import agent.runtime_cwd as _runtime_cwd
+        import tools.terminal_tool as _tt
+
+        current = {"host": "one.example"}
+        calls = []
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                calls.append(current["host"])
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/home/u\n"
+                        f"cwd=/srv/{current['host']}\nuser=u\n"
+                    ),
+                }
+
+        def _config():
+            return {
+                "ssh_host": current["host"],
+                "ssh_user": "u",
+                "ssh_port": 22,
+                "ssh_persistent": False,
+            }
+
+        monkeypatch.setattr(_runtime_cwd, "resolve_tool_cwd", lambda: "~")
+        monkeypatch.setattr(_tt, "_get_env_config", _config)
+        monkeypatch.setattr(_tt, "_create_environment", lambda **kw: _FakeEnv())
+        _pb._clear_backend_probe_cache()
+
+        assert "one.example" in (_pb._probe_remote_backend("ssh") or "")
+        current["host"] = "two.example"
+        assert "two.example" in (_pb._probe_remote_backend("ssh") or "")
+        assert calls == ["one.example", "two.example"]
+
     def test_probe_remote_backend_tears_down_its_sandbox(self, monkeypatch):
         """THE BUG: the probe leaked a second, permanently idle sandbox.
 

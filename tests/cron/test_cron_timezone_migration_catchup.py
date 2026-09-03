@@ -197,6 +197,15 @@ def test_classifier_separates_migration_from_edit(temp_home):
         _classify_stale_cron_next_run(daily, raw_legacy, normalized)
         == STALE_CRON_TIMEZONE_MIGRATION
     )
+    # An explicit per-job timezone must not reinterpret the legacy value before
+    # checking its own wall clock. This is the conflict-prone composition of
+    # the migration repair with the fork's per-job timezone support.
+    assert (
+        _classify_stale_cron_next_run(
+            daily, raw_legacy, normalized, "Europe/Brussels"
+        )
+        == STALE_CRON_TIMEZONE_MIGRATION
+    )
     # Wall clock never moved, so a mismatch can only be a schedule edit.
     assert (
         _classify_stale_cron_next_run(
