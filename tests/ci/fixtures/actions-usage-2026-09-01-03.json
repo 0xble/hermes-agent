@@ -1,0 +1,19 @@
+{
+  "period": "2026-09-01 through 2026-09-03",
+  "rounded_minutes": {
+    "linux": 7976,
+    "windows": 433,
+    "macos": 102
+  },
+  "fork_ci_pull_request_runs": 76,
+  "fork_ci_push_runs": 43,
+  "trusted_policy_runs": 86,
+  "trusted_policy_linux_minutes": 216,
+  "other_linux_minutes": 8,
+  "fork_ci_pull_request_minutes": {
+    "linux": 5378,
+    "windows": 298,
+    "macos": 75
+  },
+  "source": "GitHub Actions runs and jobs API, captured 2026-09-03"
+}

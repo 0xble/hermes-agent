@@ -1576,6 +1576,31 @@ def profile_env(tmp_path, monkeypatch):
 
 ## Testing
 
+### Local-first CI
+
+The maintained private fork uses repository-owned local checks as the normal
+development and pre-publication gate. Run the smallest profile that proves the
+current step, then bind final evidence to the exact tree being published:
+
+```bash
+python3 scripts/ci/local_check.py --profile fast
+python3 scripts/ci/local_check.py --profile affected --base origin/main \
+  --python-test tests/path/test_changed_behavior.py
+python3 scripts/ci/local_check.py --profile full --json > local-ci-receipt.json
+```
+
+`affected` fails open to the complete Python suite when a Python lane is
+selected without explicit focused targets. `full` runs every locally supported
+lane and reports Windows-native residuals as `remote_only`; request the hosted
+full gate with the `ci:full` pull-request label when those residuals or another
+risk trigger applies. Do not describe local evidence as independent or as
+Windows proof.
+
+Ordinary pull requests receive only the dependency-free hosted smoke and the
+trusted fork-policy check. Full Linux, macOS, and Windows jobs are reserved for
+`ci:full`, explicit workflow dispatch, and the bounded weekly drift run. Never
+run untrusted pull-request code on a Brian-controlled self-hosted runner.
+
 ### Python
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
 hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
@@ -1617,9 +1642,9 @@ ContextVars from one test file cannot leak into the next.
 
 The CI change classifier (`scripts/ci/classify_changes.py`) runs specific jobs based on what files changed. A Python test that asserts
 about the contents of `package.json`, `package-lock.json`, `.ts`/`.tsx`
-source, or any other JS-side artifact will not run on a PR that only touches
-those files. This means a regression can go green on a PR and red on `main` (where the
-classifier fails open and runs everything).
+source, or any other JS-side artifact will not reach the Python lane when full
+hosted CI is requested. This means a regression can escape a narrow local run
+and appear only in an explicit or scheduled full gate.
 
 Any test that reads or asserts about `package.json`,
 `package-lock.json`, `tsconfig.json`, `.ts`/`.tsx`/`.js`/`.mjs`/`.cjs`

@@ -203,6 +203,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
 | `Merge remote-tracking branch 'origin/main' into fix/worktree-path-warning` | Task-owned integration of the current reviewed fork base into PR #25; no additional behavior beyond the indexed worktree advisory. |
 | `fix(ci): advance maintenance baseline after auth patch` | Repairs the history gate after PR #46 was merged without its patch record; the commit adds HERMES-103 and makes no shipped Hermes behavior change. |
+| `fix(ci): prepare local-first fork verification` | Transitional trusted-policy compatibility needed to land the local-first CI shape in a separately reviewed follow-up; also adds local verification tooling, cost replay, and operating guidance without changing hosted triggers. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
