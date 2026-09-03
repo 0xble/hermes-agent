@@ -149,6 +149,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `docs(maintenance): reconcile stale patch records` | Maintenance-only reconciliation of already-registered patch records and exemptions; no shipped Hermes behavior. |
 | `chore(fork): remove dead reconciliation residue` | Removal of dead code left by retired paths and rebase replay (response-aware title route plumbing, retired HERMES-043 snapshot, obsolete compatibility shims, unused helpers, duplicate import, stale docstrings/comments); no behavioral change. |
 | `fix(reconcile): restore upstream recovery guidance` | Patch-neutral restoration of upstream's snapshot-first manual recovery guidance after replaying HERMES-002's atomic forensic-copy guard; no independently retireable behavior. |
+| `test: make periodic cancellation event-driven` | Test-only replacement of a fixed sleep with callback events under loaded local CI; no shipped Hermes behavior. |
 | `test: raise loaded-runner file timeout` | Local-CI timeout stabilization for very large test files under the repository's 56-worker load; no shipped Hermes behavior. |
 | `test: use real streams in execute-code integration fixture` | Test-fixture repair replacing thread-visible MagicMocks with byte streams so warning-as-error runs observe real EOF behavior; no shipped Hermes behavior. |
 | `test: exercise recovery boundaries without source scans` | Test-only replacement of source-shape assertions and leaked sqlite CLI probe state with direct slash-handler and recovery-boundary behavior; no shipped Hermes behavior. |

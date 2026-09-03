@@ -30,11 +30,13 @@ def test_two_intervals_fire_proportionally_and_cancel_stops_one():
     assert threading.active_count() == before
     assert sched._thread is not None and sched._thread.is_alive()
 
-    h_fast.cancel()
+    h_fast.cancel(wait=2.0)
     n_fast = len(fast)
-    time.sleep(0.1)
+    n_slow = len(slow)
+    assert _wait_until(lambda: len(slow) > n_slow, timeout=2.0), (
+        "sibling callback stopped when another was cancelled"
+    )
     assert len(fast) == n_fast, "cancelled callback kept firing"
-    assert len(slow) > 3, "sibling callback stopped when another was cancelled"
     h_slow.cancel()
 
 
