@@ -189,11 +189,14 @@ These exact subjects are fork-only history but do not define independently retir
 | `chore(actions)(deps): bump the actions-minor-patch group across 1 directory with 3 updates` | Automated pinned GitHub Action dependency refresh for the reviewed Hadolint, Cachix, and OSV SHAs; no shipped Hermes behavior. |
 | `fix(ci): reconcile squash-merged goal history` | Fork-administrative history reconciliation that replaces PR #17's accidental merge commit with its tree-equivalent squash commit while preserving later reviewed merges; no shipped Hermes behavior. |
 | `fix(ci): reconcile post-merge history baseline` | Fork-administrative history reconciliation after concurrent reviewed merges advanced `main`; no shipped Hermes behavior. |
+| `fix(ci): register reconciled worktree branch history` | Fork-administrative registration of exact historical and integration subjects exposed by reconciling PR #25 with the current fork base; no shipped Hermes behavior. |
 | `Merge pull request #3 from 0xble/dependabot/github_actions/astral-sh/setup-uv-9.0.0` | GitHub-authored merge wrapper around the already-registered setup-uv dependency refresh; no additional behavior. |
 | `Merge pull request #5 from 0xble/dependabot/github_actions/actions/checkout-7.0.1` | GitHub-authored merge wrapper around the already-registered checkout dependency refresh; no additional behavior. |
 | `Merge pull request #13 from 0xble/dependabot/github_actions/actions-minor-patch-f5d4e90336` | GitHub-authored merge wrapper around the already-registered grouped action refresh; no additional behavior. |
+| `Merge pull request #17 from 0xble/feat/goal-tool-parity` | GitHub-authored merge wrapper around the indexed goal-control patch; no additional behavior. |
 | `Merge pull request #18 from 0xble/fix/duplicate-topic-titles-100002` | GitHub-authored merge wrapper around the indexed Telegram topic-label patch; no additional behavior. |
 | `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
+| `Merge remote-tracking branch 'origin/main' into fix/worktree-path-warning` | Task-owned integration of the current reviewed fork base into PR #25; no additional behavior beyond the indexed worktree advisory. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
