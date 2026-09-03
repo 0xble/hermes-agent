@@ -1,5 +1,7 @@
 """Continuable /side routing and persistence."""
 
+import sqlite3
+
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,13 +15,23 @@ from gateway.session import SessionStore
 from hermes_state import SessionDB
 
 
-def _source(*, user_id: str = "12345", thread_id: str = "42") -> SessionSource:
+def _source(
+    *,
+    user_id: str = "12345",
+    thread_id: str = "42",
+    profile: str | None = None,
+    scope_id: str | None = None,
+    business_connection_id: str | None = None,
+) -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="67890",
         chat_type="dm",
         user_id=user_id,
         thread_id=thread_id,
+        profile=profile,
+        scope_id=scope_id,
+        business_connection_id=business_connection_id,
     )
 
 
@@ -86,6 +98,103 @@ def test_side_message_binding_is_durable_and_exactly_scoped(tmp_path):
         ) is None
     finally:
         reopened.close()
+
+
+def test_side_message_bindings_do_not_collide_across_transport_scopes(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    for root, route in (("side-a", "route-a"), ("side-b", "route-b")):
+        db.create_session(root, "slack", session_key=route)
+    common = {
+        "platform": "slack",
+        "chat_id": "C123",
+        "thread_id": "171.1",
+        "user_id": "U123",
+        "message_id": "reply-1",
+        "profile": "shared",
+    }
+    db.record_side_message_binding(
+        **common,
+        scope_id="TEAM-A",
+        side_route_key="route-a",
+        side_root_session_id="side-a",
+    )
+    db.record_side_message_binding(
+        **common,
+        scope_id="TEAM-B",
+        side_route_key="route-b",
+        side_root_session_id="side-b",
+    )
+
+    first = db.resolve_side_message_binding(**common, scope_id="TEAM-A")
+    second = db.resolve_side_message_binding(**common, scope_id="TEAM-B")
+    assert first is not None and first["side_route_key"] == "route-a"
+    assert second is not None and second["side_route_key"] == "route-b"
+    assert db.resolve_side_message_binding(**common, scope_id="TEAM-C") is None
+    db.close()
+
+
+def test_legacy_side_message_binding_schema_migrates_without_losing_routes(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(db_path=path)
+    db.create_session("side-legacy", "telegram", session_key="legacy-route")
+    db.record_side_message_binding(
+        platform="telegram",
+        chat_id="chat",
+        thread_id="thread",
+        user_id="user",
+        message_id="message",
+        side_route_key="legacy-route",
+        side_root_session_id="side-legacy",
+    )
+    db.close()
+
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            DROP INDEX idx_side_message_bindings_route;
+            ALTER TABLE side_message_bindings RENAME TO side_message_bindings_v31;
+            CREATE TABLE side_message_bindings (
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                message_id TEXT NOT NULL,
+                side_route_key TEXT NOT NULL,
+                side_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (platform, chat_id, thread_id, user_id, message_id)
+            );
+            INSERT INTO side_message_bindings
+            SELECT platform, chat_id, thread_id, user_id, message_id,
+                   side_route_key, side_root_session_id, created_at
+              FROM side_message_bindings_v31;
+            DROP TABLE side_message_bindings_v31;
+            CREATE INDEX idx_side_message_bindings_route
+                ON side_message_bindings(side_route_key);
+            UPDATE schema_version SET version = 30;
+            """
+        )
+
+    migrated = SessionDB(db_path=path)
+    try:
+        found = migrated.resolve_side_message_binding(
+            platform="telegram",
+            chat_id="chat",
+            thread_id="thread",
+            user_id="user",
+            message_id="message",
+        )
+        assert found is not None and found["side_route_key"] == "legacy-route"
+        with sqlite3.connect(path) as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(side_message_bindings)"
+                ).fetchall()
+            }
+        assert {"profile", "scope_id", "business_connection_id"} <= columns
+    finally:
+        migrated.close()
 
 
 def test_side_route_closes_without_rebinding_parent(tmp_path):
@@ -163,6 +272,17 @@ async def test_reply_anchor_prepares_strict_normal_session_route():
 
     await runner._prepare_side_reply_route(event)
 
+    resolver = runner._session_db.resolve_side_message_binding
+    resolver.assert_awaited_once_with(
+        platform="telegram",
+        chat_id="67890",
+        thread_id="42",
+        user_id="12345",
+        profile="",
+        scope_id="",
+        business_connection_id="",
+        message_id="side-response-1",
+    )
     assert event.metadata == {
         "gateway_session_key": "parent:side:side-1",
         "gateway_session_id": "side-tip-2",
@@ -207,6 +327,12 @@ async def test_side_delivery_receipt_records_message_ids():
     })
     await runner._record_side_delivery(event, ["one", "two"])
     assert {call.kwargs["message_id"] for call in record.await_args_list} == {"one", "two"}
+    assert all(call.kwargs["profile"] == "" for call in record.await_args_list)
+    assert all(call.kwargs["scope_id"] == "" for call in record.await_args_list)
+    assert all(
+        call.kwargs["business_connection_id"] == ""
+        for call in record.await_args_list
+    )
 
 
 @pytest.mark.asyncio

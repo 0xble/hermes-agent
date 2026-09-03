@@ -61,8 +61,7 @@ AuxiliaryRouteCallback = Callable[[dict], None]
 # Character cap for the title input at the provider boundary, enforced here
 # as the final boundary regardless of the caller's excerpting.
 MAX_TITLE_INPUT_CHARS = 1000
-MAX_TITLE_ATTACHMENT_PARTS = 4
-_TITLE_ATTACHMENT_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
 
 # Cap on the instant derived title. Deliberately shorter than the model's
 # budget: a raw sentence fragment reads worse the longer it runs. Cline and
@@ -620,36 +619,6 @@ def _clean_title(
     return title or None
 
 
-def _title_attachment_parts(title_context: Any) -> list[dict]:
-    if not isinstance(title_context, list):
-        return []
-    return [
-        dict(part)
-        for part in title_context
-        if isinstance(part, dict)
-        and str(part.get("type") or "").lower() in _TITLE_ATTACHMENT_PART_TYPES
-    ][:MAX_TITLE_ATTACHMENT_PARTS]
-
-
-def _title_request_content(user_snippet: str, title_context: Any) -> Any:
-    """Build bounded provider content without mutating the opening turn."""
-    attachments = _title_attachment_parts(title_context)
-    if not attachments:
-        return user_snippet
-
-    text = user_snippet or "Use the attached content to identify the concrete topic."
-    return [{"type": "text", "text": text}, *attachments]
-
-
-def _attachment_context_rejected(exc: BaseException) -> bool:
-    if isinstance(exc, (TypeError, ValueError)):
-        return True
-    status = getattr(exc, "status_code", None)
-    if status is None:
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-    return status in {400, 415, 422}
-
-
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -698,8 +667,7 @@ def generate_title(
     # over the user's visible instruction.
     summarized_user_message = _summarize_user_message(user_message)
     user_snippet = summarized_user_message[:MAX_TITLE_INPUT_CHARS]
-    has_attachments = bool(_title_attachment_parts(title_context))
-    if not user_snippet.strip() and not has_attachments:
+    if not user_snippet.strip():
         return None
 
     language = _title_language()
@@ -730,22 +698,11 @@ def generate_title(
             require_complete_response=True,
         )
 
-    user_content = _title_request_content(user_snippet, title_context)
-
     try:
-        try:
-            response = _request_title(user_content)
-        except Exception as first_error:
-            if (
-                not isinstance(user_content, list)
-                or not user_snippet.strip()
-                or not _attachment_context_rejected(first_error)
-            ):
-                raise
-            logger.info(
-                "Title route rejected attachment context; retrying with text only"
-            )
-            response = _request_title(user_snippet)
+        # Auxiliary title routes may use a different provider from the main
+        # conversation. Never widen attachment disclosure implicitly: title and
+        # icon generation receive only the bounded text already supplied here.
+        response = _request_title(user_snippet)
         choice = response.choices[0]
         finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
@@ -1010,7 +967,7 @@ def choose_topic_icon(
         {"role": "system", "content": prompt},
         {
             "role": "user",
-            "content": _title_request_content(icon_user_text, title_context),
+            "content": icon_user_text,
         },
     ]
 
@@ -1449,8 +1406,7 @@ def maybe_auto_title(
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
     """
-    has_attachments = bool(_title_attachment_parts(title_context))
-    if not session_db or not session_id or (not user_message and not has_attachments):
+    if not session_db or not session_id or not user_message:
         return
 
     # Count the real questions behind us to detect the opening turn.

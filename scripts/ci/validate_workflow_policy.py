@@ -226,8 +226,8 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                     "run": (
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
-                        "--history-baseline-subject "
-                        "'fix(ci): advance goal guidance maintenance baseline'"
+                        "--history-baseline "
+                        "5657e7cf1a9c9f418c979648ee2d741bcfa1be7e"
                     ),
                 },
                 {

@@ -170,6 +170,7 @@ jobs:
       - js-tests
       - installer-tests
       - rust-tests
+      - e2e-desktop
       - docs-site
       - history-check
       - uv-lockfile

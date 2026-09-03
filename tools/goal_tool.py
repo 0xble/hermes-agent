@@ -44,6 +44,11 @@ _NEGATED_MUTATION_RE = re.compile(
     r"\b(?:set|draft|start|activate|replace|pause|resume|clear|park|wait|unwait|add|remove)\b",
     re.IGNORECASE,
 )
+_NEGATED_ACTION_OBJECT_RE = re.compile(
+    r"\b(?:but\s+not|not|except)\b[^.!?\n]{0,48}"
+    r"\b(?:goal|subgoals?|(?:quality\s+)?gates?|wait(?:\s+barrier)?)\b",
+    re.IGNORECASE,
+)
 _REPLACEMENT_RE = re.compile(
     r"(?:\b(?:replace|overwrite|supersede|switch|change)\b.{0,80}\b(?:standing\s+|active\s+|current\s+)?goal\b"
     r"|\b(?:standing\s+|active\s+|current\s+)?goal\b.{0,80}\b(?:replace|overwrite|supersede|switch|change)\b)",
@@ -206,7 +211,11 @@ def _authorized_action(
     if auth_start < 0:
         return False, "authorization_not_in_current_turn", ""
     context = _authorization_sentence(task_text, auth_start, len(auth_text))
-    if _NEGATED_ACTIVATION_RE.search(context) or _NEGATED_MUTATION_RE.search(context):
+    if (
+        _NEGATED_ACTIVATION_RE.search(context)
+        or _NEGATED_MUTATION_RE.search(context)
+        or _NEGATED_ACTION_OBJECT_RE.search(context)
+    ):
         return False, "", context
     prefix = task_text[:auth_start]
     suffix = task_text[auth_start + len(auth_text) :]

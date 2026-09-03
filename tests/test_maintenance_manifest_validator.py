@@ -158,6 +158,20 @@ def test_unindexed_fork_subject_is_rejected(tmp_path):
     assert "fork-only subject is neither indexed nor exempt: fix: orphan" in errors
 
 
+def test_duplicate_post_baseline_commit_subject_is_rejected(tmp_path):
+    repo, _manifest, baseline = _init_history_repo(tmp_path)
+    (repo / "duplicate.py").write_text("duplicate = True\n", encoding="utf-8")
+    _git(repo, "add", "duplicate.py")
+    _git(repo, "commit", "-m", "fix: one")
+
+    errors = _validate_registration_history(repo, baseline)
+
+    assert any(
+        "fork commit reuses an earlier subject" in error and "fix: one" in error
+        for error in errors
+    )
+
+
 def test_explicit_administrative_subject_exemption_is_accepted(tmp_path):
     path = _write(
         tmp_path,
@@ -281,7 +295,7 @@ def test_trusted_policy_validates_immutable_pull_request_head():
     assert "HEAD:refs/remotes/canonical-upstream/main" in workflow
 
 
-def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_path):
+def test_history_validation_includes_merge_commits(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init")
@@ -306,6 +320,7 @@ def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_pat
     )
     _git(repo, "add", "MAINTENANCE.md")
     _git(repo, "commit", "-m", "fix: one")
+    baseline = _git(repo, "rev-parse", "HEAD")
     fork_branch = _git(repo, "branch", "--show-current")
 
     _git(repo, "checkout", "canonical")
@@ -325,23 +340,23 @@ def test_history_validation_ignores_canonical_upstream_commits_and_merge(tmp_pat
     _git(repo, "commit", "-m", "fix: registered")
     _git(repo, "merge", "--no-ff", "canonical", "-m", "Merge canonical upstream")
 
+    errors = _validate_registration_history(repo, baseline)
+    assert any(
+        "fork subject was not registered in its own commit" in error
+        and "Merge canonical upstream" in error
+        for error in errors
+    )
+
+
+def test_subject_only_history_baseline_is_rejected(tmp_path):
+    repo, _manifest, _baseline = _init_history_repo(tmp_path)
+
     assert _validate_registration_history(
         repo,
         None,
         upstream_ref="canonical",
         baseline_subject="fix: one",
-    ) == []
-
-    (repo / "duplicate.txt").write_text("duplicate marker\n", encoding="utf-8")
-    _git(repo, "add", "duplicate.txt")
-    _git(repo, "commit", "-m", "fix: one")
-
-    errors = _validate_registration_history(
-        repo,
-        None,
-        upstream_ref="canonical",
-        baseline_subject="fix: one",
-    )
-    assert errors == [
-        "maintenance history baseline subject must occur exactly once: fix: one"
+    ) == [
+        "subject-only maintenance history baselines are unsafe; pass an exact "
+        "trusted commit with --history-baseline"
     ]

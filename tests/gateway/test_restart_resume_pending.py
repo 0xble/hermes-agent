@@ -137,6 +137,29 @@ async def test_restart_drain_busy_reply_is_ephemeral_not_a_final_obligation():
     assert "queued for the next turn" in response
 
 
+@pytest.mark.asyncio
+async def test_restart_drain_raw_send_receives_plain_text():
+    runner, adapter = make_restart_runner()
+    runner._draining = True
+    runner._restart_requested = True
+    runner._busy_input_mode = "queue"
+    runner._persist_restart_inbox_event = AsyncMock(return_value=True)
+    source = make_restart_source()
+    event = MessageEvent(
+        text="continue after restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        user_id=source.user_id,
+        message_id="incoming-1",
+    )
+
+    assert await runner._handle_active_session_busy_message(event, "session-key")
+    sent = getattr(adapter, "sent")
+    assert sent
+    assert type(sent[-1]) is str
+    assert "queued for the next turn" in sent[-1]
+
+
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
     return SessionSource(platform=platform, chat_id=chat_id, user_id=user_id)
 

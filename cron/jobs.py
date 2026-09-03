@@ -3182,16 +3182,32 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
 
 
 def remove_job(job_id: str) -> bool:
-    """Remove a job by ID or name."""
+    """Remove an idle job by ID or name.
+
+    A durable fire claim is ownership, not stale decoration. The explicit
+    stop/recovery path must release it before deletion can revoke the runner's
+    identity and erase its completion target.
+    """
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
-    with _jobs_lock():
-        jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) < original_len:
+    with _fire_job_lock(canonical_id) as acquired:
+        if not acquired:
+            raise RuntimeError(
+                f"Cannot remove cron job {canonical_id}: its fire-claim fence is busy"
+            )
+        with _jobs_lock():
+            jobs = load_jobs()
+            current = next((item for item in jobs if item.get("id") == canonical_id), None)
+            if current is None:
+                return False
+            if isinstance(current.get("fire_claim"), dict):
+                raise RuntimeError(
+                    f"Cannot remove cron job {canonical_id}: it has an active fire claim; "
+                    "stop the run and release its claim first"
+                )
+            jobs = [item for item in jobs if item.get("id") != canonical_id]
             # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
             # left over from before the create-time guard) fails closed without
             # half-applying the removal.
@@ -3213,9 +3229,9 @@ def remove_job(job_id: str) -> bool:
                 )
             # Prune the per-job fire-fence lock entry so the registry does
             # not grow monotonically across create/remove cycles.
-            _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
+            fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
             with _fire_fence_locks_guard:
-                _fire_fence_locks.pop(_fence_key, None)
+                _fire_fence_locks.pop(fence_key, None)
             return True
     return False
 

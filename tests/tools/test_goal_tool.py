@@ -459,6 +459,8 @@ def test_goal_action_labels_are_semantic():
         ("Explain why you should pause the goal.", "pause the goal"),
         ("Pause the goal. Actually, don't pause it.", "Pause the goal"),
         ("Pause the goal. Actually, don't.", "Pause the goal"),
+        ("Pause, but not the goal.", "Pause, but not the goal"),
+        ("Pause everything except the goal.", "Pause everything except the goal"),
     ],
 )
 def test_mutations_reject_non_direct_or_later_revoked_authority(

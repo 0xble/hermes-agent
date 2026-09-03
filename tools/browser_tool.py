@@ -1963,6 +1963,10 @@ def _real_profile_cdp(
                     return None, conflict
                 return cached, None
             _agent_browser_close_session(session_name)
+            # A failed CDP ownership probe does not prove the directly launched
+            # Chromium process exited. Stop the tracked snapshot owner before
+            # any later overlay can rewrite its credential databases.
+            _stop_real_profile_browser(cache_key)
         _real_profile_cdp_cache.pop(cache_key, None)
         _real_profile_headed_modes.pop(cache_key, None)
         if identity is not None:

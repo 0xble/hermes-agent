@@ -21,7 +21,7 @@ def _duplicates(values: Iterable[str]) -> list[str]:
     return sorted(value for value, count in Counter(values).items() if count > 1)
 
 
-def _fork_subjects(repo: Path, upstream_ref: str) -> set[str]:
+def _fork_subjects(repo: Path, upstream_ref: str) -> list[str]:
     result = subprocess.run(
         ["git", "log", "--format=%s", f"{upstream_ref}..HEAD"],
         cwd=repo,
@@ -29,7 +29,7 @@ def _fork_subjects(repo: Path, upstream_ref: str) -> set[str]:
         text=True,
         capture_output=True,
     )
-    return {line for line in result.stdout.splitlines() if line}
+    return [line for line in result.stdout.splitlines() if line]
 
 
 def _registered_subjects(text: str) -> set[str]:
@@ -64,46 +64,12 @@ def _validate_registration_history(
     baseline_subject: str | None = None,
 ) -> list[str]:
     """Reject fork commits registered only by a later descendant."""
-    if upstream_ref and baseline_subject:
-        try:
-            commits = subprocess.run(
-                [
-                    "git", "rev-list", "--reverse", "--no-merges",
-                    f"{upstream_ref}..HEAD",
-                ],
-                cwd=repo,
-                check=True,
-                text=True,
-                capture_output=True,
-            ).stdout.splitlines()
-        except subprocess.CalledProcessError as exc:
-            return [
-                f"could not read fork history from {upstream_ref}: "
-                f"git exited {exc.returncode}"
-            ]
-        marker_indexes = []
-        for index, commit in enumerate(commits):
-            subject = subprocess.run(
-                ["git", "show", "-s", "--format=%s", commit],
-                cwd=repo,
-                check=True,
-                text=True,
-                capture_output=True,
-            ).stdout.strip()
-            if subject == baseline_subject:
-                marker_indexes.append(index)
-        if not marker_indexes:
-            return [
-                "maintenance history baseline subject is absent from fork history: "
-                + baseline_subject
-            ]
-        if len(marker_indexes) != 1:
-            return [
-                "maintenance history baseline subject must occur exactly once: "
-                + baseline_subject
-            ]
-        commits = commits[marker_indexes[0] + 1 :]
-    elif baseline is not None:
+    if baseline_subject is not None:
+        return [
+            "subject-only maintenance history baselines are unsafe; pass an exact "
+            "trusted commit with --history-baseline"
+        ]
+    if baseline is not None:
         try:
             subprocess.run(
                 ["git", "merge-base", "--is-ancestor", baseline, "HEAD"],
@@ -126,6 +92,19 @@ def _validate_registration_history(
         return ["maintenance history validation requires a baseline"]
 
     errors: list[str] = []
+    prior_subjects: set[str] = set()
+    if baseline is not None:
+        prior_subjects = {
+            line
+            for line in subprocess.run(
+                ["git", "log", "--format=%s", baseline],
+                cwd=repo,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            if line
+        }
     for commit in commits:
         subject = subprocess.run(
             ["git", "show", "-s", "--format=%s", commit],
@@ -134,6 +113,11 @@ def _validate_registration_history(
             text=True,
             capture_output=True,
         ).stdout.strip()
+        if subject in prior_subjects:
+            errors.append(
+                f"fork commit reuses an earlier subject {commit[:12]}: {subject}"
+            )
+        prior_subjects.add(subject)
         manifest = subprocess.run(
             ["git", "show", f"{commit}:MAINTENANCE.md"],
             cwd=repo,
@@ -152,7 +136,7 @@ def validate_manifest(
     path: Path,
     *,
     upstream_ref: str | None = None,
-    fork_subjects: set[str] | None = None,
+    fork_subjects: Iterable[str] | None = None,
     history_baseline: str | None = None,
     history_baseline_subject: str | None = None,
 ) -> list[str]:
@@ -255,22 +239,23 @@ def validate_manifest(
             )
 
     if fork_subjects is not None:
+        fork_subject_set = set(fork_subjects)
         coverage_label = f"{upstream_ref}..HEAD" if upstream_ref else "fork history"
         indexed_subjects = {
             subject for _patch_id, _status, subjects in rows for subject in subjects
         }
         for patch_id, _status, subjects in rows:
             for subject in subjects:
-                if subject not in fork_subjects:
+                if subject not in fork_subject_set:
                     errors.append(
                         f"{patch_id} stable subject missing from "
                         f"{coverage_label}: {subject}"
                     )
-        for subject in sorted(fork_subjects - indexed_subjects - set(exemptions)):
+        for subject in sorted(fork_subject_set - indexed_subjects - set(exemptions)):
             errors.append(
                 "fork-only subject is neither indexed nor exempt: " + subject
             )
-        for subject in sorted(set(exemptions) - fork_subjects):
+        for subject in sorted(set(exemptions) - fork_subject_set):
             errors.append(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )

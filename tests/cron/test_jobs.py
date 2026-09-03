@@ -462,6 +462,18 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
+    def test_remove_job_rejects_a_durable_fire_claim(self, tmp_cron_dir):
+        job = create_job(prompt="Still running", schedule="30m")
+        claimed = claim_job_for_fire(job["id"], force=True, return_job=True)
+        assert isinstance(claimed, dict)
+
+        with pytest.raises(RuntimeError, match="active fire claim"):
+            remove_job(job["id"])
+
+        persisted = get_job(job["id"])
+        assert persisted is not None
+        assert persisted["fire_claim"] == claimed["fire_claim"]
+
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):
         job = create_job(prompt="One-shot", schedule="in 1h")

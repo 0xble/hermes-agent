@@ -972,43 +972,46 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
-    result = _cron_api(
-        action="update",
-        job_id=args.job_id,
-        schedule=getattr(args, "schedule", None),
-        prompt=getattr(args, "prompt", None),
-        name=getattr(args, "name", None),
-        deliver=getattr(args, "deliver", None),
-        failure_deliver=getattr(args, "failure_deliver", None),
-        repeat=getattr(args, "repeat", None),
-        skills=final_skills,
-        script=getattr(args, "script", None),
-        workdir=getattr(args, "workdir", None),
-        model=getattr(args, "model", None),
-        provider=getattr(args, "model_provider", None),
-        no_agent=getattr(args, "no_agent", None),
-        monitor_script=getattr(args, "monitor_script", None),
-        monitor_url=getattr(args, "monitor_url", None),
-        continuity=getattr(args, "continuity", None),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
-        run_budget_seconds=getattr(args, "run_budget_seconds", None),
-        timezone=getattr(args, "timezone", None),
-        allow_messaging=getattr(args, "allow_messaging", None),
-    )
-    if not result.get("success"):
-        print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
-        return 1
+    update_kwargs = {
+        "schedule": getattr(args, "schedule", None),
+        "prompt": getattr(args, "prompt", None),
+        "name": getattr(args, "name", None),
+        "deliver": getattr(args, "deliver", None),
+        "failure_deliver": getattr(args, "failure_deliver", None),
+        "repeat": getattr(args, "repeat", None),
+        "skills": final_skills,
+        "script": getattr(args, "script", None),
+        "workdir": getattr(args, "workdir", None),
+        "model": getattr(args, "model", None),
+        "provider": getattr(args, "model_provider", None),
+        "no_agent": getattr(args, "no_agent", None),
+        "monitor_script": getattr(args, "monitor_script", None),
+        "monitor_url": getattr(args, "monitor_url", None),
+        "continuity": getattr(args, "continuity", None),
+        "reasoning_effort": getattr(args, "reasoning_effort", None),
+        "run_budget_seconds": getattr(args, "run_budget_seconds", None),
+        "timezone": getattr(args, "timezone", None),
+        "allow_messaging": getattr(args, "allow_messaging", None),
+    }
+    if any(value is not None for value in update_kwargs.values()):
+        result = _cron_api(action="update", job_id=args.job_id, **update_kwargs)
+        if not result.get("success"):
+            print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
+            return 1
+    else:
+        from tools.cronjob_tools import _format_job
+
+        result = {"success": True, "job": _format_job(job)}
 
     if completion_script is not None:
         try:
-            _set_completion_script(job["id"], completion_script)
+            updated_job = _set_completion_script(job["id"], completion_script)
         except Exception as exc:
             print(color(f"Failed to update completion verifier: {exc}", Colors.RED))
             return 1
-        if completion_script:
-            result.setdefault("job", {})["completion_script"] = completion_script
-        else:
-            result.setdefault("job", {}).pop("completion_script", None)
+        from tools.cronjob_tools import _format_job
+
+        result["job"] = _format_job(updated_job)
 
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))

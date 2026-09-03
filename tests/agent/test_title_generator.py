@@ -42,7 +42,7 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=response):
             assert generate_title("財務テーブルを確認") == "財務テーブル"
 
-    def test_includes_native_image_in_title_request(self):
+    def test_does_not_forward_native_image_to_title_route(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "Hermes Attachment Topics"}'
@@ -61,55 +61,18 @@ class TestGenerateTitle:
             )
 
         assert title == "Hermes Attachment Topics"
-        assert llm.call_args.kwargs["messages"][1]["content"] == [
-            {"type": "text", "text": "Autofix this"},
-            image_part,
-        ]
+        assert llm.call_args.kwargs["messages"][1]["content"] == "Autofix this"
 
-    def test_image_only_title_request_uses_attachment_context(self):
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Telegram Error Screenshot"}'
+    def test_image_only_title_request_does_not_call_auxiliary_route(self):
         image_part = {
             "type": "image_url",
             "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
         }
 
-        with patch("agent.title_generator.call_llm", return_value=response) as llm:
-            title = generate_title("", title_context=[image_part])
+        with patch("agent.title_generator.call_llm") as llm:
+            assert generate_title("", title_context=[image_part]) is None
 
-        assert title == "Telegram Error Screenshot"
-        assert llm.call_args.kwargs["messages"][1]["content"] == [
-            {
-                "type": "text",
-                "text": "Use the attached content to identify the concrete topic.",
-            },
-            image_part,
-        ]
-
-    def test_retries_text_only_when_title_route_rejects_attachment_context(self):
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Hermes Attachment Topics"}'
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
-        }
-
-        with patch(
-            "agent.title_generator.call_llm",
-            side_effect=[TypeError("image parts unsupported"), response],
-        ) as llm:
-            title = generate_title(
-                "Hermes attachment topic metadata",
-                title_context=[image_part],
-            )
-
-        assert title == "Hermes Attachment Topics"
-        assert llm.call_count == 2
-        assert llm.call_args.kwargs["messages"][1]["content"] == (
-            "Hermes attachment topic metadata"
-        )
+        llm.assert_not_called()
 
     def test_title_language_reads_config(self):
         cfg = {"auxiliary": {"title_generation": {"language": "  French "}}}
@@ -659,7 +622,7 @@ class TestGenerateTitle:
 
 
 class TestChooseTopicIcon:
-    def test_includes_native_image_in_icon_request(self):
+    def test_does_not_forward_native_image_to_icon_route(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = "🎨"
@@ -680,13 +643,9 @@ class TestChooseTopicIcon:
             )
 
         assert selected == "🎨"
-        assert llm.call_args.kwargs["messages"][1]["content"] == [
-            {
-                "type": "text",
-                "text": "Title: Hermes Attachment Topics\nOpening request: Autofix this",
-            },
-            image_part,
-        ]
+        assert llm.call_args.kwargs["messages"][1]["content"] == (
+            "Title: Hermes Attachment Topics\nOpening request: Autofix this"
+        )
 
     def test_requests_up_to_six_ranked_unicode_selectors(self):
         mock_response = MagicMock()
@@ -1008,9 +967,7 @@ class TestAutoTitleSession:
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
-    def test_image_only_opener_starts_worker_with_attachment_context(self, tmp_path):
-        import threading
-
+    def test_image_only_opener_does_not_start_auxiliary_worker(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="telegram")
         title_context = [
@@ -1019,9 +976,7 @@ class TestMaybeAutoTitle:
                 "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
             }
         ]
-        called = threading.Event()
         with patch("agent.title_generator.auto_title_session") as worker:
-            worker.side_effect = lambda *_args, **_kwargs: called.set()
             maybe_auto_title(
                 db,
                 "sess-1",
@@ -1029,9 +984,8 @@ class TestMaybeAutoTitle:
                 [],
                 title_context=title_context,
             )
-            assert called.wait(timeout=10), "auto-title worker never ran"
 
-        assert worker.call_args.kwargs["title_context"] == title_context
+        worker.assert_not_called()
 
     def test_skips_if_not_first_exchange(self):
         """Should not fire once the conversation is past its opening turn."""

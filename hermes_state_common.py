@@ -354,7 +354,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -513,11 +513,17 @@ CREATE TABLE IF NOT EXISTS side_message_bindings (
     chat_id TEXT NOT NULL,
     thread_id TEXT NOT NULL DEFAULT '',
     user_id TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    scope_id TEXT NOT NULL DEFAULT '',
+    business_connection_id TEXT NOT NULL DEFAULT '',
     message_id TEXT NOT NULL,
     side_route_key TEXT NOT NULL,
     side_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     created_at REAL NOT NULL,
-    PRIMARY KEY (platform, chat_id, thread_id, user_id, message_id)
+    PRIMARY KEY (
+        platform, chat_id, thread_id, user_id, profile, scope_id,
+        business_connection_id, message_id
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_side_message_bindings_route

@@ -124,6 +124,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-100 | Active | `fix(reconcile): preserve scoped cwd and canonical title contracts` | Keep automatic title protection for a hidden canonical Bot Chat inside the title writer's tuple-return contract. |
 | HERMES-101 | Active | `fix(profiles): tolerate transient macOS process access` | Keep profile deletion resilient when macOS denies or races a process command-line read. |
 | HERMES-102 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
+| HERMES-103 | Active | `fix(maintenance): close candidate safety gates` | Preserve exact cron ownership, transport-scoped side replies, explicit goal authorization, typed drain replies, auxiliary attachment privacy, snapshot ownership, and trusted fork-history policy. |
 | HERMES-104 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Keep manually pooled Codex OAuth accounts from adopting another account's singleton auth-store tokens. |
 
 
@@ -221,6 +222,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subject `fix(auth): isolate manually added Codex accounts (#46)`; source, regression, and this record ship together.
 - **Rollback:** Revert the stable subject only if manual Codex entries are removed or receive a separate account-bound resynchronization source. No persistent schema changes are involved.
 - **Retirement:** Retire after released upstream distinguishes singleton-seeded and manual Codex accounts at the auth-store synchronization boundary and passes equivalent multi-account regression coverage.
+
+### HERMES-103 — Close candidate safety gates
+
+- **Independent hypothesis (2026-09-03):** Exact-candidate review and live cron behavior exposed related fail-open boundaries: a completion-verifier-only edit was discarded before its trusted write, durable fire ownership could be deleted, side reply keys omitted transport tenancy, object-level negation could authorize goal mutation, a direct drain send retained its sentinel type, auxiliary title calls forwarded native attachments to separately routed providers, stale Chromium ownership could survive before snapshot overlay, and fork-history validation trusted mutable subjects while collapsing duplicates and skipping merges.
+- **Summary:** Treat the CLI-owned completion verifier as a complete edit, fence removal and reject any durable fire claim until an explicit stop/release path clears it, key side reply bindings by profile/workspace/business identity with an on-open database migration, reject negated goal objects, send plain text through the raw drain path, keep title/icon auxiliary calls text-only, stop tracked snapshot browsers before resnapshotting after a stale CDP probe, include Desktop E2E in the aggregate dependency set, and validate every uniquely-subjected commit and merge after an exact trusted baseline SHA.
+- **Surfaces:** `.github/workflows/ci.yaml`; `.github/workflows/fork-policy.yml`; `agent/title_generator.py`; `cron/jobs.py`; `gateway/run.py`; `hermes_cli/cron.py`; `hermes_state.py`; `hermes_state_common.py`; `hermes_state_schema.py`; `scripts/validate_maintenance_manifest.py`; `tools/browser_tool.py`; `tools/goal_tool.py`; focused title, browser, cron, gateway, goal, schema, and maintenance-validator regressions; this record.
+- **Upstream tracking:** These repairs preserve fork-only contracts or harden fork-specific policy; no released upstream replacement was identified as of 2026-09-03.
+- **Upstream PR:** None.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_title_generator.py tests/tools/test_browser_identity.py tests/hermes_cli/test_cron.py tests/cron/test_jobs.py tests/gateway/test_restart_resume_pending.py tests/gateway/test_side_continuation.py tests/tools/test_goal_tool.py tests/test_maintenance_manifest_validator.py -q`; the repository workflow-policy, manifest, Windows, JavaScript, and full Python gates remain mandatory.
+- **Expected published commit identity:** Stable subject `fix(maintenance): close candidate safety gates`; source, migrations, regressions, policy, and this record ship together.
+- **Rollback:** Revert the stable subject only after stopping claimed cron runs and confirming no scoped side bindings depend on the v31 key. Restore the prior schema version and policy baseline together; do not partially roll back trust-boundary checks.
+- **Retirement:** Retire individual behavior only after released upstream supplies an equivalent fail-closed contract and focused proof. Keep the remaining checks and compact this record rather than removing the whole patch as one unit.
 
 ### HERMES-102 — Verify observable agent completion
 

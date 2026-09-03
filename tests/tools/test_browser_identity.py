@@ -810,7 +810,9 @@ class TestNamedRealProfileProcesses:
         fresh = "http://127.0.0.1:9301"
         bt._real_profile_cdp_cache[cache_key] = stale
         closed = []
+        stopped = []
         cdp_results = iter([None, fresh])
+        bt._real_profile_browser_processes[cache_key] = (None, str(snapshot))
 
         monkeypatch.setattr(
             "hermes_cli.browser_identity.read_browser_identity_config",
@@ -840,6 +842,11 @@ class TestNamedRealProfileProcesses:
             "_agent_browser_close_session",
             lambda name, **_kwargs: closed.append(name),
         )
+        monkeypatch.setattr(
+            bc,
+            "stop_snapshot_browser_processes",
+            lambda root: stopped.append(root) or 1,
+        )
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
         monkeypatch.setattr(
             bt.subprocess,
@@ -850,6 +857,7 @@ class TestNamedRealProfileProcesses:
         result, err = bt._real_profile_cdp("lpg")
         assert err is None and result == fresh
         assert closed == [session_name]
+        assert stopped == [str(snapshot)]
         assert bt._real_profile_cdp_cache[cache_key] == fresh
 
     def test_recovers_direct_browser_before_snapshot_overlay(

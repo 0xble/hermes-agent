@@ -11723,7 +11723,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
-                content=message,
+                content=str(message),
                 reply_to=(
                     reply_anchor
                     if event.source.platform == Platform.TELEGRAM
@@ -19542,6 +19542,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_id=str(source.chat_id or ""),
             thread_id=str(source.thread_id or ""),
             user_id=user_id,
+            profile=str(source.profile or ""),
+            scope_id=str(source.scope_id or ""),
+            business_connection_id=str(source.business_connection_id or ""),
             message_id=reply_id,
         )
         binding = (
@@ -19606,6 +19609,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=str(source.chat_id or ""),
                 thread_id=str(source.thread_id or ""),
                 user_id=user_id,
+                profile=str(source.profile or ""),
+                scope_id=str(source.scope_id or ""),
+                business_connection_id=str(source.business_connection_id or ""),
                 message_id=message_id,
                 side_route_key=route_key,
                 side_root_session_id=root_id,
