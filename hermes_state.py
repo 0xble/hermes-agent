@@ -11390,7 +11390,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "identity, and renaming it would orphan the conversation. "
                         "To start fresh, create a new bot instead."
                     )
-                return 0
+                return 0, current["title"]
             if not is_user and current["title"] is not None:
                 if self._title_rank(current["title_source"]) >= new_rank:
                     return 0, current["title"]

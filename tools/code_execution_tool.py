@@ -2297,8 +2297,8 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = None
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
-    from agent.runtime_cwd import scope_terminal_cwd
-    raw = scope_terminal_cwd().strip()
+    from agent.runtime_cwd import resolve_tool_cwd
+    raw = resolve_tool_cwd().strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):

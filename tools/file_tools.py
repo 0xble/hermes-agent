@@ -312,6 +312,21 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     registered = _registered_task_cwd_override(task_id)
     if registered:
         return registered
+
+    # Gateway turns bind their logical workspace in a ContextVar. A fresh
+    # turn may not have run a terminal command yet, so there is no recorded
+    # per-session cwd to consult above. Resolve the scoped value before the
+    # process-wide TERMINAL_CWD fallback, which can belong to a concurrent
+    # cron turn in the same gateway process.
+    try:
+        from agent.runtime_cwd import resolve_tool_cwd
+
+        scoped = resolve_tool_cwd()
+    except Exception:
+        scoped = ""
+    if scoped:
+        return scoped
+
     return _configured_terminal_cwd()
 
 

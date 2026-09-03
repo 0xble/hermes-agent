@@ -138,13 +138,20 @@ def format_runtime_footer(
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
         elif field == "cwd":
-            try:
-                from tools.terminal_scope import terminal_env as _tenv
-            except ImportError:
-                env_cwd = os.environ.get("TERMINAL_CWD", "")
-            else:
-                env_cwd = _tenv("TERMINAL_CWD", "")
-            rel = _home_relative_cwd(cwd or env_cwd)
+            effective_cwd = cwd
+            if effective_cwd is None:
+                try:
+                    from agent.runtime_cwd import resolve_tool_cwd
+
+                    effective_cwd = resolve_tool_cwd()
+                except Exception:
+                    try:
+                        from tools.terminal_scope import terminal_env as _tenv
+                    except ImportError:
+                        effective_cwd = os.environ.get("TERMINAL_CWD", "")
+                    else:
+                        effective_cwd = _tenv("TERMINAL_CWD", "")
+            rel = _home_relative_cwd(effective_cwd or "")
             if rel:
                 parts.append(rel)
         # Unknown field names are silently ignored.
