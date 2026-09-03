@@ -317,6 +317,7 @@ class TestDeleteProfile:
         set_active_profile("coder")
 
         with patch("hermes_cli.profiles._cleanup_gateway_service"), \
+             patch("hermes_cli.profiles._stop_profile_backends"), \
              patch("hermes_cli.profiles.time.sleep"), \
              patch("hermes_cli.profiles.shutil.rmtree", side_effect=PermissionError("locked")):
             with pytest.raises(RuntimeError, match="Could not remove profile directory"):
@@ -324,6 +325,50 @@ class TestDeleteProfile:
 
         assert profile_dir.is_dir()
         assert get_active_profile() == "default"
+
+    def test_backend_scan_defers_process_attributes_to_guarded_body(
+        self, profile_env, monkeypatch
+    ):
+        """One protected macOS process must not abort the profile scan."""
+        import hermes_cli.profiles as profiles
+
+        profile_dir = create_profile("coder", no_alias=True)
+
+        class CurrentProc:
+            pid = os.getpid()
+
+            def parents(self):
+                return []
+
+            def username(self):
+                return "brian"
+
+        class ProtectedProc:
+            pid = os.getpid() + 1000
+
+            def name(self):
+                return "python3"
+
+            def username(self):
+                return "brian"
+
+            def cmdline(self):
+                raise SystemError("process vanished during KERN_PROCARGS2")
+
+        def process_iter(attrs=None):
+            assert attrs is None
+            return iter([ProtectedProc()])
+
+        fake_psutil = types.SimpleNamespace(
+            process_iter=process_iter,
+            Process=lambda pid=None: CurrentProc(),
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+            AccessDenied=type("AccessDenied", (Exception,), {}),
+            ZombieProcess=type("ZombieProcess", (Exception,), {}),
+        )
+        monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+        assert profiles._profile_bound_backend_pids("coder", profile_dir) == []
 
 
 

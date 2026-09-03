@@ -122,6 +122,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
 | HERMES-099 | Active | `fix(desktop): preserve expanded remote update mutex paths` | Keep the Desktop SSH lifecycle mutex inside the selected remote Hermes home instead of creating a quote-bearing relative path. |
 | HERMES-100 | Active | `fix(reconcile): preserve scoped cwd and canonical title contracts` | Keep automatic title protection for a hidden canonical Bot Chat inside the title writer's tuple-return contract. |
+| HERMES-101 | Active | `fix(profiles): tolerate transient macOS process access` | Keep profile deletion resilient when macOS denies or races a process command-line read. |
 
 ## Fork-only administrative subject exemptions
 
@@ -205,6 +206,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-101 — Keep profile deletion resilient to transient process access failures
+
+- **Independent hypothesis (2026-09-03):** `psutil.process_iter([...])` eagerly populated `proc.info` before the loop body. On macOS, a process that became protected or disappeared during `KERN_PROCARGS2` raised outside the existing per-process guard and aborted profile deletion.
+- **Summary:** Enumerate process objects without eager attributes, then read name, user, and command line inside the existing guarded body. A transiently unreadable process is skipped while profile-bound backend matching remains unchanged.
+- **Surfaces:** `hermes_cli/profiles.py`; `tests/hermes_cli/test_profiles.py`; this record.
+- **Upstream tracking:** Current upstream `63279301bcbdc185c1b07b98a9312eb0c862f26d` still requests eager process attributes. No released fix was identified.
+- **Upstream PR:** None identified at the frozen cutoff.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_profiles.py -q`; a deterministic protected-process double must be skipped and the rmtree-failure test must not depend on the live host process table.
+- **Expected published commit identity:** Stable subject `fix(profiles): tolerate transient macOS process access`; source, regression, and this record ship together.
+- **Rollback:** Revert the stable subject and remove HERMES-101's row and record; profile deletion may again abort when macOS denies a concurrent process command-line read.
+- **Retirement:** Retire after released upstream defers process attributes into per-process error guards and passes the focused regression.
 
 ### HERMES-100 — Preserve canonical Bot Chat automatic-title protection
 

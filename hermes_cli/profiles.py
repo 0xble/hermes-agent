@@ -1562,9 +1562,19 @@ def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
     _HERMES_CONSOLE_SCRIPT_NAMES = frozenset({"hermes", "hermes-agent", "hermes-acp"})
     pids: list[int] = []
 
-    for proc in psutil.process_iter(["pid", "name", "username", "cmdline"]):
+    # Do not request eager attrs from process_iter. On macOS a process can
+    # disappear or become protected while psutil is building proc.info, which
+    # raises before the loop body can apply its per-process guards.
+    for proc in psutil.process_iter(attrs=None):
         try:
-            info = proc.info
+            info = getattr(proc, "info", None)
+            if not isinstance(info, dict):
+                info = {
+                    "pid": proc.pid,
+                    "name": proc.name(),
+                    "username": proc.username(),
+                    "cmdline": proc.cmdline(),
+                }
             pid = info.get("pid")
             if pid is None or pid in skip:
                 continue
