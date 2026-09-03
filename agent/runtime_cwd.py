@@ -72,13 +72,13 @@ def resolve_tool_cwd() -> str:
     """Return the cwd for prompt and tool consumers in this execution context.
 
     A bound session value wins even when it is explicitly empty.  Only
-    unbound CLI/one-shot contexts may fall back to process-global
-    ``TERMINAL_CWD``.
+    unbound CLI/one-shot contexts may fall back to the scope-aware
+    ``TERMINAL_CWD`` carrier.
     """
     bound, override = _session_cwd_state()
     if bound:
         return override
-    return os.environ.get("TERMINAL_CWD", "").strip()
+    return _terminal_cwd_env().strip()
 
 
 def _terminal_cwd_env() -> str:

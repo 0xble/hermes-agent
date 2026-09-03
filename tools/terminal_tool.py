@@ -1650,7 +1650,7 @@ def _safe_getcwd() -> str:
     except (FileNotFoundError, PermissionError):
         from agent.runtime_cwd import resolve_tool_cwd
 
-        return _tenv() or os.path.expanduser("~")
+        return resolve_tool_cwd() or os.path.expanduser("~")
 
 
 # Path prefixes that identify a *host* working directory which cannot exist
@@ -1854,7 +1854,7 @@ def _get_env_config() -> Dict[str, Any]:
     # normal sandbox behavior and discard host paths.
     from agent.runtime_cwd import resolve_tool_cwd
 
-    resolved_cwd = _tenv()
+    resolved_cwd = resolve_tool_cwd()
     cwd = resolved_cwd or default_cwd
     from hermes_cli.config import _is_ssh_remote_tilde_cwd
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):

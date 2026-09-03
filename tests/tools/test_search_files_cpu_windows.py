@@ -40,7 +40,7 @@ def test_same_backend_class_and_root_serialize_five_filename_walks():
     maximum_active = 0
     completed = 0
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         nonlocal active, maximum_active, completed
         with counter_lock:
             active += 1
@@ -70,7 +70,7 @@ def test_same_backend_class_and_root_serialize_five_filename_walks():
 def test_different_roots_can_enter_filename_walks_together():
     both_entered = threading.Barrier(2)
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         both_entered.wait(5)
         return SearchResult(files=[str(path)], total_count=1)
 
@@ -90,7 +90,7 @@ def test_different_backend_classes_can_walk_the_same_root_together():
 
     both_entered = threading.Barrier(2)
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         both_entered.wait(5)
         return SearchResult(files=[str(path)], total_count=1)
 
@@ -112,7 +112,7 @@ def test_overlapping_multi_root_sets_are_claimed_atomically(monkeypatch):
     active = 0
     maximum_active = 0
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         nonlocal active, maximum_active
         with lock:
             active += 1
@@ -153,7 +153,7 @@ def test_interrupted_waiter_returns_without_dispatch_or_late_dispatch(monkeypatc
     waiter_tid = []
     dispatches = []
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         dispatches.append(threading.get_ident())
         holder_entered.set()
         assert release_holder.wait(5)
@@ -198,7 +198,7 @@ def test_interrupt_published_after_final_sample_prevents_filename_dispatch(monke
     worker_tid = []
     dispatches = []
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         dispatches.append(threading.get_ident())
         return SearchResult(files=[str(path)], total_count=1)
 
@@ -240,7 +240,7 @@ def test_interrupt_published_after_final_sample_prevents_filename_dispatch(monke
 
 
 def test_empty_filename_roots_are_rejected_before_engine_resolution():
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         raise AssertionError("filename engine dispatched")
 
     operations = _operations(RemoteEnvironment(), scan)
@@ -258,7 +258,7 @@ def test_empty_filename_roots_are_rejected_before_engine_resolution():
 def test_admission_releases_after_every_base_exception_path(raised):
     attempts = 0
 
-    def scan(self, pattern, path, limit, offset, order, rg_executable=None):
+    def scan(self, pattern, path, limit, offset, order, rg_executable=None, **_kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
