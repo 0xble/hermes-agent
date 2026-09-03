@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import shutil
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -240,15 +242,26 @@ class TestGuidanceNeverNamesLiveDb:
         assert ".recover\"`" not in message
         assert "do NOT" in message
 
-    def test_forensic_backup_refusals_name_safe_lane(self):
+    def test_forensic_backup_refusals_name_safe_lane(self, tmp_path, monkeypatch):
         """The low-disk and stat-failure forensic backup refusal strings
         must not embed a raw sqlite3 command against the live path."""
         import hermes_state
 
-        body = inspect.getsource(hermes_state._backup_db_file)
-        assert ".recover\"`" not in body
-        assert "sessions recover --source" in body
-        assert "--inspect-only" in body
+        db_path = tmp_path / "state.db"
+        db_path.write_bytes(b"damaged")
+        monkeypatch.setattr(
+            shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(total=10_000, used=10_000, free=0),
+        )
+
+        backup, reason = hermes_state._backup_db_file(db_path)
+
+        assert backup is None
+        assert reason is not None
+        assert ".recover\"`" not in reason
+        assert "sessions recover --source" in reason
+        assert "--inspect-only" in reason
 
     def test_kanban_manual_recovery_warns_about_live_db(self):
         import hermes_cli.kanban as kanban

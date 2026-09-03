@@ -3013,6 +3013,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _backup_refusal_with_recovery(db_path: Path, detail: str) -> str:
+    """Add the supported, snapshot-first manual lane to a backup refusal."""
+    return (
+        f"{detail} After resolving the filesystem problem, inspect recovery with "
+        f"`hermes sessions recover --source {db_path} --inspect-only`; do NOT "
+        "point a raw `sqlite3` shell at the live database."
+    )
+
+
 def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     """Atomically copy a malformed DB before repair, or return a hard-stop reason."""
     import datetime
@@ -3190,19 +3199,19 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             usage = shutil.disk_usage(db_path.parent)
             headroom = _repair_backup_headroom_bytes(usage.total)
             if usage.free - needed < headroom:
-                reason = (
+                reason = _backup_refusal_with_recovery(db_path, (
                     f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; "
                     f"copying the damaged DB bundle needs {needed / 1e9:.2f}GB "
                     f"and must leave {headroom / 1e9:.2f}GB headroom. Free disk "
                     "space, then retry."
-                )
+                ))
                 logger.error("Refusing forensic backup of %s: %s", db_path, reason)
                 return None, reason
         except OSError as exc:
-            reason = (
+            reason = _backup_refusal_with_recovery(db_path, (
                 f"could not determine free space on {db_path.parent} ({exc}); "
                 "refusing the forensic copy rather than risk filling the volume"
-            )
+            ))
             logger.error("Refusing forensic backup of %s: %s", db_path, reason)
             return None, reason
 
@@ -3225,7 +3234,9 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         return None, reason
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
-        return None, f"backup copy failed: {exc}"
+        return None, _backup_refusal_with_recovery(
+            db_path, f"backup copy failed: {exc}"
+        )
 
 def preflight_db_writability(
     db_path: Path,
