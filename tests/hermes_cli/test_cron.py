@@ -1,6 +1,7 @@
 """Tests for hermes_cli.cron command handling."""
 
 import argparse
+import hashlib
 from argparse import Namespace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -22,6 +23,39 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
+
+    def test_cli_owns_completion_script_and_pins_its_content_hash(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        scripts = tmp_cron_dir / "scripts"
+        scripts.mkdir()
+        verifier = scripts / "verify.py"
+        verifier.write_text("print('verified')\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home", lambda: tmp_cron_dir
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Maintain the repository",
+                "--completion-script",
+                "verify.py",
+            ]
+        )
+        assert cron_command(args) == 0
+
+        job = list_jobs()[0]
+        assert job["completion_script"] == "verify.py"
+        assert job["completion_script_sha256"] == hashlib.sha256(
+            verifier.read_bytes()
+        ).hexdigest()
+        assert "Completion verifier: verify.py" in capsys.readouterr().out
 
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")

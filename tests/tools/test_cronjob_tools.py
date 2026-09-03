@@ -1,5 +1,6 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
+import inspect
 import json
 import pytest
 
@@ -8,6 +9,12 @@ from tools.cronjob_tools import (
     check_cronjob_requirements,
     cronjob,
 )
+
+
+def test_completion_script_is_not_model_tool_configurable():
+    parameters = inspect.signature(cronjob).parameters
+    assert "completion_script" not in parameters
+    assert "completion_script_sha256" not in parameters
 
 
 # =========================================================================

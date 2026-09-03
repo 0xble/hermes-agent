@@ -191,6 +191,29 @@ When `workdir` is set:
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. Set `cron.max_parallel_jobs` if you want to limit total cron concurrency.
 :::
 
+## Verifying observable completion
+
+For consequential agentic jobs, a normal final reply may not prove that the
+external outcome is complete. A trusted post-run script can verify those facts
+without prescribing how the agent does its work:
+
+```bash
+hermes cron edit <job_id> \
+  --completion-script verify-maintenance.py
+```
+
+The CLI pins the script's SHA-256 digest when configured. Before the agent gets
+control, the scheduler verifies that digest and captures the exact bytes it will
+run. The captured script runs after the agent returns, from the configured
+`workdir`, using the same `~/.hermes/scripts/` containment rules as `--script`.
+Exit zero affirms completion. A changed verifier, non-zero exit, timeout, or
+interruption marks the cron run failed and retains the verifier output alongside
+the agent response. The agent keeps its normal tools and freedom to investigate,
+modify, test, and adapt its plan.
+
+`--completion-script` is intentionally a user-owned CLI setting rather than a
+model-callable cron parameter. Pass an empty string on edit to clear it.
+
 ## Bounding total run time
 
 Use a per-job total wall-clock budget when a run must finish within a predictable window:

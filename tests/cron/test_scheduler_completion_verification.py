@@ -12,7 +12,9 @@ best-effort: a probe failure keeps the historical reason rather than
 mislabeling a healthy run.
 """
 
+import hashlib
 import os
+from typing import Callable
 
 import pytest
 
@@ -20,11 +22,18 @@ import cron.scheduler as cron_scheduler
 from gateway.session_context import reset_session_vars
 
 
+_on_agent_run: Callable[[], None] | None = None
+
+
 class _FakeCronAgent:
+
     def __init__(self, *args, **kwargs):
         pass
 
-    def run_conversation(self, prompt):
+    def run_conversation(self, prompt, **_kwargs):
+        callback = _on_agent_run
+        if callback is not None:
+            callback()
         return {
             "completed": True,
             "failed": False,
@@ -63,7 +72,9 @@ class _RecordingSessionDB:
         pass
 
 
-def _run_booked_job(monkeypatch, tmp_path):
+def _run_booked_job(
+    monkeypatch, tmp_path, *, live_job_updates=None, **job_updates
+):
     import hermes_state
     import run_agent
 
@@ -103,21 +114,36 @@ def _run_booked_job(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cron_scheduler, "_guard_job_credential_exfil", lambda _job: None
     )
-    cron_scheduler.run_job(
-        {
-            "id": "verify-complete",
-            "name": "Verification",
-            "prompt": "Do the thing",
-            "schedule_display": "manual",
-        }
-    )
-    return instances
+    job = {
+        "id": "verify-complete",
+        "name": "Verification",
+        "prompt": "Do the thing",
+        "schedule_display": "manual",
+        "enabled": True,
+    }
+    job.update(job_updates)
+    def _live_job(_ref):
+        live = dict(job)
+        if live_job_updates:
+            live.update(live_job_updates)
+        return live
+
+    monkeypatch.setattr(cron_scheduler, "resolve_job_ref", _live_job)
+    if job.get("completion_script") and not job.get("completion_script_sha256"):
+        script_path = tmp_path / "scripts" / job["completion_script"]
+        job["completion_script_sha256"] = hashlib.sha256(
+            script_path.read_bytes()
+        ).hexdigest()
+    result = cron_scheduler.run_job(job)
+    return instances, result
 
 
 @pytest.fixture(autouse=True)
 def _clean_state():
+    global _on_agent_run
     reset_session_vars()
     _RecordingSessionDB.next_lifecycle = "complete"
+    _on_agent_run = None
     yield
     reset_session_vars()
 
@@ -127,7 +153,7 @@ def test_run_without_final_assistant_message_books_incomplete(monkeypatch, tmp_p
     not surface as a healthy complete run."""
     _RecordingSessionDB.next_lifecycle = "interrupted"
 
-    instances = _run_booked_job(monkeypatch, tmp_path)
+    instances, _ = _run_booked_job(monkeypatch, tmp_path)
 
     assert instances, "SessionDB was never constructed"
     reasons = [reason for _sid, reason in instances[0].ended]
@@ -137,7 +163,7 @@ def test_run_without_final_assistant_message_books_incomplete(monkeypatch, tmp_p
 def test_run_with_final_assistant_reply_books_complete(monkeypatch, tmp_path):
     """A real assistant reply (plain answer or [SILENT] — both assistant
     text rows) keeps the healthy booking."""
-    instances = _run_booked_job(monkeypatch, tmp_path)
+    instances, _ = _run_booked_job(monkeypatch, tmp_path)
 
     reasons = [reason for _sid, reason in instances[0].ended]
     assert reasons == ["cron_complete"]
@@ -147,7 +173,99 @@ def test_classification_probe_failure_keeps_historical_reason(monkeypatch, tmp_p
     """Best-effort metadata: a failing classifier must not mislabel a run."""
     _RecordingSessionDB.next_lifecycle = RuntimeError("db busy")
 
-    instances = _run_booked_job(monkeypatch, tmp_path)
+    instances, _ = _run_booked_job(monkeypatch, tmp_path)
 
     reasons = [reason for _sid, reason in instances[0].ended]
     assert reasons == ["cron_complete"]
+
+
+def test_completion_script_can_verify_agent_result(monkeypatch, tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    verifier = scripts / "verify.py"
+    verifier.write_text("print('candidate and rollout verified')\n", encoding="utf-8")
+
+    _, result = _run_booked_job(
+        monkeypatch,
+        tmp_path,
+        completion_script="verify.py",
+    )
+
+    success, output, final_response, error = result
+    assert success is True
+    assert "candidate and rollout verified" in output
+    assert final_response == "done"
+    assert error is None
+
+
+def test_completion_script_failure_cannot_surface_as_healthy(monkeypatch, tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    verifier = scripts / "verify.py"
+    verifier.write_text(
+        "import sys\nprint('published SHA does not match runtime')\nsys.exit(7)\n",
+        encoding="utf-8",
+    )
+
+    instances, result = _run_booked_job(
+        monkeypatch,
+        tmp_path,
+        completion_script="verify.py",
+    )
+
+    success, output, final_response, error = result
+    assert success is False
+    assert "completion verification failed" in output.lower()
+    assert "published SHA does not match runtime" in output
+    assert "verification failed" in final_response.lower()
+    assert error is not None
+    assert "published SHA does not match runtime" in error
+    reasons = [reason for _sid, reason in instances[0].ended]
+    assert reasons == ["cron_completion_failed"]
+
+
+def test_agent_cannot_replace_its_completion_verifier(monkeypatch, tmp_path):
+    global _on_agent_run
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    verifier = scripts / "verify.py"
+    verifier.write_text(
+        "import sys\nprint('original verifier ran')\nsys.exit(9)\n",
+        encoding="utf-8",
+    )
+
+    def replace_verifier():
+        verifier.write_text("print('replacement bypass')\n", encoding="utf-8")
+
+    _on_agent_run = replace_verifier
+    _, result = _run_booked_job(
+        monkeypatch,
+        tmp_path,
+        completion_script="verify.py",
+    )
+
+    success, output, _, error = result
+    assert success is False
+    assert "original verifier ran" in output
+    assert "replacement bypass" not in output
+    assert error is not None
+
+
+def test_agent_cannot_disable_completion_verification_mid_run(monkeypatch, tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    verifier = scripts / "verify.py"
+    verifier.write_text("print('verifier ran')\n", encoding="utf-8")
+
+    _, result = _run_booked_job(
+        monkeypatch,
+        tmp_path,
+        completion_script="verify.py",
+        live_job_updates={"enabled": False},
+    )
+
+    success, output, _, error = result
+    assert success is False
+    assert "disabled during its run" in output
+    assert "verifier ran" not in output
+    assert error is not None
