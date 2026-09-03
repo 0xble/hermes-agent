@@ -407,6 +407,49 @@ class TestJobCRUD:
         assert fetched is not None
         assert fetched["prompt"] == "Check server status"
 
+    def test_completion_script_round_trips_and_can_be_cleared(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Maintain the repository",
+            schedule="30m",
+            completion_script="verify-maintenance.py",
+        )
+        assert job["completion_script"] == "verify-maintenance.py"
+        assert get_job(job["id"])["completion_script"] == "verify-maintenance.py"
+
+        updated = update_job(
+            job["id"],
+            {"completion_script": "", "completion_script_sha256": None},
+            trusted_completion_config=True,
+        )
+        assert updated["completion_script"] is None
+
+    def test_completion_verifier_fields_reject_untrusted_updates(self, tmp_cron_dir):
+        job = create_job(prompt="Maintain the repository", schedule="30m")
+        with pytest.raises(ValueError, match="CLI-controlled"):
+            update_job(job["id"], {"completion_script": "bypass.py"})
+        with pytest.raises(ValueError, match="CLI-controlled"):
+            update_job(job["id"], {"completion_script_sha256": "0" * 64})
+
+    def test_completion_script_requires_an_agent(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="completion_script requires an agent run"):
+            create_job(
+                prompt="",
+                schedule="30m",
+                script="collect.py",
+                completion_script="verify.py",
+                no_agent=True,
+            )
+
+    def test_update_cannot_disable_agent_while_completion_script_is_set(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Maintain the repository",
+            schedule="30m",
+            script="collect.py",
+            completion_script="verify.py",
+        )
+        with pytest.raises(ValueError, match="completion_script requires an agent run"):
+            update_job(job["id"], {"no_agent": True})
+
     def test_list_jobs(self, tmp_cron_dir):
         create_job(prompt="Job 1", schedule="every 1h")
         create_job(prompt="Job 2", schedule="every 2h")

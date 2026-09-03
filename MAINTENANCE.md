@@ -122,6 +122,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
 | HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 | HERMES-100 | Active | `fix(agent): rotate credentials across transient retries` | Try one previously untried eligible logical account on each transient same-provider retry before crossing to the configured fallback. |
+| HERMES-101 | Active | `feat(cron): verify observable agent completion` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
 
 ## Fork-only administrative subject exemptions
 
@@ -202,7 +203,6 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
-
 ### HERMES-100 — Rotate credentials across transient retries
 
 - **Independent hypothesis (2026-09-02):** Retrying a transient provider failure with the same credential can exhaust the bounded retry budget while another eligible account remains unused, and duplicate OAuth rows can make apparent rotation repeat the same logical account.
@@ -226,6 +226,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subjects `feat(terminal): warn on nonstandard worktree paths` and `fix(terminal): recognize compound shell separators`; source, regressions, and this lifecycle record ship together.
 - **Rollback:** Revert only `feat(terminal): warn on nonstandard worktree paths`, remove the path guard, terminal result field, focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
 - **Retirement:** Retire after released upstream Hermes provides equivalent advisory or enforcement for direct agent-created worktrees outside `.worktrees/`, including shell traversal and wrapper coverage, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
+
+### HERMES-101 — Verify observable agent completion
+
+- **Independent hypothesis (2026-09-02):** Cron health treats a normally returned assistant response as successful even when a consequential agent explicitly reports `CONTINUING` and the intended publication or rollout never happened. Prompt-only completion language cannot distinguish a fluent report from verified external state, while prescribing the engineering path would unnecessarily constrain the agent.
+- **Summary:** Add a trusted, CLI-owned `completion_script` whose content hash is pinned at configuration time and whose exact verified bytes are captured before the agent runs. The captured script runs after the agent returns and before the scheduler books success. Changed content, non-zero exit, timeout, or interruption records a failed run while preserving both the agent response and verifier evidence. The verifier does not alter the prompt, tools, plan, or engineering choices available to the agent.
+- **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `hermes_cli/cron.py`; `hermes_cli/subcommands/cron.py`; `tests/cron/test_jobs.py`; `tests/cron/test_scheduler_completion_verification.py`; `tests/hermes_cli/test_cron.py`; `tests/tools/test_cronjob_tools.py`; `website/docs/user-guide/features/cron.md`; this record.
+- **Upstream tracking:** No released upstream behavior was found that supports a user-owned post-agent completion verifier distinct from pre-run scripts and agent lifecycle completion as of 2026-09-02.
+- **Upstream PR:** None.
+- **Regression:** `scripts/run_tests.sh tests/cron/test_scheduler_completion_verification.py tests/cron/test_jobs.py tests/tools/test_cronjob_tools.py tests/hermes_cli/test_cron.py -q`; focused cases prove success on verifier exit zero, failure with retained evidence and a truthful session reason on non-zero, pre-agent byte capture against in-run replacement, CLI-pinned content hashes, model-tool non-exposure, persistence and clearing of the field, and compatibility with existing cron management surfaces.
+- **Expected published commit identity:** Stable subject `feat(cron): verify observable agent completion`; source, regressions, documentation, and this record ship together.
+- **Rollback:** Revert only `feat(cron): verify observable agent completion`, remove `completion_script` from affected jobs first, and restore assistant-response lifecycle completion as the sole post-agent scheduler gate. Existing pre-run scripts, monitor mode, run budgets, and agent freedom remain unchanged.
+- **Retirement:** Retire after released upstream supports an equivalent trusted post-agent verifier whose failure marks the run unhealthy, retains verifier evidence, remains user-owned rather than model-configurable, and does not constrain the agent's execution plan. Remove the fork implementation and duplicate tests rather than keeping parallel gates.
 
 ### HERMES-098 — Keep Telegram citation brackets visible
 

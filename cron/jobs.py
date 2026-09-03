@@ -545,6 +545,10 @@ NO_AGENT_WITHOUT_SCRIPT_ERROR = (
     "there is nothing for the job to run."
 )
 
+NO_AGENT_WITH_COMPLETION_SCRIPT_ERROR = (
+    "completion_script requires an agent run and cannot be combined with no_agent=True."
+)
+
 
 def job_payload_is_empty(job: Dict[str, Any]) -> bool:
     """True when a job record has nothing runnable at all.
@@ -2306,6 +2310,7 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    completion_script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
@@ -2341,6 +2346,11 @@ def create_job(
                 change-detection pattern). Paths resolve under
                 ~/.hermes/scripts/; ``.sh`` / ``.bash`` files run via bash,
                 anything else via Python.
+        completion_script: Optional trusted script run after an agent returns.
+                Exit zero affirms the run's observable completion; non-zero or
+                timeout makes the cron run fail even when the agent produced a
+                normal final response. The script does not direct the agent and
+                follows the same ~/.hermes/scripts/ containment rules.
         context_from: Optional job ID (or list of job IDs) whose most recent output
                       is injected into the prompt as context before each run.
                       Useful for chaining cron jobs: job A finds data, job B processes it.
@@ -2420,10 +2430,16 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_completion_script = (
+        str(completion_script).strip() if isinstance(completion_script, str) else None
+    )
+    normalized_completion_script = normalized_completion_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    if normalized_no_agent and normalized_completion_script:
+        raise ValueError(NO_AGENT_WITH_COMPLETION_SCRIPT_ERROR)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_run_budget = _normalize_run_budget_seconds(run_budget_seconds)
@@ -2508,6 +2524,7 @@ def create_job(
         "model_snapshot": model_snapshot,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "completion_script": normalized_completion_script,
         "no_agent": normalized_no_agent,
         "monitor_script": normalized_monitor_script,
         "monitor_url": normalized_monitor_url,
@@ -2623,9 +2640,21 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    trusted_completion_config: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     updates = dict(updates or {})
+    protected_completion_fields = {"completion_script", "completion_script_sha256"}
+    attempted_completion_fields = protected_completion_fields.intersection(updates)
+    if attempted_completion_fields and not trusted_completion_config:
+        fields = ", ".join(sorted(attempted_completion_fields))
+        raise ValueError(
+            f"completion verifier fields are CLI-controlled and cannot be updated here: {fields}"
+        )
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2659,6 +2688,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = updates[_mon_field]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
+
+            if "completion_script" in updates:
+                _completion = updates["completion_script"]
+                _completion = (
+                    str(_completion).strip()
+                    if isinstance(_completion, str)
+                    else None
+                )
+                updates["completion_script"] = _completion or None
 
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
@@ -2695,6 +2733,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if bool(updated.get("no_agent")) and updated.get("completion_script"):
+                raise ValueError(NO_AGENT_WITH_COMPLETION_SCRIPT_ERROR)
             if "run_budget_seconds" in updates and updates["run_budget_seconds"] is None:
                 updated.pop("run_budget_seconds", None)
 

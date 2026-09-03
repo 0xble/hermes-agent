@@ -60,6 +60,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--completion-script",
+        dest="completion_script",
+        help=(
+            "Trusted script under ~/.hermes/scripts/ run after the agent "
+            "returns. Exit zero verifies observable completion; non-zero or "
+            "timeout marks the run failed without constraining the agent's work."
+        ),
+    )
+    cron_create.add_argument(
         "--no-agent",
         dest="no_agent",
         action="store_true",
@@ -198,6 +207,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "With --no-agent the script IS the job; otherwise its stdout is "
             "injected into the agent's prompt each run."
         ),
+    )
+    cron_edit.add_argument(
+        "--completion-script",
+        dest="completion_script",
+        help="Set the post-agent completion verifier. Pass an empty string to clear.",
     )
     cron_edit.add_argument(
         "--no-agent",

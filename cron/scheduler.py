@@ -14,6 +14,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -782,6 +784,7 @@ from cron.jobs import (
     heartbeat_fire_claim,
     heartbeat_run_claim,
     mark_job_run,
+    resolve_job_ref,
     save_job_output,
     use_cron_store,
 )
@@ -4323,11 +4326,54 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _completion_configuration_failure(job: dict[str, Any]) -> Optional[str]:
+    live_job = resolve_job_ref(str(job.get("id") or ""))
+    if live_job is None:
+        return "job was removed during its run"
+    if live_job.get("enabled") is not True:
+        return "job was disabled during its run"
+
+    protected_fields = ("script", "completion_script", "completion_script_sha256", "workdir")
+    changed = [
+        field
+        for field in protected_fields
+        if live_job.get(field) != job.get(field)
+    ]
+    if changed:
+        return "protected safety configuration changed: " + ", ".join(changed)
+    return None
+
+
+def _capture_job_script_snapshot(script_path: str) -> tuple[bool, bytes | str]:
+    """Read one trusted script before the agent can mutate its backing file."""
+    scripts_dir = (_get_hermes_home() / "scripts").resolve()
+    try:
+        raw_path = Path(script_path).expanduser()
+    except (RuntimeError, OSError, ValueError):
+        return False, f"Blocked: script path is invalid: {script_path!r}"
+    resolved = raw_path if raw_path.is_absolute() else scripts_dir / raw_path
+    try:
+        path = resolved.resolve()
+        path.relative_to(scripts_dir)
+    except (OSError, RuntimeError, ValueError):
+        return False, (
+            f"Blocked: script path resolves outside the scripts directory "
+            f"({scripts_dir}): {script_path!r}"
+        )
+    if not path.is_file():
+        return False, f"Script not found or not a file: {path}"
+    try:
+        return True, path.read_bytes()
+    except OSError as exc:
+        return False, f"Could not snapshot completion script {path}: {exc}"
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     timeout_seconds: Optional[float] = None,
+    script_snapshot: Optional[bytes] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4415,6 +4461,25 @@ def _run_job_script(
     if timeout_seconds is not None:
         script_timeout = min(script_timeout, max(0.0, float(timeout_seconds)))
 
+    execution_path = path
+    snapshot_path: Optional[Path] = None
+    if script_snapshot is not None:
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".cron-completion-",
+                suffix=path.suffix,
+                dir=scripts_dir_resolved,
+                delete=False,
+            ) as handle:
+                handle.write(script_snapshot)
+                handle.flush()
+                os.fsync(handle.fileno())
+                snapshot_path = Path(handle.name)
+            execution_path = snapshot_path
+        except OSError as exc:
+            return False, f"Could not materialize completion script snapshot: {exc}"
+
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
@@ -4430,12 +4495,21 @@ def _run_job_script(
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
+            if snapshot_path is not None:
+                try:
+                    snapshot_path.unlink()
+                except OSError:
+                    logger.warning(
+                        "Could not remove cron completion snapshot %s",
+                        snapshot_path,
+                        exc_info=True,
+                    )
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(execution_path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -4443,9 +4517,9 @@ def _run_job_script(
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
-            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
+            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(execution_path))
         else:
-            argv = [python_exe, str(path)]
+            argv = [python_exe, str(execution_path)]
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -4529,6 +4603,16 @@ def _run_job_script(
 
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        if snapshot_path is not None:
+            try:
+                snapshot_path.unlink()
+            except OSError:
+                logger.warning(
+                    "Could not remove cron completion snapshot %s",
+                    snapshot_path,
+                    exc_info=True,
+                )
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -4537,6 +4621,7 @@ def _run_job_script_with_claim_heartbeat(
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     timeout_seconds: Optional[float] = None,
+    script_snapshot: Optional[bytes] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4557,6 +4642,8 @@ def _run_job_script_with_claim_heartbeat(
         }
         if timeout_seconds is not None:
             kwargs["timeout_seconds"] = timeout_seconds
+        if script_snapshot is not None:
+            kwargs["script_snapshot"] = script_snapshot
         return _run_job_script(script_path, **kwargs)
 
     schedule = job.get("schedule")
@@ -6033,7 +6120,35 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     _session_db = None
+    _completion_script = str(job.get("completion_script") or "").strip()
+    _completion_snapshot: Optional[bytes] = None
+    _completion_failed = False
     try:
+        if _completion_script:
+            _snapshot_ok, _snapshot_value = _capture_job_script_snapshot(
+                _completion_script
+            )
+            if not _snapshot_ok:
+                raise RuntimeError(
+                    f"Completion verifier unavailable before agent run: {_snapshot_value}"
+                )
+            if not isinstance(_snapshot_value, bytes):
+                raise RuntimeError(
+                    "Completion verifier snapshot returned an invalid payload"
+                )
+            _expected_snapshot_sha = str(
+                job.get("completion_script_sha256") or ""
+            ).lower()
+            _observed_snapshot_sha = hashlib.sha256(_snapshot_value).hexdigest()
+            if not re.fullmatch(r"[0-9a-f]{64}", _expected_snapshot_sha):
+                raise RuntimeError(
+                    "Completion verifier has no valid CLI-pinned content hash"
+                )
+            if _observed_snapshot_sha != _expected_snapshot_sha:
+                raise RuntimeError(
+                    "Completion verifier content changed after CLI configuration"
+                )
+            _completion_snapshot = _snapshot_value
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -6996,6 +7111,80 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        # Optional observable completion gate. The agent retains full freedom
+        # over how it performs the job; this trusted, user-owned script checks
+        # only whether the external facts required for success are now true.
+        # A normal assistant reply is therefore not enough to mark a guarded
+        # job healthy. This is deliberately post-run and separate from the
+        # pre-run ``script`` context hook.
+        _completion_output = ""
+        if _completion_script:
+            _completion_configuration_error = _completion_configuration_failure(job)
+            if _completion_configuration_error:
+                _completion_ok = False
+                _completion_output = _completion_configuration_error
+            else:
+                _completion_budget = _remaining_run_budget(_total_run_deadline)
+                if _completion_budget is not None and _completion_budget <= 0:
+                    return _total_run_budget_failure(job, job_name, _total_run_budget)
+                _completion_kwargs = {
+                    "workdir": _job_workdir,
+                    "cancel_event": cancel_event,
+                    "script_snapshot": _completion_snapshot,
+                }
+                if _completion_budget is not None:
+                    _completion_kwargs["timeout_seconds"] = _completion_budget
+                _completion_ok, _completion_output = _run_job_script_with_claim_heartbeat(
+                    job,
+                    _completion_script,
+                    **_completion_kwargs,
+                )
+            if not _completion_ok:
+                _completion_failed = True
+                _completion_error = (
+                    f"Completion verification failed: {_completion_output}"
+                )
+                _completion_doc = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Agent Response
+
+{logged_response}
+
+## Completion Verification Failed
+
+{_completion_output}
+"""
+                _completion_alert = (
+                    f"⚠ Cron '{job_name}' completion verification failed\n\n"
+                    f"{_completion_output}"
+                )
+                _audit_duration_ms = int(
+                    (time.monotonic() - _audit_t_start) * 1000
+                )
+                _write_usage_audit({
+                    "ts": _utcnow_iso_ms(),
+                    "job_id": job_id,
+                    "fire_id": _audit_fire_id,
+                    "prompt_tokens": result.get("prompt_tokens"),
+                    "completion_tokens": result.get("completion_tokens"),
+                    "total_tokens": result.get("total_tokens"),
+                    "response_silent": False,
+                    "deliver_target": job.get("deliver"),
+                    "model": model or None,
+                    "duration_ms": _audit_duration_ms,
+                    "error": _completion_error,
+                })
+                return (
+                    False,
+                    _completion_doc,
+                    _completion_alert,
+                    _completion_error,
+                )
         
         output = f"""# Cron Job: {job_name}
 
@@ -7010,6 +7199,13 @@ def run_job(
 ## Response
 
 {logged_response}
+"""
+        if _completion_script:
+            output += f"""
+
+## Completion Verification
+
+{_completion_output or "verified"}
 """
         
         logger.info("Job '%s' completed successfully", job_name)
@@ -7163,24 +7359,25 @@ def run_job(
             # historical reason, and so does a failed probe — the booking
             # itself is FAIL-OPEN on probe errors, because classification is
             # best-effort metadata and must not mislabel a healthy run.
-            _end_reason = "cron_complete"
-            try:
-                _statuses = _session_db.session_lifecycle_statuses(
-                    [_final_cron_session_id]
-                )
-                _lifecycle = _statuses.get(_final_cron_session_id)
-                if _lifecycle in ("interrupted", "error", "empty"):
-                    _end_reason = "cron_incomplete_no_output"
-                    logger.warning(
-                        "Job '%s': session ended without a final assistant "
-                        "message (lifecycle=%s) — booking run as %s",
-                        job_id, _lifecycle, _end_reason,
+            _end_reason = "cron_completion_failed" if _completion_failed else "cron_complete"
+            if not _completion_failed:
+                try:
+                    _statuses = _session_db.session_lifecycle_statuses(
+                        [_final_cron_session_id]
                     )
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug(
-                    "Job '%s': session lifecycle classification failed: %s",
-                    job_id, e,
-                )
+                    _lifecycle = _statuses.get(_final_cron_session_id)
+                    if _lifecycle in ("interrupted", "error", "empty"):
+                        _end_reason = "cron_incomplete_no_output"
+                        logger.warning(
+                            "Job '%s': session ended without a final assistant "
+                            "message (lifecycle=%s) — booking run as %s",
+                            job_id, _lifecycle, _end_reason,
+                        )
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug(
+                        "Job '%s': session lifecycle classification failed: %s",
+                        job_id, e,
+                    )
             try:
                 _session_db.end_session(
                     _final_cron_session_id, _end_reason

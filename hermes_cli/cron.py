@@ -5,6 +5,7 @@ Handles standalone cron management commands like list, create, edit,
 pause/resume/run/remove, status, and tick.
 """
 
+import hashlib
 import json
 import re
 import sys
@@ -52,6 +53,39 @@ def _cron_api(**kwargs):
     from tools.cronjob_tools import cronjob as cronjob_tool
 
     return json.loads(cronjob_tool(**kwargs))
+
+
+def _validate_completion_script_path(script: Optional[str]) -> Optional[str]:
+    """Validate a CLI-owned verifier without exposing it to the model tool."""
+    if not script:
+        return None
+    from tools.cronjob_tools import _validate_cron_script_path
+
+    return _validate_cron_script_path(script)
+
+
+def _set_completion_script(job_id: str, script: Optional[str]) -> Dict[str, Any]:
+    """Persist the trusted completion verifier through the storage API."""
+    from cron.jobs import update_job
+    from cron.lifecycle_guard import _resolve_script_path
+
+    script_sha256 = None
+    if script:
+        resolved = _resolve_script_path(script)
+        if resolved is None:
+            raise ValueError(f"Invalid completion script path: {script!r}")
+        script_sha256 = hashlib.sha256(resolved.resolve().read_bytes()).hexdigest()
+    updated = update_job(
+        job_id,
+        {
+            "completion_script": script or None,
+            "completion_script_sha256": script_sha256,
+        },
+        trusted_completion_config=True,
+    )
+    if updated is None:
+        raise RuntimeError(f"Job not found after update: {job_id}")
+    return updated
 
 
 def _active_cron_provider_name() -> str:
@@ -208,6 +242,9 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        completion_script = job.get("completion_script")
+        if completion_script:
+            print(f"    Verify:    {completion_script} (post-agent completion gate)")
         monitor_source = job.get("monitor_script") or job.get("monitor_url")
         if monitor_source:
             print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
@@ -696,6 +733,21 @@ def cron_create(args):
     # raises GatewayLifecycleBlocked, the `cronjob` tool wrapper catches it and
     # returns it as result["error"], and the `if not result.get("success")`
     # branch below prints it in red and exits 1 — same UX as before.
+    completion_script = getattr(args, "completion_script", None)
+    completion_error = _validate_completion_script_path(completion_script)
+    if completion_error:
+        print(color(f"Failed to create job: {completion_error}", Colors.RED))
+        return 1
+    if completion_script and getattr(args, "no_agent", False):
+        print(
+            color(
+                "Failed to create job: completion_script requires an agent run and "
+                "cannot be combined with --no-agent.",
+                Colors.RED,
+            )
+        )
+        return 1
+
     result = _cron_api(
         action="create",
         schedule=args.schedule,
@@ -721,6 +773,14 @@ def cron_create(args):
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
+    if completion_script:
+        try:
+            _set_completion_script(result["job_id"], completion_script)
+        except Exception as exc:
+            _cron_api(action="remove", job_id=result["job_id"])
+            print(color(f"Failed to create job: {exc}", Colors.RED))
+            return 1
+        result.setdefault("job", {})["completion_script"] = completion_script
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}")
     print(f"  Schedule: {result['schedule']}")
@@ -729,6 +789,8 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+    if job_data.get("completion_script"):
+        print(f"  Completion verifier: {job_data['completion_script']}")
     if job_data.get("monitor_script"):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
@@ -762,6 +824,34 @@ def cron_edit(args):
         return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+
+    completion_script = getattr(args, "completion_script", None)
+    completion_error = _validate_completion_script_path(completion_script)
+    if completion_error:
+        print(color(f"Failed to update job: {completion_error}", Colors.RED))
+        return 1
+    effective_no_agent = (
+        getattr(args, "no_agent", None)
+        if getattr(args, "no_agent", None) is not None
+        else bool(job.get("no_agent"))
+    )
+    if completion_script and effective_no_agent:
+        print(
+            color(
+                "Failed to update job: completion_script requires an agent run and "
+                "cannot be combined with --no-agent.",
+                Colors.RED,
+            )
+        )
+        return 1
+    if completion_script == "" and getattr(args, "no_agent", None) is True:
+        print(
+            color(
+                "Failed to update job: clear --completion-script before enabling --no-agent.",
+                Colors.RED,
+            )
+        )
         return 1
 
     existing_skills = list(job.get("skills") or ([] if not job.get("skill") else [job.get("skill")]))
@@ -806,6 +896,17 @@ def cron_edit(args):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
 
+    if completion_script is not None:
+        try:
+            _set_completion_script(job["id"], completion_script)
+        except Exception as exc:
+            print(color(f"Failed to update completion verifier: {exc}", Colors.RED))
+            return 1
+        if completion_script:
+            result.setdefault("job", {})["completion_script"] = completion_script
+        else:
+            result.setdefault("job", {}).pop("completion_script", None)
+
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))
     print(f"  Name: {updated['name']}")
@@ -816,6 +917,8 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+    if updated.get("completion_script"):
+        print(f"  Completion verifier: {updated['completion_script']}")
     if updated.get("monitor_script"):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):
