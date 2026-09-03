@@ -616,6 +616,25 @@ async def test_control_boundaries_preserve_cooldown_retry_metadata(
     assert result.retry_after == 5.0
 
 
+@pytest.mark.asyncio
+async def test_multi_image_cooldown_preserves_prior_chunk_results():
+    adapter = _make_adapter()
+    delivered = [MagicMock(message_id=index) for index in range(1, 11)]
+    adapter._send_with_dm_topic_reply_anchor_retry = AsyncMock(
+        side_effect=[delivered, _TelegramSendCooldownExceeded(9.0)]
+    )
+    images = [(f"https://example.com/{index}.png", "") for index in range(11)]
+
+    results = await adapter.send_multiple_images("1", images)
+
+    assert [result.message_id for result in results[:-1]] == [
+        str(index) for index in range(1, 11)
+    ]
+    assert results[-1].success is False
+    assert results[-1].retryable is True
+    assert results[-1].retry_after == 5.0
+
+
 def test_retry_after_accepts_ptb_timedelta_mode():
     error = Exception("flood control")
     error.retry_after = timedelta(seconds=7)  # type: ignore[attr-defined]

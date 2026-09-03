@@ -9446,8 +9446,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     sent_id = getattr(sent_message, "message_id", None)
                     if sent_id is not None:
                         results.append(SendResult(success=True, message_id=str(sent_id)))
-            except _TelegramSendCooldownExceeded:
-                raise
+            except _TelegramSendCooldownExceeded as cooldown_error:
+                # Preserve successes from earlier animation/album chunks and
+                # expose the same bounded retry contract as every sibling
+                # media sender. Re-raising here discarded partial-delivery
+                # evidence and violated the List[SendResult] boundary.
+                results.append(self._send_cooldown_failure(cooldown_error))
+                break
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",

@@ -1599,23 +1599,29 @@ class TestBuildApiKwargs:
         assert agent._github_models_reasoning_extra_body() == {"effort": "xhigh"}
 
 
-def test_turn_reasoning_override_reaches_direct_summary_helpers(agent, monkeypatch):
-    from agent.reasoning_context import turn_reasoning_context
+    def test_turn_reasoning_override_reaches_direct_summary_helpers(
+        self, agent, monkeypatch
+    ):
+        from agent.reasoning_context import turn_reasoning_context
 
-    agent.reasoning_config = {"enabled": True, "effort": "medium"}
-    agent.model = "gpt-5.5"
-    monkeypatch.setattr(agent, "_lmstudio_reasoning_options_cached", lambda: ["low", "medium", "high"])
-    token = turn_reasoning_context.begin(
-        agent, {"enabled": True, "effort": "high"}
-    )
-    try:
-        assert agent._github_models_reasoning_extra_body() == {"effort": "high"}
-        assert agent._resolve_lmstudio_summary_reasoning_effort() == "high"
-    finally:
-        turn_reasoning_context.end(token)
+        agent.reasoning_config = {"enabled": True, "effort": "medium"}
+        agent.model = "gpt-5.5"
+        monkeypatch.setattr(
+            agent,
+            "_lmstudio_reasoning_options_cached",
+            lambda: ["low", "medium", "high"],
+        )
+        token = turn_reasoning_context.begin(
+            agent, {"enabled": True, "effort": "high"}
+        )
+        try:
+            assert agent._github_models_reasoning_extra_body() == {"effort": "high"}
+            assert agent._resolve_lmstudio_summary_reasoning_effort() == "high"
+        finally:
+            turn_reasoning_context.end(token)
 
-    assert agent._github_models_reasoning_extra_body() == {"effort": "medium"}
-    assert agent._resolve_lmstudio_summary_reasoning_effort() == "medium"
+        assert agent._github_models_reasoning_extra_body() == {"effort": "medium"}
+        assert agent._resolve_lmstudio_summary_reasoning_effort() == "medium"
 
 
 
