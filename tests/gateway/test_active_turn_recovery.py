@@ -305,7 +305,7 @@ def test_existing_resume_reason_and_freshness_are_preserved(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()
     entry = store.get_or_create_session(source)
-    store.mark_turn_active(entry.session_key)
+    interrupted_token = store.mark_turn_active(entry.session_key)
     original_mark = datetime.now() - timedelta(minutes=2)
 
     with store._lock:
@@ -319,6 +319,7 @@ def test_existing_resume_reason_and_freshness_are_preserved(tmp_path):
     assert recovered.resume_pending is True
     assert recovered.resume_reason == "shutdown_timeout"
     assert recovered.last_resume_marked_at == original_mark
+    assert recovered.resume_turn_token == interrupted_token
     assert recovered.active_turn_token is None
     assert recovered.active_turn_started_at is None
 

@@ -588,13 +588,16 @@ SET_GOAL_SCHEMA = {
     "name": "set_goal",
     "description": (
         "Manage the current interactive session's persistent standing goal with one tool. "
-        "Use status/show/list actions for inspection. Use mutations only when the current user "
-        "turn explicitly authorizes that exact operation. For set or draft, write one concise outcome, "
-        "not a persona or implementation diary. Put objective proof in verification, non-negotiable "
-        "limits in constraints and boundaries, and the exact stopping condition in stop_when. Remove "
-        "generic exhortations, duplicate requirements, speculative edge cases, and repository rules "
-        "already supplied elsewhere. After setting a goal, continue the first concrete step in the "
-        "same turn. Resume never resets the model's spent turn budget."
+        "Inspect with status/show/list. Set or draft only when the user explicitly requests a goal and "
+        "the work has one durable multi-turn outcome, an evidence-based finish line, and later steps "
+        "that depend on results. Do not set a goal for a one-turn answer or edit, a read-only question, "
+        "a vague aspiration, an unrelated backlog, routine task tracking, or work blocked on unresolved "
+        "user decisions. Mutations require exact current-turn authorization. For set or draft: goal is "
+        "one concise end state; verification is objective proof; constraints are invariants; boundaries "
+        "define scope; stop_when names a blocker requiring user input. Keep the path flexible. Omit "
+        "personas, plans or implementation diaries, generic exhortations, duplicate requirements, "
+        "speculative edge cases, and repository rules supplied elsewhere. After setting, take the first "
+        "concrete step in the same turn. Resume never resets the model's spent turn budget."
     ),
     "parameters": {
         "type": "object",
@@ -606,7 +609,7 @@ SET_GOAL_SCHEMA = {
             },
             "goal": {
                 "type": "string",
-                "description": "Concise persistent outcome for set or draft.",
+                "description": "One concise, verifiable end state for set or draft.",
             },
             "authorization_text": {
                 "type": "string",

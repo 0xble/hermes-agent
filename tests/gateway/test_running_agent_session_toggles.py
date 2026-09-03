@@ -1,4 +1,4 @@
-"""Regression tests: /yolo and /verbose dispatch mid-agent-run.
+"""Regression tests for session controls that dispatch mid-agent-run.
 
 When an agent is running, the gateway's running-agent guard rejects most
 slash commands with "⏳ Agent is running — /{cmd} can't run mid-turn"
@@ -8,12 +8,8 @@ slash commands with "⏳ Agent is running — /{cmd} can't run mid-turn"
     pending approval prompt without waiting for the agent to finish.
   * /verbose — cycles the per-platform tool-progress display mode;
     affects the ongoing stream.
-
-Commands whose handlers say "takes effect on next message" stay on the
-catch-all by design:
-
-  * /fast — writes config.yaml only
-  * /reasoning — writes config.yaml only
+  * /fast — updates request overrides for the next model request.
+  * /reasoning — updates reasoning config for the next model request.
 
 These tests lock in both behaviors so the allowlist doesn't silently
 grow or shrink.
@@ -83,6 +79,13 @@ def _make_runner():
     runner._fallback_model = None
     runner._show_reasoning = False
     runner._service_tier = None
+    runner._load_show_reasoning = lambda: False
+    runner._load_reasoning_config = lambda model="": {
+        "enabled": True,
+        "effort": "medium",
+    }
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._evict_cached_agent = MagicMock()
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
@@ -104,6 +107,10 @@ def _make_runner():
         "api_call_count": 1,
         "max_iterations": 60,
     }
+    agent_mock.model = "openai/gpt-5.4"
+    agent_mock.service_tier = None
+    agent_mock.request_overrides = {"extra_body": {"client": "kept"}}
+    agent_mock.reasoning_config = {"enabled": True, "effort": "medium"}
     runner._running_agents[sk] = agent_mock
     runner._running_agents_ts[sk] = time.time()
     return runner
@@ -133,6 +140,75 @@ async def test_verbose_dispatches_mid_run(monkeypatch):
     runner._handle_verbose_command.assert_awaited_once()
     assert result == "tool progress: new"
     assert "can't run mid-turn" not in (result or "")
+
+
+@pytest.mark.asyncio
+async def test_fast_updates_live_agent_from_next_request_boundary(monkeypatch):
+    """Busy /fast replaces live request state without mutating the request
+    snapshot already owned by an in-flight API call."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+    agent = runner._running_agents[sk]
+    in_flight_overrides = agent.request_overrides
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model", lambda _config: "openai/gpt-5.4"
+    )
+
+    result = await runner._handle_message(_make_event("/fast fast"))
+
+    assert "can't run mid-turn" not in (result or "")
+    assert agent.service_tier == "priority"
+    assert in_flight_overrides == {"extra_body": {"client": "kept"}}
+    assert agent.request_overrides == {
+        "extra_body": {"client": "kept"},
+        "service_tier": "priority",
+    }
+    assert agent.request_overrides is not in_flight_overrides
+    assert runner._resolve_session_service_tier(session_key=sk) == "priority"
+    getattr(runner, "_evict_cached_agent").assert_not_called()
+
+    fast_request_overrides = agent.request_overrides
+    result = await runner._handle_message(_make_event("/fast normal"))
+
+    assert "can't run mid-turn" not in (result or "")
+    assert agent.service_tier is None
+    assert fast_request_overrides["service_tier"] == "priority"
+    assert agent.request_overrides == {"extra_body": {"client": "kept"}}
+    assert runner._resolve_session_service_tier(session_key=sk) is None
+    getattr(runner, "_evict_cached_agent").assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_updates_live_agent_from_next_request_boundary():
+    """Busy /reasoning replaces live reasoning state without mutating the
+    config snapshot already owned by an in-flight API call."""
+    runner = _make_runner()
+    sk = build_session_key(_make_source())
+    agent = runner._running_agents[sk]
+    in_flight_reasoning = agent.reasoning_config
+
+    result = await runner._handle_message(_make_event("/reasoning high"))
+
+    assert "can't run mid-turn" not in (result or "")
+    assert in_flight_reasoning == {"enabled": True, "effort": "medium"}
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+    assert agent.reasoning_config is not in_flight_reasoning
+    assert runner._session_reasoning_overrides[sk] == {
+        "enabled": True,
+        "effort": "high",
+    }
+    getattr(runner, "_evict_cached_agent").assert_not_called()
+
+    high_reasoning = agent.reasoning_config
+    result = await runner._handle_message(_make_event("/reasoning reset"))
+
+    assert "can't run mid-turn" not in (result or "")
+    assert high_reasoning == {"enabled": True, "effort": "high"}
+    assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+    assert sk not in runner._session_reasoning_overrides
+    getattr(runner, "_evict_cached_agent").assert_not_called()
 
 
 @pytest.mark.asyncio

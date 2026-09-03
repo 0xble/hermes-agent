@@ -10032,6 +10032,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _status_action_gerund(self) -> str:
         return "restarting" if self._restart_requested else "shutting down"
 
+    def _build_drain_busy_reply(self, *, queued: bool) -> EphemeralReply:
+        """Return a control-plane drain notice, never an agent final response."""
+        if queued:
+            return EphemeralReply(
+                f"⏳ Gateway {self._status_action_gerund()} — queued for the next "
+                "turn after it comes back."
+            )
+        return EphemeralReply(
+            f"⏳ Gateway is {self._status_action_gerund()} and is not accepting "
+            "another turn right now."
+        )
+
+    async def _persist_restart_inbox_event(
+        self, session_key: str, event: MessageEvent
+    ) -> bool:
+        """Durably accept drain-time inbound before promising it is queued."""
+        try:
+            from gateway.restart_inbox import record_event
+
+            adapter = self._adapter_for_source(event.source)
+            await asyncio.to_thread(
+                record_event,
+                session_key,
+                event,
+                getattr(adapter, "_owner_profile", None),
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Could not persist restart-drain inbound for %s; rejecting instead",
+                session_key,
+            )
+            return False
+
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
     ) -> bool:
@@ -11325,10 +11359,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
-                self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                queued = await self._persist_restart_inbox_event(session_key, event)
+                message = self._build_drain_busy_reply(queued=queued)
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = self._build_drain_busy_reply(queued=False)
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -11942,15 +11976,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
+
+        def _notification_message(adapter: Any) -> str:
+            hint = "Your current task will be interrupted."
+            if self._restart_requested:
+                if resolve_restart_resume_policy(self.config, adapter) == "continue":
+                    hint += " I'll try to resume it automatically after restart."
+                else:
+                    hint += (
+                        " Send any message after restart and I'll try to resume "
+                        "where you left off."
+                    )
+            return f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
+        notified_dm_topic_parents: set[tuple[str, str]] = set()
         for session_key in active:
             source = None
             try:
@@ -11972,6 +12012,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                chat_type = getattr(source, "chat_type", None)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -11981,6 +12022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+                chat_type = _parsed.get("chat_type")
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
@@ -12023,7 +12065,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await adapter.send(
+                    chat_id,
+                    _notification_message(adapter),
+                    metadata=_interim_metadata(metadata),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -12034,6 +12080,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 notified.add(dedup_key)
+                if (
+                    platform is Platform.TELEGRAM
+                    and chat_type == "dm"
+                    and thread_id is not None
+                ):
+                    notified_dm_topic_parents.add((platform_str, chat_id))
                 logger.info(
                     "Sent shutdown notification to active chat %s:%s",
                     platform_str, chat_id,
@@ -12057,7 +12109,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # The per-active-session interrupt pings above are deliberately NOT
         # gated: on a drained shutdown they're empty by construction, and in the
         # force-interrupt (deadline-exceeded) case they carry the genuinely
-        # useful "your task was cut off, message me to resume" hint. The flag is
+        # useful interruption hint. The flag is
         # only honoured for a CURRENT-epoch marker (drain_notification_suppressed
         # reuses the NS-570 staleness check), so an orphaned marker can never
         # silence a fresh gateway's legitimate broadcast.
@@ -12096,6 +12148,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if dedup_key in notified:
                 continue
 
+            # Telegram's unthreaded private-chat target is the All Messages
+            # parent lane for every DM topic. Once an affected DM topic has been
+            # warned, a second parent-scoped advisory is redundant and can
+            # surface below an unrelated completed topic. Keep forum/group
+            # parents, explicit home topics, and distinct home chats unchanged.
+            if home.thread_id is None and (
+                platform.value,
+                str(home.chat_id),
+            ) in notified_dm_topic_parents:
+                logger.info(
+                    "Skipping redundant parent home-channel shutdown notification for %s:%s",
+                    platform.value,
+                    home.chat_id,
+                )
+                continue
+
             try:
                 metadata = self._thread_metadata_for_target(
                     platform,
@@ -12103,10 +12171,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                result = await adapter.send(
+                    str(home.chat_id),
+                    _notification_message(adapter),
+                    metadata=_interim_metadata(metadata),
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
@@ -12961,6 +13030,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _drain_restart_inbox(self) -> int:
+        """Replay messages durably accepted by the previous draining process."""
+        try:
+            from gateway.restart_inbox import claim_recoverable
+
+            targets = {
+                (getattr(platform, "value", str(platform)), "default")
+                for platform in self.adapters
+            }
+            for profile, adapters in (getattr(self, "_profile_adapters", None) or {}).items():
+                targets.update(
+                    (getattr(platform, "value", str(platform)), str(profile))
+                    for platform in adapters
+                )
+            claimed = await asyncio.to_thread(
+                claim_recoverable, deliverable_targets=targets
+            )
+        except Exception:
+            logger.exception("Could not claim restart-drain inbox")
+            return 0
+
+        dispatched = 0
+        for row in claimed:
+            event = row["event"]
+            adapter: Any = self._adapter_for_source(event.source)
+            if adapter is None:
+                logger.warning(
+                    "Restart inbox claim %s has no live adapter; leaving for retry",
+                    row["queue_id"],
+                )
+                try:
+                    from gateway.restart_inbox import release_claim
+
+                    await asyncio.to_thread(release_claim, row["queue_id"])
+                except Exception:
+                    logger.exception(
+                        "Could not release restart inbox claim %s",
+                        row["queue_id"],
+                    )
+                continue
+            setattr(event, "_hermes_startup_restore_replay", True)
+            await adapter.handle_message(event)
+            dispatched += 1
+        return dispatched
+
     async def _drain_startup_restore_queue(self) -> int:
         """Replay inbound messages queued while startup auto-resume ran."""
         drained = 0
@@ -13115,8 +13229,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Warm the turn machinery BEFORE the queue drains: replayed (and
         # fresh) inbound turns must not build skeleton prompts (#99373).
         await self._await_startup_warmup()
+        durable_drained = await self._drain_restart_inbox()
         drained = await self._drain_startup_restore_queue()
         self._startup_restore_in_progress = False
+        if durable_drained:
+            logger.info(
+                "Dispatched %d durable restart-drain inbound message(s)",
+                durable_drained,
+            )
         if drained:
             logger.info("Drained %d inbound message(s) queued during startup restore", drained)
 
@@ -13234,8 +13354,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not session_key:
                 sendable.append(row)
                 continue
+            kind = row.get("obligation_kind") or "legacy"
+            if kind == "control":
+                # Busy/restart notices are owed messages, not proof that the
+                # interrupted agent turn completed. Redeliver without touching
+                # its recovery marker.
+                sendable.append(row)
+                continue
             try:
-                await self.async_session_store.clear_resume_pending(session_key)
+                await self.async_session_store.clear_resume_pending_for_obligation(
+                    session_key,
+                    row.get("turn_token"),
+                    allow_legacy=kind == "legacy",
+                )
             except Exception:
                 logger.debug(
                     "clear_resume_pending failed for %s", session_key,
@@ -18298,6 +18429,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "busy": self._handle_busy_command,
             "yolo": self._handle_yolo_command,
             "verbose": self._handle_verbose_command,
+            "reasoning": self._handle_reasoning_command,
+            "fast": self._handle_fast_command,
             "footer": self._handle_footer_command,
             "help": self._handle_help_command,
             "commands": self._handle_commands_command,
@@ -19599,12 +19732,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     effective_busy_input_mode
                 )
                 if queue_during_drain:
-                    self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
-                )
+                    queue_during_drain = await self._persist_restart_inbox_event(
+                        _quick_key, event
+                    )
+                return self._build_drain_busy_reply(queued=queue_during_drain)
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
@@ -21048,6 +21179,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # token out of public metadata, transcripts, and platform payloads.
         setattr(event, "_gateway_active_turn_session_key", session_key)
         setattr(event, "_gateway_active_turn_token", token)
+        queue_id = getattr(event, "_restart_inbox_queue_id", None)
+        if queue_id:
+            try:
+                from gateway.restart_inbox import mark_handed_off
+
+                await asyncio.to_thread(mark_handed_off, queue_id)
+            except Exception:
+                logger.exception(
+                    "Could not hand restart inbox row %s to active-turn recovery",
+                    queue_id,
+                )
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
@@ -25193,8 +25335,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         text_already_delivered: bool = False,
         deliver_media: bool = True,
         stream_consumer=None,
-    ) -> None:
-        """Deliver a queued response using the normal text+attachment split."""
+    ) -> bool:
+        """Deliver a queued response and report whether text delivery succeeded."""
+        _delivery_confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -25222,6 +25365,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            _delivery_confirmed = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -25232,18 +25376,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _qe,
                         )
                 if not _reconciled:
-                    await adapter.send(
+                    _send_result = await adapter.send(
                         source.chat_id,
                         text_content,
                         metadata=metadata,
                     )
+                    _delivery_confirmed = bool(
+                        getattr(_send_result, "success", False)
+                    )
+                    if not _delivery_confirmed:
+                        return False
+            else:
+                _delivery_confirmed = True
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
         # the ``not agent_result.get("failed")`` guard on the completed-turn
         # delivery path.
         if not deliver_media:
-            return
+            return _delivery_confirmed
 
         synthetic_event = MessageEvent(
             text="",
@@ -25256,6 +25407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter,
             thread_metadata=metadata,
         )
+        return _delivery_confirmed
 
     async def _run_background_task(
         self,
@@ -31432,6 +31584,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
+        _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -31455,6 +31608,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
+                _post_delivery_adapter=_post_delivery_adapter,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -31471,6 +31625,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
                 side_delivery_callback=side_delivery_callback,
+                _post_delivery_adapter=_post_delivery_adapter,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -31617,6 +31772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
         side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
+        _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -31878,6 +32034,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Adapter doesn't support deletion — silently disable.
             _cleanup_progress = False
             _cleanup_adapter = None
+        _cleanup_callback_adapter = cast(
+            Optional[BasePlatformAdapter],
+            _post_delivery_adapter or _cleanup_adapter,
+        )
         _cleanup_msg_ids: List[str] = []
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
@@ -32874,6 +33034,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
                     if callable(_mark_turn):
                         _mark_turn(session_key, run_generation)
+            # Register temporary-progress cleanup before inspecting the pending
+            # queue. A normal turn leaves this callback for the outer delivery
+            # lifecycle. An in-band queued turn pops it immediately after the
+            # first response is delivered and before recursive follow-up work
+            # begins. Registering only after this branch would be unreachable
+            # for queued turns because the recursive result returns early.
+            if (
+                _cleanup_progress
+                and _cleanup_adapter is not None
+                and _cleanup_callback_adapter is not None
+                and _cleanup_msg_ids
+                and session_key
+                and isinstance(response, dict)
+                and not response.get("failed")
+                and hasattr(_cleanup_adapter, "register_post_delivery_callback")
+            ):
+                _chat_id_snapshot = source.chat_id
+                _adapter_snapshot = _cleanup_adapter
+
+                async def _cleanup_temp_bubbles() -> None:
+                    # Snapshot at invocation rather than registration so a
+                    # heartbeat/status send that completes while final delivery
+                    # is in flight is included in this turn's cleanup set.
+                    _ids_snapshot = list(dict.fromkeys(_cleanup_msg_ids))
+                    _deleted_count = 0
+                    _failed_details: list[str] = []
+                    for _mid in _ids_snapshot:
+                        try:
+                            _delete_adapter = cast(
+                                BasePlatformAdapter,
+                                self._adapter_for_source(source) or _adapter_snapshot,
+                            )
+                            _deleted = await _delete_adapter.delete_message(
+                                _chat_id_snapshot, _mid
+                            )
+                        except asyncio.CancelledError:
+                            _completed_count = _deleted_count + len(_failed_details)
+                            logger.warning(
+                                "Temp bubble cleanup cancelled for session %s generation %s: "
+                                "requested=%d completed=%d remaining=%d",
+                                session_key,
+                                run_generation,
+                                len(_ids_snapshot),
+                                _completed_count,
+                                len(_ids_snapshot) - _completed_count,
+                            )
+                            raise
+                        except Exception as _cleanup_error:
+                            _failed_details.append(
+                                f"{_mid}:{type(_cleanup_error).__name__}"
+                            )
+                        else:
+                            if _deleted:
+                                _deleted_count += 1
+                            else:
+                                _failed_details.append(f"{_mid}:returned_false")
+                    if _failed_details:
+                        _shown_failures = _failed_details[:10]
+                        _omitted_failures = len(_failed_details) - len(_shown_failures)
+                        logger.warning(
+                            "Temp bubble cleanup failures for session %s generation %s: "
+                            "%s%s",
+                            session_key,
+                            run_generation,
+                            ", ".join(_shown_failures),
+                            (
+                                f" (+{_omitted_failures} more)"
+                                if _omitted_failures
+                                else ""
+                            ),
+                        )
+                    logger.info(
+                        "Temp bubble cleanup complete for session %s generation %s: "
+                        "requested=%d deleted=%d failed=%d",
+                        session_key,
+                        run_generation,
+                        len(_ids_snapshot),
+                        _deleted_count,
+                        len(_failed_details),
+                    )
+
+                try:
+                    _cleanup_callback_adapter.register_post_delivery_callback(
+                        session_key,
+                        _cleanup_temp_bubbles,
+                        generation=run_generation,
+                    )
+                except Exception as _rpe:
+                    logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
+            elif (
+                _cleanup_progress
+                and _cleanup_msg_ids
+                and isinstance(response, dict)
+                and response.get("failed")
+            ):
+                logger.info(
+                    "Temp bubble cleanup skipped for session %s generation %s: "
+                    "reason=failed_run tracked=%d",
+                    session_key,
+                    run_generation,
+                    len(_cleanup_msg_ids),
+                )
 
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
@@ -32989,6 +33251,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return result_holder[0] or {"final_response": response, "messages": history}
 
                 was_interrupted = result.get("interrupted")
+                _callback_owner = cast(
+                    BasePlatformAdapter,
+                    _cleanup_callback_adapter or adapter,
+                )
                 if not was_interrupted:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
@@ -33028,6 +33294,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    _first_response_delivered = True
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
@@ -33045,24 +33312,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                            await self._deliver_queued_first_response(
-                                first_response,
-                                source=source,
-                                adapter=adapter,
-                                metadata=_status_thread_metadata,
-                                event_message_id=event_message_id,
-                                text_already_delivered=_already_streamed,
-                                deliver_media=not _delivery_result.get("failed"),
-                                stream_consumer=_sc,
+                            _first_response_delivered = (
+                                await self._deliver_queued_first_response(
+                                    first_response,
+                                    source=source,
+                                    adapter=adapter,
+                                    metadata=_status_thread_metadata,
+                                    event_message_id=event_message_id,
+                                    text_already_delivered=_already_streamed,
+                                    deliver_media=not _delivery_result.get("failed"),
+                                    stream_consumer=_sc,
+                                )
                             )
                         except Exception as e:
+                            _first_response_delivered = False
                             logger.warning("Failed to send first response before queued message: %s", e)
+                    if not _first_response_delivered and pending_event is not None:
+                        _pending_slot = getattr(adapter, "_pending_messages", None)
+                        if isinstance(_pending_slot, dict):
+                            _existing_pending = _pending_slot.get(session_key)
+                            if _existing_pending is not None:
+                                self._session_state(
+                                    session_key
+                                ).conversation.queued_events.insert(
+                                    0, _existing_pending
+                                )
+                            _pending_slot[session_key] = pending_event
+                        logger.warning(
+                            "Queued follow-up for session %s deferred because the "
+                            "first response was not delivered.",
+                            session_key or "?",
+                        )
+                        return result or {
+                            "final_response": response,
+                            "messages": history,
+                        }
+
                     # Release deferred bg-review notifications now that the
                     # first response has been delivered.  Pop from the
                     # adapter's callback dict (prevents double-fire in
                     # base.py's finally block) and call it.
-                    if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
-                        _bg_cb = adapter.pop_post_delivery_callback(
+                    if (
+                        getattr(
+                            type(_callback_owner),
+                            "pop_post_delivery_callback",
+                            None,
+                        )
+                        is not None
+                    ):
+                        _bg_cb = _callback_owner.pop_post_delivery_callback(
                             session_key,
                             generation=run_generation,
                         )
@@ -33073,8 +33371,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     await _bg_result
                             except Exception:
                                 pass
-                    elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
-                        _bg_cb = adapter._post_delivery_callbacks.pop(session_key, None)
+                    elif hasattr(_callback_owner, "_post_delivery_callbacks"):
+                        _bg_cb = _callback_owner._post_delivery_callbacks.pop(
+                            session_key, None
+                        )
                         if callable(_bg_cb):
                             try:
                                 _bg_result = _bg_cb()
@@ -33183,6 +33483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    _post_delivery_adapter=_callback_owner,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
@@ -33434,52 +33735,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _transformed,
                     len(_final),
                 )
-
-        # Schedule deletion of tracked temporary progress bubbles after the
-        # final response lands. Failed runs skip this so bubbles remain as
-        # breadcrumbs for the user to see what work happened. Only fires on
-        # adapters that support ``delete_message`` (see init above); failures
-        # are swallowed — deletion is best-effort.
-        if (
-            _cleanup_progress
-            and _cleanup_adapter is not None
-            and _cleanup_msg_ids
-            and session_key
-            and isinstance(response, dict)
-            and not response.get("failed")
-            and hasattr(_cleanup_adapter, "register_post_delivery_callback")
-        ):
-            _ids_snapshot = list(_cleanup_msg_ids)
-            _chat_id_snapshot = source.chat_id
-            _adapter_snapshot = _cleanup_adapter
-            _loop_snapshot = asyncio.get_running_loop()
-
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
-
-            try:
-                _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
-                    _cleanup_temp_bubbles,
-                    generation=run_generation,
-                )
-            except Exception as _rpe:
-                logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
 

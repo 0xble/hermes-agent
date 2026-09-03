@@ -353,10 +353,12 @@ class TestBrowserUseIdentityRouting:
             lambda: _browser_cfg(),
         )
 
-        def route(env, force_local, identity=None):
+        def route(env, force_local, identity=None, headed=None):
             assert identity.alias == "lpg"
+            assert headed is None
             assert bu._browser_exec_identity_daemons == {}
             env["BU_CDP_URL"] = "http://127.0.0.1:9229"
+            env[bu._REAL_PROFILE_SENTINEL] = "1"
             return None
 
         monkeypatch.setattr(bu, "_resolve_real_profile_cdp", route)

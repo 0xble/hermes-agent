@@ -199,11 +199,21 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                     },
                 },
                 {
+                    "name": "Checkout canonical upstream history",
+                    "uses": CHECKOUT_ACTION,
+                    "with": {
+                        "repository": "NousResearch/hermes-agent",
+                        "ref": "main",
+                        "path": "canonical-upstream",
+                        "fetch-depth": "0",
+                        "persist-credentials": "false",
+                    },
+                },
+                {
                     "name": "Fetch canonical upstream history into candidate checkout",
                     "run": (
-                        "git -C candidate fetch --no-tags --filter=blob:none "
-                        "https://github.com/NousResearch/hermes-agent.git "
-                        "refs/heads/main:refs/remotes/canonical-upstream/main"
+                        "git -C candidate fetch --no-tags ../canonical-upstream "
+                        "HEAD:refs/remotes/canonical-upstream/main"
                     ),
                 },
                 {
@@ -212,7 +222,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
                         "--history-baseline-subject "
-                        "'fix(ci): reconcile post-merge history baseline'"
+                        "'fix(ci): advance goal guidance maintenance baseline'"
                     ),
                 },
                 {
@@ -237,9 +247,10 @@ def _fork_policy_variant(checkout_action: str, setup_uv_action: str) -> dict[str
     steps = policy["jobs"]["policy"]["steps"]
     steps[0]["uses"] = checkout_action
     steps[1]["uses"] = checkout_action
+    steps[2]["uses"] = checkout_action
     if checkout_action == CHECKOUT_ACTION_NEXT:
         steps[1]["with"]["allow-unsafe-pr-checkout"] = "true"
-    steps[4]["uses"] = setup_uv_action
+    steps[5]["uses"] = setup_uv_action
     return policy
 
 

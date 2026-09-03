@@ -4638,6 +4638,26 @@ class GatewaySlashCommandsMixin:
             logger.error("Failed to save config key %s: %s", key_path, e)
             return False
 
+    def _live_agent_for_session_control(self, session_key: str):
+        """Return the running agent that a request-boundary control may update.
+
+        The pending sentinel reserves the turn before agent construction. Its
+        build path consumes the session override, but it is never itself a
+        mutable agent.
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        running_agents = getattr(self, "_running_agents", {}) or {}
+        agent = running_agents.get(session_key)
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return None
+        return agent
+
+    def _evict_idle_agent_after_session_control(self, session_key: str) -> None:
+        """Rebuild an idle cached agent, never one reserved by a live turn."""
+        if not getattr(self, "_is_session_running")(session_key):
+            getattr(self, "_evict_cached_agent")(session_key)
+
     def _apply_reasoning_selection(
         self,
         session_key: str,
@@ -4654,6 +4674,15 @@ class GatewaySlashCommandsMixin:
         from hermes_constants import parse_reasoning_effort
 
         value = (value or "").strip().lower()
+        live_agent = self._live_agent_for_session_control(session_key)
+
+        def _activate(reasoning_config) -> None:
+            if live_agent is not None:
+                live_agent.reasoning_config = (
+                    None if reasoning_config is None else dict(reasoning_config)
+                )
+            else:
+                self._evict_idle_agent_after_session_control(session_key)
 
         # Display toggle (per-platform)
         if value in {"show", "on"}:
@@ -4673,8 +4702,13 @@ class GatewaySlashCommandsMixin:
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
-            self._reasoning_config = self._load_reasoning_config()
-            self._evict_cached_agent(session_key)
+            self._reasoning_config = getattr(
+                self, "_resolve_session_reasoning_config"
+            )(
+                session_key=session_key,
+                model=str(getattr(live_agent, "model", "") or ""),
+            )
+            _activate(self._reasoning_config)
             return t("gateway.reasoning.reset_done")
 
         parsed = parse_reasoning_effort(value)
@@ -4685,14 +4719,14 @@ class GatewaySlashCommandsMixin:
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
                 self._set_session_reasoning_override(session_key, None)
-                self._evict_cached_agent(session_key)
+                _activate(parsed)
                 return t("gateway.reasoning.set_global", effort=value)
             self._set_session_reasoning_override(session_key, parsed)
-            self._evict_cached_agent(session_key)
+            _activate(parsed)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
 
         self._set_session_reasoning_override(session_key, parsed)
-        self._evict_cached_agent(session_key)
+        _activate(parsed)
         return t("gateway.reasoning.set_session", effort=value)
 
     def _reasoning_picker_choices(self, current_effort: str) -> list:
@@ -4963,7 +4997,10 @@ class GatewaySlashCommandsMixin:
         to config.yaml (parity with /model and /reasoning).
         """
         from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from hermes_cli.models import model_supports_fast_mode
+        from hermes_cli.models import (
+            model_supports_fast_mode,
+            resolve_fast_mode_overrides,
+        )
 
         raw_args = event.get_command_args().strip().lower()
         # Reuse the /reasoning arg parser: strips --global (any position),
@@ -4973,15 +5010,26 @@ class GatewaySlashCommandsMixin:
         self._service_tier = self._resolve_session_service_tier(
             session_key=session_key
         )
+        live_agent = self._live_agent_for_session_control(session_key)
+        if live_agent is not None:
+            self._service_tier = getattr(live_agent, "service_tier", None)
 
         user_config = _load_gateway_config()
-        model = _resolve_gateway_model(user_config)
+        model = str(
+            getattr(live_agent, "model", "") or _resolve_gateway_model(user_config)
+        )
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 
         def _apply_fast_selection(value: str, persist: bool = False) -> str:
             """Apply a /fast argument (typed or picked) and return the reply."""
+            selection_agent = self._live_agent_for_session_control(session_key)
+            selection_model = str(
+                getattr(selection_agent, "model", "") or model
+            )
             if value in {"fast", "on"}:
+                if not model_supports_fast_mode(selection_model):
+                    return t("gateway.fast.not_supported")
                 tier = "priority"
                 saved_value = "fast"
                 label = t("gateway.fast.label_fast")
@@ -4992,21 +5040,35 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.fast.unknown_arg", arg=value)
             self._service_tier = tier
+            if selection_agent is not None:
+                request_overrides = dict(
+                    getattr(selection_agent, "request_overrides", {}) or {}
+                )
+                request_overrides.pop("service_tier", None)
+                request_overrides.pop("speed", None)
+                if tier:
+                    request_overrides.update(
+                        resolve_fast_mode_overrides(selection_model) or {}
+                    )
+                selection_agent.service_tier = tier
+                # Copy-on-write keeps an already-built API request unchanged;
+                # the next model iteration reads this replacement.
+                selection_agent.request_overrides = request_overrides
             if persist:
                 if self._save_gateway_config_key("agent.service_tier", saved_value):
                     # Global write supersedes any session override.
                     self._set_session_service_tier_override(
                         session_key, None, clear=True
                     )
-                    self._evict_cached_agent(session_key)
+                    self._evict_idle_agent_after_session_control(session_key)
                     return t("gateway.fast.saved", label=label)
                 # Config write failed — fall back to a session override so the
                 # user's choice still applies (mirrors /reasoning --global).
                 self._set_session_service_tier_override(session_key, tier)
-                self._evict_cached_agent(session_key)
+                self._evict_idle_agent_after_session_control(session_key)
                 return t("gateway.fast.session_only", label=label)
             self._set_session_service_tier_override(session_key, tier)
-            self._evict_cached_agent(session_key)
+            self._evict_idle_agent_after_session_control(session_key)
             return t("gateway.fast.session_only", label=label)
 
         if not args or args == "status":

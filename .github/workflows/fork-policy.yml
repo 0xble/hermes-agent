@@ -36,18 +36,25 @@ jobs:
           persist-credentials: false
           # Candidate contents are inspected as data by trusted default-branch code.
           allow-unsafe-pr-checkout: true
+      - name: Checkout canonical upstream history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: main
+          path: canonical-upstream
+          fetch-depth: 0
+          persist-credentials: false
       - name: Fetch canonical upstream history into candidate checkout
         run: >-
-          git -C candidate fetch --no-tags --filter=blob:none
-          https://github.com/NousResearch/hermes-agent.git
-          refs/heads/main:refs/remotes/canonical-upstream/main
+          git -C candidate fetch --no-tags ../canonical-upstream
+          HEAD:refs/remotes/canonical-upstream/main
       - name: Validate maintained patch history with trusted code
         run: >-
           python3 trusted-policy/scripts/validate_maintenance_manifest.py
           candidate/MAINTENANCE.md
           --upstream-ref canonical-upstream/main
           --history-baseline-subject
-          'fix(ci): reconcile post-merge history baseline'
+          'fix(ci): advance goal guidance maintenance baseline'
       - name: Install pinned uv for trusted workflow policy
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:

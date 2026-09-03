@@ -39,6 +39,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         adapter_profile=kw.get("adapter_profile"),
+        obligation_kind=kw.get("obligation_kind", "agent_final"),
+        turn_token=kw.get("turn_token"),
     )
 
 
@@ -124,6 +126,48 @@ class TestSchemaMigration:
             conn.close()
 
         assert "adapter_profile" in columns
+        assert "obligation_kind" in columns
+        assert "turn_token" in columns
+
+    def test_classifies_historical_restart_status_as_control(self):
+        conn = sqlite3.connect(dl._db_path())
+        try:
+            conn.execute(
+                """CREATE TABLE delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY,
+                    session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    owner_pid INTEGER,
+                    owner_started_at INTEGER,
+                    last_error TEXT,
+                    adapter_profile TEXT
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO delivery_obligations VALUES
+                   ('status', 'sk', 'telegram', 'c', 't', ?, 'failed', 0,
+                    1, 1, 999999999, 1, NULL, 'default'),
+                   ('answer', 'sk', 'telegram', 'c', 't', 'real answer',
+                    'failed', 0, 1, 1, 999999999, 1, NULL, 'default')""",
+                ("⏳ Gateway is restarting and is not accepting new work right now.",),
+            )
+            dl._initialize_schema(conn)
+            rows = dict(
+                conn.execute(
+                    "SELECT obligation_id, obligation_kind FROM delivery_obligations"
+                )
+            )
+        finally:
+            conn.close()
+
+        assert rows == {"status": "control", "answer": "legacy"}
 
 
 class TestStateMachine:
@@ -150,12 +194,14 @@ class TestSweep:
         assert dl.sweep_recoverable() == []
 
     def test_dead_owner_pending_claimed_without_marker(self):
-        _record()
+        _record(turn_token="turn-123")
         _orphan("ob-1")
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is False
         assert claimed[0]["attempts"] == 1
+        assert claimed[0]["obligation_kind"] == "agent_final"
+        assert claimed[0]["turn_token"] == "turn-123"
         # Claim re-stamps ownership: a second sweep in the same (live)
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
@@ -362,7 +408,7 @@ class TestGatewayRedeliverySweep:
         runner._profile_adapters = {}
         runner._active_profile_name = lambda: "default"
         _store = MagicMock()
-        _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending_for_obligation = AsyncMock(return_value=True)
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
@@ -390,8 +436,8 @@ class TestGatewayRedeliverySweep:
         assert sent["content"] == "the final answer"  # no marker
         assert sent["metadata"] == {"thread_id": "171.001"}
         assert _row("ob-1")["state"] == "delivered"
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_for_obligation.assert_awaited_once_with(
+            "agent:main:slack:channel:C1", None, allow_legacy=False
         )
 
     @pytest.mark.asyncio
@@ -459,8 +505,8 @@ class TestGatewayRedeliverySweep:
         n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
 
         assert n == 1
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_for_obligation.assert_awaited_once_with(
+            "agent:main:slack:channel:C1", None, allow_legacy=False
         )
         assert adapter.send.await_count == 1
         assert adapter.send.call_args.kwargs["content"].startswith(
@@ -516,7 +562,7 @@ class TestGatewayRedeliverySweep:
         dl.mark_failed("ob-1", "send_path_degraded")
         adapter = self._adapter()
         runner = self._runner(adapter)
-        runner._async_session_store.clear_resume_pending.side_effect = RuntimeError(
+        runner._async_session_store.clear_resume_pending_for_obligation.side_effect = RuntimeError(
             "session store unavailable"
         )
 
@@ -575,13 +621,13 @@ class TestGatewayRedeliverySweep:
         task = asyncio.create_task(runner._redeliver_pending_obligations())
 
         deadline = asyncio.get_running_loop().time() + 2
-        while runner._async_session_store.clear_resume_pending.await_count == 0:
+        while runner._async_session_store.clear_resume_pending_for_obligation.await_count == 0:
             if asyncio.get_running_loop().time() >= deadline:
                 raise AssertionError("resume_pending was not cleared before send")
             await asyncio.sleep(0)
 
-        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
-            "agent:main:slack:channel:C1"
+        runner._async_session_store.clear_resume_pending_for_obligation.assert_awaited_once_with(
+            "agent:main:slack:channel:C1", None, allow_legacy=False
         )
         assert not task.done()
 
@@ -643,7 +689,7 @@ class TestUnconnectedPlatformKeepsItsBudget:
         runner = object.__new__(GatewayRunner)
         runner.adapters = {}  # slack failed to connect this boot
         _store = MagicMock()
-        _store.clear_resume_pending = AsyncMock()
+        _store.clear_resume_pending_for_obligation = AsyncMock(return_value=True)
         _store._store = None
         runner.session_store = None
         runner._async_session_store = _store
