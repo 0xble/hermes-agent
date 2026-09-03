@@ -123,6 +123,9 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-099 | Active | `fix(desktop): preserve expanded remote update mutex paths` | Keep the Desktop SSH lifecycle mutex inside the selected remote Hermes home instead of creating a quote-bearing relative path. |
 | HERMES-100 | Active | `fix(reconcile): preserve scoped cwd and canonical title contracts` | Keep automatic title protection for a hidden canonical Bot Chat inside the title writer's tuple-return contract. |
 | HERMES-101 | Active | `fix(profiles): tolerate transient macOS process access` | Keep profile deletion resilient when macOS denies or races a process command-line read. |
+| HERMES-102 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
+| HERMES-104 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Keep manually pooled Codex OAuth accounts from adopting another account's singleton auth-store tokens. |
+
 
 ## Fork-only administrative subject exemptions
 
@@ -206,6 +209,30 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-104 — Isolate manually added Codex accounts
+
+- **Independent hypothesis (2026-09-03):** The singleton Codex auth-store mirror was applied to both its seeded device-code entry and independently added `manual:device_code` pool entries, so refreshing one logical account could overwrite another account's tokens.
+- **Summary:** Restrict singleton auth-store resynchronization to the canonical `device_code` seed. Manual device-code entries retain their own access and refresh tokens.
+- **Surfaces:** `agent/credential_pool.py`; `tests/agent/test_credential_pool.py`; this record.
+- **Upstream tracking:** Fork-origin correction accepted on Brian's owned remote as #46; not present in released canonical upstream as of 2026-09-03.
+- **Upstream PR:** None.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_credential_pool.py -q`; the manual-entry case must preserve both tokens and avoid persistence while singleton seed behavior remains covered by the existing suite.
+- **Expected published commit identity:** Stable subject `fix(auth): isolate manually added Codex accounts (#46)`; source, regression, and this record ship together.
+- **Rollback:** Revert the stable subject only if manual Codex entries are removed or receive a separate account-bound resynchronization source. No persistent schema changes are involved.
+- **Retirement:** Retire after released upstream distinguishes singleton-seeded and manual Codex accounts at the auth-store synchronization boundary and passes equivalent multi-account regression coverage.
+
+### HERMES-102 — Verify observable agent completion
+
+- **Independent hypothesis (2026-09-02):** Cron health treats a normally returned assistant response as successful even when a consequential agent explicitly reports `CONTINUING` and the intended publication or rollout never happened. Prompt-only completion language cannot distinguish a fluent report from verified external state, while prescribing the engineering path would unnecessarily constrain the agent.
+- **Summary:** Add a trusted, CLI-owned `completion_script` whose content hash is pinned at configuration time and whose exact verified bytes are captured before the agent runs. The captured script runs after the agent returns and before the scheduler books success. Changed content, non-zero exit, timeout, or interruption records a failed run while preserving both the agent response and verifier evidence. The verifier does not alter the prompt, tools, plan, or engineering choices available to the agent.
+- **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `hermes_cli/cron.py`; `hermes_cli/subcommands/cron.py`; `tests/cron/test_jobs.py`; `tests/cron/test_scheduler_completion_verification.py`; `tests/hermes_cli/test_cron.py`; `tests/tools/test_cronjob_tools.py`; `website/docs/user-guide/features/cron.md`; this record.
+- **Upstream tracking:** No released upstream behavior was found that supports a user-owned post-agent completion verifier distinct from pre-run scripts and agent lifecycle completion as of 2026-09-02.
+- **Upstream PR:** None.
+- **Regression:** `scripts/run_tests.sh tests/cron/test_scheduler_completion_verification.py tests/cron/test_jobs.py tests/tools/test_cronjob_tools.py tests/hermes_cli/test_cron.py -q`; focused cases prove success on verifier exit zero, failure with retained evidence and a truthful session reason on non-zero, pre-agent byte capture against in-run replacement, CLI-pinned content hashes, model-tool non-exposure, persistence and clearing of the field, and compatibility with existing cron management surfaces.
+- **Expected published commit identity:** Stable subject `feat(cron): verify observable agent completion (#44)`; source, regressions, documentation, and this record ship together.
+- **Rollback:** Revert only the stable subject, remove `completion_script` from affected jobs first, and restore assistant-response lifecycle completion as the sole post-agent scheduler gate. Existing pre-run scripts, monitor mode, run budgets, and agent freedom remain unchanged.
+- **Retirement:** Retire after released upstream supports an equivalent trusted post-agent verifier whose failure marks the run unhealthy, retains verifier evidence, remains user-owned rather than model-configurable, and does not constrain the agent's execution plan. Remove the fork implementation and duplicate tests rather than keeping parallel gates.
 
 ### HERMES-101 — Keep profile deletion resilient to transient process access failures
 

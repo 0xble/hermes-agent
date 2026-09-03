@@ -2079,3 +2079,47 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def test_codex_manual_device_code_entry_keeps_its_independent_account(monkeypatch):
+    """Refreshing one Codex account must not clobber another pooled account."""
+    from contextlib import nullcontext
+
+    from agent import credential_pool as credential_pool_module
+    from agent.credential_pool import AUTH_TYPE_OAUTH, CredentialPool, PooledCredential
+
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="account-a",
+        label="account-a",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=1,
+        source="manual:device_code",
+        access_token="account-a-access",
+        refresh_token="account-a-refresh",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    monkeypatch.setattr(credential_pool_module, "_auth_store_lock", nullcontext)
+    monkeypatch.setattr(
+        credential_pool_module,
+        "_load_auth_store",
+        lambda: {
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "account-b-access",
+                        "refresh_token": "account-b-refresh",
+                    }
+                }
+            }
+        },
+    )
+    persist_calls = []
+    monkeypatch.setattr(pool, "_persist", lambda: persist_calls.append(True))
+
+    synced = pool._sync_codex_entry_from_auth_store(entry)
+
+    assert synced is entry
+    assert pool.entries()[0].access_token == "account-a-access"
+    assert pool.entries()[0].refresh_token == "account-a-refresh"
+    assert persist_calls == []
