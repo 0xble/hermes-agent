@@ -120,6 +120,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
 | HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
+| HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 
 ## Fork-only administrative subject exemptions
 
@@ -187,15 +188,31 @@ These exact subjects are fork-only history but do not define independently retir
 | `chore(actions)(deps): bump actions/checkout from 6.0.2 to 7.0.1` | Automated pinned GitHub Action dependency refresh with the documented v7 fork-data opt-in on the exact trusted policy workflow; no shipped Hermes behavior. |
 | `chore(actions)(deps): bump the actions-minor-patch group across 1 directory with 3 updates` | Automated pinned GitHub Action dependency refresh for the reviewed Hadolint, Cachix, and OSV SHAs; no shipped Hermes behavior. |
 | `fix(ci): reconcile squash-merged goal history` | Fork-administrative history reconciliation that replaces PR #17's accidental merge commit with its tree-equivalent squash commit while preserving later reviewed merges; no shipped Hermes behavior. |
+| `fix(ci): reconcile post-merge history baseline` | Fork-administrative history reconciliation after concurrent reviewed merges advanced `main`; no shipped Hermes behavior. |
+| `fix(ci): register reconciled worktree branch history` | Fork-administrative registration of exact historical and integration subjects exposed by reconciling PR #25 with the current fork base; no shipped Hermes behavior. |
 | `Merge pull request #3 from 0xble/dependabot/github_actions/astral-sh/setup-uv-9.0.0` | GitHub-authored merge wrapper around the already-registered setup-uv dependency refresh; no additional behavior. |
 | `Merge pull request #5 from 0xble/dependabot/github_actions/actions/checkout-7.0.1` | GitHub-authored merge wrapper around the already-registered checkout dependency refresh; no additional behavior. |
 | `Merge pull request #13 from 0xble/dependabot/github_actions/actions-minor-patch-f5d4e90336` | GitHub-authored merge wrapper around the already-registered grouped action refresh; no additional behavior. |
+| `Merge pull request #17 from 0xble/feat/goal-tool-parity` | GitHub-authored merge wrapper around the indexed goal-control patch; no additional behavior. |
 | `Merge pull request #18 from 0xble/fix/duplicate-topic-titles-100002` | GitHub-authored merge wrapper around the indexed Telegram topic-label patch; no additional behavior. |
 | `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
+| `Merge remote-tracking branch 'origin/main' into fix/worktree-path-warning` | Task-owned integration of the current reviewed fork base into PR #25; no additional behavior beyond the indexed worktree advisory. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-099 — Warn on nonstandard worktree paths
+
+- **Independent hypothesis (2026-09-01):** A live inventory found worktrees spread across `/private/tmp`, `~/Worktrees`, and `~/.hermes/hermes-agent-worktrees`. Those locations were accepted by Git but escaped Hermes's `.worktrees/` lifecycle, obscured source/runtime ownership, and accumulated redundant or abandoned trees.
+- **Summary:** Inspect direct agent terminal commands for `git worktree add`, resolve literal destinations across shell separators, `git -C`, common wrappers, options, and traversal, then attach a non-blocking warning when the destination does not contain a `.worktrees` folder. Preserve legitimate external worktree use while making the repository-owned convention visible in both foreground and background tool results.
+- **Surfaces:** `tools/worktree_path_guard.py`; `tools/terminal_tool.py`; `tests/tools/test_worktree_path_guard.py`; this record.
+- **Upstream tracking:** Not yet filed upstream as of 2026-09-01. Hermes's native `-w`, `/worktree new`, and Kanban worktree paths already use repository-local `.worktrees/`; this patch adds advisory coverage for manual terminal commands.
+- **Upstream PR:** None as of 2026-09-01. The maintained-fork PR is the only published implementation currently tracked.
+- **Regression:** `python -m pytest -q tests/tools/test_worktree_path_guard.py tests/tools/test_terminal_tool.py tests/tools/test_terminal_bounded_execute.py tests/tools/test_terminal_task_cwd.py tests/tools/test_terminal_output_transform_hook.py`; coverage must prove compliant paths remain silent, absolute and relative external paths warn, traversal cannot escape an apparent `.worktrees` path, shell separators and common wrappers remain visible, heredoc data does not create false positives, and successful foreground worktree creation returns the advisory warning.
+- **Expected published commit identity:** Stable subjects `feat(terminal): warn on nonstandard worktree paths` and `fix(terminal): recognize compound shell separators`; source, regressions, and this lifecycle record ship together.
+- **Rollback:** Revert only `feat(terminal): warn on nonstandard worktree paths`, remove the path guard, terminal result field, focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
+- **Retirement:** Retire after released upstream Hermes provides equivalent advisory or enforcement for direct agent-created worktrees outside `.worktrees/`, including shell traversal and wrapper coverage, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
 ### HERMES-098 — Keep Telegram citation brackets visible
 
