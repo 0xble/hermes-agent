@@ -205,6 +205,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `chore(actions)(deps): bump actions/checkout from 6.0.2 to 7.0.1` | Automated pinned GitHub Action dependency refresh with the documented v7 fork-data opt-in on the exact trusted policy workflow; no shipped Hermes behavior. |
 | `chore(actions)(deps): bump the actions-minor-patch group across 1 directory with 3 updates` | Automated pinned GitHub Action dependency refresh for the reviewed Hadolint, Cachix, and OSV SHAs; no shipped Hermes behavior. |
 | `fix(ci): reconcile squash-merged goal history` | Fork-administrative history reconciliation that replaces PR #17's accidental merge commit with its tree-equivalent squash commit while preserving later reviewed merges; no shipped Hermes behavior. |
+| `fix(maintenance): reconcile concurrent auth baseline` | Fork-administrative reconciliation preserving the concurrent Codex account-isolation publication through HERMES-104 while retaining the candidate's stricter immutable history baseline; no additional shipped behavior. |
 
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
