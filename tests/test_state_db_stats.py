@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from hermes_state import SessionDB, collect_state_db_stats, count_db_holders
+from hermes_state_common import FTS_STORAGE_VERSION
 
 
 @pytest.fixture()
@@ -171,7 +172,7 @@ def _base_stats(**overrides):
             "messages_fts_trigram": True,
             "messages_fts_cjk": False,
         },
-        "fts_storage_version": 1,
+        "fts_storage_version": FTS_STORAGE_VERSION,
         "fts_rebuild_pending": False,
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,

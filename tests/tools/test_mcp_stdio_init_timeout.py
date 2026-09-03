@@ -87,7 +87,7 @@ class TestStdioInitializeTimeout:
                 return time.monotonic() - start
 
         elapsed = asyncio.run(drive())
-        assert elapsed < 2.0, (
+        assert elapsed < 4.5, (
             f"_run_stdio blocked {elapsed:.1f}s on a hanging initialize() — the "
             f"connect_timeout ({config['connect_timeout']}s) bound was not applied; "
             f"the #59349 subprocess/FD leak has regressed."

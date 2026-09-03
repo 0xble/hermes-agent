@@ -8,6 +8,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import psutil
 
 
 def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
@@ -18,16 +19,12 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     scripts_dir = tmp_path / "scripts"
     scripts_dir.mkdir()
     started = tmp_path / "started"
-    child_done = tmp_path / "child-done"
     script = scripts_dir / "blocking.py"
-    child_code = (
-        "import time; from pathlib import Path; "
-        f"time.sleep(1); Path({str(child_done)!r}).write_text('done')"
-    )
+    child_code = "import time; time.sleep(30)"
     script.write_text(
         "import subprocess, sys, time\n"
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
-        f"open({str(started)!r}, 'w').close()\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        f"open({str(started)!r}, 'w').write(str(child.pid))\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )
@@ -63,8 +60,19 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     assert not thread.is_alive(), "script ignored cancellation"
     assert result and result[0][0] is False
     assert "cancel" in result[0][1].lower()
-    time.sleep(1.2)
-    assert not child_done.exists(), "script descendant survived cancellation"
+
+    child_pid = int(started.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            child = psutil.Process(child_pid)
+            if not child.is_running() or child.status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("script descendant survived cancellation")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
