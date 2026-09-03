@@ -123,6 +123,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 | HERMES-100 | Active | `fix(agent): rotate credentials across transient retries` | Try one previously untried eligible logical account on each transient same-provider retry before crossing to the configured fallback. |
 | HERMES-101 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
+| HERMES-102 | Active | `fix(compression): preserve fallback at route deadline` | Make the configured compression fallback independent of whether the worker or host observes the shared hard deadline first. |
 | HERMES-103 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Prevent singleton Codex auth recovery from overwriting independently added pooled accounts. |
 
 ## Fork-only administrative subject exemptions
@@ -217,6 +218,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Expected published commit identity:** Stable subject `fix(auth): isolate manually added Codex accounts (#46)`; the code and regression landed in PR #46, while this record repairs the omitted lifecycle registration.
 - **Rollback:** Revert `fix(auth): isolate manually added Codex accounts (#46)`, restoring broad manual-entry synchronization, then remove this index row and record. No schema or persistent-data migration rollback is required.
 - **Retirement:** Retire after released upstream preserves independently added Codex accounts during singleton auth recovery and passes equivalent credential-pool regressions.
+### HERMES-102 — Preserve compression fallback at route deadline
+
+- **Independent hypothesis (2026-09-03):** Five primary compression attempts ended at the same 600-second boundary with `failure_class=explicit_interrupt` and no fallback, while the opposite timer ordering immediately ran the configured fallback successfully. The worker and host share one deadline, so scheduling order was deciding whether fallback ran.
+- **Summary:** Mark only worker-side `AuxiliaryExplicitCancellation` caused by the shared route deadline, classify its telemetry as `route_deadline`, then route that completed-future result through the existing ...[truncated]
+- **Surfaces:** `agent/conversation_compression.py`; `tests/agent/test_compression_attempt_lifecycle.py`; `tests/agent/test_compression_stall_fallback_78981.py`; this record.
+- **Upstream tracking:** NousResearch/hermes-agent#102339 documents the reproduced equal-deadline race and evidence.
+- **Upstream PR:** Open PR #102370 carries the upstream-compatible implementation and regressions. Mirror reviewed changes until it merges or closes without merging that unowned PR.
+- **Regression:** `uv run --frozen pytest tests/agent/test_compression*.py -q`; focused coverage must prove worker-first and host-first deadlines each attempt fallback once, rotation-mode message rebinding cannot hide the worker signal, explicit stop does not set it, safe unchanged outcomes do not retry, and a cancelled primary cannot publish late.
+- **Expected published commit identity:** Stable subject `fix(compression): preserve fallback at route deadline`; source, regressions, and this lifecycle record ship together.
+- **Rollback:** Revert only `fix(compression): preserve fallback at route deadline`, removing the deadline-abort fence signal, host branch, focused regressions, index row, and this record. No configuration or persistent-data rollback is required.
+- **Retirement:** Retire after released upstream includes PR #102370 or equivalent behavior, passes the focused regressions, and makes configured fallback independent of equal-deadline scheduling. Remove the fork implementation and duplicate tests rather than retaining parallel paths.
+
 
 ### HERMES-100 — Rotate credentials across transient retries
 
