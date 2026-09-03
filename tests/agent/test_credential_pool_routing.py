@@ -10,6 +10,7 @@ Covers:
    exhausted, not whatever pool.current() happens to point at
 """
 
+import base64
 import json
 import time
 from types import SimpleNamespace
@@ -415,6 +416,13 @@ class TestFailureAttribution:
         entry.update(overrides)
         return entry
 
+    def _codex_token(self, account_id, token_id="token"):
+        payload = base64.urlsafe_b64encode(json.dumps({
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+            "jti": token_id,
+        }).encode()).decode().rstrip("=")
+        return f"header.{payload}.signature"
+
     def _agent(self, pool, failing_key, credential_id=None, provider="anthropic"):
         return SimpleNamespace(
             provider=provider,
@@ -752,9 +760,8 @@ class TestFailureAttribution:
         assert pool.soft_cooldown_ids() == {"cred-1"}
         assert agent._swap_credential.call_args[0][0].id == "cred-0"
 
-    def test_provider_overload_uses_each_alternate_once(self, tmp_path, monkeypatch):
-        """The same overloaded turn must not cycle through more than one
-        same-provider account before the caller escalates to fallback."""
+    def test_provider_overload_uses_one_distinct_account_per_retry(self, tmp_path, monkeypatch):
+        """Each transient retry advances to an untried same-provider account."""
         from agent.error_classifier import FailoverReason
 
         pool = self._make_pool(
@@ -768,6 +775,7 @@ class TestFailureAttribution:
         )
         agent = self._agent(pool, failing_key="key-a")
         agent.provider = "openai-codex"
+        attempted = set()
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
@@ -775,20 +783,63 @@ class TestFailureAttribution:
             agent,
             status_code=None,
             has_retried_429=False,
+            attempted_credential_identities=attempted,
             classified_reason=FailoverReason.overloaded,
         )
+        agent.api_key = "key-b"
+        agent._credential_pool_entry_id = "cred-1"
         second, _ = recover_with_credential_pool(
             agent,
             status_code=None,
             has_retried_429=False,
-            alternate_credential_attempted=True,
+            attempted_credential_identities=attempted,
             classified_reason=FailoverReason.overloaded,
         )
 
         assert first is True
-        assert second is False
-        assert agent._swap_credential.call_count == 1
-        assert agent._last_credential_rotation is None
+        assert second is True
+        assert [call.args[0].id for call in agent._swap_credential.call_args_list] == [
+            "cred-1",
+            "cred-2",
+        ]
+        assert attempted == {"cred-0", "cred-1", "cred-2"}
+
+    def test_provider_overload_skips_duplicate_codex_account(self, tmp_path, monkeypatch):
+        """Two OAuth rows for one ChatGPT account count as one retry identity."""
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        token_a1 = self._codex_token("account-a", "token-a1")
+        token_a2 = self._codex_token("account-a", "token-a2")
+        token_b = self._codex_token("account-b", "token-b")
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [
+                self._entry(0, token_a1),
+                self._entry(1, token_a2),
+                self._entry(2, token_b),
+            ],
+            provider="openai-codex",
+        )
+        agent = self._agent(
+            pool,
+            failing_key=token_a1,
+            credential_id="cred-0",
+            provider="openai-codex",
+        )
+        attempted = set()
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            attempted_credential_identities=attempted,
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is True
+        assert agent._swap_credential.call_args.args[0].id == "cred-2"
+        assert attempted == {"account:account-a", "account:account-b"}
 
     def test_failed_alternate_is_cooled_before_provider_fallback(
         self, tmp_path, monkeypatch
@@ -869,6 +920,61 @@ class TestFailureAttribution:
         assert has_retried_429 is True
         assert agent._swap_credential.call_count == 1
 
+    def test_provider_overload_skips_exhausted_alternate(self, tmp_path, monkeypatch):
+        """Durably exhausted entries never consume a transient retry slot."""
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        exhausted = self._entry(1, "key-b")
+        exhausted.update({
+            "last_status": "exhausted",
+            "last_status_at": time.time(),
+            "last_error_code": 429,
+        })
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), exhausted, self._entry(2, "key-c")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a", provider="openai-codex")
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            attempted_credential_identities=set(),
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is True
+        assert agent._swap_credential.call_args.args[0].id == "cred-2"
+
+    def test_provider_overload_never_uses_soft_cooled_alternate(
+        self, tmp_path, monkeypatch
+    ):
+        """Transient account rotation must not revive a cooling entry."""
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        pool.soft_cooldown("cred-1", reason="overloaded")
+        agent = self._agent(pool, failing_key="key-a", provider="openai-codex")
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            attempted_credential_identities=set(),
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is False
+        agent._swap_credential.assert_not_called()
+
     def test_single_credential_overload_falls_through(self, tmp_path, monkeypatch):
         """A one-account pool cannot recover overload by account rotation."""
         from agent.error_classifier import FailoverReason
@@ -892,6 +998,32 @@ class TestFailureAttribution:
 
         assert recovered is False
         assert has_retried is False
+        agent._swap_credential.assert_not_called()
+
+    def test_transient_failure_does_not_rotate_without_a_retry_slot(
+        self, tmp_path, monkeypatch
+    ):
+        """A credential swap must never expand the configured request budget."""
+        from agent.error_classifier import FailoverReason
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+            provider="openai-codex",
+        )
+        agent = self._agent(pool, failing_key="key-a", provider="openai-codex")
+
+        recovered, _ = recover_with_credential_pool(
+            agent,
+            status_code=None,
+            has_retried_429=False,
+            attempted_credential_identities=set(),
+            transient_retry_available=False,
+            classified_reason=FailoverReason.overloaded,
+        )
+
+        assert recovered is False
         agent._swap_credential.assert_not_called()
 
     def test_upstream_aggregator_rate_limit_still_bypasses_account_rotation(

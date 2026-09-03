@@ -26,7 +26,7 @@ imported by the turn loop without an import cycle.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 
 @dataclass
@@ -68,6 +68,9 @@ class TurnRetryState:
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
     alternate_credential_attempted: bool = False
+    attempted_credential_identities: set[str] = field(default_factory=set)
+    transient_credential_retries_used: int = 0
+    transient_credential_retry_budget_exhausted: bool = False
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider

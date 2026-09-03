@@ -1092,7 +1092,12 @@ def sync_credential_pool_entry_id(agent) -> None:
         agent._credential_pool_entry_id = None
 
 
-def _select_alternate_credential(agent) -> Optional[Any]:
+def _select_alternate_credential(
+    agent,
+    *,
+    exclude_identities: Optional[set[str]] = None,
+    exclude_soft_cooled: bool = False,
+) -> Optional[Any]:
     """Return one available same-provider credential different from the one
     that just failed.
 
@@ -1120,6 +1125,8 @@ def _select_alternate_credential(agent) -> Optional[Any]:
         return pool.select_alternate(
             exclude_id=current_id,
             exclude_runtime_key=current_key,
+            exclude_identities=exclude_identities,
+            exclude_soft_cooled=exclude_soft_cooled,
         )
     except Exception:
         logger.debug("Could not select alternate credential", exc_info=True)
@@ -1132,6 +1139,8 @@ def recover_with_credential_pool(
     status_code: Optional[int],
     has_retried_429: bool,
     alternate_credential_attempted: bool = False,
+    attempted_credential_identities: Optional[set[str]] = None,
+    transient_retry_available: bool = True,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
     billing_unverified: bool = False,
@@ -1321,15 +1330,37 @@ def recover_with_credential_pool(
                     exc_info=True,
                 )
 
-        # Try one other configured account before provider fallback. A dedicated
-        # per-turn guard bounds this to one alternate without changing the
-        # existing first-429 retry semantics. The cooldown above still records
-        # a failed alternate so nearby requests prefer a third healthy account.
-        if alternate_credential_attempted:
+        if not transient_retry_available:
             return False, has_retried_429
-        alternate = _select_alternate_credential(agent)
+
+        # Each retry may use one previously untried same-provider credential.
+        # The caller owns this set for the retry sequence, which prevents a
+        # soft-cooled entry from being selected again when every entry is cool.
+        attempted = attempted_credential_identities
+        if attempted is None:
+            # Compatibility for direct callers that have not adopted the
+            # sequence state yet: preserve the old one-alternate bound.
+            if alternate_credential_attempted:
+                return False, has_retried_429
+            attempted = set()
+        if failed_credential_id:
+            try:
+                attempted.add(pool.credential_retry_identity(failed_credential_id))
+            except Exception:
+                attempted.add(failed_credential_id)
+        alternate = _select_alternate_credential(
+            agent,
+            exclude_identities=attempted,
+            exclude_soft_cooled=True,
+        )
         if alternate is None:
             return False, has_retried_429
+        alternate_id = getattr(alternate, "id", None)
+        if alternate_id:
+            try:
+                attempted.add(pool.credential_retry_identity(alternate_id))
+            except Exception:
+                attempted.add(alternate_id)
         _rotation_context = {
             "from_entry": failed_credential_id,
             "to_entry": getattr(alternate, "id", None),

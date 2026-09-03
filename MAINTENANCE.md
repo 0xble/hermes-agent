@@ -121,6 +121,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
 | HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
+| HERMES-100 | Active | `fix(agent): rotate credentials across transient retries` | Try one previously untried eligible logical account on each transient same-provider retry before crossing to the configured fallback. |
 
 ## Fork-only administrative subject exemptions
 
@@ -201,6 +202,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-100 — Rotate credentials across transient retries
+
+- **Independent hypothesis (2026-09-02):** Retrying a transient provider failure with the same credential can exhaust the bounded retry budget while another eligible account remains unused, and duplicate OAuth rows can make apparent rotation repeat the same logical account.
+- **Summary:** Track attempted logical account identities across one retry sequence and select one previously untried eligible credential before each transient same-provider retry. Preserve priority, reservation, cooldown, durable quota and auth handling, hard retry ceilings, transport recovery, provider-wide overload behavior, and configured cross-provider fallback.
+- **Surfaces:** `agent/agent_runtime_helpers.py`; `agent/conversation_loop.py`; `agent/credential_pool.py`; `agent/turn_retry_state.py`; `run_agent.py`; focused credential-pool and retry regressions; this record.
+- **Upstream tracking:** Not yet filed upstream as of 2026-09-02. The maintained-fork PR is the only published implementation currently tracked.
+- **Upstream PR:** None as of 2026-09-02.
+- **Regression:** `python -m pytest -q tests/agent/test_credential_pool_routing.py tests/agent/test_turn_retry_state.py tests/run_agent/test_32646_fallback_429_after_timeout.py`; coverage must prove priority order, duplicate logical-account suppression, exhausted and cooled credential handling, no-alternate behavior, retry ceilings, provider-wide and Z.AI overload handling, transport recovery, and final configured fallback.
+- **Expected published commit identity:** Stable subject `fix(agent): rotate credentials across transient retries`; source, regressions, and this lifecycle record ship together.
+- **Rollback:** Revert `fix(agent): rotate credentials across transient retries`, removing attempted-account retry state, alternate-credential selection, focused regressions, the index row, and this record. No persistent-data migration rollback is required.
+- **Retirement:** Retire after released upstream Hermes provides equivalent logical-account rotation within bounded transient retries while preserving the listed failure classes and passes equivalent focused regressions.
 
 ### HERMES-099 — Warn on nonstandard worktree paths
 

@@ -31,6 +31,9 @@ EXPECTED_FIELDS = {
     "primary_recovery_attempted",
     "has_retried_429",
     "alternate_credential_attempted",
+    "attempted_credential_identities",
+    "transient_credential_retries_used",
+    "transient_credential_retry_budget_exhausted",
     "auth_failover_attempted",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
@@ -59,6 +62,9 @@ def test_guards_are_independently_mutable():
     # untouched guards stay False
     assert s.has_retried_429 is False
     assert s.anthropic_auth_retry_attempted is False
+    assert s.attempted_credential_identities == set()
+    assert s.transient_credential_retries_used == 0
+    assert s.transient_credential_retry_budget_exhausted is False
 
 
 def test_copilot_provider_check_accepts_alias_spellings():

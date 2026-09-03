@@ -2210,6 +2210,8 @@ class CredentialPool:
         *,
         exclude_id: Optional[str] = None,
         exclude_runtime_key: Optional[str] = None,
+        exclude_identities: Optional[set[str]] = None,
+        exclude_soft_cooled: bool = False,
     ) -> Optional[PooledCredential]:
         """Select a usable alternate without changing durable credential health."""
         with self._lock:
@@ -2217,10 +2219,13 @@ class CredentialPool:
                 clear_expired=True,
                 refresh=False,
             )
+            cooled_ids = self.soft_cooldown_ids() if exclude_soft_cooled else set()
             eligible = [
                 entry
                 for entry in available
                 if (not exclude_id or entry.id != exclude_id)
+                and self._retry_identity(entry) not in (exclude_identities or set())
+                and entry.id not in cooled_ids
                 and (
                     not exclude_runtime_key
                     or entry.runtime_api_key != exclude_runtime_key
@@ -2228,6 +2233,23 @@ class CredentialPool:
             ]
             candidates = self._prefer_not_soft_cooled(eligible)
             return candidates[0] if candidates else None
+
+    def _retry_identity(self, entry: PooledCredential) -> str:
+        """Return the stable account identity used to deduplicate one retry sequence."""
+        if self.provider == "openai-codex":
+            claims = _decode_jwt_claims(entry.access_token)
+            auth_claims = claims.get("https://api.openai.com/auth", {})
+            if isinstance(auth_claims, dict):
+                account_id = auth_claims.get("chatgpt_account_id")
+                if isinstance(account_id, str) and account_id:
+                    return f"account:{account_id}"
+        return entry.id
+
+    def credential_retry_identity(self, credential_id: str) -> str:
+        """Resolve a pool entry ID to its retry-sequence account identity."""
+        with self._lock:
+            entry = next((item for item in self._entries if item.id == credential_id), None)
+            return self._retry_identity(entry) if entry is not None else credential_id
 
     def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[tuple]]:
         """Run selection under the lock, returning entry + pending refreshes."""

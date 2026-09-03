@@ -5064,6 +5064,10 @@ def run_conversation(
                     status_code=status_code,
                     has_retried_429=_retry.has_retried_429,
                     alternate_credential_attempted=_retry.alternate_credential_attempted,
+                    attempted_credential_identities=_retry.attempted_credential_identities,
+                    transient_retry_available=(
+                        _retry.transient_credential_retries_used < max_retries
+                    ),
                     classified_reason=classified.reason,
                     error_context=error_context,
                     billing_unverified=classified.billing_unverified,
@@ -5075,7 +5079,24 @@ def run_conversation(
                         FailoverReason.timeout,
                     }:
                         _retry.alternate_credential_attempted = True
+                        _retry.transient_credential_retries_used += 1
                     continue
+                if (
+                    classified.reason in {
+                        FailoverReason.overloaded,
+                        FailoverReason.server_error,
+                        FailoverReason.timeout,
+                    }
+                    and _retry.transient_credential_retries_used > 0
+                ):
+                    # After at least one alternate account has been tried, every
+                    # configured credential retry used a distinct account. If no
+                    # untried eligible identity remains, consume the remaining
+                    # generic retry budget and fall back rather than repeat the
+                    # last account. A single-account pool never enters this branch,
+                    # preserving ordinary same-account backoff and transport recovery.
+                    _retry.transient_credential_retry_budget_exhausted = True
+                    retry_count = max(retry_count, max_retries - 1)
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -5730,7 +5751,10 @@ def run_conversation(
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
-                if _is_zai_coding_overload:
+                if (
+                    _is_zai_coding_overload
+                    and not _retry.transient_credential_retry_budget_exhausted
+                ):
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
@@ -6702,8 +6726,14 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
-                        api_error, retry_count=retry_count, max_retries=max_retries,
+                    if (
+                        not _retry.transient_credential_retry_budget_exhausted
+                        and not _retry.primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
+                            api_error,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                        )
                     ):
                         _retry.primary_recovery_attempted = True
                         retry_count = 0
