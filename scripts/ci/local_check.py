@@ -94,7 +94,9 @@ def build_checks(
 ) -> list[Check]:
     """Build an explicit, non-mutating check list for a profile."""
     python = project_python(root)
-    py_files = _python_files(paths)
+    py_files = tuple(
+        path for path in _python_files(paths) if (root / path).is_file()
+    )
     checks: list[Check] = []
     for index, chunk in enumerate(_chunks(py_files), start=1):
         suffix = f" ({index}/{math.ceil(len(py_files) / 200)})" if len(py_files) > 200 else ""
@@ -121,15 +123,42 @@ def build_checks(
             checks.append(
                 Check(
                     "JS and TS workspace checks",
-                    ("node", ".github/scripts/run-workspace-checks.mjs"),
+                    (
+                        "node",
+                        ".github/scripts/run-workspace-checks.mjs",
+                        "--exclude",
+                        "apps/desktop::check:test:desktop:platforms",
+                        "--exclude",
+                        "apps/desktop::check:test:desktop:all",
+                    ),
+                )
+            )
+            checks.append(
+                Check(
+                    "Desktop platform tests (hosted clean-room residual)",
+                    ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
+                    remote_only=True,
+                )
+            )
+            checks.append(
+                Check(
+                    "Desktop packaging tests (hosted clean-room residual)",
+                    ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:all"),
+                    remote_only=True,
                 )
             )
         if lanes["site"]:
-            checks.append(
-                Check(
-                    "Documentation site",
-                    ("npm", "run", "build:fast", "--workspace", "website"),
-                )
+            checks.extend(
+                [
+                    Check(
+                        "Documentation dependencies",
+                        ("npm", "--prefix", "website", "ci"),
+                    ),
+                    Check(
+                        "Documentation site",
+                        ("npm", "--prefix", "website", "run", "build:fast"),
+                    ),
+                ]
             )
         if lanes["rust"]:
             checks.append(
@@ -164,11 +193,32 @@ def build_checks(
             Check("Python tests", ("scripts/run_tests.sh",)),
             Check(
                 "JS and TS workspace checks",
-                ("node", ".github/scripts/run-workspace-checks.mjs"),
+                (
+                    "node",
+                    ".github/scripts/run-workspace-checks.mjs",
+                    "--exclude",
+                    "apps/desktop::check:test:desktop:platforms",
+                    "--exclude",
+                    "apps/desktop::check:test:desktop:all",
+                ),
+            ),
+            Check(
+                "Desktop platform tests (hosted clean-room residual)",
+                ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
+                remote_only=True,
+            ),
+            Check(
+                "Desktop packaging tests (hosted clean-room residual)",
+                ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:all"),
+                remote_only=True,
+            ),
+            Check(
+                "Documentation dependencies",
+                ("npm", "--prefix", "website", "ci"),
             ),
             Check(
                 "Documentation site",
-                ("npm", "run", "build:fast", "--workspace", "website"),
+                ("npm", "--prefix", "website", "run", "build:fast"),
             ),
             Check(
                 "Rust tests",
@@ -259,6 +309,7 @@ def _print_human(results: Sequence[Result]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    started = time.monotonic()
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=("smoke", "fast", "affected", "full"), required=True)
     parser.add_argument("--base")
@@ -277,10 +328,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         head_sha = _git(root, "rev-parse", args.head)
         base_sha = _git(root, "rev-parse", args.base) if args.base else None
         paths = changed_files(root, args.base, args.head)
-        dirty = bool(_git(root, "status", "--porcelain", "--untracked-files=all"))
+        status_before = _git(root, "status", "--porcelain", "--untracked-files=all")
+        dirty = bool(status_before)
         validate_worktree(args.profile, dirty, args.allow_dirty)
         checks = build_checks(root, args.profile, paths, args.python_test)
         results = run_checks(root, checks, args.dry_run)
+        status_after = _git(root, "status", "--porcelain", "--untracked-files=all")
+        if status_after != status_before:
+            results.append(
+                Result(
+                    "Worktree mutation guard",
+                    ["git", "status", "--porcelain", "--untracked-files=all"],
+                    "failed",
+                    1,
+                    0.0,
+                    status_after,
+                    "local checks changed the worktree; restore it before trusting this receipt\n",
+                )
+            )
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         if args.as_json:
             print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True))
@@ -294,8 +359,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "base": base_sha,
         "head": head_sha,
         "worktree_dirty": dirty,
+        "worktree_dirty_after": bool(status_after),
         "changed_files": paths,
         "results": [asdict(result) for result in results],
+        "duration_seconds": round(time.monotonic() - started, 3),
         "status": "failed" if failed else "passed",
     }
     if args.as_json:

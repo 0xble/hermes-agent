@@ -179,7 +179,7 @@ CASES = {
     # real failures, so it keeps the conservative full lane set.
     "test runner script → python_prod stays on": (
         ["scripts/run_tests_parallel.py"],
-        _lanes(python=True, scan=True),
+        _lanes(python=True, scan=True, ci_review=True),
     ),
     # Supply-chain lanes
     ".pth file → scan": (["evil.pth"], _lanes(python=True, scan=True)),
@@ -244,7 +244,62 @@ CASES = {
 
 @pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
 def test_classify(files, expected):
-    assert classify(files) == expected
+    actual = classify(files)
+    actual.pop("risk_full")
+    actual.pop("lock_scan")
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("run_agent.py", False),
+        ("README.md", False),
+        ("pyproject.toml", True),
+        ("website/package-lock.json", True),
+        (".github/workflows/ci.yaml", True),
+        ("scripts/ci/classify_changes.py", True),
+        ("scripts/ci/local_check.py", True),
+        ("scripts/ci/validate_workflow_policy.py", True),
+        ("scripts/run_tests.sh", True),
+        ("scripts/check-windows-footguns.py", True),
+        ("scripts/run_tests_parallel.py", True),
+        ("scripts/validate_maintenance_manifest.py", True),
+        ("apps/desktop/src/app.tsx", True),
+        ("hermes_cli/windows_ssh_runtime.py", True),
+        ("hermes_cli/macos_tcc_anchor.py", True),
+        ("scripts/desktop-update/windows.ps1", True),
+        ("foo/platform-windows.py", True),
+        (".dockerignore", True),
+        ("docker-compose.yml", True),
+        ("docker-compose.windows.yml", True),
+        ("tools/environments/docker.py", True),
+        ("scripts/install.ps1", True),
+        ("scripts/platform-helper.cmd", True),
+        ("agent/platform_windows.py", True),
+    ],
+)
+def test_risk_full_classification(path: str, expected: bool) -> None:
+    assert classify([path])["risk_full"] is expected
+
+
+def test_risk_full_fails_open_when_diff_is_unavailable() -> None:
+    assert classify([])["risk_full"] is True
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        ([".github/workflows/ci.yaml"], False),
+        (["uv.lock"], True),
+        (["website/package-lock.json"], True),
+        ([], True),
+    ],
+)
+def test_lock_scan_only_fails_open_for_an_unavailable_diff(
+    files: list[str], expected: bool
+) -> None:
+    assert classify(files)["lock_scan"] is expected
 
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -264,7 +319,7 @@ def test_every_lane_reaches_the_composite_action():
     assert lanes - action_outputs == set(), "lane(s) missing from the composite action's outputs"
 
 
-def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
+def test_ci_jobs_only_gate_on_smoke_outputs_that_smoke_actually_declares():
     """An ``if`` that reads an undeclared output resolves to the empty string.
 
     The lane then reports "skipping" on every PR, forever, and nothing goes red
@@ -274,15 +329,15 @@ def test_ci_jobs_only_gate_on_detect_outputs_that_detect_actually_declares():
     so ``needs.detect.outputs.rust`` was never anything but "".
     """
     ci = _yaml(".github/workflows/ci.yaml")
-    declared = set(ci["jobs"]["detect"]["outputs"])
+    declared = set(ci["jobs"]["smoke"]["outputs"])
 
     referenced: set[str] = set()
     for job in ci["jobs"].values():
         for expr in _iter_if_expressions(job):
-            referenced.update(re.findall(r"needs\.detect\.outputs\.(\w+)", expr))
+            referenced.update(re.findall(r"needs\.smoke\.outputs\.(\w+)", expr))
 
-    assert referenced, "found no detect-gated jobs — the walk is broken, not the wiring"
-    assert referenced - declared == set(), "job(s) gate on an output detect never declares"
+    assert referenced, "found no smoke-gated jobs — the walk is broken, not the wiring"
+    assert referenced - declared == set(), "job(s) gate on an output smoke never declares"
 
 
 def _iter_if_expressions(job: object):

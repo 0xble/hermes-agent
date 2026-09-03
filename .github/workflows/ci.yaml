@@ -1,12 +1,15 @@
 name: Fork CI
 
-# Economical private-mirror orchestrator. The classifier runs once and calls
-# only checks that the changed paths can affect. Contributor governance,
-# publication, and live PR-comment automation are intentionally absent.
+# Local-first private-mirror orchestrator. Every PR gets one small, unprivileged
+# Linux smoke job. Risk-sensitive paths must receive a fresh ci:full approval
+# on their final commit. Expensive lanes otherwise run only for ci:full,
+# workflow_dispatch, or the bounded weekly drift schedule.
 on:
   pull_request:
-  push:
-    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 1'
 
 permissions:
   actions: read
@@ -14,13 +17,17 @@ permissions:
 
 concurrency:
   group: fork-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
-  detect:
-    name: Detect affected areas
+  smoke:
+    name: Hosted smoke and affected areas
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     outputs:
       python: ${{ steps.classify.outputs.python }}
       python_prod: ${{ steps.classify.outputs.python_prod }}
@@ -33,6 +40,8 @@ jobs:
       installer: ${{ steps.classify.outputs.installer }}
       rust: ${{ steps.classify.outputs.rust }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
+      risk_full: ${{ steps.classify.outputs.risk_full }}
+      lock_scan: ${{ steps.classify.outputs.lock_scan }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,93 +52,148 @@ jobs:
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
-
+      - name: Require fresh ci:full approval for risk-sensitive changes
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.classify.outputs.risk_full == 'true' &&
+          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')
+        run: |
+          echo "::error::Risk-sensitive changes require a fresh ci:full label on the final commit. Remove and re-add ci:full after the last push."
+          exit 1
+      - name: Run dependency-free smoke gate
+        shell: bash
+        run: |
+          base=HEAD
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            # actions/checkout provides the synthetic merge and both parents.
+            # Parent one is the immutable base represented by this event.
+            base=HEAD^1
+          fi
+          python3 scripts/ci/local_check.py --profile smoke --base "$base"
 
   tests:
     name: Python tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
 
   tests-os:
     name: OS-specific tests
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.python == 'true'
     uses: ./.github/workflows/tests-os.yml
 
   lint:
     name: Python static checks
-    needs: detect
-    if: needs.detect.outputs.python == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.python == 'true'
     uses: ./.github/workflows/lint.yml
 
   js-tests:
     name: JS and TS checks
-    needs: detect
-    if: needs.detect.outputs.frontend == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
     name: Installer tests
-    needs: detect
-    if: needs.detect.outputs.installer == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.installer == 'true'
     uses: ./.github/workflows/installer-tests.yml
 
   rust-tests:
     name: Rust tests
-    needs: detect
-    if: needs.detect.outputs.rust == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.rust == 'true'
     uses: ./.github/workflows/rust-tests.yml
 
   docs-site:
     name: Docs site
-    needs: detect
-    if: needs.detect.outputs.site == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
 
   history-check:
     name: Deny unrelated histories
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request'
+    needs: smoke
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ci:full')
     uses: ./.github/workflows/history-check.yml
 
   uv-lockfile:
     name: Check uv.lock
-    needs: detect
-    if: needs.detect.outputs.uv_lock == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
 
   lockfile-diff:
     name: package-lock.json diff
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true'
+    needs: smoke
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' && github.event.label.name == 'ci:full' &&
+      needs.smoke.outputs.npm_lock == 'true'
     uses: ./.github/workflows/lockfile-diff.yml
 
   docker-lint:
     name: Lint Docker inputs
-    needs: detect
-    if: needs.detect.outputs.docker_meta == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
   supply-chain:
     name: Supply-chain checks
-    needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
+    needs: smoke
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' && github.event.label.name == 'ci:full' &&
+      (needs.smoke.outputs.scan == 'true' || needs.smoke.outputs.deps == 'true')
     uses: ./.github/workflows/supply-chain-audit.yml
     with:
-      scan: ${{ needs.detect.outputs.scan == 'true' }}
-      deps: ${{ needs.detect.outputs.deps == 'true' }}
+      scan: ${{ needs.smoke.outputs.scan == 'true' }}
+      deps: ${{ needs.smoke.outputs.deps == 'true' }}
 
   osv-scanner:
     name: OSV dependency scan
-    needs: detect
-    if: needs.detect.outputs.uv_lock == 'true' || needs.detect.outputs.npm_lock == 'true'
+    needs: smoke
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
+      needs.smoke.outputs.lock_scan == 'true'
     uses: ./.github/workflows/osv-scanner.yml
 
   all-checks-pass:
-    name: All required checks pass
+    name: All requested full checks pass
     needs:
-      - detect
+      - smoke
       - tests
       - tests-os
       - lint
@@ -143,11 +207,14 @@ jobs:
       - docker-lint
       - supply-chain
       - osv-scanner
-    if: always()
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' ||
+       (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      - name: Evaluate required jobs
+      - name: Evaluate requested full jobs
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
@@ -165,6 +232,6 @@ jobs:
           for name, value in sorted(needs.items()):
               print(f"{name}: {value['result']}")
           if failed:
-              print(f"::error::{len(failed)} required job(s) did not pass: {failed}")
+              print(f"::error::{len(failed)} requested job(s) did not pass: {failed}")
               sys.exit(1)
           PY

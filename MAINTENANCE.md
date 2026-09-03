@@ -205,6 +205,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): advance maintenance baseline after auth patch` | Repairs the history gate after PR #46 was merged without its patch record; the commit adds HERMES-103 and makes no shipped Hermes behavior change. |
 | `fix(ci): prepare local-first fork verification (#49)` | Transitional trusted-policy compatibility needed to land the local-first CI shape in a separately reviewed follow-up; also adds local verific...[truncated]
 | `fix(ci): advance maintenance baseline after goal patch` | Repairs the history gate after PR #50's squash suffix diverged from HERMES-071 and records the pre-fix-compatible behavioral regression; no shipped Hermes behavior changes. |
+| `fix(ci): adopt local-first fork verification` | Fork-administrative CI cost control: makes local checks the normal trusted-development gate, caps ordinary hosted PR work, and reserves full cross-platform lanes for explicit or bounded triggers; no shipped Hermes behavior. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 

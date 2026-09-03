@@ -1591,15 +1591,18 @@ python3 scripts/ci/local_check.py --profile full --json > local-ci-receipt.json
 
 `affected` fails open to the complete Python suite when a Python lane is
 selected without explicit focused targets. `full` runs every locally supported
-lane and reports Windows-native residuals as `remote_only`; request the hosted
-full gate with the `ci:full` pull-request label when those residuals or another
-risk trigger applies. Do not describe local evidence as independent or as
-Windows proof.
+lane and reports Windows-native and Desktop clean-room residuals as
+`remote_only`; request the hosted full gate with the `ci:full` pull-request
+label when those residuals or another risk trigger applies. Do not describe
+local evidence as independent, Windows, or Desktop-platform proof.
 
-Ordinary pull requests receive only the dependency-free hosted smoke and the
-trusted fork-policy check. Full Linux, macOS, and Windows jobs are reserved for
-`ci:full`, explicit workflow dispatch, and the bounded weekly drift run. Never
-run untrusted pull-request code on a Brian-controlled self-hosted runner.
+Ordinary non-risk pull requests receive one dependency-free hosted smoke job,
+the existing unrelated-history check, and the trusted fork-policy check. CI,
+dependency, packaging, installer, or platform-sensitive changes require a fresh
+`ci:full` label on the final commit; remove and re-add the label after a later
+push. Full Linux, macOS, and Windows jobs also remain available through explicit
+workflow dispatch and the bounded weekly drift run. Never run untrusted
+pull-request code on a Brian-controlled self-hosted runner.
 
 ### Python
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces

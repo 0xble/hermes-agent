@@ -162,16 +162,16 @@ def test_symlinked_workflow_directory_escape_fails_closed(
     assert any("workflow directory" in error and "symlink" in error for error in errors)
 
 
-def test_unexpected_schedule_fails_closed(tmp_path: Path) -> None:
+def test_reintroduced_push_trigger_fails_closed(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     ci = root / ".github" / "workflows" / "ci.yaml"
     _replace(
         ci,
-        "on:\n  pull_request:\n  push:\n    branches: [main]\n",
-        "on: [pull_request, push, schedule]\n",
+        "  workflow_dispatch:\n",
+        "  workflow_dispatch:\n  push:\n    branches: [main]\n",
     )
     errors = validate(root)
-    assert any("ci.yaml: triggers" in error and "schedule" in error for error in errors)
+    assert any("ci.yaml: triggers" in error and "push" in error for error in errors)
 
 
 def test_write_permission_fails_closed(tmp_path: Path) -> None:
@@ -226,10 +226,10 @@ def test_bracket_style_secret_expression_fails_closed(tmp_path: Path) -> None:
     assert any("secret references are forbidden" in error for error in errors)
 
 
-def test_broadened_push_branches_fail_closed(tmp_path: Path) -> None:
+def test_changed_local_first_schedule_fails_closed(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     ci = root / ".github" / "workflows" / "ci.yaml"
-    _replace(ci, "    branches: [main]\n", "    branches: [main, develop]\n")
+    _replace(ci, "    - cron: '0 8 * * 1'\n", "    - cron: '0 8 * * *'\n")
     errors = validate(root)
     assert any("ci.yaml: trigger configuration" in error for error in errors)
 
@@ -237,9 +237,62 @@ def test_broadened_push_branches_fail_closed(tmp_path: Path) -> None:
 def test_narrowed_pull_request_branches_fail_closed(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     ci = root / ".github" / "workflows" / "ci.yaml"
-    _replace(ci, "  pull_request:\n", "  pull_request:\n    branches: [main]\n")
+    _replace(
+        ci,
+        "    types: [opened, synchronize, reopened, ready_for_review, labeled]\n",
+        "    branches: [main]\n"
+        "    types: [opened, synchronize, reopened, ready_for_review, labeled]\n",
+    )
     errors = validate(root)
     assert any("ci.yaml: trigger configuration" in error for error in errors)
+
+
+def test_full_pr_lane_without_explicit_label_fails_closed(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    ci = root / ".github" / "workflows" / "ci.yaml"
+    _replace(
+        ci,
+        "       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&\n",
+        "       github.event.action != 'closed') &&\n",
+    )
+    errors = validate(root)
+    assert any("expensive lane must require ci:full" in error for error in errors)
+
+
+def test_risk_change_without_fresh_full_label_gate_fails_closed(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    ci = root / ".github" / "workflows" / "ci.yaml"
+    _replace(
+        ci,
+        "          exit 1\n",
+        "          exit 0\n",
+    )
+    errors = validate(root)
+    assert any("must require a fresh ci:full label" in error for error in errors)
+
+
+def test_orchestrator_does_not_duplicate_weekly_osv_scan(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    ci = root / ".github" / "workflows" / "ci.yaml"
+    _replace(
+        ci,
+        "      (github.event_name == 'workflow_dispatch' ||\n",
+        "      (github.event_name != 'pull_request' ||\n",
+    )
+    errors = validate(root)
+    assert any("OSV scan must be manual/PR-only" in error for error in errors)
+
+
+def test_orchestrated_osv_uses_exact_lockfile_signal(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    ci = root / ".github" / "workflows" / "ci.yaml"
+    _replace(
+        ci,
+        "      needs.smoke.outputs.lock_scan == 'true'\n",
+        "      needs.smoke.outputs.uv_lock == 'true'\n",
+    )
+    errors = validate(root)
+    assert any("OSV scan must use exact lockfile changes" in error for error in errors)
 
 
 def test_changed_or_additional_osv_schedule_fails_closed(tmp_path: Path) -> None:

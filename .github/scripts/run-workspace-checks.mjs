@@ -14,7 +14,8 @@
 // their lines, and a failure is then hard to read.
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
-// `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--concurrency N` sets the limit. `--exclude package::script` leaves a unit
+// for a separately reported hosted residual. `--list` prints selected units.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
@@ -26,7 +27,7 @@ const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 function discoverUnits() {
   const raw = execFileSync(NPM, ['query', '.workspace'], {
     encoding: 'utf-8',
-    shell: process.platform === 'win32',
+    shell: process.platform === 'win32'
   })
   /** @type {{location: string, scripts?: Record<string,string>}[]} */
   const pkgs = JSON.parse(raw)
@@ -35,7 +36,7 @@ function discoverUnits() {
   const units = []
   for (const pkg of pkgs) {
     const scripts = pkg.scripts || {}
-    const subs = Object.keys(scripts).filter((s) => /^check:.+$/.test(s))
+    const subs = Object.keys(scripts).filter(s => /^check:.+$/.test(s))
     if (subs.length > 0) {
       for (const script of subs) units.push({ pkg: pkg.location, script })
     } else if (scripts.check) {
@@ -47,28 +48,28 @@ function discoverUnits() {
 
 /** @param {{pkg: string, script: string}} unit */
 function runUnit(unit) {
-  return new Promise((resolve) => {
+  return new Promise(resolve => {
     const started = Date.now()
     const child = spawn(NPM, ['run', '--prefix', unit.pkg, unit.script], {
       // Buffer, and do not inherit. Children that share one stdout
       // interleave their lines, and a failure is then hard to read.
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
+      shell: process.platform === 'win32'
     })
     /** @type {Buffer[]} */
     const chunks = []
-    child.stdout.on('data', (c) => chunks.push(c))
-    child.stderr.on('data', (c) => chunks.push(c))
-    child.on('error', (err) => {
+    child.stdout.on('data', c => chunks.push(c))
+    child.stderr.on('data', c => chunks.push(c))
+    child.on('error', err => {
       chunks.push(Buffer.from(`failed to spawn: ${err.message}\n`))
       resolve({ unit, code: 1, output: Buffer.concat(chunks).toString('utf-8'), ms: Date.now() - started })
     })
-    child.on('close', (code) => {
+    child.on('close', code => {
       resolve({
         unit,
         code: code ?? 1,
         output: Buffer.concat(chunks).toString('utf-8'),
-        ms: Date.now() - started,
+        ms: Date.now() - started
       })
     })
   })
@@ -76,11 +77,29 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  const discovered = discoverUnits()
+  const excluded = new Set()
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] !== '--exclude') continue
+    const value = argv[index + 1]
+    if (!value || !value.includes('::')) {
+      console.error('::error::--exclude requires package::script')
+      process.exit(2)
+    }
+    excluded.add(value)
+    index += 1
+  }
+  const key = unit => `${unit.pkg}::${unit.script}`
+  const units = discovered.filter(unit => !excluded.has(key(unit)))
+  const unknown = [...excluded].filter(value => !discovered.some(unit => key(unit) === value))
+  if (unknown.length > 0) {
+    console.error(`::error::Unknown workspace check exclusion: ${unknown.join(', ')}`)
+    process.exit(2)
+  }
 
   if (units.length === 0) {
     console.error(
-      '::error::No workspace package declares a check script — refusing to report green having run nothing.',
+      '::error::No workspace package declares a check script — refusing to report green having run nothing.'
     )
     process.exit(1)
   }
@@ -93,7 +112,7 @@ async function main() {
   const flagIdx = argv.indexOf('--concurrency')
   const concurrency = Math.max(
     1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism())
   )
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
@@ -122,11 +141,11 @@ async function main() {
 
   await Promise.all(Array.from({ length: Math.min(concurrency, units.length) }, worker))
 
-  const failed = results.filter((r) => r.code !== 0)
+  const failed = results.filter(r => r.code !== 0)
   console.log('\n=== summary ===')
   for (const r of [...results].sort((a, b) => b.ms - a.ms)) {
     console.log(
-      `  ${r.code === 0 ? 'pass' : 'FAIL'}  ${(r.ms / 1000).toFixed(1).padStart(6)}s  ${r.unit.pkg} :: ${r.unit.script}`,
+      `  ${r.code === 0 ? 'pass' : 'FAIL'}  ${(r.ms / 1000).toFixed(1).padStart(6)}s  ${r.unit.pkg} :: ${r.unit.script}`
     )
   }
 

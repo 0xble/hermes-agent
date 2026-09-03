@@ -29,6 +29,10 @@ Lanes:
   lives under ``apps/``, so without this lane a Rust change matched ``frontend``
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
+* ``risk_full``   — CI, dependency, packaging, installer, or platform changes
+  that require fresh full-hosted approval on the final commit.
+* ``lock_scan``   — changed lockfiles only; unlike broad fail-open lanes, a
+  workflow-only PR does not rescan and fail on unrelated existing CVEs.
 
 Docker is not a lane — it builds on push-to-main and release only,
 never per-PR.
@@ -96,8 +100,12 @@ _PY_RELEVANT_SITE = (
 # can't get push access — it runs on an ephemeral runner with zero write perms.
 _CI_REVIEW_FILES = {
     ".prettierrc",
+    "scripts/check-windows-footguns.py",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "scripts/validate_maintenance_manifest.py",
 }
-_CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
+_CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/", "scripts/ci/")
 
 # Supply-chain scan: files that can execute code at install/import time.
 _SCAN_EXTS = (".py", ".pth")
@@ -118,6 +126,55 @@ _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
 # and the crate's unit tests had never executed in CI at all.
 _RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
 _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
+_RISK_FULL_FILES = {
+    ".dockerignore",
+    "MANIFEST.in",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.windows.yml",
+    "package-lock.json",
+    "package.json",
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    "uv.lock",
+}
+_RISK_FULL_PATHS = (
+    "apps/desktop/",
+    "apps/bootstrap-installer/",
+    "docker/",
+    "scripts/tests/",
+)
+_PLATFORM_PATH_MARKERS = (
+    "/darwin/",
+    "/darwin.",
+    "/darwin_",
+    "/darwin-",
+    "/linux/",
+    "/linux.",
+    "/linux_",
+    "/linux-",
+    "/macos/",
+    "/macos.",
+    "/macos_",
+    "/macos-",
+    "/windows/",
+    "/windows.",
+    "/windows_",
+    "/windows-",
+    ".darwin.",
+    ".linux.",
+    ".macos.",
+    ".windows.",
+    "_darwin.",
+    "_linux.",
+    "_macos.",
+    "_windows.",
+    "-darwin.",
+    "-linux.",
+    "-macos.",
+    "-windows.",
+)
 
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
@@ -181,6 +238,23 @@ def _is_ci_review(p: str) -> bool:
     return os.path.basename(p).startswith("eslint.config.")
 
 
+def _is_risk_full(p: str) -> bool:
+    lowered = f"/{p.lower()}"
+    return (
+        _is_ci_review(p)
+        or _is_installer(p)
+        or _is_rust(p)
+        or _is_nix(p)
+        or p in _RISK_FULL_FILES
+        or os.path.basename(p) in {"package.json", "package-lock.json"}
+        or os.path.basename(p).startswith("docker-compose.")
+        or p.startswith(_RISK_FULL_PATHS)
+        or p == "tools/environments/docker.py"
+        or p.lower().endswith((".bat", ".cmd", ".ps1"))
+        or any(marker in lowered for marker in _PLATFORM_PATH_MARKERS)
+    )
+
+
 def ci_review_files(files: list[str]) -> list[str]:
     """Return the CI-sensitive paths that need maintainer review."""
     return sorted({f.strip() for f in files if f.strip() and _is_ci_review(f.strip())})
@@ -211,8 +285,12 @@ def classify(files: list[str]) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
+        "risk_full": any(_is_risk_full(f) for f in files),
+        "lock_scan": any(f == "uv.lock" or f.endswith("package-lock.json") for f in files),
         "nix": python_prod or frontend or any(_is_nix(f) for f in files)
     }
+    if not files:
+        ret["lock_scan"] = True
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
         ret["python_prod"] = True
@@ -228,6 +306,7 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["rust"] = True
         ret["nix"] = True
         ret["ci_review"] = True
+        ret["risk_full"] = True
 
         # explicitly skip mcp catalog here. it's not needed unless those files are modified.
     return ret

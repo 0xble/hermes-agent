@@ -57,6 +57,12 @@ outputs:
   ci_review:
     description: Require CI-sensitive file review label.
     value: ${{ steps.classify.outputs.ci_review }}
+  risk_full:
+    description: Require full hosted CI for CI, dependency, packaging, installer, or platform changes.
+    value: ${{ steps.classify.outputs.risk_full }}
+  lock_scan:
+    description: Scan only when a lockfile changed, or when classification fully fails open.
+    value: ${{ steps.classify.outputs.lock_scan }}
   ci_review_files:
     description: JSON list of CI-sensitive files changed by the pull request.
     value: ${{ steps.classify.outputs.ci_review_files }}

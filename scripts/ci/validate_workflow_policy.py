@@ -88,17 +88,6 @@ WORKFLOW_TRIGGER_CONFIGS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Two-step migration support: the default-branch trusted policy must accept the
-# current expensive orchestrator before it can accept the local-first candidate.
-# Remove the legacy entries in the follow-up that changes ci.yaml.
-LEGACY_CI_TRIGGERS = frozenset({"pull_request", "push"})
-LEGACY_CI_TRIGGER_CONFIG = {
-    "pull_request": "",
-    "push": {"branches": ["main"]},
-}
-CI_TRIGGER_VARIANTS = (LEGACY_CI_TRIGGERS, WORKFLOW_TRIGGERS["ci.yaml"])
-CI_TRIGGER_CONFIG_VARIANTS = (LEGACY_CI_TRIGGER_CONFIG, WORKFLOW_TRIGGER_CONFIGS["ci.yaml"])
-
 WORKFLOW_PERMISSIONS: dict[str, dict[str, str]] = {
     name: {"contents": "read"} for name in WORKFLOW_TRIGGERS
 }
@@ -454,10 +443,6 @@ def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
         return
     smoke = jobs.get("smoke")
     if not isinstance(smoke, dict):
-        if "detect" in jobs:
-            # Transitional default-branch shape. The next migration commit
-            # removes this compatibility path after ci.yaml changes.
-            return
         errors.append("ci.yaml: required local-first smoke job is missing")
         return
     if smoke.get("runs-on") != "ubuntu-latest" or smoke.get("timeout-minutes") != "3":
@@ -465,14 +450,41 @@ def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
     smoke_text = str(smoke)
     if "scripts/ci/local_check.py --profile smoke" not in smoke_text:
         errors.append("ci.yaml.jobs.smoke: must run the repository-owned smoke profile")
+    risk_gate_fragments = (
+        "steps.classify.outputs.risk_full",
+        "github.event.action != 'labeled'",
+        "github.event.label.name != 'ci:full'",
+        "exit 1",
+    )
+    if not all(fragment in smoke_text for fragment in risk_gate_fragments):
+        errors.append(
+            "ci.yaml.jobs.smoke: risk-sensitive changes must require a fresh "
+            "ci:full label on the final commit"
+        )
 
     full_jobs = set(jobs) - {"smoke", "history-check"}
     for job_name in sorted(full_jobs):
         job = jobs[job_name]
         condition = str(job.get("if", "")) if isinstance(job, dict) else ""
-        if "ci:full" not in condition:
+        if (
+            "github.event.action == 'labeled'" not in condition
+            or "github.event.label.name == 'ci:full'" not in condition
+        ):
             errors.append(
                 f"ci.yaml.jobs.{job_name}: expensive lane must require ci:full on pull requests"
+            )
+
+    osv = jobs.get("osv-scanner")
+    if isinstance(osv, dict):
+        condition = str(osv.get("if", ""))
+        if "github.event_name == 'workflow_dispatch'" not in condition:
+            errors.append(
+                "ci.yaml: orchestrated OSV scan must be manual/PR-only; "
+                "osv-scanner.yml already owns the weekly schedule"
+            )
+        if "needs.smoke.outputs.lock_scan" not in condition:
+            errors.append(
+                "ci.yaml: orchestrated OSV scan must use exact lockfile changes"
             )
 
 
@@ -543,19 +555,13 @@ def validate(root: Path) -> list[str]:
             errors.append(str(exc))
             continue
         expected_triggers = WORKFLOW_TRIGGERS[name]
-        allowed_trigger_variants = (
-            CI_TRIGGER_VARIANTS if name == "ci.yaml" else (expected_triggers,)
-        )
-        if actual_triggers not in allowed_trigger_variants:
+        if actual_triggers != expected_triggers:
             errors.append(
                 f"{name}: triggers {sorted(actual_triggers)} != allowed "
-                f"variants {[sorted(item) for item in allowed_trigger_variants]}"
+                f"{sorted(expected_triggers)}"
             )
         expected_trigger_config = WORKFLOW_TRIGGER_CONFIGS.get(name)
-        allowed_trigger_configs = (
-            CI_TRIGGER_CONFIG_VARIANTS if name == "ci.yaml" else (expected_trigger_config,)
-        )
-        if expected_trigger_config is not None and data.get("on") not in allowed_trigger_configs:
+        if expected_trigger_config is not None and data.get("on") != expected_trigger_config:
             errors.append(f"{name}: trigger configuration differs from the allowed policy")
 
         expected_permissions = WORKFLOW_PERMISSIONS[name]
