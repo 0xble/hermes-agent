@@ -16,7 +16,7 @@ from typing import Optional
 
 from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-_SHELL_SEPARATORS = {"&&", "||", ";", "|", "&", "\n"}
+_SHELL_PUNCTUATION = frozenset(";&|\n")
 _OPTIONS_WITH_VALUES = {
     "-b",
     "-B",
@@ -53,7 +53,10 @@ def _segments(tokens: list[str]) -> list[list[str]]:
     segments: list[list[str]] = []
     current: list[str] = []
     for token in tokens:
-        if token in _SHELL_SEPARATORS:
+        # ``shlex`` coalesces consecutive punctuation into one token, including
+        # mixed runs such as ``;\n`` and ``&&\n``. Every such run is a command
+        # boundary even when it is not one of the ordinary shell operators.
+        if token and all(character in _SHELL_PUNCTUATION for character in token):
             if current:
                 segments.append(current)
                 current = []

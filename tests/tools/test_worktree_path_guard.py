@@ -111,6 +111,15 @@ def test_finds_worktree_add_after_newline():
     assert warning is not None
 
 
+def test_finds_worktree_add_after_compound_separator_runs():
+    for command in (
+        "printf ready\n\ngit worktree add /tmp/review review",
+        "printf ready;\ngit worktree add /tmp/review review",
+        "printf ready &&\ngit worktree add /tmp/review review",
+    ):
+        assert nonstandard_worktree_add_warning(command, "/repo") is not None
+
+
 def test_finds_worktree_add_through_env_and_sudo_wrappers():
     assert nonstandard_worktree_add_warning(
         "env FOO=bar git worktree add /tmp/review review",

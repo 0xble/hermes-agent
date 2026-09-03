@@ -120,7 +120,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-096 | Active | `fix(gateway): await progress cleanup before follow-ups` | Make post-delivery completion include tracked temporary-message deletion so queued turns cannot outrun cleanup. |
 | HERMES-097 | Active | `fix(gateway): make restart recovery run-correlated and durable` | Prevent control-message redelivery from cancelling interrupted-turn recovery and durably replay drain-time inbound acknowledged as queued. |
 | HERMES-098 | Active | `fix(telegram): keep citation brackets visible` | Preserve both square brackets as part of linked numeric citation labels in legacy and rich Telegram replies. |
-| HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
+| HERMES-099 | Active | `feat(terminal): warn on nonstandard worktree paths`; `fix(terminal): recognize compound shell separators` | Warn agents when direct terminal commands create Git worktrees outside a `.worktrees/` folder. |
 
 ## Fork-only administrative subject exemptions
 
@@ -210,7 +210,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream tracking:** Not yet filed upstream as of 2026-09-01. Hermes's native `-w`, `/worktree new`, and Kanban worktree paths already use repository-local `.worktrees/`; this patch adds advisory coverage for manual terminal commands.
 - **Upstream PR:** None as of 2026-09-01. The maintained-fork PR is the only published implementation currently tracked.
 - **Regression:** `python -m pytest -q tests/tools/test_worktree_path_guard.py tests/tools/test_terminal_tool.py tests/tools/test_terminal_bounded_execute.py tests/tools/test_terminal_task_cwd.py tests/tools/test_terminal_output_transform_hook.py`; coverage must prove compliant paths remain silent, absolute and relative external paths warn, traversal cannot escape an apparent `.worktrees` path, shell separators and common wrappers remain visible, heredoc data does not create false positives, and successful foreground worktree creation returns the advisory warning.
-- **Expected published commit identity:** Stable subject `feat(terminal): warn on nonstandard worktree paths`; source, regressions, and this lifecycle record ship together.
+- **Expected published commit identity:** Stable subjects `feat(terminal): warn on nonstandard worktree paths` and `fix(terminal): recognize compound shell separators`; source, regressions, and this lifecycle record ship together.
 - **Rollback:** Revert only `feat(terminal): warn on nonstandard worktree paths`, remove the path guard, terminal result field, focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
 - **Retirement:** Retire after released upstream Hermes provides equivalent advisory or enforcement for direct agent-created worktrees outside `.worktrees/`, including shell traversal and wrapper coverage, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
 
