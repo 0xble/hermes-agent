@@ -99,7 +99,8 @@ def test_dead_owner_event_is_claimed_once_and_handoff_fences_replay():
         deliverable_targets={("telegram", "default")}
     ) == []
 
-    assert inbox.mark_handed_off(queue_id) is True
+    assert inbox.mark_handed_off(queue_id, "") is False
+    assert inbox.mark_handed_off(queue_id, "turn-token") is True
     _orphan(queue_id)
     assert inbox.claim_recoverable(
         deliverable_targets={("telegram", "default")}
@@ -152,3 +153,26 @@ async def test_gateway_replays_durable_inbound_through_the_live_adapter():
     replay = adapter.handle_message.await_args_list[0].args[0]
     assert replay.text == "continue the task"
     assert getattr(replay, "_restart_inbox_queue_id") == queue_id
+
+
+@pytest.mark.asyncio
+async def test_gateway_releases_failed_restart_claim_and_continues_dispatching():
+    failed_id = inbox.record_event(
+        "failed-session", _event(text="first"), adapter_profile="default"
+    )
+    delivered_id = inbox.record_event(
+        "delivered-session", _event(text="second"), adapter_profile="default"
+    )
+    _orphan(failed_id)
+    _orphan(delivered_id)
+    runner, adapter = make_restart_runner()
+    adapter.handle_message = AsyncMock(side_effect=[RuntimeError("dispatch failed"), None])
+
+    count = await GatewayRunner._drain_restart_inbox(runner)
+
+    assert count == 1
+    assert adapter.handle_message.await_count == 2
+    reclaimed = inbox.claim_recoverable(
+        deliverable_targets={("telegram", "default")}
+    )
+    assert [row["queue_id"] for row in reclaimed] == [failed_id]

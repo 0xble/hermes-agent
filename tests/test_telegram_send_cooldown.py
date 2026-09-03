@@ -640,3 +640,40 @@ def test_retry_after_accepts_ptb_timedelta_mode():
     error.retry_after = timedelta(seconds=7)  # type: ignore[attr-defined]
 
     assert TelegramAdapter._telegram_retry_after(error) == 7.0
+
+
+@pytest.mark.asyncio
+async def test_edit_respects_an_existing_per_chat_cooldown():
+    adapter = _make_adapter()
+    bot = MagicMock()
+    bot.edit_message_text = AsyncMock(return_value=True)
+    adapter._bot = bot
+    adapter._send_cooldown_max_wait = 0.5
+    adapter._send_cooldown_until["123"] = time.monotonic() + 30.0
+
+    result = await adapter.edit_message("123", "42", "update", finalize=False)
+
+    assert result.success is False
+    assert result.retry_after is not None and result.retry_after >= 29.0
+    bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_retry_after_publishes_the_shared_chat_cooldown():
+    adapter = _make_adapter()
+    adapter._send_cooldown_max_wait = 0.5
+
+    class Flooded(Exception):
+        retry_after = 30.0
+
+    bot = MagicMock()
+    bot.edit_message_text = AsyncMock(side_effect=Flooded("Retry after 30"))
+    adapter._bot = bot
+    before = time.monotonic()
+
+    result = await adapter.edit_message("123", "42", "update", finalize=False)
+
+    assert result.success is False
+    assert result.retry_after == 30.0
+    assert adapter._send_cooldown_until["123"] >= before + 29.0
+    bot.edit_message_text.assert_awaited_once()

@@ -2589,6 +2589,11 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     if normalized_no_agent and normalized_completion_script:
         raise ValueError(NO_AGENT_WITH_COMPLETION_SCRIPT_ERROR)
+    if normalized_completion_script:
+        raise ValueError(
+            "completion verifier fields are CLI-controlled; use the Hermes cron CLI "
+            "so the verifier content is validated and pinned"
+        )
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_run_budget = _normalize_run_budget_seconds(run_budget_seconds)

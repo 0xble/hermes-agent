@@ -4156,6 +4156,7 @@ class SlackAdapter(BasePlatformAdapter):
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
                 payload = getattr(result, "data", result)
                 message_ids: List[str] = []
+                file_ids: List[str] = []
                 if isinstance(payload, dict):
                     direct_ts = payload.get("ts")
                     if direct_ts:
@@ -4164,6 +4165,8 @@ class SlackAdapter(BasePlatformAdapter):
                     for file_payload in files_payload:
                         if not isinstance(file_payload, dict):
                             continue
+                        if file_payload.get("id"):
+                            file_ids.append(str(file_payload["id"]))
                         shares = file_payload.get("shares") or {}
                         if not isinstance(shares, dict):
                             continue
@@ -4174,9 +4177,17 @@ class SlackAdapter(BasePlatformAdapter):
                                 for share in channel_shares or []:
                                     if isinstance(share, dict) and share.get("ts"):
                                         message_ids.append(str(share["ts"]))
+                identifiers = list(dict.fromkeys(message_ids or file_ids))
                 results.extend(
-                    SendResult(success=True, message_id=message_id)
-                    for message_id in dict.fromkeys(message_ids)
+                    SendResult(
+                        success=True,
+                        message_id=(
+                            identifiers[index]
+                            if index < len(identifiers)
+                            else identifiers[-1] if identifiers else None
+                        ),
+                    )
+                    for index in range(len(file_uploads))
                 )
             except Exception as e:
                 logger.warning(

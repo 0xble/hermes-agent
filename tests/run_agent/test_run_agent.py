@@ -2209,7 +2209,7 @@ class TestConcurrentToolExecution:
         messages = [
             {"role": "user", "content": "Earlier request"},
             {"role": "assistant", "content": "Earlier response"},
-            {"role": "user", "content": "Set a goal to implement this and validate it."},
+            {"role": "user", "content": "Set a goal to implement this and validate it. Focused tests pass."},
             {"role": "assistant", "content": "", "tool_calls": []},
         ]
 
@@ -2222,7 +2222,7 @@ class TestConcurrentToolExecution:
             )
 
         assert mock_hfc.call_args.kwargs["user_task"] == (
-            "Set a goal to implement this and validate it."
+            "Set a goal to implement this and validate it. Focused tests pass."
         )
 
     def test_invoke_tool_activates_goal_through_live_registry(
@@ -2244,7 +2244,7 @@ class TestConcurrentToolExecution:
         agent._current_goal_control_revision = 0
         agent.valid_tool_names = {"set_goal"}
         messages = [
-            {"role": "user", "content": "Set a goal to implement this and validate it."},
+            {"role": "user", "content": "Set a goal to implement this and validate it. Focused tests pass."},
             {"role": "assistant", "content": "", "tool_calls": []},
         ]
 

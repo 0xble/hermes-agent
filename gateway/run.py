@@ -3849,6 +3849,7 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
+_INTERRUPT_REASON_SIDE_CLOSE = "Side session closed"
 _INTERRUPT_REASON_RESET = "Session reset requested"
 _INTERRUPT_REASON_TIMEOUT = "Execution timed out (inactivity)"
 _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
@@ -4074,6 +4075,7 @@ def _watch_gateway_turn_inactivity(
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
+        _INTERRUPT_REASON_SIDE_CLOSE.lower(),
         _INTERRUPT_REASON_RESET.lower(),
         _INTERRUPT_REASON_TIMEOUT.lower(),
         _INTERRUPT_REASON_SSE_DISCONNECT.lower(),
@@ -13413,7 +13415,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _drain_restart_inbox(self) -> int:
         """Replay messages durably accepted by the previous draining process."""
         try:
-            from gateway.restart_inbox import claim_recoverable
+            from gateway.restart_inbox import claim_recoverable, release_claim
 
             targets = {
                 (getattr(platform, "value", str(platform)), "default")
@@ -13441,8 +13443,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["queue_id"],
                 )
                 try:
-                    from gateway.restart_inbox import release_claim
-
                     await asyncio.to_thread(release_claim, row["queue_id"])
                 except Exception:
                     logger.exception(
@@ -13451,7 +13451,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 continue
             setattr(event, "_hermes_startup_restore_replay", True)
-            await adapter.handle_message(event)
+            try:
+                await adapter.handle_message(event)
+            except Exception:
+                logger.exception(
+                    "Restart inbox dispatch failed for claim %s; releasing for retry",
+                    row["queue_id"],
+                )
+                try:
+                    await asyncio.to_thread(release_claim, row["queue_id"])
+                except Exception:
+                    logger.exception(
+                        "Could not release failed restart inbox claim %s",
+                        row["queue_id"],
+                    )
+                continue
             dispatched += 1
         return dispatched
 
@@ -13609,9 +13623,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Warm the turn machinery BEFORE the queue drains: replayed (and
         # fresh) inbound turns must not build skeleton prompts (#99373).
         await self._await_startup_warmup()
-        durable_drained = await self._drain_restart_inbox()
-        drained = await self._drain_startup_restore_queue()
-        self._startup_restore_in_progress = False
+        durable_drained = 0
+        drained = 0
+        try:
+            durable_drained = await self._drain_restart_inbox()
+            drained = await self._drain_startup_restore_queue()
+        finally:
+            self._startup_restore_in_progress = False
         if durable_drained:
             logger.info(
                 "Dispatched %d durable restart-drain inbound message(s)",
@@ -19628,14 +19646,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None:
             return False
-        self._invalidate_session_run_generation(session_key, reason="side_closed")
-        self._release_running_agent_state(session_key)
         cache_lock = getattr(self, "_agent_cache_lock", None)
         cached_agent = None
         if cache_lock is not None:
             with cache_lock:
                 cached = self._agent_cache.get(session_key)
                 cached_agent = cached[0] if isinstance(cached, tuple) else cached
+        await self._interrupt_and_clear_session(
+            session_key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_SIDE_CLOSE,
+            invalidation_reason="side_closed",
+        )
         if cached_agent is not None:
             try:
                 await asyncio.wait_for(
@@ -21950,7 +21972,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.restart_inbox import mark_handed_off
 
-                await asyncio.to_thread(mark_handed_off, queue_id)
+                await asyncio.to_thread(mark_handed_off, queue_id, token)
             except Exception:
                 logger.exception(
                     "Could not hand restart inbox row %s to active-turn recovery",

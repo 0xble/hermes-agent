@@ -72,10 +72,14 @@ def _connect() -> sqlite3.Connection:
             attempts INTEGER NOT NULL DEFAULT 0,
             owner_pid INTEGER,
             owner_started_at INTEGER,
+            turn_token TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )"""
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(restart_inbox)")}
+    if "turn_token" not in columns:
+        conn.execute("ALTER TABLE restart_inbox ADD COLUMN turn_token TEXT")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -263,8 +267,24 @@ def _mark(queue_id: str, state: str) -> bool:
             conn.close()
 
 
-def mark_handed_off(queue_id: str) -> bool:
-    return _mark(queue_id, "handed_off")
+def mark_handed_off(queue_id: str, turn_token: str) -> bool:
+    """Bind terminal inbox handoff to the durable active-turn marker."""
+    token = str(turn_token or "").strip()
+    if not token:
+        return False
+    with _LOCK:
+        conn = _connect()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    """UPDATE restart_inbox
+                       SET state='handed_off', turn_token=?, updated_at=?
+                       WHERE queue_id=? AND state='attempting'""",
+                    (token, time.time(), queue_id),
+                )
+            return bool(cursor.rowcount)
+        finally:
+            conn.close()
 
 
 def release_claim(queue_id: str) -> bool:

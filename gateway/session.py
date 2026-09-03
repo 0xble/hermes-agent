@@ -3699,13 +3699,11 @@ class SessionStore:
         Called on gateway startup after a crash or fast restart to preserve
         in-flight sessions instead of destroying their conversation history
         (#7536).  Only marks sessions updated within *max_age_seconds* to
-        avoid touching long-idle sessions.  When a durable transcript is
-        available, an ``assistant/stop`` tail proves the last turn completed
-        before the crash. A terminal model transcript is not delivery
-        acknowledgement: the gateway may persist it before the platform
-        adapter sends it, so every recent non-suspended candidate remains
-        eligible for recovery. Eligible entries are resumed during startup or
-        when the next message arrives.
+        avoid touching long-idle sessions. A terminal ``assistant/stop`` tail
+        without pending tool calls proves the model turn completed. Its delivery
+        obligation is recovered separately, so rerunning the agent would duplica...[truncated]
+        user work. User/tool tails, pending tool calls, and nonterminal assistant
+        tails remain eligible for recovery.
 
         Entries already flagged ``resume_pending=True`` are skipped.  Entries
         explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
@@ -3718,11 +3716,43 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(seconds=max_age_seconds)
+
+        def _completed_model_turn(entry: SessionEntry) -> bool:
+            try:
+                db = self._db_for_session_id(entry.session_id)
+                if db is None:
+                    return False
+                loader = getattr(db, "get_messages_as_conversation", None)
+                if not callable(loader):
+                    return False
+                tip_loader = getattr(db, "get_compression_tip", None)
+                tip_id = tip_loader(entry.session_id) if callable(tip_loader) else None
+                messages = loader(tip_id or entry.session_id)
+            except Exception:
+                logger.debug(
+                    "Could not inspect durable tail for %s during crash recovery",
+                    entry.session_id,
+                    exc_info=True,
+                )
+                return False
+            if not isinstance(messages, list) or not messages:
+                return False
+            tail = messages[-1]
+            if not isinstance(tail, dict):
+                return False
+            return bool(
+                tail.get("role") == "assistant"
+                and tail.get("finish_reason") == "stop"
+                and not tail.get("tool_calls")
+            )
+
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if entry.resume_pending:
+                    continue
+                if _completed_model_turn(entry):
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.resume_pending = True

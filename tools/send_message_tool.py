@@ -1080,13 +1080,24 @@ async def _send_live_adapter_media(
                     None,
                 )
                 if _failed is not None:
+                    successful_results = [
+                        result
+                        for result in (_res or [])
+                        if result is not None and getattr(result, "success", False)
+                    ]
+                    delivered += len(successful_results)
                     return {
                         "error": (
-                            f"Adapter media send failed after 0/{total} files: "
+                            f"Adapter media send failed after {delivered}/{total} files: "
                             f"{_bounded_send_error(_failed.error or 'image delivery failed')}"
                         ),
                         "_text_message_id": text_message_id,
-                        "_media_delivered": 0,
+                        "_media_delivered": delivered,
+                        "_media_message_ids": [
+                            result.message_id
+                            for result in successful_results
+                            if getattr(result, "message_id", None)
+                        ],
                     }
                 batched_indices = {_i for _i, _ in _images}
                 delivered += len(_images)
@@ -1380,11 +1391,18 @@ async def _send_via_adapter(
                 # Text (and possibly some media) already reached the platform,
                 # so this stays an ambiguous (non-pre_send) failure that names
                 # the partial delivery instead of reporting a verified success.
-                _partial = {
-                    "error": (
+                if _txt_id is None:
+                    _partial_error = (
+                        f"Adapter delivered {_n} media attachment(s), but a later "
+                        f"attachment failed: {result['error']}"
+                    )
+                else:
+                    _partial_error = (
                         "Adapter delivered text but media attachment delivery "
                         f"failed: {result['error']}"
-                    ),
+                    )
+                _partial = {
+                    "error": _partial_error,
                     "message_id": _txt_id,
                 }
                 # Deliberately NOT "media_delivered": on a failure that key
@@ -1483,17 +1501,6 @@ async def _send_to_platform(
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     media_files = media_files or []
-    if str(profile or "").strip():
-        return await _send_via_adapter(
-            platform,
-            pconfig,
-            chat_id,
-            message,
-            thread_id=thread_id,
-            media_files=media_files,
-            force_document=force_document,
-            profile=profile,
-        )
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
@@ -1559,6 +1566,24 @@ async def _send_to_platform(
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
         chunks = [message]
+
+    if str(profile or "").strip():
+        last_result = None
+        for index, chunk in enumerate(chunks):
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                media_files=media_files if index == len(chunks) - 1 else [],
+                force_document=force_document,
+                profile=profile,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
 
     # --- Telegram: special handling for media attachments ---
     # _send_telegram now owns text chunking internally — it formats the full

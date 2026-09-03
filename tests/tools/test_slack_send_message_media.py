@@ -133,6 +133,40 @@ def test_media_only_skips_text_post():
         os.unlink(pdf)
 
 
+def test_partial_native_album_delivery_reports_the_successful_prefix():
+    from gateway.platforms.base import SendResult
+    from tools.send_message_tool import _send_live_adapter_media
+
+    first = _tmpfile(".png")
+    second = _tmpfile(".png")
+    class PartialAlbumAdapter:
+        send_multiple_images = AsyncMock(
+            return_value=[
+                SendResult(success=True, message_id="F1"),
+                SendResult(success=False, error="rate_limited"),
+            ]
+        )
+
+    adapter = PartialAlbumAdapter()
+    try:
+        result = asyncio.run(
+            _send_live_adapter_media(
+                adapter,
+                "C012AB3CD",
+                "",
+                [(first, False), (second, False)],
+                metadata={},
+            )
+        )
+    finally:
+        os.unlink(first)
+        os.unlink(second)
+
+    assert result["_media_delivered"] == 1
+    assert result["_media_message_ids"] == ["F1"]
+    assert "after 1/2 files" in result["error"]
+
+
 def test_send_to_platform_routes_slack_media():
     """_send_to_platform must call Slack standalone_sender with media_files."""
     import httpx

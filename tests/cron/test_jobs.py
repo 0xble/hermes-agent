@@ -408,11 +408,16 @@ class TestJobCRUD:
         assert fetched["prompt"] == "Check server status"
 
     def test_completion_script_round_trips_and_can_be_cleared(self, tmp_cron_dir):
-        job = create_job(
-            prompt="Maintain the repository",
-            schedule="30m",
-            completion_script="verify-maintenance.py",
+        created = create_job(prompt="Maintain the repository", schedule="30m")
+        job = update_job(
+            created["id"],
+            {
+                "completion_script": "verify-maintenance.py",
+                "completion_script_sha256": "a" * 64,
+            },
+            trusted_completion_config=True,
         )
+        assert job is not None
         assert job["completion_script"] == "verify-maintenance.py"
         assert get_job(job["id"])["completion_script"] == "verify-maintenance.py"
 
@@ -430,6 +435,15 @@ class TestJobCRUD:
         with pytest.raises(ValueError, match="CLI-controlled"):
             update_job(job["id"], {"completion_script_sha256": "0" * 64})
 
+    def test_completion_script_rejects_direct_creation_without_cli_pin(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="CLI-controlled"):
+            create_job(
+                prompt="Maintain the repository",
+                schedule="30m",
+                completion_script="verify-maintenance.py",
+            )
+        assert list_jobs() == []
+
     def test_completion_script_requires_an_agent(self, tmp_cron_dir):
         with pytest.raises(ValueError, match="completion_script requires an agent run"):
             create_job(
@@ -441,12 +455,15 @@ class TestJobCRUD:
             )
 
     def test_update_cannot_disable_agent_while_completion_script_is_set(self, tmp_cron_dir):
-        job = create_job(
-            prompt="Maintain the repository",
-            schedule="30m",
-            script="collect.py",
-            completion_script="verify.py",
+        created = create_job(
+            prompt="Maintain the repository", schedule="30m", script="collect.py"
         )
+        job = update_job(
+            created["id"],
+            {"completion_script": "verify.py", "completion_script_sha256": "b" * 64},
+            trusted_completion_config=True,
+        )
+        assert job is not None
         with pytest.raises(ValueError, match="completion_script requires an agent run"):
             update_job(job["id"], {"no_agent": True})
 

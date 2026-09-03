@@ -4583,6 +4583,26 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _windows_cron_bootstrap_stdin_argv(
+    python_exe: str,
+    env_overlay: dict[str, str],
+    script_label: str,
+) -> list[str]:
+    """Execute a captured script from stdin while retaining Windows .pth support."""
+    site_packages = Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
+    if not site_packages.is_dir():
+        return [python_exe, "-"]
+    bootstrap = (
+        "import site, sys;"
+        f"site.addsitedir({str(site_packages)!r});"
+        "source = sys.stdin.read();"
+        "label = sys.argv[1];"
+        "scope = {'__name__': '__main__', '__file__': label, '__package__': None};"
+        "exec(compile(source, label, 'exec'), scope)"
+    )
+    return [python_exe, "-c", bootstrap, script_label]
+
+
 def _completion_configuration_failure(job: dict[str, Any]) -> Optional[str]:
     live_job = resolve_job_ref(str(job.get("id") or ""))
     if live_job is None:
@@ -4718,24 +4738,12 @@ def _run_job_script(
     if timeout_seconds is not None:
         script_timeout = min(script_timeout, max(0.0, float(timeout_seconds)))
 
-    execution_path = path
-    snapshot_path: Optional[Path] = None
+    script_stdin: Optional[str] = None
     if script_snapshot is not None:
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                prefix=".cron-completion-",
-                suffix=path.suffix,
-                dir=scripts_dir_resolved,
-                delete=False,
-            ) as handle:
-                handle.write(script_snapshot)
-                handle.flush()
-                os.fsync(handle.fileno())
-                snapshot_path = Path(handle.name)
-            execution_path = snapshot_path
-        except OSError as exc:
-            return False, f"Could not materialize completion script snapshot: {exc}"
+            script_stdin = script_snapshot.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return False, f"Completion script snapshot is not UTF-8: {exc}"
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -4752,21 +4760,12 @@ def _run_job_script(
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
-            if snapshot_path is not None:
-                try:
-                    snapshot_path.unlink()
-                except OSError:
-                    logger.warning(
-                        "Could not remove cron completion snapshot %s",
-                        snapshot_path,
-                        exc_info=True,
-                    )
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(execution_path)]
+        argv = [_bash, "-s" if script_stdin is not None else str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -4774,9 +4773,16 @@ def _run_job_script(
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
-            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(execution_path))
+            if script_stdin is not None:
+                argv = _windows_cron_bootstrap_stdin_argv(
+                    python_exe, env_overlay, str(path)
+                )
+            else:
+                argv = _windows_cron_bootstrap_argv(
+                    python_exe, env_overlay, str(path)
+                )
         else:
-            argv = [python_exe, str(execution_path)]
+            argv = [python_exe, "-" if script_stdin is not None else str(path)]
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -4798,6 +4804,7 @@ def _run_job_script(
         _script_cwd = workdir or str(path.parent)
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.PIPE if script_stdin is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -4805,6 +4812,7 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
+        pending_script_input = script_stdin
         deadline = time.monotonic() + script_timeout
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -4830,9 +4838,21 @@ def _run_job_script(
                     f"Script timed out after {script_timeout:g}s: {path}"
                 )
             try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                if pending_script_input is None:
+                    stdout_raw, stderr_raw = proc.communicate(
+                        timeout=min(0.1, remaining)
+                    )
+                else:
+                    stdout_raw, stderr_raw = proc.communicate(
+                        input=pending_script_input,
+                        timeout=min(0.1, remaining),
+                    )
+                pending_script_input = None
                 break
             except subprocess.TimeoutExpired:
+                # communicate() retains the original input after a timeout;
+                # passing it again would raise once communication has started.
+                pending_script_input = None
                 continue
 
         stdout = (stdout_raw or "").strip()
@@ -4860,16 +4880,6 @@ def _run_job_script(
 
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
-    finally:
-        if snapshot_path is not None:
-            try:
-                snapshot_path.unlink()
-            except OSError:
-                logger.warning(
-                    "Could not remove cron completion snapshot %s",
-                    snapshot_path,
-                    exc_info=True,
-                )
 
 
 def _run_job_script_with_claim_heartbeat(

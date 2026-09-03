@@ -55,6 +55,36 @@ def test_substantive_web_extraction_requires_explicit_tool_source_opt_in():
     assert "stale" in candidate.context
 
 
+def test_web_source_urls_strip_credentials_and_query_values():
+    content = "Source paragraph. " * 60
+    credentialed = discover_source_candidates(
+        _tool_turn(
+            "web_extract",
+            {
+                "url": (
+                    "https://user:password@Example.com/page?"
+                    "X-Amz-Credential=secret&token=abc#access_token=also-hidden"
+                )
+            },
+            content,
+        ),
+        session_id="credentialed-url",
+        retain_tool_sources=True,
+    )[0]
+    clean = discover_source_candidates(
+        _tool_turn("web_extract", {"url": "https://example.com/page"}, content),
+        session_id="credentialed-url",
+        retain_tool_sources=True,
+    )[0]
+
+    assert credentialed.metadata["source_origin"] == "https://example.com/page"
+    assert credentialed.source_id == clean.source_id
+    serialized = json.dumps(credentialed.metadata)
+    assert "password" not in serialized
+    assert "secret" not in serialized
+    assert "token" not in serialized
+
+
 def test_incidental_search_results_and_short_outputs_are_skipped():
     assert discover_source_candidates(
         _tool_turn("web_search", {"query": "example"}, "Result " * 200)

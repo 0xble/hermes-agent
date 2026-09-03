@@ -77,8 +77,11 @@ def _validate_registration_history(
                 check=True,
                 capture_output=True,
             )
+            rev_list_args = ["git", "rev-list", "--reverse", f"{baseline}..HEAD"]
+            if upstream_ref:
+                rev_list_args.extend(["--not", upstream_ref])
             commits = subprocess.run(
-                ["git", "rev-list", "--reverse", f"{baseline}..HEAD"],
+                rev_list_args,
                 cwd=repo,
                 check=True,
                 text=True,

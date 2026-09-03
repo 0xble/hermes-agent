@@ -106,6 +106,20 @@ _NON_DIRECT_MUTATION_RE = re.compile(
     r".{0,80}\b(?:how|why|whether|if|should|ways?|options?)\b",
     re.I | re.S,
 )
+_QUESTION_CONTEXT_RE = re.compile(
+    r"^\s*(?:what|why|how|when|where|who|which|can|could|would|will|is|are|"
+    r"does|do|did|should)\b|\?\s*$",
+    re.I | re.S,
+)
+_POSITIVE_DIRECTIVE_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:please|kindly|go\s+ahead\s+and)\s+|"
+    r"(?:i\s+(?:want|need|authorize|am\s+asking)\s+you\s+to|"
+    r"you\s+(?:may|can|should|must)|(?:can|could|would|will)\s+you)\s+)?$",
+    re.I,
+)
+_REQUEST_QUESTION_PREFIX_RE = re.compile(
+    r"^\s*(?:can|could|would|will)\s+you\b", re.I
+)
 _LATER_REVOCATION_RE = re.compile(
     r"\b(?:do\s+not|don't|dont|never)\b[^.!?\n]{0,80}"
     r"\b(?:set|draft|start|activate|replace|pause|resume|clear|park|wait|unwait|add|remove|do)\b"
@@ -150,6 +164,49 @@ def _authorization_sentence(user_task: str, span_start: int, span_length: int) -
     ]
     sentence_end = min(sentence_ends) + 1 if sentence_ends else len(user_task)
     return user_task[sentence_start:sentence_end]
+
+
+def _has_positive_directive(pattern: re.Pattern[str], authorization_text: str) -> bool:
+    """Require a matched goal action to be introduced as an affirmative request."""
+    match = pattern.search(authorization_text)
+    return bool(
+        match
+        and _POSITIVE_DIRECTIVE_PREFIX_RE.fullmatch(
+            authorization_text[: match.start()]
+        )
+    )
+
+
+def _normalized_authorized_text(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _iter_contract_text(value: Any):
+    if isinstance(value, str):
+        if value.strip():
+            yield value
+        return
+    if isinstance(value, Mapping):
+        for child in value.values():
+            yield from _iter_contract_text(child)
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_contract_text(child)
+
+
+def _goal_payload_authorized(
+    goal: str, contract: Optional[Mapping[str, Any]], user_task: str
+) -> bool:
+    """Bind every durable textual instruction to the current user turn."""
+    authorized = _normalized_authorized_text(user_task)
+    goal_text = _normalized_authorized_text(goal)
+    if not goal_text or goal_text not in authorized:
+        return False
+    return all(
+        _normalized_authorized_text(value) in authorized
+        for value in _iter_contract_text(contract or {})
+    )
 
 
 def _normalize_positive_int(
@@ -223,15 +280,25 @@ def _authorized_action(
         prefix[-160:]
     ):
         return False, "", context
+    if _QUESTION_CONTEXT_RE.search(context) and not _REQUEST_QUESTION_PREFIX_RE.search(
+        context
+    ):
+        return False, "", context
     if _LATER_REVOCATION_RE.search(suffix):
         return False, "", context
     if action == "draft":
-        ok = bool(_DRAFT_RE.search(auth_text) and _ACTIVATION_RE.search(auth_text))
+        ok = bool(
+            _has_positive_directive(_DRAFT_RE, context)
+            and _ACTIVATION_RE.search(auth_text)
+        )
     elif action == "set":
-        ok = _explicit_activation_requested(auth_text, prefix, context)
+        ok = bool(
+            _has_positive_directive(_ACTIVATION_RE, context)
+            and _explicit_activation_requested(auth_text, prefix, context)
+        )
     else:
         pattern = _ACTION_AUTH_RE.get(action)
-        ok = bool(pattern and pattern.search(auth_text))
+        ok = bool(pattern and _has_positive_directive(pattern, context))
     return ok, "", context
 
 
@@ -360,6 +427,11 @@ def set_goal_tool(
                     return _failure("invalid_goal", "goal text is empty")
                 if contract is not None and not isinstance(contract, Mapping):
                     return _failure("invalid_contract", "contract must be an object")
+                if not _goal_payload_authorized(goal, contract, user_task or ""):
+                    return _failure(
+                        "goal_payload_authorization_required",
+                        "The exact durable goal and every textual contract term must appear in the current user turn",
+                    )
                 goal_contract = GoalContract.from_dict(dict(contract or {}))
                 if normalized_action == "draft" and goal_contract.is_empty():
                     return _failure(
@@ -601,9 +673,11 @@ SET_GOAL_SCHEMA = {
         "the work has one durable multi-turn outcome, an evidence-based finish line, and later steps "
         "that depend on results. Do not set a goal for a one-turn answer or edit, a read-only question, "
         "a vague aspiration, an unrelated backlog, routine task tracking, or work blocked on unresolved "
-        "user decisions. Mutations require exact current-turn authorization. For set or draft: goal is "
-        "one concise end state; verification is objective proof; constraints are invariants; boundaries "
-        "define scope; stop_when names a blocker requiring user input. Keep the path flexible. Omit "
+        "user decisions. Mutations require exact current-turn authorization. For set or draft, copy "
+        "the goal and every textual contract term verbatim from the current user turn; do not infer, "
+        "broaden, or invent a durable objective. Goal is one concise end state; verification is objective "
+        "proof; constraints are invariants; boundaries define scope; stop_when names a blocker requiring "
+        "user input. Keep the path flexible. Omit "
         "personas, plans or implementation diaries, generic exhortations, duplicate requirements, "
         "speculative edge cases, and repository rules supplied elsewhere. After setting, take the first "
         "concrete step in the same turn. Resume never resets the model's spent turn budget."

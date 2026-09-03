@@ -340,7 +340,10 @@ def test_history_validation_includes_merge_commits(tmp_path):
     _git(repo, "commit", "-m", "fix: registered")
     _git(repo, "merge", "--no-ff", "canonical", "-m", "Merge canonical upstream")
 
-    errors = _validate_registration_history(repo, baseline)
+    errors = _validate_registration_history(
+        repo, baseline, upstream_ref="canonical"
+    )
+    assert not any("upstream: change" in error for error in errors)
     assert any(
         "fork subject was not registered in its own commit" in error
         and "Merge canonical upstream" in error

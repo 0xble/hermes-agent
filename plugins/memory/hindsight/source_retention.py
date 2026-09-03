@@ -97,11 +97,17 @@ def _json_args(value: Any) -> dict[str, Any]:
 def _normalize_url(value: str) -> str:
     try:
         parsed = urlsplit(value.strip())
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return value.strip()
-        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+        hostname = parsed.hostname.lower()
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        netloc = f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
+        # Durable source metadata must never retain URL userinfo or signed/query
+        # credentials. The path is sufficient to identify the external source.
+        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", "", ""))
     except Exception:
-        return value.strip()
+        return ""
 
 
 def _path_value(args: dict[str, Any]) -> str:

@@ -349,8 +349,7 @@ async def test_close_side_runs_session_finalize_boundary():
         ),
     )
     runner.session_store = runner._async_session_store._store
-    runner._invalidate_session_run_generation = MagicMock()
-    runner._release_running_agent_state = MagicMock()
+    runner._interrupt_and_clear_session = AsyncMock()
     object.__setattr__(runner, "_agent_cache_lock", None)
     runner._evict_cached_agent = MagicMock()
     runner._clear_conversation_scope = MagicMock()
@@ -358,6 +357,12 @@ async def test_close_side_runs_session_finalize_boundary():
 
     assert await runner._close_side_route("route", _source()) is True
 
+    runner._interrupt_and_clear_session.assert_awaited_once_with(
+        "route",
+        _source(),
+        interrupt_reason="Side session closed",
+        invalidation_reason="side_closed",
+    )
     runner._finalize_session_off_loop.assert_awaited_once_with(
         session_id="child",
         platform="telegram",

@@ -452,6 +452,39 @@ class TestSendGate:
         assert result == {"success": True, "message_id": "standalone"}
         sender.assert_awaited_once()
 
+    def test_profile_bound_send_preserves_platform_chunking(self, monkeypatch):
+        from gateway.config import Platform
+        from tools.send_message_tool import _send_to_platform
+
+        sender = AsyncMock(
+            side_effect=lambda *_args, **kwargs: {
+                "success": True,
+                "message_id": str(len(kwargs.get("message", ""))),
+            }
+        )
+        entry = SimpleNamespace(standalone_sender_fn=sender)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr(
+            "gateway.platform_registry.platform_registry.get", lambda _name: entry
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+        )
+
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.TELEGRAM,
+                SimpleNamespace(),
+                "2027045491",
+                "x" * 5000,
+                profile="default",
+            )
+        )
+
+        assert result["success"] is True
+        assert sender.await_count == 2
+        assert all(len(call.args[2]) <= 4096 for call in sender.await_args_list)
+
     def test_profile_bound_standalone_send_rejects_profile_mismatch(self, monkeypatch):
         from gateway.config import Platform
         from tools.send_message_tool import _send_to_platform

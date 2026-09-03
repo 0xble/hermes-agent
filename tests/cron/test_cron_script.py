@@ -155,6 +155,22 @@ class TestRunJobScript:
         assert success is True
         assert output == "hello from script"
 
+    def test_snapshot_bytes_execute_without_materializing_an_agent_writable_file(
+        self, cron_env
+    ):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "completion.py"
+        script.write_text('print("tampered")\n', encoding="utf-8")
+
+        success, output = _run_job_script(
+            str(script), script_snapshot=b'print("captured")\n'
+        )
+
+        assert success is True
+        assert output == "captured"
+        assert not list((cron_env / "scripts").glob(".cron-completion-*"))
+
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
 

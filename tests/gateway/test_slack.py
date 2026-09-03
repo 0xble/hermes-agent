@@ -1239,6 +1239,34 @@ class TestStandaloneSendUserDmResolution:
 
 
 # ---------------------------------------------------------------------------
+# TestSendMultipleImages
+# ---------------------------------------------------------------------------
+
+
+class TestSendMultipleImages:
+    @pytest.mark.asyncio
+    async def test_success_without_share_timestamps_counts_each_uploaded_file(
+        self, adapter, tmp_path
+    ):
+        first = tmp_path / "first.png"
+        second = tmp_path / "second.png"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        adapter._app.client.files_upload_v2 = AsyncMock(
+            return_value={"ok": True, "files": [{"id": "F1"}, {"id": "F2"}]}
+        )
+
+        results = await adapter.send_multiple_images(
+            "C123",
+            [(first.as_uri(), "first"), (second.as_uri(), "second")],
+        )
+
+        assert len(results) == 2
+        assert all(result.success for result in results)
+        assert [result.message_id for result in results] == ["F1", "F2"]
+
+
+# ---------------------------------------------------------------------------
 # TestSendDocument
 # ---------------------------------------------------------------------------
 
