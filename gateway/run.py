@@ -34607,9 +34607,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception as e:
                             _first_response_delivered = False
                             logger.warning("Failed to send first response before queued message: %s", e)
-                    if not _first_response_delivered and pending_event is not None:
+                    if not _first_response_delivered:
                         _pending_slot = getattr(adapter, "_pending_messages", None)
-                        if isinstance(_pending_slot, dict):
+                        if pending_event is not None and isinstance(_pending_slot, dict):
                             _existing_pending = _pending_slot.get(session_key)
                             if _existing_pending is not None:
                                 self._session_state(
@@ -34618,6 +34618,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     0, _existing_pending
                                 )
                             _pending_slot[session_key] = pending_event
+                        elif adapter is not None and hasattr(adapter, "queue_message"):
+                            adapter.queue_message(session_key, pending)
                         logger.warning(
                             "Queued follow-up for session %s deferred because the "
                             "first response was not delivered.",

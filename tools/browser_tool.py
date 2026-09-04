@@ -1636,7 +1636,10 @@ def _reload_browser_use_runtime(runtime_key: str) -> bool:
     try:
         from tools.browser_use_cli import _reload_browser_exec_daemons_for_runtime
 
-        return _reload_browser_exec_daemons_for_runtime(runtime_key)
+        return _reload_browser_exec_daemons_for_runtime(
+            runtime_key,
+            home_key=hermes_home_key(),
+        )
     except Exception as exc:
         logger.debug("Browser Use identity daemon reload failed for %s: %s", runtime_key, exc)
         return False

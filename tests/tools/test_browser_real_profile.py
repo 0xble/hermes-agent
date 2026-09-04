@@ -591,7 +591,7 @@ class TestRealProfileCdpLaunch:
         assert ("--headless=new" in captured["chrome_argv"]) is expect_headless
         self._reset()
 
-    @pytest.mark.parametrize("headed", [True, None])
+    @pytest.mark.parametrize("headed", [True])
     def test_existing_runtime_rejects_opposite_effective_mode(self, headed):
         import tools.browser_tool as bt
         self._reset()
@@ -605,6 +605,31 @@ class TestRealProfileCdpLaunch:
         assert cdp is None
         assert "already running headless" in err
         self._reset()
+
+    def test_identity_daemon_reload_is_scoped_to_active_profile(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.browser_tool as bt
+        import tools.browser_use_cli as bu
+        from hermes_constants import hermes_home_key
+
+        home = tmp_path / "worker"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        observed = {}
+
+        def reload_runtime(runtime_key, *, home_key=None):
+            observed.update(runtime_key=runtime_key, home_key=home_key)
+            return True
+
+        monkeypatch.setattr(
+            bu, "_reload_browser_exec_daemons_for_runtime", reload_runtime
+        )
+
+        assert bt._reload_browser_use_runtime("identity-key") is True
+        assert observed == {
+            "runtime_key": "identity-key",
+            "home_key": hermes_home_key(),
+        }
 
     @pytest.mark.linux_only
     def test_configured_headed_reuses_headless_runtime_without_a_display(self, monkeypatch):

@@ -283,13 +283,13 @@ def test_risk_change_without_fresh_full_label_gate_fails_closed(tmp_path: Path) 
     assert any("must require a fresh ci:full label" in error for error in errors)
 
 
-def test_unrelated_label_cannot_bypass_risk_gate(tmp_path: Path) -> None:
+def test_unrelated_label_does_not_fail_the_risk_gate(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     ci = root / ".github" / "workflows" / "ci.yaml"
     _replace(
         ci,
-        "          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')\n",
         "          github.event.action != 'labeled'\n",
+        "          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')\n",
     )
     errors = validate(root)
     assert any("must require a fresh ci:full label" in error for error in errors)
