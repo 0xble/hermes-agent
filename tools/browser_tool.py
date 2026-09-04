@@ -64,7 +64,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Any, Dict, List, MutableMapping, Optional, Tuple, TypeVar, Union
 from pathlib import Path
 from agent.redact import redact_cdp_url
 from hermes_constants import (
@@ -1544,24 +1544,57 @@ _real_profile_session_homes: dict[str, str] = {}
 _real_profile_browser_processes: dict[
     str, tuple[Optional[subprocess.Popen], str]
 ] = {}
+_RuntimeState = TypeVar("_RuntimeState")
+
+
+def _migrate_real_profile_runtime_state(
+    state: MutableMapping[str, _RuntimeState], previous_key: str, cache_key: str
+) -> None:
+    if previous_key not in state or cache_key in state:
+        return
+    state[cache_key] = state.pop(previous_key)
 
 
 def _real_profile_runtime_resources(identity) -> tuple[str, threading.Lock, str]:
     """Return an identity-owned agent-browser session, lock, and cache key."""
     from hermes_cli.browser_identity import browser_identity_scope_key
+    from hermes_constants import hermes_home_key
 
+    home_key = hermes_home_key()
     runtime_key = browser_identity_scope_key(
         identity.runtime_key if identity is not None else "legacy-real-profile"
     )
+    kind = "identity" if identity is not None else "legacy"
+    cache_key = f"{kind}:{home_key}:{runtime_key}"
+    previous_cache_key = f"{kind}:{runtime_key}"
+    lock_key = f"{home_key}\0{runtime_key}"
     with _real_profile_cdp_locks_guard:
-        lock = _real_profile_cdp_locks.setdefault(runtime_key, threading.Lock())
+        previous_lock = _real_profile_cdp_locks.pop(runtime_key, None)
+        lock = _real_profile_cdp_locks.setdefault(
+            lock_key, previous_lock or threading.Lock()
+        )
+        if _real_profile_session_homes.get(previous_cache_key) == home_key:
+            _migrate_real_profile_runtime_state(
+                _real_profile_cdp_cache, previous_cache_key, cache_key
+            )
+            _migrate_real_profile_runtime_state(
+                _real_profile_headed_modes, previous_cache_key, cache_key
+            )
+            _migrate_real_profile_runtime_state(
+                _real_profile_session_names, previous_cache_key, cache_key
+            )
+            _migrate_real_profile_runtime_state(
+                _real_profile_session_homes, previous_cache_key, cache_key
+            )
+            _migrate_real_profile_runtime_state(
+                _real_profile_browser_processes, previous_cache_key, cache_key
+            )
         session_name = (
             f"hermes-rp-{runtime_key}"
             if identity is not None
             else f"{_REAL_PROFILE_SESSION}-{runtime_key}"
         )
-    kind = "identity" if identity is not None else "legacy"
-    return session_name, lock, f"{kind}:{runtime_key}"
+    return session_name, lock, cache_key
 
 
 def _track_real_profile_session(cache_key: str, session_name: str) -> None:
@@ -1902,7 +1935,7 @@ def _real_profile_cdp(
         return None, str(exc)
 
     session_name, identity_lock, cache_key = _real_profile_runtime_resources(identity)
-    scoped_runtime_key = cache_key.partition(":")[2] if identity is not None else ""
+    scoped_runtime_key = cache_key.rpartition(":")[2] if identity is not None else ""
 
     def mode_conflict() -> Optional[str]:
         running_headed = _real_profile_headed_modes.get(cache_key)

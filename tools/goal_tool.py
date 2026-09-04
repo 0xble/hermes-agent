@@ -108,11 +108,11 @@ _NON_DIRECT_MUTATION_RE = re.compile(
     r".{0,80}\b(?:how|why|whether|if|should|ways?|options?)\b",
     re.I | re.S,
 )
-_EMBEDDED_CONTENT_PREFIX_RE = re.compile(
-    r"(?:\b(?:here\s+is|here['’]s|below\s+is|the\s+following\s+is)\b"
-    r"[^.!?\n]{0,100}:\s*$"
-    r"|(?:^|\n)\s*(?:>|```|~~~|\|)\s*$)",
-    re.I | re.S,
+_EMBEDDED_CONTENT_INTRO_RE = re.compile(
+    r"\b(?:review|quote|paste|transcribe)\s+this\b[^.!?\n]{0,100}:\s*(?:\n|$)"
+    r"|\b(?:here\s+is|here['’]s|below\s+is|the\s+following\s+is)\b"
+    r"[^.!?\n]{0,100}:\s*(?:\n|$)",
+    re.I,
 )
 _QUESTION_CONTEXT_RE = re.compile(
     r"^\s*(?:what|why|how|when|where|who|which|can|could|would|will|is|are|"
@@ -172,6 +172,67 @@ def _authorization_sentence(user_task: str, span_start: int, span_length: int) -
     ]
     sentence_end = min(sentence_ends) + 1 if sentence_ends else len(user_task)
     return user_task[sentence_start:sentence_end]
+
+
+def _authorization_is_embedded(user_task: str, span_start: int, span_length: int) -> bool:
+    """Reject action spans inside quoted, fenced, or introduced pasted content."""
+    span_end = span_start + span_length
+    line_start = user_task.rfind("\n", 0, span_start) + 1
+    line_end = user_task.find("\n", span_end)
+    if line_end < 0:
+        line_end = len(user_task)
+    stripped_line = user_task[line_start:line_end].lstrip()
+    if stripped_line.startswith(">") or (
+        stripped_line.startswith("|") and stripped_line.rstrip().endswith("|")
+    ):
+        return True
+
+    open_fence: tuple[str, int] | None = None
+    last_closed_fence_end = -1
+    fence_pattern = re.compile(r"(?m)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*(?:\n|$)")
+    for match in fence_pattern.finditer(user_task):
+        marker = match.group(1)
+        if open_fence is None:
+            if match.start() > span_start:
+                break
+            open_fence = (marker[0], len(marker))
+            if match.start() <= span_start < match.end():
+                return True
+            continue
+        fence_char, minimum = open_fence
+        if marker[0] == fence_char and len(marker) >= minimum:
+            if match.start() > span_start:
+                return True
+            last_closed_fence_end = match.end()
+            open_fence = None
+        elif match.start() <= span_start < match.end():
+            return True
+    if open_fence is not None:
+        return True
+
+    introductions = list(
+        _EMBEDDED_CONTENT_INTRO_RE.finditer(user_task, 0, span_start)
+    )
+    return bool(
+        introductions and last_closed_fence_end < introductions[-1].end()
+    )
+
+
+def _direct_authorization_prefix(user_task: str, span_start: int) -> str:
+    """Ignore completed fenced material before a later direct instruction."""
+    last_close = -1
+    open_fence: tuple[str, int] | None = None
+    for match in re.finditer(
+        r"(?m)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*(?:\n|$)",
+        user_task[:span_start],
+    ):
+        marker = match.group(1)
+        if open_fence is None:
+            open_fence = (marker[0], len(marker))
+        elif marker[0] == open_fence[0] and len(marker) >= open_fence[1]:
+            last_close = match.end()
+            open_fence = None
+    return user_task[last_close:span_start] if last_close >= 0 else user_task[:span_start]
 
 
 def _has_positive_directive(pattern: re.Pattern[str], authorization_text: str) -> bool:
@@ -279,6 +340,12 @@ def _authorized_action(
     auth_start = task_text.find(auth_text)
     if auth_start < 0:
         return False, "authorization_not_in_current_turn", ""
+    while auth_start >= 0 and _authorization_is_embedded(
+        task_text, auth_start, len(auth_text)
+    ):
+        auth_start = task_text.find(auth_text, auth_start + 1)
+    if auth_start < 0:
+        return False, "", ""
     context = _authorization_sentence(task_text, auth_start, len(auth_text))
     if (
         _NEGATED_ACTIVATION_RE.search(context)
@@ -286,13 +353,12 @@ def _authorized_action(
         or _NEGATED_ACTION_OBJECT_RE.search(context)
     ):
         return False, "", context
-    prefix = task_text[:auth_start]
+    prefix = _direct_authorization_prefix(task_text, auth_start)
     suffix = task_text[auth_start + len(auth_text) :]
     if (
         _NON_DIRECT_MUTATION_RE.search(context)
         or _NON_DIRECT_MUTATION_RE.search(prefix[-160:])
         or _NON_DIRECT_CONTEXT_RE.search(prefix[-160:])
-        or _EMBEDDED_CONTENT_PREFIX_RE.search(prefix[-240:])
     ):
         return False, "", context
     if _QUESTION_CONTEXT_RE.search(context) and not _REQUEST_QUESTION_PREFIX_RE.search(

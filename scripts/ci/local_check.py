@@ -16,6 +16,10 @@ import time
 from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_COMPILE_CHANGED_PYTHON = (
+    "import pathlib,sys; "
+    "[compile(pathlib.Path(path).read_bytes(), path, 'exec') for path in sys.argv[1:]]"
+)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -118,7 +122,12 @@ def build_checks(
     checks: list[Check] = []
     for index, chunk in enumerate(_chunks(py_files), start=1):
         suffix = f" ({index}/{math.ceil(len(py_files) / 200)})" if len(py_files) > 200 else ""
-        checks.append(Check(f"compile changed Python{suffix}", (python, "-m", "py_compile", *chunk)))
+        checks.append(
+            Check(
+                f"compile changed Python{suffix}",
+                (python, "-c", _COMPILE_CHANGED_PYTHON, *chunk),
+            )
+        )
     checks.append(
         Check(
             "Windows portability guard",

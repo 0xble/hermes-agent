@@ -23,6 +23,17 @@ def test_smoke_uses_only_stdlib_python_and_portability_guard() -> None:
     assert not any("uv" in check.command or "npm" in check.command for check in checks)
 
 
+def test_python_compilation_does_not_write_bytecode(tmp_path: Path) -> None:
+    source = tmp_path / "changed.py"
+    source.write_text("answer = 42\n", encoding="utf-8")
+    compile_check = MODULE.build_checks(tmp_path, "smoke", [source.name], [])[0]
+
+    results = MODULE.run_checks(tmp_path, [compile_check], dry_run=False)
+
+    assert results[0].status == "passed"
+    assert not (tmp_path / "__pycache__").exists()
+
+
 def test_python_compilation_is_batched_for_large_changes(tmp_path: Path) -> None:
     paths = [f"pkg/module_{index}.py" for index in range(401)]
     for relative in paths:

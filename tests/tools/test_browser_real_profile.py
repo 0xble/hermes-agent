@@ -332,6 +332,7 @@ class TestRealProfileCdpLaunch:
 
     def _reset(self):
         import tools.browser_tool as bt
+        bt._real_profile_cdp_locks.clear()
         bt._real_profile_cdp_cache.clear()
         bt._real_profile_headed_modes.clear()
         bt._real_profile_session_names.clear()
@@ -375,6 +376,82 @@ class TestRealProfileCdpLaunch:
         with patch.object(bt, "_use_real_profile", return_value=False):
             cdp, err = bt._real_profile_cdp()
         assert cdp is None and err is None
+
+    def test_runtime_resources_are_isolated_by_hermes_profile(self, tmp_path):
+        import tools.browser_tool as bt
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        identity = Mock(runtime_key="shared-identity")
+        homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+        resources = []
+        for home in homes:
+            home.mkdir()
+            token = set_hermes_home_override(home)
+            try:
+                resources.append(bt._real_profile_runtime_resources(identity))
+            finally:
+                reset_hermes_home_override(token)
+
+        assert resources[0][0] != resources[1][0]
+        assert resources[0][1] is not resources[1][1]
+        assert resources[0][2] != resources[1][2]
+        assert str(homes[0].resolve()) in resources[0][2]
+        assert str(homes[1].resolve()) in resources[1][2]
+
+    def test_runtime_resources_migrate_owned_legacy_process_state(self, tmp_path):
+        import tools.browser_tool as bt
+        from hermes_constants import (
+            hermes_home_key,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        token = set_hermes_home_override(home)
+        try:
+            _, _, cache_key = bt._real_profile_runtime_resources(None)
+            previous_key = f"legacy:{cache_key.rpartition(':')[2]}"
+            bt._real_profile_cdp_cache[previous_key] = "http://127.0.0.1:41000"
+            bt._real_profile_session_names[previous_key] = "legacy-session"
+            bt._real_profile_session_homes[previous_key] = hermes_home_key()
+
+            _, _, migrated_key = bt._real_profile_runtime_resources(None)
+        finally:
+            reset_hermes_home_override(token)
+
+        assert migrated_key == cache_key
+        assert previous_key not in bt._real_profile_cdp_cache
+        assert bt._real_profile_cdp_cache[cache_key] == "http://127.0.0.1:41000"
+        assert bt._real_profile_session_names[cache_key] == "legacy-session"
+
+    def test_runtime_resources_do_not_migrate_another_profiles_legacy_state(
+        self, tmp_path
+    ):
+        import tools.browser_tool as bt
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home = tmp_path / "profile"
+        home.mkdir()
+        token = set_hermes_home_override(home)
+        try:
+            _, _, cache_key = bt._real_profile_runtime_resources(None)
+            previous_key = f"legacy:{cache_key.rpartition(':')[2]}"
+            bt._real_profile_cdp_cache[previous_key] = "http://127.0.0.1:41000"
+            bt._real_profile_session_homes[previous_key] = str(tmp_path / "other")
+
+            bt._real_profile_runtime_resources(None)
+        finally:
+            reset_hermes_home_override(token)
+
+        assert cache_key not in bt._real_profile_cdp_cache
+        assert bt._real_profile_cdp_cache[previous_key] == "http://127.0.0.1:41000"
 
     def test_non_chromium_default_fails_closed(self):
         import tools.browser_tool as bt

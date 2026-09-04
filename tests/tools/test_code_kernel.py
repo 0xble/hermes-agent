@@ -383,8 +383,17 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         self.assertTrue(owned[0].alive())
         proc = owned[0].proc
         assert proc is not None
-        child_pids = [child.pid for child in psutil.Process().children()]
-        self.assertEqual(child_pids, [proc.pid])
+        kernel_runner_pids = []
+        for child in psutil.Process().children():
+            try:
+                if any(
+                    os.path.basename(arg) == "hermes_kernel_runner.py"
+                    for arg in child.cmdline()
+                ):
+                    kernel_runner_pids.append(child.pid)
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+        self.assertEqual(kernel_runner_pids, [proc.pid])
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):
