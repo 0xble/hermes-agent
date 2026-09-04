@@ -22,7 +22,10 @@ visible blank row. Headings, lists, blockquotes, fenced code, tables,
 `<details>`, and display math keep their raw boundaries. The normalized payload,
 not the source, is counted against the rich character limit. Runs of three or
 more newlines collapse to the same single spacer, and normalization is
-idempotent.
+idempotent. A pipe table also gets a blank line, not a hard break, on any side
+where a single newline separates it from other content: Telegram cannot open a
+table inside a caption's open paragraph, and GFM continues a table through prose
+directly below it as one more row.
 
 Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
 two currency amounts in a sentence render as an unwrapped italic formula with
@@ -80,7 +83,7 @@ and draft, and is idempotent. Verified against live `sendRichMessage` output on
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
   `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
   `telegram-ordered-list-separation`, `telegram-footnote-refs`,
-  `telegram-progress-literal`.
+  `telegram-progress-literal`, `telegram-table-boundaries`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -125,6 +128,16 @@ Open [upstream PR 76368](https://github.com/NousResearch/hermes-agent/pull/76368
 touches the same function but only stops hard-break markers next to block lines.
 The paragraph still absorbs a list not starting at 1, so it does not replace
 this patch.
+
+Table boundaries: ported from open [upstream PR 102929](https://github.com/NousResearch/hermes-agent/pull/102929)
+by i-Hun, head `89a57e4f8a11ec7a623b15eb8b19b722fed3d69f`, adopted 2026-10-11
+with authorship kept. The fork's `_rich_normalize_linebreaks` had diverged
+(paragraph materialization, ordered-list separation), so the boundary promotion
+was re-applied to the fork's region loop; the PR's regression file is carried
+unchanged. Prose under a table joining it as a row was reproduced locally with
+markdown-it; the caption-above-table failure rests on the PR's
+`sendRichMessage` echo evidence and was not reproduced locally. Retire when a
+released upstream version carries equivalent behavior and regressions.
 
 Telegram unsupported link targets: adopted from the archived fork's HERMES-065
 implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
