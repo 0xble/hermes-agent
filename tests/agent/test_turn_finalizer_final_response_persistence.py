@@ -85,6 +85,40 @@ class FakeAgent:
 
 
 
+def test_output_transform_does_not_rewrite_matching_prior_turn(monkeypatch):
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "earlier"},
+        {"role": "assistant", "content": "Done"},
+        {"role": "user", "content": "current"},
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.transform_llm_output",
+        lambda response, **_kwargs: (response + "!", True),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    result = finalize_turn(
+        agent,
+        final_response="Done",
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="current",
+        original_user_message="current",
+        _should_review_memory=False,
+        _turn_exit_reason="partial_stream_recovery",
+    )
+
+    assert result["final_response"].startswith("Done!")
+    assert messages[1]["content"] == "Done"
+
+
+
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     """A recovered/previewed final response must be durable in session history.
 

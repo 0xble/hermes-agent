@@ -326,11 +326,14 @@ async def test_partial_chunk_cooldown_is_not_retryable(monkeypatch):
     result = await adapter.send("chunk-chat", content)
 
     assert result.success is False
-    assert result.retryable is False
+    assert result.retryable is True
     assert result.message_id == "101"
     assert result.raw_response["telegram_partial_text_delivery"] is True
     assert result.raw_response["delivered_chunks"] == 1
     assert result.raw_response["total_chunks"] == 2
+    retry_content = result.raw_response["delivery_retry_content"]
+    assert retry_content.startswith("x" * 200)
+    assert retry_content.endswith(r" \(2/2\)")
 
 
 @pytest.mark.asyncio

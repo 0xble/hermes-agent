@@ -124,6 +124,30 @@ class TestSendWithRetryNetworkRetry:
         assert len(adapter._send_calls) == 1
 
 
+    @pytest.mark.asyncio
+    async def test_partial_delivery_retries_only_undelivered_suffix(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="flood_control:30",
+                retryable=True,
+                retry_after=30,
+                raw_response={"delivery_retry_content": "remaining suffix"},
+            ),
+            SendResult(success=True, message_id="ok"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "full response", base_delay=0)
+
+        assert result.success
+        assert adapter._send_calls == [
+            ("chat1", "full response"),
+            ("chat1", "remaining suffix"),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # _send_with_retry — all retries exhausted → user notification
 # ---------------------------------------------------------------------------

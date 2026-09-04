@@ -6393,8 +6393,11 @@ class TelegramAdapter(BasePlatformAdapter):
                                     "message_ids": message_ids,
                                     "delivered_chunks": len(message_ids),
                                     "total_chunks": len(chunks),
+                                    "delivery_retry_content": "".join(
+                                        chunks[len(message_ids) :]
+                                    ),
                                 },
-                                retryable=False,
+                                retryable=True,
                                 retry_after=failure.retry_after,
                             )
                         return failure

@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import json
 import subprocess
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -296,6 +297,40 @@ def test_run_job_passes_remaining_budget_to_script_and_agent(tmp_path, monkeypat
     assert response == "done"
     assert observed["script_budget"] == pytest.approx(7.0)
     assert observed["agent_budget"] == pytest.approx(7.0)
+
+
+def test_agent_construction_is_bounded_by_total_budget(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class SlowAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            started.set()
+            release.wait(timeout=2)
+
+        def close(self):
+            closed.set()
+
+    scheduler, _ = _install_run_job_stubs(monkeypatch, tmp_path, SlowAgent)
+
+    success, _doc, response, error = scheduler.run_job(
+        {
+            "id": "slow-init",
+            "name": "slow initialization",
+            "prompt": "work",
+            "run_budget_seconds": 0.05,
+        }
+    )
+
+    assert started.is_set()
+    assert success is False
+    assert response == ""
+    assert "total execution budget exhausted" in error.lower()
+    release.set()
+    assert closed.wait(timeout=2)
+
 
 
 def test_continuously_active_agent_still_exhausts_total_budget(tmp_path, monkeypatch):

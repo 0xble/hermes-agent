@@ -7086,7 +7086,8 @@ def run_job(
                 )
             raise _total_run_budget_error(job_name, _total_run_budget)
 
-        agent = AIAgent(
+        def _construct_agent():
+            return AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
@@ -7129,7 +7130,34 @@ def run_job(
                 else {}
             ),
         )
-        
+
+        _agent_init_future: concurrent.futures.Future = concurrent.futures.Future()
+        _agent_init_context = contextvars.copy_context()
+
+        def _initialize_agent() -> None:
+            try:
+                _agent_init_future.set_result(_agent_init_context.run(_construct_agent))
+            except BaseException as error:
+                _agent_init_future.set_exception(error)
+
+        threading.Thread(
+            target=_initialize_agent,
+            name=f"cron-agent-init-{job_id[:8]}",
+            daemon=True,
+        ).start()
+        try:
+            agent = _agent_init_future.result(timeout=_agent_run_budget)
+        except concurrent.futures.TimeoutError as error:
+            def _teardown_late_agent(future):
+                try:
+                    late_agent = future.result()
+                except BaseException:
+                    return
+                _teardown_cron_agent(late_agent, job_id)
+
+            _agent_init_future.add_done_callback(_teardown_late_agent)
+            raise _total_run_budget_error(job_name, _total_run_budget) from error
+
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured

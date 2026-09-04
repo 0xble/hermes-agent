@@ -6142,6 +6142,16 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+        # Adapters that split one logical response may have committed a prefix
+        # before a retryable failure. Retrying the original payload would
+        # duplicate that prefix, so the adapter can narrow subsequent attempts
+        # to the exact undelivered suffix.
+        retry_content = content
+        if isinstance(result.raw_response, dict):
+            suffix = result.raw_response.get("delivery_retry_content")
+            if isinstance(suffix, str) and suffix:
+                retry_content = suffix
+
         if result.success:
             return result
 
@@ -6182,13 +6192,17 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(delay)
                 result = await self.send(
                     chat_id=chat_id,
-                    content=content,
+                    content=retry_content,
                     reply_to=reply_to,
                     metadata=metadata,
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                if isinstance(result.raw_response, dict):
+                    suffix = result.raw_response.get("delivery_retry_content")
+                    if isinstance(suffix, str) and suffix:
+                        retry_content = suffix
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -6211,7 +6225,7 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
+            content=f"(Response formatting failed, plain text:)\n\n{retry_content[:3500]}",
             reply_to=reply_to,
             metadata=metadata,
         )

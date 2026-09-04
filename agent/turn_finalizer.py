@@ -801,7 +801,18 @@ def finalize_turn(
     # Replace the matching current-turn assistant message so persistence,
     # memory sync, and future context cannot reintroduce pre-transform text.
     if _output_hook_transformed and _pre_transform_response is not None:
-        for _message in reversed(messages):
+        # A partial/interrupted turn can produce visible final_response without
+        # ever appending an assistant row. Never let equal text from an older
+        # turn stand in for that missing row.
+        _last_user_index = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            default=-1,
+        )
+        for _message in reversed(messages[_last_user_index + 1 :]):
             if (
                 isinstance(_message, dict)
                 and _message.get("role") == "assistant"
