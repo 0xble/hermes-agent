@@ -227,8 +227,8 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                     "run": (
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
-                        "--history-baseline-subject "
-                        "'fix(maintenance): reconcile concurrent origin baseline'"
+                        "--history-baseline "
+                        "f0efcb2ff0b1da37cccfcd0726df60628923ca9c"
                     ),
                 },
                 {
