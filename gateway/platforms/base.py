@@ -6147,8 +6147,9 @@ class BasePlatformAdapter(ABC):
         # duplicate that prefix, so the adapter can narrow subsequent attempts
         # to the exact undelivered suffix.
         retry_content = content
-        if isinstance(result.raw_response, dict):
-            suffix = result.raw_response.get("delivery_retry_content")
+        raw_response = getattr(result, "raw_response", None)
+        if isinstance(raw_response, dict):
+            suffix = raw_response.get("delivery_retry_content")
             if isinstance(suffix, str) and suffix:
                 retry_content = suffix
 
@@ -6199,8 +6200,9 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
-                if isinstance(result.raw_response, dict):
-                    suffix = result.raw_response.get("delivery_retry_content")
+                raw_response = getattr(result, "raw_response", None)
+                if isinstance(raw_response, dict):
+                    suffix = raw_response.get("delivery_retry_content")
                     if isinstance(suffix, str) and suffix:
                         retry_content = suffix
                 error_str = result.error or ""
