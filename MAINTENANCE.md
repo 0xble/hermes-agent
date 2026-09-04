@@ -212,6 +212,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): pin reconciled maintenance baseline` | Exact history-baseline advancement after the concurrent origin reconciliation; no shipped Hermes runtime behavior. |
 | `test: stabilize loaded full-suite verification` | Test-only isolation of unrelated lifespan startup threads plus additional per-file headroom for the large doctor suite under a 56-worker local-CI load; no shipped Hermes behavior. |
 | `fix(prompt): reject synthetic session database paths` | Defensive type guard that prevents test doubles or malformed session stores from materializing synthetic `MagicMock/...` paths; valid runtime session paths are unchanged. |
+| `fix(delegation): reject synthetic parent database paths` | Defensive type guard that prevents test-double parent agents from opening shared session stores at synthetic `MagicMock/...` paths; valid parent stores and missing-path fallback are unchanged. |
 
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.

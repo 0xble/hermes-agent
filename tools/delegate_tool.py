@@ -31,6 +31,7 @@ import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -2098,11 +2099,10 @@ def _build_child_agent(
             from hermes_state import get_shared_session_db
 
             _parent_db_path = getattr(parent_session_db, "db_path", None)
-            child_session_db = (
-                get_shared_session_db(_parent_db_path)
-                if _parent_db_path is not None
-                else get_shared_session_db()
-            )
+            if _parent_db_path is None:
+                child_session_db = get_shared_session_db()
+            elif isinstance(_parent_db_path, (str, Path)):
+                child_session_db = get_shared_session_db(Path(_parent_db_path))
         except Exception:
             logger.debug(
                 "subagent: failed to open dedicated SessionDB; child persistence disabled",

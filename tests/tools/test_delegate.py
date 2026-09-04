@@ -372,6 +372,31 @@ class TestDelegateTask(unittest.TestCase):
             _, kwargs = MockAgent.call_args
             self.assertIsNone(kwargs["session_db"])
 
+    def test_child_ignores_synthetic_parent_db_path(self):
+        """A generic parent mock must not materialize a fake DB path."""
+        parent = _make_mock_parent(depth=0)
+        parent._session_db = MagicMock()
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("hermes_state.get_shared_session_db") as get_shared,
+        ):
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="test",
+                context=None,
+                toolsets=None,
+                model="test-model",
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertIsNone(kwargs["session_db"])
+            get_shared.assert_not_called()
+
     def test_child_dedicated_db_follows_parents_db_path(self):
         """Per-profile parents: the child's dedicated handle must target the
         parent's database FILE, not the launch profile's default state.db.
