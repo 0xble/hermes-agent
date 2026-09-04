@@ -175,6 +175,23 @@ def test_goal_clear_rejects_action_mentions_without_an_affirmative_directive(
     assert GoalManager("negative-clear").state is not None
 
 
+def test_goal_payload_rejects_text_only_present_in_a_negated_sentence(
+    isolated_goal_db,
+):
+    result = call_goal(
+        goal="delete production",
+        session_id="negated-goal-payload",
+        user_task=(
+            "Do not set a goal to delete production. "
+            "Set a goal to audit backups."
+        ),
+        authorization_text="Set a goal to audit backups.",
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "goal_payload_authorization_required"
+
+
 def test_missing_turn_scope_fails_closed(isolated_goal_db):
     result = call_goal(
         goal="Implement and verify",

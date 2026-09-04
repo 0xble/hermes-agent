@@ -629,7 +629,7 @@ def generate_title(
     route_callback: Optional[AuxiliaryRouteCallback] = None,
     title_context: Any = None,
 ) -> Optional[str]:
-    """Generate a session title from bounded title context.
+    """Generate a session title from bounded text-only context.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
     small/fast model tier. Thinking is disabled and the response is constrained
@@ -637,6 +637,10 @@ def generate_title(
 
     ``MAX_TITLE_INPUT_CHARS`` is the character cap enforced immediately
     before the provider request.
+
+    ``title_context`` is accepted for call-site compatibility but is
+    intentionally not forwarded: it may contain native attachments that must
+    remain on the main model route under the auxiliary privacy contract.
 
     ``failure_callback`` is invoked with ``(task, exception)`` when the
     auxiliary call raises — the caller typically wires this to

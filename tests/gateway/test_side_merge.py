@@ -17,7 +17,13 @@ from hermes_state import SessionDB
 def _seed_side(db: SessionDB):
     db.create_session("main", source="telegram")
     db.append_message("main", role="user", content="main question", timestamp=1.0)
-    db.append_message("main", role="assistant", content="main answer", timestamp=2.0)
+    db.append_message(
+        "main",
+        role="assistant",
+        content="main answer",
+        finish_reason="stop",
+        timestamp=2.0,
+    )
     db.create_session(
         "side",
         source="telegram",

@@ -15637,9 +15637,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if destination_tip != destination_session_id:
             raise ValueError("the originating main route was reset or replaced")
         side_tip_session_id = self.get_compression_tip(side_root_session_id) or side_root_session_id
-        side_messages = self.get_messages_as_conversation(
-            side_tip_session_id, include_ancestors=True, include_row_ids=True
-        )
         # A compaction summary entangles the copied fork seed and side-only
         # turns into one canonical checkpoint. There is no honest row boundary
         # to strip after that, so import the checkpoint as frozen historical
@@ -15652,6 +15649,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ]
         else:
             side_lineage = [side_root_session_id]
+        # The side root already stores a copy of the fork seed. Reading the
+        # root through ancestor expansion would prepend the live parent rows
+        # and shift the persisted fork-count boundary, leaking parent context
+        # into the merge delta. Read only the side-owned lineage.
+        side_messages = [
+            message
+            for lineage_session_id in side_lineage
+            for message in self.get_messages_as_conversation(
+                lineage_session_id,
+                include_row_ids=True,
+            )
+        ]
         has_compaction_checkpoint = any(
             bool(message.get("compacted"))
             for lineage_session_id in side_lineage

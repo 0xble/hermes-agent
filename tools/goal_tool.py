@@ -196,12 +196,16 @@ def _iter_contract_text(value: Any):
 
 
 def _goal_payload_authorized(
-    goal: str, contract: Optional[Mapping[str, Any]], user_task: str
+    goal: str,
+    contract: Optional[Mapping[str, Any]],
+    user_task: str,
+    authorization_context: str,
 ) -> bool:
     """Bind every durable textual instruction to the current user turn."""
     authorized = _normalized_authorized_text(user_task)
     goal_text = _normalized_authorized_text(goal)
-    if not goal_text or goal_text not in authorized:
+    affirmative_context = _normalized_authorized_text(authorization_context)
+    if not goal_text or goal_text not in affirmative_context:
         return False
     return all(
         _normalized_authorized_text(value) in authorized
@@ -427,7 +431,12 @@ def set_goal_tool(
                     return _failure("invalid_goal", "goal text is empty")
                 if contract is not None and not isinstance(contract, Mapping):
                     return _failure("invalid_contract", "contract must be an object")
-                if not _goal_payload_authorized(goal, contract, user_task or ""):
+                if not _goal_payload_authorized(
+                    goal,
+                    contract,
+                    user_task or "",
+                    auth_context,
+                ):
                     return _failure(
                         "goal_payload_authorization_required",
                         "The exact durable goal and every textual contract term must appear in the current user turn",
