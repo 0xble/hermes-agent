@@ -1,5 +1,6 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
+import inspect
 from contextvars import ContextVar
 
 import pytest
@@ -42,35 +43,12 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=response):
             assert generate_title("財務テーブルを確認") == "財務テーブル"
 
-    def test_does_not_forward_native_image_to_title_route(self):
-        response = MagicMock()
-        response.choices = [MagicMock()]
-        response.choices[0].message.content = '{"title": "Hermes Attachment Topics"}'
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
-        }
-
-        with patch("agent.title_generator.call_llm", return_value=response) as llm:
-            title = generate_title(
-                "Autofix this",
-                title_context=[
-                    {"type": "text", "text": "Autofix this"},
-                    image_part,
-                ],
-            )
-
-        assert title == "Hermes Attachment Topics"
-        assert llm.call_args.kwargs["messages"][1]["content"] == "Autofix this"
+    def test_title_route_interface_cannot_accept_native_attachment_context(self):
+        assert "title_context" not in inspect.signature(generate_title).parameters
 
     def test_image_only_title_request_does_not_call_auxiliary_route(self):
-        image_part = {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
-        }
-
         with patch("agent.title_generator.call_llm") as llm:
-            assert generate_title("", title_context=[image_part]) is None
+            assert generate_title("") is None
 
         llm.assert_not_called()
 

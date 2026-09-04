@@ -13,6 +13,7 @@ import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from hermes_cli.reasoning_turn import ReasoningTurnError
 
 
 def _make_event(text="/reasoning", platform=Platform.TELEGRAM, user_id="12345", chat_id="67890"):
@@ -246,4 +247,14 @@ def test_gateway_bare_reasoning_effort_remains_session_scoped():
 
     assert runner._prepare_reasoning_turn_event(event) is None
     assert event.text == "/reasoning high"
+
+
+def test_gateway_one_turn_reasoning_cannot_wrap_a_slash_command():
+    runner = _make_runner()
+    event = _make_event("/reasoning high /logs")
+
+    with pytest.raises(ReasoningTurnError, match="cannot wrap another slash command"):
+        runner._prepare_reasoning_turn_event(event)
+
+    assert event.text == "/reasoning high /logs"
 

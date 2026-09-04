@@ -627,7 +627,6 @@ def generate_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     avoid_titles: Optional[list[str]] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
-    title_context: Any = None,
 ) -> Optional[str]:
     """Generate a session title from bounded text-only context.
 
@@ -637,10 +636,6 @@ def generate_title(
 
     ``MAX_TITLE_INPUT_CHARS`` is the character cap enforced immediately
     before the provider request.
-
-    ``title_context`` is accepted for call-site compatibility but is
-    intentionally not forwarded: it may contain native attachments that must
-    remain on the main model route under the auxiliary privacy contract.
 
     ``failure_callback`` is invoked with ``(task, exception)`` when the
     auxiliary call raises — the caller typically wires this to
@@ -1278,7 +1273,6 @@ def _auto_title_session(
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
         route_callback=route_callback,
-        title_context=title_context,
     )
     source = "llm"
     if not title:

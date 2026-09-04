@@ -19518,7 +19518,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _prepare_reasoning_turn_event(self, event: MessageEvent):
         """Convert an expanded one-turn /reasoning command into agent input."""
         from hermes_cli.commands import resolve_command
-        from hermes_cli.reasoning_turn import parse_reasoning_turn
+        from hermes_cli.reasoning_turn import ReasoningTurnError, parse_reasoning_turn
 
         get_command = getattr(event, "get_command", None)
         if not callable(get_command):
@@ -19535,6 +19535,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         request = parse_reasoning_turn(raw_args)
         if request is None:
             return None
+        if request.prompt.lstrip().startswith("/"):
+            raise ReasoningTurnError(
+                "One-turn reasoning cannot wrap another slash command."
+            )
 
         event.text = request.prompt
         event.turn_reasoning_config = dict(request.reasoning_config)

@@ -899,8 +899,8 @@ finally:
 function withRemoteUpdateMutex(command, mutexPath) {
   const script = `
 import fcntl,os,subprocess,sys
-mutex_path=sys.argv[1]
-payload=sys.argv[2]
+mutex_path=os.environ["HERMES_UPDATE_MUTEX_PATH"]
+payload=sys.argv[1]
 parent=os.path.dirname(mutex_path)
 if parent:os.makedirs(parent,exist_ok=True)
 fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT|os.O_CLOEXEC,0o600)
@@ -913,9 +913,9 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  // mutexPath is expandRemotePath() output. Assign it raw so $HOME expands;
-  // shq() here would pass the quote characters as part of the filename.
-  return `mutex_path=${mutexPath}; python3 -c ${shq(script)} "$mutex_path" ${shq(command)}`
+  // Bind the validated, shell-quoted path through the child environment so it
+  // never becomes executable Python argument syntax.
+  return `HERMES_UPDATE_MUTEX_PATH=${mutexPath} python3 -c ${shq(script)} ${shq(command)}`
 }
 
 /**
