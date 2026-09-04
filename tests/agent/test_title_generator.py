@@ -600,7 +600,7 @@ class TestGenerateTitle:
 
 
 class TestChooseTopicIcon:
-    def test_does_not_forward_native_image_to_icon_route(self):
+    def test_forwards_safe_image_metadata_but_not_payload_to_icon_route(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = "🎨"
@@ -621,9 +621,13 @@ class TestChooseTopicIcon:
             )
 
         assert selected == "🎨"
-        assert llm.call_args.kwargs["messages"][1]["content"] == (
-            "Title: Hermes Attachment Topics\nOpening request: Autofix this"
+        provider_content = llm.call_args.kwargs["messages"][1]["content"]
+        assert provider_content == (
+            "Title: Hermes Attachment Topics\nOpening request: Autofix this\n"
+            "Attachments: image"
         )
+        assert "aW1hZ2U=" not in provider_content
+        assert "data:image" not in provider_content
 
     def test_requests_up_to_six_ranked_unicode_selectors(self):
         mock_response = MagicMock()
@@ -945,7 +949,7 @@ class TestAutoTitleSession:
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
-    def test_image_only_opener_does_not_start_auxiliary_worker(self, tmp_path):
+    def test_image_only_opener_starts_worker_with_safe_metadata(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="telegram")
         title_context = [
@@ -955,6 +959,10 @@ class TestMaybeAutoTitle:
             }
         ]
         with patch("agent.title_generator.auto_title_session") as worker:
+            import threading
+
+            called = threading.Event()
+            worker.side_effect = lambda *args, **kwargs: called.set()
             maybe_auto_title(
                 db,
                 "sess-1",
@@ -963,7 +971,30 @@ class TestMaybeAutoTitle:
                 title_context=title_context,
             )
 
-        worker.assert_not_called()
+        assert called.wait(timeout=10), "auto-title worker never ran"
+        assert worker.call_args.kwargs["title_context"] == title_context
+
+    def test_auto_title_passes_only_safe_attachment_metadata_to_provider(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-attachment", source="telegram")
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Image Attachment"}'
+        secret_payload = "data:image/png;base64,VE9QLVNFQ1JFVA=="
+        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+            auto_title_session(
+                db,
+                "sess-attachment",
+                "",
+                title_context=[
+                    {"type": "image_url", "image_url": {"url": secret_payload}}
+                ],
+            )
+
+        provider_content = llm.call_args.kwargs["messages"][1]["content"]
+        assert provider_content == "Attachments: image"
+        assert secret_payload not in provider_content
+        assert db.get_session_title("sess-attachment") == "Image Attachment"
 
     def test_skips_if_not_first_exchange(self):
         """Should not fire once the conversation is past its opening turn."""

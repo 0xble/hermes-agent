@@ -16,6 +16,27 @@ def test_complete_compare_file_list_is_emitted() -> None:
     assert extract_complete_file_list(payload) == ["hermes.py", "website/docs.md"]
 
 
+def test_renamed_file_emits_source_and_destination_paths() -> None:
+    payload = json.dumps(
+        {
+            "files": [
+                {
+                    "filename": "docs/pyproject.md",
+                    "previous_filename": "pyproject.toml",
+                    "status": "renamed",
+                }
+            ]
+        }
+    )
+    assert extract_complete_file_list(payload) == ["pyproject.toml", "docs/pyproject.md"]
+
+
+def test_renamed_file_without_source_path_fails_closed() -> None:
+    payload = json.dumps({"files": [{"filename": "docs/new.md", "status": "renamed"}]})
+    with pytest.raises(ValueError, match="previous_filename"):
+        extract_complete_file_list(payload)
+
+
 def test_compare_file_cap_fails_so_action_can_fail_open() -> None:
     payload = _compare_payload([f"docs/{index}.md" for index in range(300)])
     with pytest.raises(ValueError, match="300-file cap"):

@@ -17086,11 +17086,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           v1 — initial shape (no ON DELETE CASCADE on session_id FK)
           v2 — session_id FK gets ON DELETE CASCADE so session pruning
                automatically clears bindings.
-          v3 — ``profile_name`` dimension on both tables so multiplexed
+          v3 — ``profile_name`` dimension on the topic-mode and binding tables so multiplexed
                gateways (shared ``state.db``) isolate topic mode/bindings
                per Hermes profile (issue #76423).
                It also adds durable topic-icon ownership and per-chat
                recent-selection state.
+          v4 — ``profile_name`` dimension on icon ownership/history.
         """
         # (table, column list, DDL body). ``profile_name`` leads the primary
         # key so multiplexed profiles sharing one state.db never collide on a
@@ -17169,6 +17170,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ON telegram_dm_topic_bindings(profile_name, user_id, chat_id);
 
                 CREATE TABLE IF NOT EXISTS telegram_topic_icon_state (
+                    profile_name TEXT NOT NULL DEFAULT 'default',
                     chat_id TEXT NOT NULL,
                     thread_id TEXT NOT NULL,
                     custom_emoji_id TEXT,
@@ -17176,26 +17178,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ownership IN ('auto', 'manual', 'default')
                     ),
                     observed_at REAL NOT NULL,
-                    PRIMARY KEY (chat_id, thread_id)
+                    PRIMARY KEY (profile_name, chat_id, thread_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS telegram_topic_icon_history (
+                    profile_name TEXT NOT NULL DEFAULT 'default',
                     chat_id TEXT NOT NULL,
                     custom_emoji_id TEXT NOT NULL,
                     emoji TEXT NOT NULL,
                     selected_at REAL NOT NULL,
-                    PRIMARY KEY (chat_id, custom_emoji_id)
+                    PRIMARY KEY (profile_name, chat_id, custom_emoji_id)
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_telegram_topic_icon_history_recent
-                ON telegram_topic_icon_history(chat_id, selected_at DESC);
                 """
+            )
+
+            icon_tables = (
+                (
+                    "telegram_topic_icon_state",
+                    "profile_name, chat_id, thread_id, custom_emoji_id, ownership, observed_at",
+                    """
+                        profile_name TEXT NOT NULL DEFAULT 'default',
+                        chat_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        custom_emoji_id TEXT,
+                        ownership TEXT NOT NULL CHECK (
+                            ownership IN ('auto', 'manual', 'default')
+                        ),
+                        observed_at REAL NOT NULL,
+                        PRIMARY KEY (profile_name, chat_id, thread_id)
+                    """,
+                ),
+                (
+                    "telegram_topic_icon_history",
+                    "profile_name, chat_id, custom_emoji_id, emoji, selected_at",
+                    """
+                        profile_name TEXT NOT NULL DEFAULT 'default',
+                        chat_id TEXT NOT NULL,
+                        custom_emoji_id TEXT NOT NULL,
+                        emoji TEXT NOT NULL,
+                        selected_at REAL NOT NULL,
+                        PRIMARY KEY (profile_name, chat_id, custom_emoji_id)
+                    """,
+                ),
+            )
+            for table, columns, ddl in icon_tables:
+                have = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+                if "profile_name" in have:
+                    continue
+                legacy_columns = columns.replace("profile_name, ", "", 1)
+                conn.executescript(
+                    f"""
+                    CREATE TABLE {table}_new ({ddl});
+                    INSERT INTO {table}_new ({columns})
+                        SELECT 'default', {legacy_columns} FROM {table};
+                    DROP TABLE {table};
+                    ALTER TABLE {table}_new RENAME TO {table};
+                    """
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_telegram_topic_icon_history_recent "
+                "ON telegram_topic_icon_history(profile_name, chat_id, selected_at DESC)"
             )
 
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                ("telegram_dm_topic_schema_version", "3"),
+                ("telegram_dm_topic_schema_version", "4"),
             )
         self._execute_write(_do)
 
@@ -17369,6 +17417,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         chat_id: str,
         thread_id: str,
+        profile_name: str = "default",
     ) -> Optional[Dict[str, Any]]:
         """Return durable observed icon ownership without creating tables."""
         with self._read_ctx() as conn:
@@ -17377,8 +17426,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 row = conn.execute(
                     "SELECT * FROM telegram_topic_icon_state "
-                    "WHERE chat_id = ? AND thread_id = ?",
-                    (str(chat_id), str(thread_id)),
+                    "WHERE profile_name = ? AND chat_id = ? AND thread_id = ?",
+                    (
+                        _normalize_telegram_topic_profile_name(profile_name),
+                        str(chat_id),
+                        str(thread_id),
+                    ),
                 ).fetchone()
             except (AttributeError, sqlite3.OperationalError):
                 return None
@@ -17390,6 +17443,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str,
         thread_id: str,
         custom_emoji_id: Optional[str],
+        profile_name: str = "default",
     ) -> str:
         """Persist an observed Telegram icon as auto, manual, or default.
 
@@ -17401,13 +17455,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id = str(chat_id)
         thread_id = str(thread_id)
         icon_id = str(custom_emoji_id or "").strip() or None
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
         ownership_result = {"value": "default"}
 
         def _do(conn):
             current = conn.execute(
                 "SELECT custom_emoji_id, ownership FROM telegram_topic_icon_state "
-                "WHERE chat_id = ? AND thread_id = ?",
-                (chat_id, thread_id),
+                "WHERE profile_name = ? AND chat_id = ? AND thread_id = ?",
+                (profile_name, chat_id, thread_id),
             ).fetchone()
             ownership = "default"
             if icon_id:
@@ -17421,14 +17476,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """
                 INSERT INTO telegram_topic_icon_state (
-                    chat_id, thread_id, custom_emoji_id, ownership, observed_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    profile_name, chat_id, thread_id, custom_emoji_id, ownership, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
                     custom_emoji_id = excluded.custom_emoji_id,
                     ownership = excluded.ownership,
                     observed_at = excluded.observed_at
                 """,
-                (chat_id, thread_id, icon_id, ownership, time.time()),
+                (profile_name, chat_id, thread_id, icon_id, ownership, time.time()),
             )
 
         self._execute_write(_do)
@@ -17439,6 +17494,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         *,
         chat_id: str,
         limit: int = 24,
+        profile_name: str = "default",
     ) -> List[Dict[str, Any]]:
         """Return durable least-recently-used icon history for one chat."""
         bounded_limit = max(1, min(int(limit), 100))
@@ -17448,9 +17504,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 rows = conn.execute(
                     "SELECT custom_emoji_id, emoji, selected_at "
-                    "FROM telegram_topic_icon_history WHERE chat_id = ? "
+                    "FROM telegram_topic_icon_history "
+                    "WHERE profile_name = ? AND chat_id = ? "
                     "ORDER BY selected_at DESC LIMIT ?",
-                    (str(chat_id), bounded_limit),
+                    (
+                        _normalize_telegram_topic_profile_name(profile_name),
+                        str(chat_id),
+                        bounded_limit,
+                    ),
                 ).fetchall()
             except (AttributeError, sqlite3.OperationalError):
                 return []
@@ -17463,6 +17524,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         custom_emoji_id: str,
         emoji: str,
         limit: int = 24,
+        profile_name: str = "default",
     ) -> None:
         """Record a selected icon and prune history to a bounded per-chat LRU."""
         self.apply_telegram_topic_migration()
@@ -17472,27 +17534,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not icon_id or not emoji:
             return
         bounded_limit = max(1, min(int(limit), 100))
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
 
         def _do(conn):
             now = time.time()
             conn.execute(
                 """
                 INSERT INTO telegram_topic_icon_history (
-                    chat_id, custom_emoji_id, emoji, selected_at
-                ) VALUES (?, ?, ?, ?)
-                ON CONFLICT(chat_id, custom_emoji_id) DO UPDATE SET
+                    profile_name, chat_id, custom_emoji_id, emoji, selected_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(profile_name, chat_id, custom_emoji_id) DO UPDATE SET
                     emoji = excluded.emoji,
                     selected_at = excluded.selected_at
                 """,
-                (chat_id, icon_id, emoji, now),
+                (profile_name, chat_id, icon_id, emoji, now),
             )
             conn.execute(
                 "DELETE FROM telegram_topic_icon_history "
-                "WHERE chat_id = ? AND custom_emoji_id NOT IN ("
+                "WHERE profile_name = ? AND chat_id = ? AND custom_emoji_id NOT IN ("
                 "  SELECT custom_emoji_id FROM telegram_topic_icon_history "
-                "  WHERE chat_id = ? ORDER BY selected_at DESC LIMIT ?"
+                "  WHERE profile_name = ? AND chat_id = ? "
+                "  ORDER BY selected_at DESC LIMIT ?"
                 ")",
-                (chat_id, chat_id, bounded_limit),
+                (profile_name, chat_id, profile_name, chat_id, bounded_limit),
             )
 
         self._execute_write(_do)
@@ -17503,25 +17567,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str,
         thread_id: str,
         custom_emoji_id: str,
+        profile_name: str = "default",
     ) -> None:
         """Persist ownership only after Telegram accepted the automatic edit."""
         self.apply_telegram_topic_migration()
         icon_id = str(custom_emoji_id).strip()
         if not icon_id:
             return
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
 
         def _do(conn):
             conn.execute(
                 """
                 INSERT INTO telegram_topic_icon_state (
-                    chat_id, thread_id, custom_emoji_id, ownership, observed_at
-                ) VALUES (?, ?, ?, 'auto', ?)
-                ON CONFLICT(chat_id, thread_id) DO UPDATE SET
+                    profile_name, chat_id, thread_id, custom_emoji_id, ownership, observed_at
+                ) VALUES (?, ?, ?, ?, 'auto', ?)
+                ON CONFLICT(profile_name, chat_id, thread_id) DO UPDATE SET
                     custom_emoji_id = excluded.custom_emoji_id,
                     ownership = 'auto',
                     observed_at = excluded.observed_at
                 """,
-                (str(chat_id), str(thread_id), icon_id, time.time()),
+                (profile_name, str(chat_id), str(thread_id), icon_id, time.time()),
             )
 
         self._execute_write(_do)

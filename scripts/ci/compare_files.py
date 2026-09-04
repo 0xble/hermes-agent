@@ -31,8 +31,16 @@ def extract_complete_file_list(payload: str) -> list[str]:
     for index, item in enumerate(files):
         if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
             raise ValueError(f"compare response files[{index}].filename must be a string")
+        if item.get("status") == "renamed":
+            previous = item.get("previous_filename")
+            if not isinstance(previous, str) or not previous:
+                raise ValueError(
+                    f"compare response files[{index}].previous_filename "
+                    "must be a string for renamed files"
+                )
+            filenames.append(previous)
         filenames.append(item["filename"])
-    return filenames
+    return list(dict.fromkeys(filenames))
 
 
 def main() -> int:

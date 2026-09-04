@@ -16,7 +16,7 @@ def _session(db, sid, profile_name=None):
 
 
 def test_legacy_rows_migrate_only_to_default(tmp_path: Path):
-    """v1 shape (no CASCADE, old user index) → v3: rows land in 'default' only."""
+    """Legacy topic and icon rows land in the v4 default profile only."""
     db_path = tmp_path / "legacy.db"
     conn = sqlite3.connect(str(db_path))
     conn.executescript(
@@ -53,13 +53,27 @@ def test_legacy_rows_migrate_only_to_default(tmp_path: Path):
             ON telegram_dm_topic_bindings(user_id, chat_id);
         INSERT INTO telegram_dm_topic_bindings
             VALUES ('{CHAT}', '99', '{CHAT}', 'k', 'legacy-sess', 'auto', 1.0, 1.0);
+        CREATE TABLE telegram_topic_icon_state (
+            chat_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+            custom_emoji_id TEXT, ownership TEXT NOT NULL, observed_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, thread_id)
+        );
+        INSERT INTO telegram_topic_icon_state
+            VALUES ('{CHAT}', '99', 'legacy-icon', 'auto', 1.0);
+        CREATE TABLE telegram_topic_icon_history (
+            chat_id TEXT NOT NULL, custom_emoji_id TEXT NOT NULL,
+            emoji TEXT NOT NULL, selected_at REAL NOT NULL,
+            PRIMARY KEY (chat_id, custom_emoji_id)
+        );
+        INSERT INTO telegram_topic_icon_history
+            VALUES ('{CHAT}', 'legacy-icon', '💻', 1.0);
         """
     )
     conn.close()
 
     db = SessionDB(db_path=db_path)
     db.apply_telegram_topic_migration()
-    assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert db.get_meta("telegram_dm_topic_schema_version") == "4"
     assert db.is_telegram_topic_mode_enabled(
         chat_id=CHAT, user_id=CHAT, profile_name="default",
     )
@@ -72,6 +86,19 @@ def test_legacy_rows_migrate_only_to_default(tmp_path: Path):
     assert db.get_telegram_topic_binding(
         chat_id=CHAT, thread_id="99", profile_name="coder",
     ) is None
+    default_icon = db.get_telegram_topic_icon_state(
+        chat_id=CHAT, thread_id="99", profile_name="default",
+    )
+    assert default_icon is not None and default_icon["custom_emoji_id"] == "legacy-icon"
+    assert db.get_telegram_topic_icon_state(
+        chat_id=CHAT, thread_id="99", profile_name="coder",
+    ) is None
+    assert db.list_recent_telegram_topic_icons(
+        chat_id=CHAT, profile_name="default",
+    )[0]["custom_emoji_id"] == "legacy-icon"
+    assert db.list_recent_telegram_topic_icons(
+        chat_id=CHAT, profile_name="coder",
+    ) == []
     fk = db._conn.execute("PRAGMA foreign_key_list('telegram_dm_topic_bindings')").fetchall()
     assert any(row[2] == "sessions" and row[6] == "CASCADE" for row in fk)
     db.close()

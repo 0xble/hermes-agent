@@ -1073,7 +1073,7 @@ async def test_auto_topic_icon_selection_serializes_same_chat_history():
         ]
 
     assert observed_recent == [[], ["💻"]]
-    entry = runner._telegram_topic_icon_locks["208214988"]
+    entry = runner._telegram_topic_icon_locks["default\x00208214988"]
     assert entry["users"] == 0
 
 
@@ -1141,12 +1141,18 @@ def test_telegram_adapter_install_wires_durable_icon_observer():
     runner = _make_runner()
     adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
     adapter.platform = Platform.TELEGRAM
+    adapter._hermes_profile_name = "default"
     adapter.set_dm_topic_icon_observer = MagicMock()
+    runner._queue_telegram_topic_icon_observation = MagicMock()
 
     runner._install_telegram_topic_icon_observer(adapter)
 
-    adapter.set_dm_topic_icon_observer.assert_called_once_with(
-        runner._queue_telegram_topic_icon_observation
+    adapter.set_dm_topic_icon_observer.assert_called_once()
+    observer = adapter.set_dm_topic_icon_observer.call_args.args[0]
+    observer("208214988", "42", "icon-id")
+    queue_observation = cast(Any, runner._queue_telegram_topic_icon_observation)
+    queue_observation.assert_called_once_with(
+        "208214988", "42", "icon-id", profile_name="default"
     )
 
 
@@ -1192,6 +1198,37 @@ async def test_auto_topic_icon_history_is_isolated_per_chat():
 
 
 @pytest.mark.asyncio
+async def test_auto_topic_icon_history_is_isolated_per_profile():
+    runner = _make_runner()
+    adapter = cast(Any, runner.adapters[Platform.TELEGRAM])
+    runner.config.platforms[Platform.TELEGRAM].extra["auto_topic_icons"] = True
+    adapter.dm_topic_custom_icon_state.return_value = False
+    adapter.get_forum_topic_icon_options.return_value = [
+        {"emoji": "💻", "custom_emoji_id": "computer-id"},
+        {"emoji": "🎨", "custom_emoji_id": "art-id"},
+    ]
+    first_source = _make_source(thread_id="42")
+    first_source.profile = "work"
+    second_source = _make_source(thread_id="43")
+    second_source.profile = "personal"
+
+    with patch(
+        "agent.title_generator.choose_topic_icon", side_effect=["💻", "🎨"]
+    ) as choose:
+        await runner._select_telegram_topic_icon_id(
+            adapter, first_source, "Developer Tools", "debug the agent"
+        )
+        await runner._select_telegram_topic_icon_id(
+            adapter, second_source, "Creative Assets", "design a campaign"
+        )
+
+    assert choose.call_args_list[0].kwargs["recent_emojis"] == []
+    assert choose.call_args_list[1].kwargs["recent_emojis"] == []
+    assert "work\x00208214988" in runner._telegram_topic_icon_locks
+    assert "personal\x00208214988" in runner._telegram_topic_icon_locks
+
+
+@pytest.mark.asyncio
 async def test_auto_topic_icon_per_chat_state_is_lru_bounded():
     runner = _make_runner()
     runner._telegram_topic_icon_locks = OrderedDict(
@@ -1212,7 +1249,7 @@ async def test_auto_topic_icon_per_chat_state_is_lru_bounded():
 
     assert result is None
     assert len(runner._telegram_topic_icon_locks) == 256
-    assert "208214988" in runner._telegram_topic_icon_locks
+    assert "default\x00208214988" in runner._telegram_topic_icon_locks
     assert "0" not in runner._telegram_topic_icon_locks
     assert "0" not in runner._telegram_topic_icon_history
 
@@ -1295,7 +1332,7 @@ async def test_auto_topic_icon_history_keeps_only_twenty_four_recent_unique_choi
             )
             assert selected_id == f"icon-{index}"
 
-    assert runner._telegram_topic_icon_history["208214988"] == emojis[-24:]
+    assert runner._telegram_topic_icon_history["default\x00208214988"] == emojis[-24:]
     assert choose.call_args_list[-1].kwargs["recent_emojis"] == list(
         reversed(emojis[3:27])
     )

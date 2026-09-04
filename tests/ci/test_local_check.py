@@ -39,20 +39,31 @@ def test_deleted_python_file_is_not_compiled(tmp_path: Path) -> None:
     assert not any(check.name.startswith("compile changed Python") for check in checks)
 
 
-def test_changed_files_includes_deleted_paths(monkeypatch, tmp_path: Path) -> None:
+def test_changed_files_includes_deleted_and_renamed_paths(
+    monkeypatch, tmp_path: Path
+) -> None:
     captured: list[tuple[str, ...]] = []
 
     def fake_git(_root: Path, *args: str) -> str:
         captured.append(args)
-        return "tools/deleted_tool.py"
+        return "D\ttools/deleted_tool.py\nR100\tpyproject.toml\tdocs/pyproject.md"
 
     monkeypatch.setattr(MODULE, "_git", fake_git)
 
     assert MODULE.changed_files(tmp_path, "origin/main", "HEAD") == [
-        "tools/deleted_tool.py"
+        "tools/deleted_tool.py",
+        "pyproject.toml",
+        "docs/pyproject.md",
     ]
     assert captured == [
-        ("diff", "--name-only", "--diff-filter=ACMRD", "origin/main...HEAD")
+        (
+            "diff",
+            "--name-status",
+            "--find-renames",
+            "--find-copies",
+            "--diff-filter=ACMRD",
+            "origin/main...HEAD",
+        )
     ]
 
 

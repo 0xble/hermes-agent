@@ -107,6 +107,12 @@ _NON_DIRECT_MUTATION_RE = re.compile(
     r".{0,80}\b(?:how|why|whether|if|should|ways?|options?)\b",
     re.I | re.S,
 )
+_EMBEDDED_CONTENT_PREFIX_RE = re.compile(
+    r"(?:\b(?:here\s+is|here['’]s|below\s+is|the\s+following\s+is)\b"
+    r"[^.!?\n]{0,100}:\s*$"
+    r"|(?:^|\n)\s*(?:>|```|~~~|\|)\s*$)",
+    re.I | re.S,
+)
 _QUESTION_CONTEXT_RE = re.compile(
     r"^\s*(?:what|why|how|when|where|who|which|can|could|would|will|is|are|"
     r"does|do|did|should)\b|\?\s*$",
@@ -281,8 +287,11 @@ def _authorized_action(
         return False, "", context
     prefix = task_text[:auth_start]
     suffix = task_text[auth_start + len(auth_text) :]
-    if _NON_DIRECT_MUTATION_RE.search(context) or _NON_DIRECT_MUTATION_RE.search(
-        prefix[-160:]
+    if (
+        _NON_DIRECT_MUTATION_RE.search(context)
+        or _NON_DIRECT_MUTATION_RE.search(prefix[-160:])
+        or _NON_DIRECT_CONTEXT_RE.search(prefix[-160:])
+        or _EMBEDDED_CONTENT_PREFIX_RE.search(prefix[-240:])
     ):
         return False, "", context
     if _QUESTION_CONTEXT_RE.search(context) and not _REQUEST_QUESTION_PREFIX_RE.search(

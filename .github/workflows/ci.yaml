@@ -16,16 +16,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
+  # A label event cannot be filtered by label name at trigger time. Keep each
+  # label lane separate so an unrelated label cannot cancel the final-commit
+  # ci:full run (or the ordinary synchronize smoke run).
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'main' }}
   cancel-in-progress: true
 
 jobs:
   smoke:
     name: Hosted smoke and affected areas
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'labeled' ||
-      github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:

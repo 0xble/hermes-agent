@@ -25,7 +25,7 @@ import threading
 import unicodedata
 from contextvars import copy_context
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
@@ -785,6 +785,43 @@ def generate_title(
         return None
 
 
+def _attachment_metadata_context(title_context: Any) -> str:
+    """Describe supported attachments without disclosing names, URLs, or bytes."""
+    parts = title_context if isinstance(title_context, (list, tuple)) else []
+    descriptions: list[str] = []
+    for part in parts[:8]:
+        if not isinstance(part, Mapping):
+            continue
+        kind = str(part.get("type") or "").strip().casefold()
+        if kind in {"text", "input_text", "output_text"}:
+            continue
+        media_type = str(
+            part.get("media_type") or part.get("mime_type") or part.get("content_type") or ""
+        ).strip().casefold()
+        if kind in {"image", "image_url", "input_image"} or media_type.startswith("image/"):
+            label = "image"
+        elif kind in {"audio", "input_audio"} or media_type.startswith("audio/"):
+            label = "audio"
+        elif kind in {"video", "input_video"} or media_type.startswith("video/"):
+            label = "video"
+        elif kind in {"file", "input_file", "document"} or media_type:
+            label = "PDF document" if media_type == "application/pdf" else "file"
+        else:
+            continue
+        if label not in descriptions:
+            descriptions.append(label)
+    if not descriptions:
+        return ""
+    return "Attachments: " + ", ".join(descriptions)
+
+
+def _title_request_text(user_message: str, title_context: Any) -> str:
+    """Combine visible text with privacy-safe attachment metadata."""
+    text = str(user_message or "").strip()
+    metadata = _attachment_metadata_context(title_context)
+    return "\n\n".join(part for part in (text, metadata) if part)
+
+
 _TOPIC_ICON_TERMS = {
     "🚀": "launch ship deploy release startup",
     "📊": "chart data metrics analytics report table finance financial",
@@ -962,6 +999,9 @@ def choose_topic_icon(
         f"Title: {str(title or '')[:120]}\n"
         f"Opening request: {str(user_message or '')[:500]}"
     )
+    attachment_metadata = _attachment_metadata_context(title_context)
+    if attachment_metadata:
+        icon_user_text += f"\n{attachment_metadata}"
     messages = [
         {"role": "system", "content": prompt},
         {
@@ -1267,8 +1307,9 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
+    request_text = _title_request_text(user_message, title_context)
     title = generate_title(
-        user_message,
+        request_text,
         failure_callback=failure_callback,
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
@@ -1300,7 +1341,7 @@ def _auto_title_session(
                 )
             except ValueError:
                 retry_title = generate_title(
-                    user_message,
+                    request_text,
                     failure_callback=None,
                     main_runtime=main_runtime,
                     runtime_validator=runtime_validator,
@@ -1404,7 +1445,8 @@ def maybe_auto_title(
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
     """
-    if not session_db or not session_id or not user_message:
+    request_text = _title_request_text(user_message, title_context)
+    if not session_db or not session_id or not request_text:
         return
 
     # Count the real questions behind us to detect the opening turn.
@@ -1421,7 +1463,7 @@ def maybe_auto_title(
     if user_msg_count >= 1 and not _session_is_untitled(session_db, session_id):
         return
 
-    if user_message and not is_titleable_user_message(user_message):
+    if not is_titleable_user_message(request_text):
         return
 
     # Config read comes after the cheap guards so the file isn't touched on

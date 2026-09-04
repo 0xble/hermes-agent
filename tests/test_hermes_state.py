@@ -1790,7 +1790,7 @@ class TestSchemaInit:
         assert binding["user_id"] == "208214988"
         assert binding["session_key"] == "telegram:dm:208214988:thread:17585"
         assert binding["session_id"] == "topic-session"
-        assert db.get_meta("telegram_dm_topic_schema_version") == "3"
+        assert db.get_meta("telegram_dm_topic_schema_version") == "4"
         db.close()
 
     def test_telegram_topic_icon_state_preserves_manual_and_auto_ownership(self, tmp_path):
@@ -1863,6 +1863,33 @@ class TestSchemaInit:
             row["emoji"]
             for row in db.list_recent_telegram_topic_icons(chat_id="208214988")
         ] == [f"emoji-{index}" for index in range(27, 3, -1)]
+        db.close()
+
+    def test_telegram_topic_icons_are_isolated_by_profile(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.mark_telegram_topic_icon_auto(
+            profile_name="work", chat_id="208214988", thread_id="42",
+            custom_emoji_id="shared-id",
+        )
+        assert db.record_telegram_topic_icon_observation(
+            profile_name="personal", chat_id="208214988", thread_id="42",
+            custom_emoji_id="shared-id",
+        ) == "manual"
+        db.record_telegram_topic_icon_selection(
+            profile_name="work", chat_id="208214988",
+            custom_emoji_id="work-id", emoji="💻",
+        )
+        assert db.list_recent_telegram_topic_icons(
+            profile_name="personal", chat_id="208214988"
+        ) == []
+        work_state = db.get_telegram_topic_icon_state(
+            profile_name="work", chat_id="208214988", thread_id="42"
+        )
+        personal_state = db.get_telegram_topic_icon_state(
+            profile_name="personal", chat_id="208214988", thread_id="42"
+        )
+        assert work_state is not None and work_state["ownership"] == "auto"
+        assert personal_state is not None and personal_state["ownership"] == "manual"
         db.close()
 
 

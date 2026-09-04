@@ -56,8 +56,26 @@ def _git(root: Path, *args: str) -> str:
 def changed_files(root: Path, base: str | None, head: str) -> list[str]:
     """Return immutable base...head paths; broad profiles need no path payload."""
     if base:
-        output = _git(root, "diff", "--name-only", "--diff-filter=ACMRD", f"{base}...{head}")
-        return [line for line in output.splitlines() if line]
+        output = _git(
+            root,
+            "diff",
+            "--name-status",
+            "--find-renames",
+            "--find-copies",
+            "--diff-filter=ACMRD",
+            f"{base}...{head}",
+        )
+        paths: list[str] = []
+        for line in output.splitlines():
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            status = fields[0]
+            if status.startswith(("R", "C")) and len(fields) >= 3:
+                paths.extend(fields[1:3])
+            else:
+                paths.append(fields[1])
+        return list(dict.fromkeys(paths))
     return []
 
 

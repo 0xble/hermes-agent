@@ -19946,6 +19946,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.reasoning_turn import ReasoningTurnError
 
+        # One-turn /reasoning is rewritten into ordinary agent input below, so
+        # authorize its canonical command while the slash-command provenance is
+        # still present. Otherwise the normal dispatch gate can no longer see it.
+        from hermes_cli.commands import resolve_command as _resolve_command
+
+        _reasoning_command = event.get_command()
+        _reasoning_definition = (
+            _resolve_command(_reasoning_command) if _reasoning_command else None
+        )
+        if _reasoning_definition and _reasoning_definition.name == "reasoning":
+            _reasoning_denied = self._check_slash_access(
+                event.source, _reasoning_definition.name
+            )
+            if _reasoning_denied is not None:
+                return _reasoning_denied
         try:
             self._prepare_reasoning_turn_event(event)
         except ReasoningTurnError as exc:
@@ -27151,7 +27166,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title_context: Any = None,
     ) -> Optional[str]:
         """Serialize icon selection per chat so recent-history rotation is race-free."""
-        history_key = str(source.chat_id)
+        history_key = f"{self._telegram_topic_profile_name(source)}\0{source.chat_id}"
         lock_store = getattr(self, "_telegram_topic_icon_locks", None)
         if not isinstance(lock_store, OrderedDict):
             lock_store = OrderedDict()
@@ -27234,13 +27249,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         setter = getattr(adapter, "set_dm_topic_icon_observer", None)
         if callable(setter):
-            setter(self._queue_telegram_topic_icon_observation)
+            profile_name = str(
+                getattr(adapter, "_hermes_profile_name", None) or "default"
+            )
+            setter(
+                lambda chat_id, thread_id, custom_emoji_id: self._queue_telegram_topic_icon_observation(
+                    chat_id,
+                    thread_id,
+                    custom_emoji_id,
+                    profile_name=profile_name,
+                )
+            )
 
     def _queue_telegram_topic_icon_observation(
         self,
         chat_id: str,
         thread_id: str,
         custom_emoji_id: Optional[str],
+        *,
+        profile_name: str = "default",
     ) -> None:
         """Persist a service-event icon observation without blocking PTB."""
         session_db = getattr(self, "_session_db", None)
@@ -27253,6 +27280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(chat_id),
                     thread_id=str(thread_id),
                     custom_emoji_id=custom_emoji_id,
+                    profile_name=profile_name,
                 )
             except Exception:
                 logger.debug(
@@ -27275,6 +27303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         chat_id = str(source.chat_id)
         thread_id = str(source.thread_id)
+        profile_name = self._telegram_topic_profile_name(source)
         session_db = getattr(self, "_session_db", None)
 
         observation = None
@@ -27292,6 +27321,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=chat_id,
                         thread_id=thread_id,
                         custom_emoji_id=observation,
+                        profile_name=profile_name,
                     )
                 except Exception:
                     logger.debug("Failed to persist Telegram topic icon observation", exc_info=True)
@@ -27302,6 +27332,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 state = await session_db.get_telegram_topic_icon_state(
                     chat_id=chat_id,
                     thread_id=thread_id,
+                    profile_name=profile_name,
                 )
                 if isinstance(state, dict):
                     ownership = str(state.get("ownership") or "").strip()
@@ -27394,7 +27425,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 history_store.items() if isinstance(history_store, dict) else ()
             )
             self._telegram_topic_icon_history = history_store
-        history_key = str(source.chat_id)
+        profile_name = self._telegram_topic_profile_name(source)
+        history_key = f"{profile_name}\0{source.chat_id}"
         if history_key in history_store:
             history_store.move_to_end(history_key)
         memory_recent = [
@@ -27409,8 +27441,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if session_db is not None:
             try:
                 durable_rows = await session_db.list_recent_telegram_topic_icons(
-                    chat_id=history_key,
+                    chat_id=str(source.chat_id),
                     limit=_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                    profile_name=profile_name,
                 )
                 durable_icons = [
                     str(row.get("emoji") or "").strip()
@@ -27491,10 +27524,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session_db is not None:
                 try:
                     await session_db.record_telegram_topic_icon_selection(
-                        chat_id=history_key,
+                        chat_id=str(source.chat_id),
                         custom_emoji_id=selected_id,
                         emoji=selected_emoji,
                         limit=_TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                        profile_name=profile_name,
                     )
                 except Exception:
                     logger.debug("Failed to persist Telegram icon history", exc_info=True)
@@ -27634,6 +27668,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 latest_binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=self._telegram_topic_profile_name(source),
                 )
                 if latest_binding:
                     if str(latest_binding.get("session_id") or "") != str(session_id):
@@ -27669,6 +27704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                     custom_emoji_id=icon_custom_emoji_id,
+                    profile_name=self._telegram_topic_profile_name(source),
                 )
             except Exception:
                 logger.debug("Failed to persist automatic Telegram icon ownership", exc_info=True)

@@ -367,6 +367,15 @@ def test_ci_jobs_only_gate_on_smoke_outputs_that_smoke_actually_declares():
     assert referenced - declared == set(), "job(s) gate on an output smoke never declares"
 
 
+def test_unrelated_label_events_run_smoke_without_cancelling_ci_full():
+    ci = _yaml(".github/workflows/ci.yaml")
+    smoke = ci["jobs"]["smoke"]
+    assert "if" not in smoke
+    concurrency_group = ci["concurrency"]["group"]
+    assert "github.event.action == 'labeled'" in concurrency_group
+    assert "github.event.label.name" in concurrency_group
+
+
 def _iter_if_expressions(job: object):
     """Yield every ``if:`` string in a job, including inside its steps."""
     if not isinstance(job, dict):
