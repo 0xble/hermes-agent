@@ -509,6 +509,34 @@ class TestBrowserUseIdentityRouting:
         assert calls == [(["browser-use", "--reload"], "rp_a")]
         assert bu._browser_exec_identity_daemons == {"rp_b": "runtime-b"}
 
+    def test_reload_recovers_durable_daemon_after_process_restart(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.browser_use_cli as bu
+        from hermes_constants import hermes_home_key
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        claim = bu._browser_exec_durable_binding_dir("session-a")
+        claim.mkdir(parents=True)
+        (claim / "owner").write_text("runtime-a\n", encoding="utf-8")
+        (claim / "daemon").write_text("rp_runtime_a_123456789abc\n", encoding="utf-8")
+        bu._browser_exec_identity_daemons.clear()
+        bu._browser_exec_identity_daemon_homes.clear()
+        calls = []
+        monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu.subprocess,
+            "run",
+            lambda argv, **kwargs: calls.append(kwargs["env"]["BU_NAME"]),
+        )
+
+        assert bu._reload_browser_exec_daemons_for_runtime(
+            "runtime-a", home_key=hermes_home_key()
+        ) is True
+
+        assert calls == ["rp_runtime_a_123456789abc"]
+        assert not (claim / "daemon").exists()
+
     def test_failed_daemon_reload_remains_registered_for_retry(self):
         import tools.browser_use_cli as bu
 

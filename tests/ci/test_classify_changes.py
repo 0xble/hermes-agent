@@ -304,6 +304,8 @@ def test_classify(files, expected):
         ("scripts/install.ps1", True),
         ("scripts/platform-helper.cmd", True),
         ("agent/platform_windows.py", True),
+        ("tests/test_windows_long_paths.py", True),
+        ("tests/test_macos_permissions.py", True),
     ],
 )
 def test_risk_full_classification(path: str, expected: bool) -> None:

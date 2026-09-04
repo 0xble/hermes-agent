@@ -82,6 +82,26 @@ def _claim_browser_exec_durable_binding(session: str, owner: str) -> str | None:
             shutil.rmtree(temporary, ignore_errors=True)
 
 
+def _persist_browser_exec_daemon(session: str, daemon_name: str) -> None:
+    claim = _browser_exec_durable_binding_dir(session)
+    (claim / "daemon").write_text(daemon_name + "\n", encoding="utf-8")
+
+
+def _clear_persisted_browser_exec_daemon(daemon_name: str) -> None:
+    from hermes_constants import get_hermes_home
+
+    root = get_hermes_home() / "browser-profile" / "browser-use-bindings"
+    if not root.is_dir():
+        return
+    for claim in root.iterdir():
+        daemon = claim / "daemon"
+        try:
+            if daemon.read_text(encoding="utf-8").strip() == daemon_name:
+                daemon.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def _browser_exec_binding_key(session: str) -> str:
     from hermes_constants import hermes_home_key
 
@@ -102,6 +122,25 @@ def _identity_daemon_name(identity, session: str) -> str | None:
     binding_key = _browser_exec_binding_key(session)
     session_digest = hashlib.sha256(binding_key.encode("utf-8")).hexdigest()[:12]
     return f"rp_{_browser_exec_runtime_owner(identity)}_{session_digest}"
+
+
+def _recover_browser_exec_daemons(*, home_key: str) -> None:
+    from hermes_constants import get_hermes_home
+
+    root = get_hermes_home() / "browser-profile" / "browser-use-bindings"
+    if not root.is_dir():
+        return
+    for claim in root.iterdir():
+        try:
+            owner = (claim / "owner").read_text(encoding="utf-8").strip()
+            name = (claim / "daemon").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not owner or not _SESSION_RE.fullmatch(name):
+            continue
+        with _browser_exec_identity_lock:
+            _browser_exec_identity_daemons[name] = owner
+            _browser_exec_identity_daemon_homes[name] = home_key
 
 
 def _check_browser_exec_identity_binding(identity, session: str) -> str | None:
@@ -134,6 +173,12 @@ def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str
             "browser session is already bound to another identity; use a new "
             "session name instead of switching cookie jars"
         )
+    daemon_name = _identity_daemon_name(identity, session)
+    if daemon_name:
+        try:
+            _persist_browser_exec_daemon(session, daemon_name)
+        except OSError as exc:
+            return None, f"could not persist browser daemon binding: {exc}"
     with _browser_exec_identity_lock:
         previous = _browser_exec_identity_bindings.get(binding_key)
         if previous is not None and previous != owner:
@@ -142,7 +187,6 @@ def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str
                 "session name instead of switching cookie jars"
             )
         _browser_exec_identity_bindings[binding_key] = owner
-        daemon_name = _identity_daemon_name(identity, session)
         if daemon_name:
             from hermes_constants import hermes_home_key
 
@@ -157,6 +201,11 @@ def _reload_browser_exec_daemons_for_runtime(
     home_key: str | None = None,
 ) -> bool:
     """Stop identity-owned Browser Use daemons so a new CDP is picked up."""
+    from hermes_constants import hermes_home_key
+
+    active_home = hermes_home_key()
+    if home_key is None or home_key == active_home:
+        _recover_browser_exec_daemons(home_key=active_home)
     with _browser_exec_identity_lock:
         targets = {
             name: owner
@@ -199,6 +248,7 @@ def _reload_browser_exec_daemons_for_runtime(
             )
             all_stopped = False
             continue
+        _clear_persisted_browser_exec_daemon(name)
         with _browser_exec_identity_lock:
             if _browser_exec_identity_daemons.get(name) == owner:
                 _browser_exec_identity_daemons.pop(name, None)

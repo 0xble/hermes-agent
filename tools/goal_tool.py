@@ -271,13 +271,12 @@ def _goal_payload_authorized(
     authorization_context: str,
 ) -> bool:
     """Bind every durable textual instruction to the current user turn."""
-    authorized = _normalized_authorized_text(user_task)
     goal_text = _normalized_authorized_text(goal)
     affirmative_context = _normalized_authorized_text(authorization_context)
     if not goal_text or goal_text not in affirmative_context:
         return False
     return all(
-        _normalized_authorized_text(value) in authorized
+        _normalized_authorized_text(value) in affirmative_context
         for value in _iter_contract_text(contract or {})
     )
 
