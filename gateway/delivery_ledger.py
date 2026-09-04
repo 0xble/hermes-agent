@@ -406,13 +406,13 @@ def sweep_recoverable(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile,
-                      obligation_kind, turn_token
+                      obligation_kind, turn_token, last_error, updated_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
-             adapter_profile, obligation_kind, turn_token) in rows:
+             adapter_profile, obligation_kind, turn_token, last_error, updated_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
@@ -433,6 +433,9 @@ def sweep_recoverable(
                 deliverable_targets is not None
                 and (platform, adapter_profile) not in deliverable_targets
             ):
+                continue
+            retry_after = parse_flood_retry_after(last_error)
+            if retry_after is not None and now < updated_at + retry_after:
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations
@@ -500,7 +503,7 @@ def sweep_failed_for_runtime(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile,
-                      obligation_kind, turn_token
+                      obligation_kind, turn_token, updated_at
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""",
             (platform,),
@@ -520,6 +523,7 @@ def sweep_failed_for_runtime(
             adapter_profile,
             obligation_kind,
             turn_token,
+            updated_at,
         ) in rows:
             expected_profile = (
                 "default" if not profile or profile == "default" else str(profile)
@@ -541,6 +545,9 @@ def sweep_failed_for_runtime(
                          AND owner_pid IS ? AND owner_started_at IS ?""",
                     (now, *owner_guard),
                 )
+                continue
+            retry_after = parse_flood_retry_after(last_error)
+            if retry_after is not None and now < updated_at + retry_after:
                 continue
             cursor = conn.execute(
                 """UPDATE delivery_obligations

@@ -91,7 +91,7 @@ class TestFloodRowsAreClaimable:
         _record()
         dl.mark_failed("ob-1", "flood_control:3459")
 
-        claimed = dl.sweep_failed_for_runtime("telegram")
+        claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 3460)
 
         assert [r["obligation_id"] for r in claimed] == ["ob-1"]
         assert _row("ob-1")["state"] == "attempting"
@@ -103,7 +103,7 @@ class TestFloodRowsAreClaimable:
         _record()
         dl.mark_failed("ob-1", "flood_control:3459")
 
-        claimed = dl.sweep_failed_for_runtime("telegram")
+        claimed = dl.sweep_failed_for_runtime("telegram", now=time.time() + 3460)
 
         assert claimed[0]["last_error"] == "flood_control:3459"
 
@@ -112,6 +112,21 @@ class TestFloodRowsAreClaimable:
         dl.mark_failed("ob-1", "Message thread not found")
 
         assert dl.sweep_failed_for_runtime("telegram") == []
+        assert _row("ob-1")["state"] == "failed"
+
+    def test_flood_failed_row_waits_until_the_persisted_deadline(self):
+        _record()
+        dl.mark_failed("ob-1", "flood_control:60")
+
+        assert dl.sweep_failed_for_runtime("telegram", now=time.time() + 59) == []
+        assert _row("ob-1")["state"] == "failed"
+
+    def test_dead_owner_sweep_also_honors_the_flood_deadline(self, monkeypatch):
+        _record()
+        dl.mark_failed("ob-1", "flood_control:60")
+        monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+
+        assert dl.sweep_recoverable(now=time.time() + 59) == []
         assert _row("ob-1")["state"] == "failed"
 
     def test_attempts_cap_still_bounds_flood_rows(self):

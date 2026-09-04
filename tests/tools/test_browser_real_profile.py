@@ -529,6 +529,24 @@ class TestRealProfileCdpLaunch:
         assert "already running headless" in err
         self._reset()
 
+    @pytest.mark.linux_only
+    def test_configured_headed_reuses_headless_runtime_without_a_display(self, monkeypatch):
+        import tools.browser_tool as bt
+
+        self._reset()
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        _, _, cache_key = bt._real_profile_runtime_resources(None)
+        bt._real_profile_cdp_cache[cache_key] = "http://127.0.0.1:41000"
+        bt._real_profile_headed_modes[cache_key] = False
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch.object(bt, "_cdp_http_ready", return_value=True), \
+             patch.object(bt, "_is_headed_mode", return_value=True):
+            cdp, err = bt._real_profile_cdp()
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        self._reset()
+
     def test_omitted_reuses_unknown_mode_without_claiming_config(self, tmp_path):
         import tools.browser_tool as bt
 

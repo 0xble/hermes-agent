@@ -81,6 +81,20 @@ def test_activation_requires_explicit_authorization(isolated_goal_db, user_task)
     assert result["error_code"] == "explicit_goal_authorization_required"
 
 
+def test_activation_rejects_ordinary_goal_config_edit(isolated_goal_db):
+    from hermes_cli.goals import GoalManager
+
+    result = call_goal(
+        goal="goal timeout",
+        session_id="goal-config-edit",
+        user_task="Change the goal timeout config field.",
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_goal_authorization_required"
+    assert GoalManager("goal-config-edit").state is None
+
+
 @pytest.mark.parametrize(
     ("user_task", "authorization_text", "error_code"),
     [

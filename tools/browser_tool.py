@@ -1863,6 +1863,10 @@ def _real_profile_cdp(
         )
 
     effective_headed = _is_headed_mode() if headed is None else headed
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    wants_headed = effective_headed and (
+        has_display or not sys.platform.startswith("linux")
+    )
 
     from hermes_cli.browser_connect import (
         UNSUPPORTED_CHANNEL,
@@ -1897,10 +1901,10 @@ def _real_profile_cdp(
                 "headed mode cannot be verified. Close it and retry to apply an "
                 "explicit headed value safely."
             )
-        if running_headed == effective_headed:
+        if running_headed == wants_headed:
             return None
         running = "headed" if running_headed else "headless"
-        requested = "headed" if effective_headed else "headless"
+        requested = "headed" if wants_headed else "headless"
         return (
             f"The Hermes real-profile browser is already running {running}; "
             f"it cannot be reused as {requested}. Close the existing browser "
@@ -2111,12 +2115,6 @@ def _real_profile_cdp(
         # mode reads the browser's normal cookie store, while the auth loss this
         # path avoids comes from mock-keychain/basic-password-store switches.
         # Users can opt into a visible window on hosts that have a display.
-        has_display = bool(
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        )
-        wants_headed = effective_headed and (
-            has_display or not sys.platform.startswith("linux")
-        )
         if headed is True and not wants_headed:
             return None, (
                 "headed=true requires a graphical display, but no DISPLAY or "

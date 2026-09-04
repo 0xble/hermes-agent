@@ -3717,42 +3717,11 @@ class SessionStore:
 
         cutoff = _now() - timedelta(seconds=max_age_seconds)
 
-        def _completed_model_turn(entry: SessionEntry) -> bool:
-            try:
-                db = self._db_for_session_id(entry.session_id)
-                if db is None:
-                    return False
-                loader = getattr(db, "get_messages_as_conversation", None)
-                if not callable(loader):
-                    return False
-                tip_loader = getattr(db, "get_compression_tip", None)
-                tip_id = tip_loader(entry.session_id) if callable(tip_loader) else None
-                messages = loader(tip_id or entry.session_id)
-            except Exception:
-                logger.debug(
-                    "Could not inspect durable tail for %s during crash recovery",
-                    entry.session_id,
-                    exc_info=True,
-                )
-                return False
-            if not isinstance(messages, list) or not messages:
-                return False
-            tail = messages[-1]
-            if not isinstance(tail, dict):
-                return False
-            return bool(
-                tail.get("role") == "assistant"
-                and tail.get("finish_reason") == "stop"
-                and not tail.get("tool_calls")
-            )
-
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if entry.resume_pending:
-                    continue
-                if _completed_model_turn(entry):
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.resume_pending = True

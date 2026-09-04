@@ -816,7 +816,12 @@ def _attachment_metadata_context(title_context: Any) -> str:
 
 
 def _title_request_text(user_message: str, title_context: Any) -> str:
-    """Combine visible text with privacy-safe attachment metadata."""
+    """Combine visible text with privacy-safe attachment metadata.
+
+    Native attachment payloads deliberately stay on the primary model route.
+    Auxiliary title/icon routes can use a different provider and credential,
+    so forwarding attachment URLs or bytes here would cross a privacy boundary.
+    """
     text = str(user_message or "").strip()
     metadata = _attachment_metadata_context(title_context)
     return "\n\n".join(part for part in (text, metadata) if part)

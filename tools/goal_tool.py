@@ -29,8 +29,9 @@ MUTATION_ACTIONS = frozenset({
 GOAL_ACTIONS = tuple(sorted(READ_ACTIONS | MUTATION_ACTIONS))
 
 _ACTIVATION_RE = re.compile(
-    r"(?:\b(?:set|create|start|activate|establish|make|replace|overwrite|supersede|switch|change)\b.{0,80}\b(?:standing\s+|active\s+|current\s+)?goal\b"
-    r"|\b(?:standing\s+|active\s+|current\s+)?goal\b.{0,80}\b(?:set|create|start|activate|establish|make|replace|overwrite|supersede|switch|change)\b)",
+    r"(?:\bset\s+a\s+goal\b"
+    r"|\b(?:set|create|start|activate|establish|make|replace|overwrite|supersede|switch|change)\b.{0,80}\b(?:standing|active)\s+goal\b"
+    r"|\b(?:standing|active)\s+goal\b.{0,80}\b(?:set|create|start|activate|establish|make|replace|overwrite|supersede|switch|change)\b)",
     re.IGNORECASE | re.DOTALL,
 )
 _NEGATED_ACTIVATION_RE = re.compile(
