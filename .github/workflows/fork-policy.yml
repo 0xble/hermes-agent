@@ -53,8 +53,8 @@ jobs:
           python3 trusted-policy/scripts/validate_maintenance_manifest.py
           candidate/MAINTENANCE.md
           --upstream-ref canonical-upstream/main
-          --history-baseline
-          5657e7cf1a9c9f418c979648ee2d741bcfa1be7e
+          --history-baseline-subject
+          'fix(maintenance): reconcile concurrent origin baseline'
       - name: Install pinned uv for trusted workflow policy
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:

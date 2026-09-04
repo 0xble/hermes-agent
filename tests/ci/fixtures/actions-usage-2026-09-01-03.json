@@ -1,0 +1,48 @@
+{
+  "period": "2026-09-01 through 2026-09-03",
+  "rounded_minutes": {
+    "linux": 7976,
+    "windows": 433,
+    "macos": 102
+  },
+  "fork_ci_pull_request_runs": 76,
+  "fork_ci_push_runs": 43,
+  "trusted_policy_runs": 86,
+  "trusted_policy_linux_minutes": 216,
+  "other_linux_minutes": 8,
+  "ordinary_pr_rounded_minutes": {
+    "smoke": 1,
+    "history": 1
+  },
+  "fork_ci_pull_request_minutes": {
+    "linux": 5378,
+    "windows": 298,
+    "macos": 75
+  },
+  "risk_replay": {
+    "query_window_utc": "2026-09-01T04:00:00Z through 2026-09-03T16:47:00Z",
+    "analyzed_pull_request_runs": 74,
+    "risk_full_revision_count": 27,
+    "risk_pull_request_count": 15,
+    "unmatched_summary_runs": 2,
+    "conservative_full_confirmations": 17,
+    "risk_pull_request_branches": [
+      "dependabot/github_actions/actions-minor-patch-f5d4e90336",
+      "dependabot/github_actions/actions/checkout-7.0.1",
+      "dependabot/github_actions/astral-sh/setup-uv-9.0.0",
+      "feat/fable-5-1",
+      "feat/goal-tool-parity",
+      "feat/merge-side-session",
+      "fix/browser-headed-linux-ci",
+      "fix/ci-python-suite-timeout",
+      "fix/duplicate-topic-titles-100002",
+      "fix/persistent-goal-correctness",
+      "fix/progress-cleanup-recurrence-21",
+      "fix/telegram-rich-paragraph-squash-baseline",
+      "fix/telegram-rich-paragraph-squash-history",
+      "fix/telegram-rich-paragraph-structural-protection",
+      "fix/worktree-path-warning"
+    ]
+  },
+  "source": "GitHub Actions runs, pull requests, compare, and jobs APIs; captured 2026-09-03"
+}

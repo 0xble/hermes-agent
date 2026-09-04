@@ -48,7 +48,7 @@ TRANSITION_ACTION_FAMILIES = (
 
 WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
     "case-collision-check.yml": frozenset({"workflow_call"}),
-    "ci.yaml": frozenset({"pull_request", "push"}),
+    "ci.yaml": frozenset({"pull_request", "schedule", "workflow_dispatch"}),
     "docs-site-checks.yml": frozenset({"workflow_call"}),
     "docker-lint.yml": frozenset({"workflow_call"}),
     "e2e-desktop.yml": frozenset({"workflow_call", "workflow_dispatch"}),
@@ -74,8 +74,11 @@ WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
 # can silently broaden or narrow when a workflow runs.
 WORKFLOW_TRIGGER_CONFIGS: dict[str, dict[str, Any]] = {
     "ci.yaml": {
-        "pull_request": "",
-        "push": {"branches": ["main"]},
+        "pull_request": {
+            "types": ["opened", "synchronize", "reopened", "ready_for_review", "labeled"]
+        },
+        "workflow_dispatch": "",
+        "schedule": [{"cron": "0 8 * * 1"}],
     },
     "fork-policy.yml": {
         "pull_request_target": {"branches": ["main"]},
@@ -146,10 +149,8 @@ STEP_ACTION_ALLOWLIST = frozenset(
 )
 JOB_REUSABLE_WORKFLOW_ALLOWLIST = frozenset(
     {
-        "./.github/workflows/case-collision-check.yml",
         "./.github/workflows/docker-lint.yml",
         "./.github/workflows/docs-site-checks.yml",
-        "./.github/workflows/e2e-desktop.yml",
         "./.github/workflows/history-check.yml",
         "./.github/workflows/install-e2e-run.yml",
         "./.github/workflows/installer-tests.yml",
@@ -157,7 +158,7 @@ JOB_REUSABLE_WORKFLOW_ALLOWLIST = frozenset(
         "./.github/workflows/lint.yml",
         "./.github/workflows/lockfile-diff.yml",
         "./.github/workflows/osv-scanner.yml",
-        "./.github/workflows/profile-artifact-check.yml",
+
         "./.github/workflows/rust-tests.yml",
         "./.github/workflows/supply-chain-audit.yml",
         "./.github/workflows/tests-os.yml",
@@ -226,8 +227,8 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                     "run": (
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
-                        "--history-baseline "
-                        "5657e7cf1a9c9f418c979648ee2d741bcfa1be7e"
+                        "--history-baseline-subject "
+                        "'fix(maintenance): reconcile concurrent origin baseline'"
                     ),
                 },
                 {
@@ -438,6 +439,58 @@ def _validate_runners(data: dict[str, Any], name: str, errors: list[str]) -> Non
         errors.append(f"{location}: nonstandard runner {runner!r} is forbidden")
 
 
+def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
+    """Keep automatic fork CI bounded while preserving explicit full lanes."""
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict):
+        return
+    smoke = jobs.get("smoke")
+    if not isinstance(smoke, dict):
+        errors.append("ci.yaml: required local-first smoke job is missing")
+        return
+    if smoke.get("runs-on") != "ubuntu-latest" or smoke.get("timeout-minutes") != "3":
+        errors.append("ci.yaml.jobs.smoke: must be a three-minute standard Linux job")
+    smoke_text = str(smoke)
+    if "scripts/ci/local_check.py --profile smoke" not in smoke_text:
+        errors.append("ci.yaml.jobs.smoke: must run the repository-owned smoke profile")
+    risk_gate_fragments = (
+        "steps.classify.outputs.risk_full",
+        "github.event.action != 'labeled'",
+        "github.event.label.name != 'ci:full'",
+        "exit 1",
+    )
+    if not all(fragment in smoke_text for fragment in risk_gate_fragments):
+        errors.append(
+            "ci.yaml.jobs.smoke: risk-sensitive changes must require a fresh "
+            "ci:full label on the final commit"
+        )
+
+    full_jobs = set(jobs) - {"smoke", "history-check"}
+    for job_name in sorted(full_jobs):
+        job = jobs[job_name]
+        condition = str(job.get("if", "")) if isinstance(job, dict) else ""
+        if (
+            "github.event.action == 'labeled'" not in condition
+            or "github.event.label.name == 'ci:full'" not in condition
+        ):
+            errors.append(
+                f"ci.yaml.jobs.{job_name}: expensive lane must require ci:full on pull requests"
+            )
+
+    osv = jobs.get("osv-scanner")
+    if isinstance(osv, dict):
+        condition = str(osv.get("if", ""))
+        if "github.event_name == 'workflow_dispatch'" not in condition:
+            errors.append(
+                "ci.yaml: orchestrated OSV scan must be manual/PR-only; "
+                "osv-scanner.yml already owns the weekly schedule"
+            )
+        if "needs.smoke.outputs.lock_scan" not in condition:
+            errors.append(
+                "ci.yaml: orchestrated OSV scan must use exact lockfile changes"
+            )
+
+
 def validate(root: Path) -> list[str]:
     workflows = root / ".github" / "workflows"
     errors: list[str] = []
@@ -526,6 +579,8 @@ def validate(root: Path) -> list[str]:
         _validate_security(data, name, errors, expected_permissions)
         _validate_steps(data, name, errors)
         _validate_runners(data, name, errors)
+        if name == "ci.yaml":
+            _validate_ci_budget(data, errors)
         step_actions, reusable_workflows = _references(data)
         seen_step_actions.update(step_actions)
         seen_reusable_workflows.update(reusable_workflows)

@@ -26,6 +26,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.turn_retry_state import TurnRetryState
 from run_agent import AIAgent
 
@@ -81,6 +83,24 @@ class RateLimitError(Exception):
         super().__init__("Error code: 429 - rate limit exceeded")
         self.response = SimpleNamespace(headers={})
         self.body = {"error": {"message": "rate limit exceeded"}}
+
+
+class OverloadedError(Exception):
+    status_code = 503
+
+    def __init__(self):
+        super().__init__("Our servers are currently overloaded. Please try again later.")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"message": str(self)}}
+
+
+class ZaiCodingOverloadedError(Exception):
+    status_code = 429
+
+    def __init__(self):
+        super().__init__("1305: The service may be temporarily overloaded")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"code": 1305, "message": str(self)}}
 
 
 # Regression: post-recovery reset of fallback-chain state
@@ -322,3 +342,97 @@ class TestPostRecoveryResetDoesNotBreakHappyPath:
         assert agent._fallback_activated is False
         # Gate still open for a future 429.
         assert agent._fallback_index < len(agent._fallback_chain)
+
+
+class TestTransientCredentialRetries:
+    @pytest.mark.parametrize(
+        ("entry_count", "max_retries", "expected_primary_keys", "error_kind"),
+        [
+            (4, 3, ["key-0", "key-1", "key-2", "key-3"], "adaptive-zai"),
+            (1, 3, ["key-0", "key-0"], "overloaded"),
+            (3, 1, ["key-0", "key-1"], "timeout"),
+        ],
+        ids=["distinct-per-retry", "no-alternate", "retry-budget-one"],
+    )
+    def test_overload_rotates_one_distinct_account_per_retry_then_falls_back(
+        self, entry_count, max_retries, expected_primary_keys, error_kind
+    ):
+        """Full loop keeps the request budget while advancing pool accounts."""
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        agent = _make_agent_with_fallback([
+            {
+                "provider": "xai",
+                "model": "grok-4.6",
+                "base_url": "https://api.x.ai/v1",
+            }
+        ])
+        agent._api_max_retries = max_retries
+        if error_kind == "adaptive-zai":
+            agent.model = "glm-5.2"
+        entries = [
+            PooledCredential(
+                provider="zai",
+                id=f"cred-{index}",
+                label=f"account-{index}",
+                auth_type="api_key",
+                priority=index,
+                source="manual",
+                access_token=f"key-{index}",
+                base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+            )
+            for index in range(entry_count)
+        ]
+        agent._credential_pool = CredentialPool("zai", entries)
+        agent.api_key = "key-0"
+        agent._credential_pool_entry_id = "cred-0"
+
+        def swap_credential(entry):
+            agent.api_key = entry.runtime_api_key
+            agent._credential_pool_entry_id = entry.id
+
+        agent._swap_credential = MagicMock(side_effect=swap_credential)
+        calls = []
+
+        def fake_api_call(_api_kwargs):
+            calls.append((agent.provider, agent.api_key))
+            if agent.provider == "zai":
+                if error_kind == "adaptive-zai":
+                    raise ZaiCodingOverloadedError()
+                if error_kind == "timeout":
+                    raise ReadTimeout("read timed out")
+                raise OverloadedError()
+            return _mock_response("Recovered via fallback")
+
+        fallback_client = MagicMock()
+        fallback_client.api_key = "xai-fallback-key"
+        fallback_client.base_url = "https://api.x.ai/v1"
+        fallback_client._custom_headers = None
+        fallback_client.default_headers = None
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.conversation_loop.time.sleep"),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "grok-4.6"),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, _provider: model,
+            ),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via fallback"
+        assert calls == [
+            *(("zai", key) for key in expected_primary_keys),
+            ("xai", "xai-fallback-key"),
+        ]
+        assert agent._swap_credential.call_count == len(set(expected_primary_keys)) - 1
