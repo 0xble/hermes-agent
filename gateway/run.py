@@ -19563,6 +19563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_metadata = getattr(event, "metadata", None)
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         event.metadata = metadata
+        metadata.setdefault("gateway_original_text", str(event.text or ""))
         if metadata.get("gateway_explicit_session_route") is True:
             return
         reply_id = str(getattr(event, "reply_to_message_id", None) or "").strip()
@@ -20064,11 +20065,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "This side is closed or no longer available. "
                 "Use /side <prompt> to start a new one."
             )
+        _explicit_side_close = bool(
+            re.fullmatch(
+                r"/side(?:@[A-Za-z0-9_]+)?\s+close\s*",
+                str(_event_metadata.get("gateway_original_text") or event.text or ""),
+                flags=re.IGNORECASE,
+            )
+        )
         if (
             _event_metadata.get("gateway_explicit_session_route")
             and bool(getattr(event, "allow_gateway_control", True))
-            and event.get_command() == "side"
-            and event.get_command_args().strip().lower() == "close"
+            and _explicit_side_close
         ):
             _side_denied = self._check_slash_access(source, "side")
             if _side_denied is not None:

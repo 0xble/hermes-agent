@@ -4829,6 +4829,7 @@ def browser_navigate(
         return json.dumps({"success": False, "error": str(exc)})
     if resolved_identity is not None:
         if not _use_real_profile():
+            _close_all_real_profile_runtimes()
             return json.dumps({
                 "success": False,
                 "error": (

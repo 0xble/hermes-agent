@@ -498,7 +498,7 @@ def test_fork_policy_run_commands_resolve_only_trusted_scripts(
     policy_script.write_text(
         "from pathlib import Path\n"
         "import os, sys\n"
-        "assert sys.argv[1:] == ['--root', 'candidate']\n"
+        "assert sys.argv[1:] == ['--root', 'candidate', '--trusted-root', 'trusted-policy']\n"
         "with Path(os.environ['TRUSTED_MARKER']).open('a') as handle:\n"
         "    handle.write('policy\\n')\n",
         encoding="utf-8",

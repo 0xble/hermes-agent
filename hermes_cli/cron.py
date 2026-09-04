@@ -88,6 +88,31 @@ def _set_completion_script(job_id: str, script: Optional[str]) -> Dict[str, Any]
     return updated
 
 
+def _rollback_created_job(job_id: str) -> None:
+    from cron.jobs import get_job, remove_job, update_job
+
+    removed = remove_job(job_id)
+    remaining = get_job(job_id)
+    if not removed and remaining is not None:
+        update_job(job_id, {"enabled": False})
+        remaining = get_job(job_id)
+    if remaining is not None and remaining.get("enabled", True):
+        raise RuntimeError(f"could not remove or disable partially configured job: {job_id}")
+
+
+def _restore_job_snapshot(job_id: str, snapshot: Dict[str, Any]) -> None:
+    from cron.jobs import get_job, update_job
+
+    expected = {key: value for key, value in snapshot.items() if key not in {"id", "latest_execution"}}
+    restored = update_job(job_id, expected, trusted_completion_config=True)
+    current = get_job(job_id)
+    if restored is None or current is None:
+        raise RuntimeError(f"could not restore job after failed verifier update: {job_id}")
+    for key, value in expected.items():
+        if current.get(key) != value:
+            raise RuntimeError(f"job rollback verification failed for {job_id}: {key}")
+
+
 def _active_cron_provider_name() -> str:
     """Name of the resolved cron scheduler provider ('builtin', 'chronos', …).
 
@@ -879,7 +904,7 @@ def cron_create(args):
         try:
             _set_completion_script(result["job_id"], completion_script)
         except Exception as exc:
-            _cron_api(action="remove", job_id=result["job_id"])
+            _rollback_created_job(result["job_id"])
             print(color(f"Failed to create job: {exc}", Colors.RED))
             return 1
         result.setdefault("job", {})["completion_script"] = completion_script
@@ -1007,6 +1032,8 @@ def cron_edit(args):
         try:
             updated_job = _set_completion_script(job["id"], completion_script)
         except Exception as exc:
+            if any(value is not None for value in update_kwargs.values()):
+                _restore_job_snapshot(job["id"], job)
             print(color(f"Failed to update completion verifier: {exc}", Colors.RED))
             return 1
         from tools.cronjob_tools import _format_job

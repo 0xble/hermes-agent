@@ -144,7 +144,7 @@ jobs:
     uses: ./.github/workflows/docs-site-checks.yml
 
   history-check:
-    name: Deny unrelated histories
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational history check for unrelated label' || 'Deny unrelated histories' }}
     needs: smoke
     if: >-
       github.event_name == 'pull_request' &&
@@ -201,7 +201,7 @@ jobs:
     uses: ./.github/workflows/osv-scanner.yml
 
   all-checks-pass:
-    name: All requested full checks pass
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational aggregate for unrelated label' || 'All requested full checks pass' }}
     needs:
       - smoke
       - tests

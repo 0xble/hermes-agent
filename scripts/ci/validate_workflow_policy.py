@@ -241,7 +241,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                     "run": (
                         "uv run --script "
                         "trusted-policy/scripts/ci/validate_workflow_policy.py "
-                        "--root candidate"
+                        "--root candidate --trusted-root trusted-policy"
                     ),
                 },
             ],
@@ -582,9 +582,26 @@ python3 scripts/ci/local_check.py --profile smoke --base "$base"
             )
 
 
-def validate(root: Path) -> list[str]:
+def _trusted_surface_files(root: Path) -> dict[str, bytes]:
+    files = {}
+    for subdir in (".github/workflows", ".github/actions"):
+        base = root / subdir
+        if base.is_dir():
+            for path in base.rglob("*"):
+                if path.is_file():
+                    files[path.relative_to(root).as_posix()] = path.read_bytes()
+    return files
+
+
+def _validate_trusted_surface(root: Path, trusted_root: Path) -> list[str]:
+    if _trusted_surface_files(root) == _trusted_surface_files(trusted_root):
+        return []
+    return ["candidate workflows and local actions differ from trusted default branch"]
+
+
+def validate(root: Path, trusted_root: Path | None = None) -> list[str]:
     workflows = root / ".github" / "workflows"
-    errors: list[str] = []
+    errors = _validate_trusted_surface(root, trusted_root) if trusted_root else []
 
     for directory in (root / ".github", workflows):
         if directory.is_symlink():
@@ -711,8 +728,9 @@ def validate(root: Path) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--trusted-root", type=Path)
     args = parser.parse_args()
-    errors = validate(args.root)
+    errors = validate(args.root, args.trusted_root)
     if errors:
         for error in errors:
             print(f"ERROR: {error}")
