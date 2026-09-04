@@ -14,6 +14,7 @@ its ``_session_db.db_path`` and passes it explicitly.
 
 import re
 import threading
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -87,6 +88,17 @@ def test_agent_home_none_without_session_db():
 
     class _Agent:
         _session_db = None
+
+    assert system_prompt._agent_home(_Agent()) is None
+    assert system_prompt._agent_skills_dir(_Agent()) is None
+
+
+def test_agent_home_ignores_non_path_session_db_fixture():
+    """A generic mock must not turn its synthetic db_path into a real path."""
+    from agent import system_prompt
+
+    class _Agent:
+        _session_db = MagicMock()
 
     assert system_prompt._agent_home(_Agent()) is None
     assert system_prompt._agent_skills_dir(_Agent()) is None

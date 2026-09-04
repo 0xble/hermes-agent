@@ -400,7 +400,7 @@ def _agent_home(agent: Any) -> Optional[Path]:
     try:
         db = getattr(agent, "_session_db", None)
         db_path = getattr(db, "db_path", None)
-        if db_path:
+        if isinstance(db_path, (str, Path)):
             return Path(db_path).parent
     except Exception:
         pass

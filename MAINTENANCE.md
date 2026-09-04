@@ -211,6 +211,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(maintenance): reconcile concurrent auth baseline` | Fork-administrative reconciliation preserving the concurrent Codex account-isolation publication through HERMES-104 while retaining the candidate's stricter immutable history baseline; no additional shipped behavior. |
 | `fix(ci): pin reconciled maintenance baseline` | Exact history-baseline advancement after the concurrent origin reconciliation; no shipped Hermes runtime behavior. |
 | `test: stabilize loaded full-suite verification` | Test-only isolation of unrelated lifespan startup threads plus additional per-file headroom for the large doctor suite under a 56-worker local-CI load; no shipped Hermes behavior. |
+| `fix(prompt): reject synthetic session database paths` | Defensive type guard that prevents test doubles or malformed session stores from materializing synthetic `MagicMock/...` paths; valid runtime session paths are unchanged. |
 
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
