@@ -216,7 +216,9 @@ async def _self_post_chat_completion(
         "X-Hermes-Session-Id": session_id,
         # Preserve synthetic-turn authority across the non-push HTTP bridge.
         # The API adapter otherwise sees an ordinary authenticated user turn.
-        "X-Hermes-Internal-Notification": "1",
+        "X-Hermes-Internal-Notification": str(
+            getattr(adapter, "_internal_notification_token", "")
+        ),
     }
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),

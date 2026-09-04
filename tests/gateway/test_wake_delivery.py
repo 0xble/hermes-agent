@@ -34,6 +34,7 @@ class ApiServerLikeAdapter:
         self._host = host
         self._port = port
         self._api_key = key
+        self._internal_notification_token = "private-wake-token"
         self._model_name = model
 
     async def handle_message(self, event):  # pragma: no cover — must NOT be hit
@@ -92,7 +93,7 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
 
     asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
-    assert seen["internal"] == "1"
+    assert seen["internal"] == "private-wake-token"
     assert seen["auth"] == "Bearer sekrit"
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [

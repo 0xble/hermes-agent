@@ -1019,7 +1019,7 @@ class TestChatCompletionsEndpoint:
                     headers={
                         "Authorization": "Bearer test-key",
                         "X-Hermes-Session-Id": "wake-session",
-                        "X-Hermes-Internal-Notification": "1",
+                        "X-Hermes-Internal-Notification": adapter._internal_notification_token,
                     },
                     json={
                         "model": "test",

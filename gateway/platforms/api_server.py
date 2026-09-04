@@ -1541,6 +1541,7 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._internal_notification_token = os.urandom(32).hex()
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -5268,8 +5269,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        internal_notification = (
-            request.headers.get("X-Hermes-Internal-Notification", "").strip() == "1"
+        _internal_token = getattr(self, "_internal_notification_token", None)
+        internal_notification = bool(_internal_token) and hmac.compare_digest(
+            request.headers.get("X-Hermes-Internal-Notification", "").strip(),
+            _internal_token,
         )
         if provided_session_id:
             if not self._api_key:
