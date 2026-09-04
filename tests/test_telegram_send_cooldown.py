@@ -309,6 +309,31 @@ async def test_each_message_chunk_reserves_its_own_slot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_partial_chunk_cooldown_is_not_retryable(monkeypatch):
+    adapter = _make_adapter()
+    calls = 0
+
+    async def run_send(cooldown_chat_id, send_fn, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise _TelegramSendCooldownExceeded(30.0)
+        return SimpleNamespace(message_id=100 + calls)
+
+    monkeypatch.setattr(adapter, "_run_send_call", run_send)
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 200)
+
+    result = await adapter.send("chunk-chat", content)
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.message_id == "101"
+    assert result.raw_response["telegram_partial_text_delivery"] is True
+    assert result.raw_response["delivered_chunks"] == 1
+    assert result.raw_response["total_chunks"] == 2
+
+
+@pytest.mark.asyncio
 async def test_retry_after_is_shared_with_already_waiting_sender():
     adapter = TelegramAdapter(
         PlatformConfig(enabled=True, token="***", extra={"rich_messages": True})

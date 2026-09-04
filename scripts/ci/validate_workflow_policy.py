@@ -450,6 +450,16 @@ def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
         return
     if smoke.get("runs-on") != "ubuntu-latest" or smoke.get("timeout-minutes") != "3":
         errors.append("ci.yaml.jobs.smoke: must be a three-minute standard Linux job")
+    expected_smoke_name = (
+        "${{ github.event.action == 'labeled' && "
+        "github.event.label.name != 'ci:full' && "
+        "'Informational smoke for unrelated label' || "
+        "'Hosted smoke and affected areas' }}"
+    )
+    if smoke.get("name") != expected_smoke_name:
+        errors.append(
+            "ci.yaml.jobs.smoke: unrelated labels must use a distinct informational check context"
+        )
     smoke_steps = smoke.get("steps", [])
     smoke_steps = smoke_steps if isinstance(smoke_steps, list) else []
     smoke_step = next(
@@ -484,7 +494,7 @@ python3 scripts/ci/local_check.py --profile smoke --base "$base"
     expected_risk_if = (
         "github.event_name == 'pull_request' && "
         "steps.classify.outputs.risk_full == 'true' && "
-        "github.event.action != 'labeled'"
+        "(github.event.action != 'labeled' || github.event.label.name != 'ci:full')"
     )
     expected_risk_run = (
         'echo "::error::Risk-sensitive changes require a fresh ci:full label '

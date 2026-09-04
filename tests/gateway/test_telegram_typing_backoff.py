@@ -20,6 +20,24 @@ def _make_adapter():
 
 
 @pytest.mark.asyncio
+async def test_typing_uses_shared_per_chat_send_gate():
+    adapter = _make_adapter()
+    original = adapter._run_send_call
+    adapter._run_send_call = AsyncMock(side_effect=original)
+    bot = AsyncMock()
+    bot.send_chat_action = AsyncMock(return_value=None)
+    adapter._bot = bot
+
+    await adapter.send_typing("123")
+
+    adapter._run_send_call.assert_awaited_once()
+    gate_call = adapter._run_send_call.await_args
+    assert gate_call is not None
+    assert gate_call.args[0] == "123"
+    bot.send_chat_action.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_typing_transient_failure_enters_cooldown(monkeypatch):
     adapter = _make_adapter()
     now = {"value": 1000.0}

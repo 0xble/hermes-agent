@@ -24,7 +24,10 @@ concurrency:
 
 jobs:
   smoke:
-    name: Hosted smoke and affected areas
+    # Keep unrelated-label checks informational under a distinct context. This
+    # avoids failing routine label maintenance without allowing that later run
+    # to supersede the required final-commit smoke check.
+    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational smoke for unrelated label' || 'Hosted smoke and affected areas' }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
@@ -56,7 +59,7 @@ jobs:
         if: >-
           github.event_name == 'pull_request' &&
           steps.classify.outputs.risk_full == 'true' &&
-          github.event.action != 'labeled'
+          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')
         run: |
           echo "::error::Risk-sensitive changes require a fresh ci:full label on the final commit. Remove and re-add ci:full after the last push."
           exit 1

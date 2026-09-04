@@ -6039,6 +6039,7 @@ class TelegramAdapter(BasePlatformAdapter):
         cooldown_chat_id: Any,
         send_fn: Any,
         *args: Any,
+        _reserve_gap: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Run one outbound Bot API send under the chat's atomic gate.
@@ -6091,7 +6092,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 await asyncio.sleep(wait)
 
             started_at = time.monotonic()
-            stamp_gap = True
+            stamp_gap = _reserve_gap
             try:
                 return await send_fn(*args, **kwargs)
             except Exception as error:
@@ -6381,7 +6382,22 @@ class TelegramAdapter(BasePlatformAdapter):
                                 raise
                         break  # success
                     except _TelegramSendCooldownExceeded as cooldown_error:
-                        return self._send_cooldown_failure(cooldown_error)
+                        failure = self._send_cooldown_failure(cooldown_error)
+                        if message_ids:
+                            return SendResult(
+                                success=False,
+                                error=failure.error,
+                                message_id=message_ids[0],
+                                raw_response={
+                                    "telegram_partial_text_delivery": True,
+                                    "message_ids": message_ids,
+                                    "delivered_chunks": len(message_ids),
+                                    "total_chunks": len(chunks),
+                                },
+                                retryable=False,
+                                retry_after=failure.retry_after,
+                            )
+                        return failure
                     except _NetErr as send_err:
                         handled, retry_result = self._send_retry_after_outcome(
                             send_err,
@@ -9988,27 +10004,44 @@ class TelegramAdapter(BasePlatformAdapter):
 
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
+        _typing_send_fn: Any = None
         try:
             _typing_thread = self._metadata_thread_id(metadata)
             _is_dm_topic = bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
             message_thread_id = self._message_thread_id_for_typing(_typing_thread)
-            await self._bot.send_chat_action(
-                chat_id=normalize_telegram_chat_id(chat_id),
-                action="typing",
-                message_thread_id=message_thread_id,
-                **self._business_connection_kwargs(metadata),
+            bot = self._bot
+            if bot is None:
+                return
+
+            async def _send_action(*, include_thread: bool) -> Any:
+                kwargs = {
+                    "chat_id": normalize_telegram_chat_id(chat_id),
+                    "action": "typing",
+                    **self._business_connection_kwargs(metadata),
+                }
+                if include_thread:
+                    kwargs["message_thread_id"] = message_thread_id
+                return await bot.send_chat_action(**kwargs)
+
+            _typing_send_fn = _send_action
+            await self._run_send_call(
+                chat_id,
+                _typing_send_fn,
+                include_thread=True,
+                _reserve_gap=False,
             )
             self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         except Exception as e:
             # For DM topic lanes, Telegram may reject message_thread_id.
             # Fall back to sending typing without thread_id so the typing
             # indicator at least appears in the main DM view.
-            if _is_dm_topic and message_thread_id is not None:
+            if _is_dm_topic and message_thread_id is not None and _typing_send_fn is not None:
                 try:
-                    await self._bot.send_chat_action(
-                        chat_id=normalize_telegram_chat_id(chat_id),
-                        action="typing",
-                        **self._business_connection_kwargs(metadata),
+                    await self._run_send_call(
+                        chat_id,
+                        _typing_send_fn,
+                        include_thread=False,
+                        _reserve_gap=False,
                     )
                     self._telegram_typing_cooldown_until.pop(str(chat_id), None)
                     return
