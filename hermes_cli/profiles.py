@@ -1568,7 +1568,11 @@ def _profile_bound_backend_pids(canon: str, profile_dir: Path) -> list[int]:
     for proc in psutil.process_iter(attrs=None):
         try:
             info = getattr(proc, "info", None)
-            if not isinstance(info, dict):
+            if not isinstance(info, dict) or not {
+                "pid",
+                "username",
+                "cmdline",
+            }.issubset(info):
                 info = {
                     "pid": proc.pid,
                     "name": proc.name(),

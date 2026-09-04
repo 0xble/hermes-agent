@@ -13415,7 +13415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _drain_restart_inbox(self) -> int:
         """Replay messages durably accepted by the previous draining process."""
         try:
-            from gateway.restart_inbox import claim_recoverable, release_claim
+            from gateway.restart_inbox import (
+                claim_recoverable,
+                mark_delivered,
+                release_claim,
+            )
 
             targets = {
                 (getattr(platform, "value", str(platform)), "default")
@@ -13466,6 +13470,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["queue_id"],
                     )
                 continue
+            session_tasks = getattr(adapter, "_session_tasks", None)
+            if not isinstance(session_tasks, dict) or not session_tasks.get(
+                row["session_key"]
+            ):
+                # Commands and other control messages can complete entirely
+                # inside handle_message without acquiring an agent turn. They
+                # therefore never reach the adapter's turn finalizer.
+                try:
+                    await asyncio.to_thread(mark_delivered, row["queue_id"])
+                except Exception:
+                    logger.exception(
+                        "Could not finalize handled restart inbox claim %s",
+                        row["queue_id"],
+                    )
             dispatched += 1
         return dispatched
 

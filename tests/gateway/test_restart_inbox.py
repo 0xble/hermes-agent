@@ -1,5 +1,6 @@
 """Crash-durable inbound queue for messages accepted during restart drain."""
 
+import asyncio
 import sqlite3
 from unittest.mock import AsyncMock
 
@@ -153,6 +154,37 @@ async def test_gateway_replays_durable_inbound_through_the_live_adapter():
     replay = adapter.handle_message.await_args_list[0].args[0]
     assert replay.text == "continue the task"
     assert getattr(replay, "_restart_inbox_queue_id") == queue_id
+    with sqlite3.connect(inbox._db_path()) as conn:
+        state = conn.execute(
+            "SELECT state FROM restart_inbox WHERE queue_id=?", (queue_id,)
+        ).fetchone()[0]
+    assert state == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_gateway_keeps_claim_when_replay_hands_off_to_an_agent_task():
+    queue_id = inbox.record_event(
+        "session-key", _event(text="continue the task"), adapter_profile="default"
+    )
+    _orphan(queue_id)
+    runner, adapter = make_restart_runner()
+    adapter._session_tasks = {}
+
+    async def hand_off(event):
+        task = asyncio.current_task()
+        assert task is not None
+        adapter._session_tasks["session-key"] = task
+
+    adapter.handle_message = hand_off
+
+    count = await GatewayRunner._drain_restart_inbox(runner)
+
+    assert count == 1
+    with sqlite3.connect(inbox._db_path()) as conn:
+        state = conn.execute(
+            "SELECT state FROM restart_inbox WHERE queue_id=?", (queue_id,)
+        ).fetchone()[0]
+    assert state == "attempting"
 
 
 @pytest.mark.asyncio

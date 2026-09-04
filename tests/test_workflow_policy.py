@@ -259,6 +259,18 @@ def test_full_pr_lane_without_explicit_label_fails_closed(tmp_path: Path) -> Non
     assert any("expensive lane must require ci:full" in error for error in errors)
 
 
+def test_always_expression_cannot_bypass_a_full_lane_condition(tmp_path: Path) -> None:
+    root = _copy_workflows(tmp_path)
+    ci = root / ".github" / "workflows" / "ci.yaml"
+    _replace(
+        ci,
+        "    if: >-\n      (github.event_name != 'pull_request' ||\n",
+        "    if: >-\n      always() && (github.event_name != 'pull_request' ||\n",
+    )
+    errors = validate(root)
+    assert any("expensive lane must require ci:full" in error for error in errors)
+
+
 def test_risk_change_without_fresh_full_label_gate_fails_closed(tmp_path: Path) -> None:
     root = _copy_workflows(tmp_path)
     ci = root / ".github" / "workflows" / "ci.yaml"

@@ -55,7 +55,8 @@ _REPLACEMENT_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _NON_DIRECT_CONTEXT_RE = re.compile(
-    r"(?:\b(?:recommend|assess|evaluate|consider|decide|explain|discuss|suggest)\b"
+    r"(?:\b(?:review|quote|paste|transcribe)\b.{0,120}$"
+    r"|\b(?:recommend|assess|evaluate|consider|decide|explain|discuss|suggest)\b"
     r".{0,80}\b(?:whether|if)\b.{0,40}$"
     r"|\bshould\s+(?:i|we|you|this|that|it)\b.{0,40}$)",
     re.IGNORECASE | re.DOTALL,

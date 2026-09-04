@@ -1472,35 +1472,28 @@ def skill_view(
             except ValueError:
                 continue
         if _outside_skills_dir:
-            # An explicitly configured external directory may intentionally be
-            # a symlink farm whose entries point at a generated build cache.
-            # Trust the lexical entry in that configured root, while retaining
-            # resolved-path enforcement for profile/project roots so an
-            # unconfigured local symlink escape still warns.
-            try:
-                lexical_skill = Path(os.path.abspath(str(skill_md.expanduser())))
-                for external_dir in external_dirs:
-                    lexical_root = Path(
-                        os.path.abspath(str(external_dir.expanduser()))
-                    )
-                    try:
-                        lexical_skill.relative_to(lexical_root)
-                        _outside_skills_dir = False
-                        break
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
-
+            logging.getLogger(__name__).warning(
+                "Refusing skill '%s' outside configured resolved roots: %s",
+                name,
+                skill_md,
+            )
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Skill '{name}' resolves outside configured skill roots. "
+                        "Allowlist its resolved target root in skills.external_dirs."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         # Security: detect common prompt injection patterns
         # (pattern list at module level as _INJECTION_PATTERNS)
         _content_lower = content.lower()
         _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
 
-        if _outside_skills_dir or _injection_detected:
+        if _injection_detected:
             _warnings = []
-            if _outside_skills_dir:
-                _warnings.append(f"skill file is outside the trusted skills directory (~/.hermes/skills/): {skill_md}")
             if _injection_detected:
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))

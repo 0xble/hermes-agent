@@ -74,7 +74,13 @@ class TestScanSkillCommands:
         except (OSError, NotImplementedError) as exc:
             pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
-        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+        ):
             result = scan_skill_commands()
             message = build_skill_invocation_message("/impeccable")
 

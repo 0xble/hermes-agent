@@ -380,13 +380,23 @@ class TestDeleteProfile:
         class FakeProc:
             def __init__(self, pid, cmdline, username="me"):
                 self.pid = pid
-                self.info = {"pid": pid, "name": "python", "username": username, "cmdline": cmdline}
+                self._cmdline = cmdline
+                self._username = username
+                # psutil.process_iter(attrs=None) exposes an empty info mapping;
+                # the scanner must fall back to guarded per-process methods.
+                self.info = {}
+
+            def name(self):
+                return "python"
+
+            def cmdline(self):
+                return self._cmdline
 
             def parent(self):
                 return None
 
             def username(self):
-                return "me"
+                return self._username
 
             def environ(self):
                 return {}

@@ -450,31 +450,113 @@ def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
         return
     if smoke.get("runs-on") != "ubuntu-latest" or smoke.get("timeout-minutes") != "3":
         errors.append("ci.yaml.jobs.smoke: must be a three-minute standard Linux job")
-    smoke_text = str(smoke)
-    if "scripts/ci/local_check.py --profile smoke" not in smoke_text:
-        errors.append("ci.yaml.jobs.smoke: must run the repository-owned smoke profile")
-    risk_gate_fragments = (
-        "steps.classify.outputs.risk_full",
-        "github.event.action != 'labeled'",
-        "github.event.label.name != 'ci:full'",
-        "exit 1",
+    smoke_steps = smoke.get("steps", [])
+    smoke_steps = smoke_steps if isinstance(smoke_steps, list) else []
+    smoke_step = next(
+        (
+            step
+            for step in smoke_steps
+            if isinstance(step, dict)
+            and step.get("name") == "Run dependency-free smoke gate"
+        ),
+        None,
     )
-    if not all(fragment in smoke_text for fragment in risk_gate_fragments):
+    expected_smoke_run = """base=HEAD
+if [ "${{ github.event_name }}" = pull_request ]; then
+  # actions/checkout provides the synthetic merge and both parents.
+  # Parent one is the immutable base represented by this event.
+  base=HEAD^1
+fi
+python3 scripts/ci/local_check.py --profile smoke --base "$base"
+"""
+    if not isinstance(smoke_step, dict) or smoke_step.get("run") != expected_smoke_run:
+        errors.append("ci.yaml.jobs.smoke: must run the repository-owned smoke profile")
+    risk_step = next(
+        (
+            step
+            for step in smoke_steps
+            if isinstance(step, dict)
+            and step.get("name")
+            == "Require fresh ci:full approval for risk-sensitive changes"
+        ),
+        None,
+    )
+    expected_risk_if = (
+        "github.event_name == 'pull_request' && "
+        "steps.classify.outputs.risk_full == 'true' && "
+        "(github.event.action != 'labeled' || "
+        "github.event.label.name != 'ci:full')"
+    )
+    expected_risk_run = (
+        'echo "::error::Risk-sensitive changes require a fresh ci:full label '
+        'on the final commit. Remove and re-add ci:full after the last push."\n'
+        "exit 1\n"
+    )
+    if (
+        not isinstance(risk_step, dict)
+        or risk_step.get("if") != expected_risk_if
+        or risk_step.get("run") != expected_risk_run
+    ):
         errors.append(
             "ci.yaml.jobs.smoke: risk-sensitive changes must require a fresh "
             "ci:full label on the final commit"
         )
 
-    full_jobs = set(jobs) - {"smoke", "history-check"}
-    for job_name in sorted(full_jobs):
-        job = jobs[job_name]
+    approval = (
+        "(github.event_name != 'pull_request' || "
+        "(github.event.action == 'labeled' && "
+        "github.event.label.name == 'ci:full'))"
+    )
+    output_conditions = {
+        "tests": "python",
+        "tests-os": "python",
+        "lint": "python",
+        "js-tests": "frontend",
+        "installer-tests": "installer",
+        "rust-tests": "rust",
+        "docs-site": "site",
+        "uv-lockfile": "uv_lock",
+        "docker-lint": "docker_meta",
+    }
+    expected_conditions = {
+        name: f"{approval} && needs.smoke.outputs.{output} == 'true'"
+        for name, output in output_conditions.items()
+    }
+    expected_conditions.update(
+        {
+            "lockfile-diff": (
+                "github.event_name == 'pull_request' && "
+                "github.event.action == 'labeled' && "
+                "github.event.label.name == 'ci:full' && "
+                "needs.smoke.outputs.npm_lock == 'true'"
+            ),
+            "supply-chain": (
+                "github.event_name == 'pull_request' && "
+                "github.event.action == 'labeled' && "
+                "github.event.label.name == 'ci:full' && "
+                "(needs.smoke.outputs.scan == 'true' || "
+                "needs.smoke.outputs.deps == 'true')"
+            ),
+            "osv-scanner": (
+                "(github.event_name == 'workflow_dispatch' || "
+                "(github.event_name == 'pull_request' && "
+                "github.event.action == 'labeled' && "
+                "github.event.label.name == 'ci:full')) && "
+                "needs.smoke.outputs.lock_scan == 'true'"
+            ),
+            "all-checks-pass": f"always() && {approval}",
+        }
+    )
+
+    def compact(value: Any) -> str:
+        return " ".join(str(value).split())
+
+    for job_name, expected_condition in sorted(expected_conditions.items()):
+        job = jobs.get(job_name)
         condition = str(job.get("if", "")) if isinstance(job, dict) else ""
-        if (
-            "github.event.action == 'labeled'" not in condition
-            or "github.event.label.name == 'ci:full'" not in condition
-        ):
+        if compact(condition) != compact(expected_condition):
             errors.append(
-                f"ci.yaml.jobs.{job_name}: expensive lane must require ci:full on pull requests"
+                f"ci.yaml.jobs.{job_name}: expensive lane must require ci:full through the exact condition"
             )
 
     osv = jobs.get("osv-scanner")
