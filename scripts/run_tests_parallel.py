@@ -80,17 +80,17 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
-# Set to 600s (10 min): the per-test subprocess
+# Set to 1200s (20 min): the per-test subprocess
 # isolation plugin spawns a fresh Python process per test, so a
 # large-collection file pays N × (interpreter startup + import) of
 # overhead before any test logic runs — and that overhead dilates under
 # load on shared CI runners, producing false "no tests ran" timeouts on
 # files that finish in seconds on a quiet box. Files with >1,000 tests have
-# crossed five minutes under a 56-worker local-CI load, so the old cap itself
+# crossed ten minutes under a 56-worker local-CI load, so the old cap itself
 # created a retry-only flake. The Docker build matrix jobs
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
-_DEFAULT_FILE_TIMEOUT_SECONDS = 600.0
+_DEFAULT_FILE_TIMEOUT_SECONDS = 1200.0
 
 # One-shot retry of failing test FILES. A file that exits non-zero is re-run
 # once in a fresh subprocess; if the re-run passes, the file counts as passed

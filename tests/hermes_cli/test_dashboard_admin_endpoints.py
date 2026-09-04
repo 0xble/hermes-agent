@@ -1039,6 +1039,17 @@ def test_spawn_hermes_action_scrubs_gateway_loop_guard_env(monkeypatch, tmp_path
 # Desktop lifespan reaps orphan gateways at serve startup (#77276)
 # ---------------------------------------------------------------------------
 
+def _stub_lifespan_state_services(monkeypatch, web_server):
+    """Keep unrelated SQLite-owning startup threads out of lifespan tests."""
+    from tui_gateway import methods_groups
+
+    monkeypatch.setattr(web_server, "_eager_reconcile_own_session_db", lambda: None)
+    monkeypatch.setattr(methods_groups, "start_hosted_room_service", lambda: None)
+    monkeypatch.setattr(
+        methods_groups, "stop_hosted_room_service", lambda **_kwargs: True
+    )
+
+
 def test_desktop_lifespan_reaps_orphan_gateways_on_startup(
     monkeypatch, _isolate_hermes_home
 ):
@@ -1059,10 +1070,12 @@ def test_desktop_lifespan_reaps_orphan_gateways_on_startup(
         return True
 
     monkeypatch.setenv("HERMES_DESKTOP", "1")
-    # Keep the lifespan cheap: don't re-import the gateway module or spin up the
-    # real cron scheduler thread.
+    # Keep the lifespan cheap and deterministic: this test owns neither the
+    # state-DB reconciliation nor hosted-room recovery threads. Leaving those
+    # real can race two SQLite schema initializers during TestClient startup.
     monkeypatch.setattr(ws, "_warm_gateway_module", lambda: None)
     monkeypatch.setattr(ws, "_start_desktop_cron_ticker", lambda *_args: None)
+    _stub_lifespan_state_services(monkeypatch, ws)
     # web_server imports the reaper lazily from hermes_cli.gateway, so patch it
     # on that module.
     import hermes_cli.gateway as g
@@ -1076,7 +1089,9 @@ def test_desktop_lifespan_reaps_orphan_gateways_on_startup(
     assert called == [True]
 
 
-def test_desktop_lifespan_terminates_managed_gateway_restart(monkeypatch):
+def test_desktop_lifespan_terminates_managed_gateway_restart(
+    monkeypatch, _isolate_hermes_home
+):
     """A Desktop-owned gateway child must not survive its serve backend."""
     import hermes_cli.web_server as ws
 
@@ -1092,6 +1107,7 @@ def test_desktop_lifespan_terminates_managed_gateway_restart(monkeypatch):
     monkeypatch.setenv("HERMES_DESKTOP", "1")
     monkeypatch.setattr(ws, "_warm_gateway_module", lambda: None)
     monkeypatch.setattr(ws, "_start_desktop_cron_ticker", lambda *_args: None)
+    _stub_lifespan_state_services(monkeypatch, ws)
     monkeypatch.setitem(ws._ACTION_PROCS, "gateway-restart", _FakeRunningProc())
 
     client, _header = _client()
