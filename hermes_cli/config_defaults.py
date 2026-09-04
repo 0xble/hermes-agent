@@ -1286,6 +1286,9 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "provider": "auto",
             "model": "",
+            # Native opening images may be sent to an independently configured
+            # auxiliary provider only after the operator opts into that boundary.
+            "include_attachments": False,
             "prefer_fast_model": False,  # opt in to provider fast tier; auto otherwise uses the main model
             "base_url": "",
             "api_key": "",

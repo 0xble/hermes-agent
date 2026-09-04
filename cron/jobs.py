@@ -2945,8 +2945,13 @@ def update_job(
             if any(k in updates for k in _PAYLOAD_FIELDS):
                 if job_payload_is_empty(updated):
                     raise ValueError(EMPTY_PAYLOAD_ERROR)
-            schedule_changed = "schedule" in updates
-            timezone_changed = "timezone" in updates
+            schedule_changed = (
+                "schedule" in updates and updated.get("schedule") != job.get("schedule")
+            )
+            timezone_changed = (
+                "timezone" in updates
+                and normalize_job_timezone(job.get("timezone")) != updates["timezone"]
+            )
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes

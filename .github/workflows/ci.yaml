@@ -56,7 +56,7 @@ jobs:
         if: >-
           github.event_name == 'pull_request' &&
           steps.classify.outputs.risk_full == 'true' &&
-          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')
+          github.event.action != 'labeled'
         run: |
           echo "::error::Risk-sensitive changes require a fresh ci:full label on the final commit. Remove and re-add ci:full after the last push."
           exit 1

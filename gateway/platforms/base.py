@@ -4883,6 +4883,13 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                results.append(
+                    SendResult(
+                        success=False,
+                        error=f"image_delivery_exception:{type(img_err).__name__}",
+                        retryable=True,
+                    )
+                )
         return results
 
     async def send_image(
@@ -7001,14 +7008,23 @@ class BasePlatformAdapter(ABC):
                     message_ids.extend(
                         str(mid) for mid in (raw.get("message_ids") or ()) if mid
                     )
-                callback = getattr(
-                    getattr(self, "gateway_runner", None),
-                    "_record_side_delivery",
-                    None,
+                callback = (getattr(event, "metadata", None) or {}).get(
+                    "_gateway_side_delivery_callback"
                 )
+                callback_owns_event = callable(callback)
+                if not callback_owns_event:
+                    callback = getattr(
+                        getattr(self, "gateway_runner", None),
+                        "_record_side_delivery",
+                        None,
+                    )
                 if message_ids and callable(callback):
                     try:
-                        recorded = callback(event, message_ids)
+                        recorded = (
+                            callback(message_ids)
+                            if callback_owns_event
+                            else callback(event, message_ids)
+                        )
                         if inspect.isawaitable(recorded):
                             task = asyncio.ensure_future(recorded)
                             delivery_receipt_tasks.add(task)

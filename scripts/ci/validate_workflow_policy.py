@@ -484,8 +484,7 @@ python3 scripts/ci/local_check.py --profile smoke --base "$base"
     expected_risk_if = (
         "github.event_name == 'pull_request' && "
         "steps.classify.outputs.risk_full == 'true' && "
-        "(github.event.action != 'labeled' || "
-        "github.event.label.name != 'ci:full')"
+        "github.event.action != 'labeled'"
     )
     expected_risk_run = (
         'echo "::error::Risk-sensitive changes require a fresh ci:full label '

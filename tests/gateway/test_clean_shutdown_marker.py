@@ -41,6 +41,7 @@ class TestSuspendRecentlyActive:
         store = _make_store(tmp_path)
         source = _make_source()
         entry = store.get_or_create_session(source)
+        entry.active_turn_token = "turn-before-crash"
         assert not entry.suspended
 
         count = store.suspend_recently_active()
@@ -49,9 +50,10 @@ class TestSuspendRecentlyActive:
         # Re-fetch — should be resume_pending (preserved, not wiped)
         refreshed = store.get_or_create_session(source)
         assert refreshed.resume_pending
+        assert refreshed.resume_turn_token == "turn-before-crash"
         assert refreshed.session_id == entry.session_id  # same session preserved
 
-    def test_recovers_recent_session_with_terminal_assistant_transcript(self, tmp_path):
+    def test_skips_recent_session_with_terminal_assistant_transcript(self, tmp_path):
         store = _make_store(tmp_path)
         source = _make_source(chat_id="completed")
         entry = store.get_or_create_session(source)
@@ -63,8 +65,8 @@ class TestSuspendRecentlyActive:
             finish_reason="stop",
         )
 
-        assert store.suspend_recently_active() == 1
-        assert store._entries[entry.session_key].resume_pending
+        assert store.suspend_recently_active() == 0
+        assert not store._entries[entry.session_key].resume_pending
 
     def test_keeps_recent_session_when_latest_transcript_row_is_user(self, tmp_path):
         store = _make_store(tmp_path)

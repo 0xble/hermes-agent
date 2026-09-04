@@ -5061,7 +5061,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # while future message-like payloads become observable instead of
         # disappearing silently.
         app.add_handler(TelegramMessageHandler(
-            filters.ALL,
+            filters.UpdateType.MESSAGES,
             self._handle_unmatched_message,
         ))
         # Handle inline keyboard button callbacks (update prompts)
@@ -6147,11 +6147,19 @@ class TelegramAdapter(BasePlatformAdapter):
         return parsed
 
     def _bounded_send_retry_after(self, retry_after: float) -> float:
-        max_wait = max(
-            0.001,
-            float(getattr(self, "_send_cooldown_max_wait", 5.0)),
-        )
-        return min(max(0.001, float(retry_after)), max_wait)
+        """Return the full finite deadline for upstream retry scheduling.
+
+        ``_send_cooldown_max_wait`` limits only inline sleeping. Truncating
+        this result wakes the delivery ledger while Telegram still has the
+        chat flood-controlled.
+        """
+        parsed = float(retry_after)
+        if not math.isfinite(parsed):
+            return max(
+                0.001,
+                float(getattr(self, "_send_cooldown_max_wait", 5.0)),
+            )
+        return max(0.001, parsed)
 
     def _send_retry_after_outcome(
         self,

@@ -32,6 +32,56 @@ _browser_exec_identity_daemon_homes: dict[str, str] = {}
 _LEGACY_BROWSER_BINDING = "__legacy__"
 
 
+def _browser_exec_durable_binding_dir(session: str) -> Path:
+    """Return the profile-scoped immutable binding claim for ``session``."""
+    from hermes_constants import get_hermes_home
+
+    digest = hashlib.sha256((session or "__default__").encode("utf-8")).hexdigest()
+    return get_hermes_home() / "browser-profile" / "browser-use-bindings" / digest
+
+
+def _read_browser_exec_durable_binding(session: str) -> str | None:
+    claim = _browser_exec_durable_binding_dir(session)
+    if not claim.exists():
+        return None
+    try:
+        owner = (claim / "owner").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not owner or len(owner) > 128 or any(ch.isspace() for ch in owner):
+        return ""
+    return owner
+
+
+def _claim_browser_exec_durable_binding(session: str, owner: str) -> str | None:
+    """Atomically claim one session name across gateway process lifetimes."""
+    claim = _browser_exec_durable_binding_dir(session)
+    root = claim.parent
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(root)
+    except Exception:
+        logger.debug("Could not harden Browser Use binding directory", exc_info=True)
+    temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        temporary.mkdir()
+        (temporary / "owner").write_text(owner + "\n", encoding="utf-8")
+        try:
+            temporary.rename(claim)
+            return owner
+        except FileExistsError:
+            return _read_browser_exec_durable_binding(session)
+        except OSError:
+            if claim.exists():
+                return _read_browser_exec_durable_binding(session)
+            raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
 def _browser_exec_binding_key(session: str) -> str:
     from hermes_constants import hermes_home_key
 
@@ -59,6 +109,10 @@ def _check_browser_exec_identity_binding(identity, session: str) -> str | None:
     owner = _browser_exec_runtime_owner(identity)
     with _browser_exec_identity_lock:
         previous = _browser_exec_identity_bindings.get(binding_key)
+    durable = _read_browser_exec_durable_binding(session)
+    if durable == "":
+        return "browser session identity binding is corrupt; use a new session name"
+    previous = previous if previous is not None else durable
     if previous is not None and previous != owner:
         return (
             "browser session is already bound to another identity; use a new "
@@ -71,6 +125,15 @@ def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str
     """Bind a Browser Use session immutably and return its opaque daemon name."""
     binding_key = _browser_exec_binding_key(session)
     owner = _browser_exec_runtime_owner(identity)
+    try:
+        durable = _claim_browser_exec_durable_binding(session, owner)
+    except OSError as exc:
+        return None, f"could not persist browser session identity binding: {exc}"
+    if durable != owner:
+        return None, (
+            "browser session is already bound to another identity; use a new "
+            "session name instead of switching cookie jars"
+        )
     with _browser_exec_identity_lock:
         previous = _browser_exec_identity_bindings.get(binding_key)
         if previous is not None and previous != owner:

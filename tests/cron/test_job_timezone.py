@@ -59,6 +59,26 @@ def test_update_rejects_invalid_timezone_without_mutating_job(cron_store):
     assert get_job(job["id"])["timezone"] == "America/New_York"
 
 
+def test_unchanged_schedule_and_timezone_do_not_reanchor_next_run(
+    cron_store, fixed_now
+):
+    job = create_job("test", "0 9 * * *", timezone="America/New_York")
+    original_next = job["next_run_at"]
+
+    updated = update_job(
+        job["id"],
+        {
+            "name": "renamed",
+            "schedule": job["schedule"],
+            "timezone": job["timezone"],
+        },
+    )
+
+    assert updated is not None
+    assert updated["name"] == "renamed"
+    assert updated["next_run_at"] == original_next
+
+
 def test_same_wall_clock_in_distinct_zones_is_distinct_absolute_instant(fixed_now):
     schedule = {"kind": "cron", "expr": "0 9 * * *"}
 

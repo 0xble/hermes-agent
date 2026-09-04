@@ -3724,9 +3724,35 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
+                    try:
+                        db = self._db_for_key(entry.session_key)
+                        get_messages = getattr(db, "get_messages", None)
+                        tail_session_id = entry.session_id
+                        find_child = getattr(db, "find_live_compression_child", None)
+                        for _ in range(16):
+                            child = find_child(tail_session_id) if callable(find_child) else None
+                            child_id = child.get("id") if isinstance(child, dict) else None
+                            if not child_id:
+                                break
+                            tail_session_id = str(child_id)
+                        messages: Any = (
+                            get_messages(tail_session_id) if callable(get_messages) else []
+                        )
+                        latest = messages[-1] if messages else None
+                    except Exception:
+                        latest = None
+                    if (
+                        not entry.active_turn_token
+                        and isinstance(latest, dict)
+                        and latest.get("role") == "assistant"
+                        and str(latest.get("finish_reason") or "").casefold() == "stop"
+                        and not latest.get("tool_calls")
+                    ):
+                        continue
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
+                    entry.resume_turn_token = entry.active_turn_token
                     count += 1
             if count:
                 self._save()

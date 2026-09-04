@@ -1637,6 +1637,19 @@ def _close_all_real_profile_runtimes(*, all_profiles: bool = False) -> None:
         _stop_real_profile_browser(key)
         _real_profile_cdp_cache.pop(key, None)
         _real_profile_headed_modes.pop(key, None)
+    if not all_profiles:
+        # Managed snapshot Chromium intentionally survives gateway restarts, so
+        # process-local maps may be empty when consent is revoked. Discover each
+        # credential-bearing runtime from its ownership marker before cleanup.
+        try:
+            from hermes_constants import get_hermes_home
+            from hermes_cli.browser_connect import stop_snapshot_browser_processes
+
+            root = get_hermes_home() / "browser-profile"
+            for marker in root.rglob("DevToolsActivePort") if root.is_dir() else ():
+                stop_snapshot_browser_processes(str(marker.parent))
+        except Exception as exc:
+            logger.debug("Could not stop recovered real-profile browsers: %s", exc)
 
 
 def _agent_browser_argv(browser_cmd: str) -> list:
@@ -2000,9 +2013,9 @@ def _real_profile_cdp(
                     "headed mode cannot be verified. Close it and retry to apply an "
                     "explicit headed value safely."
                 )
-            if existing_headed is not None and existing_headed != effective_headed:
+            if existing_headed is not None and existing_headed != wants_headed:
                 running = "headed" if existing_headed else "headless"
-                requested = "headed" if effective_headed else "headless"
+                requested = "headed" if wants_headed else "headless"
                 return None, (
                     f"The Hermes real-profile browser is already running {running}; "
                     f"it cannot be reused as {requested}. Close the existing browser "
@@ -3586,6 +3599,22 @@ def _get_session_info(
         # Check if we already have a session for this task
         existing_session = _active_sessions.get(task_id)
 
+    recycled_identity = (
+        str(existing_session.get("browser_identity") or "")
+        if existing_session is not None
+        else ""
+    )
+    recycled_identity_key = (
+        str(existing_session.get("browser_identity_key") or "")
+        if existing_session is not None
+        else ""
+    )
+    if existing_session is not None:
+        # Validate an explicit request before ensure_healthy() can tear down a
+        # suspect task. The captured binding remains authoritative if this task
+        # must be recreated after expiry, backend death, or suspect recycling.
+        _ensure_identity_binding(existing_session)
+
     # Suspect-session recycle (#72205 / #85125 3b): a previous command
     # timeout marked this cached session suspect via the SuspectableBackend
     # adapter.  ensure_healthy() tears it down here, at next use, and we fall
@@ -3634,6 +3663,9 @@ def _get_session_info(
     # the configured default here so that session creation is stamped with the
     # same immutable identity metadata as browser_navigate. Existing sessions
     # above intentionally inherit their already-bound identity instead.
+    if identity is None and recycled_identity:
+        identity = recycled_identity
+        requested_identity_key = recycled_identity_key
     if identity is None:
         from hermes_cli.browser_identity import (
             BrowserIdentityError,

@@ -1361,13 +1361,18 @@ class SignalAdapter(BasePlatformAdapter):
 
             attachments.append(file_path)
 
+        skipped_total = skipped_download + skipped_missing + skipped_oversize
+        results: List[SendResult] = [
+            SendResult(success=False, error="Signal image validation failed")
+            for _ in range(skipped_total)
+        ]
         if not attachments:
             logger.error(
                 "Signal: no valid images in batch of %d "
                 "(download=%d missing=%d oversize=%d)",
                 len(images), skipped_download, skipped_missing, skipped_oversize,
             )
-            return []
+            return results
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1387,9 +1392,8 @@ class SignalAdapter(BasePlatformAdapter):
             attachments[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
             for i in range(0, len(attachments), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
         ]
-        results: List[SendResult] = []
-
         for idx, att_batch in enumerate(att_batches):
+            batch_succeeded = False
             n = len(att_batch)
             estimated = scheduler.estimate_wait(n)
             logger.debug(
@@ -1430,6 +1434,7 @@ class SignalAdapter(BasePlatformAdapter):
                             results.append(
                                 SendResult(success=True, raw_response=raw_response)
                             )
+                            batch_succeeded = True
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
                                 "Signal batch %d/%d: %d attachments sent in %.1fs "
@@ -1491,6 +1496,15 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+
+            if not batch_succeeded:
+                results.append(
+                    SendResult(
+                        success=False,
+                        error="Signal image batch send failed",
+                        retryable=True,
+                    )
+                )
 
         return results
 

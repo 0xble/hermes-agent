@@ -1,6 +1,5 @@
 """Tests for agent.title_generator — auto-generated session titles."""
 
-import inspect
 from contextvars import ContextVar
 
 import pytest
@@ -43,14 +42,33 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", return_value=response):
             assert generate_title("財務テーブルを確認") == "財務テーブル"
 
-    def test_title_route_interface_cannot_accept_native_attachment_context(self):
-        assert "title_context" not in inspect.signature(generate_title).parameters
+    def test_forwards_native_image_context_and_retries_text_only_on_rejection(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Screenshot Repair"}'
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
+        }
 
-    def test_image_only_title_request_does_not_call_auxiliary_route(self):
-        with patch("agent.title_generator.call_llm") as llm:
-            assert generate_title("") is None
+        config = {"auxiliary": {"title_generation": {"include_attachments": True}}}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch(
+                "agent.title_generator.call_llm",
+                side_effect=[RuntimeError("route is text-only"), response],
+            ) as llm,
+        ):
+            assert generate_title(
+                "Autofix this",
+                title_context=[{"type": "text", "text": "Autofix this"}, image_part],
+            ) == "Screenshot Repair"
 
-        llm.assert_not_called()
+        assert llm.call_args_list[0].kwargs["messages"][1]["content"] == [
+            {"type": "text", "text": "Autofix this"},
+            image_part,
+        ]
+        assert llm.call_args_list[1].kwargs["messages"][1]["content"] == "Autofix this"
 
     def test_title_language_reads_config(self):
         cfg = {"auxiliary": {"title_generation": {"language": "  French "}}}
@@ -600,7 +618,7 @@ class TestGenerateTitle:
 
 
 class TestChooseTopicIcon:
-    def test_forwards_safe_image_metadata_but_not_payload_to_icon_route(self):
+    def test_forwards_native_image_context_to_icon_route(self):
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = "🎨"
@@ -609,7 +627,11 @@ class TestChooseTopicIcon:
             "image_url": {"url": "data:image/png;base64,aW1hZ2U="},
         }
 
-        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+        config = {"auxiliary": {"title_generation": {"include_attachments": True}}}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
             selected = choose_topic_icon(
                 "Hermes Attachment Topics",
                 "Autofix this",
@@ -622,12 +644,16 @@ class TestChooseTopicIcon:
 
         assert selected == "🎨"
         provider_content = llm.call_args.kwargs["messages"][1]["content"]
-        assert provider_content == (
-            "Title: Hermes Attachment Topics\nOpening request: Autofix this\n"
-            "Attachments: image"
-        )
-        assert "aW1hZ2U=" not in provider_content
-        assert "data:image" not in provider_content
+        assert provider_content == [
+            {
+                "type": "text",
+                "text": (
+                    "Title: Hermes Attachment Topics\nOpening request: Autofix this\n"
+                    "Attachments: image"
+                ),
+            },
+            image_part,
+        ]
 
     def test_requests_up_to_six_ranked_unicode_selectors(self):
         mock_response = MagicMock()
@@ -974,26 +1000,32 @@ class TestMaybeAutoTitle:
         assert called.wait(timeout=10), "auto-title worker never ran"
         assert worker.call_args.kwargs["title_context"] == title_context
 
-    def test_auto_title_passes_only_safe_attachment_metadata_to_provider(self, tmp_path):
+    def test_auto_title_passes_supported_image_to_provider(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-attachment", source="telegram")
         response = MagicMock()
         response.choices = [MagicMock()]
         response.choices[0].message.content = '{"title": "Image Attachment"}'
-        secret_payload = "data:image/png;base64,VE9QLVNFQ1JFVA=="
-        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+        image_payload = "data:image/png;base64,VE9QLVNFQ1JFVA=="
+        config = {"auxiliary": {"title_generation": {"include_attachments": True}}}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
             auto_title_session(
                 db,
                 "sess-attachment",
                 "",
                 title_context=[
-                    {"type": "image_url", "image_url": {"url": secret_payload}}
+                    {"type": "image_url", "image_url": {"url": image_payload}}
                 ],
             )
 
         provider_content = llm.call_args.kwargs["messages"][1]["content"]
-        assert provider_content == "Attachments: image"
-        assert secret_payload not in provider_content
+        assert provider_content == [
+            {"type": "text", "text": "Attachments: image"},
+            {"type": "image_url", "image_url": {"url": image_payload}},
+        ]
         assert db.get_session_title("sess-attachment") == "Image Attachment"
 
     def test_skips_if_not_first_exchange(self):

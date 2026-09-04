@@ -14003,7 +14003,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         existing = self._deferred_obligation_sweeps.get(key)
         if existing is not None and not existing.done():
             existing_at = getattr(existing, "_hermes_sweep_at", None)
-            if existing_at is not None and existing_at <= time.monotonic() + delay:
+            if existing_at is not None and existing_at >= time.monotonic() + delay:
                 return
             existing.cancel()
 
@@ -24200,6 +24200,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             goal_post_turn_state: Dict[str, bool] = {}
+            _side_delivery_callback = (
+                (lambda message_ids: self._record_side_delivery(event, message_ids))
+                if event_metadata.get("gateway_explicit_session_route")
+                else None
+            )
+            if _side_delivery_callback is not None:
+                event_metadata["_gateway_side_delivery_callback"] = _side_delivery_callback
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -24219,11 +24226,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 turn_reasoning_config=event.turn_reasoning_config,
-                side_delivery_callback=(
-                    (lambda message_ids: self._record_side_delivery(event, message_ids))
-                    if event_metadata.get("gateway_explicit_session_route")
-                    else None
-                ),
+                side_delivery_callback=_side_delivery_callback,
                 goal_session_entry=session_entry,
                 goal_post_turn_state=goal_post_turn_state,
             )

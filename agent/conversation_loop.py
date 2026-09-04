@@ -4984,6 +4984,9 @@ def run_conversation(
                 
                 _retry.has_retried_429 = False  # Reset on success
                 _retry.alternate_credential_attempted = False
+                _retry.attempted_credential_identities.clear()
+                _retry.transient_credential_retries_used = 0
+                _retry.transient_credential_retry_budget_exhausted = False
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the

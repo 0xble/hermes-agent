@@ -233,6 +233,7 @@ async def test_oversized_wait_returns_retryable_error(monkeypatch):
     assert result.success is False
     assert result.retryable is True
     assert "flood_control" in (result.error or "")
+    assert result.retry_after is not None and result.retry_after >= 6999.0
     # No Bot API call should have been made.
     assert adapter._bot.send_message.await_count == 0
 
@@ -345,10 +346,10 @@ async def test_retry_after_is_shared_with_already_waiting_sender():
     first, second = await asyncio.gather(first_task, second_task)
 
     assert first.success is False
-    assert first.retry_after == 5.0
+    assert first.retry_after == 7.0
     assert second.success is False
     assert second.retryable is True
-    assert second.retry_after == 5.0
+    assert second.retry_after is not None and second.retry_after >= 6.9
     assert adapter._bot.calls == 1
 
 
@@ -613,7 +614,7 @@ async def test_control_boundaries_preserve_cooldown_retry_metadata(
 
     assert result.success is False
     assert result.retryable is True
-    assert result.retry_after == 5.0
+    assert result.retry_after == 9.0
 
 
 @pytest.mark.asyncio
@@ -632,7 +633,7 @@ async def test_multi_image_cooldown_preserves_prior_chunk_results():
     ]
     assert results[-1].success is False
     assert results[-1].retryable is True
-    assert results[-1].retry_after == 5.0
+    assert results[-1].retry_after == 9.0
 
 
 def test_retry_after_accepts_ptb_timedelta_mode():

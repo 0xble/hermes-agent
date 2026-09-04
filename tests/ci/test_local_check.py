@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 from scripts.ci import local_check as MODULE
 
@@ -122,7 +123,7 @@ def test_full_marks_windows_native_work_as_remote_on_non_windows() -> None:
 def test_json_dry_run_binds_receipt_to_exact_head() -> None:
     completed = subprocess.run(
         [
-            str(ROOT / ".venv" / "bin" / "python") if (ROOT / ".venv").exists() else "python3",
+            sys.executable,
             str(PATH),
             "--profile",
             "smoke",

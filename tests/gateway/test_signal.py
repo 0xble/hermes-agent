@@ -1169,13 +1169,15 @@ class TestSignalSendMultipleImages:
         adapter._rpc = mock_rpc
         adapter._stop_typing_indicator = AsyncMock()
 
-        await adapter.send_multiple_images(
+        results = await adapter.send_multiple_images(
             chat_id="+155****4567",
             images=[(f"file://{tmp_path}/missing_a.png", ""),
                     (f"file://{tmp_path}/missing_b.png", "")],
         )
 
         assert captured == []
+        assert len(results) == 2
+        assert all(result.success is False for result in results)
 
     @pytest.mark.asyncio
     async def test_single_batch_under_limit(self, monkeypatch, tmp_path):

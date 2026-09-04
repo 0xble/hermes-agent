@@ -87,6 +87,19 @@ class TestBaseDefaultLoop:
         assert len(a.sent_files) == 1
         assert a.sent_files[0][1] == "/tmp/foo.png"
 
+    def test_records_a_retryable_failure_when_an_image_send_raises(self):
+        a = _StubAdapter()
+        a.send_image = AsyncMock(side_effect=RuntimeError("provider failed"))
+
+        results = _run(
+            a.send_multiple_images("chat1", [("https://x.com/a.png", "alt")])
+        )
+
+        assert len(results) == 1
+        assert results[0].success is False
+        assert results[0].retryable is True
+        assert results[0].error == "image_delivery_exception:RuntimeError"
+
 
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 

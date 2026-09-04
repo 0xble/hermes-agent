@@ -627,8 +627,9 @@ def generate_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     avoid_titles: Optional[list[str]] = None,
     route_callback: Optional[AuxiliaryRouteCallback] = None,
+    title_context: Any = None,
 ) -> Optional[str]:
-    """Generate a session title from bounded text-only context.
+    """Generate a session title from bounded text and supported image context.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
     small/fast model tier. Thinking is disabled and the response is constrained
@@ -698,10 +699,17 @@ def generate_title(
         )
 
     try:
-        # Auxiliary title routes may use a different provider from the main
-        # conversation. Never widen attachment disclosure implicitly: title and
-        # icon generation receive only the bounded text already supplied here.
-        response = _request_title(user_snippet)
+        request_content = _title_request_content(user_snippet, title_context)
+        try:
+            response = _request_title(request_content)
+        except Exception:
+            if not isinstance(request_content, list):
+                raise
+            # Auxiliary routes are not uniformly multimodal. Preserve automatic
+            # titles by retrying once with the same bounded text when a selected
+            # provider rejects supported native image parts.
+            logger.info("Multimodal title request failed; retrying with text only")
+            response = _request_title(user_snippet)
         choice = response.choices[0]
         finish_reason = str(getattr(choice, "finish_reason", "") or "").lower()
         if finish_reason in {"length", "max_tokens"}:
@@ -813,6 +821,55 @@ def _attachment_metadata_context(title_context: Any) -> str:
     if not descriptions:
         return ""
     return "Attachments: " + ", ".join(descriptions)
+
+
+def _title_request_content(text: str, title_context: Any) -> Any:
+    """Build bounded multimodal content from normalized native image parts."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        enabled = bool(
+            ((load_config_readonly() or {}).get("auxiliary") or {})
+            .get("title_generation", {})
+            .get("include_attachments", False)
+        )
+    except Exception:
+        enabled = False
+    if not enabled:
+        return text
+    parts = title_context if isinstance(title_context, (list, tuple)) else []
+    images: list[dict[str, Any]] = []
+    encoded_budget = 2 * 1024 * 1024
+    encoded_used = 0
+    for part in parts:
+        if len(images) >= 4 or not isinstance(part, Mapping):
+            continue
+        kind = str(part.get("type") or "").strip().casefold()
+        if kind == "image_url":
+            value = part.get("image_url")
+            url = value.get("url") if isinstance(value, Mapping) else value
+            if isinstance(url, str) and url.strip():
+                size = len(url.encode("utf-8"))
+                if encoded_used + size <= encoded_budget:
+                    images.append(dict(part))
+                    encoded_used += size
+        elif kind == "input_image":
+            value = part.get("image_url")
+            if isinstance(value, str) and value.strip():
+                size = len(value.encode("utf-8"))
+                if encoded_used + size <= encoded_budget:
+                    images.append(dict(part))
+                    encoded_used += size
+        elif kind == "image":
+            source = part.get("source")
+            if isinstance(source, Mapping) and source.get("data"):
+                size = len(str(source.get("data")).encode("utf-8"))
+                if encoded_used + size <= encoded_budget:
+                    images.append(dict(part))
+                    encoded_used += size
+    if not images:
+        return text
+    return [{"type": "text", "text": text}, *images]
 
 
 def _title_request_text(user_message: str, title_context: Any) -> str:
@@ -1007,24 +1064,35 @@ def choose_topic_icon(
     attachment_metadata = _attachment_metadata_context(title_context)
     if attachment_metadata:
         icon_user_text += f"\n{attachment_metadata}"
+    request_content = _title_request_content(icon_user_text, title_context)
     messages = [
         {"role": "system", "content": prompt},
         {
             "role": "user",
-            "content": icon_user_text,
+            "content": request_content,
         },
     ]
 
     try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.7,
-            timeout=timeout,
-            reasoning_config={"enabled": False, "effort": "none"},
-            require_complete_response=True,
-        )
+        def _request_icon(content: Any):
+            messages[1]["content"] = content
+            return call_llm(
+                task="title_generation",
+                messages=messages,
+                max_tokens=1024,
+                temperature=0.7,
+                timeout=timeout,
+                reasoning_config={"enabled": False, "effort": "none"},
+                require_complete_response=True,
+            )
+
+        try:
+            response = _request_icon(request_content)
+        except Exception:
+            if not isinstance(request_content, list):
+                raise
+            logger.info("Multimodal topic-icon request failed; retrying with text only")
+            response = _request_icon(icon_user_text)
         content = response.choices[0].message.content or ""
         from agent.agent_runtime_helpers import strip_think_blocks
 
@@ -1319,6 +1387,7 @@ def _auto_title_session(
         main_runtime=main_runtime,
         runtime_validator=runtime_validator,
         route_callback=route_callback,
+        title_context=title_context,
     )
     source = "llm"
     if not title:
@@ -1351,6 +1420,7 @@ def _auto_title_session(
                     main_runtime=main_runtime,
                     runtime_validator=runtime_validator,
                     avoid_titles=[title],
+                    title_context=title_context,
                 )
                 if (
                     retry_title

@@ -398,6 +398,37 @@ class TestBrowserUseIdentityRouting:
         assert "already bound" in switched["error"]
         assert "lpg" not in switched["error"]
 
+    def test_named_session_binding_survives_process_local_state_reset(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.browser_use_cli as bu
+
+        cli = tmp_path / "browser-use"
+        cli.write_text("#!/bin/sh\ncat > /dev/null\n")
+        cli.chmod(0o755)
+        monkeypatch.setattr(bu, "_find_cli", lambda: [str(cli)])
+        monkeypatch.setattr(bu, "_real_profile_consented", lambda: True)
+        monkeypatch.setattr(
+            "hermes_cli.browser_identity.read_browser_identity_config",
+            lambda: _browser_cfg(),
+        )
+        monkeypatch.setattr(
+            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
+
+        assert json.loads(
+            bu.browser_exec("print(1)", session="durable", identity="lpg")
+        )["success"]
+        bu._browser_exec_identity_bindings.clear()
+        bu._browser_exec_identity_daemons.clear()
+        bu._browser_exec_identity_daemon_homes.clear()
+
+        switched = json.loads(
+            bu.browser_exec("print(1)", session="durable", identity="personal")
+        )
+        assert "already bound" in switched["error"]
+
     @pytest.mark.parametrize("legacy_first", [True, False])
     def test_session_rejects_legacy_named_transitions(
         self, tmp_path, monkeypatch, legacy_first

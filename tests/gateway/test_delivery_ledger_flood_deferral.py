@@ -211,23 +211,25 @@ class TestDeferredSweepScheduling:
             task.cancel()
 
     @pytest.mark.asyncio
-    async def test_an_earlier_wait_supersedes_a_later_pending_one(self):
+    async def test_a_later_wait_supersedes_an_earlier_pending_one(self):
         calls = []
         stub = self._stub(calls)
 
         stub._schedule_deferred_obligation_redelivery(
-            "telegram", profile=None, delay=3000.0,
+            "telegram", profile=None, delay=0.0,
         )
         first = stub._deferred_obligation_sweeps["telegram:default"]
         stub._schedule_deferred_obligation_redelivery(
-            "telegram", profile=None, delay=0.0,
+            "telegram", profile=None, delay=3000.0,
         )
 
         # cancel() only takes effect on the next loop turn.
         await asyncio.sleep(0)
         assert first.cancelled() or first.done()
-        await asyncio.sleep(1.3)
-        assert calls == [("telegram", None)]
+        replacement = stub._deferred_obligation_sweeps["telegram:default"]
+        assert replacement is not first
+        assert replacement._hermes_sweep_at >= time.monotonic() + 2999.0
+        replacement.cancel()
 
     @pytest.mark.asyncio
     async def test_delay_is_bounded_by_the_ledger_stale_cutoff(self):
