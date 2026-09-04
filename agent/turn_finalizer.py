@@ -338,7 +338,7 @@ def finalize_turn(
     # answer with a receipt-only response such as "Fresh verification...".
     # This is the response-safe boundary for messaging and streamed surfaces.
     _verification_delivery_pre_transform = None
-    if interrupted and _pending_verification_response:
+    if interrupted and final_response and _pending_verification_response:
         if final_response != _pending_verification_response:
             _verification_delivery_pre_transform = final_response
         final_response = _pending_verification_response

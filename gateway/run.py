@@ -19563,7 +19563,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         raw_metadata = getattr(event, "metadata", None)
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         event.metadata = metadata
-        metadata.setdefault("gateway_original_text", str(event.text or ""))
+        setattr(event, "_gateway_original_text", str(event.text or ""))
         if metadata.get("gateway_explicit_session_route") is True:
             return
         reply_id = str(getattr(event, "reply_to_message_id", None) or "").strip()
@@ -20068,7 +20068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _explicit_side_close = bool(
             re.fullmatch(
                 r"/side(?:@[A-Za-z0-9_]+)?\s+close\s*",
-                str(_event_metadata.get("gateway_original_text") or event.text or ""),
+                str(getattr(event, "_gateway_original_text", None) or event.text or ""),
                 flags=re.IGNORECASE,
             )
         )
