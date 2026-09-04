@@ -19951,7 +19951,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # still present. Otherwise the normal dispatch gate can no longer see it.
         from hermes_cli.commands import resolve_command as _resolve_command
 
-        _reasoning_command = event.get_command()
+        _get_reasoning_command = getattr(event, "get_command", None)
+        _reasoning_command = (
+            _get_reasoning_command() if callable(_get_reasoning_command) else None
+        )
         _reasoning_definition = (
             _resolve_command(_reasoning_command) if _reasoning_command else None
         )

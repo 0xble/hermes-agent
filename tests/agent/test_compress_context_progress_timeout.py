@@ -552,7 +552,10 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         monkeypatch.setattr(
             "agent.conversation_compression.resolve_context_compression_timeouts",
-            lambda compression_cfg=None: (0.05, 0.2),
+            # Leave enough total budget for the shared executor to start this
+            # worker under a fully loaded per-file test run. Once started, the
+            # 50ms idle budget still drives the timeout behavior under test.
+            lambda compression_cfg=None: (0.05, 2.0),
         )
         monkeypatch.setattr(
             "agent.portal_tags.get_conversation_context",
