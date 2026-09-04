@@ -16,7 +16,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -85,6 +91,30 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
         is_voice=True,
     )
     adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mixed_image_batch_reports_processing_failure(tmp_path, monkeypatch):
+    adapter = _MediaRoutingAdapter()
+    event = _event()
+    first = _allowed_media_path(tmp_path, monkeypatch, "first.png")
+    second = _allowed_media_path(tmp_path, monkeypatch, "second.png")
+    adapter._message_handler = AsyncMock(
+        return_value=f"MEDIA:{first}\nMEDIA:{second}"
+    )
+    adapter.send_multiple_images = AsyncMock(
+        return_value=[
+            SendResult(success=True, message_id="first"),
+            SendResult(success=False, error="second failed"),
+        ]
+    )
+    adapter.on_processing_complete = AsyncMock()
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.on_processing_complete.assert_awaited_once_with(
+        event, ProcessingOutcome.FAILURE
+    )
 
 
 def _fake_runner(thread_meta):

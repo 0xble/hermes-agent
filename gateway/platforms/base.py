@@ -6980,11 +6980,12 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        delivery_failed = False
         delivery_receipt_tasks: set[asyncio.Future] = set()
         callback_generation: int | None = None
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, delivery_failed
             if isinstance(result, (list, tuple)):
                 for item in result:
                     _record_delivery(item)
@@ -7030,6 +7031,8 @@ class BasePlatformAdapter(ABC):
                             delivery_receipt_tasks.add(task)
                     except Exception:
                         logger.debug("Side delivery receipt callback failed", exc_info=True)
+            else:
+                delivery_failed = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -7613,8 +7616,13 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-            # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # Determine overall success for the processing hook. Every attempted
+            # component must succeed so a partial batch remains recoverable.
+            processing_ok = (
+                delivery_succeeded and not delivery_failed
+                if delivery_attempted
+                else not bool(response)
+            )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(

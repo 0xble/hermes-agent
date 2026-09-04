@@ -20070,6 +20070,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and event.get_command() == "side"
             and event.get_command_args().strip().lower() == "close"
         ):
+            _side_denied = self._check_slash_access(source, "side")
+            if _side_denied is not None:
+                return _side_denied
             closed = await self._close_side_route(_quick_key, source)
             side_root = (
                 _event_metadata.get("gateway_side_root_session_id")
