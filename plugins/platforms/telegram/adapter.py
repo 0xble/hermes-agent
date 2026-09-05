@@ -6216,6 +6216,29 @@ class TelegramAdapter(BasePlatformAdapter):
             retry_after=self._bounded_send_retry_after(error.retry_after),
         )
 
+    @staticmethod
+    def _partial_text_delivery_failure(
+        failure: SendResult,
+        message_ids: list[str],
+        chunks: list[str],
+    ) -> SendResult:
+        """Return a resumable suffix after one or more chunks were delivered."""
+        return SendResult(
+            success=False,
+            error=failure.error,
+            message_id=message_ids[0],
+            raw_response={
+                "telegram_partial_text_delivery": True,
+                "message_ids": message_ids,
+                "delivered_chunks": len(message_ids),
+                "total_chunks": len(chunks),
+                "delivery_retry_content": "".join(chunks[len(message_ids) :]),
+            },
+            retryable=True,
+            retry_after=failure.retry_after,
+            error_kind=failure.error_kind,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -6394,21 +6417,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     except _TelegramSendCooldownExceeded as cooldown_error:
                         failure = self._send_cooldown_failure(cooldown_error)
                         if message_ids:
-                            return SendResult(
-                                success=False,
-                                error=failure.error,
-                                message_id=message_ids[0],
-                                raw_response={
-                                    "telegram_partial_text_delivery": True,
-                                    "message_ids": message_ids,
-                                    "delivered_chunks": len(message_ids),
-                                    "total_chunks": len(chunks),
-                                    "delivery_retry_content": "".join(
-                                        chunks[len(message_ids) :]
-                                    ),
-                                },
-                                retryable=True,
-                                retry_after=failure.retry_after,
+                            return self._partial_text_delivery_failure(
+                                failure,
+                                message_ids,
+                                chunks,
                             )
                         return failure
                     except _NetErr as send_err:
@@ -6419,6 +6431,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                         if handled:
                             if retry_result is not None:
+                                if message_ids:
+                                    return self._partial_text_delivery_failure(
+                                        retry_result,
+                                        message_ids,
+                                        chunks,
+                                    )
                                 return retry_result
                             continue
                         # BadRequest is a subclass of NetworkError in
@@ -6541,6 +6559,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                         if handled:
                             if retry_result is not None:
+                                if message_ids:
+                                    return self._partial_text_delivery_failure(
+                                        retry_result,
+                                        message_ids,
+                                        chunks,
+                                    )
                                 return retry_result
                             continue
                         raise
@@ -7038,7 +7062,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, wait,
                 )
                 if wait > _FLOOD_INLINE_WAIT_CAP_SECS:
-                    return _flood_cap_result(wait)
+                    return _flood_cap_result(wait, retryable=True)
                 await asyncio.sleep(wait)
                 try:
                     await self._edit_message_text_with_cooldown(
@@ -7175,6 +7199,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     text=first_chunk,
                     **self._business_connection_kwargs(metadata),
                 )
+        except _TelegramSendCooldownExceeded as cooldown_error:
+            return self._send_cooldown_failure(cooldown_error)
         except Exception as e:
             err_str = str(e).lower()
             if "not modified" in err_str:

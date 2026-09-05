@@ -111,8 +111,9 @@ _NON_DIRECT_MUTATION_RE = re.compile(
 _EMBEDDED_CONTENT_INTRO_RE = re.compile(
     r"\b(?:review|quote|paste|transcribe)\s+this\b[^.!?\n]{0,100}:\s*(?:\n|$)"
     r"|\b(?:here\s+is|here['’]s|below\s+is|the\s+following\s+is)\b"
-    r"[^.!?\n]{0,100}:\s*(?:\n|$)",
-    re.I,
+    r"[^.!?\n]{0,100}:\s*(?:\n|$)"
+    r"|^[ \t]{0,3}[^.!?:\n]{1,100}:[ \t]*(?:\n|$)",
+    re.I | re.M,
 )
 _QUESTION_CONTEXT_RE = re.compile(
     r"^\s*(?:what|why|how|when|where|who|which|can|could|would|will|is|are|"

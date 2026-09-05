@@ -521,7 +521,7 @@ async def test_extreme_server_retry_after_never_sleeps_inline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_extreme_retry_after_after_a_chunk_is_not_full_message_retryable():
+async def test_extreme_retry_after_after_a_chunk_retries_only_the_remaining_suffix():
     adapter = _make_adapter()
     adapter._send_cooldown_max_wait = 5.0
 
@@ -539,9 +539,16 @@ async def test_extreme_retry_after_after_a_chunk_is_not_full_message_retryable()
     result = await adapter.send("flood-chat", content, metadata={"notify": True})
 
     assert result.success is False
-    assert result.retryable is False
+    assert result.retryable is True
     assert result.error == "flood_control:7000.0"
     assert result.retry_after == 7000.0
+    assert result.message_id == "42"
+    assert result.raw_response["telegram_partial_text_delivery"] is True
+    assert result.raw_response["delivered_chunks"] == 1
+    assert result.raw_response["total_chunks"] == 2
+    retry_content = result.raw_response["delivery_retry_content"]
+    assert retry_content.startswith("x" * 200)
+    assert retry_content.endswith(r" \(2/2\)")
     assert bot.send_message.await_count == 2
 
 
@@ -707,6 +714,7 @@ async def test_edit_respects_an_existing_per_chat_cooldown():
     result = await adapter.edit_message("123", "42", "update", finalize=False)
 
     assert result.success is False
+    assert result.retryable is True
     assert result.retry_after is not None and result.retry_after >= 29.0
     bot.edit_message_text.assert_not_awaited()
 
@@ -727,6 +735,26 @@ async def test_edit_retry_after_publishes_the_shared_chat_cooldown():
     result = await adapter.edit_message("123", "42", "update", finalize=False)
 
     assert result.success is False
+    assert result.retryable is True
     assert result.retry_after == 30.0
     assert adapter._send_cooldown_until["123"] >= before + 29.0
     bot.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_final_overflow_edit_cooldown_remains_retryable():
+    adapter = _make_adapter()
+    adapter._edit_message_text_with_cooldown = AsyncMock(
+        side_effect=_TelegramSendCooldownExceeded(30.0)
+    )
+
+    result = await adapter.edit_message(
+        "123",
+        "42",
+        "x" * (adapter.MAX_MESSAGE_LENGTH + 200),
+        finalize=True,
+    )
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.retry_after == 30.0
