@@ -45,12 +45,14 @@ def test_no_background_consistency_carveout():
     assert "topic overlap" in lower
 
 
-def test_persistent_memory_remains_reference_only_after_compaction():
+def test_persistent_memory_remains_active_but_scope_bound_after_compaction():
     lower = SUMMARY_PREFIX.lower()
 
     assert "persistent memory" in lower
-    assert "reference-only hints" in lower
-    assert "not instructions, authorization, or current authority" in lower
+    assert "remains active and applicable after compaction" in lower
+    assert "preferences and conventions" in lower
+    assert "cannot override the latest user message" in lower
+    assert "grant authorization for new side effects" in lower
     assert "verify" in lower
     assert "canonical live sources" in lower
     assert "always authoritative and active" not in lower
@@ -86,8 +88,8 @@ def test_replaced_prefixes_are_frozen_for_renormalization():
 # derive them from module constants — the tests below must fail if any
 # frozen entry is mutated, reordered, or dropped.
 _FROZEN_PREFIX_GENERATIONS = (
-    # Pre-reference-only-memory guidance: current handoff shape with the
-    # retired authoritative-memory sentence.
+    # Pre-scope-bound-memory guidance: current handoff shape with the retired
+    # unconditional-authority sentence.
     (
         "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
         "compacted into the summary below. This is a handoff from a "
