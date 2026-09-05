@@ -1355,7 +1355,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "allow_memory_mutations", "description": "Expose explicit, audited invalidation and restoration tools; does not enable automatic mutation", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
-            {"key": "recall_indicator", "description": "Show a '💭 Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
+            {"key": "recall_indicator", "description": "Show a '💭 Recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
             {"key": "retain_indicator", "description": "Show a '🧠 Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_attachments", "description": "Upload raw file attachments to Hindsight during automatic source retention. Default off because this reads and durably transmits the original file bytes.", "default": False},
@@ -2030,7 +2030,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._allow_memory_mutations = _coerce_bool(self._config.get("allow_memory_mutations", False), default=False)
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         # On-by-default deterministic indicator: when auto-recall injects memory,
-        # Hermes emits a "💭 Hindsight — recalled N memories" status line so the
+        # Hermes emits a "💭 Recalled N memories" status line so the
         # user SEES memory working, independent of whether the model mentions it.
         # Off switch for customer-facing agents that shouldn't surface internals.
         self._recall_indicator = bool(self._config.get("recall_indicator", True))
