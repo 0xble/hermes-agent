@@ -108,20 +108,33 @@ def test_deferred_agent_cleanup_uses_only_remaining_total_budget(monkeypatch):
     assert _deferred_agent_cleanup_timeout(agent) == 0.75
 
 
-def test_exhausted_total_budget_skips_deferred_cleanup():
+def test_exhausted_total_budget_still_runs_deferred_cleanup(monkeypatch):
     called = False
+    agent = MagicMock()
+    agent._cron_total_run_deadline = 100.0
+    monkeypatch.setattr("cron.scheduler.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("cron.scheduler._cron_cleanup_timeout_seconds", lambda: 10.0)
 
     def cleanup():
         nonlocal called
         called = True
 
-    assert not _run_cron_cleanup_with_timeout(
+    assert _run_cron_cleanup_with_timeout(
         cleanup,
         job_id="cleanup-budget-exhausted",
         label="agent resource teardown",
-        timeout_seconds=0.0,
+        timeout_seconds=_deferred_agent_cleanup_timeout(agent),
     )
-    assert called is False
+    assert called is True
+
+
+def test_disabled_cleanup_timeout_preserves_inline_teardown(monkeypatch):
+    agent = MagicMock()
+    agent._cron_total_run_deadline = 100.0
+    monkeypatch.setattr("cron.scheduler.time.monotonic", lambda: 100.0)
+    monkeypatch.setattr("cron.scheduler._cron_cleanup_timeout_seconds", lambda: 0.0)
+
+    assert _deferred_agent_cleanup_timeout(agent) == 0.0
 
 
 def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):

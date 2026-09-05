@@ -5890,13 +5890,6 @@ def _run_cron_cleanup_with_timeout(
         if timeout_seconds is None
         else float(timeout_seconds)
     )
-    if timeout <= 0 and timeout_seconds is not None:
-        logger.error(
-            "Job '%s': %s skipped because the total execution budget is exhausted",
-            job_id,
-            label,
-        )
-        return False
     if timeout <= 0:
         try:
             cleanup()
@@ -5941,12 +5934,15 @@ def _run_cron_cleanup_with_timeout(
 
 
 def _deferred_agent_cleanup_timeout(agent) -> float:
-    """Clamp agent teardown to the remaining total run budget, when present."""
+    """Clamp teardown to the budget while preserving a bounded cleanup chance."""
     timeout = _cron_cleanup_timeout_seconds()
+    if timeout <= 0:
+        return timeout
     deadline = getattr(agent, "_cron_total_run_deadline", None)
     if deadline is None:
         return timeout
-    return min(timeout, max(0.0, float(deadline) - time.monotonic()))
+    remaining = max(0.0, float(deadline) - time.monotonic())
+    return min(timeout, max(0.1, remaining))
 
 
 class _BoundedCronSessionDB:
