@@ -29,6 +29,12 @@ def _copy_workflows(tmp_path: Path) -> Path:
     return target
 
 
+def _copy_trusted_surfaces(target: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    for subdir in ("workflows", "actions"):
+        shutil.copytree(root / ".github" / subdir, target / ".github" / subdir)
+
+
 def _replace(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
     assert old in text
@@ -160,6 +166,27 @@ def test_symlinked_workflow_directory_escape_fails_closed(
     errors = validate(root)
 
     assert any("workflow directory" in error and "symlink" in error for error in errors)
+
+
+@pytest.mark.parametrize("entry", [".github/actions", ".github/actions/retry/action.yml"])
+def test_symlinked_trusted_surface_entry_fails_closed(
+    tmp_path: Path, entry: str
+) -> None:
+    candidate = tmp_path / "candidate"
+    trusted = tmp_path / "trusted-policy"
+    _copy_trusted_surfaces(candidate)
+    _copy_trusted_surfaces(trusted)
+    path = candidate / entry
+    trusted_path = trusted / entry
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    path.symlink_to(trusted_path, target_is_directory=trusted_path.is_dir())
+
+    errors = validate(candidate, trusted)
+
+    assert any("protected workflow surface" in error and "symlink" in error for error in errors)
 
 
 def test_reintroduced_push_trigger_fails_closed(tmp_path: Path) -> None:

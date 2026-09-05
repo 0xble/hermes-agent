@@ -19,7 +19,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 _MIN_TEXT_CHARS = 512
 _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -59,6 +59,8 @@ _EXCLUDED_ARTIFACT_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".rb", ".java", ".c", ".cpp",
     ".sh", ".zsh", ".fish", ".toml", ".lock", ".db", ".sqlite", ".log",
 }
+_YOUTUBE_WATCH_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -123,6 +125,34 @@ def _url_value(args: dict[str, Any]) -> str:
         value = args.get(key)
         if isinstance(value, str) and value.strip():
             return _normalize_url(value)
+    return ""
+
+
+def _url_identity_value(args: dict[str, Any]) -> str:
+    """Return a private identity input without retaining URL credentials."""
+
+    for key in ("url", "source_url", "video_url", "webpage_url"):
+        value = args.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        origin = _normalize_url(value)
+        try:
+            parsed = urlsplit(value.strip())
+            if (
+                parsed.hostname
+                and parsed.hostname.lower() in _YOUTUBE_WATCH_HOSTS
+                and parsed.path.rstrip("/") == "/watch"
+            ):
+                video_ids = [
+                    query_value
+                    for query_key, query_value in parse_qsl(parsed.query)
+                    if query_key == "v" and _YOUTUBE_VIDEO_ID_RE.fullmatch(query_value)
+                ]
+                if video_ids:
+                    return f"{origin}\0youtube-video:{video_ids[0]}"
+        except (TypeError, ValueError):
+            pass
+        return origin
     return ""
 
 
@@ -454,14 +484,15 @@ def discover_source_candidates(
             if source_type == "file_extraction" and not retain_file_extractions:
                 continue
             origin = _url_value(args) or _path_value(args) or name
+            identity_origin = _url_identity_value(args) or origin
             if source_type == "webpage":
-                source_id = f"webpage-{_sha256_text(origin)[:32]}"
+                source_id = f"webpage-{_sha256_text(identity_origin)[:32]}"
                 context = (
                     "Webpage content retrieved and substantively used in the completed turn. "
                     "External source that may become stale; preserve retrieval provenance."
                 )
             else:
-                source_id = f"{source_type}-{_sha256_text(origin or name)[:32]}"
+                source_id = f"{source_type}-{_sha256_text(identity_origin or name)[:32]}"
                 context = (
                     f"Complete {source_type} extraction used in the completed turn. "
                     "Preserve attribution and uncertainty; distinguish source evidence from Hermes analysis."

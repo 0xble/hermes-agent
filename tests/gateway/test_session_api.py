@@ -850,7 +850,6 @@ async def test_session_chat_returns_interrupt_as_metadata_not_assistant_text(ada
         {
             "final_response": sentinel,
             "session_id": session_id,
-            "completed": False,
             "interrupted": True,
         },
         {"total_tokens": 0},
@@ -880,7 +879,6 @@ async def test_session_chat_stream_emits_interrupt_as_metadata_not_assistant_tex
         return {
             "final_response": sentinel,
             "session_id": session_id,
-            "completed": False,
             "interrupted": True,
             "messages": [
                 {"role": "user", "content": "continue"},

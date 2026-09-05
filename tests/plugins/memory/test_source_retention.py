@@ -85,6 +85,36 @@ def test_web_source_urls_strip_credentials_and_query_values():
     assert "token" not in serialized
 
 
+def test_youtube_source_identity_keeps_only_the_public_video_key():
+    content = "Transcript paragraph. " * 60
+
+    def candidate(url: str):
+        return discover_source_candidates(
+            _tool_turn("youtube_transcript", {"url": url}, content),
+            session_id="youtube-identity",
+            retain_tool_sources=True,
+        )[0]
+
+    first = candidate(
+        "https://user:password@www.youtube.com/watch?"
+        "v=AAAAAAAAAAA&token=secret&t=30#fragment"
+    )
+    same_video = candidate(
+        "https://www.youtube.com/watch?si=tracking&v=AAAAAAAAAAA"
+    )
+    other_video = candidate(
+        "https://www.youtube.com/watch?v=BBBBBBBBBBB&token=other-secret"
+    )
+
+    assert first.source_id == same_video.source_id
+    assert first.source_id != other_video.source_id
+    assert first.metadata["source_origin"] == "https://www.youtube.com/watch"
+    assert other_video.metadata["source_origin"] == "https://www.youtube.com/watch"
+    serialized = json.dumps([first.metadata, other_video.metadata])
+    for sensitive in ("password", "secret", "token", "tracking", "AAAAAAAAAAA"):
+        assert sensitive not in serialized
+
+
 def test_incidental_search_results_and_short_outputs_are_skipped():
     assert discover_source_candidates(
         _tool_turn("web_search", {"query": "example"}, "Result " * 200)

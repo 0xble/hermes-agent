@@ -593,7 +593,39 @@ def _trusted_surface_files(root: Path) -> dict[str, bytes]:
     return files
 
 
+def _protected_surface_symlink_errors(root: Path, *, label: str) -> list[str]:
+    errors: list[str] = []
+    github = root / ".github"
+    try:
+        if github.is_symlink():
+            return [f"{label} protected workflow surface contains symlink: .github"]
+        for subdir in (".github/workflows", ".github/actions"):
+            base = root / subdir
+            if base.is_symlink():
+                errors.append(
+                    f"{label} protected workflow surface contains symlink: {subdir}"
+                )
+                continue
+            if not base.is_dir():
+                continue
+            for path in base.rglob("*"):
+                if path.is_symlink():
+                    errors.append(
+                        f"{label} protected workflow surface contains symlink: "
+                        f"{path.relative_to(root).as_posix()}"
+                    )
+    except OSError as exc:
+        errors.append(f"unable to inspect {label} protected workflow surface: {exc}")
+    return errors
+
+
 def _validate_trusted_surface(root: Path, trusted_root: Path) -> list[str]:
+    errors = _protected_surface_symlink_errors(root, label="candidate")
+    errors.extend(
+        _protected_surface_symlink_errors(trusted_root, label="trusted")
+    )
+    if errors:
+        return errors
     if _trusted_surface_files(root) == _trusted_surface_files(trusted_root):
         return []
     return ["candidate workflows and local actions differ from trusted default branch"]

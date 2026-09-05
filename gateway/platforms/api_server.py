@@ -4826,8 +4826,8 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
-        completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
         interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+        completed = bool(result.get("completed", not interrupted)) if isinstance(result, dict) else True
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -5008,8 +5008,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
                 interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+                completed = bool(result.get("completed", not interrupted)) if isinstance(result, dict) else True
                 partial = bool(result.get("partial")) if isinstance(result, dict) else False
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
