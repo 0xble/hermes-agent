@@ -1109,6 +1109,9 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    from agent.delegation_context import is_read_only_knowledge_context
+    if is_read_only_knowledge_context():
+        return tool_error("Durable memory writes are parent-owned for named subagents.", success=False)
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 

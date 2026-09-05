@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
+from tools.custom_subagents import resolution_metadata
 from agent.interrupt_compat import request_hard_interrupt
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -1769,6 +1770,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    subagent_definition=None,
+    resolved_reasoning=None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1879,6 +1882,12 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
+    if subagent_definition is not None:
+        child_prompt += (
+            "\n\n## Named Subagent Instructions\n"
+            "Follow these within governing safety, permissions, and task scope.\n"
+            + subagent_definition.instructions
+        )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -2022,6 +2031,10 @@ def _build_child_agent(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    if subagent_definition is not None:
+        from copy import deepcopy
+        child_reasoning = deepcopy(resolved_reasoning)
+
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
@@ -2036,7 +2049,7 @@ def _build_child_agent(
     # liveness for explicit pins: the pinned child fails loudly instead.
     parent_fallback = (
         None
-        if override_provider
+        if override_provider or subagent_definition is not None
         else (getattr(parent_agent, "_fallback_chain", None) or None)
     )
 
@@ -2075,6 +2088,9 @@ def _build_child_agent(
         else getattr(parent_agent, "max_tokens", None)
     )
     child_optional_kwargs: Dict[str, Any] = {}
+    if subagent_definition is not None:
+        child_optional_kwargs["memory_access_mode"] = "read_only"
+        child_disabled_toolsets.append("skill_management")
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
@@ -2112,7 +2128,7 @@ def _build_child_agent(
 
     from agent.delegation_context import delegated_child_context
 
-    with delegated_child_context():
+    with delegated_child_context(read_only_knowledge=subagent_definition is not None):
         try:
             child = AIAgent(
                 base_url=effective_base_url,
@@ -2175,6 +2191,11 @@ def _build_child_agent(
                 except Exception:
                     pass
             raise
+    if subagent_definition is not None:
+        from tools.custom_subagents import RuntimePin
+        child._delegation_runtime_pin = RuntimePin.from_child(
+            child, subagent_definition, child_reasoning
+        )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
@@ -2218,8 +2239,10 @@ def _build_child_agent(
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
-    child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
+    child_pool = (
+        None if subagent_definition is not None else _resolve_child_credential_pool(
+            effective_provider, parent_agent, effective_base_url
+        )
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -2823,6 +2846,7 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                **resolution_metadata(child),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -3007,7 +3031,10 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                read_only_knowledge=getattr(child, "memory_access_mode", None) == "read_only",
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
@@ -3738,6 +3765,8 @@ def _finalize_child_results(
     with _parent_finalization_lock(parent_agent):
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
+        for entry in results:
+            entry.update(resolution_metadata(child_by_index.get(entry.get("task_index"))))
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
             for entry in results:
@@ -4035,12 +4064,8 @@ def delegate_task(
     # ({provider, model, base_url, api_key, api_mode}); the /review engine
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Credentials are resolved below, after validating the entire task list.
+    # A named Codex child must never even consult an unrelated legacy pin.
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -4118,6 +4143,30 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    from tools.custom_subagents import parse_definitions, resolve_definition, resolve_named_credentials
+
+    task_runtime = []
+    legacy_creds = None
+    try:
+        definitions = parse_definitions(cfg)
+        for i, task in enumerate(task_list):
+            definition = resolve_definition(definitions, task.get("subagent_type"))
+            if definition is not None and credentials_cfg:
+                raise ValueError("named subagents cannot override an internal credentials_cfg route")
+            if definition is None:
+                if legacy_creds is None:
+                    legacy_creds = _resolve_delegation_credentials(
+                        credentials_cfg if credentials_cfg else cfg, parent_agent
+                    )
+                task_creds = legacy_creds
+                reasoning = None
+            else:
+                task_creds, reasoning = resolve_named_credentials(definition, cfg, parent_agent)
+            task_runtime.append((definition, task_creds, reasoning))
+    except ValueError as exc:
+        return tool_error(f"Task {len(task_runtime)} preflight failed: {exc}")
+    creds = task_runtime[0][1]
+
     overall_start = time.monotonic()
     results = []
 
@@ -4180,6 +4229,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        definition, creds, reasoning = task_runtime[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -4212,6 +4262,8 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                **({"subagent_definition": definition, "resolved_reasoning": reasoning}
+                   if definition is not None else {}),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -5209,6 +5261,22 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+    from copy import deepcopy
+    from tools.custom_subagents import parse_definitions
+    try:
+        definitions = parse_definitions(_load_config())
+    except ValueError:
+        definitions = {}  # Spawn reports the invalid config without breaking control actions.
+    if definitions:
+        task_schema = deepcopy(overrides_params["properties"]["tasks"])
+        task_schema["items"]["properties"]["subagent_type"] = {
+            "type": "string",
+            "enum": sorted(definitions),
+            "description": "Optional trusted subagent definition. " + " ".join(
+                f"{name}: {definitions[name].description}" for name in sorted(definitions)
+            ),
+        }
+        overrides_params["properties"]["tasks"] = task_schema
 
     return {
         "description": _build_top_level_description(),

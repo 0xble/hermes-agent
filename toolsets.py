@@ -183,6 +183,14 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
+
+    # Singleton alias used as a deny toolset for delegated children. Keep the
+    # mixed public ``skills`` toolset unchanged for backwards compatibility.
+    "skill_management": {
+        "description": "Create, edit, and manage shared skill documents",
+        "tools": ["skill_manage"],
+        "includes": [],
+    },
     
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",

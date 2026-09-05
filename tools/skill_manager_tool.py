@@ -2006,6 +2006,13 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    from agent.delegation_context import is_read_only_knowledge_context
+    if is_read_only_knowledge_context():
+        return tool_error(
+            "Delegated children have read-only access to shared skills; "
+            "return proposed skill changes to the parent agent.",
+            success=False,
+        )
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None,

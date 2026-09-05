@@ -571,6 +571,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        memory_access_mode: str | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -588,6 +589,7 @@ class AIAgent:
             provider=provider,
             requested_provider=requested_provider,
             capabilities=capabilities,
+            memory_access_mode=memory_access_mode,
             api_mode=api_mode,
             acp_command=acp_command,
             acp_args=acp_args,
@@ -6363,6 +6365,10 @@ class AIAgent:
         return run_codex_create_stream_fallback(self, api_kwargs, client)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
+        # Named children never re-resolve singleton/pool credentials mid-run.
+        # Parent refresh can authorize a fresh child after expiration.
+        if getattr(self, "_delegation_runtime_pin", None) is not None:
+            return False
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
             return False
 
@@ -8280,12 +8286,19 @@ class AIAgent:
     def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        kwargs = build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        pin = getattr(self, "_delegation_runtime_pin", None)
+        if pin is not None:
+            pin.validate_request(self, kwargs)
+        return kwargs
 
     def _current_reasoning_config(self) -> dict | None:
         """Return this task's explicit turn override or the session baseline."""
         from agent.reasoning_context import turn_reasoning_context
 
+        pin = getattr(self, "_delegation_runtime_pin", None)
+        if pin is not None:
+            return pin.reasoning_config()
         return turn_reasoning_context.current(self) or self.reasoning_config
 
     def _supports_reasoning_extra_body(self) -> bool:
