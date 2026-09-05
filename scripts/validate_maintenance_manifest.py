@@ -15,12 +15,6 @@ _INDEX_ROW_RE = re.compile(
 )
 _RECORD_RE = re.compile(r"^###\s+(HERMES-\d+)\b")
 _SUBJECT_RE = re.compile(r"`([^`]+)`")
-_SQUASH_PR_SUFFIX_RE = re.compile(r" \(#[1-9][0-9]*\)$")
-
-
-def _canonical_subject(subject: str) -> str:
-    """Strip GitHub's automatic squash-merge PR-number suffix."""
-    return _SQUASH_PR_SUFFIX_RE.sub("", subject)
 
 
 def _duplicates(values: Iterable[str]) -> list[str]:
@@ -147,14 +141,7 @@ def _validate_registration_history(
             text=True,
             capture_output=True,
         )
-        if (
-            manifest.returncode != 0
-            or _canonical_subject(subject)
-            not in {
-                _canonical_subject(registered)
-                for registered in _registered_subjects(manifest.stdout)
-            }
-        ):
+        if manifest.returncode != 0 or subject not in _registered_subjects(manifest.stdout):
             errors.append(
                 f"fork subject was not registered in its own commit {commit[:12]}: {subject}"
             )
@@ -269,37 +256,21 @@ def validate_manifest(
 
     if fork_subjects is not None:
         coverage_label = f"{upstream_ref}..HEAD" if upstream_ref else "fork history"
-        canonical_fork_subjects = {_canonical_subject(subject) for subject in fork_subjects}
         indexed_subjects = {
             subject for _patch_id, _status, subjects in rows for subject in subjects
         }
-        canonical_indexed_subjects = {
-            _canonical_subject(subject) for subject in indexed_subjects
-        }
-        canonical_exemptions = {
-            _canonical_subject(subject) for subject in exemptions
-        }
         for patch_id, _status, subjects in rows:
             for subject in subjects:
-                if _canonical_subject(subject) not in canonical_fork_subjects:
+                if subject not in fork_subjects:
                     errors.append(
                         f"{patch_id} stable subject missing from "
                         f"{coverage_label}: {subject}"
                     )
-        covered_subjects = canonical_indexed_subjects | canonical_exemptions
-        for subject in sorted(
-            original
-            for original in fork_subjects
-            if _canonical_subject(original) not in covered_subjects
-        ):
+        for subject in sorted(fork_subjects - indexed_subjects - set(exemptions)):
             errors.append(
                 "fork-only subject is neither indexed nor exempt: " + subject
             )
-        for subject in sorted(
-            original
-            for original in exemptions
-            if _canonical_subject(original) not in canonical_fork_subjects
-        ):
+        for subject in sorted(set(exemptions) - fork_subjects):
             errors.append(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )

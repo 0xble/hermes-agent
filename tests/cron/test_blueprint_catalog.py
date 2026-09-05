@@ -8,7 +8,6 @@ cron job store.
 
 import importlib
 import json
-import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,22 +40,6 @@ class TestCatalog:
     def test_bad_slot_type_rejected(self):
         with pytest.raises(ValueError):
             BlueprintSlot(name="x", type="bogus", label="X")
-
-    def test_declared_skills_are_bundled_and_daily_brief_reference_exists(self):
-        repo_root = Path(__file__).resolve().parents[2]
-        skill_files = list((repo_root / "skills").glob("**/SKILL.md"))
-        bundled_names = {
-            match.group(1)
-            for path in skill_files
-            if (match := re.search(r"(?m)^name:\s*['\"]?([^'\"\n]+)", path.read_text()))
-        }
-
-        declared = {name for blueprint in CATALOG for name in blueprint.skills}
-        assert declared <= bundled_names
-        assert (
-            repo_root
-            / "skills/productivity/google-workspace/references/daily-brief.md"
-        ).is_file()
 
 
 class TestScheduleResolution:
@@ -135,43 +118,6 @@ class TestValidation:
             get_blueprint("morning-brief"), {"time": "08:00"}, origin={"platform": "telegram", "chat_id": "9"}
         )
         assert spec["origin"] == {"platform": "telegram", "chat_id": "9"}
-
-    def test_workday_start_uses_canonical_tasks_as_read_only_authority(self):
-        blueprint = get_blueprint("workday-start")
-        assert blueprint is not None
-        spec = fill_blueprint(blueprint, {})
-        assert "canonical task source" in spec["prompt"]
-        assert "discovery lead, not as task-state authority" in spec["prompt"]
-        assert "Read only" in spec["prompt"]
-        assert "do not create or change tasks, calendar events, or messages" in spec["prompt"]
-
-    @pytest.mark.parametrize(
-        ("key", "skill", "state_dir"),
-        [
-            ("price-watch", "product-price-monitor", "price-watches"),
-            ("competitor-watch", "competitor-news-monitor", "competitor-watches"),
-        ],
-    )
-    def test_monitor_prompts_keep_owner_and_bound_state(self, key, skill, state_dir):
-        blueprint = get_blueprint(key)
-        assert blueprint is not None
-        spec = fill_blueprint(blueprint, {})
-        assert spec["skills"] == [skill]
-        assert state_dir in spec["prompt"]
-        assert "one JSON watch contract scoped to this watch" in spec["prompt"]
-        assert "write it atomically" in spec["prompt"]
-        assert "read it back after writes" in spec["prompt"]
-        assert "credentials" in spec["prompt"]
-        assert "[SILENT]" in spec["prompt"]
-        if key == "competitor-watch":
-            assert spec["schedule"] == "0 9 * * 1"
-
-    def test_gratitude_cron_does_not_claim_future_reply_ownership(self):
-        blueprint = get_blueprint("gratitude-journal")
-        assert blueprint is not None
-        prompt = fill_blueprint(blueprint, {})["prompt"]
-        assert "If they reply" not in prompt
-        assert prompt.endswith("One message.")
 
 
 class TestRenderers:

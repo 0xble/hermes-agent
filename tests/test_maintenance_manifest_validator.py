@@ -189,46 +189,6 @@ def test_explicit_administrative_subject_exemption_is_accepted(tmp_path):
     ) == []
 
 
-def test_fork_coverage_accepts_github_squash_suffix(tmp_path):
-    path = _write(
-        tmp_path,
-        INDEX
-        + """
-### HERMES-001 — One
-- **Upstream tracking:** None.
-- **Upstream PR:** None.
-### HERMES-002 — Two
-- **Upstream tracking:** None.
-- **Upstream PR:** None.
-""",
-    )
-
-    assert validate_manifest(
-        path,
-        fork_subjects={"fix: one (#42)", "fix: two", "docs: retire two"},
-    ) == []
-
-
-def test_fork_coverage_accepts_exact_suffixed_registration(tmp_path):
-    path = _write(
-        tmp_path,
-        INDEX.replace("`fix: one`", "`fix: one (#42)`")
-        + """
-### HERMES-001 — One
-- **Upstream tracking:** None.
-- **Upstream PR:** None.
-### HERMES-002 — Two
-- **Upstream tracking:** None.
-- **Upstream PR:** None.
-""",
-    )
-
-    assert validate_manifest(
-        path,
-        fork_subjects={"fix: one (#42)", "fix: two", "docs: retire two"},
-    ) == []
-
-
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args],
@@ -299,59 +259,6 @@ def test_history_validation_accepts_same_commit_registration(tmp_path):
     _git(repo, "commit", "-m", "fix: registered")
 
     assert validate_manifest(manifest, history_baseline=baseline) == []
-
-
-def test_history_validation_accepts_github_squash_suffix(tmp_path):
-    repo, manifest, baseline = _init_history_repo(tmp_path)
-    manifest.write_text(
-        manifest.read_text(encoding="utf-8").replace(
-            "`fix: one`", "`fix: one`; `fix: registered`"
-        ),
-        encoding="utf-8",
-    )
-    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
-    _git(repo, "add", "MAINTENANCE.md", "feature.py")
-    _git(repo, "commit", "-m", "fix: registered (#42)")
-
-    assert validate_manifest(manifest, history_baseline=baseline) == []
-
-
-def test_history_validation_accepts_exact_suffixed_registration(tmp_path):
-    repo, manifest, baseline = _init_history_repo(tmp_path)
-    manifest.write_text(
-        manifest.read_text(encoding="utf-8").replace(
-            "`fix: one`", "`fix: one`; `fix: registered (#41)`"
-        ),
-        encoding="utf-8",
-    )
-    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
-    _git(repo, "add", "MAINTENANCE.md", "feature.py")
-    _git(repo, "commit", "-m", "fix: registered (#42)")
-
-    assert validate_manifest(manifest, history_baseline=baseline) == []
-
-
-@pytest.mark.parametrize(
-    "suffix",
-    [" (#0)", " (#01)", " (#abc)", "(#42)", " (#42) extra"],
-)
-def test_history_validation_rejects_non_github_squash_suffixes(tmp_path, suffix):
-    repo, manifest, baseline = _init_history_repo(tmp_path)
-    manifest.write_text(
-        manifest.read_text(encoding="utf-8").replace(
-            "`fix: one`", "`fix: one`; `fix: registered`"
-        ),
-        encoding="utf-8",
-    )
-    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
-    _git(repo, "add", "MAINTENANCE.md", "feature.py")
-    _git(repo, "commit", "-m", f"fix: registered{suffix}")
-
-    errors = validate_manifest(manifest, history_baseline=baseline)
-
-    assert len(errors) == 1
-    assert "fork subject was not registered in its own commit" in errors[0]
-    assert f"fix: registered{suffix}" in errors[0]
 
 
 def test_trusted_policy_validates_immutable_pull_request_head():

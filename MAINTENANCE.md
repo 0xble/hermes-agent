@@ -127,7 +127,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-103 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Prevent singleton Codex auth recovery from overwriting independently added pooled accounts. |
 | HERMES-104 | Active | `feat(delegate): add named custom subagents` | Select trusted named children with fixed subscription routes and read-only shared knowledge. |
 | HERMES-105 | Active | `fix(telegram): recover stranded answers after polling health returns` | Pace degraded retries and wake the identity-scoped delivery ledger after internal recovery, including late failure writes. |
-| HERMES-106 | Active | `fix(prompt): keep runtime guidance scope-bound`; `fix(prompt): preserve persistent memory after compaction` | Route skills by material task relevance, keep recalled context reference-only while preserving applicable persistent-memory preferences, gate skill maintenance by ownership, and execute side effects within already authorized scope. |
+| HERMES-106 | Retired | `fix(prompt): keep runtime guidance scope-bound`; `fix(prompt): preserve persistent memory after compaction`; `revert(astra): retire instruction support patches` | Historical Astra-specific runtime guidance and bundled blueprint hardening, reverted before runtime promotion at the user's request. |
 
 ## Fork-only administrative subject exemptions
 
@@ -208,6 +208,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `Merge pull request #19 from 0xble/feat/merge-side-session` | GitHub-authored merge wrapper around the indexed side-session merge patch; no additional behavior. |
 | `Merge remote-tracking branch 'origin/main' into fix/worktree-path-warning` | Task-owned integration of the current reviewed fork base into PR #25; no additional behavior beyond the indexed worktree advisory. |
 | `Merge remote-tracking branch 'origin/main' into fix/astra-instruction-remediation` | Task-owned integration of the current fork base into PR #54; no additional behavior beyond the indexed instruction-remediation patch and upstream source. |
+| `Merge pull request #54 from 0xble/fix/astra-instruction-remediation` | GitHub-authored merge wrapper around retired HERMES-106; no active behavior remains after `revert(astra): retire instruction support patches`. |
 | `fix(ci): advance maintenance baseline after auth patch` | Repairs the history gate after PR #46 was merged without its patch record; the commit adds HERMES-103 and makes no shipped Hermes behavior change. |
 | `fix(ci): prepare local-first fork verification (#49)` | Transitional trusted-policy compatibility needed to land the local-first CI shape in a separately reviewed follow-up; also adds local verific...[truncated]
 | `fix(ci): advance maintenance baseline after goal patch` | Repairs the history gate after PR #50's squash suffix diverged from HERMES-071 and records the pre-fix-compatible behavioral regression; no shipped Hermes behavior changes. |
@@ -217,6 +218,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-106 — Retired Astra instruction support
+
+- **Summary:** Historical Astra-specific prompt, memory-context, compaction-prefix, and bundled cron-blueprint hardening from PR #54. The implementation and duplicate regressions were completely removed at the user's request before any runtime promotion. No compatibility shim or retired production logic remains.
+- **Surfaces:** Historical only: `agent/prompt_builder.py`; `agent/memory_manager.py`; `agent/context_compressor.py`; `cron/blueprint_catalog.py`; their focused tests; this record.
+- **Upstream tracking:** None. This was fork-only work and is intentionally retired.
+- **Upstream PR:** None.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/agent/test_streaming_context_scrubber.py tests/agent/test_summary_prefix_semantics.py tests/cron/test_blueprint_catalog.py tests/test_maintenance_manifest_validator.py -q`; byte-identity checks compare the retired production surfaces with the pre-Astra first-parent baseline while preserving later independent memory-label work.
+- **Published commit identity:** Historical stable subjects `fix(prompt): keep runtime guidance scope-bound` and `fix(prompt): preserve persistent memory after compaction`; removal subject `revert(astra): retire instruction support patches`.
+- **Rollback:** The removal commit restores the pre-Astra source behavior and removes the PR #58 suffix-normalization validator logic. Do not restore the retired patch without new explicit authorization. The exact PR #58 subject remains registered as an administrative history exemption because Git history is immutable. No schema, configuration, profile, workflow, or runtime change is required.
+- **Retired:** `revert(astra): retire instruction support patches` (2026-09-05). Source-only retirement requested by the user; the active runtime was not promoted from PR #54, so no emitted compaction prefix or deployed compatibility state required preservation.
 
 ### HERMES-105 — Recover Answers After Internal Telegram Recovery
 
@@ -239,19 +251,6 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Published commit identity:** Expected stable subject `feat(delegate): add named custom subagents`.
 - **Rollback:** Revert only `feat(delegate): add named custom subagents` and remove its configuration entries during a separately authorized deployment. Preserve legacy delegation defaults, the Astra parent, and AutoReview policy. Source landing does not activate any profile.
 - **Retirement:** Retire after released upstream provides equivalent trusted named selection, whole-batch preflight, subscription-account isolation, every child request's effort guarantee, read-only authorized shared knowledge, stable prompt prefixes, and native lifecycle behavior, with the same regression contract passing.
-
-### HERMES-106 — Keep runtime guidance scope-bound
-
-- **Independent hypothesis (2026-09-04):** Runtime prompt text over-routed tangential skills, universally advised mutating flawed skills, elevated recalled and compacted memory to authority, and told the model to reconfirm every side effect even when the user had already authorized its scope.
-- **Summary:** Route only skills that directly govern the task or a material subtask through progressive disclosure; gate skill maintenance on task authorization, profile/source ownership, and the live schema; keep recalled memory and compacted task history reference-only while preserving applicable persistent-memory preferences and conventions without letting memory override the latest user message or grant new authorization; and preserve tool/platform approval gates while acting inside already authorized scope.
-- **Surfaces:** `agent/prompt_builder.py`; `agent/memory_manager.py`; `agent/context_compressor.py`; `tests/agent/test_prompt_builder.py`; `tests/agent/test_streaming_context_scrubber.py`; `tests/agent/test_summary_prefix_semantics.py`; this record.
-- **Upstream tracking:** No upstream issue or PR filed from this implementation-only worktree as of 2026-09-04; parent task owns independent review and publication decisions.
-- **Upstream PR:** None as of 2026-09-04.
-- **Regression:** `scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/agent/test_streaming_context_scrubber.py tests/agent/test_summary_prefix_semantics.py -q`; coverage must exercise a temp-`HERMES_HOME` skill index, current and legacy memory-note cleanup, generated recalled-memory text, current compaction guidance, and retired-prefix detection/stripping.
-- **Expected published commit identity:** Stable subjects `fix(prompt): keep runtime guidance scope-bound` and `fix(prompt): preserve persistent memory after compaction`; source, regressions, and this lifecycle record ship together. No runtime promotion occurred in this source-landing task.
-- **Rollback:** Revert the HERMES-106 source and focused tests together, but retain the retired authoritative-memory compaction prefix in `_HISTORICAL_SUMMARY_PREFIXES` once any runtime has emitted the new prefix. Existing sessions retain their cached prompt until restarted; no schema or persistent-data migration is required.
-- **Retirement:** Retire after released upstream provides equivalent task-specific skill routing, maintenance ownership gates, reference-only recalled and compacted task context with applicable persistent-memory preferences, authorized-scope side-effect guidance, and historical-prefix normalization with equivalent regressions.
-- **Reusable blueprint contract:** Keep bundled blueprint skill owners and valid bundled references intact; treat recent context as a discovery lead rather than canonical task state, keep read-only briefs non-mutating, confine monitor state to one profile-local watch contract with verified writes, and do not promise follow-up handling that a one-shot cron invocation cannot own. Focused regression: `scripts/run_tests.sh tests/cron/test_blueprint_catalog.py -q`.
 
 ### HERMES-103 — Isolate manually added Codex accounts
 
