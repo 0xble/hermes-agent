@@ -480,41 +480,6 @@ CREATE TABLE IF NOT EXISTS messages (
     display_metadata TEXT
 );
 
--- Durable reply routing for continuable /side conversations. A
--- platform message names one child inside its originating identity scope.
-CREATE TABLE IF NOT EXISTS side_message_bindings (
-    platform TEXT NOT NULL,
-    chat_id TEXT NOT NULL,
-    thread_id TEXT NOT NULL DEFAULT '',
-    user_id TEXT NOT NULL DEFAULT '',
-    message_id TEXT NOT NULL,
-    side_route_key TEXT NOT NULL,
-    side_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    created_at REAL NOT NULL,
-    PRIMARY KEY (platform, chat_id, thread_id, user_id, message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_side_message_bindings_route
-ON side_message_bindings(side_route_key);
-
--- Immutable side-to-main context imports. The destination root stays stable
--- across compression children, while source_cutoff_message_id makes retries
--- exactly-once and later merges incremental.
-CREATE TABLE IF NOT EXISTS session_context_merges (
-    destination_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    destination_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    side_root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    side_tip_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    previous_cutoff_message_id INTEGER NOT NULL DEFAULT 0,
-    source_cutoff_message_id INTEGER NOT NULL,
-    receipt_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    created_at REAL NOT NULL,
-    PRIMARY KEY (destination_root_session_id, side_root_session_id, source_cutoff_message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_session_context_merges_latest
-ON session_context_merges(destination_root_session_id, side_root_session_id, source_cutoff_message_id DESC);
-
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
