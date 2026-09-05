@@ -54,7 +54,7 @@ jobs:
           candidate/MAINTENANCE.md
           --upstream-ref canonical-upstream/main
           --history-baseline
-          f0efcb2ff0b1da37cccfcd0726df60628923ca9c
+          93455e0d6b40305ac2c9486a06e701d9aef205ca
       - name: Install pinned uv for trusted workflow policy
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:
