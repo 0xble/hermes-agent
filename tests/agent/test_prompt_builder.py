@@ -86,6 +86,15 @@ class TestGuidanceConstants:
         assert "exact transcript evidence" in SEMANTIC_MEMORY_HISTORY_GUIDANCE
         assert "canonical live systems" in SEMANTIC_MEMORY_HISTORY_GUIDANCE
 
+    def test_execution_safety_uses_existing_authorized_scope(self):
+        guidance = OPENAI_MODEL_EXECUTION_GUIDANCE
+
+        assert "act within scope the user has already authorized" in guidance
+        assert "preserve any tool or platform approval gates" in guidance
+        assert "scope remains unresolved" in guidance
+        assert "action would expand it" in guidance
+        assert "confirm scope before executing" not in guidance
+
 
 # =========================================================================
 # Context injection scanning
@@ -349,6 +358,43 @@ class TestBuildSkillsSystemPrompt:
 
         assert "\n  general:\n    - git-worktree-discipline:" in result
         assert "\n  git-worktree-discipline:\n" not in result
+
+    def test_skill_routing_is_task_specific_and_progressively_disclosed(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "health" / "nutrition"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: nutrition\ndescription: Plan meals and nutrition\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "directly govern the task or a material subtask" in result
+        assert "progressive disclosure" in result
+        assert "real domain work covered by a skill" in result
+        assert "merely tangential or partially related" in result
+        assert "even partially relevant" not in result
+        assert "Err on the side of loading" not in result
+
+    def test_skill_maintenance_respects_authorization_and_ownership(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "general" / "owned-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: owned-skill\ndescription: Perform owned work\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "skill maintenance is authorized" in result
+        assert "within your owned scope" in result
+        assert "canonical owner" in result
+        assert "live skill_manage schema and ownership gates" in result
+        assert "skill_manage(action='patch')" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

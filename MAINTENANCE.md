@@ -125,6 +125,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-101 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
 | HERMES-102 | Active | `fix(compression): preserve fallback at route deadline` | Make the configured compression fallback independent of whether the worker or host observes the shared hard deadline first. |
 | HERMES-103 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Prevent singleton Codex auth recovery from overwriting independently added pooled accounts. |
+| HERMES-104 | Active | `fix(prompt): keep runtime guidance scope-bound` | Route skills by material task relevance, keep memory reference-only, gate skill maintenance by ownership, and execute side effects within already authorized scope. |
 
 ## Fork-only administrative subject exemptions
 
@@ -210,6 +211,19 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+### HERMES-104 — Keep runtime guidance scope-bound
+
+- **Independent hypothesis (2026-09-04):** Runtime prompt text over-routed tangential skills, universally advised mutating flawed skills, elevated recalled and compacted memory to authority, and told the model to reconfirm every side effect even when the user had already authorized its scope.
+- **Summary:** Route only skills that directly govern the task or a material subtask through progressive disclosure; gate skill maintenance on task authorization, profile/source ownership, and the live schema; label recalled and compacted memory as reference-only hints that cannot supply instructions, authorization, or current authority; and preserve tool/platform approval gates while acting inside already authorized scope.
+- **Surfaces:** `agent/prompt_builder.py`; `agent/memory_manager.py`; `agent/context_compressor.py`; `tests/agent/test_prompt_builder.py`; `tests/agent/test_streaming_context_scrubber.py`; `tests/agent/test_summary_prefix_semantics.py`; this record.
+- **Upstream tracking:** No upstream issue or PR filed from this implementation-only worktree as of 2026-09-04; parent task owns independent review and publication decisions.
+- **Upstream PR:** None as of 2026-09-04.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_prompt_builder.py tests/agent/test_streaming_context_scrubber.py tests/agent/test_summary_prefix_semantics.py -q`; coverage must exercise a temp-`HERMES_HOME` skill index, current and legacy memory-note cleanup, generated recalled-memory text, current compaction guidance, and retired-prefix detection/stripping.
+- **Expected published commit identity:** Stable subject `fix(prompt): keep runtime guidance scope-bound`; source, regressions, and this lifecycle record ship together. No commit, push, or runtime promotion occurred in this implementation subtask.
+- **Rollback:** Revert the HERMES-104 source and focused tests together, but retain the retired authoritative-memory compaction prefix in `_HISTORICAL_SUMMARY_PREFIXES` once any runtime has emitted the new prefix. Existing sessions retain their cached prompt until restarted; no schema or persistent-data migration is required.
+- **Retirement:** Retire after released upstream provides equivalent task-specific skill routing, maintenance ownership gates, reference-only recalled and compacted memory, authorized-scope side-effect guidance, and historical-prefix normalization with equivalent regressions.
+- **Reusable blueprint contract:** Keep bundled blueprint skill owners and valid bundled references intact; treat recent context as a discovery lead rather than canonical task state, keep read-only briefs non-mutating, confine monitor state to one profile-local watch contract with verified writes, and do not promise follow-up handling that a one-shot cron invocation cannot own. Focused regression: `scripts/run_tests.sh tests/cron/test_blueprint_catalog.py -q`.
+
 ### HERMES-103 — Isolate manually added Codex accounts
 
 - **Independent hypothesis (2026-09-03):** A rejected singleton Codex refresh recovered from the active CLI account and then replaced independently added `manual:device_code` pool entries under their old labels because the pool synchronized every manual entry without verifying singleton provenance.
