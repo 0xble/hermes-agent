@@ -25341,6 +25341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        session_key: Optional[str] = None,
+        enqueue_continuation: bool = True,
+        emit_status_notice: bool = True,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
@@ -25404,10 +25407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # would show "✓ Goal achieved" before the answer itself. Registering
         # an awaited post-delivery callback preserves delivery reliability
         # without reversing the user-visible ordering.
-        if msg and source is not None:
+        if msg and source is not None and emit_status_notice:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
-        if not decision.get("should_continue"):
+        if not decision.get("should_continue") or not enqueue_continuation:
             return
 
         prompt = decision.get("continuation_prompt") or ""
@@ -25418,7 +25421,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # flight preempts the continuation naturally.
         try:
             adapter = self._adapter_for_source(source)
-            _quick_key = self._session_key_for_source(source)
+            _quick_key = session_key or self._session_key_for_source(source)
             if adapter and _quick_key:
                 cont_event = MessageEvent(
                     text=prompt,
