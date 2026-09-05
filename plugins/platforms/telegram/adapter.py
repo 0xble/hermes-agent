@@ -3058,7 +3058,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self._polling_conflict_recovery_generation = None
         else:
             self._polling_conflict_count = 0
+        was_degraded = getattr(self, "_send_path_degraded", False)
         self._send_path_degraded = False
+        if was_degraded and getattr(self, "gateway_runner", None) is not None:
+            # Polling owns the health transition, not the gateway reconnect
+            # watcher. Wake the durable ledger on this edge without blocking
+            # getUpdates or emitting a task on every healthy long-poll.
+            task = asyncio.create_task(self._redeliver_recovered_send_path())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(_consume_abandoned_task)
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -6141,7 +6150,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
-            return SendResult(success=False, error="send_path_degraded", retryable=True)
+            # Adapted from upstream #93440: let polling prove recovery before
+            # spending the generic send loop's small retry budget.
+            return SendResult(
+                success=False,
+                error="send_path_degraded",
+                retryable=True,
+                retry_after=_POLLING_PROGRESS_TIMEOUT,
+                error_kind="transient",
+            )
 
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
