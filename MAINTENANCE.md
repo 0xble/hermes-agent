@@ -206,6 +206,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): prepare local-first fork verification (#49)` | Transitional trusted-policy compatibility needed to land the local-first CI shape in a separately reviewed follow-up; also adds local verific...[truncated]
 | `fix(ci): advance maintenance baseline after goal patch` | Repairs the history gate after PR #50's squash suffix diverged from HERMES-071 and records the pre-fix-compatible behavioral regression; no shipped Hermes behavior changes. |
 | `fix(ci): adopt local-first fork verification (#52)` | Fork-administrative CI cost control: makes local checks the normal trusted-development gate, caps ordinary hosted PR work, and reserves full cross-platform lanes for explicit or bounded triggers; no shipped Hermes behavior. |
+| `fix(ci): advance maintenance baseline after local-first CI` | Operator-approved reconciliation of PR #52's squash-added subject suffix. Move the exact trusted baseline to PR #52 while retaining same-commit registration for every later commit. Workflow and trusted-policy expectation change together; no runtime or AutoReview changes. |
 
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
