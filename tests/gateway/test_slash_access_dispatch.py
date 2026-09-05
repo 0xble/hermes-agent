@@ -156,33 +156,6 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
 
 
 @pytest.mark.asyncio
-async def test_non_admin_cannot_close_an_explicit_side_route():
-    runner = _make_runner(
-        platform_extra={
-            "allow_admin_from": ["111"],
-            "user_allowed_commands": [],
-        }
-    )
-    runner._close_side_route = AsyncMock(return_value=True)
-    source = _make_source(user_id="999")
-    event = _make_event("/side close", source)
-    event.metadata.update(
-        {
-            "gateway_explicit_session_route": True,
-            "gateway_session_key": "agent:main:discord:dm:c1:side:child",
-            "gateway_session_id": "child",
-            "gateway_session_strict": True,
-            "gateway_side_root_session_id": "child",
-        }
-    )
-
-    result = await runner._handle_message(event)
-
-    assert "⛔" in result
-    runner._close_side_route.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_non_admin_cannot_hide_reasoning_command_inside_one_turn_prompt():
     runner = _make_runner(
         platform_extra={

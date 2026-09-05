@@ -1553,60 +1553,6 @@ class SessionSchemaMixin:
                 # rows, but clear migrated rows so future writes do not keep
                 # one large prompt copy per session.
                 self._dedupe_legacy_system_prompts(cursor)
-            if current_version < 31:
-                # v31: the old primary key omitted transport discriminators
-                # that are part of normal gateway session identity. Rebuild so
-                # multiplexed profiles, Slack workspaces, and Telegram Business
-                # connections cannot overwrite one another's side reply route.
-                columns = {
-                    row["name"] if isinstance(row, sqlite3.Row) else row[1]
-                    for row in cursor.execute(
-                        "PRAGMA table_info(side_message_bindings)"
-                    ).fetchall()
-                }
-                required = {"profile", "scope_id", "business_connection_id"}
-                if not required.issubset(columns):
-                    cursor.execute(
-                        "ALTER TABLE side_message_bindings "
-                        "RENAME TO side_message_bindings_v30"
-                    )
-                    cursor.execute(
-                        """CREATE TABLE side_message_bindings (
-                               platform TEXT NOT NULL,
-                               chat_id TEXT NOT NULL,
-                               thread_id TEXT NOT NULL DEFAULT '',
-                               user_id TEXT NOT NULL DEFAULT '',
-                               profile TEXT NOT NULL DEFAULT '',
-                               scope_id TEXT NOT NULL DEFAULT '',
-                               business_connection_id TEXT NOT NULL DEFAULT '',
-                               message_id TEXT NOT NULL,
-                               side_route_key TEXT NOT NULL,
-                               side_root_session_id TEXT NOT NULL
-                                   REFERENCES sessions(id) ON DELETE CASCADE,
-                               created_at REAL NOT NULL,
-                               PRIMARY KEY (
-                                   platform, chat_id, thread_id, user_id,
-                                   profile, scope_id, business_connection_id,
-                                   message_id
-                               )
-                           )"""
-                    )
-                    cursor.execute(
-                        """INSERT INTO side_message_bindings (
-                               platform, chat_id, thread_id, user_id, profile,
-                               scope_id, business_connection_id, message_id,
-                               side_route_key, side_root_session_id, created_at
-                           )
-                           SELECT platform, chat_id, thread_id, user_id, '', '', '',
-                                  message_id, side_route_key, side_root_session_id,
-                                  created_at
-                             FROM side_message_bindings_v30"""
-                    )
-                    cursor.execute("DROP TABLE side_message_bindings_v30")
-                    cursor.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_side_message_bindings_route "
-                        "ON side_message_bindings(side_route_key)"
-                    )
             if current_version < 30 and fts5_available:
                 # v29: cron sessions remain canonical and stay in the standard
                 # word index, but no longer inflate the trigram substring index.
