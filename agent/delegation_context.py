@@ -33,6 +33,17 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 )
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+_READ_ONLY_KNOWLEDGE_CONTEXT: ContextVar[bool] = ContextVar(
+    "hermes_read_only_knowledge_context", default=False,
+)
+READ_ONLY_KNOWLEDGE_ENV_MARKER = "HERMES_READ_ONLY_KNOWLEDGE_CONTEXT"
+
+
+def is_read_only_knowledge_context() -> bool:
+    """Named-child knowledge authority, including ordinary tool subprocesses."""
+    import os
+    return bool(_READ_ONLY_KNOWLEDGE_CONTEXT.get()) or os.environ.get(READ_ONLY_KNOWLEDGE_ENV_MARKER) == "1"
+
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
@@ -46,7 +57,9 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None, *, read_only_knowledge: bool = False,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity.
 
     Child construction calls ``set_current_session_id`` internally, so even a
@@ -54,6 +67,9 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     execution passes its explicit id and receives it only for this scope.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    knowledge_token = _READ_ONLY_KNOWLEDGE_CONTEXT.set(
+        bool(read_only_knowledge or is_read_only_knowledge_context())
+    )
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -62,6 +78,7 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _READ_ONLY_KNOWLEDGE_CONTEXT.reset(knowledge_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
@@ -136,6 +153,8 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     for key in KANBAN_ENV_KEYS:
         cleaned.pop(key, None)
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
+    if is_read_only_knowledge_context():
+        cleaned[READ_ONLY_KNOWLEDGE_ENV_MARKER] = "1"
     return cleaned
 
 

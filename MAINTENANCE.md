@@ -125,6 +125,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-101 | Active | `feat(cron): verify observable agent completion (#44)` | Let trusted user-owned post-run scripts fail a cron invocation whose agent reply is not backed by the required external state, without constraining the agent's engineering process. |
 | HERMES-102 | Active | `fix(compression): preserve fallback at route deadline` | Make the configured compression fallback independent of whether the worker or host observes the shared hard deadline first. |
 | HERMES-103 | Active | `fix(auth): isolate manually added Codex accounts (#46)` | Prevent singleton Codex auth recovery from overwriting independently added pooled accounts. |
+| HERMES-104 | Active | `feat(delegate): add named custom subagents` | Select trusted named children with fixed subscription routes and read-only shared knowledge. |
 
 ## Fork-only administrative subject exemptions
 
@@ -211,6 +212,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-104 — Configure Named Custom Subagents
+
+- **Summary:** Extend native delegation with trusted `delegation.subagents` definitions and per-task `subagent_type`, fixed model/provider/effort, read-only shared knowledge, and nonsecret resolution metadata. Ordinary delegation and AutoReview keep their existing configuration and lifecycle.
+- **Surfaces:** `tools/custom_subagents.py`, `tools/delegate_tool.py`, `run_agent.py`, `agent/agent_init.py`, `agent/codex_runtime.py`, `agent/delegation_context.py`, `agent/memory_manager.py`, `agent/memory_provider.py`, `plugins/memory/hindsight/__init__.py`, `tools/memory_tool.py`, `tools/skill_manager_tool.py`, `tools/skills_tool.py`, `toolsets.py`, `hermes_cli/setup.py`, `scripts/smoke_custom_subagents.py`, `tests/tools/test_custom_subagents.py`, `tests/run_agent/test_custom_subagent_runtime.py`, `tests/test_custom_subagent_knowledge.py`, `website/docs/user-guide/features/delegation.md`, and this manifest.
+- **Upstream tracking:** Related open [issue #80222](https://github.com/NousResearch/hermes-agent/issues/80222), checked 2026-09-04. This implementation intentionally exposes named trusted definitions, not arbitrary model-callable route overrides.
+- **Upstream PR:** Related [#83343](https://github.com/NousResearch/hermes-agent/pull/83343) is open at `bf48118f5259e08d8e58ed26e91be7179597233b`, checked 2026-09-04. Its filesystem personas and capability narrowing do not implement this registry, subscription-route lock, or shared read-only knowledge contract. Related #4929, #18522, and #53531 are closed without merge. No direct upstream PR. The relevant #83343 feedback on repeated discovery and global mutable warning caches is avoided by one validated batch snapshot and no warning cache.
+- **Regression:** `scripts/run_tests.sh -j 4 tests/tools/test_custom_subagents.py tests/run_agent/test_custom_subagent_runtime.py tests/test_custom_subagent_knowledge.py tests/tools/test_delegate*.py tests/tools/test_async_delegation*.py tests/run_agent/test_run_agent_codex_responses.py -q`. Covers definition validation, whole-batch launch preflight, legacy delegation, concurrent efforts, correction/retry/iteration-summary paths, physical SDK route guards, cancellation, parent isolation, and parent-owned knowledge writes. `python scripts/smoke_custom_subagents.py` exercises actual Luna/Terra medium subscription calls, skill/standing-memory/session fixture attribution, a worker artifact and successful native command, and an authorization blocker. Full local CI and independent AutoReview receipts belong to the landing PR. Live smoke evidence must include `physical_request: true` entries for both exact models, not only request-builder entries. Read-only provider initialization failures and missing contracts are reported in `unavailable_memory_providers`; embedded Hindsight startup remains disabled and documented. The smoke is isolated, not production-bank or live-profile activation evidence.
+- **Published commit identity:** Expected stable subject `feat(delegate): add named custom subagents`.
+- **Rollback:** Revert only `feat(delegate): add named custom subagents` and remove its configuration entries during a separately authorized deployment. Preserve legacy delegation defaults, the Astra parent, and AutoReview policy. Source landing does not activate any profile.
+- **Retirement:** Retire after released upstream provides equivalent trusted named selection, whole-batch preflight, subscription-account isolation, every child request's effort guarantee, read-only authorized shared knowledge, stable prompt prefixes, and native lifecycle behavior, with the same regression contract passing.
+
 ### HERMES-103 — Isolate manually added Codex accounts
 
 - **Independent hypothesis (2026-09-03):** A rejected singleton Codex refresh recovered from the active CLI account and then replaced independently added `manual:device_code` pool entries under their old labels because the pool synchronized every manual entry without verifying singleton provenance.

@@ -193,6 +193,14 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def supports_read_only_prefetch(self) -> bool:
+        """Whether ``prefetch`` is safe in a read-only agent context.
+
+        Providers must opt in explicitly. The default is fail-closed because
+        legacy prefetch implementations may have incidental side effects.
+        """
+        return False
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Queue a background recall for the NEXT turn.
 
@@ -241,6 +249,10 @@ class MemoryProvider(ABC):
 
         Return empty list if this provider has no tools (context-only).
         """
+
+    def get_read_only_tool_names(self) -> set[str]:
+        """Enumerate pure-retrieval tools; unknown operations are withheld."""
+        return set()
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         """Handle a tool call for one of this provider's tools.

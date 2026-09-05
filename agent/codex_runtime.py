@@ -1633,6 +1633,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 agent,
                 next_api_kwargs,
             )
+            pin = getattr(agent, "_delegation_runtime_pin", None)
+            if pin is not None:
+                pin.validate_request(agent, stream_kwargs, client=active_client)
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
             return active_client.responses.create(**stream_kwargs)
