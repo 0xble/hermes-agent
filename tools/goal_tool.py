@@ -355,6 +355,12 @@ def _authorized_action(
         return False, "", context
     prefix = _direct_authorization_prefix(task_text, auth_start)
     suffix = task_text[auth_start + len(auth_text) :]
+    # Only the opening direct instruction in a user turn can authorize durable
+    # mutation. Completed fenced material is explicitly stripped by
+    # _direct_authorization_prefix; arbitrary prose before the directive is
+    # not a trusted content boundary.
+    if not _POSITIVE_DIRECTIVE_PREFIX_RE.fullmatch(prefix):
+        return False, "", context
     if (
         _NON_DIRECT_MUTATION_RE.search(context)
         or _NON_DIRECT_MUTATION_RE.search(prefix[-160:])

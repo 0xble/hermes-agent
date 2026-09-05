@@ -70,6 +70,28 @@ class TestGenerateTitle:
         ]
         assert llm.call_args_list[1].kwargs["messages"][1]["content"] == "Autofix this"
 
+    def test_never_forwards_remote_attachment_urls_to_auxiliary_route(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Screenshot Repair"}'
+        signed_url = "https://media.example.test/private.png?token=redacted"
+        config = {"auxiliary": {"title_generation": {"include_attachments": True}}}
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response) as llm,
+        ):
+            assert generate_title(
+                "Autofix this",
+                title_context=[
+                    {"type": "image_url", "image_url": {"url": signed_url}}
+                ],
+            ) == "Screenshot Repair"
+
+        provider_content = llm.call_args.kwargs["messages"][1]["content"]
+        assert provider_content == "Autofix this"
+        assert signed_url not in str(llm.call_args)
+
     def test_title_language_reads_config(self):
         cfg = {"auxiliary": {"title_generation": {"language": "  French "}}}
 

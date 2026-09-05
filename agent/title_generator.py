@@ -824,7 +824,7 @@ def _attachment_metadata_context(title_context: Any) -> str:
 
 
 def _title_request_content(text: str, title_context: Any) -> Any:
-    """Build bounded multimodal content from normalized native image parts."""
+    """Build opt-in multimodal content without forwarding remote URLs."""
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -848,14 +848,22 @@ def _title_request_content(text: str, title_context: Any) -> Any:
         if kind == "image_url":
             value = part.get("image_url")
             url = value.get("url") if isinstance(value, Mapping) else value
-            if isinstance(url, str) and url.strip():
+            if (
+                isinstance(url, str)
+                and url.strip().casefold().startswith("data:image/")
+                and ";base64," in url[:128].casefold()
+            ):
                 size = len(url.encode("utf-8"))
                 if encoded_used + size <= encoded_budget:
                     images.append(dict(part))
                     encoded_used += size
         elif kind == "input_image":
             value = part.get("image_url")
-            if isinstance(value, str) and value.strip():
+            if (
+                isinstance(value, str)
+                and value.strip().casefold().startswith("data:image/")
+                and ";base64," in value[:128].casefold()
+            ):
                 size = len(value.encode("utf-8"))
                 if encoded_used + size <= encoded_budget:
                     images.append(dict(part))
@@ -875,9 +883,9 @@ def _title_request_content(text: str, title_context: Any) -> Any:
 def _title_request_text(user_message: str, title_context: Any) -> str:
     """Combine visible text with privacy-safe attachment metadata.
 
-    Native attachment payloads deliberately stay on the primary model route.
-    Auxiliary title/icon routes can use a different provider and credential,
-    so forwarding attachment URLs or bytes here would cross a privacy boundary.
+    Native attachment payloads stay on the primary model route by default.
+    The separate opt-in multimodal builder permits bounded inline image bytes,
+    but never forwards remote or signed URLs to an auxiliary provider.
     """
     text = str(user_message or "").strip()
     metadata = _attachment_metadata_context(title_context)
