@@ -7257,28 +7257,14 @@ def run_job(
         )
 
         def _wait_for_cron_worker_exit() -> None:
-            """Keep this fire claimed until an interrupted worker actually exits."""
-            deadline = time.monotonic() + 5.0
-            while not _cron_future.done() and time.monotonic() < deadline:
+            """Keep this fire fenced until the interrupted worker actually exits."""
+            while not _cron_future.done():
                 _heartbeat_run_claim_if_due()
-                concurrent.futures.wait(
-                    {_cron_future},
-                    timeout=min(1.0, max(0.0, deadline - time.monotonic())),
-                )
-            if _cron_future.done():
-                return
-            with _running_lock:
-                _retained_worker_job_ids.add(job_id)
-                _running_futures[job_id] = _cron_future
-
-            def _release_lingering_worker(_future) -> None:
-                with _running_lock:
-                    _retained_worker_job_ids.discard(job_id)
-                    _running_job_ids.discard(job_id)
-                    _running_since.pop(job_id, None)
-                    _running_futures.pop(job_id, None)
-
-            _cron_future.add_done_callback(_release_lingering_worker)
+                concurrent.futures.wait({_cron_future}, timeout=1.0)
+            try:
+                _cron_future.result()
+            except BaseException:
+                pass
 
         try:
             if _cron_inactivity_limit is not None:

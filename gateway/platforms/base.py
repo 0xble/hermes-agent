@@ -7722,6 +7722,18 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            _restart_queue_id = getattr(event, "_restart_inbox_queue_id", None)
+            if _restart_queue_id:
+                try:
+                    from gateway.restart_inbox import release_claim
+
+                    await asyncio.to_thread(release_claim, _restart_queue_id)
+                except Exception:
+                    logger.exception(
+                        "[%s] Could not release cancelled restart inbox row %s",
+                        self.name,
+                        _restart_queue_id,
+                    )
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -7729,6 +7741,14 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except BaseException as e:
+            _restart_queue_id = getattr(event, "_restart_inbox_queue_id", None)
+            if _restart_queue_id:
+                try:
+                    from gateway.restart_inbox import release_claim
+
+                    await asyncio.to_thread(release_claim, _restart_queue_id)
+                except Exception:
+                    logger.exception("[%s] Could not release failed restart inbox row %s", self.name, _restart_queue_id)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence

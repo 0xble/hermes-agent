@@ -3141,6 +3141,21 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                     orphan.unlink(missing_ok=True)
                 except OSError:
                     pass
+        for orphan in db_path.parent.iterdir():
+            if not orphan.name.startswith(f"{db_path.name}.malformed-backup-"):
+                continue
+            if orphan.name.endswith(_DB_SIDECAR_SUFFIXES):
+                continue
+            if _bundle_marker(orphan).is_file():
+                continue
+            for victim in (
+                orphan,
+                *(orphan.with_name(orphan.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
+            ):
+                try:
+                    victim.unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             for existing in _existing_malformed_backups(db_path)[:1]:
                 marker = _bundle_marker(existing)
