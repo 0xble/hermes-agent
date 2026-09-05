@@ -133,6 +133,7 @@ These exact subjects are fork-only history but do not define independently retir
 
 | Stable commit subject | Narrow non-patch reason |
 | --- | --- |
+| `fix(ci): accept GitHub squash subject suffixes` | Fork-governance compatibility that matches GitHub auto-appended PR numbers to the exact stable subject registered in the squashed commit; no shipped Hermes behavior. |
 | `fix(fork): restore upstream gateway contracts after rebase` | Patch-neutral restoration of upstream-owned gateway and finalization hunks clobbered by fork replay. |
 | `fmt(js): npm run fix after upstream refresh` | Mechanical formatter output created during an upstream reconciliation. |
 | `test: make local CI deterministic across hosts` | Repository test-runner determinism only; no shipped Hermes behavior. |
