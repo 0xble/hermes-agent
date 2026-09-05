@@ -152,6 +152,7 @@ These exact subjects are fork-only history but do not define independently retir
 | `test: align rebased regressions with fork contracts` | Adaptation of upstream-owned tests to registered fork contracts (HERMES-011 shared SessionDB ownership, HERMES-015 renamed upstream helper, HERMES-036 cron memory policy) after the 2026-08-26 rebase; no shipped Hermes behavior. |
 | `fix(gateway): restore string-form disabled_toolsets parsing` | Patch-neutral restoration of upstream commit `309cf2c5e2`'s `parse_config_string_list` hunks clobbered by fork replay. |
 | `docs(maintenance): reconcile stale patch records` | Maintenance-only reconciliation of already-registered patch records and exemptions; no shipped Hermes behavior. |
+| `docs(maintenance): normalize regression commands` | Maintenance-only normalization of recorded regression commands to the repository test runner, plus removal of stale selectors; no shipped Hermes behavior. |
 | `chore(fork): remove dead reconciliation residue` | Removal of dead code left by retired paths and rebase replay (response-aware title route plumbing, retired HERMES-043 snapshot, obsolete compatibility shims, unused helpers, duplicate import, stale docstrings/comments); no behavioral change. |
 | `test(cron): stabilize claim heartbeat grace` | Test-only heartbeat timing tolerance for HERMES-057 under loaded CI hosts; no shipped Hermes behavior. |
 | `fix(reconcile): remove duplicate auxiliary route parameters` | Patch-neutral syntax repair after preserving upstream route telemetry together with the fork's complete-response wrapper during rebase. |
@@ -231,7 +232,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/credential_pool.py`; `tests/agent/test_credential_pool.py`; this record.
 - **Upstream tracking:** Maintained-fork issue and PR #46 contain the reproduced incident, implementation, review resolution, and focused evidence. No upstream issue was filed before the fork fix landed.
 - **Upstream PR:** None as of 2026-09-03.
-- **Regression:** `python -m pytest tests/agent/test_credential_pool.py tests/hermes_cli/test_auth_codex_provider.py -q`; coverage must prove singleton recovery updates only the singleton-owned entry and does not overwrite independent manual credentials.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_credential_pool.py tests/hermes_cli/test_auth_codex_provider.py -q`; coverage must prove singleton recovery updates only the singleton-owned entry and does not overwrite independent manual credentials.
 - **Expected published commit identity:** Stable subject `fix(auth): isolate manually added Codex accounts (#46)`; the code and regression landed in PR #46, while this record repairs the omitted lifecycle registration.
 - **Rollback:** Revert `fix(auth): isolate manually added Codex accounts (#46)`, restoring broad manual-entry synchronization, then remove this index row and record. No schema or persistent-data migration rollback is required.
 - **Retirement:** Retire after released upstream preserves independently added Codex accounts during singleton auth recovery and passes equivalent credential-pool regressions.
@@ -242,7 +243,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/conversation_compression.py`; `tests/agent/test_compression_attempt_lifecycle.py`; `tests/agent/test_compression_stall_fallback_78981.py`; this record.
 - **Upstream tracking:** NousResearch/hermes-agent#102339 documents the reproduced equal-deadline race and evidence.
 - **Upstream PR:** Open PR #102370 carries the upstream-compatible implementation and regressions. Mirror reviewed changes until it merges or closes without merging that unowned PR.
-- **Regression:** `uv run --frozen pytest tests/agent/test_compression*.py -q`; focused coverage must prove worker-first and host-first deadlines each attempt fallback once, rotation-mode message rebinding cannot hide the worker signal, explicit stop does not set it, safe unchanged outcomes do not retry, and a cancelled primary cannot publish late.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_compression*.py -q`; focused coverage must prove worker-first and host-first deadlines each attempt fallback once, rotation-mode message rebinding cannot hide the worker signal, explicit stop does not set it, safe unchanged outcomes do not retry, and a cancelled primary cannot publish late.
 - **Expected published commit identity:** Stable subject `fix(compression): preserve fallback at route deadline`; source, regressions, and this lifecycle record ship together.
 - **Rollback:** Revert only `fix(compression): preserve fallback at route deadline`, removing the deadline-abort fence signal, host branch, focused regressions, index row, and this record. No configuration or persistent-data rollback is required.
 - **Retirement:** Retire after released upstream includes PR #102370 or equivalent behavior, passes the focused regressions, and makes configured fallback independent of equal-deadline scheduling. Remove the fork implementation and duplicate tests rather than retaining parallel paths.
@@ -255,7 +256,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/agent_runtime_helpers.py`; `agent/conversation_loop.py`; `agent/credential_pool.py`; `agent/turn_retry_state.py`; `run_agent.py`; focused credential-pool and retry regressions; this record.
 - **Upstream tracking:** Not yet filed upstream as of 2026-09-02. The maintained-fork PR is the only published implementation currently tracked.
 - **Upstream PR:** None as of 2026-09-02.
-- **Regression:** `python -m pytest -q tests/agent/test_credential_pool_routing.py tests/agent/test_turn_retry_state.py tests/run_agent/test_32646_fallback_429_after_timeout.py`; coverage must prove priority order, duplicate logical-account suppression, exhausted and cooled credential handling, no-alternate behavior, retry ceilings, provider-wide and Z.AI overload handling, transport recovery, and final configured fallback.
+- **Regression:** `scripts/run_tests.sh -q tests/agent/test_credential_pool_routing.py tests/agent/test_turn_retry_state.py tests/run_agent/test_32646_fallback_429_after_timeout.py`; coverage must prove priority order, duplicate logical-account suppression, exhausted and cooled credential handling, no-alternate behavior, retry ceilings, provider-wide and Z.AI overload handling, transport recovery, and final configured fallback.
 - **Expected published commit identity:** Stable subject `fix(agent): rotate credentials across transient retries`; source, regressions, and this lifecycle record ship together.
 - **Rollback:** Revert `fix(agent): rotate credentials across transient retries`, removing attempted-account retry state, alternate-credential selection, focused regressions, the index row, and this record. No persistent-data migration rollback is required.
 - **Retirement:** Retire after released upstream Hermes provides equivalent logical-account rotation within bounded transient retries while preserving the listed failure classes and passes equivalent focused regressions.
@@ -267,7 +268,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/worktree_path_guard.py`; `tools/terminal_tool.py`; `tests/tools/test_worktree_path_guard.py`; this record.
 - **Upstream tracking:** Not yet filed upstream as of 2026-09-01. Hermes's native `-w`, `/worktree new`, and Kanban worktree paths already use repository-local `.worktrees/`; this patch adds advisory coverage for manual terminal commands.
 - **Upstream PR:** None as of 2026-09-01. The maintained-fork PR is the only published implementation currently tracked.
-- **Regression:** `python -m pytest -q tests/tools/test_worktree_path_guard.py tests/tools/test_terminal_tool.py tests/tools/test_terminal_bounded_execute.py tests/tools/test_terminal_task_cwd.py tests/tools/test_terminal_output_transform_hook.py`; coverage must prove compliant paths remain silent, absolute and relative external paths warn, traversal cannot escape an apparent `.worktrees` path, shell separators and common wrappers remain visible, heredoc data does not create false positives, and successful foreground worktree creation returns the advisory warning.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_worktree_path_guard.py tests/tools/test_terminal_tool.py tests/tools/test_terminal_bounded_execute.py tests/tools/test_terminal_task_cwd.py tests/tools/test_terminal_output_transform_hook.py`; coverage must prove compliant paths remain silent, absolute and relative external paths warn, traversal cannot escape an apparent `.worktrees` path, shell separators and common wrappers remain visible, heredoc data does not create false positives, and successful foreground worktree creation returns the advisory warning.
 - **Expected published commit identity:** Stable subjects `feat(terminal): warn on nonstandard worktree paths` and `fix(terminal): recognize compound shell separators`; source, regressions, and this lifecycle record ship together.
 - **Rollback:** Revert only `feat(terminal): warn on nonstandard worktree paths`, remove the path guard, terminal result field, focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required.
 - **Retirement:** Retire after released upstream Hermes provides equivalent advisory or enforcement for direct agent-created worktrees outside `.worktrees/`, including shell traversal and wrapper coverage, and passes equivalent focused regressions. Remove the fork implementation and duplicate tests rather than retaining parallel behavior.
@@ -518,7 +519,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_cli/commands.py`; `gateway/run.py`; `tests/gateway/test_title_command.py`; this record.
 - **Upstream tracking:** Open issue #98152 reports the exact gap. Upstream `main` at `4209d371aa1bb8840ce8447555bdd863a1a96c38` still declares `/title` with the default reject policy and falls through to the generic busy rejection. Merged PR #39289 routes Desktop slash commands out of the input queue but does not make `/title` dispatchable; issues/PRs #5057, #6252, #10116, and #10370 cover adjacent busy-command loss or toggles, not this contract.
 - **Upstream PR:** None found for immediate mid-turn `/title` dispatch as of 2026-08-29.
-- **Regression:** `venv/bin/python -m pytest tests/gateway/test_title_command.py tests/hermes_cli/test_busy_policy_invariants.py -q`; focused coverage must prove the registry declares non-interrupting dispatch and the real busy dispatcher invokes `_handle_title_command` without interruption or queueing.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_title_command.py tests/hermes_cli/test_busy_policy_invariants.py -q`; focused coverage must prove the registry declares non-interrupting dispatch and the real busy dispatcher invokes `_handle_title_command` without interruption or queueing.
 - **Published commit identity:** Stable subject `fix(gateway): dispatch title while busy`; source, focused regression, and this record ship together.
 - **Rollback:** Revert only `fix(gateway): dispatch title while busy`, restoring `/title` to the generic mid-turn rejection and removing the focused busy-dispatch regression plus this record. Session titles and previously stored metadata remain unchanged.
 - **Retirement:** Retire after a released upstream version dispatches both bare and named `/title` commands through the active gateway guard without interrupting or queueing the current turn, while preserving existing title validation, persistence, and Telegram topic renaming with equivalent regressions.
@@ -579,7 +580,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/slash_commands.py`; `tests/gateway/test_background_command.py`; this record.
 - **Upstream tracking:** Open issue #97498 contains the current-upstream failing regression. Related open PR #83820 preserves structured background reply/topic context but still initializes the task from raw `event.source` as of 2026-08-28.
 - **Upstream PR:** Related but incomplete: #83820.
-- **Regression:** `python -m pytest tests/gateway/test_background_command.py::TestHandleBackgroundCommand::test_telegram_topic_source_is_normalized_before_dispatch tests/gateway/test_background_command.py::TestRunBackgroundTask::test_recovered_dm_topic_without_anchor_stays_on_topic -q`; RED proved raw lobby anchors survived topic recovery and GREEN proves the recovered topic is dispatched without a cross-topic reply anchor through Telegram's adapter routing.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_background_command.py::TestHandleBackgroundCommand::test_telegram_topic_source_is_normalized_before_dispatch tests/gateway/test_background_command.py::TestRunBackgroundTask::test_recovered_dm_topic_without_anchor_stays_on_topic -q`; RED proved raw lobby anchors survived topic recovery and GREEN proves the recovered topic is dispatched without a cross-topic reply anchor through Telegram's adapter routing.
 - **Published commit identity:** Stable subjects `fix(gateway): normalize background topic sources` and `fix(gateway): harden contextual background delivery`; source, regressions, and manifest record ship together.
 - **Rollback:** Revert `fix(gateway): harden contextual background delivery` first, then revert `fix(gateway): normalize background topic sources`, restoring raw slash-command source dispatch and removing the focused regressions plus this record. Preserve all unrelated background execution and Telegram topic-recovery behavior.
 - **Retirement:** Retire after released upstream normalizes `/background` sources before session-key/runtime resolution and execution, with equivalent Telegram DM-topic coverage.
@@ -614,7 +615,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_cli/browser_connect.py`; `tests/tools/test_browser_real_profile.py`; this record.
 - **Upstream tracking:** Upstream `main` at `00bbfc690060d1323ddb2f065297c7425cb71c26` still trusts any existing `profile.last_used` directory and copies Local State without normalizing guest mode. No matching upstream issue or pull request was found after targeted repository and GitHub searches on 2026-08-28.
 - **Upstream PR:** None checked 2026-08-28.
-- **Regression:** `.venv/bin/python -m pytest tests/tools/test_browser_real_profile.py -q`; focused cases prove guest selection falls back to `Default`, the managed snapshot rewrites guest activation to `Default`, and the source Local State remains untouched.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_browser_real_profile.py -q`; focused cases prove guest selection falls back to `Default`, the managed snapshot rewrites guest activation to `Default`, and the source Local State remains untouched.
 - **Published commit identity:** Stable subject `fix(browser): reject guest profile for real-profile browsing`; source, regression, and manifest ship together.
 - **Rollback:** Revert only `fix(browser): reject guest profile for real-profile browsing`, removing the guest/system rejection, copied-state normalizer, focused regressions, and this record. Preserve snapshot security, profile-copy exclusions, and all unrelated browser authorization behavior.
 - **Retirement:** Retire after a released upstream version rejects non-browsable guest/system profiles for managed real-profile snapshots, normalizes the copied launch state without mutating the source profile, and passes equivalent focused coverage.
@@ -639,7 +640,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_cli/browser_identity.py`; `hermes_cli/browser_connect.py`; `hermes_cli/config_defaults.py`; `tools/browser_tool.py`; `tools/browser_use_cli.py`; `tests/tools/test_browser_identity.py`; `tests/tools/test_browser_real_profile.py`; `tests/tools/test_browser_use_cli.py`; `website/docs/user-guide/features/browser.md`; this record.
 - **Upstream tracking:** Open issue #96652 requests one exact source-profile pin and establishes the wrong-principal risk from `profile.last_used`. Open issue #49693 and open PR #49691 propose named CDP endpoint profiles and task binding for the granular browser tools. Neither current upstream `main` nor those proposals provide multiple exact local real-profile mappings, Browser Use `identity`, strict omission policy, or identity-keyed snapshot/process/daemon ownership. Checked 2026-08-28 against upstream `3340bbbdad8368e7f3d9f6827d61692adbbd87d6`.
 - **Upstream PR:** Related: #49691 (open); no direct implementation PR found as of 2026-08-28.
-- **Regression:** `python -m pytest -q tests/tools/test_browser_identity.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_use_cli.py`; focused cases cover resolver policy, dynamic schemas, exact profile selection independent of `last_used`, path validation, distinct snapshot/process/CDP/cache/daemon resources, owner-verified cache reuse, immutable legacy/named session transitions, first-command default stamping, bounded inter-process locking, profile-scoped cleanup, incompatible backend rejection, and legacy behavior. Disposable Chromium and concurrent Browser Use evidence plus repository-wide gate results are recorded in the implementation commit and task report.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_browser_identity.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_use_cli.py`; focused cases cover resolver policy, dynamic schemas, exact profile selection independent of `last_used`, path validation, distinct snapshot/process/CDP/cache/daemon resources, owner-verified cache reuse, immutable legacy/named session transitions, first-command default stamping, bounded inter-process locking, profile-scoped cleanup, incompatible backend rejection, and legacy behavior. Disposable Chromium and concurrent Browser Use evidence plus repository-wide gate results are recorded in the implementation commit and task report.
 - **Published commit identity:** Stable subject `feat(browser): add isolated named real-profile identities`; source, regression, documentation, and manifest ship together.
 - **Rollback:** Revert only `feat(browser): add isolated named real-profile identities`, removing the identity resolver, keyed resources, tool arguments, configuration defaults, focused regressions, documentation, and this record. Preserve HERMES-060's guest-profile rejection, Local State normalization, snapshot secret-store handling, legacy `profile.last_used` behavior, cloud/CDP routing, and unrelated browser concurrency fixes.
 - **Retirement:** Retire after a released upstream version maps multiple aliases to exact local Chromium profiles, preserves explicit/default/strict resolution semantics, never falls back across identities, isolates every snapshot/process/CDP/cache/daemon resource, immutably binds Browser Use and granular-tool sessions, fails closed on incompatible backends, preserves unconfigured behavior, and passes equivalent unit and disposable-browser regressions.
@@ -721,7 +722,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/skills_tool.py`; `tests/tools/test_skills_tool.py`; this record.
 - **Upstream tracking:** No equivalent released behavior or matching local upstream-history change found as of 2026-08-27.
 - **Upstream PR:** None checked 2026-08-27.
-- **Regression:** `pytest -q tests/tools/test_skills_tool.py`; the managed external symlink-farm case loads without a warning, while the local/profile symlink escape case still emits the warning.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_skills_tool.py`; the managed external symlink-farm case loads without a warning, while the local/profile symlink escape case still emits the warning.
 - **Rollback:** Revert only `fix(skills): trust configured symlink farms`, restoring resolved-only trust classification and its previous false positive. Preserve skill traversal, collision, mutation, and quarantine guards.
 - **Retirement:** Retire after a released upstream version distinguishes explicitly configured external symlink farms from unconfigured local symlink escapes with equivalent positive and negative regressions.
 
@@ -743,7 +744,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/computer_use/cua_backend.py`; `tests/tools/test_computer_use_browser_authorization.py`.
 - **Upstream tracking:** No matching upstream issue or PR found for the symlink-blind resolution or the team pin after targeted searches on 2026-08-27.
 - **Upstream PR:** None after checked 2026-08-27.
-- **Regression:** `.venv/bin/python -m pytest tests/tools/test_computer_use_browser_authorization.py tests/tools/test_computer_use_cua_0_10_permissions.py -q`; live probe proving `_resolve_cua_driver_app_path('~/.local/bin/cua-driver')` returns `/Applications/CuaDriver.app` and its signature validates.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_computer_use_browser_authorization.py tests/tools/test_computer_use_cua_0_10_permissions.py -q`; live probe proving `_resolve_cua_driver_app_path('~/.local/bin/cua-driver')` returns `/Applications/CuaDriver.app` and its signature validates.
 - **Rollback:** Restore the string-based resolver and single-team pin; expect symlinked installs to fail closed again.
 - **Retirement:** Retire after released upstream resolves symlinked driver installs to their carrying bundle and accepts the release signing team, with equivalent regressions.
 
@@ -754,7 +755,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_state.py`; `tests/state/test_fts_runtime_rebuild.py`.
 - **Upstream tracking:** Upstream's classifier and rebuild flow retain the generic-class attribution as of `36b0a96dcb` on 2026-08-27; no matching issue or PR found.
 - **Upstream PR:** None after checked 2026-08-27.
-- **Regression:** `.venv/bin/python -m pytest tests/state/test_fts_runtime_rebuild.py -q -k 'Attribution'`; the clean-probe case proves no rebuild and no stale marker for a non-FTS malformed error.
+- **Regression:** `scripts/run_tests.sh tests/state/test_fts_runtime_rebuild.py -q`; current coverage checks evidence-based corruption classification, structural-corruption propagation without live FTS mutation, and rejection of bare malformed errors. The retired `Attribution` selector no longer selects tests; do not treat an empty selection as verification of the historical attribution probe.
 - **Rollback:** Remove `_fts_structure_is_corrupt` and its two call-site guards; preserve the rebuild, fail-open, and startup recovery flows.
 - **Retirement:** Retire after released upstream positively attributes malformed errors to FTS structures before automatic index repair, with equivalent regressions.
 
@@ -764,7 +765,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_state.py`; `tests/state/test_fts_runtime_rebuild.py`.
 - **Upstream tracking:** Same upstream head as HERMES-051; no size gate exists upstream and no matching issue or PR was found on 2026-08-27.
 - **Upstream PR:** None after checked 2026-08-27.
-- **Regression:** `.venv/bin/python -m pytest tests/state/test_fts_runtime_rebuild.py -q -k 'LargeDb'`; proves the oversized path skips rebuild yet heals via fail-open with the stale marker set and the canonical write preserved.
+- **Regression:** `scripts/run_tests.sh tests/state/test_fts_runtime_rebuild.py -q`; current coverage checks deferred live rebuilds, fail-open canonical writes, and recovery on reopen. The retired `LargeDb` selector no longer selects tests; this suite does not establish the historical size-threshold-specific contract.
 - **Rollback:** Remove the size gate; preserve HERMES-054's attribution probe independently.
 - **Retirement:** Retire after released upstream bounds or offloads runtime FTS rebuilds so large databases cannot starve turns or trip the liveness watchdog, with equivalent regressions.
 
@@ -776,7 +777,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/send_message_tool.py`; `tests/cron/test_cron_outbound_messages.py`; this record.
 - **Upstream tracking:** Upstream `main` at `79b8703d005f284bc5a6756e0c48f2e2488e029d` still directly awaits the live adapter. Open PR #77378 detects a foreign loop but falls back to standalone delivery, which cannot preserve this fork's trusted-profile contract. Open PR #74826 uses `run_coroutine_threadsafe` only for Weixin. Neither supplies the generic profile-bound correction or this two-loop regression. Checked 2026-08-26.
 - **Upstream PR:** Related only: #77378 (open, non-draft, green reported checks, no review decision) and #74826 (open, non-draft, no reported checks or review decision), checked 2026-08-26. Direct HERMES-022 PR #86648 remains open and does not include this correction.
-- **Regression:** `.venv/bin/python -m pytest tests/cron/test_cron_outbound_messages.py -q`; `.venv/bin/python -m pytest tests/tools/test_send_message_tool.py tests/tools/test_send_message_slack.py tests/cron/test_scheduler.py -q`; `.venv/bin/python scripts/validate_maintenance_manifest.py MAINTENANCE.md`; `git diff --check`. Before implementation, `test_live_transport_runs_on_gateway_owned_event_loop` returned `Plugin platform send failed: adapter send is bound to a different event loop`; after implementation it returns the verified adapter message ID.
+- **Regression:** `scripts/run_tests.sh tests/cron/test_cron_outbound_messages.py -q`; `scripts/run_tests.sh tests/tools/test_send_message_tool.py tests/tools/test_send_message_slack.py tests/cron/test_scheduler.py -q`; `.venv/bin/python scripts/validate_maintenance_manifest.py MAINTENANCE.md`; `git diff --check`. Before implementation, `test_live_transport_runs_on_gateway_owned_event_loop` returned `Plugin platform send failed: adapter send is bound to a different event loop`; after implementation it returns the verified adapter message ID.
 - **Published commit identity:** Stable subject `fix(send_message): schedule live adapters on the gateway loop`; source, tests, and manifest ship together.
 - **Rollback:** Remove only the owner-loop scheduling branch and HERMES-049 tests and record. Preserve HERMES-022 profile binding, outbound idempotency ledger, and origin-only authorization.
 - **Retirement:** Retire after a released upstream version schedules in-process `send_message` adapter work on its owning gateway loop and passes equivalent real two-loop coverage for verified success and pre-send owner-loop failure.
@@ -788,7 +789,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/run.py`; `tests/gateway/test_run_progress_topics.py`; this record.
 - **Upstream tracking:** Direct open issue #9136 reports progress coalescing stopping after a stale edit. Open PR #9345 implements stale-anchor replacement and is the direct upstream candidate. Related open PRs #9805 and #28327 attempt broader recovery but received review feedback for conflating stale, transient, and permanent failures. Merged PRs #28484 (`1b3c51bccc`) and #28485 (`6be579f626`) cover flood control and retryable network failures respectively, but intentionally do not recover `message to edit not found`. Checked 2026-08-23 against upstream `9ab056d4e8b892fccb797cc5cd5dffd090ac827e`, which still contains the stale-anchor fallback defect.
 - **Upstream PR:** Direct: #9345 (open, non-draft, GitHub reports mergeable, green CI, no review approval; checked 2026-08-23). Related only: #9805 and #28327.
-- **Regression:** `.venv/bin/python -m pytest tests/gateway/test_run_progress_topics.py -q`; `.venv/bin/python -m pytest tests/gateway/test_progress_edit_shared_clock_integration.py tests/test_progress_edit_chat_throttle.py tests/gateway/test_telegram_progress_edit_transient.py -q`; `.venv/bin/python scripts/validate_maintenance_manifest.py MAINTENANCE.md`; `git diff --check`. Before implementation, `test_stale_progress_anchor_is_replaced_and_edits_resume` failed with four separate sends instead of two; the focused suite now proves ordinary and overflow replacement, bounded replacement failure, permanent-failure send-only behavior, and existing retryable/flood contracts.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_run_progress_topics.py -q`; `scripts/run_tests.sh tests/gateway/test_progress_edit_shared_clock_integration.py tests/test_progress_edit_chat_throttle.py tests/gateway/test_telegram_progress_edit_transient.py -q`; `.venv/bin/python scripts/validate_maintenance_manifest.py MAINTENANCE.md`; `git diff --check`. Before implementation, `test_stale_progress_anchor_is_replaced_and_edits_resume` failed with four separate sends instead of two; the focused suite now proves ordinary and overflow replacement, bounded replacement failure, permanent-failure send-only behavior, and existing retryable/flood contracts.
 - **Published commit identity:** Stable subject `fix(gateway): recover stale progress anchors`; source, tests, and manifest ship together in the same fork commit.
 - **Activation:** Source publication is separate from runtime promotion. Gateways started before this patch retain the old progress state machine until a separately authorized promotion and restart.
 - **Rollback:** Revert `fix(gateway): recover stale progress anchors` in a follow-up commit. Remove only the stale-anchor classifier, replacement-anchor branch, and focused regression while preserving retryable-network recovery, flood-control suppression, shared edit throttling, topic metadata, cleanup tracking, and unrelated progress behavior. Expect a stale edit to fragment the remainder of the run again.
@@ -800,7 +801,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/computer_use/cua_backend.py`; `tests/tools/test_computer_use_cua_0_10_permissions.py`; this record.
 - **Upstream tracking:** Direct Hermes issue #93312 covers the readiness timeout. Direct Cua issue trycua/cua#3347 covers cua-driver 0.21's eager Computer History attestation latency. Upstream absorbed the macOS TCC launch-identity contract (previously tracked via #84033/#76433); its current `_EmbeddedCuaDaemon.start` still probes with a fixed 2.0s subprocess timeout as of upstream `7a1aafb4e1da` on 2026-08-26. Related open PR #76686 bounds startup but leaves the inner two-second probe unchanged.
 - **Upstream PR:** None for the probe-timeout correction after checked 2026-08-23. Related only: #76686.
-- **Regression:** `.venv/bin/python -m pytest tests/tools/test_computer_use_cua_0_10_permissions.py -q` including `test_private_daemon_allows_slow_healthy_status_probe`, which fails on the fixed 2.0s bound and passes with the bounded 5.0s probe.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_computer_use_cua_0_10_permissions.py -q` including `test_private_daemon_allows_slow_healthy_status_probe`, which fails on the fixed 2.0s bound and passes with the bounded 5.0s probe.
 - **Published commit identity:** Stable subject `fix(computer-use): allow slow healthy readiness probes`; the historical subjects `fix(computer-use): preserve private macOS runtime readiness` and `fix(computer-use): keep forced stop portable` remain indexed for fork-history attribution after their launch-path implementation was retired in favor of upstream.
 - **Activation:** Source publication is separate from runtime promotion. The active gateway keeps its imported pre-patch adapter until a separately authorized restart; the upstream-owned macOS launch path also needs a live macOS canary during that promotion.
 - **Rollback:** Revert `fix(computer-use): allow slow healthy readiness probes` to restore the fixed 2.0s probe. Do not restore the retired private launch-path implementation; if upstream's signed-app launch regresses, repair or backport upstream's implementation as one coherent contract.
@@ -812,7 +813,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/computer_use/cua_backend.py`; `tests/tools/test_computer_use.py`.
 - **Upstream tracking:** Open issue #89527 reports the same bare-`element_index` rejection after token support is lost at the Hermes adapter boundary. Open PR #89531 is complementary: it restores vendor capability discovery through strict MCP 2.x models but does not replace the live-schema fallback when cua-driver genuinely omits the legacy capability label. Closed-unmerged PR #91116 and duplicate #91299 implement the same schema-or-capability gate. Open PR #92694 carries an equivalent element-token commit plus an unrelated Linux/X11 foreground-delivery change. Official `main` at `6994851694a98c9078bd90f7bc562f7b33f9bb51` does not contain the schema fallback after checked 2026-08-23.
 - **Upstream PR:** Source-equivalent: #91116 (closed unmerged), #91299 (closed as a duplicate), and #92694 (open, mergeable, blocked, no reported checks; checked 2026-08-23). Complementary: #89531 (open, mergeable, clean, green CI; checked 2026-08-23).
-- **Regression:** `venv/bin/python -m pytest -q tests/tools/test_computer_use.py -k 'ElementTokenAttachment or CapabilityDiscovery'`; `venv/bin/python -m pytest -q tests/tools/test_computer_use.py tests/tools/test_computer_use_delivery_ladder.py tests/tools/test_computer_use_cua_0_9.py`; `git diff --check`; and a live macOS cua-driver 0.21.0 probe proving a captured token is attached when `supports_input_property("click", "element_token")` is true, the legacy capability is false, and the background AX action is accepted without coordinate fallback.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_computer_use.py -k 'ElementTokenAttachment or CapabilityDiscovery'`; `scripts/run_tests.sh -q tests/tools/test_computer_use.py tests/tools/test_computer_use_delivery_ladder.py tests/tools/test_computer_use_cua_0_9.py`; `git diff --check`; and a live macOS cua-driver 0.21.0 probe proving a captured token is attached when `supports_input_property("click", "element_token")` is true, the legacy capability is false, and the background AX action is accepted without coordinate fallback.
 - **Activation:** Source is published in the maintained fork. A gateway process started before this patch remains on the old imported adapter until a separately authorized restart; source publication is not runtime activation.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated computer-use changes. Remove the live-schema branch and its schema-only/no-signal regressions, restoring the legacy capability-only gate. Expect cua-driver 0.21.x element-index actions to fail with `snapshot_id_required`; do not substitute coordinate clicks as the maintained safety contract.
 - **Retirement:** Retire after a released upstream version attaches the matching captured token whenever either the live action schema or legacy capability establishes support, sends no unknown field when neither does, preserves stale-snapshot rejection, and passes the focused unit regressions plus a real background AX canary on the supported cua-driver version. Remove the private implementation and duplicate tests rather than retaining both paths.
@@ -823,7 +824,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/prompt_builder.py`; `tests/agent/test_system_prompt.py`.
 - **Upstream tracking:** Closed issue #14160 and merged PR #16997 introduced Telegram table-to-row-group fallback. Closed issue #47095 tracks native Bot API 10.1 table support and was marked duplicate. Closed issue #46009 repaired rich formatting during streamed edits. No exact upstream issue or pull request requires the model prompt to avoid wide native tables as of upstream `0159b51f2b1cdaa8fcf65d181fc0527692724fae` on 2026-08-23.
 - **Upstream PR:** None for narrow rich-table generation after checked 2026-08-23. Related merged PR: #16997.
-- **Regression:** `.venv/bin/python -m pytest tests/agent/test_system_prompt.py tests/agent/test_prompt_builder.py -q`; `git diff --check`. The focused rich-message test requires the exact three-or-more-column prohibition.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_system_prompt.py tests/agent/test_prompt_builder.py -q`; `git diff --check`. The focused rich-message test requires the exact three-or-more-column prohibition.
 - **Published commit identity:** Stable subjects `fix(telegram): keep rich tables narrow` and `fix(telegram): keep wide tables out of mobile replies`; source, regression, and manifest ship together.
 - **Rollback:** Remove the exact three-or-more-column prohibition, restore the advisory many-column wording, and remove the focused assertion. Preserve rich-message activation, native table rendering, transport fallback, and unrelated formatting guidance.
 - **Retirement:** Retire after released upstream gives agents an objective no-three-or-more-column Telegram rule, uses vertically stacked labeled records for wider data, preserves existing rich-message behavior, and passes the focused prompt regression.
@@ -847,7 +848,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_cli/doctor.py`; `tests/test_state_db_stats.py`.
 - **Upstream tracking:** Issue #83933 remains open and directly reports the false `auto_prune` recommendation. Open PR #83954 is a narrower associated fix. Closed-unmerged PR #84091 proposed a related retention-aware severity model. Open PR #86271 is broader health-diagnostic work and is not an equivalent replacement. No released upstream implementation touched the affected files as of 2026-08-17 at upstream `93ed11379b`.
 - **Upstream PR:** Associated: #83954 (open, unmerged, no review decision; checked 2026-08-17). Related: #84091 (closed unmerged) and #86271 (open; checked 2026-08-17).
-- **Regression:** `uv run pytest tests/test_state_db_stats.py tests/hermes_cli/test_doctor.py tests/hermes_cli/test_doctor_journal_modes.py -q`; `uv run ruff check hermes_cli/doctor.py tests/test_state_db_stats.py`; `git diff --check`; and a real `uv run hermes doctor` against an oversized retained database.
+- **Regression:** `scripts/run_tests.sh tests/test_state_db_stats.py tests/hermes_cli/test_doctor.py tests/hermes_cli/test_doctor_journal_modes.py -q`; `uv run ruff check hermes_cli/doctor.py tests/test_state_db_stats.py`; `git diff --check`; and a real `uv run hermes doctor` against an oversized retained database.
 - **Rollback:** Revert the stable-subject patch in a follow-up commit while preserving later unrelated Doctor changes. Remove `_session_retention_policy`, the explicit advisory issue field, retention-aware severity, and only HERMES-032's focused tests. Restore the prior tuple contract and issue construction without changing state-size, WAL, FTS, pruning, VACUUM, or runtime-maintenance behavior.
 - **Retirement:** Retire after released upstream loads effective retention configuration, treats a large database with valid positive retention as informational, keeps invalid or unavailable retention and pending or legacy FTS actionable, avoids rendered-text issue inference, and passes the focused regressions plus a real Doctor canary.
 
@@ -858,7 +859,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/conversation_loop.py`; `agent/turn_finalizer.py`; `tests/run_agent/test_verification_continuation_budget.py`; `apps/desktop/e2e/hidden-history-messages.spec.ts`.
 - **Upstream tracking:** Issue #53828 remains open and directly describes this contract. Related merged messaging mitigation is PR #52412, but it does not cover an explicit `agent.verify_on_stop: true` override. Related response-loss work includes issue #62142 and closed PR #53553.
 - **Upstream PR:** None after checked 2026-08-16.
-- **Regression:** `pytest -q tests/run_agent/test_verification_continuation_budget.py`; transformed-stream edit-failure regression in `tests/gateway/test_run_progress_topics.py`; Desktop `hidden-history-messages.spec.ts` live verify-on-stop case with interim assistant messages disabled, backed by a real SessionDB readback proving exactly one canonical assistant row is durable.
+- **Regression:** `scripts/run_tests.sh -q tests/run_agent/test_verification_continuation_budget.py`; transformed-stream edit-failure regression in `tests/gateway/test_run_progress_topics.py`; Desktop `hidden-history-messages.spec.ts` live verify-on-stop case with interim assistant messages disabled, backed by a real SessionDB readback proving exactly one canonical assistant row is durable.
 - **Rollback:** Remove `_VERIFICATION_RECEIPT_PREFIX`, `_compose_verification_receipt_with_answer`, its finalization call, and the two focused tests. Preserve the existing budget-exhaustion fallback and ordinary later-answer replacement behavior.
 - **Retirement:** Retire after released upstream preserves a pending substantive answer whenever a verification continuation returns only a receipt, proven by the focused regression and a real Telegram or equivalent messaging-surface canary.
 
@@ -881,7 +882,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/platforms/base.py`; `tests/gateway/test_media_download_retry.py`; `tests/gateway/test_media_download_retry_after.py`.
 - **Upstream tracking:** No equivalent implementation was found on current official `main` (`30c469b15313711d47c45e7175d6ef5c8437f1ed`) after source/history and issue/PR/commit searches for the two cache helper symbols plus Retry-After on 2026-08-15. Upstream already supplies the shared seconds/HTTP-date parser in `agent.retry_utils`, which this patch reuses.
 - **Upstream PR:** None after checked 2026-08-15.
-- **Regression:** `.venv/bin/python -m pytest tests/gateway/test_media_download_retry_after.py tests/gateway/test_media_download_retry.py tests/gateway/test_platform_base.py -q`.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_media_download_retry_after.py tests/gateway/test_media_download_retry.py tests/gateway/test_platform_base.py -q`.
 - **Rollback:** Remove `_download_media_from_url` and its media retry constants/helpers, restore the separate image/audio request loops and prior timeout fixture, and remove `tests/gateway/test_media_download_retry_after.py`. Preserve SSRF validation, redirect hooks, streaming byte limits, cache validation, and all outbound platform retry semantics.
 - **Retirement:** Retire after released upstream shares equivalent image/audio URL-cache GET retry behavior that honors delta/date Retry-After as a minimum, bounds cumulative waiting, retries only the same safe statuses/transports, sanitizes logs, and passes the focused regression.
 
@@ -901,7 +902,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/session.py`; `tests/gateway/test_clean_shutdown_marker.py`.
 - **Upstream tracking:** Local fork correction to the concurrent gateway-boundary hardening; no released upstream durable delivery acknowledgement was identified.
 - **Upstream PR:** None.
-- **Regression:** `pytest -q tests/gateway/test_clean_shutdown_marker.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/gateway/test_clean_shutdown_marker.py`.
 - **Rollback:** Restore terminal-transcript suppression only after the platform delivery path writes a durable acknowledgement that is atomically associated with the transcript turn. Never infer delivery from `finish_reason=stop` alone.
 - **Retirement:** Retire after released upstream recovery suppresses only turns with durable confirmed delivery and preserves generated-but-undelivered responses across gateway crashes.
 
@@ -911,7 +912,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; `plugins/memory/hindsight/source_retention.py`; `tests/plugins/memory/test_source_retention.py`; `tests/plugins/memory/test_source_retention_canary.py`.
 - **Upstream tracking:** Local fork behavior; no released upstream equivalent or privacy-gated source-retention contract has been identified.
 - **Upstream PR:** None.
-- **Regression:** `pytest -q tests/plugins/memory/test_source_retention.py tests/plugins/memory/test_source_retention_canary.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/plugins/memory/test_source_retention.py tests/plugins/memory/test_source_retention_canary.py`.
 - **Rollback:** Remove automatic source discovery, source-ledger/readback tracking, and HERMES-026 tests together. Preserve ordinary conversation retain, HERMES-008 observation scopes, HERMES-009 extraction-error handling, and HERMES-010 embedded-daemon safety.
 - **Retirement:** Retire after released upstream preserves equivalent source provenance and durability while keeping raw attachment reads/uploads default-off behind an explicit trust-boundary opt-in.
 
@@ -922,7 +923,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/conversation_compression.py`; `apps/desktop/src/app/session/hooks/use-message-stream/gateway-event.ts`; `apps/desktop/src/app/session/hooks/use-message-stream/compaction-event.test.tsx`; `tests/run_agent/test_413_compression.py`; `tests/run_agent/test_codex_app_server_compaction.py`; `tests/gateway/test_telegram_noise_filter.py`.
 - **Upstream tracking:** No exact issue or PR for duplicate anti-growth notices was found after current open/closed issue and PR searches on 2026-08-17 against upstream `bc76f62c20`. Related issue #88568 and direct open PR #88593 cover repeated automatic `would_grow` attempts, not the duplicate lifecycle delivery. Related released anti-growth safety work is #86700.
 - **Upstream PR:** None for the duplicate-notice correction after checked 2026-08-17. Related: #88593 (open, mergeable, unreviewed) for anti-thrashing only.
-- **Regression:** `pytest -q tests/run_agent/test_413_compression.py::TestPreflightCompression::test_compress_context_emits_deferred_terminal_status_for_would_grow`; then `pytest -q tests/run_agent/test_413_compression.py tests/agent/test_compaction_anti_thrash.py tests/agent/test_would_grow_refusal_runway.py tests/gateway/test_telegram_noise_filter.py`. The strike counter now follows upstream semantics (one strike per rejected attempt).
+- **Regression:** `scripts/run_tests.sh -q tests/run_agent/test_413_compression.py::TestPreflightCompression::test_compress_context_emits_deferred_terminal_status_for_would_grow`; then `scripts/run_tests.sh -q tests/run_agent/test_413_compression.py tests/agent/test_compaction_anti_thrash.py tests/agent/test_would_grow_refusal_runway.py tests/gateway/test_telegram_noise_filter.py`. The strike counter now follows upstream semantics (one strike per rejected attempt).
 - **Rollback:** Remove the detailed `would_grow` terminal-message override and restore the separate direct warning only if another released mechanism deduplicates semantic lifecycle events on every surface. Preserve the anti-growth guard, rejection recording, telemetry, transcript preservation, and exactly-one terminal lifecycle contract. Full HERMES-025 rollback restores `_emit_compaction_done` and removes the outcome/message state and HERMES-025 tests, while preserving all compression locking, commit-fence, cooldown, and transcript-preservation behavior.
 - **Retirement:** Retire after released upstream emits exactly one equivalent terminal outcome per visible compaction lifecycle, including a detailed single notice for `would_grow`, and never reports completion or a second warning for an aborted or deferred attempt.
 
@@ -932,7 +933,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/auxiliary_client.py`; `tests/agent/test_auxiliary_client.py`.
 - **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
 - **Upstream PR:** None.
-- **Regression:** `pytest -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryTransientCredentialRetry or AuxiliaryOverloadFallback'`.
+- **Regression:** `scripts/run_tests.sh -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryTransientCredentialRetry or AuxiliaryOverloadFallback'`.
 - **Rollback:** Remove `_transient_credential_retry_reason`, `_select_transient_aux_alternate`, the sync/async alternate retry blocks, and the HERMES-024 focused tests. Preserve HERMES-023 overload fallback and all durable auth, billing, and rate-limit rotation behavior.
 - **Retirement:** Retire after released upstream provides provider-neutral, non-exhausting, bounded same-provider credential alternation for equivalent auxiliary transient failures before model/provider fallback.
 
@@ -942,7 +943,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `agent/auxiliary_client.py`; `tests/agent/test_auxiliary_client.py`.
 - **Upstream tracking:** Local fork behavior; upstream equivalence has not yet been established.
 - **Upstream PR:** None.
-- **Regression:** `pytest -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryOverloadFallback'`.
+- **Regression:** `scripts/run_tests.sh -q tests/agent/test_auxiliary_client.py -k 'AuxiliaryOverloadFallback'`.
 - **Rollback:** Remove `_is_overload_error`, its sync/async fallback predicates and reason labels, and the HERMES-023 focused tests. Preserve all existing auth, billing, connection, rate-limit, model-compatibility, and response-validation fallback behavior.
 - **Retirement:** Retire after released upstream routes classified provider overload through equivalent sync and async auxiliary fallback chains.
 
@@ -953,7 +954,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `cron/jobs.py`; `cron/scheduler.py`; `cron/outbound.py`; `tools/send_message_tool.py`; `tools/cronjob_tools.py`; `toolsets.py`; `tests/cron/test_cron_outbound_messages.py`; `tests/cron/test_scheduler.py`; `tests/cron/test_jobs.py`; `tests/cron/test_cronjob_schema.py`.
 - **Upstream tracking:** Direct PR `#86648` implements this patch contract on current upstream `main` and links issues `#20140` and `#67591`. Its 2026-08-16 automated review raised three items. The edit-preservation concern was valid as a missing regression: the CLI already forwards `None` without coercion and the update boundary already treats it as “unchanged,” now proven by an unrelated timezone edit preserving `allow_messaging=true`. The result-downgrade concern was valid and fixed in the fork by making a durable `verified` record immutable against late callbacks. The toolset-name concern is stale against this fork: `messaging` is an explicit default-off capability, no platform base toolset includes it, and runtime send gates remain a second boundary. Related open PRs `#7388` and `#70304` remain incomplete: `#7388` is a process-wide env var, `#70304` restores a broader platform-level messaging toolset, and neither provides job-scoped origin-only targeting plus idempotent multi-message delivery. Removal context: merged PR `#47856`.
 - **Upstream PR:** Direct: #86648 (open, no reviews or review threads, one automated issue comment addressed as classified above, head checks not reported; checked 2026-08-18). Related: #7388 (open, failing head checks, one unresolved review thread) and #70304 (open, failing head checks, no unresolved review threads). Removal context: #47856 (merged).
-- **Regression:** `pytest -q tests/cron/test_cron_outbound_messages.py tests/cron/test_scheduler.py tests/cron/test_jobs.py tests/cron/test_cronjob_schema.py -k 'disabled_toolsets or memory_toolset or PerJobToolset or allow_messaging or fire_claim_run_id'`.
+- **Regression:** `scripts/run_tests.sh -q tests/cron/test_cron_outbound_messages.py tests/cron/test_scheduler.py tests/cron/test_jobs.py tests/cron/test_cronjob_schema.py -k 'disabled_toolsets or memory_toolset or PerJobToolset or allow_messaging or fire_claim_run_id'`.
 - **Rollback:** Remove the `allow_messaging` field, the cron outbound ledger, the cron-only `send_message` registration/check, the origin-only send gate, the `[SILENT]` exception for explicit outbound messages, and the HERMES-022 tests. Restore the previous default cron denylist and delivery hint. Do not restore a process-wide messaging env var.
 - **Retirement:** Retire after released upstream provides job-scoped opt-in, origin-only targeting, adapter-owned identity, idempotent multi-message delivery, and `[SILENT]` that does not suppress those explicit messages.
 
@@ -963,7 +964,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tools/skill_manager_tool.py`; `cli-config.yaml.example`; `tests/tools/test_skill_manager_tool.py`.
 - **Upstream tracking:** Local fork behavior; no released upstream setting currently provides this selective policy.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/tools/test_skill_manager_tool.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_skill_manager_tool.py`.
 - **Rollback:** Remove the create guard, its focused test, the example setting, and this manifest entry in one follow-up commit. Preserve the existing background ownership and read-before-write guards.
 
 ### HERMES-021 — Try alternate same-provider credentials before provider fallback
@@ -991,7 +992,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_state.py`; `hermes_cli/kanban_db.py`; `tests/test_raw_copy_offline_guard.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/test_raw_copy_offline_guard.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/test_raw_copy_offline_guard.py`.
 - **Rollback:** Remove the `_copy_all`/`offline_file_access` guarded backup path in `hermes_state.py` and `_backup_corrupt_db_locked` guarded quarantine path in `hermes_cli/kanban_db.py`, then remove `tests/test_raw_copy_offline_guard.py`. Preserve upstream's released HERMES-001 replacement and all unrelated database-repair behavior. Verify the upstream replacement with the same live-connection race cases before deleting the private test.
 
 ### HERMES-003 — Retired fixed file-descriptor soft-limit floor
@@ -1009,7 +1010,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/test_telegram_send_cooldown.py`.
 - **Upstream tracking:** Related upstream pull request `#66722` remains open and unmerged.
 - **Upstream PR:** Related: #66722 (open; checked 2026-08-14).
-- **Regression:** `pytest -q tests/test_telegram_send_cooldown.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/test_telegram_send_cooldown.py`.
 - **Rollback:** Remove `_TelegramSendCooldownExceeded`, the per-chat cooldown state maps and bound, `_send_cooldown_seconds`, `_send_cooldown_max_wait`, the atomic send helper and its call sites, then remove the dedicated test. Verify the upstream adapter atomically coordinates concurrent rich, chunked, fallback, control, and media calls per chat, shares `RetryAfter` deadlines, bounds excessive waits, and prunes idle state before deploying the removal.
 
 ### HERMES-005 — Share the progress-edit throttle per chat
@@ -1018,7 +1019,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/run.py`; `tests/test_progress_edit_chat_throttle.py`; `tests/gateway/test_progress_edit_shared_clock_integration.py`; flood-control coverage in `tests/gateway/test_run_progress_interrupt.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/test_progress_edit_chat_throttle.py tests/gateway/test_progress_edit_shared_clock_integration.py tests/gateway/test_run_progress_interrupt.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/test_progress_edit_chat_throttle.py tests/gateway/test_progress_edit_shared_clock_integration.py tests/gateway/test_run_progress_interrupt.py`.
 - **Rollback:** Remove `GatewayRunner._progress_edit_clock`, the shared-clock helpers and call-site stamps in `TurnRunner`, and the flood-control no-fallback branch. Remove only the patch-owned progress tests. Preserve unrelated gateway/session changes. Verify upstream coordinates the limit at `platform:chat_id` scope and does not fallback-send during a flood penalty.
 
 ### HERMES-006 — Resolve memory notifications per platform
@@ -1027,7 +1028,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/run.py`; `tests/gateway/test_memory_notifications_per_platform.py`.
 - **Upstream tracking:** Narrow backport associated with upstream `#59364`.
 - **Upstream PR:** Associated: #59364 (open; checked 2026-08-14).
-- **Regression:** `pytest -q tests/gateway/test_memory_notifications_per_platform.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/gateway/test_memory_notifications_per_platform.py`.
 - **Rollback:** Replace the `resolve_display_setting(...)` call with the released upstream configuration path and remove the private test only after equivalent per-platform precedence is covered upstream. Do not fall back to reading only `display.memory_notifications`.
 
 ### HERMES-007 — Keep interrupt sentinels out of API assistant text
@@ -1036,7 +1037,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `gateway/platforms/api_server.py`; interrupt tests in `tests/gateway/test_session_api.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/gateway/test_session_api.py -k interrupt`.
+- **Regression:** `scripts/run_tests.sh -q tests/gateway/test_session_api.py -k interrupt`.
 - **Rollback:** Remove `_is_api_interrupt_sentinel` and `_api_final_response_text`, switch response construction to the released upstream representation, and remove/adapt only the two interrupt-metadata tests. Prove interrupted synchronous and streaming responses expose correct metadata without leaking the internal sentinel.
 
 ### HERMES-008 — Preserve Hindsight's explicit shared observation scope
@@ -1045,7 +1046,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; `TestObservationScopes` coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** Related upstream issue `#74933`.
 - **Upstream PR:** None after checked 2026-08-14; issue #74933 only.
-- **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k 'ObservationScopes or shared_scope'`.
+- **Regression:** `scripts/run_tests.sh -q tests/plugins/memory/test_hindsight_provider.py -k 'ObservationScopes or shared_scope'`.
 - **Rollback:** Remove only the explicit-empty-inner-list preservation branch and its seven patch-owned tests after the released upstream parser proves equivalent handling for native and JSON forms, mixed scopes, whitespace-only entries, provider config, and retain calls.
 
 ### HERMES-009 — Fail Hindsight retains on extraction errors
@@ -1054,7 +1055,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; embedded-profile environment coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** No equivalent released upstream Hermes behavior was identified when this patch was published; also verify the current Hindsight server contract before retirement.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k embedded_profile_env` plus a failed-extraction operation probe against the supported embedded Hindsight version.
+- **Regression:** `scripts/run_tests.sh -q tests/plugins/memory/test_hindsight_provider.py -k embedded_profile_env` plus a failed-extraction operation probe against the supported embedded Hindsight version.
 - **Rollback:** Remove the managed environment key only after upstream Hermes/Hindsight guarantees failed extraction yields a failed operation. Update the environment assertion and prove cursor-owning consumers still distinguish failure from an empty document.
 
 ### HERMES-010 — Avoid destructive Hindsight daemon restarts and empty-key overwrite
@@ -1063,7 +1064,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/memory/hindsight/__init__.py`; embedded-profile drift coverage in `tests/plugins/memory/test_hindsight_provider.py`.
 - **Upstream tracking:** No equivalent released upstream implementation was identified when this patch was published.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `pytest -q tests/plugins/memory/test_hindsight_provider.py -k 'embedded and (env or config or restart)'` plus a daemon restart-count probe across repeated session initialization.
+- **Regression:** `scripts/run_tests.sh -q tests/plugins/memory/test_hindsight_provider.py -k 'embedded and (env or config or restart)'` plus a daemon restart-count probe across repeated session initialization.
 - **Rollback:** Replace the managed-key comparison and preserved-key materialization with the released upstream lifecycle implementation. Remove/adapt only its focused tests after proving daemon-added keys cause no restart and an unavailable secret lookup cannot blank a persisted credential.
 
 ### HERMES-011 — Serialize SessionDB reads, bound readers, and share one gateway database
@@ -1073,7 +1074,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_state.py`; `gateway/run.py`; `run_agent.py`; `tests/test_sessiondb_cross_thread_safety.py`; `tests/gateway/test_runner_session_db_fd_budget.py`; persistence diagnostics in `tests/run_agent/test_run_agent.py`.
 - **Upstream tracking:** The remaining private behavior combines the public-read, single-owner, and diagnostics contracts from upstream PRs `#73803` and `#78287`; deliberately excludes the fallback spool from `#78552`. Released upstream commits `87aedbe7b` and `0472c31aa` now provide the pooled reader lifecycle and hard peak budget.
 - **Upstream PR:** Associated: #73803 and #78287 (open; checked 2026-08-14). Related but excluded: #78552.
-- **Regression:** `pytest -q tests/test_sessiondb_cross_thread_safety.py tests/gateway/test_runner_session_db_fd_budget.py tests/run_agent/test_run_agent.py -k 'persistence or sqlite or session_db or reader or writer'`.
+- **Regression:** `scripts/run_tests.sh -q tests/test_sessiondb_cross_thread_safety.py tests/gateway/test_runner_session_db_fd_budget.py tests/run_agent/test_run_agent.py -k 'persistence or sqlite or session_db or reader or writer'`.
 - **Rollback:** Remove only the remaining private public-read routing, shared gateway database ownership, and sanitized diagnostics in a follow-up change while preserving upstream's pooled-reader implementation and later unrelated edits. Before retirement, verify upstream covers all public-read serialization, single gateway DB ownership, sanitized diagnostics, and no duplicate-prone retry; upstream already owns the hard peak reader budget and cross-thread pooled drain.
 
 ### HERMES-012 — Retired GitHub Actions fork synchronization pipeline
@@ -1091,7 +1092,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `cron/jobs.py`; `tools/cronjob_tools.py`; gateway/CLI/web/desktop cron surfaces; `tests/cron/test_job_timezone.py` and associated cron UI/API tests.
 - **Upstream tracking:** Issue `#26549`; open PR `#27393` superseded `#21926` but was incomplete for this explicit job-field contract when the patch was implemented.
 - **Upstream PR:** Associated: #27393 (open) and superseded #21926 (closed; checked 2026-08-14).
-- **Regression:** `pytest -q tests/cron/test_job_timezone.py tests/cron/test_cronjob_schema.py tests/cron/test_cron_script.py tests/gateway/test_api_server_jobs.py tests/hermes_cli/test_cron.py tests/hermes_cli/test_cron_interactive_timezone.py tests/hermes_cli/test_cron_parser_builder.py tests/hermes_cli/test_web_server_cron_profiles.py`; run the web and desktop cron model tests with their repository commands.
+- **Regression:** `scripts/run_tests.sh -q tests/cron/test_job_timezone.py tests/cron/test_cronjob_schema.py tests/cron/test_cron_script.py tests/gateway/test_api_server_jobs.py tests/hermes_cli/test_cron.py tests/hermes_cli/test_cron_interactive_timezone.py tests/hermes_cli/test_cron_parser_builder.py tests/hermes_cli/test_web_server_cron_profiles.py`; run the web and desktop cron model tests with their repository commands.
 - **Rollback:** Inventory every persisted job with an explicit timezone. Migrate each to the released upstream representation or an equivalent profile/schedule arrangement before removing the private field. Then revert the stable-subject commit in a follow-up change, resolve current upstream overlap, remove duplicate UI/API/tool fields and fork-only tests, and prove New York/Los Angeles separation, profile fallback, update/clear behavior, DST, restart persistence, and interval/one-shot invariance against upstream.
 
 ### HERMES-014 — Cron CLI failure propagation
@@ -1100,7 +1101,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `hermes_cli/main.py`; `tests/hermes_cli/test_cron.py`.
 - **Upstream tracking:** Current `upstream/main` still calls `cron_command(args)` without returning its result. Retire when a released upstream dispatcher propagates cron failures through an equivalent process-status contract.
 - **Upstream PR:** None after checked 2026-08-14.
-- **Regression:** `source venv/bin/activate && python -m pytest -q tests/hermes_cli/test_cron.py -k top_level_handler_propagates_failure_status`.
+- **Regression:** `scripts/run_tests.sh -q tests/hermes_cli/test_cron.py -k top_level_handler_propagates_failure_status`.
 - **Rollback:** Once the released upstream dispatcher owns the same exit-status contract, remove the private `return` change and delete only `test_top_level_handler_propagates_failure_status` if upstream provides equivalent coverage. Run `tests/hermes_cli/test_cron.py`, invoke a deliberately failing read-only cron CLI operation, and verify its nonzero process status before promotion.
 
 ### HERMES-015 — Isolate gateway and cron workdir state
@@ -1149,7 +1150,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `plugins/platforms/telegram/adapter.py`; `hermes_cli/config_defaults.py`; `agent/system_prompt.py`; `cli-config.yaml.example`; Telegram messaging documentation; Rich Message tests.
 - **Upstream tracking:** Fork-owned routing control. Current released upstream retains adaptive Rich Message delivery but does not provide the explicit `auto|always|never` contract after checked 2026-08-18.
 - **Upstream PR:** None after checked 2026-08-18.
-- **Regression:** `uv run pytest -q tests/gateway/test_telegram_rich_messages.py tests/agent/test_system_prompt.py tests/gateway/test_config.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_visual_spacing.py` — 117 passed. `git diff --check` passed.
+- **Regression:** `scripts/run_tests.sh -q tests/gateway/test_telegram_rich_messages.py tests/agent/test_system_prompt.py tests/gateway/test_config.py tests/gateway/test_telegram_rich_newlines.py tests/gateway/test_telegram_visual_spacing.py` — 117 passed. `git diff --check` passed.
 - **Activation:** The active personal profile now has `gateway.platforms.telegram.extra.rich_drafts: true`. The running gateway could not self-restart; an external `hermes gateway restart` is still required. The new `always` mode is not active until the patched Hermes runtime is published and activated.
 - **Rollback:** Set `rich_drafts: false`; set `rich_messages: true` or `auto` for adaptive routing; or revert the patch and restart externally. Do not force-push over the current fork/remote divergence.
 - **Retirement:** Retire after released upstream exposes equivalent validated routing modes across config, system guidance, adapter behavior, backward-compatible booleans, and the focused Rich Message regressions.
@@ -1160,7 +1161,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Surfaces:** `tests/gateway/test_telegram_visual_spacing.py` (test-only guard; no shipped adapter delta remains).
 - **Upstream tracking:** Upstream never carried the retired transport-wide NBSP expansion, so the legacy/plain guard remains upstream-equivalent. Rich Message paragraph rendering is tracked in issue #100664.
 - **Upstream PR:** PR #100686 covers only the Rich Message renderer correction; it does not alter this legacy/plain contract.
-- **Regression:** `uv run pytest -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py`.
+- **Regression:** `scripts/run_tests.sh -q tests/gateway/test_telegram_visual_spacing.py tests/gateway/test_telegram_rich_newlines.py`.
 - **Rollback:** Delete the test file; there is no adapter code to revert.
 - **Retirement:** Retire (delete the guard) once an upstream-owned test pins the same exact-paragraph-boundary payload contract.
 
@@ -1326,7 +1327,7 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Surfaces:** `tools/browser_use_cli.py`; `tools/browser_tool.py`; `agent/chat_completion_helpers.py`; focused browser-use, real-profile, identity, and headed-mode regressions; browser documentation; this record.
 - **Upstream tracking:** [Issue #100428](https://github.com/NousResearch/hermes-agent/issues/100428) tracks the missing per-session control.
 - **Upstream PR:** [#100468](https://github.com/NousResearch/hermes-agent/pull/100468) carries the generic upstream implementation.
-- **Regression:** `uv run --extra dev pytest -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves schema routing, true and false overrides, configured fallback, identity isolation, live-runtime conflict refusal, backend/display rejection, durable mode recovery, and cleanup behavior.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves schema routing, true and false overrides, configured fallback, identity isolation, live-runtime conflict refusal, backend/display rejection, durable mode recovery, and cleanup behavior.
 - **Published commit identity:** Stable subject `feat(browser): choose headed mode per exec session (#28)`.
 - **Rollback:** Revert `feat(browser): choose headed mode per exec session (#28)`, removing the schema argument, runtime mode tracking, focused regressions, documentation, and this record while preserving existing real-profile identity isolation and the global `browser.headed` setting.
 - **Retirement:** Retire after released upstream ships equivalent per-call or per-session managed-local headed control with identity-safe reuse conflicts, durable mode recovery, and runtime-effective cleanup, and the regression contract passes against that release.
@@ -1338,7 +1339,7 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Surfaces:** `tools/browser_tool.py`; `tests/tools/test_browser_headed_mode.py`; this record.
 - **Upstream tracking:** [Issue #100428](https://github.com/NousResearch/hermes-agent/issues/100428) tracks per-session headed control and its lifecycle contract.
 - **Upstream PR:** [#100468](https://github.com/NousResearch/hermes-agent/pull/100468) carries the generic recovery fix and focused regressions.
-- **Regression:** `uv run --extra dev pytest -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves identity-scoped restart recovery, exact marker parsing, malformed-marker preservation, configured fallback, and existing headed-control behavior.
+- **Regression:** `scripts/run_tests.sh -q tests/tools/test_browser_headed_mode.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py`; coverage proves identity-scoped restart recovery, exact marker parsing, malformed-marker preservation, configured fallback, and existing headed-control behavior.
 - **Published commit identity:** Stable subject `fix(browser): recover persisted headed mode after restart`.
 - **Rollback:** Revert `fix(browser): recover persisted headed mode after restart`, removing restart-time mode rediscovery and its focused regressions while retaining HERMES-091's per-call argument and in-process runtime tracking.
 - **Retirement:** Retire with HERMES-091 after released upstream provides equivalent per-session headed control plus restart-safe effective-mode recovery and the combined regression contract passes.
