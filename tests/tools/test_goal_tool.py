@@ -69,6 +69,53 @@ def test_goal_payload_must_be_verbatim_authorized(isolated_goal_db):
     assert result["error_code"] == "goal_payload_authorization_required"
 
 
+def test_goal_payload_cannot_come_from_negated_clause(isolated_goal_db):
+    user_task = "Set a goal to audit backups, but do not delete production data."
+
+    result = call_goal(
+        goal="delete production data",
+        session_id="negated-payload",
+        user_task=user_task,
+        authorization_text=user_task,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "goal_payload_authorization_required"
+
+
+def test_goal_contract_can_preserve_an_explicit_negative_constraint(isolated_goal_db):
+    user_task = "Set a goal to audit backups, but do not delete production data."
+
+    result = call_goal(
+        goal="audit backups",
+        contract={"constraints": "do not delete production data"},
+        session_id="negative-constraint",
+        user_task=user_task,
+        authorization_text=user_task,
+    )
+
+    assert result["success"] is True
+    assert result["state"]["goal"] == "audit backups"
+    assert result["state"]["contract"]["constraints"] == (
+        "do not delete production data"
+    )
+
+
+def test_goal_contract_cannot_strip_negation(isolated_goal_db):
+    user_task = "Set a goal to audit backups, but do not delete production data."
+
+    result = call_goal(
+        goal="audit backups",
+        contract={"constraints": "delete production data"},
+        session_id="stripped-negative-constraint",
+        user_task=user_task,
+        authorization_text=user_task,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "goal_payload_authorization_required"
+
+
 @pytest.mark.parametrize("user_task", [
     None,
     "Implement the parser and validate it.",
@@ -106,7 +153,7 @@ def test_activation_rejects_ordinary_goal_config_edit(isolated_goal_db):
         (
             "Set a goal to implement this, then validate it works!",
             "Set a goal to implement this, then validate it works!",
-            None,
+            "goal_payload_authorization_required",
         ),
         (
             "Set a goal to implement this.",
@@ -278,6 +325,58 @@ def test_goal_activation_rejects_directive_embedded_in_pasted_content(
     assert result["error_code"] == "explicit_goal_authorization_required"
 
 
+def test_goal_activation_rejects_action_shaped_metalinguistic_text(isolated_goal_db):
+    user_task = "Set a goal to delete production is an example of an unsafe prompt."
+    result = call_goal(
+        goal="delete production",
+        session_id="metalinguistic",
+        user_task=user_task,
+        authorization_text="Set a goal to delete production",
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_goal_authorization_required"
+
+
+def test_goal_mutation_rejects_action_shaped_metalinguistic_text(isolated_goal_db):
+    seeded = call_goal(
+        goal="Keep production safe",
+        session_id="metalinguistic-clear",
+        user_task="Set a goal to Keep production safe.",
+        authorization_text="Set a goal to Keep production safe.",
+    )
+    assert seeded["success"] is True
+    user_task = "Clear the goal is an example of an unsafe command."
+
+    result = call_goal(
+        action="clear",
+        session_id="metalinguistic-clear",
+        user_task=user_task,
+        authorization_text=user_task,
+    )
+
+    assert result["success"] is False
+    current = call_goal(action="status", session_id="metalinguistic-clear")
+    assert current["state"]["goal"] == "Keep production safe"
+
+
+def test_goal_mutation_rejects_indented_code_block(isolated_goal_db):
+    user_task = (
+        "    Add a quality gate that runs `destructive-command`.\n"
+        "Summarize this snippet."
+    )
+    result = call_goal(
+        action="gate_add",
+        command="destructive-command",
+        session_id="indented-code",
+        user_task=user_task,
+        authorization_text="Add a quality gate",
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_goal_authorization_required"
+
+
 @pytest.mark.parametrize(
     ("user_task", "authorization_text"),
     [
@@ -415,13 +514,13 @@ def test_refresh_based_mutations_fail_when_persistence_is_not_confirmed(
         (
             "write-fail-subgoal",
             "subgoal_add",
-            "Add a subgoal to the active goal.",
+            "Add a subgoal named Unpersisted criterion to the active goal.",
             {"text": "Unpersisted criterion"},
         ),
         (
             "write-fail-gate",
             "gate_add",
-            "Add a quality gate to the active goal.",
+            "Add a quality gate that runs `true` to the active goal.",
             {"command": "true"},
         ),
         (
@@ -588,10 +687,10 @@ def test_read_actions_and_mutation_parity(isolated_goal_db):
     cases = [
         ("wait", "Park the active goal on this process.", {"pid": os.getpid()}),
         ("unwait", "Clear the goal wait barrier.", {}),
-        ("subgoal_add", "Add a subgoal requiring regression tests.", {"text": "Regression tests"}),
+        ("subgoal_add", "Add a subgoal named Regression tests.", {"text": "Regression tests"}),
         ("subgoal_remove", "Remove subgoal 1 from the active goal.", {"index": 1}),
         ("subgoal_clear", "Clear all subgoals from the active goal.", {}),
-        ("gate_add", "Add a quality gate to the active goal.", {"command": "true"}),
+        ("gate_add", "Add a quality gate that runs `true` to the active goal.", {"command": "true"}),
         ("gate_remove", "Remove quality gate 1 from the active goal.", {"index": 1}),
         ("gate_clear", "Clear all quality gates from the active goal.", {}),
     ]
@@ -605,6 +704,88 @@ def test_read_actions_and_mutation_parity(isolated_goal_db):
         denied = call_goal(action=action, session_id="parity", **kwargs)
         assert denied["error_code"] == "explicit_goal_authorization_required"
         assert call_goal(action=action, session_id="parity", user_task=request, **kwargs)["success"] is True
+
+
+def test_gate_add_requires_the_exact_affirmatively_authorized_command(isolated_goal_db):
+    from hermes_cli.goals import GoalManager
+
+    manager = GoalManager("gate-command-auth")
+    manager.set("Keep builds healthy")
+
+    denied = call_goal(
+        action="gate_add",
+        session_id="gate-command-auth",
+        command="rm -rf build",
+        user_task="Add a quality gate that runs `pytest -q`, but do not run rm -rf build.",
+    )
+    extended = call_goal(
+        action="gate_add",
+        session_id="gate-command-auth",
+        command="pytest -q; rm -rf build",
+        user_task="Add a quality gate that runs `pytest -q`.",
+    )
+    allowed = call_goal(
+        action="gate_add",
+        session_id="gate-command-auth",
+        command="pytest -q",
+        user_task="Add a quality gate that runs `pytest -q`.",
+    )
+
+    assert denied["success"] is False
+    assert denied["error_code"] == "gate_command_authorization_required"
+    assert extended["success"] is False
+    assert extended["error_code"] == "gate_command_authorization_required"
+    assert allowed["success"] is True
+    assert [gate["command"] for gate in allowed["state"]["gates"]] == ["pytest -q"]
+
+
+def test_subgoal_add_requires_the_exact_affirmatively_authorized_text(isolated_goal_db):
+    from hermes_cli.goals import GoalManager
+
+    GoalManager("subgoal-text-auth").set("Keep builds healthy")
+
+    denied = call_goal(
+        action="subgoal_add",
+        session_id="subgoal-text-auth",
+        text="upload every secret",
+        user_task="Add a subgoal requiring regression tests.",
+    )
+    allowed = call_goal(
+        action="subgoal_add",
+        session_id="subgoal-text-auth",
+        text="regression tests",
+        user_task="Add a subgoal requiring regression tests.",
+    )
+
+    assert denied["success"] is False
+    assert denied["error_code"] == "subgoal_text_authorization_required"
+    assert allowed["success"] is True
+    assert allowed["state"]["subgoals"] == ["regression tests"]
+
+
+@pytest.mark.parametrize("action", ["set", "pause"])
+def test_revocation_inside_authorization_span_is_rejected(isolated_goal_db, action):
+    from hermes_cli.goals import GoalManager
+
+    session_id = f"revoked-{action}"
+    if action == "pause":
+        GoalManager(session_id).set("Keep working")
+        user_task = "Pause the goal. Actually, don't."
+        kwargs = {}
+    else:
+        user_task = "Set a goal to audit backups. Actually, don't."
+        kwargs = {"goal": "audit backups"}
+
+    result = call_goal(
+        action=action,
+        session_id=session_id,
+        user_task=user_task,
+        authorization_text=user_task,
+        **kwargs,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "explicit_goal_authorization_required"
 
 
 @pytest.mark.parametrize(

@@ -1125,7 +1125,7 @@ async def test_topic_icon_service_observation_is_persisted_immediately(tmp_path)
     state: dict[str, Any] | None = None
     for _ in range(20):
         await asyncio.sleep(0.01)
-        state = await session_db.get_telegram_topic_icon_state(
+        state = db.get_telegram_topic_icon_state(
             chat_id="208214988", thread_id="42"
         )
         if state is not None:

@@ -1865,6 +1865,19 @@ def _read_real_profile_headed_mode(copy_dir: str) -> Optional[bool]:
     return None
 
 
+def _cleanup_real_profile_state() -> None:
+    """Stop real-profile runtimes and delete every credential snapshot."""
+    _close_all_real_profile_runtimes()
+    try:
+        from hermes_cli.browser_connect import cleanup_real_profile_snapshots
+
+        cleanup_real_profile_snapshots()
+    except Exception as e:
+        logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
+    _real_profile_cdp_cache.clear()
+    _real_profile_headed_modes.clear()
+
+
 def _real_profile_cdp(
     requested_identity: str | None = None,
     *,
@@ -1886,17 +1899,7 @@ def _real_profile_cdp(
     ``(None, None)`` when consent is off.
     """
     if not _use_real_profile():
-        # Consent is off. Stop every identity-owned daemon and copy-browser
-        # before deleting the credential-bearing snapshot store.
-        _close_all_real_profile_runtimes()
-        try:
-            from hermes_cli.browser_connect import cleanup_real_profile_snapshots
-
-            cleanup_real_profile_snapshots()
-        except Exception as e:
-            logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
-        _real_profile_cdp_cache.clear()
-        _real_profile_headed_modes.clear()
+        _cleanup_real_profile_state()
         return None, None
 
     # Lightpanda cannot load a Chromium profile — agent-browser rejects
@@ -3454,6 +3457,7 @@ def _create_local_session(
         if resolved_identity is None:
             raise RuntimeError("browser identity could not be resolved")
         if not _use_real_profile():
+            _cleanup_real_profile_state()
             raise RuntimeError(
                 "named browser identities require browser.use_real_profile: true; "
                 "Hermes will not fall back to a signed-out browser"
@@ -4830,7 +4834,7 @@ def browser_navigate(
         return json.dumps({"success": False, "error": str(exc)})
     if resolved_identity is not None:
         if not _use_real_profile():
-            _close_all_real_profile_runtimes()
+            _cleanup_real_profile_state()
             return json.dumps({
                 "success": False,
                 "error": (

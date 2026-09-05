@@ -136,6 +136,25 @@ _LATER_REVOCATION_RE = re.compile(
     r"|\b(?:never\s+mind|scratch\s+that|cancel\s+that|ignore\s+that)\b",
     re.I,
 )
+_PAYLOAD_NEGATION_BOUNDARY_RE = re.compile(
+    r"\b(?:but\s+|and\s+)?(?:do\s+not|don't|dont|never|must\s+not|"
+    r"should\s+not|cannot|can't|without)\b",
+    re.I,
+)
+_LEADING_NEGATION_RE = re.compile(
+    r"^(?:do\s+not|don't|dont|never|must\s+not|should\s+not|cannot|can't|without)\b",
+    re.I,
+)
+_TRAILING_REVOCATION_RE = re.compile(
+    r"(?:\b(?:actually\s*,?\s*)?(?:do\s+not|don't|dont)\s*(?:do\s+(?:that|it))?[.!?]*\s*$)"
+    r"|\b(?:never\s+mind|scratch\s+that|cancel\s+that|ignore\s+that)\b",
+    re.I,
+)
+_METALINGUISTIC_GOAL_TAIL_RE = re.compile(
+    r"\b(?:is|was|would\s+be|sounds|seems|appears)\b[^.!?\n]{0,100}"
+    r"\b(?:example|illustration|quote|prompt|instruction|text|unsafe|dangerous|hypothetical)\b",
+    re.I,
+)
 
 
 def _failure(error_code: str, message: str, **fields: Any) -> str:
@@ -182,7 +201,10 @@ def _authorization_is_embedded(user_task: str, span_start: int, span_length: int
     line_end = user_task.find("\n", span_end)
     if line_end < 0:
         line_end = len(user_task)
-    stripped_line = user_task[line_start:line_end].lstrip()
+    raw_line = user_task[line_start:line_end]
+    if raw_line.startswith("\t") or len(raw_line) - len(raw_line.lstrip(" ")) >= 4:
+        return True
+    stripped_line = raw_line.lstrip()
     if stripped_line.startswith(">") or (
         stripped_line.startswith("|") and stripped_line.rstrip().endswith("|")
     ):
@@ -265,19 +287,55 @@ def _iter_contract_text(value: Any):
             yield from _iter_contract_text(child)
 
 
+def _affirmative_authorization_context(authorization_context: str) -> str:
+    boundary = _PAYLOAD_NEGATION_BOUNDARY_RE.search(authorization_context)
+    return authorization_context[: boundary.start()] if boundary else authorization_context
+
+
+def _contract_text_authorized(
+    value: str, affirmative_context: str, full_context: str
+) -> bool:
+    normalized = _normalized_authorized_text(value)
+    if not normalized:
+        return True
+    if normalized in affirmative_context:
+        return True
+    return bool(_LEADING_NEGATION_RE.match(normalized) and normalized in full_context)
+
+
+def _gate_command_authorized(command: str, authorization_context: str) -> bool:
+    stripped = command.strip() if isinstance(command, str) else ""
+    if not stripped:
+        return False
+    affirmative = _affirmative_authorization_context(authorization_context)
+    return stripped in re.findall(r"`([^`\n]+)`", affirmative)
+
+
+def _subgoal_text_authorized(text: str, authorization_context: str) -> bool:
+    stripped = text.strip() if isinstance(text, str) else ""
+    return bool(stripped and stripped in _affirmative_authorization_context(authorization_context))
+
+
 def _goal_payload_authorized(
     goal: str,
     contract: Optional[Mapping[str, Any]],
     user_task: str,
     authorization_context: str,
 ) -> bool:
-    """Bind every durable textual instruction to the current user turn."""
+    """Bind the goal to an affirmative clause and contract text to the turn."""
     goal_text = _normalized_authorized_text(goal)
-    affirmative_context = _normalized_authorized_text(authorization_context)
+    affirmative_context = _normalized_authorized_text(
+        _affirmative_authorization_context(authorization_context)
+    )
+    full_context = _normalized_authorized_text(authorization_context)
     if not goal_text or goal_text not in affirmative_context:
         return False
+    goal_end = affirmative_context.rfind(goal_text) + len(goal_text)
+    tail = affirmative_context[goal_end:]
+    if tail.strip(" .,!?:;-'\"") and not re.match(r"^\s*[.!?]\s+", tail):
+        return False
     return all(
-        _normalized_authorized_text(value) in affirmative_context
+        _contract_text_authorized(value, affirmative_context, full_context)
         for value in _iter_contract_text(contract or {})
     )
 
@@ -353,6 +411,8 @@ def _authorized_action(
         or _NEGATED_ACTION_OBJECT_RE.search(context)
     ):
         return False, "", context
+    if _METALINGUISTIC_GOAL_TAIL_RE.search(context):
+        return False, "", context
     prefix = _direct_authorization_prefix(task_text, auth_start)
     suffix = task_text[auth_start + len(auth_text) :]
     # Only the opening direct instruction in a user turn can authorize durable
@@ -371,7 +431,9 @@ def _authorized_action(
         context
     ):
         return False, "", context
-    if _LATER_REVOCATION_RE.search(suffix):
+    if _LATER_REVOCATION_RE.search(suffix) or _TRAILING_REVOCATION_RE.search(
+        task_text[auth_start:]
+    ):
         return False, "", context
     if action == "draft":
         ok = bool(
@@ -644,6 +706,11 @@ def set_goal_tool(
                 state = manager.refresh()
                 change = {"kind": "goal_unparked", "cleared": cleared}
             elif normalized_action == "subgoal_add":
+                if not _subgoal_text_authorized(text, auth_context):
+                    return _failure(
+                        "subgoal_text_authorization_required",
+                        "The complete subgoal text must appear verbatim in the current user's affirmative instruction",
+                    )
                 added = manager.add_subgoal(text)
                 if manager.state is not None:
                     expected_persisted_json = manager.state.to_json()
@@ -681,6 +748,11 @@ def set_goal_tool(
                 state = manager.refresh()
                 change = {"kind": "subgoals_cleared", "count": count}
             elif normalized_action == "gate_add":
+                if not _gate_command_authorized(command, auth_context):
+                    return _failure(
+                        "gate_command_authorization_required",
+                        "The complete gate command must appear verbatim in the current user's affirmative instruction",
+                    )
                 try:
                     timeout = _normalize_positive_int(
                         timeout_seconds, "timeout_seconds", optional=True
@@ -817,13 +889,19 @@ SET_GOAL_SCHEMA = {
                 "description": "Process ID for wait.",
             },
             "reason": {"type": "string", "description": "Optional pause/wait reason."},
-            "text": {"type": "string", "description": "Subgoal text for subgoal_add."},
+            "text": {
+                "type": "string",
+                "description": "Subgoal text for subgoal_add. Copy the complete text verbatim from the current user's affirmative instruction.",
+            },
             "index": {
                 "type": "integer",
                 "minimum": 1,
                 "description": "1-based subgoal or gate index for remove actions.",
             },
-            "command": {"type": "string", "description": "Shell command for gate_add."},
+            "command": {
+                "type": "string",
+                "description": "Shell command for gate_add. Copy the complete command verbatim from the current user's affirmative gate-add instruction.",
+            },
             "timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,

@@ -940,6 +940,12 @@ def _resolve_real_profile_cdp(
     """
     if not _real_profile_consented():
         if identity is not None:
+            try:
+                from tools.browser_tool import _cleanup_real_profile_state
+
+                _cleanup_real_profile_state()
+            except Exception as e:  # pragma: no cover - stubbed browser_tool in tests
+                logger.debug("real-profile consent-off cleanup unavailable: %s", e)
             return (
                 "named browser identities require browser.use_real_profile: true; "
                 "Hermes will not fall back to a signed-out browser"

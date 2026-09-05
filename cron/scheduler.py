@@ -7278,8 +7278,9 @@ def run_job(
                     _running_since.pop(job_id, None)
                     _running_futures.pop(job_id, None)
 
+            worker_context = contextvars.copy_context()
             threading.Thread(
-                target=_fence_lingering_worker,
+                target=lambda: worker_context.run(_fence_lingering_worker),
                 name=f"cron-fence-{str(job_id)[:8]}",
                 daemon=True,
             ).start()

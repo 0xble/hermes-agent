@@ -32,6 +32,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -5452,6 +5453,9 @@ class TurnRunner:
         # against a multi-hour ban. getattr() keeps unit-test runners that
         # build a bare runner object working.
         _edit_clock = getattr(self._runner, "_progress_edit_clock", None)
+        _edit_retry_deadlines = getattr(
+            self._runner, "_progress_edit_retry_deadlines", None
+        )
         _edit_clock_key = "%s:%s" % (
             getattr(ctx.source.platform, "value", ctx.source.platform),
             ctx.source.chat_id,
@@ -5472,6 +5476,21 @@ class TurnRunner:
                     for _k in [k for k, v in _edit_clock.items() if v < _cutoff]:
                         _edit_clock.pop(_k, None)
             return now
+
+        def _defer_progress_edits(now: float, retry_after: float) -> None:
+            if _edit_retry_deadlines is None:
+                return
+            _edit_retry_deadlines[_edit_clock_key] = max(
+                _edit_retry_deadlines.get(_edit_clock_key, 0.0),
+                now + retry_after,
+            )
+            if len(_edit_retry_deadlines) > 64:
+                for key in [
+                    key
+                    for key, deadline in _edit_retry_deadlines.items()
+                    if deadline <= now
+                ]:
+                    _edit_retry_deadlines.pop(key, None)
 
         _progress_len_fn = (
             adapter.message_len_fn
@@ -5518,6 +5537,19 @@ class TurnRunner:
 
         async def _edit_progress_message(message_id: str, content: str):
             nonlocal _last_edit_ts
+            _now = time.monotonic()
+            _retry_deadline = (
+                _edit_retry_deadlines.get(_edit_clock_key, 0.0)
+                if _edit_retry_deadlines is not None
+                else 0.0
+            )
+            if _retry_deadline > _now:
+                return SendResult(
+                    success=False,
+                    error="progress_edit_flood_control_deferred",
+                    retryable=True,
+                    retry_after=_retry_deadline - _now,
+                )
             while True:
                 _now = time.monotonic()
                 _remaining = _PROGRESS_EDIT_INTERVAL - _edit_gate_elapsed(_now)
@@ -5536,7 +5568,15 @@ class TurnRunner:
                 kwargs["finalize"] = True
             if _edit_accepts_metadata:
                 kwargs["metadata"] = ctx._progress_metadata
-            return await adapter.edit_message(**kwargs)
+            result = await adapter.edit_message(**kwargs)
+            if not result.success:
+                try:
+                    retry_after = float(getattr(result, "retry_after", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+                if math.isfinite(retry_after) and retry_after > 0:
+                    _defer_progress_edits(time.monotonic(), retry_after)
+            return result
 
         def _progress_text(lines: list) -> str:
             return "\n".join(str(line) for line in lines)
@@ -5841,11 +5881,31 @@ class TurnRunner:
                     return
 
                 if can_edit and progress_msg_id is not None:
+                    _edit_now = time.monotonic()
+                    if (
+                        _edit_retry_deadlines is not None
+                        and _edit_retry_deadlines.get(_edit_clock_key, 0.0) > _edit_now
+                    ):
+                        continue
                     # Try to edit the existing progress message
                     full_text = "\n".join(progress_lines)
                     result = await _edit_progress_message(progress_msg_id, full_text)
                     if not result.success:
                         _err = (getattr(result, "error", "") or "").lower()
+                        try:
+                            _retry_after = float(
+                                getattr(result, "retry_after", 0.0) or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            _retry_after = 0.0
+                        if math.isfinite(_retry_after) and _retry_after > 0:
+                            _defer_progress_edits(time.monotonic(), _retry_after)
+                            logger.info(
+                                "[%s] Progress edit deferred for %.1fs after flood control",
+                                adapter.name,
+                                _retry_after,
+                            )
+                            continue
                         # Transient network errors (ConnectError, timeouts)
                         # must not permanently disable progress-message
                         # editing — the next cycle can catch up.  Only
@@ -8064,6 +8124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # trimmed opportunistically in send_progress_messages so a
         # long-lived gateway can't accumulate an entry per chat forever.
         self._progress_edit_clock: Dict[str, float] = {}
+        self._progress_edit_retry_deadlines: Dict[str, float] = {}
         # Deferred delivery-ledger sweeps, keyed "platform:profile".
         # A flood-control rejection is retryable but NOT yet: the server names
         # the wait. Re-driving the ledger before it elapses would spend the
@@ -34685,6 +34746,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
+                next_side_delivery_callback = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -34717,6 +34779,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_event_metadata = getattr(pending_event, "metadata", None) or {}
+                    if next_event_metadata.get("gateway_explicit_session_route"):
+                        next_side_delivery_callback = (
+                            lambda message_ids, event=pending_event: self._record_side_delivery(
+                                event, message_ids
+                            )
+                        )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -34773,6 +34842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                     _post_delivery_adapter=_callback_owner,
+                    side_delivery_callback=next_side_delivery_callback,
                     goal_session_entry=next_goal_entry,
                     goal_post_turn_state=goal_post_turn_state,
                 )

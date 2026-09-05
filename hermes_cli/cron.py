@@ -963,7 +963,12 @@ def cron_edit(args):
         if getattr(args, "no_agent", None) is not None
         else bool(job.get("no_agent"))
     )
-    if completion_script and effective_no_agent:
+    effective_completion_script = (
+        completion_script
+        if completion_script is not None
+        else job.get("completion_script")
+    )
+    if effective_completion_script and effective_no_agent:
         print(
             color(
                 "Failed to update job: completion_script requires an agent run and "

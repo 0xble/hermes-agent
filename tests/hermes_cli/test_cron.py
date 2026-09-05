@@ -111,6 +111,42 @@ class TestCronCommandLifecycle:
         assert "Updated job" in output
         assert "No updates provided" not in output
 
+    def test_edit_cannot_enable_no_agent_with_existing_completion_script(
+        self, tmp_cron_dir, capsys, monkeypatch
+    ):
+        scripts = tmp_cron_dir / "scripts"
+        scripts.mkdir()
+        verifier = scripts / "verify.py"
+        verifier.write_text("print('verified')\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home", lambda: tmp_cron_dir
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+        create_args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Daily report",
+                "--completion-script",
+                "verify.py",
+            ]
+        )
+        assert cron_command(create_args) == 0
+        job = list_jobs()[0]
+        capsys.readouterr()
+
+        args = parser.parse_args(["cron", "edit", job["id"], "--no-agent"])
+
+        assert cron_command(args) == 1
+        persisted = get_job(job["id"])
+        assert persisted is not None
+        assert persisted["no_agent"] is False
+        assert persisted["completion_script"] == "verify.py"
+        assert "completion_script requires an agent run" in capsys.readouterr().out
+
     def test_top_level_handler_propagates_failure_status(self, monkeypatch):
         from hermes_cli.main import cmd_cron
 

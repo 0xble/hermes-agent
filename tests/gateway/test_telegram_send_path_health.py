@@ -42,8 +42,8 @@ class _FloodError(Exception):
 
 
 @pytest.mark.asyncio
-async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
-    """A 97-minute RetryAfter must not pin send() for the full penalty."""
+async def test_send_long_flood_is_deferred_without_inline_sleep(monkeypatch):
+    """A 97-minute RetryAfter remains retryable without pinning send()."""
     adapter = _make_adapter()
     adapter._rich_send_disabled = True
     adapter._bot.send_message = AsyncMock(side_effect=_FloodError(5827.0))
@@ -55,7 +55,7 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
     assert result.success is False
     assert result.error == "flood_control:5827.0"
     assert result.retry_after == 5827.0
-    assert result.retryable is False
+    assert result.retryable is True
     sleep.assert_not_awaited()
 
 

@@ -899,8 +899,8 @@ finally:
 function withRemoteUpdateMutex(command, mutexPath) {
   const script = `
 import fcntl,os,subprocess,sys
-mutex_path=os.environ["HERMES_UPDATE_MUTEX_PATH"]
-payload=sys.argv[1]
+mutex_path=os.path.expandvars(os.path.expanduser(sys.argv[1]))
+payload=sys.argv[2]
 parent=os.path.dirname(mutex_path)
 if parent:os.makedirs(parent,exist_ok=True)
 fd=os.open(mutex_path,os.O_RDWR|os.O_CREAT|os.O_CLOEXEC,0o600)
@@ -913,9 +913,9 @@ finally:
 sys.exit(result.returncode if result is not None else 1)
 `.trim()
 
-  // Bind the validated, shell-quoted path through the child environment so it
-  // never becomes executable Python argument syntax.
-  return `HERMES_UPDATE_MUTEX_PATH=${mutexPath} python3 -c ${shq(script)} ${shq(command)}`
+  // Pass both values as quoted positional arguments. Python performs home
+  // expansion after the shell has treated the path as inert data.
+  return `python3 -c ${shq(script)} ${shq(mutexPath)} ${shq(command)}`
 }
 
 /**
@@ -1047,9 +1047,7 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   const subCmd = `serve --isolated --host 127.0.0.1 --port 0${tokenArg}${ownerArg}`
   const marker = expandRemotePath(`${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress`)
 
-  const updateMutex = expandRemotePath(
-    `${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress.mutex`
-  )
+  const updateMutex = `${remoteInstallRoot(opts.hermesHome || '~/.hermes')}/.hermes-update-in-progress.mutex`
 
   // The marker probe, ownership reservation, process creation, and initial
   // lockfile publication must be one remote command. A second Desktop process

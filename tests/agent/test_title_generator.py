@@ -1018,9 +1018,8 @@ class TestMaybeAutoTitle:
                 [],
                 title_context=title_context,
             )
-
-        assert called.wait(timeout=10), "auto-title worker never ran"
-        assert worker.call_args.kwargs["title_context"] == title_context
+            assert called.wait(timeout=10), "auto-title worker never ran"
+            assert worker.call_args.kwargs["title_context"] == title_context
 
     def test_auto_title_passes_supported_image_to_provider(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
