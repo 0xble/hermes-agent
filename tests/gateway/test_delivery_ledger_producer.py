@@ -128,14 +128,17 @@ class TestProducerHook:
         assert rows[0][1] == "failed"
 
     @pytest.mark.asyncio
-    async def test_late_transient_failure_signals_reconnected_runner(self):
-        """A replacement installed mid-send must trigger another ledger sweep."""
+    @pytest.mark.parametrize("same_adapter", [False, True])
+    async def test_late_transient_failure_signals_reconnected_runner(self, same_adapter):
+        """Recovery before the failed-row write must trigger another sweep."""
         adapter = _Adapter()
         adapter._owner_profile = "reviewer"
         replacement = _Adapter()
         replacement._owner_profile = "reviewer"
         runner = MagicMock()
-        runner._adapter_for_source.side_effect = [adapter, replacement]
+        runner._adapter_for_source.side_effect = [adapter, adapter if same_adapter else replacement]
+        runner._authorization_adapter.return_value = adapter
+        setattr(adapter, "_send_path_degraded", False)
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
         adapter.gateway_runner = runner
         adapter.send = AsyncMock(

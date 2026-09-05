@@ -130,6 +130,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-106 | Active | `fix(maintenance): reconcile concurrent origin baseline` | Try one previously untried eligible logical account on each transient same-provider retry before crossing to the configured fallback. |
 | HERMES-107 | Active | `fix(maintenance): reconcile concurrent origin baseline` | Make the configured compression fallback independent of whether the worker or host observes the shared hard deadline first. |
 | HERMES-108 | Active | `feat(delegate): add named custom subagents` | Select trusted named children with fixed subscription routes and read-only shared knowledge. |
+| HERMES-109 | Active | `fix(telegram): recover stranded answers after polling health returns` | Pace degraded retries and wake the identity-scoped delivery ledger after internal recovery, including late failure writes. |
 
 
 ## Fork-only administrative subject exemptions
@@ -233,6 +234,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-109 — Recover Answers After Internal Telegram Recovery
+
+- **Summary:** Telegram's internal polling recovery must redeliver completed answers stranded as `failed/send_path_degraded` without requiring a gateway restart. Retry pacing uses the existing polling-health window. Health transitions and late failure writes both wake the existing ledger, preserving transactional claims, exact adapter ownership, ambiguity classification, and attempt limits.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`, `gateway/platforms/base.py`, `gateway/run.py`, `tests/gateway/test_telegram_internal_delivery_recovery.py`, `tests/gateway/test_delivery_ledger_producer.py`.
+- **Upstream tracking:** Related open [issue #91653](https://github.com/NousResearch/hermes-agent/issues/91653), checked 2026-09-05. No new public issue created.
+- **Upstream PR:** Adapt the narrow retry cadence from open [#93440](https://github.com/NousResearch/hermes-agent/pull/93440). Related open [#91655](https://github.com/NousResearch/hermes-agent/pull/91655) is reference only, not imported wholesale. Closed-unmerged [#95206](https://github.com/NousResearch/hermes-agent/pull/95206) provides the existing fork ledger integration and explicitly leaves same-object internal recovery unresolved. Status checked 2026-09-05.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_internal_delivery_recovery.py tests/gateway/test_delivery_ledger_producer.py tests/gateway/test_delivery_ledger.py tests/gateway/test_telegram_polling_health_confirmation.py -j 2 -q`. The new regression initially failed five cases on the unchanged fork. Require recovery-before/after-persistence, duplicate signals, exact profile routing, stale generation/adapter rejection, permanent and ambiguous failure exclusion, and bounded replay.
+- **Published commit identity:** Expected stable subject `fix(telegram): recover stranded answers after polling health returns`.
+- **Rollback:** Revert only this stable-subject commit and promote through the normal separately authorized runtime workflow. No schema, credentials, network settings, or timeout policy changes. Preserve ledger rows, never bulk-reset failed or attempting obligations.
+- **Retirement:** Retire when released upstream supplies equivalent same-object recovery and producer/replay race protection with these regression contracts passing.
 
 ### HERMES-108 — Configure Named Custom Subagents
 

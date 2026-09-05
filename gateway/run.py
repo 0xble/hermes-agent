@@ -13978,6 +13978,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"],
                         str(getattr(result, "error", "") or "send failed"),
                     )
+                    if (
+                        getattr(result, "error", None) == "send_path_degraded"
+                        and isinstance(adapter, BasePlatformAdapter)
+                    ):
+                        # A replay can also finish failing after its adapter's
+                        # recovery sweep. Claims and attempt caps bound re-entry.
+                        await adapter._redeliver_recovered_send_path()
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
         return redelivered

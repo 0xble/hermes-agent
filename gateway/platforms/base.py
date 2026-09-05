@@ -6074,6 +6074,27 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    async def _redeliver_recovered_send_path(self) -> None:
+        """Wake the existing ledger after this exact adapter recovers in place.
+
+        Called both by the health transition and after a late failed-row write.
+        Transactional claims and the ledger attempt cap arbitrate concurrent
+        signals. Never route a stale adapter's signal through another bot.
+        """
+        if getattr(self, "_send_path_degraded", None) is not False:
+            return
+        runner = getattr(self, "gateway_runner", None)
+        resolve = getattr(runner, "_authorization_adapter", None)
+        replay: Any = getattr(runner, "_redeliver_failed_obligations_for_platform", None)
+        if not callable(resolve) or not callable(replay):
+            return
+        profile = getattr(self, "_owner_profile", None)
+        try:
+            if resolve(self.platform, profile) is self:
+                await replay(self.platform, profile=profile)
+        except Exception:
+            logger.debug("[%s] Internal recovery redelivery failed", self.name, exc_info=True)
+
     def _final_delivery_adapter(
         self, source: Optional[SessionSource]
     ) -> "BasePlatformAdapter":
@@ -7353,6 +7374,10 @@ class BasePlatformAdapter(ABC):
                                                 None,
                                             ),
                                         )
+                                    elif _live_adapter is delivery_adapter:
+                                        # Recovery can win the race with mark_failed
+                                        # without replacing the adapter object.
+                                        await delivery_adapter._redeliver_recovered_send_path()
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
