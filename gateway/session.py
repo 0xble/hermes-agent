@@ -105,34 +105,6 @@ from .whatsapp_identity import (
 from utils import atomic_replace
 from agent.turn_context import extract_api_content_sidecar
 
-
-def transcript_message_append_fields(message: Dict[str, Any]) -> Dict[str, Any]:
-    """Map one transcript message to SessionDB append fields."""
-    is_assistant = message.get("role") == "assistant"
-    return {
-        "role": message.get("role", "unknown"),
-        "content": message.get("content"),
-        "tool_name": message.get("tool_name") or message.get("name"),
-        "tool_calls": message.get("tool_calls"),
-        "tool_call_id": message.get("tool_call_id"),
-        "finish_reason": message.get("finish_reason"),
-        "reasoning": message.get("reasoning") if is_assistant else None,
-        "reasoning_content": message.get("reasoning_content") if is_assistant else None,
-        "reasoning_details": message.get("reasoning_details") if is_assistant else None,
-        "codex_reasoning_items": message.get("codex_reasoning_items") if is_assistant else None,
-        "codex_message_items": message.get("codex_message_items") if is_assistant else None,
-        "platform_message_id": (
-            message.get("platform_message_id") or message.get("message_id")
-        ),
-        "observed": bool(message.get("observed")),
-        "effect_disposition": message.get("effect_disposition"),
-        "_compressed_summary": bool(message.get("_compressed_summary")),
-        "timestamp": message.get("timestamp"),
-        "api_content": extract_api_content_sidecar(message),
-        "display_kind": message.get("display_kind"),
-        "display_metadata": message.get("display_metadata"),
-    }
-
 # Session keys/ids flow into filesystem paths downstream (e.g.
 # ``sessions_dir / f"{session_id}.json"`` in hermes_state, request-dump
 # filenames in agent_runtime_helpers). Any value that could escape the
@@ -3891,85 +3863,6 @@ class SessionStore:
             self._save()
             return entry
 
-    def bind_session_route(
-        self,
-        session_key: str,
-        target_session_id: str,
-        source: SessionSource,
-        *,
-        display_name: Optional[str] = None,
-    ) -> Optional[SessionEntry]:
-        """Bind an additional route to an open session without moving another route.
-
-        This is the nonexclusive counterpart to ``switch_session``. It exists
-        for continuable side conversations whose delivery source remains the
-        parent chat while conversation state uses an independent serialized
-        lane. The target row must already exist and remain open.
-        """
-        if not session_key or not target_session_id or source is None:
-            return None
-        db = self._db
-        if db:
-            try:
-                getter = getattr(db, "get_session", None)
-                if not callable(getter):
-                    return None
-                row = getter(target_session_id)
-            except Exception:
-                logger.warning("Could not validate detached route target", exc_info=True)
-                return None
-            if not isinstance(row, dict) or row.get("ended_at") is not None:
-                return None
-
-        now = _now()
-        entry = SessionEntry(
-            session_key=session_key,
-            session_id=target_session_id,
-            created_at=now,
-            updated_at=now,
-            origin=source,
-            display_name=display_name or source.chat_name,
-            platform=source.platform,
-            chat_type=source.chat_type,
-        )
-        with self._lock:
-            self._ensure_loaded_locked()
-            current = self._entries.get(session_key)
-            if current is not None and current.session_id != target_session_id:
-                return None
-            self._entries[session_key] = entry
-            self._save()
-
-        if db:
-            self._record_gateway_session_peer(
-                target_session_id,
-                session_key,
-                source,
-                display_name=entry.display_name,
-                include_compression_ancestors=True,
-            )
-        return entry
-
-    def close_session_route(
-        self,
-        session_key: str,
-        *,
-        end_reason: str = "side_closed",
-    ) -> Optional[str]:
-        """Close one nonexclusive route and its current session without touching peers."""
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.pop(session_key, None)
-            if entry is None:
-                return None
-            self._save()
-        db = self._db
-        if db:
-            ender = getattr(db, "end_session", None)
-            if callable(ender):
-                ender(entry.session_id, end_reason=end_reason)
-        return entry.session_id
-
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
@@ -4403,7 +4296,29 @@ class SessionStore:
             )
         _db.append_message(
             session_id=session_id,
-            **transcript_message_append_fields(message),
+            role=message.get("role", "unknown"),
+            content=message.get("content"),
+            tool_name=message.get("tool_name"),
+            tool_calls=message.get("tool_calls"),
+            tool_call_id=message.get("tool_call_id"),
+            reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
+            reasoning_content=message.get("reasoning_content") if message.get("role") == "assistant" else None,
+            reasoning_details=message.get("reasoning_details") if message.get("role") == "assistant" else None,
+            codex_reasoning_items=message.get("codex_reasoning_items") if message.get("role") == "assistant" else None,
+            codex_message_items=message.get("codex_message_items") if message.get("role") == "assistant" else None,
+            platform_message_id=(message.get("platform_message_id") or message.get("message_id")),
+            observed=bool(message.get("observed")),
+            timestamp=message.get("timestamp"),
+            # api_content sidecar: the exact bytes sent to the API for
+            # this message (prompt-cache-stable replay). Must survive
+            # any gateway-side persistence path or the next turn's
+            # replay diverges at this row.
+            api_content=extract_api_content_sidecar(message),
+            # Presentation typing (e.g. "internal_notification" for
+            # self-injected async-delegation/background notification turns,
+            # #82888). DB-only; stripped from provider-bound payloads.
+            display_kind=message.get("display_kind"),
+            display_metadata=message.get("display_metadata"),
         )
 
     # Maximum in-memory pending messages per session before dropping the

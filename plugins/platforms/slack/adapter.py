@@ -4033,7 +4033,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> List[SendResult]:
+    ) -> None:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -4048,11 +4048,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Suppressed multi-image upload in configured ignored channel %s",
                 chat_id,
             )
-            return []
+            return
         if not self._app:
-            return []
+            return
         if not images:
-            return []
+            return
 
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
@@ -4065,13 +4065,13 @@ class SlackAdapter(BasePlatformAdapter):
                 is_safe_url as _is_safe_url,
             )
         except Exception:
-            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            return
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
-        results: List[SendResult] = []
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -4154,41 +4154,8 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
-                payload = getattr(result, "data", result)
-                message_ids: List[str] = []
-                file_ids: List[str] = []
-                if isinstance(payload, dict):
-                    direct_ts = payload.get("ts")
-                    if direct_ts:
-                        message_ids.append(str(direct_ts))
-                    files_payload = payload.get("files") or []
-                    for file_payload in files_payload:
-                        if not isinstance(file_payload, dict):
-                            continue
-                        if file_payload.get("id"):
-                            file_ids.append(str(file_payload["id"]))
-                        shares = file_payload.get("shares") or {}
-                        if not isinstance(shares, dict):
-                            continue
-                        for visibility in shares.values():
-                            if not isinstance(visibility, dict):
-                                continue
-                            for channel_shares in visibility.values():
-                                for share in channel_shares or []:
-                                    if isinstance(share, dict) and share.get("ts"):
-                                        message_ids.append(str(share["ts"]))
-                identifiers = list(dict.fromkeys(message_ids or file_ids))
-                results.extend(
-                    SendResult(
-                        success=True,
-                        message_id=(
-                            identifiers[index]
-                            if index < len(identifiers)
-                            else identifiers[-1] if identifiers else None
-                        ),
-                    )
-                    for index in range(len(file_uploads))
-                )
+                _ = result
+                results.extend(SendResult(success=True) for _item in file_uploads)
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -4197,12 +4164,9 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                results.extend(
-                    await super().send_multiple_images(
-                        chat_id, chunk, metadata, human_delay=human_delay
-                    )
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay
                 )
-        return results
 
     def _record_uploaded_file_thread(
         self,

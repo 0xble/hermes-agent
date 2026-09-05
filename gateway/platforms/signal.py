@@ -1186,7 +1186,6 @@ class SignalAdapter(BasePlatformAdapter):
             self.MAX_MESSAGE_LENGTH,
         )
         last_result = None
-        delivered_ids: List[str] = []
 
         for idx, (plain_text, text_styles) in enumerate(chunks, start=1):
             params: Dict[str, Any] = dict(base_params, message=plain_text)
@@ -1211,17 +1210,12 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            timestamp = result.get("timestamp") if isinstance(result, dict) else None
-            if timestamp:
-                delivered_ids.append(str(timestamp))
             last_result = result
 
         # Signal has no editable message identifier. Returning None keeps the
         # stream consumer on the non-edit fallback path instead of pretending
         # future edits can remove an in-progress cursor from the chat thread.
-        raw_response = dict(last_result) if isinstance(last_result, dict) else {}
-        raw_response["message_ids"] = delivered_ids
-        return SendResult(success=True, message_id=None, raw_response=raw_response)
+        return SendResult(success=True, message_id=None, raw_response=last_result)
 
     def _track_sent_timestamp(self, rpc_result) -> None:
         """Record outbound message timestamp for echo-back filtering."""
@@ -1310,7 +1304,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> List[SendResult]:
+    ) -> None:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1320,7 +1314,7 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return []
+            return
 
         scheduler = get_scheduler()
         logger.info(
@@ -1420,20 +1414,7 @@ class SignalAdapter(BasePlatformAdapter):
                         success, err_msg = self._validate_send_result(result)
                         if success:
                             self._track_sent_timestamp(result)
-                            timestamp = (
-                                result.get("timestamp")
-                                if isinstance(result, dict)
-                                else None
-                            )
-                            raw_response = (
-                                dict(result) if isinstance(result, dict) else {}
-                            )
-                            raw_response["message_ids"] = (
-                                [str(timestamp)] if timestamp else []
-                            )
-                            results.append(
-                                SendResult(success=True, raw_response=raw_response)
-                            )
+                            results.append(SendResult(success=True))
                             batch_succeeded = True
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
@@ -1506,8 +1487,6 @@ class SignalAdapter(BasePlatformAdapter):
                     )
                 )
 
-        return results
-
     async def _notify_batch_pacing(
         self,
         chat_id: str,
@@ -1572,10 +1551,7 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            timestamp = result.get("timestamp") if isinstance(result, dict) else None
-            raw_response = dict(result) if isinstance(result, dict) else {}
-            raw_response["message_ids"] = [str(timestamp)] if timestamp else []
-            return SendResult(success=True, raw_response=raw_response)
+            return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
 
     async def _send_attachment(
@@ -1617,10 +1593,7 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            timestamp = result.get("timestamp") if isinstance(result, dict) else None
-            raw_response = dict(result) if isinstance(result, dict) else {}
-            raw_response["message_ids"] = [str(timestamp)] if timestamp else []
-            return SendResult(success=True, raw_response=raw_response)
+            return SendResult(success=True)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 
     async def send_document(

@@ -3172,12 +3172,6 @@ from gateway.delivery import (
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
 )
-from gateway.side_notifications import (
-    format_side_closed,
-    side_response_parts,
-    side_rich_text_supported,
-    side_root_from_route,
-)
 from gateway.turn_lease import (
     DEFAULT_LEASE_WAIT,
     SessionTurnLeaseRegistry,
@@ -6354,13 +6348,6 @@ class TurnRunner:
                             on_missing_cursor="raise",
                         )
                     )
-                    _side_initial = ""
-                    _side_suffix = ""
-                    if ctx.side_delivery_callback is not None:
-                        _side_initial, _side_suffix = side_response_parts(
-                            side_root_from_route(ctx.session_key or ""),
-                            rich_text=side_rich_text_supported(_adapter),
-                        )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
@@ -6372,9 +6359,6 @@ class TurnRunner:
                             else None
                         ),
                         on_before_finalize=_pause_typing_before_finalize,
-                        on_delivery=ctx.side_delivery_callback,
-                        initial_text=_side_initial,
-                        final_suffix=_side_suffix,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                     )
@@ -7837,24 +7821,6 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
-
-
-def _stream_consumer_delivered_exact_final(consumer, final_text: str) -> bool:
-    """Confirm that a local stream consumer delivered this exact final payload."""
-    if consumer is None or not final_text:
-        return False
-    if not (
-        getattr(consumer, "final_response_sent", False)
-        or getattr(consumer, "final_content_delivered", False)
-    ):
-        return False
-    matcher = getattr(consumer, "delivered_final_matches", None)
-    if not callable(matcher):
-        return False
-    try:
-        return matcher(final_text) is True
-    except Exception:
-        return False
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -17302,13 +17268,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
-            # Stop queued active-turn sides before draining their parent turns.
-            # Otherwise a parent can publish a checkpoint during shutdown and
-            # let a child launch just before platform teardown.
-            cancel_side_waiters = getattr(self, "_cancel_side_waiters", None)
-            if cancel_side_waiters is not None:
-                await cancel_side_waiters()
-
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
             _deferred_at_start = _deferred_worker_count()
@@ -19229,8 +19188,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "agents": self._handle_agents_command,
             "bg": self._handle_background_command,
             "btw": self._handle_btw_command,
-            "side": self._handle_side_command,
-            "merge": self._handle_merge_command,
             "kanban": self._handle_kanban_command,
             "subgoal": self._handle_subgoal_command,
             "heartbeat": self._handle_heartbeat_command,
@@ -19277,7 +19234,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "new": self._busy_new_command,
                 "queue": self._busy_queue_command,
                 "steer": self._busy_steer_command,
-                "side": self._busy_side_command,
                 "egress": self._busy_egress_command,
                 "goal": self._busy_goal_command,
                 "loop": self._busy_loop_command,
@@ -19346,16 +19302,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.proxy_cli import format_status_text
 
         return format_status_text()
-
-    async def _busy_side_command(self, event: MessageEvent, quick_key: str, source):
-        """Queue /side against the next provider-valid active-turn checkpoint."""
-        state = self._peek_session_state(quick_key)
-        run_generation = int(state.persistent.run_generation)
-        return await self._handle_side_command(
-            event,
-            active_session_key=quick_key,
-            active_run_generation=run_generation,
-        )
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # /stop must hard-kill the session when an agent is running.
@@ -19606,181 +19552,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event.turn_reasoning_notice = request.notice
         return request
 
-    async def _prepare_side_reply_route(self, event: MessageEvent) -> None:
-        """Resolve a side reply inside the same profile scope as its turn."""
-        source = getattr(event, "source", None)
-        if source is None:
-            return
-        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            if not getattr(source, "profile", None):
-                source.profile = self._profile_name_for_source(source)
-            home = self._resolve_profile_home_for_source(source)
-            with _profile_runtime_scope(home):
-                await self._prepare_side_reply_route_scoped(event)
-            return
-        await self._prepare_side_reply_route_scoped(event)
-
-    async def _prepare_side_reply_route_scoped(self, event: MessageEvent) -> None:
-        raw_metadata = getattr(event, "metadata", None)
-        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
-        event.metadata = metadata
-        setattr(event, "_gateway_original_text", str(event.text or ""))
-        if metadata.get("gateway_explicit_session_route") is True:
-            return
-        reply_id = str(getattr(event, "reply_to_message_id", None) or "").strip()
-        source = getattr(event, "source", None)
-        if not reply_id or source is None:
-            return
-        db = getattr(self, "_session_db", None)
-        resolver = getattr(db, "resolve_side_message_binding", None)
-        if not callable(resolver):
-            return
-        user_id = str(source.user_id or "")
-        if not user_id:
-            return
-        platform = source.platform.value if source.platform else ""
-        binding_result = resolver(
-            platform=platform,
-            chat_id=str(source.chat_id or ""),
-            thread_id=str(source.thread_id or ""),
-            user_id=user_id,
-            profile=str(source.profile or ""),
-            scope_id=str(source.scope_id or ""),
-            business_connection_id=str(source.business_connection_id or ""),
-            message_id=reply_id,
-        )
-        binding = (
-            await binding_result
-            if inspect.isawaitable(binding_result)
-            else binding_result
-        )
-        if not isinstance(binding, dict):
-            return
-        route_key = str(binding.get("side_route_key") or "").strip()
-        root_id = str(binding.get("side_root_session_id") or "").strip()
-        entry = await self.async_session_store.lookup_by_session_key(route_key)
-        if entry is None:
-            metadata.update(
-                {
-                    "gateway_session_key": route_key,
-                    "gateway_session_strict": True,
-                    "gateway_explicit_session_route": True,
-                    "gateway_side_route_unavailable": True,
-                    "gateway_side_root_session_id": root_id,
-                }
-            )
-            return
-        metadata.update(
-            {
-                "gateway_session_key": route_key,
-                "gateway_session_id": entry.session_id,
-                "gateway_session_strict": True,
-                "gateway_explicit_session_route": True,
-                "gateway_side_root_session_id": root_id,
-            }
-        )
-
-    async def _record_side_delivery(
-        self,
-        event: MessageEvent,
-        message_ids: List[str],
-    ) -> None:
-        """Persist delivery receipts so replies continue the routed side."""
-        metadata = getattr(event, "metadata", None) or {}
-        route_key = str(metadata.get("gateway_session_key") or "").strip()
-        root_id = str(metadata.get("gateway_side_root_session_id") or "").strip()
-        if (
-            not metadata.get("gateway_explicit_session_route")
-            or metadata.get("gateway_side_route_unavailable")
-            or not route_key
-            or not root_id
-        ):
-            return
-        source = event.source
-        recorder = getattr(getattr(self, "_session_db", None), "record_side_message_binding", None)
-        if not callable(recorder):
-            return
-        platform = source.platform.value if source.platform else ""
-        user_id = str(source.user_id or "")
-        if not user_id:
-            logger.warning("Skipping side reply binding without a user identity")
-            return
-        for message_id in {str(mid) for mid in message_ids if mid}:
-            recorded = recorder(
-                platform=platform,
-                chat_id=str(source.chat_id or ""),
-                thread_id=str(source.thread_id or ""),
-                user_id=user_id,
-                profile=str(source.profile or ""),
-                scope_id=str(source.scope_id or ""),
-                business_connection_id=str(source.business_connection_id or ""),
-                message_id=message_id,
-                side_route_key=route_key,
-                side_root_session_id=root_id,
-            )
-            if inspect.isawaitable(recorded):
-                await recorded
-
-    async def _close_side_route(
-        self,
-        session_key: str,
-        source: SessionSource,
-    ) -> bool:
-        """Close a side as a real session boundary, including runtime cleanup."""
-        entry = await self.async_session_store.lookup_by_session_key(session_key)
-        if entry is None:
-            return False
-        cache_lock = getattr(self, "_agent_cache_lock", None)
-        cached_agent = None
-        if cache_lock is not None:
-            with cache_lock:
-                cached = self._agent_cache.get(session_key)
-                cached_agent = cached[0] if isinstance(cached, tuple) else cached
-        await self._interrupt_and_clear_session(
-            session_key,
-            source,
-            interrupt_reason=_INTERRUPT_REASON_SIDE_CLOSE,
-            invalidation_reason="side_closed",
-        )
-        if cached_agent is not None:
-            try:
-                await asyncio.wait_for(
-                    self._run_in_executor_with_context(
-                        self._cleanup_agent_resources, cached_agent
-                    ),
-                    timeout=15.0,
-                )
-            except Exception:
-                logger.warning("Side runtime cleanup failed for %s", session_key, exc_info=True)
-        self._evict_cached_agent(session_key)
-        self._clear_conversation_scope(session_key, reason="side_closed")
-        try:
-            from tools.async_delegation import interrupt_for_session
-            interrupt_for_session(
-                session_key=session_key,
-                parent_session_id=entry.session_id,
-                reason="side_closed",
-            )
-        except Exception:
-            pass
-        closed = await self.async_session_store.close_session_route(
-            session_key,
-            end_reason="side_closed",
-        )
-        if not closed:
-            return False
-        try:
-            await self._finalize_session_off_loop(
-                session_id=entry.session_id,
-                platform=source.platform.value if source.platform else "",
-                reason="side_closed",
-                old_session_id=entry.session_id,
-                new_session_id=None,
-            )
-        except Exception:
-            logger.warning("Side finalize hook failed for %s", session_key, exc_info=True)
-        return True
-
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -19995,7 +19766,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Resolve replies to previously delivered side messages before any
         # command-aware routing reads the event metadata. The resolver also
         # normalizes test/internal events whose metadata is not a real mapping.
-        await self._prepare_side_reply_route(event)
 
         # Expand configured aliases after authorization and plugin rewriting,
         # but before any command-aware state gate. The base adapter separately
@@ -20070,12 +19840,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _estop_allow = False
                 if not _estop_allow:
                     try:
-                        _estop_meta = getattr(event, "metadata", None) or {}
-                        _estop_key = (
-                            str(_estop_meta.get("gateway_session_key") or "").strip()
-                            if _estop_meta.get("gateway_explicit_session_route")
-                            else self._session_key_for_source(source)
-                        )
+                        _estop_key = self._session_key_for_source(source)
                         _estop_state = self._peek_session_state(_estop_key)
                         if (
                             _estop_state is not None
@@ -20115,47 +19880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _event_metadata = getattr(event, "metadata", None) or {}
-        _quick_key = (
-            str(_event_metadata.get("gateway_session_key") or "").strip()
-            if _event_metadata.get("gateway_explicit_session_route")
-            else self._session_key_for_source(source)
-        )
-        if _event_metadata.get("gateway_side_route_unavailable"):
-            return (
-                "This side is closed or no longer available. "
-                "Use /side <prompt> to start a new one."
-            )
-        _explicit_side_close = bool(
-            re.fullmatch(
-                r"/side(?:@[A-Za-z0-9_]+)?\s+close\s*",
-                str(getattr(event, "_gateway_original_text", None) or event.text or ""),
-                flags=re.IGNORECASE,
-            )
-        )
-        if (
-            _event_metadata.get("gateway_explicit_session_route")
-            and bool(getattr(event, "allow_gateway_control", True))
-            and _explicit_side_close
-        ):
-            _side_denied = self._check_slash_access(source, "side")
-            if _side_denied is not None:
-                return _side_denied
-            closed = await self._close_side_route(_quick_key, source)
-            side_root = (
-                _event_metadata.get("gateway_side_root_session_id")
-                or side_root_from_route(_quick_key)
-            )
-            return (
-                format_side_closed(
-                    side_root,
-                    rich_text=side_rich_text_supported(
-                        self._adapter_for_source(source)
-                    ),
-                )
-                if closed
-                else "This side is already closed."
-            )
+        _quick_key = self._session_key_for_source(source)
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
         if (
@@ -21048,6 +20773,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "diff":
             return await self._handle_diff_command(event)
+
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
             if not queue_payload:
@@ -22331,10 +22057,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expected_session_key = str(
             event_metadata.get("gateway_session_key") or ""
         ).strip()
-        explicit_session_route = bool(
-            event_metadata.get("gateway_explicit_session_route")
-        )
-        if expected_session_key and not explicit_session_route:
+        if expected_session_key:
             derived_session_key = self._session_key_for_source(source)
             if derived_session_key != expected_session_key:
                 logger.warning(
@@ -22382,10 +22105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if (
-            not strict_session
-            and await asyncio.to_thread(self._is_telegram_topic_lane, source)
-        ):
+        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
@@ -24271,13 +23991,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             goal_post_turn_state: Dict[str, bool] = {}
-            _side_delivery_callback = (
-                (lambda message_ids: self._record_side_delivery(event, message_ids))
-                if event_metadata.get("gateway_explicit_session_route")
-                else None
-            )
-            if _side_delivery_callback is not None:
-                event_metadata["_gateway_side_delivery_callback"] = _side_delivery_callback
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -24297,7 +24010,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
                 turn_reasoning_config=event.turn_reasoning_config,
-                side_delivery_callback=_side_delivery_callback,
                 goal_session_entry=session_entry,
                 goal_post_turn_state=goal_post_turn_state,
             )
@@ -24417,19 +24129,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
-                if (
-                    event_metadata.get("gateway_explicit_session_route")
-                    and response
-                    and not agent_result.get("already_sent")
-                ):
-                    _side_initial, _side_suffix = side_response_parts(
-                        event_metadata.get("gateway_side_root_session_id")
-                        or side_root_from_route(session_key),
-                        rich_text=side_rich_text_supported(
-                            self._adapter_for_source(source)
-                        ),
-                    )
-                    response = f"{_side_initial}{response}{_side_suffix}"
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -26637,8 +26336,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         media_urls = media_urls or []
         media_types = media_types or []
-        task_label = "Background task"
-        task_identity = task_id
 
         adapter = self._adapter_for_source(source)
         if not adapter:
@@ -26656,7 +26353,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not runtime_kwargs.get("api_key"):
                 await adapter.send(
                     source.chat_id,
-                    f"❌ {task_label} {task_identity} failed: no provider credentials configured.",
+                    f"❌ Background task {task_id} failed: no provider credentials configured.",
                     metadata=_thread_metadata,
                 )
                 return
@@ -26717,7 +26414,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
-                    parent_session_id=cast(str, None),
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
@@ -26733,18 +26429,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
-                        conversation_history=[],
                         task_id=task_id,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
+
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
-            # Repair only paths explicitly evidenced by this run's transcript.
+            # Background tasks start a fresh conversation (no prior history),
+            # so history_offset=0: every message in the run belongs to this
+            # turn. Mirrors the repair on the main turn path.
             if response:
                 response = repair_explicit_computer_use_media_paths(
                     response,
@@ -26758,14 +26456,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                prompt_preview = " ".join(prompt.split())
-                preview = prompt_preview[:60] + (
-                    "..." if len(prompt_preview) > 60 else ""
-                )
-                header = (
-                    f'✅ {task_label} complete\nPrompt: "{preview}"\n'
-                    "\n"
-                )
+                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
                     await adapter.send(
@@ -26831,27 +26523,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
             else:
-                prompt_preview = " ".join(prompt.split())
-                preview = prompt_preview[:60] + (
-                    "..." if len(prompt_preview) > 60 else ""
-                )
+                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=(
-                        f'✅ {task_label} complete\nPrompt: "{preview}"\n'
-                        "\n(No response generated)"
-                    ),
+                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
                     metadata=_thread_metadata,
                 )
 
-        except asyncio.CancelledError:
-            raise
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f"❌ {task_label} {task_identity} failed: {e}",
+                    content=f"❌ Background task {task_id} failed: {e}",
                     metadata=_thread_metadata,
                 )
             except Exception:
@@ -32577,7 +32261,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
-        side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -32671,8 +32354,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Set up platform streaming if available -------------------------
         _stream_consumer = None
-        _side_initial = ""
-        _side_suffix = ""
         _scfg = getattr(getattr(self, "config", None), "streaming", None)
         if _scfg is None:
             from gateway.config import StreamingConfig
@@ -32703,20 +32384,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_missing_cursor="fallback",
                         )
                     )
-                    if side_delivery_callback is not None:
-                        _side_initial, _side_suffix = side_response_parts(
-                            side_root_from_route(session_key or ""),
-                            rich_text=side_rich_text_supported(_adapter),
-                        )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
-                        on_delivery=side_delivery_callback,
-                        initial_text=_side_initial,
-                        final_suffix=_side_suffix,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
                     )
@@ -32852,16 +32525,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
-        _proxy_delivered_final = full_response
-        if side_delivery_callback is not None and _stream_consumer is not None:
-            _proxy_delivered_final = (
-                f"{_side_initial}{full_response}{_side_suffix}"
-            )
-        _proxy_already_sent = _stream_consumer_delivered_exact_final(
-            _stream_consumer,
-            _proxy_delivered_final,
-        )
-
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
@@ -32873,7 +32536,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
-            "already_sent": _proxy_already_sent,
         }
 
     # ------------------------------------------------------------------
@@ -32897,7 +32559,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
-        side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         goal_session_entry: Any = None,
         goal_post_turn_state: Optional[Dict[str, bool]] = None,
@@ -32923,7 +32584,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
-                side_delivery_callback=side_delivery_callback,
                 _post_delivery_adapter=_post_delivery_adapter,
                 goal_session_entry=goal_session_entry,
                 goal_post_turn_state=goal_post_turn_state,
@@ -32942,7 +32602,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
                 turn_reasoning_config=turn_reasoning_config,
-                side_delivery_callback=side_delivery_callback,
                 _post_delivery_adapter=_post_delivery_adapter,
                 goal_session_entry=goal_session_entry,
                 goal_post_turn_state=goal_post_turn_state,
@@ -33091,7 +32750,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
         turn_reasoning_config: Optional[Dict[str, Any]] = None,
-        side_delivery_callback: Optional[Callable[[List[str]], Any]] = None,
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         goal_session_entry: Any = None,
         goal_post_turn_state: Optional[Dict[str, bool]] = None,
@@ -33120,7 +32778,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
                 turn_reasoning_config=turn_reasoning_config,
-                side_delivery_callback=side_delivery_callback,
             )
 
         from run_agent import AIAgent
@@ -33407,7 +33064,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             inbound_message_id=inbound_message_id,
-            side_delivery_callback=side_delivery_callback,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
@@ -34551,7 +34207,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             next_goal_entry = goal_session_entry
             if pending_event is not None:
                 try:
-                    next_goal_entry = await self._session_entry_for_event(pending_event)
+                    next_goal_entry = await self.async_session_store.get_or_create_session(pending_event.source)
                 except Exception:
                     logger.warning("Could not resolve queued goal route", exc_info=True)
             same_goal_session_pending = bool(
@@ -34746,7 +34402,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
-                next_side_delivery_callback = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
@@ -34779,13 +34434,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
-                    next_event_metadata = getattr(pending_event, "metadata", None) or {}
-                    if next_event_metadata.get("gateway_explicit_session_route"):
-                        next_side_delivery_callback = (
-                            lambda message_ids, event=pending_event: self._record_side_delivery(
-                                event, message_ids
-                            )
-                        )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -34842,7 +34490,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                     _post_delivery_adapter=_callback_owner,
-                    side_delivery_callback=next_side_delivery_callback,
                     goal_session_entry=next_goal_entry,
                     goal_post_turn_state=goal_post_turn_state,
                 )

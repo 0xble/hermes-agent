@@ -39,11 +39,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.session_activity import ActivityProvenance
-from agent.message_sanitization import (
-    _sanitize_surrogates,
-    tool_call_id_variants,
-    tool_result_id_variants,
-)
+from agent.message_sanitization import _sanitize_surrogates
 # Intrinsic persistence marker stamped on message dicts that are known-durable
 # (#92231). One shared constant with agent.context_compressor (this module
 # already imports agent.* at module level, and context_compressor is a
@@ -8077,7 +8073,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             # Conservative fallback for rows created by current code but with a
             # temporarily-missing exact key: still require the complete peer
-            # tuple so we never cross chats/threads/users.
+            # tuple so we never cross chats/threads/users. Legacy fork-created
+            # side/spawn rows remain readable but must never win this fallback.
             if chat_id is None or chat_type is None:
                 return None
             # Profile fence (#74285): a Telegram DM's peer tuple is identical
@@ -15577,69 +15574,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             ).fetchone()
         return dict(row) if row else None
-
-    @staticmethod
-    def _side_merge_message_projection(message: Dict[str, Any]) -> Dict[str, Any]:
-        """Project one durable side row into a historical transcript item."""
-        projected: Dict[str, Any] = {
-            "message_id": int(message.get("_row_id") or 0),
-            "role": str(message.get("role") or ""),
-            "content": message.get("api_content", message.get("content")),
-        }
-        for key in ("tool_name", "tool_call_id", "tool_calls", "effect_disposition"):
-            if message.get(key):
-                projected[key] = message[key]
-        return projected
-
-    @staticmethod
-    def _side_merge_prefix_signature(message: Dict[str, Any]) -> tuple:
-        """Return fields copied byte-for-byte when /side seeds parent history."""
-        return (
-            message.get("role"),
-            message.get("content"),
-            message.get("tool_name"),
-            message.get("tool_call_id"),
-            message.get("tool_calls"),
-            message.get("timestamp"),
-        )
-
-    @staticmethod
-    def _side_merge_has_completed_checkpoint(messages: List[Dict[str, Any]]) -> bool:
-        """Return true only for a provider-valid terminal assistant checkpoint."""
-        pending: List[frozenset[str]] = []
-        for message in messages:
-            role = message.get("role")
-            if pending:
-                if role != "tool":
-                    return False
-                result_ids = tool_result_id_variants(message.get("tool_call_id"))
-                matches = [
-                    index for index, call_ids in enumerate(pending) if call_ids & result_ids
-                ]
-                if len(matches) != 1:
-                    return False
-                pending.pop(matches[0])
-                continue
-            if role == "tool":
-                return False
-            if role == "assistant" and message.get("tool_calls"):
-                pending = [
-                    tool_call_id_variants(tool_call)
-                    for tool_call in message.get("tool_calls") or []
-                ]
-                if not pending or any(not call_ids for call_ids in pending):
-                    return False
-
-        if pending or not messages:
-            return False
-        last = messages[-1]
-        if last.get("role") != "assistant" or last.get("tool_calls"):
-            return False
-        finish_reason = str(last.get("finish_reason") or "").strip().lower()
-        terminal_reasons = {"stop", "end_turn", "completed"}
-        if finish_reason and finish_reason not in terminal_reasons:
-            return False
-        return last.get("content") not in (None, "", []) or finish_reason in terminal_reasons
 
     def merge_side_context(
         self,

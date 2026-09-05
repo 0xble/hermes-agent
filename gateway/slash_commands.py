@@ -19,7 +19,6 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
-import json
 import logging
 import os
 import re
@@ -28,26 +27,19 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Optional, Union, cast
+from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
-from agent.message_sanitization import tool_call_id_variants, tool_result_id_variants
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
-from gateway.side_notifications import (
-    format_side_queued,
-    format_side_started,
-    side_rich_text_supported,
-)
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
     TranscriptReadError,
     build_session_key,
     is_shared_multi_user_session,
-    transcript_message_append_fields,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -68,11 +60,6 @@ HISTORY_UNREADABLE = (
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
-
-# Busy /side polls only while the owning foreground turn is active. Tool-call
-# and tool-result rows are persisted incrementally, so a short interval keeps
-# the status responsive without coupling the gateway loop to agent internals.
-_SIDE_CHECKPOINT_POLL_SECONDS = 0.2
 
 
 def _clean_str(value: Any) -> str:
@@ -147,59 +134,6 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
-    def _session_key_for_event(self, event: MessageEvent) -> str:
-        """Resolve the conversation route, including a pinned side route."""
-        metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route") is True:
-            pinned = str(metadata.get("gateway_session_key") or "").strip()
-            if pinned:
-                return pinned
-        return getattr(self, "_session_key_for_source")(event.source)
-
-    async def _session_entry_for_event(
-        self,
-        event: MessageEvent,
-        *,
-        source: Optional[SessionSource] = None,
-        force_new: bool = False,
-    ):
-        """Resolve a command's session without falling from a side into its parent."""
-        metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route") is True:
-            session_key = self._session_key_for_event(event)
-            entry = await self.async_session_store.lookup_by_session_key(session_key)
-            expected_id = str(metadata.get("gateway_session_id") or "").strip()
-            if entry is None or (expected_id and entry.session_id != expected_id):
-                raise RuntimeError("Pinned side session is no longer available")
-            return entry
-        effective_source = source or event.source
-        if force_new:
-            return await self.async_session_store.get_or_create_session(
-                effective_source,
-                force_new=True,
-            )
-        return await self.async_session_store.get_or_create_session(effective_source)
-
-    def _session_entry_for_event_sync(
-        self,
-        event: MessageEvent,
-        *,
-        source: Optional[SessionSource] = None,
-    ):
-        metadata = getattr(event, "metadata", None) or {}
-        if metadata.get("gateway_explicit_session_route") is True:
-            session_store = getattr(self, "session_store")
-            entry = session_store.lookup_by_session_key(
-                self._session_key_for_event(event)
-            )
-            expected_id = str(metadata.get("gateway_session_id") or "").strip()
-            if entry is None or (expected_id and entry.session_id != expected_id):
-                raise RuntimeError("Pinned side session is no longer available")
-            return entry
-        return getattr(self, "session_store").get_or_create_session(
-            source or event.source
-        )
-
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -218,7 +152,7 @@ class GatewaySlashCommandsMixin:
         source = event.source
         
         # Get existing session key
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
         self._invalidate_session_run_generation(session_key, reason="session_reset")
         # Evict the running-agent slot now that the generation is bumped. The
         # in-flight run's own guarded release (run_generation=old) will return
@@ -361,11 +295,7 @@ class GatewaySlashCommandsMixin:
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_default")
         else:
             # No existing session, just create one
-            new_entry = await self._session_entry_for_event(
-                event,
-                source=source,
-                force_new=True,
-            )
+            new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
 
         # Set session title if provided with /new <title>
@@ -654,7 +584,7 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
 
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
 
         connected_platforms = [p.value for p in self.adapters.keys()]
 
@@ -872,8 +802,8 @@ class GatewaySlashCommandsMixin:
         from gateway.run import _AGENT_PENDING_SENTINEL
 
         source = event.source
-        session_key = self._session_key_for_event(event)
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_key = self._session_key_for_source(source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         expanded = event.get_command_args().strip().lower() in {"all", "full", "details"}
 
         # Try running agent first (mid-turn), then cached agent (between turns).
@@ -1357,7 +1287,7 @@ class GatewaySlashCommandsMixin:
         from tools.process_registry import format_uptime_short, process_registry
 
         now = time.time()
-        current_session_key = self._session_key_for_event(event)
+        current_session_key = self._session_key_for_source(event.source)
 
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
@@ -1515,7 +1445,7 @@ class GatewaySlashCommandsMixin:
         """
         from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
         agent = self._running_agents.get(session_key)
@@ -1918,7 +1848,7 @@ class GatewaySlashCommandsMixin:
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -2059,7 +1989,9 @@ class GatewaySlashCommandsMixin:
                         _sess_db = getattr(_self, "_session_db", None)
                         if _sess_db is not None:
                             try:
-                                _sess_entry = await _self._session_entry_for_event(event)
+                                _sess_entry = await _self.async_session_store.get_or_create_session(
+                                    event.source
+                                )
                                 await _sess_db.update_session_model(
                                     _sess_entry.session_id, result.new_model,
                                     provider=result.target_provider,
@@ -2368,7 +2300,7 @@ class GatewaySlashCommandsMixin:
             _sess_db = getattr(self, "_session_db", None)
             if _sess_db is not None:
                 try:
-                    _sess_entry = await self._session_entry_for_event(event, source=source)
+                    _sess_entry = await self.async_session_store.get_or_create_session(source)
                     # If this session was auto-reset, consume the flag so the
                     # next regular message's cleanup does not wipe the model
                     # override just stored below (Closes #48031).
@@ -2648,7 +2580,7 @@ class GatewaySlashCommandsMixin:
         # effect on the next message rather than waiting for cache TTL.
         if result.success and new_value is not None and result.requires_new_session:
             try:
-                session_key = self._session_key_for_event(event)
+                session_key = self._session_key_for_source(event.source)
                 self._evict_cached_agent(session_key)
             except Exception:
                 logger.debug("could not evict cached agent after codex-runtime change",
@@ -2717,12 +2649,11 @@ class GatewaySlashCommandsMixin:
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
             return HISTORY_UNREADABLE
-
         # Find the last *real* user message. Timeline bookkeeping rows carry
         # role=user + display_kind (model_switch / async_delegation_complete /
         # auto_continue / hidden); clients never count them as user turns.
@@ -2837,7 +2768,7 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.goal.no_goal_set")
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = self._session_key_for_event(event) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
@@ -2857,7 +2788,7 @@ class GatewaySlashCommandsMixin:
             prompt = mgr.next_continuation_prompt()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = self._session_key_for_event(event) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if prompt and adapter and _quick_key:
                     cont_event = MessageEvent(
                         text=prompt,
@@ -2876,7 +2807,7 @@ class GatewaySlashCommandsMixin:
             mgr.clear()
             try:
                 adapter = self.adapters.get(event.source.platform) if event.source else None
-                _quick_key = self._session_key_for_event(event) if event.source else None
+                _quick_key = self._session_key_for_source(event.source) if event.source else None
                 if adapter and _quick_key:
                     self._clear_goal_pending_continuations(_quick_key, adapter)
             except Exception as exc:
@@ -2997,7 +2928,7 @@ class GatewaySlashCommandsMixin:
         # Queue the goal text as an immediate first turn so the agent
         # starts making progress. The post-turn hook takes over after.
         adapter = self.adapters.get(event.source.platform) if event.source else None
-        _quick_key = self._session_key_for_event(event) if event.source else None
+        _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
                 kickoff_event = MessageEvent(
@@ -3035,7 +2966,7 @@ class GatewaySlashCommandsMixin:
         if mgr is None:
             return "Heartbeats unavailable (no session)."
 
-        quick_key = self._session_key_for_event(event) if event.source else None
+        quick_key = self._session_key_for_source(event.source) if event.source else None
 
         if not args or lower == "status":
             return mgr.status_line()
@@ -3100,7 +3031,7 @@ class GatewaySlashCommandsMixin:
         untouched. Requires the session to have at least one completed turn.
         """
         args = (event.get_command_args() or "").strip()
-        quick_key = self._session_key_for_event(event) if event.source else None
+        quick_key = self._session_key_for_source(event.source) if event.source else None
         if not quick_key:
             return "Refine unavailable (no session)."
         if quick_key in self._running_agents:
@@ -3149,7 +3080,7 @@ class GatewaySlashCommandsMixin:
         event would carry no gateway route and never re-enter this chat.
         """
         args = (event.get_command_args() or "").strip()
-        quick_key = self._session_key_for_event(event) if event.source else None
+        quick_key = self._session_key_for_source(event.source) if event.source else None
         if not quick_key:
             return "Review unavailable (no session)."
         if quick_key in self._running_agents:
@@ -3271,7 +3202,7 @@ class GatewaySlashCommandsMixin:
         # as the /goal false-ack fix).
         await self._warm_goals_session_db("loop manager")
         try:
-            session_entry = await self._session_entry_for_event(event)
+            session_entry = await self.async_session_store.get_or_create_session(event.source)
         except Exception:
             return None, None
         sid = getattr(session_entry, "session_id", None) or ""
@@ -3352,7 +3283,7 @@ class GatewaySlashCommandsMixin:
             if n < 1:
                 n = 1
 
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         result = await self.async_session_store.rewind_session(session_entry.session_id, n)
 
         if result is None:
@@ -3743,6 +3674,7 @@ class GatewaySlashCommandsMixin:
         reply_anchor_for_event = getattr(self, "_reply_anchor_for_event")
         return reply_anchor_for_event(event)
 
+
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /bg <prompt> — run a prompt in a separate background session.
 
@@ -3754,8 +3686,10 @@ class GatewaySlashCommandsMixin:
         if not prompt:
             return t("gateway.background.usage")
 
-        normalize_source = getattr(self, "_normalize_source_for_session_key")
-        source = await asyncio.to_thread(normalize_source, event.source)
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key,
+            event.source,
+        )
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
 
         event_message_id = self._background_reply_anchor(event, source)
@@ -3798,7 +3732,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.btw.usage")
 
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -3832,7 +3766,7 @@ class GatewaySlashCommandsMixin:
         # fallback inside answer_side_question handles it.
         parent_agent = None
         try:
-            session_key = self._session_key_for_event(event)
+            session_key = self._session_key_for_source(source)
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             if _cache_lock is not None:
                 with _cache_lock:
@@ -3878,775 +3812,6 @@ class GatewaySlashCommandsMixin:
         _task.add_done_callback(self._background_tasks.discard)
 
         return t("gateway.btw.started", preview=preview)
-
-    @staticmethod
-    def _completed_side_history(history: list[dict]) -> list[dict]:
-        """Return the transcript through the last completed assistant turn.
-
-        A busy-session `/side` may race with persistence of the foreground
-        turn. Never copy its partial user/tool sequence into the child. A final
-        assistant response has no pending tool calls and either carries visible
-        content or a terminal finish reason.
-        """
-        terminal_reasons = {"stop", "end_turn", "completed"}
-        for index in range(len(history) - 1, -1, -1):
-            message = history[index]
-            if message.get("role") != "assistant" or message.get("tool_calls"):
-                continue
-            finish_reason = str(message.get("finish_reason") or "").strip().lower()
-            if finish_reason and finish_reason not in terminal_reasons:
-                continue
-            content = message.get("content")
-            if content not in (None, "", []) or finish_reason in terminal_reasons:
-                return history[: index + 1]
-        return []
-
-    @classmethod
-    def _active_turn_side_history(cls, history: list[dict]) -> list[dict]:
-        """Return the newest provider-valid checkpoint in the active user turn.
-
-        A final assistant response is already a normal committed checkpoint. While
-        the turn is still running, an assistant tool-call block becomes safe only
-        after every declared call has a matching, immediately-following tool
-        result. The child may then append its own user prompt: Hermes' replay
-        repair explicitly preserves the valid ``assistant(tool_calls) → tool →
-        user`` redirect shape.
-        """
-        last_user_index = -1
-        for index in range(len(history) - 1, -1, -1):
-            if history[index].get("role") == "user":
-                last_user_index = index
-                break
-        if last_user_index < 0:
-            return []
-
-        completed = cls._completed_side_history(history)
-        completed_end = len(completed) - 1
-
-        latest_tool_call_index = -1
-        for index in range(len(history) - 1, last_user_index, -1):
-            message = history[index]
-            if message.get("role") == "assistant" and message.get("tool_calls"):
-                latest_tool_call_index = index
-                break
-        if completed_end > last_user_index and completed_end > latest_tool_call_index:
-            return completed
-        if latest_tool_call_index < 0:
-            return []
-
-        assistant_message = history[latest_tool_call_index]
-        call_groups = [
-            tool_call_id_variants(tool_call)
-            for tool_call in assistant_message.get("tool_calls") or []
-        ]
-        if not call_groups or any(not group for group in call_groups):
-            return []
-
-        result_groups: list[frozenset[str]] = []
-        checkpoint_end = latest_tool_call_index + 1
-        while (
-            checkpoint_end < len(history)
-            and history[checkpoint_end].get("role") == "tool"
-        ):
-            result_groups.append(
-                tool_result_id_variants(
-                    history[checkpoint_end].get("tool_call_id")
-                )
-            )
-            checkpoint_end += 1
-
-        if len(result_groups) != len(call_groups) or any(
-            not group for group in result_groups
-        ):
-            return []
-
-        assignments: list[int] = []
-        for result_group in result_groups:
-            candidates = [
-                index
-                for index, call_group in enumerate(call_groups)
-                if call_group & result_group
-            ]
-            if len(candidates) != 1:
-                return []
-            assignments.append(candidates[0])
-        if sorted(assignments) != list(range(len(call_groups))):
-            return []
-        return history[:checkpoint_end]
-
-    @staticmethod
-    def _side_prompt_preview(prompt: str) -> str:
-        one_line_prompt = " ".join(prompt.split())
-        return one_line_prompt[:60] + (
-            "..." if len(one_line_prompt) > 60 else ""
-        )
-
-    async def _send_side_status(
-        self,
-        event: MessageEvent,
-        source,
-        status_key: str,
-        text: str,
-    ) -> bool:
-        """Send or edit one side lifecycle bubble when the adapter supports it."""
-        adapter_for_source = getattr(self, "_adapter_for_source", None)
-        adapter: Any = (
-            adapter_for_source(source) if callable(adapter_for_source) else None
-        )
-        if adapter is None:
-            return False
-        anchor = getattr(self, "_reply_anchor_for_event")(event)
-        metadata = getattr(self, "_thread_metadata_for_source")(source, anchor)
-        try:
-            sender = getattr(adapter, "send_or_update_status", None)
-            if callable(sender):
-                result = await sender(
-                    source.chat_id,
-                    status_key,
-                    text,
-                    metadata=metadata,
-                )
-            else:
-                result = await adapter.send(
-                    source.chat_id,
-                    text,
-                    metadata=metadata,
-                )
-            success = bool(getattr(result, "success", True))
-            if success:
-                message_ids = []
-                primary = getattr(result, "message_id", None)
-                if primary:
-                    message_ids.append(str(primary))
-                message_ids.extend(
-                    str(mid)
-                    for mid in (getattr(result, "continuation_message_ids", None) or ())
-                    if mid
-                )
-                recorder = getattr(self, "_record_side_delivery", None)
-                if message_ids and callable(recorder):
-                    recorded = recorder(event, message_ids)
-                    if inspect.isawaitable(recorded):
-                        await recorded
-            return success
-        except Exception:
-            logger.warning("Could not deliver side status", exc_info=True)
-            return False
-
-    @staticmethod
-    async def _drain_side_task(task: asyncio.Task):
-        """Wait for a side-owned operation despite repeated caller cancellation."""
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # Re-raise the owner's original cancellation after the durable
-                # operation or terminal status delivery has actually finished.
-                continue
-        return task.result()
-
-    async def _await_side_operation(self, operation):
-        """Run a durable side operation to completion before propagating cancellation."""
-        task = asyncio.create_task(operation)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await self._drain_side_task(task)
-            except asyncio.CancelledError:
-                pass
-            raise
-
-    async def _bind_side_route(
-        self,
-        side_route_key: str,
-        child_session_id: str,
-        source,
-        child_title: str,
-    ):
-        """Bind a side route through the async store's awaited API."""
-        return await self.async_session_store.bind_session_route(
-            side_route_key,
-            child_session_id,
-            source,
-            display_name=child_title,
-        )
-
-    async def _send_terminal_side_status(
-        self,
-        event: MessageEvent,
-        source,
-        status_key: str,
-        text: str,
-        lifecycle: dict[str, Any],
-    ) -> bool:
-        """Claim and completely deliver the waiter's one terminal status."""
-        lifecycle["terminal"] = True
-        delivery = asyncio.create_task(
-            self._send_side_status(event, source, status_key, text)
-        )
-        return bool(await self._drain_side_task(delivery))
-
-    def _side_turn_status(
-        self,
-        session_key: str,
-        expected_run_generation: int,
-    ) -> tuple[bool, bool]:
-        """Return whether this is the same run generation and whether it is active."""
-        state_reader = getattr(self, "_peek_session_state", None)
-        if callable(state_reader):
-            state: Any = state_reader(session_key)
-            if state is None:
-                return False, False
-            generation = getattr(state.persistent, "run_generation", None)
-            if generation != expected_run_generation:
-                return False, False
-            return True, state.turn.agent is not None
-        running_reader = getattr(self, "_is_session_running", None)
-        active = bool(running_reader(session_key)) if callable(running_reader) else False
-        return active, active
-
-    async def _wait_for_active_turn_side(
-        self,
-        *,
-        event: MessageEvent,
-        source,
-        parent_entry,
-        session_key: str,
-        expected_run_generation: int,
-        status_key: str,
-        prompt: str,
-        lifecycle: dict[str, Any],
-    ) -> None:
-        """Wait for one safe active-turn checkpoint, then launch the child."""
-        aborted = (
-            "⚠️ Side aborted: the current turn stopped before its "
-            "context could be copied. Nothing was changed."
-        )
-        try:
-            while True:
-                same_turn, _active = self._side_turn_status(
-                    session_key,
-                    expected_run_generation,
-                )
-                if not same_turn:
-                    await self._send_terminal_side_status(
-                        event, source, status_key, aborted, lifecycle
-                    )
-                    return
-
-                try:
-                    raw_history = await self.async_session_store.load_transcript(
-                        parent_entry.session_id
-                    )
-                    history = self._active_turn_side_history(raw_history)
-                except Exception:
-                    logger.warning(
-                        "Could not read active-turn side checkpoint", exc_info=True
-                    )
-                    history = []
-
-                same_turn, active = self._side_turn_status(
-                    session_key,
-                    expected_run_generation,
-                )
-                if not same_turn:
-                    await self._send_terminal_side_status(
-                        event, source, status_key, aborted, lifecycle
-                    )
-                    return
-
-                if history:
-                    try:
-                        started = await self._launch_side_from_history(
-                            event=event,
-                            source=source,
-                            current_entry=parent_entry,
-                            prompt=prompt,
-                            history=history,
-                        )
-                    except Exception:
-                        logger.exception("Unexpected active-turn side launch failure")
-                        started = "❌ Side failed: could not start the child session."
-                    await self._send_terminal_side_status(
-                        event, source, status_key, started, lifecycle
-                    )
-                    return
-
-                if not active:
-                    await self._send_terminal_side_status(
-                        event, source, status_key, aborted, lifecycle
-                    )
-                    return
-                await asyncio.sleep(_SIDE_CHECKPOINT_POLL_SECONDS)
-        except asyncio.CancelledError:
-            raise
-
-    async def _cancel_side_waiters(self) -> None:
-        """Cancel and drain queued side waiters while transports are available."""
-        statuses = getattr(self, "_side_waiter_statuses", {})
-        entries = [
-            (waiter, statuses.get(waiter))
-            for waiter in list(getattr(self, "_side_waiter_tasks", set()))
-            if not waiter.done()
-        ]
-        cancelled_entries = [
-            (waiter, lifecycle)
-            for waiter, lifecycle in entries
-            if waiter.cancel()
-        ]
-        if cancelled_entries:
-            await asyncio.gather(
-                *(waiter for waiter, _lifecycle in cancelled_entries),
-                return_exceptions=True,
-            )
-        aborted = (
-            "⚠️ Side aborted: the current turn stopped before its "
-            "context could be copied. Nothing was changed."
-        )
-        for _waiter, lifecycle in cancelled_entries:
-            if lifecycle is None or lifecycle.get("terminal"):
-                continue
-            await self._send_terminal_side_status(
-                lifecycle["event"],
-                lifecycle["source"],
-                lifecycle["status_key"],
-                aborted,
-                lifecycle,
-            )
-
-    async def _handle_side_command(
-        self,
-        event: MessageEvent,
-        *,
-        active_session_key: Optional[str] = None,
-        active_run_generation: Optional[int] = None,
-    ) -> str:
-        """Fork committed or safely checkpointed context into a continuable side."""
-        prompt = event.get_command_args().strip()
-        if not prompt:
-            return "Usage: /side <prompt>"
-        session_db = getattr(self, "_session_db", None)
-        if not session_db:
-            from hermes_state import format_session_db_unavailable
-
-            return format_session_db_unavailable(
-                prefix=t("gateway.shared.session_db_unavailable_prefix")
-            )
-
-        aborted = (
-            "⚠️ Side aborted: the current turn stopped before its "
-            "context could be copied. Nothing was changed."
-        )
-        run_generation = active_run_generation
-        if active_session_key is not None:
-            if run_generation is None:
-                return aborted
-            same_turn, _active = self._side_turn_status(
-                active_session_key,
-                run_generation,
-            )
-            if not same_turn:
-                return aborted
-
-        normalize_source = getattr(self, "_normalize_source_for_session_key")
-        source = await asyncio.to_thread(normalize_source, event.source)
-        current_entry = await self._session_entry_for_event(event, source=source)
-        raw_history = await self.async_session_store.load_transcript(
-            current_entry.session_id
-        )
-
-        if active_session_key is not None:
-            assert run_generation is not None
-            same_turn, active = self._side_turn_status(
-                active_session_key,
-                run_generation,
-            )
-            if not same_turn:
-                return aborted
-            history = self._active_turn_side_history(raw_history)
-            if history:
-                return await self._launch_side_from_history(
-                    event=event,
-                    source=source,
-                    current_entry=current_entry,
-                    prompt=prompt,
-                    history=history,
-                )
-            if not active:
-                return aborted
-
-            preview = self._side_prompt_preview(prompt)
-            status_key = (
-                f"side:{source.chat_id}:{source.thread_id or ''}:"
-                f"{event.message_id or time.time_ns()}"
-            )
-            adapter_for_source = getattr(self, "_adapter_for_source", None)
-            delivery_adapter = (
-                adapter_for_source(source) if callable(adapter_for_source) else None
-            )
-            queued = format_side_queued(
-                preview,
-                rich_text=side_rich_text_supported(delivery_adapter),
-            )
-            queued_sent = await self._send_side_status(
-                event, source, status_key, queued
-            )
-            lifecycle: dict[str, Any] = {
-                "event": event,
-                "source": source,
-                "status_key": status_key,
-                "terminal": False,
-            }
-            waiter = asyncio.create_task(
-                self._wait_for_active_turn_side(
-                    event=event,
-                    source=source,
-                    parent_entry=current_entry,
-                    session_key=active_session_key,
-                    expected_run_generation=run_generation,
-                    status_key=status_key,
-                    prompt=prompt,
-                    lifecycle=lifecycle,
-                )
-            )
-            background_tasks = getattr(self, "_background_tasks")
-            background_tasks.add(waiter)
-            waiter.add_done_callback(background_tasks.discard)
-            side_waiters = getattr(self, "_side_waiter_tasks", None)
-            if side_waiters is None:
-                side_waiters = set()
-                self._side_waiter_tasks = side_waiters
-            side_waiters.add(waiter)
-            waiter.add_done_callback(side_waiters.discard)
-            side_statuses = getattr(self, "_side_waiter_statuses", None)
-            if side_statuses is None:
-                side_statuses = {}
-                self._side_waiter_statuses = side_statuses
-            side_statuses[waiter] = lifecycle
-            waiter.add_done_callback(lambda task: side_statuses.pop(task, None))
-            return "" if queued_sent else queued
-
-        history = self._completed_side_history(raw_history)
-        if not history:
-            return (
-                "No completed conversation to fork. Wait for the current "
-                "turn to finish, then try again."
-            )
-        return await self._launch_side_from_history(
-            event=event,
-            source=source,
-            current_entry=current_entry,
-            prompt=prompt,
-            history=history,
-        )
-
-    async def _handle_merge_command(self, event: MessageEvent) -> str:
-        """Import this side's committed delta into its originating main route."""
-        metadata = getattr(event, "metadata", None) or {}
-        side_root_id = str(metadata.get("gateway_side_root_session_id") or "").strip()
-        if not metadata.get("gateway_explicit_session_route") or not side_root_id:
-            return "Reply to a side-session message with `/merge`."
-
-        session_db = getattr(self, "_session_db", None)
-        if session_db is None:
-            return "❌ Merge failed: session storage is unavailable."
-        try:
-            side_row = await session_db.get_session(side_root_id)
-        except Exception:
-            logger.exception("Could not load side metadata for merge")
-            return "❌ Merge failed: could not load the side session."
-        side_row = side_row if isinstance(side_row, dict) else {}
-        raw_config = side_row.get("model_config")
-        try:
-            config = json.loads(raw_config) if isinstance(raw_config, str) else dict(raw_config or {})
-        except (TypeError, ValueError, json.JSONDecodeError):
-            config = {}
-        parent_route = str(config.get("_side_parent_route") or "").strip()
-        if not parent_route:
-            side_route = str(metadata.get("gateway_session_key") or "")
-            suffix = f":side:{side_root_id}"
-            if side_route.endswith(suffix):
-                parent_route = side_route[:-len(suffix)]
-        if not parent_route:
-            return "❌ Merge failed: the originating main route is unavailable."
-
-        parent_entry = await self.async_session_store.lookup_by_session_key(parent_route)
-        if parent_entry is None:
-            return "❌ Merge failed: the originating main route is no longer active."
-        is_running = getattr(self, "_is_session_running", None)
-        if callable(is_running) and is_running(parent_route):
-            return "⏳ Main is still running. Wait for its current response, then retry `/merge`."
-
-        try:
-            result = await session_db.merge_side_context(
-                destination_session_id=parent_entry.session_id,
-                side_root_session_id=side_root_id,
-                command_text=event.text or "/merge",
-            )
-        except ValueError as exc:
-            return f"❌ Merge failed: {exc}."
-        except Exception:
-            logger.exception("Side context merge failed")
-            return "❌ Merge failed: the context import did not commit."
-
-        evict = getattr(self, "_evict_cached_agent", None)
-        if callable(evict):
-            evict(parent_route)
-        # The completion is a main-route anchor. Replies to older side messages
-        # still resolve through their durable bindings and continue the side.
-        for key in (
-            "gateway_session_key",
-            "gateway_session_id",
-            "gateway_session_strict",
-            "gateway_explicit_session_route",
-            "gateway_side_root_session_id",
-        ):
-            metadata.pop(key, None)
-        event.metadata = metadata
-        if result.get("status") == "already_merged":
-            cutoff = result.get("source_cutoff_message_id")
-            return f"↩️ Side context is already merged through `{side_root_id}:{cutoff}`."
-        return str(result.get("message") or "↩️ Side context merged into main.")
-
-    @staticmethod
-    async def _finalize_incomplete_side(
-        session_db,
-        child_session_id: str,
-        end_reason: str,
-    ) -> None:
-        """Cancellation-resistant finalization for an unowned child."""
-        try:
-            finalization = asyncio.create_task(
-                session_db.end_session(
-                    child_session_id,
-                    end_reason=end_reason,
-                )
-            )
-            await GatewaySlashCommandsMixin._drain_side_task(finalization)
-        except asyncio.CancelledError:
-            logger.warning(
-                "Side child finalization was internally cancelled for %s",
-                child_session_id,
-            )
-        except Exception:
-            logger.debug("Failed to finalize incomplete side", exc_info=True)
-
-    async def _launch_side_from_history(
-        self,
-        *,
-        event: MessageEvent,
-        source,
-        current_entry,
-        prompt: str,
-        history: list[dict],
-    ) -> str:
-        """Create a normal routed side session from an already-safe history prefix."""
-        import json as _json
-        import uuid as _uuid
-
-        session_db = getattr(self, "_session_db")
-        parent_session_id = current_entry.session_id
-        now = datetime.now()
-        child_session_id = (
-            f"side_{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
-        )
-        preview = self._side_prompt_preview(prompt)
-        child_title = f"Side {now.strftime('%H:%M:%S.%f')[:-3]}: {preview}"
-        parent_route_key = str(current_entry.session_key or "")
-        if not parent_route_key:
-            parent_route_key = str(getattr(self, "_session_key_for_source")(source))
-        side_route_key = f"{parent_route_key}:side:{child_session_id}"
-
-        origin = current_entry.origin or source
-        try:
-            origin_json = _json.dumps(origin.to_dict())
-        except Exception:
-            origin_json = None
-
-        parent_row = None
-        try:
-            parent_row = await session_db.get_session(parent_session_id)
-        except Exception:
-            logger.debug("Could not load parent metadata for side", exc_info=True)
-        parent_row = parent_row if isinstance(parent_row, dict) else {}
-
-        creation = asyncio.create_task(
-            session_db.create_session(
-                session_id=child_session_id,
-                source=source.platform.value if source.platform else "gateway",
-                model=parent_row.get("model"),
-                model_config={
-                    "_branched_from": parent_session_id,
-                    "_side_from": parent_session_id,
-                    "_side_root": child_session_id,
-                    "_side_parent_route": parent_route_key,
-                    "_side_fork_message_count": len(history),
-                },
-                parent_session_id=parent_session_id,
-                user_id=source.user_id,
-                # A side owns an independent normal routing lane. It never
-                # replaces the parent chat/topic route.
-                session_key=side_route_key,
-                chat_id=source.chat_id,
-                chat_type=source.chat_type,
-                thread_id=source.thread_id,
-                origin_json=origin_json,
-                display_name=current_entry.display_name,
-                cwd=parent_row.get("cwd"),
-                profile_name=parent_row.get("profile_name"),
-                git_repo_root=parent_row.get("git_repo_root"),
-            )
-        )
-        try:
-            await asyncio.shield(creation)
-        except asyncio.CancelledError:
-            # create_session runs off-loop. Drain the database worker before
-            # ending the child so a late commit cannot reactivate an orphan.
-            try:
-                await self._drain_side_task(creation)
-            except asyncio.CancelledError:
-                logger.debug("Side child creation was internally cancelled")
-            except Exception:
-                logger.debug("Side child creation failed while cancelling", exc_info=True)
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_launch_cancelled",
-            )
-            raise
-        except Exception as exc:
-            logger.error("Failed to create side session: %s", exc)
-            return "❌ Side failed: could not create the child session."
-
-        rows = [transcript_message_append_fields(message) for message in history]
-        try:
-            await self._await_side_operation(
-                session_db.append_messages_batch(
-                    child_session_id,
-                    rows,
-                    chunk_rows=500,
-                )
-            )
-        except asyncio.CancelledError:
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_launch_cancelled",
-            )
-            raise
-        except Exception as exc:
-            logger.error("Failed to copy side context: %s", exc)
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_copy_failed",
-            )
-            return "❌ Side failed: could not copy the parent context."
-
-        try:
-            await self._await_side_operation(
-                session_db.set_session_title(child_session_id, child_title)
-            )
-        except asyncio.CancelledError:
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_launch_cancelled",
-            )
-            raise
-        except Exception:
-            logger.debug("Could not title side session", exc_info=True)
-
-        binding = asyncio.create_task(
-            self._bind_side_route(
-                side_route_key,
-                child_session_id,
-                source,
-                child_title,
-            )
-        )
-        try:
-            bound = await asyncio.shield(binding)
-        except asyncio.CancelledError:
-            try:
-                await self._drain_side_task(binding)
-            finally:
-                closed = await self.async_session_store.close_session_route(
-                    side_route_key,
-                    end_reason="side_launch_cancelled",
-                )
-                if not closed:
-                    await self._finalize_incomplete_side(
-                        session_db,
-                        child_session_id,
-                        "side_launch_cancelled",
-                    )
-            raise
-        except Exception:
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_route_failed",
-            )
-            logger.warning("Could not bind side route", exc_info=True)
-            return "❌ Side failed: could not create its conversation route."
-        if bound is None:
-            await self._finalize_incomplete_side(
-                session_db,
-                child_session_id,
-                "side_route_failed",
-            )
-            return "❌ Side failed: could not create its conversation route."
-
-        route_metadata = {
-            "gateway_session_key": side_route_key,
-            "gateway_session_id": child_session_id,
-            "gateway_session_strict": True,
-            "gateway_explicit_session_route": True,
-            "gateway_side_root_session_id": child_session_id,
-        }
-        event.metadata.update(route_metadata)
-        side_event = MessageEvent(
-            text=prompt,
-            message_type=event.message_type,
-            user_id=event.user_id,
-            user_name=event.user_name,
-            source=source,
-            message_id=None,
-            media_urls=list(event.media_urls or []),
-            media_types=list(event.media_types or []),
-            reply_to_message_id=event.message_id,
-            auto_skill=event.auto_skill,
-            channel_prompt=event.channel_prompt,
-            turn_reasoning_config=event.turn_reasoning_config,
-            metadata=dict(route_metadata),
-            allow_gateway_control=False,
-        )
-        adapter_for_source = getattr(self, "_adapter_for_source", None)
-        adapter = adapter_for_source(source) if callable(adapter_for_source) else None
-        if adapter is None:
-            await self.async_session_store.close_session_route(
-                side_route_key,
-                end_reason="side_adapter_unavailable",
-            )
-            return "❌ Side failed: no delivery adapter is available."
-        background_tasks = getattr(self, "_background_tasks")
-        handle_message = getattr(adapter, "handle_message", None)
-        if not callable(handle_message):
-            await self.async_session_store.close_session_route(
-                side_route_key,
-                end_reason="side_adapter_invalid",
-            )
-            return "❌ Side failed: its delivery adapter cannot accept messages."
-        task = asyncio.ensure_future(cast(Awaitable[Any], handle_message(side_event)))
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-
-        return format_side_started(
-            child_session_id,
-            rich_text=side_rich_text_supported(adapter),
-        )
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
@@ -4936,7 +4101,7 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(event.source)
         config_path = _gateway_config_home() / "config.yaml"
 
         def _set_approval(enabled: bool):
@@ -4984,7 +4149,7 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         args = raw_args.split() if raw_args else []
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(event.source)
         config_path = _gateway_config_home() / "config.yaml"
 
         gate_on = wa.write_approval_enabled(wa.SKILLS)
@@ -5039,7 +4204,7 @@ class GatewaySlashCommandsMixin:
         # Reuse the /reasoning arg parser: strips --global (any position),
         # normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(raw_args)
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(
             session_key=session_key
         )
@@ -5175,7 +4340,7 @@ class GatewaySlashCommandsMixin:
             is_session_yolo_enabled,
         )
 
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(event.source)
         current = is_session_yolo_enabled(session_key)
         if current:
             disable_session_yolo(session_key)
@@ -5500,7 +4665,7 @@ class GatewaySlashCommandsMixin:
         https://code.claude.com/docs/en/whats-new/2026-w20).
         """
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -5558,7 +4723,7 @@ class GatewaySlashCommandsMixin:
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
 
-            session_key = self._session_key_for_event(event)
+            session_key = self._session_key_for_source(source)
             # Preserve the same platform + stable gateway session identity that a
             # normal gateway turn passes (gateway/run.py main turn), so external
             # context engines bind this temporary compression agent to the
@@ -6011,7 +5176,7 @@ class GatewaySlashCommandsMixin:
             return f"{e}\n\n{SAVE_USAGE}"
 
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         session_id = session_entry.session_id
 
         if not self._session_db:
@@ -6071,7 +5236,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_title_command(self, event: MessageEvent) -> str:
         """Handle /title command — set or show the current session's title."""
         source = event.source
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         session_id = session_entry.session_id
         session_db = getattr(self, "_session_db", None)
 
@@ -6195,14 +5360,7 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
-        """Handle /resume command - switch to a previous named session."""
-        if (getattr(event, "metadata", None) or {}).get(
-            "gateway_explicit_session_route"
-        ) is True:
-            return (
-                "Resume is unavailable inside a side because it could rebind "
-                "another conversation. Start a new side from the session you want instead."
-            )
+        """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
@@ -6210,7 +5368,7 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(
             self._normalize_source_for_session_key, event.source
         )
-        session_key = getattr(self, "_session_key_for_source")(source)
+        session_key = self._session_key_for_source(source)
         raw_args = event.get_command_args().strip()
         try:
             parts = shlex.split(raw_args)
@@ -6333,7 +5491,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.resume.blocked_not_owner", name=name)
 
         # Check if already on that session
-        current_entry = await self._session_entry_for_event(event, source=source)
+        current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
 
@@ -6420,12 +5578,7 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(
             self._normalize_source_for_session_key, event.source
         )
-        event_metadata = getattr(event, "metadata", None) or {}
-        session_key = (
-            self._session_key_for_event(event)
-            if event_metadata.get("gateway_explicit_session_route") is True
-            else getattr(self, "_session_key_for_source")(source)
-        )
+        session_key = self._session_key_for_source(source)
 
         # A cross-origin listing (`/sessions all`) is honored only for an
         # admin, mirroring the `/resume --all` override. `all` is just a parsed
@@ -6442,7 +5595,7 @@ class GatewaySlashCommandsMixin:
                 "_Note: `all` (cross-chat listing) requires a configured admin; "
                 "showing this chat's sessions only._"
             )
-        current_entry = await self._session_entry_for_event(event, source=source)
+        current_entry = await self.async_session_store.get_or_create_session(source)
         rows = await asyncio.to_thread(
             query_session_listing,
             getattr(self._session_db, "_db", self._session_db),
@@ -6491,10 +5644,10 @@ class GatewaySlashCommandsMixin:
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
         source = event.source
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
 
         # Load the current session and its transcript
-        current_entry = await self._session_entry_for_event(event, source=source)
+        current_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(current_entry.session_id)
         except TranscriptReadError:
@@ -6687,7 +5840,7 @@ class GatewaySlashCommandsMixin:
 
             history: list[dict] = []
             try:
-                entry = self._session_entry_for_event_sync(event, source=source)
+                entry = self.session_store.get_or_create_session(source)
                 history = self.session_store.load_transcript(entry.session_id) or []
             except TranscriptReadError:
                 # A read failure is not an empty transcript (#100788): the
@@ -6727,7 +5880,7 @@ class GatewaySlashCommandsMixin:
 
             history: list[dict] = []
             try:
-                entry = self._session_entry_for_event_sync(event, source=source)
+                entry = self.session_store.get_or_create_session(source)
                 history = self.session_store.load_transcript(entry.session_id) or []
             except TranscriptReadError:
                 # See _context_breakdown_block: don't pass a read failure off
@@ -6770,7 +5923,7 @@ class GatewaySlashCommandsMixin:
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         source = event.source
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
 
         # `/usage reset [--force]` — redeem one banked Codex rate-limit reset
         # credit. Parsed before the display path so it never mixes with the
@@ -6801,7 +5954,7 @@ class GatewaySlashCommandsMixin:
         api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         if not provider and getattr(self, "_session_db", None) is not None:
             try:
-                _entry_for_billing = await self._session_entry_for_event(event, source=source)
+                _entry_for_billing = await self.async_session_store.get_or_create_session(source)
                 persisted = await self._session_db.get_session(_entry_for_billing.session_id) or {}
                 route = await self._session_db.get_dominant_session_model_route(
                     _entry_for_billing.session_id
@@ -6915,7 +6068,7 @@ class GatewaySlashCommandsMixin:
             return "\n".join(lines)
 
         # No agent at all -- check session history for a rough count
-        session_entry = await self._session_entry_for_event(event, source=source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -7020,7 +6173,7 @@ class GatewaySlashCommandsMixin:
         Users can also skip the confirm by flipping the config key directly.
         """
         source = event.source
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
 
         # Read the gate fresh from disk so a prior "always" click takes
         # effect on the next invocation without restarting the gateway.
@@ -7155,7 +6308,7 @@ class GatewaySlashCommandsMixin:
             sections.append("Use skills_list to see the updated catalog.]")
             note = "\n".join(sections)
 
-            session_key = self._session_key_for_event(event)
+            session_key = self._session_key_for_source(event.source)
             if not hasattr(self, "_pending_skills_reload_notes"):
                 self._pending_skills_reload_notes = {}
             if session_key:
@@ -7224,7 +6377,7 @@ class GatewaySlashCommandsMixin:
             /approve all always   — approve all + remember permanently
         """
         source = event.source
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -7301,7 +6454,7 @@ class GatewaySlashCommandsMixin:
         only hearing "denied". Ported from qwibitai/nanoclaw#2832.
         """
         source = event.source
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(source)
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
@@ -7470,7 +6623,7 @@ class GatewaySlashCommandsMixin:
         pending_path = _hermes_home / ".update_pending.json"
         output_path = _hermes_home / ".update_output.txt"
         exit_code_path = _hermes_home / ".update_exit_code"
-        session_key = self._session_key_for_event(event)
+        session_key = self._session_key_for_source(event.source)
         pending = {
             "platform": event.source.platform.value,
             "chat_id": event.source.chat_id,

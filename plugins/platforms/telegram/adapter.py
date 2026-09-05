@@ -835,10 +835,6 @@ class TelegramAdapter(BasePlatformAdapter):
     # so a 10–20s blip delivers now. Same idea as QQBot._wait_for_reconnection.
     _RECONNECT_WAIT_SECONDS = 15.0
     _RECONNECT_POLL_INTERVAL = 0.5
-    # Status keys can be request-scoped (for example queued /side lifecycle
-    # bubbles), so bound the edit-target cache instead of assuming a small fixed
-    # vocabulary of callback names.
-    _STATUS_MESSAGE_IDS_MAX = 256
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -6876,13 +6872,6 @@ class TelegramAdapter(BasePlatformAdapter):
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
         if result.success and result.message_id:
-            if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
-                # Dict insertion order gives a cheap FIFO bound. Drop half so a
-                # sustained status stream does not trim on every subsequent send.
-                for stale in list(self._status_message_ids)[
-                    : self._STATUS_MESSAGE_IDS_MAX // 2
-                ]:
-                    self._status_message_ids.pop(stale, None)
             self._status_message_ids[key] = str(result.message_id)
         return result
 
@@ -9400,7 +9389,7 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> List[SendResult]:
+    ) -> None:
         """Send a batch of images natively via Telegram's media group API.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
@@ -9413,11 +9402,9 @@ class TelegramAdapter(BasePlatformAdapter):
         the base adapter's per-image loop.
         """
         if not self._bot:
-            return []
+            return
         if not images:
-            return []
-
-        results: List[SendResult] = []
+            return
 
         try:
             from telegram import InputMediaPhoto
@@ -9426,9 +9413,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            return await super().send_multiple_images(
-                chat_id, images, metadata, human_delay
-            )
+            await super().send_multiple_images(chat_id, images, metadata, human_delay)
+            return
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -9441,14 +9427,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Animations: route through the base default (per-image send_animation)
         if animations:
-            results.extend(
-                await super().send_multiple_images(
-                    chat_id, animations, metadata, human_delay=human_delay,
-                )
+            await super().send_multiple_images(
+                chat_id, animations, metadata, human_delay=human_delay,
             )
 
         if not photos:
-            return results
+            return
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -9503,7 +9487,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
+                await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
@@ -9518,16 +9502,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
-                for sent_message in sent_messages or []:
-                    sent_id = getattr(sent_message, "message_id", None)
-                    if sent_id is not None:
-                        results.append(SendResult(success=True, message_id=str(sent_id)))
-            except _TelegramSendCooldownExceeded as cooldown_error:
-                # Preserve successes from earlier animation/album chunks and
-                # expose the same bounded retry contract as every sibling
-                # media sender. Re-raising here discarded partial-delivery
-                # evidence and violated the List[SendResult] boundary.
-                results.append(self._send_cooldown_failure(cooldown_error))
+                results.extend(SendResult(success=True) for _sent in (sent_messages or []))
+            except _TelegramSendCooldownExceeded as exc:
+                results.append(self._send_cooldown_failure(exc))
                 break
             except Exception as e:
                 logger.warning(
@@ -9536,10 +9513,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                results.extend(
-                    await super().send_multiple_images(
-                        chat_id, chunk, metadata, human_delay=human_delay,
-                    )
+                await super().send_multiple_images(
+                    chat_id, chunk, metadata, human_delay=human_delay,
                 )
             finally:
                 for fh in opened_files:
@@ -9547,7 +9522,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         fh.close()
                     except Exception:
                         pass
-        return results
 
     async def send_image_file(
         self,
