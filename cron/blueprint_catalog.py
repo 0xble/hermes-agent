@@ -204,8 +204,11 @@ CATALOG: List[AutomationBlueprint] = [
         schedule_template="{minute} {hour} * * 1-5",
         prompt_template=(
             "Give the user a brief weekday start-of-day nudge: today's calendar "
-            "and the 1-3 highest-priority things to focus on, inferred from "
-            "recent context and any task tools. Encouraging, short, one message."
+            "and the 1-3 highest-priority things to focus on. Use the canonical "
+            "task source when one is connected; treat recent context only as a "
+            "discovery lead, not as task-state authority. Read only — do not "
+            "create or change tasks, calendar events, or messages. Encouraging, "
+            "short, one message."
         ),
         slots=[_TIME("09:00"), _DELIVER],
         tags=("daily", "focus"),
@@ -318,12 +321,15 @@ CATALOG: List[AutomationBlueprint] = [
         prompt_template=(
             "Load the product-price-monitor skill and run the tick for this "
             "watch: {item}. Alert condition: {condition}. Compare the "
-            "normalized all-in price/availability against stored state, "
-            "suppress duplicate alerts, and never overwrite last-known-good "
-            "state with a failed fetch. If no condition is met, respond with "
-            "[SILENT]. On the first run, execute the skill's setup phase "
-            "first: pin the exact item, verify one live fetch, and write the "
-            "watch contract state file."
+            "normalized all-in price/availability against one JSON watch "
+            "contract scoped to this watch under the active Hermes home's "
+            "price-watches directory. Keep durable state confined to that "
+            "contract, write it atomically only after a verified fetch, read it "
+            "back after writes, suppress duplicate alerts, and never store "
+            "credentials or overwrite last-known-good state with a failed "
+            "fetch. If no condition is met, respond with [SILENT]. On the first "
+            "run, execute the skill's setup phase first: pin the exact item, "
+            "verify one live fetch, and write that watch contract."
         ),
         slots=[
             BlueprintSlot(
@@ -358,10 +364,14 @@ CATALOG: List[AutomationBlueprint] = [
             "watch: companies {companies}; event categories {categories}. "
             "Collect incrementally from the last cutoff, deduplicate by "
             "underlying event, score materiality against the watch contract, "
-            "and deliver a cited digest of material events only. If there are "
-            "no material events, respond with [SILENT]. On the first run, "
-            "execute the skill's setup phase first: freeze the watchlist, "
-            "build source coverage, and write the watch contract state file."
+            "and deliver a cited digest of material events only. Keep durable "
+            "state confined to one JSON watch contract scoped to this watch "
+            "under the active Hermes home's competitor-watches directory; write "
+            "it atomically, read it back after writes, and never store "
+            "credentials or raw private source content. If there are no "
+            "material events, respond with [SILENT]. On the first run, execute "
+            "the skill's setup phase first: freeze the watchlist, build source "
+            "coverage, and write that watch contract."
         ),
         slots=[
             BlueprintSlot(
@@ -378,7 +388,8 @@ CATALOG: List[AutomationBlueprint] = [
             BlueprintSlot(
                 name="recurrence", type="weekdays", label="Repeat on",
                 default="monday",
-                options=tuple(WEEKDAY_PRESETS.keys()),
+                options=("sunday", "monday", "tuesday", "wednesday",
+                         "thursday", "friday", "saturday"),
             ),
             _DELIVER,
         ],
@@ -524,8 +535,7 @@ CATALOG: List[AutomationBlueprint] = [
         prompt_template=(
             "Send the user a short, warm reflection prompt for the end of the "
             "day — invite them to note one thing that went well, one thing they "
-            "are grateful for, and one small win. If they reply, acknowledge it "
-            "kindly. One message."
+            "are grateful for, and one small win. One message."
         ),
         slots=[
             _TIME("21:30"),
@@ -711,11 +721,14 @@ def _resolve_schedule(blueprint: AutomationBlueprint, values: Dict[str, Any]) ->
     if "{dow}" in sched:
         if "recurrence" in values:
             preset = str(values.get("recurrence", "everyday")).lower()
-            if preset not in WEEKDAY_PRESETS:
+            if preset in WEEKDAY_PRESETS:
+                repl["dow"] = WEEKDAY_PRESETS[preset]
+            elif preset in _DAY_TO_DOW:
+                repl["dow"] = _DAY_TO_DOW[preset]
+            else:
                 raise BlueprintFillError(
-                    f"unknown recurrence {preset!r} — one of {', '.join(WEEKDAY_PRESETS)}"
+                    f"unknown recurrence {preset!r} — use a weekday preset or day name"
                 )
-            repl["dow"] = WEEKDAY_PRESETS[preset]
         elif "day" in values:
             day = str(values.get("day", "")).lower()
             if day not in _DAY_TO_DOW:
