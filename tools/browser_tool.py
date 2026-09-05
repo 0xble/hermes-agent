@@ -1635,6 +1635,7 @@ def _stop_real_profile_browser(cache_key: str) -> None:
 def _reload_browser_use_runtime(runtime_key: str) -> bool:
     try:
         from tools.browser_use_cli import _reload_browser_exec_daemons_for_runtime
+        from hermes_constants import hermes_home_key
 
         return _reload_browser_exec_daemons_for_runtime(
             runtime_key,

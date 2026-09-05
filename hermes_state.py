@@ -3087,6 +3087,10 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             }
             if current_snapshot != source_snapshot:
                 raise RuntimeError("database bundle changed while being copied")
+            marker.write_text('{"status":"publishing"}\n', encoding="utf-8")
+            with marker.open("rb") as handle:
+                os.fsync(handle.fileno())
+            _fsync_directory(db_path.parent)
             for _, target in temporary:
                 final = next(
                     final for _, final in pairs
@@ -3102,6 +3106,7 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             if final_snapshot != source_snapshot:
                 raise RuntimeError("database bundle changed before marker publication")
             metadata = {
+                "status": "complete",
                 "files": {
                     final.name: {
                         "source": source.name,
@@ -3128,6 +3133,8 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             raise
 
     def _guarded_copy() -> "Tuple[Optional[Path], Optional[str]]":
+        import json
+
         # Remove unpublished debris from interrupted copies before dedupe. None
         # of these names is a valid completed forensic bundle.
         for pattern in (
@@ -3141,16 +3148,21 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                     orphan.unlink(missing_ok=True)
                 except OSError:
                     pass
-        for orphan in db_path.parent.iterdir():
-            if not orphan.name.startswith(f"{db_path.name}.malformed-backup-"):
+        for marker_path in db_path.parent.glob(
+            f".{db_path.name}.malformed-backup-*.complete"
+        ):
+            try:
+                marker_data = json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
                 continue
-            if orphan.name.endswith(_DB_SIDECAR_SUFFIXES):
+            if marker_data.get("status") != "publishing":
                 continue
-            if _bundle_marker(orphan).is_file():
-                continue
+            backup_name = marker_path.name[1 : -len(".complete")]
+            incomplete = marker_path.with_name(backup_name)
             for victim in (
-                orphan,
-                *(orphan.with_name(orphan.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
+                incomplete,
+                *(incomplete.with_name(incomplete.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
+                marker_path,
             ):
                 try:
                     victim.unlink(missing_ok=True)
