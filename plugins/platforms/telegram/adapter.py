@@ -515,7 +515,35 @@ _RICH_PROTECTED_REGION_RE = re.compile(
 # LaTeX delimiters. Protect currency only on rich-rendered lines containing
 # multiple amounts; leave ordinary prose, legitimate math, code, and shell
 # variables unchanged.
-_RICH_CURRENCY_PROTECTED_RE = re.compile(r"```.*?```|~~~.*?~~~|`[^`\n]*`", re.DOTALL)
+_RICH_CODE_RE = re.compile(
+    r"(?<!`)(?P<fence>`{3,})(?!`).*?(?<!`)(?P=fence)(?!`)"
+    r"|(?<!`)(?P<ticks>`{1,2})(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`)"
+    r"|(?P<tildes>~{3,}).*?(?P=tildes)",
+    re.DOTALL,
+)
+# Preserve closed math, but not dollar-prefixed tickers or prose such as
+# "$6 per US$ unit". A numeric amount followed by an ordinary word is
+# currency here; single-letter variables and backslash math commands survive.
+_RICH_CURRENCY_PROTECTED_RE = re.compile(
+    _RICH_CODE_RE.pattern
+    + r"|(?<![\\$])\$\$.*?\$\$"
+    + r"|(?<![\\$])\$(?![\s$])"
+    + r"(?!\d+(?:,\d{3})*(?:\.\d+)?\s+[A-Za-z]{2,}\b)"
+    + r"[^$\n]*?(?<![\s([{,:;])\$(?![\w$])",
+    re.DOTALL,
+)
+_RICH_DOLLAR_ENTITY_RE = re.compile(
+    _RICH_CODE_RE.pattern + r"|&#(?:0*36|x0*24);", re.DOTALL | re.IGNORECASE
+)
+
+
+def _normalize_dollar_entities(text: str) -> str:
+    """Decode dollar entities outside code before choosing a delivery route."""
+    if "&#" not in text:
+        return text
+    return _RICH_DOLLAR_ENTITY_RE.sub(
+        lambda match: "$" if match.group(0).startswith("&#") else match.group(0), text
+    )
 _RICH_CURRENCY_AMOUNT_RE = re.compile(r"(?<![\\`\w])\$\d+(?:,\d{3})*(?:\.\d+)?")
 _RICH_CURRENCY_PLACEHOLDER = "\x00HERMES_RICH_CURRENCY_{index}\x00"
 
@@ -6257,6 +6285,7 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        content = _normalize_dollar_entities(content)
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -6927,6 +6956,7 @@ class TelegramAdapter(BasePlatformAdapter):
         continuation messages, returning the final chunk's id so subsequent
         edits target the most recent visible message.
         """
+        content = _normalize_dollar_entities(content)
         if not self._bot:
             outcome = await self._await_reconnection_or_delegate(
                 "edit_message", chat_id, message_id, content,
@@ -7442,6 +7472,7 @@ class TelegramAdapter(BasePlatformAdapter):
         final ``sendMessage``/``sendRichMessage`` is what the user receives in
         their history).
         """
+        content = _normalize_dollar_entities(content)
         if not self._bot:
             return SendResult(success=False, error="not_connected")
         if self._business_connection_kwargs(metadata):

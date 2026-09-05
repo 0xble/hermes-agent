@@ -132,6 +132,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-108 | Active | `feat(delegate): add named custom subagents` | Select trusted named children with fixed subscription routes and read-only shared knowledge. |
 | HERMES-109 | Active | `fix(telegram): recover stranded answers after polling health returns` | Pace degraded retries and wake the identity-scoped delivery ledger after internal recovery, including late failure writes. |
 | HERMES-110 | Retired | `fix(prompt): keep runtime guidance scope-bound`; `fix(prompt): preserve persistent memory after compaction`; `revert(astra): retire instruction support patches` | Historical Astra-specific runtime guidance and bundled blueprint hardening, reverted before runtime promotion at the user's request. |
+| HERMES-111 | Active | `fix(telegram): preserve math and normalize currency entities` | Preserve genuine math and currency across rich, legacy, and draft delivery without a duplicate output-transform rule. |
 
 
 ## Fork-only administrative subject exemptions
@@ -242,6 +243,16 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-111 — Preserve math and currency across Telegram routes
+
+- **Summary:** The adapter already protected currency in always-rich sends, final edits and drafts. The remaining defects were closed numeric math being rewritten as currency, and numeric dollar entities surviving literally into legacy/plain fallbacks. Protect complete math spans alongside code and normalize decimal/hex dollar entities outside code at send, edit and draft boundaries. Currency protection stays adapter-owned, not in a competing output-transform rule.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_rich_messages.py`. Companion repository `0xble/hermes-output-guard` removes its already-unregistered `dollar_math` module, duplicate tests and stale documentation. Installed plugin promotion is a separate checkpoint.
+- **Upstream tracking:** Checked against upstream `b51c055a12220f8c7c18660e8599365012e19532` and current fork source on 2026-09-05. No verified complete replacement is claimed. This record separates the existing native currency projection from HERMES-044's unrelated transform-composition contract.
+- **Upstream PR:** No publication requested. Source-level defect reproduction and adapter-boundary regression tests justify this residual fix; an open proposal is not a replacement.
+- **Regression:** `python -m pytest -q tests/gateway/test_telegram_rich_messages.py`. Verify numeric atoms, decimals, coefficients, fractions and display math survive beside multiple currency amounts; dollar entities become currency before rich rejection fallback on send/edit/draft; code entities remain literal. Run the Output Guard suite before removing the dead rule, preserving session-reference and Slack behavior.
+- **Rollback:** Revert only `fix(telegram): preserve math and normalize currency entities` to restore the previous projection. Do not revive the unregistered plugin currency rule or weaken HERMES-044's transform-composition protections.
+- **Retirement:** Retire when the adopted upstream adapter passes the same math, currency, code and capability-fallback contracts on all three boundaries, then remove the private projection delta rather than retain two owners.
 
 ### HERMES-110 — Retired Astra instruction support
 
