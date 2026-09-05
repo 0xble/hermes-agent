@@ -31,10 +31,89 @@ delegate_task(tasks=[
 ])
 ```
 
+## Custom Subagents
+
+A user-authored registry in `config.yaml` can define reusable child instructions,
+models, providers, and reasoning effort. The model selects only a configured
+name, not arbitrary credentials or runtime settings.
+
+```yaml
+delegation:
+  subagents:
+    explorer:
+      description: Investigate code and return evidence without editing it.
+      instructions: >-
+        Inspect the assigned scope. Return precise file and source references,
+        uncertainty, and relevant failure modes. Do not modify project files.
+      provider: openai-codex
+      model: gpt-5.6-luna
+      reasoning_effort: medium
+    worker:
+      description: Implement scoped changes and verify them with tests.
+      instructions: >-
+        Make the smallest correct change within the assigned scope. Follow
+        repository instructions, test actual behavior, and report evidence.
+      provider: openai-codex
+      model: gpt-5.6-terra
+      reasoning_effort: medium
+```
+
+```python
+delegate_task(tasks=[
+    {"subagent_type": "explorer", "goal": "Locate the upload retry boundary"},
+    {"subagent_type": "worker", "goal": "Implement the approved parser fix"},
+])
+```
+
+Names and concise descriptions appear in the delegation tool schema.
+`description` and `instructions` are required. `provider`, `model`, and
+`reasoning_effort` are optional, inheriting applicable delegation defaults and
+parent settings. An explicit provider requires an explicit model. Names use
+lowercase letters, digits, underscores, and hyphens, starting with a letter.
+Unknown names, malformed definitions, unknown fields, and unsupported explicit
+efforts fail before any member of the batch starts.
+
+Named children retain one resolved route and effort for their lifetime,
+including tool-loop continuations, retries, output correction, and iteration
+summaries. Codex definitions require the parent's currently authorized
+`openai-codex` subscription route. They do not select another account or fall
+back to API billing. An expired credential fails the child instead of
+re-resolving another credential source. Refresh the parent through the normal
+auth flow before retrying. Quota exhaustion or model unavailability is an
+error, not permission to substitute a model.
+
+Named children receive shared authorized skill discovery, launch-time standing
+memory, and read-only memory-provider/session retrieval. They do not receive the
+parent transcript automatically. Pass task context explicitly. Durable memory
+and skill changes remain parent-owned, including indirect tool dispatch and
+provider retention hooks. Provider tools without a declared read-only contract
+are unavailable to these children. Result metadata lists skipped or failed
+providers in `unavailable_memory_providers`; the parent must not claim retrieval
+from those providers. Hindsight `local_embedded` (and its legacy `local` alias)
+is unavailable in read-only children because starting its daemon can mutate
+state. Use an already managed `local_external` or cloud connection for shared
+Hindsight retrieval. This release does not start or reconfigure a daemon.
+This is an agent-tool authority boundary,
+not an OS sandbox: a child with terminal or ordinary file-write access is still
+a trusted coding agent. A persona's request not to edit project files is an
+instruction, not a filesystem permission boundary.
+
+Results include `subagent_type`, `provider`, `model`, `reasoning_effort`, and a
+nonsecret `route_category`. Cancellation, steering, concurrency, cleanup,
+background delivery, and output-schema validation use native delegation.
+Omitting `subagent_type` preserves ordinary delegation. No registry means no
+additional schema field. Custom subagents do not define or alter AutoReview.
+
+Source landing does not activate this configuration. After separately approved
+runtime promotion, add the registry to the intended profile and start a new
+conversation so its cached tool schema includes the names. Do not change the
+parent's model block. Removing the registry and starting a new conversation
+restores the ordinary selection surface.
+
 ## How Subagent Context Works
 
 :::warning Critical: Subagents Know Nothing
-Subagents start with a **completely fresh conversation**. They have zero knowledge of the parent's conversation history, prior tool calls, or anything discussed before delegation. The subagent's only context comes from the `goal` and `context` fields the parent agent populates when it calls `delegate_task`.
+Subagents start with a **completely fresh conversation**. They do not automatically receive the parent's conversation history or prior tool calls. Pass the task-specific brief through `goal` and `context`. Named custom subagents also receive their standing instructions and authorized read-only shared knowledge.
 :::
 
 One exception: when the parent has a resolved workspace directory, every subagent's system prompt embeds that workspace's **project context files** (`.hermes.md` > AGENTS.md chain > CLAUDE.md > `.cursorrules` — the same discovery, priority, and size caps as the main agent's system prompt; SOUL.md is excluded). Subagents working in a repo operate under the repo's own conventions without having to rediscover them.

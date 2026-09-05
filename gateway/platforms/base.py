@@ -160,7 +160,7 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
             metadata["direct_messages_topic_id"] = tid
         # A SessionSource can outlive the event that created it. Falling back
         # to source.message_id here can therefore resurrect a stale anchor
-        # from a concurrent /side lane after _reply_anchor_for_event()
+        # from an earlier user turn after _reply_anchor_for_event()
         # deliberately returned None for an internal continuation. Callers
         # that own a live user event pass its anchor explicitly.
         anchor = reply_to_message_id
@@ -207,8 +207,8 @@ def _reply_anchor_for_event(event) -> str | None:
     ):
         # Internal continuations do not carry new user authority and must not
         # inherit a user-message quote anchor.  A reused anchor can belong to a
-        # concurrently active /side lane in the same DM topic, making an
-        # unrelated parent continuation appear to answer the side command.
+        # different user turn in the same DM topic, making an internal
+        # continuation appear to answer an unrelated command.
         # Route synthetic output by the immutable topic id alone.
         if getattr(event, "internal", False):
             return None
@@ -4694,7 +4694,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> List[SendResult]:
+    ) -> None:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -4709,7 +4709,6 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
-        results: List[SendResult] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4741,12 +4740,10 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                results.append(img_result)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
-        return results
 
     async def send_image(
         self,
@@ -5932,6 +5929,27 @@ class BasePlatformAdapter(ABC):
             return response.text, int(ttl or 0)
         return response, 0
 
+    async def _redeliver_recovered_send_path(self) -> None:
+        """Wake the existing ledger after this exact adapter recovers in place.
+
+        Called both by the health transition and after a late failed-row write.
+        Transactional claims and the ledger attempt cap arbitrate concurrent
+        signals. Never route a stale adapter's signal through another bot.
+        """
+        if getattr(self, "_send_path_degraded", None) is not False:
+            return
+        runner = getattr(self, "gateway_runner", None)
+        resolve = getattr(runner, "_authorization_adapter", None)
+        replay: Any = getattr(runner, "_redeliver_failed_obligations_for_platform", None)
+        if not callable(resolve) or not callable(replay):
+            return
+        profile = getattr(self, "_owner_profile", None)
+        try:
+            if resolve(self.platform, profile) is self:
+                await replay(self.platform, profile=profile)
+        except Exception:
+            logger.debug("[%s] Internal recovery redelivery failed", self.name, exc_info=True)
+
     def _final_delivery_adapter(
         self, source: Optional[SessionSource]
     ) -> "BasePlatformAdapter":
@@ -6424,8 +6442,6 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
-        *,
-        discard_pending: bool = False,
     ) -> None:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
@@ -6473,20 +6489,6 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
-                if getattr(_r, "success", False):
-                    _message_ids = ([str(_r.message_id)] if _r.message_id else [])
-                    _message_ids.extend(
-                        str(mid) for mid in (_r.continuation_message_ids or ()) if mid
-                    )
-                    _record_side = getattr(
-                        getattr(self, "gateway_runner", None),
-                        "_record_side_delivery",
-                        None,
-                    )
-                    if _message_ids and callable(_record_side):
-                        _recorded = _record_side(event, _message_ids)
-                        if inspect.isawaitable(_recorded):
-                            await _recorded
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -6498,7 +6500,7 @@ class BasePlatformAdapter(ABC):
             await self.cancel_session_processing(
                 session_key,
                 release_guard=False,
-                discard_pending=discard_pending,
+                discard_pending=False,
             )
         except Exception:
             # On failure, restore the original guard if one still exists so
@@ -6537,36 +6539,16 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        # A reply can target a durable nonexclusive route (currently used by
-        # continuable /side sessions). Resolve it before the adapter chooses its
-        # busy guard so parent and side turns serialize independently while the
-        # delivery source remains the same chat/topic.
-        runner = getattr(self, "gateway_runner", None)
-        prepare_route = getattr(runner, "_prepare_side_reply_route", None)
-        if callable(prepare_route):
-            prepared = prepare_route(event)
-            if inspect.isawaitable(prepared):
-                await prepared
-
-        derived_session_key = build_session_key(
+        session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
-        event_metadata = event.metadata or {}
         expected_session_key = str(
-            event_metadata.get("gateway_session_key") or ""
+            (event.metadata or {}).get("gateway_session_key") or ""
         ).strip()
-        explicit_route = bool(event_metadata.get("gateway_explicit_session_route"))
-        if explicit_route:
-            if not expected_session_key or not event_metadata.get("gateway_session_strict"):
-                logger.warning("Dropping malformed explicit session route")
-                return
-            session_key = expected_session_key
-        else:
-            session_key = derived_session_key
-        if expected_session_key and not explicit_route and session_key != expected_session_key:
+        if expected_session_key and session_key != expected_session_key:
             logger.warning(
                 "Dropping internally routed event: expected session=%s derived=%s",
                 expected_session_key,
@@ -6617,11 +6599,6 @@ class BasePlatformAdapter(ABC):
                 and effective_cmd
                 and is_interrupt_then_dispatch(effective_cmd)
             )
-            is_side_close = bool(
-                effective_cmd == "side"
-                and event_metadata.get("gateway_explicit_session_route")
-                and event.get_command_args().strip().lower() == "close"
-            )
             if (
                 should_bypass_active_session(effective_cmd)
                 and not alias_requires_lifecycle_handoff
@@ -6632,16 +6609,11 @@ class BasePlatformAdapter(ABC):
                 # runner response, and pending drain. Quick aliases targeting these
                 # commands stay on ordinary busy semantics until Hermes has an
                 # authorization-aware alias handoff.
-                if effective_cmd and (
-                    is_interrupt_then_dispatch(effective_cmd) or is_side_close
-                ):
+                if effective_cmd and is_interrupt_then_dispatch(effective_cmd):
                     self._discard_text_debounce(session_key)
                     try:
                         await self._dispatch_active_session_command(
-                            event,
-                            session_key,
-                            effective_cmd,
-                            discard_pending=is_side_close,
+                            event, session_key, effective_cmd
                         )
                     except Exception as e:
                         logger.error(
@@ -6668,22 +6640,6 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
-                        if getattr(_r, "success", False):
-                            _message_ids = []
-                            if _r.message_id:
-                                _message_ids.append(str(_r.message_id))
-                            _message_ids.extend(
-                                str(mid)
-                                for mid in (_r.continuation_message_ids or ())
-                                if mid
-                            )
-                            _record_side = getattr(
-                                runner, "_record_side_delivery", None
-                            )
-                            if _message_ids and callable(_record_side):
-                                _recorded = _record_side(event, _message_ids)
-                                if inspect.isawaitable(_recorded):
-                                    await _recorded
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
@@ -6836,47 +6792,15 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
-        delivery_receipt_tasks: set[asyncio.Future] = set()
         callback_generation: int | None = None
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
-            if isinstance(result, (list, tuple)):
-                for item in result:
-                    _record_delivery(item)
-                return
             if result is None:
                 return
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
-                message_ids = []
-                primary = getattr(result, "message_id", None)
-                if primary:
-                    message_ids.append(str(primary))
-                message_ids.extend(
-                    str(mid)
-                    for mid in (getattr(result, "continuation_message_ids", None) or ())
-                    if mid
-                )
-                raw = getattr(result, "raw_response", None)
-                if isinstance(raw, dict):
-                    message_ids.extend(
-                        str(mid) for mid in (raw.get("message_ids") or ()) if mid
-                    )
-                callback = getattr(
-                    getattr(self, "gateway_runner", None),
-                    "_record_side_delivery",
-                    None,
-                )
-                if message_ids and callable(callback):
-                    try:
-                        recorded = callback(event, message_ids)
-                        if inspect.isawaitable(recorded):
-                            task = asyncio.ensure_future(recorded)
-                            delivery_receipt_tasks.add(task)
-                    except Exception:
-                        logger.debug("Side delivery receipt callback failed", exc_info=True)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -7284,6 +7208,10 @@ class BasePlatformAdapter(ABC):
                                                 None,
                                             ),
                                         )
+                                    elif _live_adapter is delivery_adapter:
+                                        # Recovery can win the race with mark_failed
+                                        # without replacing the adapter object.
+                                        await delivery_adapter._redeliver_recovered_send_path()
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
@@ -7310,13 +7238,12 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        image_results = await self.send_multiple_images(
+                        await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(image_results)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -7353,13 +7280,12 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        image_results = await self.send_multiple_images(
+                        await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
-                        _record_delivery(image_results)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -7400,7 +7326,6 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
-                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -7430,7 +7355,6 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
-                        _record_delivery(file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -7582,11 +7506,6 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
-            if delivery_receipt_tasks:
-                await asyncio.gather(
-                    *tuple(delivery_receipt_tasks),
-                    return_exceptions=True,
-                )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    memory_access_mode: Optional[str] = None,
 ):
     """
     Initialize the AI Agent.
@@ -694,13 +695,17 @@ def init_agent(
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
+    if memory_access_mode not in (None, "read_only"):
+        raise ValueError("memory_access_mode must be None or 'read_only'")
+    agent.memory_access_mode = memory_access_mode
+    agent._memory_read_only = memory_access_mode == "read_only"
     # Background review (memory/skill) opt-out switch. When True, skips the
     # _spawn_background_review fork at end-of-turn -- avoids ~30K tokens /
     # event of extra LLM cost on cron-style sessions where review forks
     # provide no value (no human in the loop, no skill-creation pressure).
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
-    agent.skip_background_review = bool(skip_background_review)
+    agent.skip_background_review = bool(skip_background_review or agent._memory_read_only)
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1871,7 +1876,7 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
-    if not skip_memory or _memory_toolset_requested:
+    if not skip_memory or _memory_toolset_requested or agent._memory_read_only:
         try:
             from tools.memory_tool import (
                 get_builtin_memory_config,
@@ -1900,14 +1905,14 @@ def init_agent(
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
     agent._memory_manager = None
-    if not skip_memory:
+    if not skip_memory or agent._memory_read_only:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(read_only=agent._memory_read_only)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

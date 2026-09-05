@@ -878,6 +878,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config = None
+        self._read_only = False
         self._api_key = None
         self._api_url = _DEFAULT_API_URL
         self._bank_id = "hermes"
@@ -1415,7 +1416,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
             else:
-                _ensure_cloud_client_dependency()
+                if not self._read_only:
+                    _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
                 timeout = self._timeout or _DEFAULT_TIMEOUT
                 kwargs = {"base_url": self._api_url, "timeout": float(timeout)}
@@ -1869,6 +1871,7 @@ class HindsightMemoryProvider(MemoryProvider):
             )
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        self._read_only = kwargs.get("read_only") is True
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
         # Agent status channel for the deterministic retain indicator (recall
@@ -1885,7 +1888,10 @@ class HindsightMemoryProvider(MemoryProvider):
         start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._document_id = f"{self._session_id}-{start_ts}"
 
-        self._ensure_supported_client()
+        # Runtime package repair installs files. Read-only child contexts may
+        # use an already available client but must never mutate the environment.
+        if not self._read_only:
+            self._ensure_supported_client()
 
         self._config = _load_config()
         self._platform = str(kwargs.get("platform") or "").strip()
@@ -1913,6 +1919,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # "local" is a legacy alias for "local_embedded"
         if self._mode == "local":
             self._mode = "local_embedded"
+        if self._read_only and self._mode == "local_embedded":
+            raise RuntimeError(
+                "Hindsight local_embedded startup can mutate daemon state; "
+                "use cloud or local_external for delegated read-only access"
+            )
         if self._mode == "local_embedded":
             # Export the daemon health grace timeout BEFORE importing
             # daemon_embed_manager (which reads it at import time).
@@ -1980,6 +1991,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Retain controls
         self._auto_retain = self._config.get("auto_retain", True)
+        if self._read_only:
+            self._auto_retain = False
         self._retain_attachments = self._config.get("retain_attachments") is True
         self._retain_tool_sources = self._config.get("retain_tool_sources") is True
         self._retain_file_extractions = self._config.get("retain_file_extractions") is True
@@ -2761,12 +2774,22 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
+        if self._read_only:
+            return [RECALL_SCHEMA, REFLECT_SCHEMA]
         schemas = [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
         if self._allow_memory_mutations:
             schemas.extend([INVALIDATE_SCHEMA, RESTORE_SCHEMA])
         return schemas
 
+    def supports_read_only_prefetch(self) -> bool:
+        return True
+
+    def get_read_only_tool_names(self) -> set[str]:
+        return {"hindsight_recall", "hindsight_reflect"}
+
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if self._read_only and tool_name not in self.get_read_only_tool_names():
+            return tool_error(f"Memory tool '{tool_name}' is unavailable in read-only mode")
         if tool_name == "hindsight_retain":
             content = args.get("content", "")
             if not content:

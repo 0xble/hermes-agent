@@ -149,6 +149,9 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     model together — otherwise the system prompt would advertise tools
     that don't exist in the tool surface (#81014).
     """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager is not None and getattr(memory_manager, "_read_only", False) is True:
+        return bool(memory_manager.get_all_tool_names())
     tools = getattr(agent, "tools", None)
     if isinstance(tools, (list, tuple)):
         memory_tool_present = any(
@@ -439,10 +442,17 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        read_only: bool = False,
+    ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._read_only = bool(read_only)
+        self._read_only_initialized_providers: set[MemoryProvider] = set()
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
             if external_prefetch_timeout is None
@@ -497,11 +507,16 @@ class MemoryManager:
         for provider in routed_providers:
             provider_routes: Dict[str, MemoryProvider] = {}
             try:
+                read_only_names = (
+                    set(provider.get_read_only_tool_names()) if self._read_only else None
+                )
                 for raw_schema in provider.get_tool_schemas():
                     schema = normalize_tool_schema(raw_schema)
                     if schema is None:
                         continue
                     tool_name = schema["name"]
+                    if read_only_names is not None and tool_name not in read_only_names:
+                        continue
                     if tool_name in core_tool_names:
                         logger.warning(
                             "Memory provider '%s' tool '%s' shadows a reserved core "
@@ -620,6 +635,8 @@ class MemoryManager:
         """
         blocks = []
         for provider in self._providers:
+            if self._read_only and provider not in self._read_only_initialized_providers:
+                continue
             try:
                 block = provider.system_prompt_block()
                 if block and block.strip():
@@ -662,6 +679,11 @@ class MemoryManager:
             return ""
         parts = []
         for provider in self._providers:
+            if self._read_only:
+                if provider not in self._read_only_initialized_providers:
+                    continue
+                if not provider.supports_read_only_prefetch():
+                    continue
             try:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
@@ -767,6 +789,8 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
+        if self._read_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -826,6 +850,8 @@ class MemoryManager:
         before turn N+1; provider implementations don't need their own
         ordering guarantees.
         """
+        if self._read_only:
+            return
         providers = list(self._providers)
         if not providers:
             return
@@ -1017,7 +1043,11 @@ class MemoryManager:
         """
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
+            if self._read_only:
+                return tool_error(f"Memory tool '{tool_name}' is unavailable in read-only mode")
             return tool_error(f"No memory provider handles tool '{tool_name}'")
+        if self._read_only and tool_name not in set(provider.get_read_only_tool_names()):
+            return tool_error(f"Memory tool '{tool_name}' is unavailable in read-only mode")
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
@@ -1034,6 +1064,8 @@ class MemoryManager:
 
         kwargs may include: remaining_tokens, model, platform, tool_count.
         """
+        if self._read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
@@ -1045,6 +1077,8 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        if self._read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -1083,7 +1117,7 @@ class MemoryManager:
         ``_submit_background`` degrades to inline execution — the pre-#16454
         synchronous behavior, slow but correct.
         """
-        if not self._providers:
+        if self._read_only or not self._providers:
             return
         snapshot = list(messages or [])
 
@@ -1128,7 +1162,7 @@ class MemoryManager:
         transcript was truncated; providers caching per-turn document
         state should invalidate.
         """
-        if not new_session_id:
+        if self._read_only or not new_session_id:
             return
         # Only forward ``rewound`` when it's actually set. Passing it
         # unconditionally would inject ``rewound=False`` into every
@@ -1157,6 +1191,8 @@ class MemoryManager:
         api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION,
     ) -> bool:
         """Return whether an active provider guarantees checkpoint API support."""
+        if self._read_only:
+            return False
         for provider in self._providers:
             try:
                 provider_version = int(
@@ -1196,6 +1232,8 @@ class MemoryManager:
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
         """
+        if self._read_only:
+            return ""
         parts = []
         checkpoint_succeeded = False
         for provider in self._providers:
@@ -1284,6 +1322,8 @@ class MemoryManager:
 
         Skips the builtin provider itself (it's the source of the write).
         """
+        if self._read_only:
+            return
         for provider in self._providers:
             if provider.name == "builtin":
                 continue
@@ -1350,7 +1390,7 @@ class MemoryManager:
         session/task/tool-call provenance the manager does not) invoked once per
         mirrored op.
         """
-        if not self._memory_tool_result_succeeded(tool_result):
+        if self._read_only or not self._memory_tool_result_succeeded(tool_result):
             return
 
         target = str(tool_args.get("target") or "memory")
@@ -1387,6 +1427,8 @@ class MemoryManager:
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
         """Notify all providers that a subagent completed."""
+        if self._read_only:
+            return
         for provider in self._providers:
             try:
                 provider.on_delegation(
@@ -1489,11 +1531,36 @@ class MemoryManager:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
         initialized_providers: List[MemoryProvider] = []
+        self._read_only_unavailable_providers = []
         for provider in self._providers:
+            if self._read_only:
+                try:
+                    has_read_contract = bool(provider.get_read_only_tool_names()) or bool(
+                        provider.supports_read_only_prefetch()
+                    )
+                except Exception:
+                    has_read_contract = False
+                if not has_read_contract:
+                    self._read_only_unavailable_providers.append({
+                        "provider": provider.name, "reason": "no_read_only_contract",
+                    })
+                    logger.warning(
+                        "Memory provider '%s' has no explicit read-only contract; skipping",
+                        provider.name,
+                    )
+                    continue
             try:
-                provider.initialize(session_id=session_id, **kwargs)
+                init_kwargs = dict(kwargs)
+                if self._read_only:
+                    init_kwargs["read_only"] = True
+                    init_kwargs.setdefault("agent_context", "subagent")
+                provider.initialize(session_id=session_id, **init_kwargs)
                 initialized_providers.append(provider)
             except Exception as e:
+                if self._read_only:
+                    self._read_only_unavailable_providers.append({
+                        "provider": provider.name, "reason": "initialization_failed",
+                    })
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
@@ -1502,3 +1569,5 @@ class MemoryManager:
             initialized_providers,
             reason="provider initialization",
         )
+        if self._read_only:
+            self._read_only_initialized_providers = set(initialized_providers)

@@ -3486,7 +3486,7 @@ def _blank_slate_minimal_toolsets(config: dict):
     config.setdefault("platform_toolsets", {})["cli"] = sorted(keep)
 
     try:
-        from toolsets import TOOLSETS
+        from toolsets import TOOLSETS, resolve_toolset
         from hermes_cli.tools_config import CONFIGURABLE_TOOLSETS, _get_plugin_toolset_keys
 
         all_keys = set()
@@ -3507,7 +3507,13 @@ def _blank_slate_minimal_toolsets(config: dict):
                 # minimal Blank Slate surface (#57315).
             all_keys.add(k)
 
-        disabled = sorted(all_keys - keep)
+        # A deny-only singleton may overlap an enabled bundle (for example,
+        # skill_management and skills). Disabling it would strip kept tools.
+        kept_tools = {tool for key in keep for tool in resolve_toolset(key)}
+        disabled = sorted(
+            key for key in all_keys - keep
+            if not kept_tools.intersection(resolve_toolset(key))
+        )
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:
