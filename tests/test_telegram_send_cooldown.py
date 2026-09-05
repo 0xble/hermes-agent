@@ -511,14 +511,38 @@ async def test_extreme_server_retry_after_never_sleeps_inline(monkeypatch):
     result = await adapter.send("flood-chat", "hello", metadata={"notify": True})
 
     assert result.success is False
-    # Over-cap penalties fail closed with upstream's structured result
-    # (#91969): a blind full-content retry could duplicate chunks already
-    # delivered, so the caller's retry machinery owns the wait instead.
-    assert result.retryable is False
+    # Telegram rejected the first and only attempt, so no delivery is
+    # ambiguous and the caller can safely defer the complete message.
+    assert result.retryable is True
     assert result.error == "flood_control:7000.0"
     assert result.retry_after == 7000.0
     assert sleeps == []
     assert bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extreme_retry_after_after_a_chunk_is_not_full_message_retryable():
+    adapter = _make_adapter()
+    adapter._send_cooldown_max_wait = 5.0
+
+    class Flooded(Exception):
+        retry_after = 7000.0
+
+    bot = adapter._bot
+    assert bot is not None
+    bot.send_message.side_effect = [
+        SimpleNamespace(message_id=42),
+        Flooded("Retry after 7000"),
+    ]
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 200)
+
+    result = await adapter.send("flood-chat", content, metadata={"notify": True})
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "flood_control:7000.0"
+    assert result.retry_after == 7000.0
+    assert bot.send_message.await_count == 2
 
 
 @pytest.mark.asyncio

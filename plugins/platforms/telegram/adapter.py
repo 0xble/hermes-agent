@@ -261,11 +261,16 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
 
 
-def _flood_cap_result(wait: float) -> "SendResult":
+def _flood_cap_result(
+    wait: float,
+    *,
+    retryable: bool = False,
+) -> "SendResult":
     """The shared fail-closed SendResult for an over-cap flood wait."""
     return SendResult(
         success=False,
         error=f"flood_control:{wait}",
+        retryable=retryable,
         retry_after=float(wait),
     )
 
@@ -6166,6 +6171,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self,
         error: Exception,
         attempt: int,
+        *,
+        prior_chunks_delivered: bool = False,
     ):
         retry_after = self._telegram_retry_after(error)
         if retry_after is None:
@@ -6174,11 +6181,14 @@ class TelegramAdapter(BasePlatformAdapter):
             getattr(self, "_send_cooldown_max_wait", 5.0)
         )
         if overflow:
-            # Over-cap penalties fail closed with upstream's structured
-            # ``flood_control:{wait}`` result (#91969): the caller's retry
-            # machinery owns the wait, and an inline retry here could
-            # duplicate chunks already delivered by this call.
-            return True, _flood_cap_result(retry_after)
+            # The caller owns the long wait. A first-chunk rejection is safe
+            # to retry later because Telegram did not accept the request.
+            # Once an earlier chunk succeeded, however, a full-message retry
+            # could duplicate already-visible content.
+            return True, _flood_cap_result(
+                retry_after,
+                retryable=not prior_chunks_delivered,
+            )
         if attempt >= 2:
             return True, SendResult(
                 success=False,
@@ -6405,6 +6415,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         handled, retry_result = self._send_retry_after_outcome(
                             send_err,
                             _send_attempt,
+                            prior_chunks_delivered=bool(message_ids),
                         )
                         if handled:
                             if retry_result is not None:
@@ -6526,6 +6537,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         handled, retry_result = self._send_retry_after_outcome(
                             send_err,
                             _send_attempt,
+                            prior_chunks_delivered=bool(message_ids),
                         )
                         if handled:
                             if retry_result is not None:
