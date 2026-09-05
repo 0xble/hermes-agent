@@ -5890,6 +5890,13 @@ def _run_cron_cleanup_with_timeout(
         if timeout_seconds is None
         else float(timeout_seconds)
     )
+    if timeout <= 0 and timeout_seconds is not None:
+        logger.error(
+            "Job '%s': %s skipped because the total execution budget is exhausted",
+            job_id,
+            label,
+        )
+        return False
     if timeout <= 0:
         try:
             cleanup()
@@ -5931,6 +5938,15 @@ def _run_cron_cleanup_with_timeout(
         logger.debug("Job '%s': %s failed: %s", job_id, label, error[0])
         return False
     return True
+
+
+def _deferred_agent_cleanup_timeout(agent) -> float:
+    """Clamp agent teardown to the remaining total run budget, when present."""
+    timeout = _cron_cleanup_timeout_seconds()
+    deadline = getattr(agent, "_cron_total_run_deadline", None)
+    if deadline is None:
+        return timeout
+    return min(timeout, max(0.0, float(deadline) - time.monotonic()))
 
 
 class _BoundedCronSessionDB:
@@ -7779,6 +7795,8 @@ def run_job(
             pass
         elif defer_agent_teardown is not None:
             if agent is not None:
+                if _total_run_deadline is not None:
+                    setattr(agent, "_cron_total_run_deadline", _total_run_deadline)
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
@@ -8167,13 +8185,21 @@ def _run_one_job_body(
             # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
             # still triggers teardown before propagating.
             for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+                _teardown_cron_agent(
+                    _deferred_agent,
+                    job["id"],
+                    timeout_seconds=_deferred_agent_cleanup_timeout(_deferred_agent),
+                )
             raise
         # The outer finally resets the scope after delivery and bookkeeping.
 
         if _fire_claim_ownership_lost():
             for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+                _teardown_cron_agent(
+                    _deferred_agent,
+                    job["id"],
+                    timeout_seconds=_deferred_agent_cleanup_timeout(_deferred_agent),
+                )
             # Distinguish a real ownership loss (TTL expiry / replacement
             # claim) from a transport-level cancel (dashboard drain): in the
             # latter case WE still own the claim, and silently discarding
@@ -8365,7 +8391,11 @@ def _run_one_job_body(
             # (or raised). Must happen on every path so cron agents never leak
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+                _teardown_cron_agent(
+                    _deferred_agent,
+                    job["id"],
+                    timeout_seconds=_deferred_agent_cleanup_timeout(_deferred_agent),
+                )
 
         if side_effect_ownership_lost or _fire_claim_ownership_lost():
             # Same transport-cancel distinction as the pre-side-effect path:

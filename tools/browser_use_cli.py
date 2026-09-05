@@ -108,6 +108,16 @@ def _browser_exec_binding_key(session: str) -> str:
     return f"{hermes_home_key()}\0{session or '__default__'}"
 
 
+def _effective_browser_exec_session(session: str, task_id: Optional[str]) -> str:
+    """Scope an omitted user session to the current agent task."""
+    if session:
+        return session
+    if not task_id:
+        return ""
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:24]
+    return f"task_{digest}"
+
+
 def _browser_exec_runtime_owner(identity) -> str:
     if identity is None:
         return _LEGACY_BROWSER_BINDING
@@ -1057,11 +1067,14 @@ def browser_exec(
             "dashes, or underscores (e.g. 'r7k2')."
         )
 
-    binding_error = _check_browser_exec_identity_binding(resolved_identity, session)
+    effective_session = _effective_browser_exec_session(session, task_id)
+    binding_error = _check_browser_exec_identity_binding(
+        resolved_identity, effective_session
+    )
     if binding_error:
         return tool_error(binding_error)
 
-    daemon_name = _identity_daemon_name(resolved_identity, session)
+    daemon_name = _identity_daemon_name(resolved_identity, effective_session)
 
     cmd = _find_cli()
     if not cmd:
@@ -1079,8 +1092,8 @@ def browser_exec(
     env.pop(_REAL_PROFILE_SENTINEL, None)
     if daemon_name:
         env["BU_NAME"] = daemon_name
-    elif session:
-        env["BU_NAME"] = session
+    elif effective_session:
+        env["BU_NAME"] = effective_session
     # Real-profile consent: on a local backend this upgrades the attach to
     # the user's default browser (profile snapshot, logins included); with
     # local=True it forces that even under a cloud backend. Runs BEFORE
@@ -1118,13 +1131,17 @@ def browser_exec(
     # each other's daemon (#86894). Browser Use direct-API cloud configs
     # are the one exception: the CLI manages named cloud browsers natively,
     # and _resolve_backend_cdp skips provider resolution for them.
-    backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
+    backend_err = _resolve_backend_cdp(
+        env, task_id, session_name=effective_session
+    )
     if backend_err:
         return tool_error(backend_err)
 
     # Bind only after routing succeeds. A failed cloud/CDP/consent preflight
     # must not poison the user-visible session name for a later valid retry.
-    _, binding_error = _bind_browser_exec_identity(resolved_identity, session)
+    _, binding_error = _bind_browser_exec_identity(
+        resolved_identity, effective_session
+    )
     if binding_error:
         return tool_error(binding_error)
 
@@ -1135,7 +1152,7 @@ def browser_exec(
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
     env.pop(_REAL_PROFILE_SENTINEL, None)
-    if session and not private_browser:
+    if effective_session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)

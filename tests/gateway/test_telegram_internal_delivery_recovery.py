@@ -148,14 +148,14 @@ async def test_replay_late_failure_after_recovery_is_not_stranded(setup):
 
 
 @pytest.mark.asyncio
-async def test_repeated_late_failures_obey_existing_attempt_cap(setup):
+async def test_repeated_late_failure_waits_for_a_new_health_signal(setup):
     adapter, _ = setup
     record()
     adapter._send_path_degraded = False
     adapter.send.return_value = SendResult(success=False, error="send_path_degraded", retryable=True)
     await adapter._redeliver_recovered_send_path()
-    assert state() == ("abandoned", dl.MAX_ATTEMPTS)
-    assert adapter.send.await_count == dl.MAX_ATTEMPTS
+    assert state() == ("failed", 1)
+    assert adapter.send.await_count == 1
 
 
 @pytest.mark.asyncio

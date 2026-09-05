@@ -134,6 +134,35 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    def _session_key_for_event(self, event: MessageEvent) -> str:
+        """Resolve the ordinary session key for a command event."""
+        return self._session_key_for_source(event.source)
+
+    async def _session_entry_for_event(
+        self,
+        event: MessageEvent,
+        *,
+        source: Optional[SessionSource] = None,
+        force_new: bool = False,
+    ):
+        """Resolve a command's ordinary session row through the async store."""
+        effective_source = source or event.source
+        if force_new:
+            return await self.async_session_store.get_or_create_session(
+                effective_source,
+                force_new=True,
+            )
+        return await self.async_session_store.get_or_create_session(effective_source)
+
+    def _session_entry_for_event_sync(
+        self,
+        event: MessageEvent,
+        *,
+        source: Optional[SessionSource] = None,
+    ):
+        """Resolve a command's ordinary session row through the sync store."""
+        return self.session_store.get_or_create_session(source or event.source)
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -2649,7 +2678,7 @@ class GatewaySlashCommandsMixin:
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -3732,7 +3761,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.btw.usage")
 
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -3766,7 +3795,7 @@ class GatewaySlashCommandsMixin:
         # fallback inside answer_side_question handles it.
         parent_agent = None
         try:
-            session_key = self._session_key_for_source(source)
+            session_key = self._session_key_for_event(event)
             _cache_lock = getattr(self, "_agent_cache_lock", None)
             if _cache_lock is not None:
                 with _cache_lock:
@@ -4665,7 +4694,7 @@ class GatewaySlashCommandsMixin:
         https://code.claude.com/docs/en/whats-new/2026-w20).
         """
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -5644,10 +5673,10 @@ class GatewaySlashCommandsMixin:
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
 
         source = event.source
-        session_key = self._session_key_for_source(source)
+        session_key = self._session_key_for_event(event)
 
         # Load the current session and its transcript
-        current_entry = await self.async_session_store.get_or_create_session(source)
+        current_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(current_entry.session_id)
         except TranscriptReadError:
@@ -5840,7 +5869,7 @@ class GatewaySlashCommandsMixin:
 
             history: list[dict] = []
             try:
-                entry = self.session_store.get_or_create_session(source)
+                entry = self._session_entry_for_event_sync(event, source=source)
                 history = self.session_store.load_transcript(entry.session_id) or []
             except TranscriptReadError:
                 # A read failure is not an empty transcript (#100788): the
@@ -5880,7 +5909,7 @@ class GatewaySlashCommandsMixin:
 
             history: list[dict] = []
             try:
-                entry = self.session_store.get_or_create_session(source)
+                entry = self._session_entry_for_event_sync(event, source=source)
                 history = self.session_store.load_transcript(entry.session_id) or []
             except TranscriptReadError:
                 # See _context_breakdown_block: don't pass a read failure off
@@ -5923,7 +5952,7 @@ class GatewaySlashCommandsMixin:
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         source = event.source
-        session_key = self._session_key_for_source(source)
+        session_key = self._session_key_for_event(event)
 
         # `/usage reset [--force]` — redeem one banked Codex rate-limit reset
         # credit. Parsed before the display path so it never mixes with the

@@ -13949,6 +13949,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
+            recovery_generation = getattr(
+                adapter, "_send_path_recovery_generation", 0
+            )
 
             try:
                 result = await adapter.send(
@@ -13981,9 +13984,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if (
                         getattr(result, "error", None) == "send_path_degraded"
                         and isinstance(adapter, BasePlatformAdapter)
+                        and getattr(
+                            adapter, "_send_path_recovery_generation", 0
+                        )
+                        > recovery_generation
                     ):
-                        # A replay can also finish failing after its adapter's
-                        # recovery sweep. Claims and attempt caps bound re-entry.
+                        # Re-enter only when polling proved a newer recovery
+                        # DURING this attempt. Reusing the same health edge burns
+                        # the full retry budget in one degraded sweep.
                         await adapter._redeliver_recovered_send_path()
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)

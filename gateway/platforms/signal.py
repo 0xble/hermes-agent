@@ -1304,7 +1304,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1486,6 +1486,8 @@ class SignalAdapter(BasePlatformAdapter):
                         retryable=True,
                     )
                 )
+
+        return results
 
     async def _notify_batch_pacing(
         self,

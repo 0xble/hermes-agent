@@ -180,15 +180,25 @@ def _explicit_replacement_requested(text: str, context: Optional[str] = None) ->
     )
 
 
+def _sentence_boundary_positions(text: str):
+    for position, character in enumerate(text):
+        if character in "!?\n" or (
+            character == "."
+            and (position + 1 == len(text) or text[position + 1].isspace())
+        ):
+            yield position
+
+
 def _authorization_sentence(user_task: str, span_start: int, span_length: int) -> str:
-    sentence_start = (
-        max(user_task.rfind(separator, 0, span_start) for separator in ".!?\n") + 1
-    )
+    sentence_start = max(
+        (position for position in _sentence_boundary_positions(user_task[:span_start])),
+        default=-1,
+    ) + 1
     after_span = span_start + span_length
     sentence_ends = [
         position
-        for separator in ".!?\n"
-        if (position := user_task.find(separator, after_span)) >= 0
+        for position in _sentence_boundary_positions(user_task)
+        if position >= after_span
     ]
     sentence_end = min(sentence_ends) + 1 if sentence_ends else len(user_task)
     return user_task[sentence_start:sentence_end]

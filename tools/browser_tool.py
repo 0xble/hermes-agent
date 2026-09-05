@@ -52,6 +52,7 @@ Usage:
 import atexit
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -3440,6 +3441,79 @@ BROWSER_TOOL_SCHEMAS = [
 # Utility Functions
 # ============================================================================
 
+def _browser_identity_binding_dir(task_id: str) -> Path:
+    """Return the profile-scoped immutable identity claim for ``task_id``."""
+    digest = hashlib.sha256((task_id or "default").encode("utf-8")).hexdigest()
+    return get_hermes_home() / "browser-profile" / "agent-browser-bindings" / digest
+
+
+def _read_browser_identity_binding(task_id: str) -> tuple[str, str] | None:
+    claim = _browser_identity_binding_dir(task_id)
+    if not claim.exists():
+        return None
+    try:
+        alias = (claim / "alias").read_text(encoding="utf-8").strip()
+        owner = (claim / "owner").read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError(
+            "browser task identity binding is unreadable; start a new task"
+        ) from exc
+    if (
+        not alias
+        or not owner
+        or len(alias) > 128
+        or len(owner) > 128
+        or any(ch.isspace() for ch in alias)
+        or any(ch.isspace() for ch in owner)
+    ):
+        raise RuntimeError(
+            "browser task identity binding is corrupt; start a new task"
+        )
+    return alias, owner
+
+
+def _claim_browser_identity_binding(task_id: str, alias: str, owner: str) -> None:
+    """Atomically preserve one task's browser identity across process restarts."""
+    claim = _browser_identity_binding_dir(task_id)
+    existing = _read_browser_identity_binding(task_id)
+    if existing is not None:
+        if existing != (alias, owner):
+            raise RuntimeError(
+                "browser task is already bound to another identity; start a new task "
+                "instead of switching cookie jars"
+            )
+        return
+
+    root = claim.parent
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        from hermes_cli.config import _secure_dir
+
+        _secure_dir(root)
+    except Exception:
+        logger.debug("Could not harden browser identity binding directory", exc_info=True)
+    temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        temporary.mkdir()
+        (temporary / "alias").write_text(alias + "\n", encoding="utf-8")
+        (temporary / "owner").write_text(owner + "\n", encoding="utf-8")
+        try:
+            temporary.rename(claim)
+        except FileExistsError:
+            pass
+        except OSError:
+            if not claim.exists():
+                raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+    if _read_browser_identity_binding(task_id) != (alias, owner):
+        raise RuntimeError(
+            "browser task is already bound to another identity; start a new task "
+            "instead of switching cookie jars"
+        )
+
 def _create_local_session(
     task_id: str,
     allow_real_profile: bool = True,
@@ -3601,6 +3675,10 @@ def _get_session_info(
     if task_id is None:
         task_id = "default"
 
+    # Private-URL sidecars never receive a real browser profile and therefore
+    # must not create or recover a named identity claim.
+    force_local = _is_local_sidecar_key(task_id)
+
     requested_identity_key = None
     if identity:
         from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
@@ -3615,6 +3693,39 @@ def _get_session_info(
 
         requested_identity_key = browser_identity_scope_key(resolved_identity.runtime_key)
 
+    durable_identity = (
+        _read_browser_identity_binding(task_id) if not force_local else None
+    )
+    if durable_identity is not None:
+        durable_alias, durable_key = durable_identity
+        from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+
+        try:
+            resolved_durable = resolve_browser_identity(durable_alias)
+        except BrowserIdentityError as exc:
+            raise RuntimeError(
+                "browser task identity binding no longer resolves; start a new task"
+            ) from exc
+        if resolved_durable is None:  # defensive: persisted aliases are non-empty
+            raise RuntimeError(
+                "browser task identity binding no longer resolves; start a new task"
+            )
+        from hermes_cli.browser_identity import browser_identity_scope_key
+
+        current_durable_key = browser_identity_scope_key(resolved_durable.runtime_key)
+        if current_durable_key != durable_key:
+            raise RuntimeError(
+                "browser task identity binding no longer matches its configured profile; "
+                "start a new task"
+            )
+        if requested_identity_key and requested_identity_key != durable_key:
+            raise RuntimeError(
+                "browser task is already bound to another identity; start a new task "
+                "instead of switching cookie jars"
+            )
+        identity = resolved_durable.alias
+        requested_identity_key = durable_key
+
     def _ensure_identity_binding(session_info: Dict[str, Any]) -> None:
         if session_info.get("browser_identity"):
             from hermes_constants import hermes_home_key
@@ -3628,6 +3739,12 @@ def _get_session_info(
             raise RuntimeError(
                 "browser task is already bound to another identity; start a new task "
                 "instead of switching cookie jars"
+            )
+        if not force_local and session_info.get("browser_identity"):
+            _claim_browser_identity_binding(
+                task_id,
+                str(session_info["browser_identity"]),
+                str(session_info.get("browser_identity_key") or ""),
             )
 
     # Start the cleanup thread if not running (handles inactivity timeouts)
@@ -3724,12 +3841,17 @@ def _get_session_info(
                 resolved_default.runtime_key
             )
 
+    if identity and not force_local:
+        _claim_browser_identity_binding(
+            task_id,
+            identity,
+            str(requested_identity_key or ""),
+        )
+
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
     # URLs in the same conversation continue to use the cloud session under
     # the bare task_id key.
-    force_local = _is_local_sidecar_key(task_id)
-
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
     if identity and cdp_override:

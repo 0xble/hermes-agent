@@ -1569,6 +1569,7 @@ async def _send_to_platform(
 
     if str(profile or "").strip():
         last_result = None
+        delivered_message_ids = []
         for index, chunk in enumerate(chunks):
             result = await _send_via_adapter(
                 platform,
@@ -1581,8 +1582,15 @@ async def _send_to_platform(
                 profile=profile,
             )
             if isinstance(result, dict) and result.get("error"):
+                if delivered_message_ids:
+                    result = dict(result)
+                    result["delivery_stage"] = "partial_send"
+                    result["message_id"] = delivered_message_ids[-1]
+                    result["chunk_partial_count"] = len(delivered_message_ids)
                 return result
             last_result = result
+            if isinstance(result, dict) and result.get("message_id"):
+                delivered_message_ids.append(result["message_id"])
         return last_result
 
     # --- Telegram: special handling for media attachments ---

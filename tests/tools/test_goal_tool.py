@@ -69,6 +69,25 @@ def test_goal_payload_must_be_verbatim_authorized(isolated_goal_db):
     assert result["error_code"] == "goal_payload_authorization_required"
 
 
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "fix tools/parser.py and verify the tests",
+        "upgrade to version 3.2 and verify compatibility",
+        "check https://example.com/docs and archive the result",
+    ],
+)
+def test_goal_authorization_preserves_dotted_tokens(isolated_goal_db, goal):
+    result = call_goal(
+        goal=goal,
+        session_id=f"dotted-{abs(hash(goal))}",
+        user_task=f"Set a goal to {goal}.",
+    )
+
+    assert result["success"] is True
+    assert result["state"]["goal"] == goal
+
+
 def test_goal_payload_cannot_come_from_negated_clause(isolated_goal_db):
     user_task = "Set a goal to audit backups, but do not delete production data."
 

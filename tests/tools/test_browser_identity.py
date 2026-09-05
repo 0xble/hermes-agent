@@ -429,6 +429,45 @@ class TestBrowserUseIdentityRouting:
         )
         assert "already bound" in switched["error"]
 
+    def test_omitted_session_is_scoped_to_task_identity(self, tmp_path, monkeypatch):
+        import tools.browser_use_cli as bu
+
+        cli = tmp_path / "browser-use"
+        cli.write_text("#!/bin/sh\ncat > /dev/null\n")
+        cli.chmod(0o755)
+        monkeypatch.setattr(bu, "_find_cli", lambda: [str(cli)])
+        monkeypatch.setattr(bu, "_real_profile_consented", lambda: True)
+        monkeypatch.setattr(
+            "hermes_cli.browser_identity.read_browser_identity_config",
+            lambda: _browser_cfg(),
+        )
+        monkeypatch.setattr(
+            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+        )
+        routed_sessions = []
+
+        def route(env, task_id, session_name=""):
+            routed_sessions.append((task_id, session_name))
+            return None
+
+        monkeypatch.setattr(bu, "_resolve_backend_cdp", route)
+
+        def run(*, identity, task_id):
+            raw = bu.browser_exec("print(1)", identity=identity, task_id=task_id)
+            assert isinstance(raw, str)
+            return json.loads(raw)
+
+        assert run(identity="lpg", task_id="task-a")["success"]
+        assert run(identity="personal", task_id="task-b")["success"]
+        assert routed_sessions[0][1] != routed_sessions[1][1]
+        assert all(session.startswith("task_") for _, session in routed_sessions)
+
+        bu._browser_exec_identity_bindings.clear()
+        bu._browser_exec_identity_daemons.clear()
+        bu._browser_exec_identity_daemon_homes.clear()
+        switched = run(identity="personal", task_id="task-a")
+        assert "already bound" in switched["error"]
+
     @pytest.mark.parametrize("legacy_first", [True, False])
     def test_session_rejects_legacy_named_transitions(
         self, tmp_path, monkeypatch, legacy_first
@@ -605,6 +644,62 @@ class TestBuiltInIdentityRouting:
             assert info["browser_identity"] == "personal"
         finally:
             bt._active_sessions.pop("default-first-command", None)
+
+    def test_named_task_identity_survives_process_local_session_reset(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.browser_identity import (
+            browser_identity_scope_key,
+            resolve_browser_identity,
+        )
+        from hermes_constants import hermes_home_key
+        import tools.browser_tool as bt
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        created = []
+
+        def fake_create(task_id, allow_real_profile=True, identity=None):
+            resolved = resolve_browser_identity(identity, browser_cfg=_browser_cfg())
+            assert resolved is not None
+            created.append(identity)
+            return {
+                "session_name": f"rp_{identity}",
+                "cdp_url": "http://127.0.0.1:9230",
+                "browser_identity": identity,
+                "browser_identity_key": browser_identity_scope_key(
+                    resolved.runtime_key
+                ),
+                "browser_identity_home": hermes_home_key(),
+                "features": {"local": True, "real_profile": True},
+            }
+
+        task_id = "durable-built-in-task"
+        try:
+            with (
+                patch(
+                    "hermes_cli.browser_identity.read_browser_identity_config",
+                    return_value=_browser_cfg(),
+                ),
+                patch.object(bt, "_create_local_session", side_effect=fake_create),
+                patch.object(bt, "_get_cloud_provider", return_value=None),
+                patch.object(bt, "_get_cdp_override_raw", return_value=None),
+                patch.object(bt, "_start_browser_cleanup_thread"),
+                patch.object(bt, "_update_session_activity"),
+            ):
+                first = bt._get_session_info(task_id, identity="lpg")
+                assert first["browser_identity"] == "lpg"
+                bt._active_sessions.pop(task_id, None)
+
+                resumed = bt._get_session_info(task_id)
+                assert resumed["browser_identity"] == "lpg"
+                bt._active_sessions.pop(task_id, None)
+
+                with pytest.raises(RuntimeError, match="already bound"):
+                    bt._get_session_info(task_id, identity="personal")
+
+            assert created == ["lpg", "lpg"]
+        finally:
+            bt._active_sessions.pop(task_id, None)
 
     def test_non_navigation_creation_obeys_strict_identity_mode(self):
         import tools.browser_tool as bt

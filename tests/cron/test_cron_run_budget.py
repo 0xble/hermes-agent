@@ -7,6 +7,7 @@ import concurrent.futures
 import json
 import subprocess
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -297,6 +298,40 @@ def test_run_job_passes_remaining_budget_to_script_and_agent(tmp_path, monkeypat
     assert response == "done"
     assert observed["script_budget"] == pytest.approx(7.0)
     assert observed["agent_budget"] == pytest.approx(7.0)
+
+
+def test_deferred_agent_carries_the_absolute_total_budget_deadline(
+    tmp_path, monkeypatch
+):
+    class Agent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+
+        def run_conversation(self, _prompt, **_kw):
+            return {"final_response": "done", "messages": []}
+
+        def close(self):
+            pass
+
+    scheduler, _ = _install_run_job_stubs(monkeypatch, tmp_path, Agent)
+    deferred = []
+    started = time.monotonic()
+
+    success, _doc, response, error = scheduler.run_job(
+        {
+            "id": "deferred-budget",
+            "name": "deferred budget",
+            "prompt": "work",
+            "run_budget_seconds": 10,
+        },
+        defer_agent_teardown=deferred,
+    )
+
+    assert success is True
+    assert response == "done"
+    assert error is None
+    assert len(deferred) == 1
+    assert started < deferred[0]._cron_total_run_deadline <= started + 10.5
 
 
 def test_agent_construction_is_bounded_by_total_budget(tmp_path, monkeypatch):
