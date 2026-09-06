@@ -1,13 +1,16 @@
 """Tests for the ``api_content`` sidecar and request-context boundary.
 
-Explicit sidecars remain supported for byte-stable API data that is deliberately
-persisted. Memory and plugin context is request-only: it is composed for the
-current wire request, but never stamped into durable transcript rows or
-replayed as ordinary user-authored content.
+The first LLM call of every turn used to miss the provider prompt cache
+because the bytes sent to the API diverged from the bytes replayed from the
+persisted transcript: memory-prefetch / plugin context is injected into the
+API copy of the current turn's user message only, and the persist
+user-message override writes cleaned content to the DB row. The fix persists
+the EXACT sent content in a nullable ``messages.api_content`` column and
+replays it verbatim (no sanitize, no strip).
 
 Covers: SessionDB round-trip and auto-migration, the shared composition helper,
-request-only prologue behavior, replay isolation, and the end-to-end wire
-boundary against an in-process mock provider.
+prologue stamping order, the flush-override sidecar, and the end-to-end
+cache-stability invariant against an in-process mock provider.
 """
 
 from __future__ import annotations
@@ -251,8 +254,12 @@ class TestPrologueStamping:
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"  # clean content untouched
-        assert "api_content" not in msg
-        assert agent.api_content_at_persist is None
+        assert msg["api_content"] == compose_user_api_content(
+            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
+        )
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        # The early persist saw the stamped sidecar (written in one insert).
+        assert agent.api_content_at_persist == "hello\n\nPLUGIN-CTX"
 
     def test_no_stamp_without_injections(self):
         agent = _FakeAgent()
@@ -503,14 +510,14 @@ class TestWireInvariant:
             for m in req.get("messages", []):
                 assert "api_content" not in m
 
-        # Persisted row remains clean; request-only context is not replayable.
+        # Persisted row: clean content + exact sent bytes in the sidecar.
         user_rows = [r for r in db.get_messages(sid) if r["role"] == "user"]
         assert user_rows[0]["content"] == "hello please"
-        assert not user_rows[0].get("api_content")
+        assert user_rows[0]["api_content"] == sent_1
 
-    def test_next_turn_does_not_replay_previous_turn_request_context(self, wire_env):
-        """A fresh turn reloads clean transcript content; request-only context
-        is composed anew and is never recovered from api_content."""
+    def test_next_turn_replays_previous_turn_bytes(self, wire_env):
+        """The cache invariant: the serialized user message replayed in turn
+        N+1 (history reloaded from the store) EQUALS the bytes turn N sent."""
         make_agent, handler, db, sid = wire_env
 
         # ── Turn N ──
@@ -521,9 +528,9 @@ class TestWireInvariant:
 
         # ── Turn N+1: fresh agent, history reloaded from the store ──
         history = db.get_messages_as_conversation(sid)
-        # The stored history contains clean content and no request sidecar.
+        # The stored history carries the sidecar, not the injected content.
         assert history[0]["content"] == "hello please"
-        assert not history[0].get("api_content")
+        assert history[0]["api_content"] == turn_n_user["content"]
 
         handler.captured_requests = []
         agent2 = make_agent()
@@ -532,9 +539,9 @@ class TestWireInvariant:
         )
 
         replayed = _user_messages(_chat_requests(handler)[0])[0]
-        assert replayed["content"] == "hello please"
-        assert replayed["content"] != turn_n_user["content"]
+        assert json.dumps(replayed, sort_keys=True) == turn_n_bytes
 
+        # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
 
@@ -628,8 +635,10 @@ class TestPrologueMoaAndInPlaceBackfill:
 
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert "api_content" not in msg
-        agent._session_db.set_latest_user_api_content.assert_not_called()
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        agent._session_db.set_latest_user_api_content.assert_called_once_with(
+            agent.session_id, "hello", "hello\n\nPLUGIN-CTX"
+        )
 
 
 class TestSetLatestUserApiContent:

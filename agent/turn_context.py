@@ -79,11 +79,11 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
 def compose_user_api_content(
     content: Any, ext_prefetch_cache: str, plugin_user_context: str
 ) -> Optional[str]:
-    """Compose request-scoped content for the current provider call.
+    """Compose the API copy of the current user message.
 
-    Memory-manager prefetch and plugin hook context are internal request context. They
-    are appended to the API copy only, while the transcript message remains clean and
-    no ``api_content`` replay sidecar is stamped."""
+    Memory-manager prefetch and plugin hook context are appended to the API copy
+    only. Transcript ``content`` stays clean; the composed bytes are stamped onto
+    ``api_content`` for historical replay."""
     if not isinstance(content, str):
         return None
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
@@ -731,6 +731,48 @@ def _persist_turn_start(
     )
 
 
+def _stamp_api_content_sidecar(
+    agent: Any, messages: List[Any], current_turn_user_idx: int, ext_prefetch_cache: str,
+    plugin_user_context: str, *, preflight_compressed: bool, moa_active: bool,
+) -> None:
+    """Persist what you send: stamp composed injection bytes onto ``api_content``.
+
+    Transcript ``content`` stays clean. MoA and ``codex_app_server`` skip stamping
+    because the composed bytes are not the bytes that actually go out.
+    """
+    if moa_active or getattr(agent, "api_mode", "") == "codex_app_server":
+        return
+    if not (0 <= current_turn_user_idx < len(messages)):
+        return
+    _turn_user_msg = messages[current_turn_user_idx]
+    if not isinstance(_turn_user_msg, dict) or _turn_user_msg.get("role") != "user":
+        return
+    _api_content = compose_user_api_content(
+        _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+    )
+    if _api_content is None or _api_content == _turn_user_msg.get("content"):
+        return
+    _turn_user_msg["api_content"] = _api_content
+    # In-place preflight compaction already inserted this turn's user row and the
+    # crash persist identity-skips compacted dicts, so backfill the stamp onto the row
+    # directly. Rotation mode flushes to the child session later.
+    if not (preflight_compressed and getattr(agent, "_last_compaction_in_place", False)):
+        return
+    _db = getattr(agent, "_session_db", None)
+    if _db is not None:
+        try:
+            _db.set_latest_user_api_content(
+                agent.session_id, _turn_user_msg.get("content"), _api_content
+            )
+        except Exception:
+            logger.warning(
+                "in-place compaction api_content backfill failed "
+                "for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+
+
 def build_turn_context(
     agent, user_message: Any, system_message: Optional[str],
     conversation_history: Optional[List[Dict[str, Any]]], task_id: Optional[str], stream_callback,
@@ -858,10 +900,14 @@ def build_turn_context(
     _bind_interrupt_scope(agent, ra)
     ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message)
 
-    # Ephemeral provider/plugin context remains request-scoped. ``build_api_messages``
-    # composes it for this turn but never stamps it into the durable ``api_content``
-    # replay sidecar. Persisting retrieved context would recast it as ordinary
-    # user-authored history and multiply it on replay.
+    # Stamp the exact bytes this turn will send before the crash persist, so a
+    # later turn can replay them from ``api_content`` while transcript content
+    # stays clean.
+    _stamp_api_content_sidecar(
+        agent, messages, current_turn_user_idx, ext_prefetch_cache,
+        plugin_user_context, preflight_compressed=compaction.compressed,
+        moa_active=moa_active,
+    )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
@@ -905,10 +951,10 @@ def build_api_messages(
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
 
-    Explicit historical ``api_content`` sidecars still replay deliberately stable API
-    data. Request-scoped prefetch / ``pre_llm_call`` context is composed only on the
-    current API copy and is never persisted. ``ephemeral_system_prompt`` is likewise
-    added at API time; the cached system prompt is built once per session."""
+    Historical ``api_content`` sidecars replay the exact bytes previously sent.
+    The current turn composes prefetch / ``pre_llm_call`` context live when no
+    sidecar exists yet. ``ephemeral_system_prompt`` is added at API time; the
+    cached system prompt is built once per session."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
 
@@ -929,8 +975,8 @@ def build_api_messages(
         # time only; ``messages`` stays untouched.
         if idx == current_turn_user_idx and msg.get("role") == "user":
             if isinstance(_api_content, str) and _api_content:
-                # A caller may provide an explicit sidecar for deliberately stable API
-                # data. Request-context prologue setup never creates one.
+                # Prefer the stamped sidecar (exact bytes previously or currently
+                # composed for this turn) over live recomposition.
                 api_msg["content"] = _api_content
             else:
                 # Normal current-turn path: compose request context live.
@@ -944,8 +990,8 @@ def build_api_messages(
             and msg.get("role") in ("user", "assistant")
         ):
             # Historical row: replay the exact bytes sent live so the prompt-cache
-            # prefix stays byte-stable. User and assistant rows may carry an explicit
-            # sanitize-divergence sidecar; retrieved request context never does.
+            # prefix stays byte-stable. User and assistant rows may carry a sidecar
+            # for injections or sanitize-divergence.
             api_msg["content"] = _api_content
 
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
