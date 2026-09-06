@@ -64,3 +64,35 @@ def test_gateway_config_round_trips_global_policy():
 
     assert config.restart_resume_policy == "continue"
     assert config.to_dict()["restart_resume_policy"] == "continue"
+
+@pytest.mark.parametrize(
+    ("yaml_text", "expected"),
+    [
+        ("gateway:\n  restart_resume_policy: continue\n", "continue"),
+        ("restart_resume_policy: continue\n", "continue"),
+        ("restart_resume_policy: ask\ngateway:\n  restart_resume_policy: continue\n", "ask"),
+        ("restart_resume_policy: continue\ngateway:\n  restart_resume_policy: ask\n", "continue"),
+        ("{}\n", "ask"),
+    ],
+)
+def test_yaml_startup_preserves_restart_policy(tmp_path, monkeypatch, yaml_text, expected):
+    from gateway.config import load_gateway_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml_text)
+    config = load_gateway_config()
+    policy = resolve_restart_resume_policy(config, _adapter())
+    assert policy == expected
+    note = build_resume_recovery_note("restart_timeout", restart_resume_policy=policy)
+    assert ("CONTINUE the interrupted task" in note) == (expected == "continue")
+    assert ("ask what they would like to do next" in note) == (expected == "ask")
+
+
+@pytest.mark.parametrize("value", ["discard", "true", "''"])
+def test_yaml_startup_rejects_invalid_restart_policy(tmp_path, monkeypatch, value):
+    from gateway.config import load_gateway_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(f"gateway:\n  restart_resume_policy: {value}\n")
+    with pytest.raises(ValueError, match="restart_resume_policy"):
+        load_gateway_config()
