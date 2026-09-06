@@ -142,6 +142,7 @@ These exact subjects are fork-only history but do not define independently retir
 
 | Stable commit subject | Narrow non-patch reason |
 | --- | --- |
+| `fix(ci): pin approved goal-notice history boundary` | Brian approved immutable current-main baseline 1724c48b12a90eb8a76e91e6337eaf2e2965a8e8 on 2026-09-06. Accepts missing historical same-commit registrations in 123cd227679f, 02945a368758, 2d9f4f4a1b0e, b92ec48c7358, and f9f7d02c6562. Current manifest validation and all later same-commit and duplicate-subject checks remain unchanged. No runtime change. |
 | `fix(fork): restore upstream gateway contracts after rebase` | Patch-neutral restoration of upstream-owned gateway and finalization hunks clobbered by fork replay. |
 | `fmt(js): npm run fix after upstream refresh` | Mechanical formatter output created during an upstream reconciliation. |
 | `test: make local CI deterministic across hosts` | Repository test-runner determinism only; no shipped Hermes behavior. |
