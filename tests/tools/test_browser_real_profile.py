@@ -1038,6 +1038,29 @@ class TestWindowsLockedProfileCopy:
         assert bc._copy_auth_file(src, dst) is True
         assert sqlite3.connect(dst).execute("select count(*) from cookies").fetchone()[0] == 1
 
+    def test_copy_auth_file_returns_quickly_when_source_is_locked(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        import sqlite3
+        import time
+
+        src = str(tmp_path / "Cookies")
+        src_con = sqlite3.connect(src)
+        src_con.execute("create table cookies(x)")
+        src_con.execute("insert into cookies values(1)")
+        src_con.commit()
+        src_con.execute("begin exclusive")
+        dst = str(tmp_path / "out" / "Cookies")
+        monkeypatch.setattr(bc, "_AUTH_BACKUP_TIMEOUT_SECONDS", 0.2)
+        started = time.monotonic()
+        try:
+            result = bc._copy_auth_file(src, dst)
+        finally:
+            src_con.rollback()
+            src_con.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0
+        assert result is True
+
     def test_copy_auth_file_plain_for_non_db(self, tmp_path):
         import hermes_cli.browser_connect as bc
         src = str(tmp_path / "Preferences"); open(src, "w").write('{"k":1}')

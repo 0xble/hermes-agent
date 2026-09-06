@@ -92,3 +92,19 @@ class TestRealProfilePin:
         assert err2 is None and dst2 == dst1
         got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text()
         assert got == "cookies-Profile 2-v2", "auth re-sync must stay on the pin"
+
+    def test_guest_profile_pin_fails_closed(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        src = self._make_profile(tmp_path / "real")
+        (src / "Guest Profile" / "Network").mkdir(parents=True)
+        (src / "Guest Profile" / "Cookies").write_text("cookies-Guest Profile")
+        (src / "Guest Profile" / "Login Data").write_text("logins-Guest Profile")
+        (src / "Guest Profile" / "Preferences").write_text("{}")
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: "Guest Profile")
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert dst is None
+        assert err and "Guest Profile" in err
+        assert not (tmp_path / "hh" / "browser-profile" / "chrome" / "Default").exists()

@@ -540,10 +540,35 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
 
                     source = sqlite3.connect(uri, uri=True, timeout=0)
                     try:
-                        out = sqlite3.connect(dst_file)
+                        out = sqlite3.connect(dst_file, timeout=0)
                         try:
+                            busy_deadline = time.monotonic() + max(
+                                0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
+                            )
+
+                            def _check_backup_progress(
+                                status: int, _remaining: int, _total: int
+                            ) -> None:
+                                nonlocal busy_deadline
+                                now = time.monotonic()
+                                if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                                    if now >= busy_deadline:
+                                        raise TimeoutError(
+                                            "database remained locked for "
+                                            f"{_AUTH_BACKUP_TIMEOUT_SECONDS:g} seconds"
+                                        )
+                                else:
+                                    busy_deadline = now + max(
+                                        0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
+                                    )
+
                             with out:
-                                source.backup(out)
+                                source.backup(
+                                    out,
+                                    pages=256,
+                                    progress=_check_backup_progress,
+                                    sleep=0.1,
+                                )
                         finally:
                             out.close()
                     finally:
@@ -627,13 +652,19 @@ def _resolve_source_profile(src: str) -> tuple[str | None, str | None]:
     FAILS CLOSED — falling back would silently browse as the wrong identity (wrong-principal)."""
     pin = _real_profile_pin()
     if pin:
-        if os.path.isdir(os.path.join(src, pin)):
-            return pin, None
-        return None, (
-            f"browser.real_profile_pin is set to '{pin}' but that profile directory does not "
-            f"exist under {src!r}. Profile directories are named like 'Default' or 'Profile 2' "
-            f"— list them with: ls {src!r}. Fix the pin, or remove it to fall back to the "
-            "last-used profile.")
+        pin_error = _validate_explicit_source_profile(src, pin)
+        if pin_error:
+            if os.path.isdir(os.path.join(src, pin)):
+                return None, (
+                    f"browser.real_profile_pin is set to {pin!r} but that is not a usable "
+                    f"real profile ({pin_error}). Guest and System profiles are rejected."
+                )
+            return None, (
+                f"browser.real_profile_pin is set to '{pin}' but that profile directory does not "
+                f"exist under {src!r}. Profile directories are named like 'Default' or 'Profile 2' "
+                f"— list them with: ls {src!r}. Fix the pin, or remove it to fall back to the "
+                "last-used profile.")
+        return pin, None
     return _last_used_profile(src), None
 
 
