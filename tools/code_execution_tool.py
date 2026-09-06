@@ -1568,6 +1568,12 @@ def execute_code(
             "config.yaml / .env and retry)"
         )
 
+    from tools.knowledge_boundary import command_denial_reason
+
+    knowledge_denial = command_denial_reason(code, tool="execute_code")
+    if knowledge_denial:
+        return tool_error(knowledge_denial)
+
     if not code or not code.strip():
         return tool_error(
             "No code provided. execute_code requires a non-empty 'code' "

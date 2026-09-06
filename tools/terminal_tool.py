@@ -2926,6 +2926,19 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        # Parent-owned shared knowledge: a read-only child must not reach
+        # memory/skills through the shell either (tools/knowledge_boundary).
+        from tools.knowledge_boundary import command_denial_reason
+
+        knowledge_denial = command_denial_reason(command, tool="terminal")
+        if knowledge_denial:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": knowledge_denial,
+                "status": "error",
+            }, ensure_ascii=False)
+
         # Get configuration
         config = _get_env_config()
         env_type = "local" if _host_local else config["env_type"]

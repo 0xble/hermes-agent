@@ -4037,8 +4037,19 @@ def delegate_task(
             f"multiplies API cost)."
         )
 
-    # Load config
+    # Load config. Spawning on a config we could not read would silently
+    # substitute legacy delegation for the user's configured roles, so this
+    # path refuses where the tolerant loader degrades (item 2). Reading the
+    # recorded error (rather than calling the strict loader directly) keeps
+    # ``_load_config`` the single read point every caller and test patches.
     cfg = _load_config()
+    config_error = last_delegation_config_error()
+    if config_error:
+        return tool_error(
+            f"Delegation configuration could not be loaded: {config_error}. "
+            "Fix delegation config in config.yaml and retry; refusing to "
+            "spawn on legacy defaults that are not what you configured."
+        )
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -4145,10 +4156,20 @@ def delegate_task(
 
     from tools.custom_subagents import parse_definitions, resolve_definition, resolve_named_credentials
 
+    # Registry validation is not a per-task failure: report it as the config
+    # error it is, naming the invalid definition (item 3).
+    try:
+        definitions = parse_definitions(cfg)
+    except ValueError as exc:
+        return tool_error(
+            f"Invalid delegation.subagents configuration: {exc}. "
+            "No named role can be selected until this is fixed; "
+            "action=list/steer/stop still control running children."
+        )
+
     task_runtime = []
     legacy_creds = None
     try:
-        definitions = parse_definitions(cfg)
         for i, task in enumerate(task_list):
             definition = resolve_definition(definitions, task.get("subagent_type"))
             if definition is not None and credentials_cfg:
@@ -4186,7 +4207,9 @@ def delegate_task(
     )
 
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=creds.get("model"),
+        provider=creds.get("provider"),
+        routing=_task_routing_metadata(task_runtime, parent_agent),
     )
     # Announce the batch tag once so the later ``[tag n/N]`` completion lines
     # (and any nested batch's lines interleaving with them) are attributable.
@@ -5093,6 +5116,42 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _task_routing_metadata(task_runtime: list, parent_agent=None) -> list:
+    """Per-child resolved role/provider/model/effort for batch telemetry.
+
+    Derived from the SAME tuples the children are launched from, so mixed
+    batches record what each child actually got instead of inheriting task 0's
+    route. Nonsecret by construction: credentials never enter this dict.
+
+    An unnamed (legacy) child that inherits the parent's route resolves to no
+    explicit creds, which the manifest used to render as nothing at all. The
+    inherited values ARE the child's resolved route, so they are recorded as
+    such rather than left blank.
+    """
+    from agent.reasoning_effort import requested_effort
+
+    inherited_model = getattr(parent_agent, "model", None)
+    inherited_provider = getattr(parent_agent, "provider", None)
+    inherited_effort = requested_effort(getattr(parent_agent, "reasoning_config", None))
+
+    routing = []
+    for definition, task_creds, reasoning in task_runtime:
+        creds = task_creds or {}
+        if reasoning and reasoning.get("enabled") is False:
+            effort = "none"
+        elif reasoning:
+            effort = requested_effort(reasoning)
+        else:
+            effort = inherited_effort
+        routing.append({
+            "subagent_type": definition.name if definition is not None else None,
+            "provider": creds.get("provider") or inherited_provider,
+            "model": creds.get("model") or inherited_model,
+            "reasoning_effort": effort,
+        })
+    return routing
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -5111,18 +5170,96 @@ def _load_config() -> dict:
     only honored by the legacy ``cli`` loader, not the shared one, so when the
     flag is set we keep ``cli.CLI_CONFIG`` authoritative to preserve the
     flag's contract of suppressing user config.yaml settings.
-    """
-    prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
-    if not prefer_legacy:
-        try:
-            from hermes_cli.config import load_config_readonly
 
-            full = load_config_readonly()
-            cfg = full.get("delegation") or {}
-            if isinstance(cfg, dict):
-                return cfg
-        except Exception:
-            pass
+    Tolerant by contract: never raises, so schema rebuilds and limit lookups
+    survive a broken config. Callers that must not run on a half-understood
+    configuration — anything that SPAWNS — call ``load_delegation_config()``
+    instead and surface :class:`DelegationConfigError`.
+    """
+    try:
+        return load_delegation_config()
+    except DelegationConfigError as exc:
+        # Tolerant callers (schema rebuilds, limit lookups) keep working on a
+        # best-effort basis, but the failure is no longer invisible: it is
+        # recorded so the schema and the spawn path report it instead of
+        # quietly serving legacy settings as if they were the user's.
+        _record_delegation_config_error(exc)
+        return _legacy_delegation_config()
+
+
+class DelegationConfigError(RuntimeError):
+    """Delegation configuration exists but could not be loaded.
+
+    Distinct from an absent ``delegation`` block, which is a legitimate,
+    silent default. Silently degrading a *failed* load to legacy settings was
+    the bug: a user with ``delegation.subagents`` configured would get
+    unnamed legacy delegation with no signal that their configuration never
+    loaded.
+    """
+
+
+# Thread-local, not module-global: the gateway runs many sessions in one
+# process, and one thread's broken read must not refuse another thread's spawn.
+_delegation_config_state = threading.local()
+
+
+def _record_delegation_config_error(exc: BaseException | None) -> None:
+    _delegation_config_state.error = None if exc is None else str(exc)
+
+
+def last_delegation_config_error() -> str | None:
+    """Loader failure seen by THIS thread's most recent ``_load_config()``."""
+    return getattr(_delegation_config_state, "error", None)
+
+
+def _delegation_block(full, *, source: str) -> dict:
+    """Extract and validate the ``delegation`` block of a loaded config."""
+    if not isinstance(full, dict):
+        raise DelegationConfigError(
+            f"{source} must be a mapping, got {type(full).__name__}"
+        )
+    cfg = full.get("delegation")
+    if cfg is not None and not isinstance(cfg, dict):
+        raise DelegationConfigError(
+            f"delegation must be a mapping, got {type(cfg).__name__}"
+        )
+    _record_delegation_config_error(None)
+    return cfg or {}
+
+
+def load_delegation_config() -> dict:
+    """Return the delegation config, raising on a genuine loader failure.
+
+    Returns ``{}`` only when the config loaded fine and simply has no
+    ``delegation`` block. Any other outcome — loader exception, non-mapping
+    ``delegation`` value — raises :class:`DelegationConfigError`.
+    """
+    if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
+        # ``--ignore-user-config`` means "run on defaults". A broken legacy
+        # CLI_CONFIG in that mode degrades to {} exactly as it always did:
+        # refusing to spawn there would take away plain unnamed delegation
+        # from a user who configured no roles at all. The loud failure this
+        # record adds belongs to the real config path below, which is the one
+        # that can hide configured roles.
+        _record_delegation_config_error(None)
+        return _legacy_delegation_config()
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        full = load_config_readonly()
+    except Exception as exc:
+        raise DelegationConfigError(
+            f"could not load Hermes config: {type(exc).__name__}: {exc}"
+        ) from exc
+    return _delegation_block(full, source="Hermes config")
+
+
+def _legacy_delegation_config() -> dict:
+    """Legacy ``cli.CLI_CONFIG`` delegation block, or ``{}``.
+
+    Best-effort only. Reached exclusively from the tolerant ``_load_config()``
+    path after the strict loader has already recorded why it failed.
+    """
     try:
         from cli import CLI_CONFIG
 
@@ -5137,7 +5274,9 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _build_top_level_description() -> str:
+def _build_top_level_description(
+    definition_error: str | None = None, load_error: str | None = None,
+) -> str:
     """Compose the delegate_task tool description.
 
     Deliberately carries ONLY guidance that exists nowhere else in the
@@ -5176,7 +5315,27 @@ def _build_top_level_description() -> str:
             "cronjob.\n"
         )
 
+    # Configuration diagnostics lead: a parent that cannot see WHY a role
+    # vanished will silently fall back to unnamed delegation and never
+    # mention it. `action` (list/steer/stop) keeps working regardless — those
+    # paths never read definitions, so existing children stay controllable.
+    diagnostics = ""
+    if load_error:
+        diagnostics += (
+            "CONFIG WARNING: delegation configuration could not be loaded "
+            f"({load_error}). Spawning is refused until it loads; list/steer/"
+            "stop still work on running children.\n\n"
+        )
+    if definition_error:
+        diagnostics += (
+            "CONFIG WARNING: a configured subagent role is invalid and no "
+            f"named role is selectable right now ({definition_error}). Report "
+            "this to the user instead of silently delegating unnamed; "
+            "list/steer/stop still work on running children.\n\n"
+        )
+
     return (
+        diagnostics +
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
         "you. Pass every task in `tasks` — one entry spawns one subagent, "
@@ -5207,7 +5366,13 @@ def _build_top_level_description() -> str:
         "yourself before telling the user the operation succeeded.\n"
         + restrictions_rule +
         "- Children inherit the parent model unless pinned via "
-        "delegation.provider / delegation.model in config.yaml."
+        "delegation.provider / delegation.model in config.yaml, or unless the "
+        "task names a `subagent_type` role, whose configured provider/model/"
+        "effort override those global defaults.\n"
+        "- Selection: prefer a named role whose purpose matches the work; omit "
+        "`subagent_type` for ordinary delegation (unchanged legacy behavior); "
+        "keep simple work with yourself. There is no keyword router — this is "
+        "your judgment call, informed by the role descriptions."
     )
 
 
@@ -5262,26 +5427,67 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     from copy import deepcopy
-    from tools.custom_subagents import parse_definitions
+    from tools.custom_subagents import advertised_settings, parse_definitions
+
+    cfg = _load_config()
+    load_error = last_delegation_config_error()
+    definition_error: str | None = None
     try:
-        definitions = parse_definitions(_load_config())
-    except ValueError:
-        definitions = {}  # Spawn reports the invalid config without breaking control actions.
+        definitions = parse_definitions(cfg)
+    except ValueError as exc:
+        # Silently dropping the selector left the parent unable to see that a
+        # role it was told about is broken — and unable to tell that apart
+        # from "no roles configured". Keep list/steer/stop untouched (they
+        # never consult definitions) and say exactly what is invalid.
+        definitions = {}
+        definition_error = str(exc)
+
     if definitions:
         task_schema = deepcopy(overrides_params["properties"]["tasks"])
         task_schema["items"]["properties"]["subagent_type"] = {
             "type": "string",
             "enum": sorted(definitions),
-            "description": "Optional trusted subagent definition. " + " ".join(
-                f"{name}: {definitions[name].description}" for name in sorted(definitions)
+            "description": _build_subagent_type_description(
+                [advertised_settings(definitions[name], cfg) for name in sorted(definitions)]
             ),
         }
         overrides_params["properties"]["tasks"] = task_schema
 
     return {
-        "description": _build_top_level_description(),
+        "description": _build_top_level_description(
+            definition_error=definition_error, load_error=load_error,
+        ),
         "parameters": overrides_params,
     }
+
+
+def _build_subagent_type_description(roles: list) -> str:
+    """Advertise each configured role's purpose AND its fixed settings.
+
+    The parent previously saw only a name and a free-text description, so it
+    could not reason about cost/latency (which model? which effort?) or know
+    that its own delegation defaults do not apply to a named role.
+    """
+    lines = [
+        "Optional trusted subagent role, defined in config.yaml under "
+        "delegation.subagents. Configuration — not this call — fixes each "
+        "role's provider, model, and reasoning effort; you choose only the "
+        "identifier.",
+    ]
+    for role in roles:
+        pinned = "fixed" if role["pinned"] else "inherited"
+        lines.append(
+            f"- {role['name']} -> {role['model']} / {role['reasoning_effort']} "
+            f"effort ({pinned}): {role['description']}"
+        )
+    lines.append(
+        "Omit subagent_type for ordinary delegation on the global "
+        "delegation.model / delegation.reasoning_effort defaults. A named "
+        "role's settings override those defaults; nothing you pass here can. "
+        "Prefer a named role when the work matches its purpose, and keep "
+        "simple work with yourself rather than delegating it at all."
+    )
+    return "\n".join(lines)
 
 
 DELEGATE_TASK_SCHEMA = {

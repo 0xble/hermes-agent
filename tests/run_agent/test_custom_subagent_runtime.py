@@ -109,11 +109,16 @@ def test_named_authentication_header_overrides_are_rejected(make_child, headers)
         child._build_api_kwargs([{"role": "user", "content": "hello"}])
 
 
-@pytest.mark.parametrize("field,value", [("base_url", "https://api.openai.com/v1"), ("api_key", "other")])
-def test_named_sdk_client_route_mutation_is_rejected(make_child, field, value):
+@pytest.mark.parametrize("field,value,expected", [
+    ("base_url", "https://api.openai.com/v1", "SDK client route"),
+    ("api_key", "other", "SDK client credential"),
+])
+def test_named_sdk_client_route_mutation_is_rejected(make_child, field, value, expected):
+    # Route and credential mutations are reported separately: which one moved
+    # is the first question anyone debugging a pin failure asks.
     child = make_child()
     setattr(child.client, field, value)
-    with pytest.raises(ValueError, match="SDK client route"):
+    with pytest.raises(ValueError, match=expected):
         child._build_api_kwargs([{"role": "user", "content": "hello"}])
 
 
@@ -129,7 +134,7 @@ def test_named_physical_codex_request_rejects_another_client(make_child):
     child = make_child()
     kwargs = child._build_api_kwargs([{"role": "user", "content": "hello"}])
     other = SimpleNamespace(api_key="another-account", base_url=child.base_url)
-    with pytest.raises(ValueError, match="SDK client route"):
+    with pytest.raises(ValueError, match="SDK client credential"):
         child._run_codex_stream(kwargs, client=other)
 
 

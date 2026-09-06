@@ -729,6 +729,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _check_shared_knowledge_write(paths: list, how: str = "a write") -> str | None:
+    """Deny a delegated child's write to parent-owned memory/skills.
+
+    The specialized ``memory``/``skill_manage`` tools carried this rule alone,
+    which left write_file/patch as a straight bypass (reproduced against a
+    fixture home). Single owner: tools/knowledge_boundary.
+    """
+    from tools.knowledge_boundary import write_denial_reason
+
+    return write_denial_reason(paths, how=how)
+
+
 # ---------------------------------------------------------------------------
 # Protected agent-instruction files (always-ask approval gate)
 # ---------------------------------------------------------------------------
@@ -2303,6 +2315,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    knowledge_err = _check_shared_knowledge_write([path], how="a write")
+    if knowledge_err:
+        return tool_error(knowledge_err)
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
@@ -2450,6 +2465,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
                 return tool_error(cross_warning)
+    knowledge_err = _check_shared_knowledge_write(_paths_to_check, how="a patch")
+    if knowledge_err:
+        return tool_error(knowledge_err)
     for _p in _content_write_paths:
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:

@@ -918,6 +918,27 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
+def enforce_delegation_pin(agent, kwargs: dict, *, client=None) -> None:
+    """Assert a named subagent's pinned route at the FINAL request boundary.
+
+    ``_build_api_kwargs`` validates early, but middleware, fallback chains and
+    client replacement all run after that — so the only check that proves what
+    was actually sent is this one, immediately before the SDK call, with the
+    client that sends it. No-op for the parent and for unnamed delegation.
+
+    The Codex wire performs the same assertion inside
+    ``agent.codex_runtime._open_codex_stream``; this covers the OpenAI-wire and
+    Anthropic-wire dispatches, streaming and non-streaming alike — a route
+    declared pinnable must be checked on EVERY way it reaches the network, or
+    the guarantee is only true for whichever shape happened to be wired up.
+    Routes with no comparable hook are rejected at launch instead
+    (``custom_subagents.pinning_support_error``).
+    """
+    pin = getattr(agent, "_delegation_runtime_pin", None)
+    if pin is not None:
+        pin.validate_request(agent, kwargs, client=client)
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -948,6 +969,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
+        enforce_delegation_pin(agent, api_kwargs, client=request_client)
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
@@ -1001,6 +1023,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    enforce_delegation_pin(agent, api_kwargs, client=request_client)
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -4298,6 +4321,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
             )
             attempt_request_client["value"] = request_client
+            enforce_delegation_pin(agent, stream_kwargs, client=request_client)
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
             return request_client.chat.completions.create(**stream_kwargs)
@@ -4942,6 +4966,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            enforce_delegation_pin(agent, final_kwargs, client=request_client)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

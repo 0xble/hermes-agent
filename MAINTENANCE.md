@@ -133,6 +133,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-109 | Active | `fix(telegram): recover stranded answers after polling health returns` | Pace degraded retries and wake the identity-scoped delivery ledger after internal recovery, including late failure writes. |
 | HERMES-110 | Retired | `fix(prompt): keep runtime guidance scope-bound`; `fix(prompt): preserve persistent memory after compaction`; `revert(astra): retire instruction support patches` | Historical Astra-specific runtime guidance and bundled blueprint hardening, reverted before runtime promotion at the user's request. |
 | HERMES-111 | Active | `fix(telegram): preserve math and normalize currency entities` | Preserve genuine math and currency across rich, legacy, and draft delivery without a duplicate output-transform rule. |
+| HERMES-112 | Active | `fix(delegate): close named subagent audit findings` | Enforce parent-owned knowledge writes across every mediated tool path, fail loudly on unreadable delegation config, and disclose roles, routes, and real limits honestly. |
 
 
 ## Fork-only administrative subject exemptions
@@ -243,6 +244,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-112 — Close named subagent audit findings
+
+- **Summary:** Twelve findings from the named-subagent audit. Parent-owned memory and skills are now denied through `write_file`, `patch` (including both V4A `Move` endpoints), `terminal`, and `execute_code`, not only the specialized tools, with the residual shell limit stated rather than implied. Unreadable delegation configuration refuses to spawn instead of silently serving legacy defaults; an invalid role is named while `list`/`steer`/`stop` keep working. Named routes are validated at the final physical request for the OpenAI and Anthropic wires, and routes with no such boundary are rejected at launch rather than granted a guarantee that would not hold. `delegation.subagents` is registered and field-validated in the configuration system, batch telemetry records each child's own route, and the tool schema advertises each role's purpose with its fixed model and effort plus selection precedence.
+- **Surfaces:** `tools/knowledge_boundary.py`, `tools/custom_subagents.py`, `tools/delegate_tool.py`, `tools/delegation_live_log.py`, `tools/file_tools.py`, `tools/terminal_tool.py`, `tools/code_execution_tool.py`, `agent/chat_completion_helpers.py`, `hermes_cli/config.py`, `hermes_cli/config_defaults.py`, `scripts/smoke_custom_subagents.py`, `scripts/eval_delegation_selection.py`, `tests/test_subagent_audit_recommendations.py`, `tests/run_agent/test_custom_subagent_runtime.py`, `website/docs/user-guide/features/delegation.md`, and this manifest.
+- **Upstream tracking:** Extends HERMES-108. No new upstream issue; the audited behavior is fork-only surface introduced by that record.
+- **Upstream PR:** None. The gaps are specific to this fork's registry, subscription-route lock, and read-only knowledge contract, none of which exist upstream.
+- **Regression:** `scripts/run_tests.sh tests/test_subagent_audit_recommendations.py tests/tools/test_custom_subagents.py tests/run_agent/test_custom_subagent_runtime.py tests/test_custom_subagent_knowledge.py -q` covers every mediated write-path bypass against real fixture files, loader failure versus absent configuration, invalid-definition diagnostics with control actions intact, post-middleware request tampering, unpinnable-route rejection, mixed-batch routing telemetry, config-key validation kept in lockstep with the runtime field set, and role visibility through a real `get_definitions()` rebuild. `python scripts/smoke_custom_subagents.py --mode fixture` is deterministic and offline; `--mode active` uses Hermes's own credential resolver (never `~/.codex/auth.json`) against the active roles and records nonsecret credential-source and route evidence. `python scripts/eval_delegation_selection.py` scores the parent's own decisions — delegate or not, role choice, brief sufficiency, fan-out, and retained authorization — against a fixture project, and reports a turn that failed to complete as inconclusive rather than as a pass.
+- **Published commit identity:** Expected stable subject `fix(delegate): close named subagent audit findings`.
+- **Rollback:** Revert only this stable-subject commit. Nothing here changes credentials, schema, or persisted state; reverting restores HERMES-108 behavior including its unguarded generic write paths. Source landing does not activate any profile.
+- **Retirement:** Retire together with HERMES-108, or earlier if released upstream supplies an equivalent enforced knowledge boundary, loader-failure contract, final-request pinning, and role disclosure with these regressions passing.
 
 ### HERMES-111 — Preserve math and currency across Telegram routes
 

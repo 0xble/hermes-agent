@@ -5787,6 +5787,47 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
     return matches[0] if matches else None
 
 
+# Fields of a ``delegation.subagents.<name>`` entry, mirrored from
+# tools/custom_subagents so `hermes config set` validates without importing
+# the delegation runtime (which pulls in the provider stack).  Kept honest by
+# tests/test_subagent_audit_recommendations.py, which asserts the two sets
+# stay identical.
+_SUBAGENT_FIELDS = frozenset({
+    "description", "instructions", "provider", "model", "reasoning_effort",
+})
+_SUBAGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*\Z")
+
+
+def _validate_subagent_key(segments: list) -> tuple[bool, Optional[str]]:
+    """Validate a ``delegation.subagents...`` dotted path.
+
+    ``delegation.subagents`` is an open dict keyed by user-chosen role names,
+    but its LEAF fields are a closed set — so a typo'd
+    ``delegation.subagents.explorer.instruction`` must be caught rather than
+    written and then silently rejected at spawn time.  Before this branch the
+    whole path reported "unknown config key" even though the runtime supported
+    it (``_validate_config_key('delegation.subagents')`` returned
+    ``(False, None)``).
+    """
+    if len(segments) == 2:
+        return True, None
+    name = segments[2]
+    if not _SUBAGENT_NAME_RE.fullmatch(name):
+        return False, None
+    if len(segments) == 3:
+        return True, None
+    field = segments[3]
+    if field not in _SUBAGENT_FIELDS:
+        suggestion = _suggest_closest_key(field, set(_SUBAGENT_FIELDS))
+        if suggestion is not None:
+            return False, ".".join(segments[:3] + [suggestion])
+        return False, None
+    # Every subagent field is a scalar string; nothing nests below one.
+    if len(segments) > 4:
+        return False, ".".join(segments[:4])
+    return True, None
+
+
 def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     """Validate a dotted config-key path against the known schema.
 
@@ -5823,6 +5864,9 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     # like ``agent._max_turns`` still gets caught at the sub-key level.
     if top.startswith("_"):
         return True, None
+
+    if segments[:2] == ["delegation", "subagents"]:
+        return _validate_subagent_key(segments)
 
     known = _known_top_level_keys()
 

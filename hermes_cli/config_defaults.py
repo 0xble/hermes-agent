@@ -2170,6 +2170,15 @@ DEFAULT_CONFIG = {
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
     # configured providers (OpenRouter, Nous, Z.ai, Kimi, etc.) are supported.
     "delegation": {
+        # Named subagent roles: delegation.subagents.<name>.{description,
+        # instructions, provider, model, reasoning_effort}. ``description`` and
+        # ``instructions`` are required; provider/model/reasoning_effort pin the
+        # role's route and override the global delegation defaults below for
+        # that role only. Omitting ``subagent_type`` at the call site keeps
+        # legacy (unnamed) delegation exactly as it was.
+        # Validated by tools/custom_subagents.parse_definitions at spawn time
+        # and by hermes_cli.config._validate_config_key for `hermes config set`.
+        "subagents": {},
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
