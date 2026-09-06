@@ -57,6 +57,19 @@ def test_fire_claim_run_id_survives_stale_reclaim_but_not_new_fire(tmp_cron_dir)
     assert new_fire["fire_claim"]["run_id"] != first_run_id
 
 
+def test_legacy_run_budget_field_is_inert_and_preserved_on_unrelated_edit(tmp_cron_dir):
+    """Retirement must not corrupt existing job records before operators clear them."""
+    job = create_job(prompt="legacy record", schedule="every 5m")
+    stored = load_jobs()
+    stored[0]["run_budget_seconds"] = 30
+    save_jobs(stored)
+
+    updated = update_job(job["id"], {"name": "renamed legacy record"})
+
+    assert updated["run_budget_seconds"] == 30
+    assert load_jobs()[0]["run_budget_seconds"] == 30
+
+
 # =========================================================================
 # parse_duration
 # =========================================================================

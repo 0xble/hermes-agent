@@ -1609,22 +1609,6 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
-def _normalize_run_budget_seconds(value: Any) -> Optional[float]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        raise ValueError("run_budget_seconds must be a positive number or zero to clear")
-    try:
-        normalized = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("run_budget_seconds must be a positive number or zero to clear") from exc
-    if normalized == 0:
-        return None
-    if not math.isfinite(normalized) or normalized < 0:
-        raise ValueError("run_budget_seconds must be a positive finite number")
-    return normalized
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1760,7 +1744,6 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
-    run_budget_seconds: Optional[float] = None,
     timezone: Optional[str] = None,
     allow_messaging: bool = False,
 ) -> Dict[str, Any]:
@@ -1789,7 +1772,6 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
-    normalized_run_budget = _normalize_run_budget_seconds(run_budget_seconds)
     normalized_timezone = normalize_job_timezone(timezone)
 
     _validate_job_mode_invariants(
@@ -1869,7 +1851,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
-        ("run_budget_seconds", normalized_run_budget), ("timezone", normalized_timezone),
+        ("timezone", normalized_timezone),
     ):
         if value is not None:
             job[key] = value
@@ -1963,8 +1945,6 @@ def _normalize_job_updates(job: Dict[str, Any], updates: Dict[str, Any]) -> None
             updates["repeat"] = _rp
         else:
             updates["repeat"] = {"times": normalize_repeat_value(_rp), "completed": completed}
-    if "run_budget_seconds" in updates:
-        updates["run_budget_seconds"] = _normalize_run_budget_seconds(updates["run_budget_seconds"])
     if "timezone" in updates:
         updates["timezone"] = normalize_job_timezone(updates["timezone"])
 
@@ -2027,8 +2007,6 @@ def update_job(
                 updates["completion_script"])
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
-        if "run_budget_seconds" in updates and updates["run_budget_seconds"] is None:
-            updated.pop("run_budget_seconds", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {

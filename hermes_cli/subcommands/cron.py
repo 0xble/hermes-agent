@@ -84,9 +84,6 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "into its prompt, so it can dedupe against what was already "
             "reported and continue where the last run left off (scouts, "
             "monitors, incremental digests). First run is unchanged.")
-    cron_create.add_argument("--run-budget-seconds", dest="run_budget_seconds", type=float,
-        help="Positive total wall-clock budget for each execution, including setup, "
-            "scripts, agent work, and cleanup. Omit for no total limit.")
     cron_create.add_argument("--timezone",
         help="Optional IANA timezone for cron wall-clock schedules. Omit to inherit "
             "the profile timezone.")
@@ -156,9 +153,6 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--no-allow-messaging", dest="allow_messaging",
         action="store_const", const=False,
         help="Disable native send_message for this cron job.")
-    cron_edit.add_argument("--run-budget-seconds", dest="run_budget_seconds", type=float,
-        help="Set the total wall-clock execution budget in seconds. Pass 0 to clear it "
-            "and keep only the independent inactivity limit.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

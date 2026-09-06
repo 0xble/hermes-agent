@@ -258,8 +258,6 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Script", job.get("script")),
         ("Verify", f"{job['completion_script']} (post-agent completion gate)"
          if job.get("completion_script") else ""),
-        ("Run budget", f"{_format_seconds(job['run_budget_seconds'])} total wall clock"
-         if job.get("run_budget_seconds") else ""),
         ("Monitor", f"{monitor_source} (agent runs only on output change)" if monitor_source
          else ""),
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
@@ -610,7 +608,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("model", "model"), ("provider", "model_provider"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
-                   ("run_budget_seconds", "run_budget_seconds"), ("timezone", "timezone"),
+                   ("timezone", "timezone"),
                    ("allow_messaging", "allow_messaging"))
 
 
@@ -634,8 +632,6 @@ def _print_job_details(job_data: Dict[str, Any]) -> None:
     for key, template in _JOB_DETAIL_LINES:
         if job_data.get(key):
             print(template.format(job_data[key]))
-    if job_data.get("run_budget_seconds"):
-        print(f"  Run budget: {_format_seconds(job_data['run_budget_seconds'])} total wall clock")
     # Timezone always prints: "inherited" is the fact an operator needs when a schedule fires late.
     print(f"  Timezone: {job_data['timezone']} (explicit)" if job_data.get("timezone")
           else "  Timezone: profile (inherited)")
