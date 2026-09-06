@@ -431,7 +431,14 @@ def test_every_physical_dispatch_enforces_the_pin():
     visit(tree, None)
     assert guarded == {
         "_dispatch_nonstreaming_api_request",  # anthropic + openai non-stream
-        "_open_stream",                    # openai-wire streaming
+        # ``_open_chat_stream``, not ``_open_stream``: the decomposition split the openai-wire
+        # streaming path into a wrapper (``_open_stream``, which only builds the timeout and
+        # delegates) and the physical dispatch (``_open_chat_stream``, which owns the request
+        # client and calls ``chat.completions.create``). The guard belongs on the physical
+        # dispatch — it is the boundary another caller of ``_open_chat_stream`` could not bypass.
+        # The unrelated ``_open_stream`` at the Bedrock converse path is intentionally unguarded:
+        # bedrock is in UNPINNABLE_PROVIDERS and is refused at launch instead.
+        "_open_chat_stream",               # openai-wire streaming (physical dispatch)
         "_open_anthropic_stream",          # anthropic-wire streaming
     }, f"pin enforcement moved or a dispatch site lost its guard: {guarded}"
 

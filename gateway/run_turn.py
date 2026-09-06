@@ -3447,6 +3447,7 @@ class GatewayTurnMixin:
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
+        goal_session_entry: Any = None, goal_post_turn_state: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
         from gateway.platforms.base import merge_pending_message_event
@@ -3554,6 +3555,12 @@ class GatewayTurnMixin:
             # A mid-turn reconnect makes the follow-up's own adapter a different object; keep
             # the callback owner stable so the caller can still pop this chain's callbacks.
             _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_owner", None) or adapter,
+            # Share the caller's post-turn goal state so the follow-up turn records its own
+            # continuation handling in the SAME dict `_run_agent` consults after the chain
+            # unwinds; without it the follow-up never reports handled and the exactly-once
+            # gateway continuation guard sees a duplicate (or drops one).
+            goal_session_entry=goal_session_entry,
+            goal_post_turn_state=goal_post_turn_state,
         )
         return _preserve_queued_followup_history_offset(result, followup_result)
 
@@ -3987,6 +3994,8 @@ class GatewayTurnMixin:
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                    goal_session_entry=next_goal_entry,
+                    goal_post_turn_state=goal_post_turn_state,
                 )
         finally:
             await self._run_agent_cleanup_turn_tasks(
