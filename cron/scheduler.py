@@ -1837,6 +1837,7 @@ def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
     *, total_run_deadline: Optional[float] = None,
     total_run_budget: Optional[float] = None,
+    worker_state: Optional[dict] = None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
@@ -1881,6 +1882,8 @@ def _run_agent_with_watchdog(
     _cron_context = contextvars.copy_context()
     _cron_future = _cron_pool.submit(
         _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+    if worker_state is not None:
+        worker_state["future"] = _cron_future
     _inactivity_timeout = False
     _total_budget_timeout = False
     _watch_stop = threading.Event()
@@ -1995,10 +1998,8 @@ def _run_agent_with_watchdog(
             "Job '%s' exhausted its %.3fs total execution budget",
             job_name, total_run_budget)
         request_hard_interrupt(agent, "Cron total execution budget exhausted")
-        _teardown_cron_agent(
-            agent, job_id,
-            timeout_seconds=_remaining_run_budget(total_run_deadline))
-        setattr(agent, "_cron_teardown_complete", True)
+        # The worker may still be persisting after interruption.  Leave resource/session cleanup
+        # to run_job's detached-worker callback so close cannot race its late writes.
         _wait_for_cron_worker_exit()
         raise _total_run_budget_error(job_name, total_run_budget)
 
@@ -2188,6 +2189,14 @@ def _finalize_cron_session(
             logger.debug("Job '%s': session lifecycle classification failed: %s", job_id, e)
     try:
         _session_db.end_session(_final_cron_session_id, _end_reason)
+        # The scheduler owns cron-session finalization. AIAgent.close() also
+        # finalizes owned session rows by default; once the shared SessionDB is
+        # released below, that second end_session() would reopen the just-closed
+        # SQLite handle (#94736). The reason is durably booked, so disarm only the
+        # agent's redundant row-finalization; its resource teardown still runs in
+        # _teardown_cron_agent.
+        if agent is not None:
+            agent._end_session_on_close = False
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
@@ -2602,6 +2611,7 @@ def run_job(
     completion_script = str(job.get("completion_script") or "").strip()
     completion_snapshot: Optional[bytes] = None
     completion_failed = False
+    _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         if completion_script:
@@ -2682,7 +2692,8 @@ def run_job(
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             total_run_deadline=total_run_deadline,
-            total_run_budget=total_run_budget)
+            total_run_budget=total_run_budget,
+            worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -2739,8 +2750,11 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        from cron.scheduler_detached_worker import defer_teardown_to_running_worker
+        _worker_teardown_deferred = defer_teardown_to_running_worker(
+            _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id)
         scope.exit()
-        if _session_db:
+        if _session_db and not _worker_teardown_deferred:
             _finalize_cron_session(
                 _session_db,
                 agent,
@@ -2756,15 +2770,14 @@ def run_job(
         # per job until it hits EMFILE (#10200 / "too many open files"). When the caller opted to defer
         # teardown (passed a list), hand the live agent back instead of closing it here — delivery must run
         # against a live async client, and the caller tears down afterwards (#58720).
-        if agent is not None and getattr(agent, "_cron_teardown_complete", False) is True:
-            pass
-        elif defer_agent_teardown is not None:
-            if agent is not None:
-                defer_agent_teardown.append(agent)
-        else:
-            _teardown_cron_agent(
-                agent, job_id,
-                timeout_seconds=_deferred_agent_cleanup_timeout(agent))
+        if not _worker_teardown_deferred:
+            if defer_agent_teardown is not None:
+                if agent is not None:
+                    defer_agent_teardown.append(agent)
+            else:
+                _teardown_cron_agent(
+                    agent, job_id,
+                    timeout_seconds=_deferred_agent_cleanup_timeout(agent))
 
 
 def _teardown_cron_agent(

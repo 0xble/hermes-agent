@@ -197,9 +197,12 @@ class GatewayGoalCommandsMixin:
         except ValueError as exc:
             return t("gateway.goal.invalid", error=str(exc))
 
-        # Queue the goal text as an immediate first turn; the post-turn hook takes over after.
+        # Queue the goal text as an immediate first turn (a short pointer when the user just pasted that
+        # very text: hermes_cli.goals.goal_kick_prompt); the post-turn hook takes over after.
+        from hermes_cli.goals import goal_kick_prompt, last_user_message_from_db
+        kick = goal_kick_prompt(state.goal, last_user_message_from_db(getattr(mgr, "session_id", None)))
         self._enqueue_goal_turn(
-            event, state.goal, label="kickoff enqueue", kickoff=True, route=self._adapter_and_key_for(event)
+            event, kick, label="kickoff enqueue", kickoff=True, route=self._adapter_and_key_for(event)
         )
 
         base = format_goal_change("set", state)

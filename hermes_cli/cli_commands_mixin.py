@@ -2228,6 +2228,12 @@ class CLICommandsMixin:
         else:
             self._goal_set(mgr, arg)
 
+    def _goal_kick_prompt(self, goal: str) -> str:
+        """The goal text, or a short pointer when the last user message is essentially that text
+        (shared rule: ``hermes_cli.goals.goal_kick_prompt``)."""
+        from hermes_cli.goals import goal_kick_prompt, last_user_message_content
+        return goal_kick_prompt(goal, last_user_message_content(getattr(self, "conversation_history", None)))
+
     def _kick_goal(self, prompt: str) -> bool:
         """Queue ``prompt`` as the next turn so the loop starts without a separate message."""
         try:
@@ -2312,7 +2318,7 @@ class CLICommandsMixin:
             return
         from hermes_cli.goal_display import format_goal_change
         _cp(format_goal_change("set", state))
-        self._kick_goal(state.goal)
+        self._kick_goal(self._goal_kick_prompt(state.goal))
 
     def _print_goal_set(self, state, contract_label: str) -> None:
         _cp(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
@@ -2345,7 +2351,7 @@ class CLICommandsMixin:
         else:
             _cp(_dim_line("Couldn't draft a contract (aux model unavailable) — running as a "
                           "free-form goal. The per-turn judge still applies."))
-        self._kick_goal(state.goal)
+        self._kick_goal(self._goal_kick_prompt(state.goal))
 
     def _handle_loop_command(self, cmd: str) -> None:
         """Dispatch /loop — recurring in-session wakeups: ``/loop [interval] <prompt> [--times N]

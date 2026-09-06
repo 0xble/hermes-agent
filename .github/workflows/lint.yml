@@ -1,35 +1,149 @@
-name: Python static checks
+name: Lint (ruff + ty)
+
+# Two things here:
+#   1. Advisory diff — ruff + ty diagnostics as a diff vs the target branch.
+#      Writes a Markdown summary to the run page. Exit zero always.
+#   2. Blocking ``ruff check .`` — enforces the explicit rules in
+#      ``[tool.ruff.lint.select]``. Failure blocks merge.
+#      Separate job so the advisory diff still runs even when enforcement
+#      fails.
 
 on:
   workflow_call:
+    inputs:
+      event_name:
+        description: The event name from the calling orchestrator (pull_request or push).
+        type: string
+        required: true
 
 permissions:
   contents: read
 
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  ruff:
-    name: Ruff enforcement
+  lint-diff:
+    name: ruff + ty diff
+    if: inputs.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # need full history for merge-base + worktree
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
+        with:
+          version: "0.9.28"
+
+      - name: Install ruff + ty
+        uses: ./.github/actions/retry
+        with:
+          command: uv tool install ruff && uv tool install ty
+
+      - name: Determine base ref
+        id: base
+        run: |
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          BASE_REF="origin/${{ github.base_ref }}"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Base SHA: ${BASE_SHA}"
+          echo "Base ref: ${BASE_REF}"
+
+      - name: Run ruff + ty on HEAD
+        run: |
+          mkdir -p .lint-reports/head
+          ruff check --output-format json --exit-zero > .lint-reports/head/ruff.json || true
+          ty check --output-format gitlab --exit-zero > .lint-reports/head/ty.json || true
+          echo "HEAD ruff: $(wc -c < .lint-reports/head/ruff.json) bytes"
+          echo "HEAD ty:   $(wc -c < .lint-reports/head/ty.json) bytes"
+
+      - name: Run ruff + ty on base (via git worktree)
+        run: |
+          mkdir -p .lint-reports/base
+          HEAD_SHA=$(git rev-parse HEAD)
+          BASE_SHA="${{ steps.base.outputs.sha }}"
+          if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+            echo "Base SHA == HEAD SHA, skipping base scan."
+            echo '[]' > .lint-reports/base/ruff.json
+            echo '[]' > .lint-reports/base/ty.json
+          else
+            git worktree add --detach /tmp/lint-base "$BASE_SHA"
+            (
+              cd /tmp/lint-base
+              ruff check --output-format json --exit-zero > "$GITHUB_WORKSPACE/.lint-reports/base/ruff.json" || true
+              ty check --output-format gitlab --exit-zero > "$GITHUB_WORKSPACE/.lint-reports/base/ty.json" || true
+            )
+            git worktree remove --force /tmp/lint-base
+          fi
+          echo "base ruff: $(wc -c < .lint-reports/base/ruff.json) bytes"
+          echo "base ty:   $(wc -c < .lint-reports/base/ty.json) bytes"
+
+      - name: Generate diff summary
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          python scripts/lint_diff.py \
+            --base-ruff .lint-reports/base/ruff.json \
+            --head-ruff .lint-reports/head/ruff.json \
+            --base-ty .lint-reports/base/ty.json \
+            --head-ty .lint-reports/head/ty.json \
+            --base-ref "${{ steps.base.outputs.ref }}" \
+            --head-ref "$HEAD_REF" \
+            --output .lint-reports/summary.md
+          cat .lint-reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  ruff-blocking:
+    name: Ruff enforcement (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
         with:
           version: "0.9.28"
-      - name: Install Ruff
+      - name: Install ruff
         uses: ./.github/actions/retry
         with:
           command: uv tool install ruff
-      - name: Run Ruff
+      - name: ruff check .
         run: ruff check .
 
   windows-footguns:
-    name: Windows footguns
+    name: Windows footguns (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Run static portability guard
-        run: python3 scripts/check-windows-footguns.py --all
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
+        with:
+          version: "0.9.28"
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+      - name: Run footgun checker
+        run: python scripts/check-windows-footguns.py --all
+      - name: Forbid in-tree use of plugin-compat pointers
+        run: python scripts/check_compat_pointers.py
+      - name: Public-surface diff vs base (advisory)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" HEAD
+          for i in 1 2 3; do
+            git merge-base "origin/${{ github.base_ref }}" HEAD >/dev/null 2>&1 && break
+            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" HEAD
+          done
+          python scripts/ci/check_public_surface.py --base "origin/${{ github.base_ref }}" --head HEAD

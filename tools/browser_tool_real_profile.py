@@ -38,6 +38,18 @@ def _cdp_http_ready(http_cdp: str) -> bool:
     return _cdp_ready(http_cdp, timeout=1.0)
 
 
+def _real_profile_daemon_env(session_name: Optional[str] = None) -> dict:
+    """Reaper-visible socket dir + ``owner_pid`` claim like every other lane (agent-browser's
+    default dir is invisible to the reaper — #100855). The daemon-side idle timeout is dropped:
+    Chrome is launched by Hermes, not the daemon, so a self-exiting daemon would leave Chrome
+    holding the copy dir under the next snapshot overlay."""
+    _bt = _origin()
+    socket_dir = _session._prepare_session_socket_dir(session_name or _bt._REAL_PROFILE_SESSION)
+    env = _session._agent_browser_command_env(socket_dir)
+    env.pop("AGENT_BROWSER_IDLE_TIMEOUT_MS", None)
+    return env
+
+
 def _agent_browser_session_cmd(session_name: str, *cmd: str, log_label: str) -> Optional[subprocess.CompletedProcess]:
     """Run ``agent-browser --session <name> <cmd...>``; None when agent-browser is missing or the run fails."""
     _bt = _origin()
@@ -48,7 +60,7 @@ def _agent_browser_session_cmd(session_name: str, *cmd: str, log_label: str) -> 
     try:
         return subprocess.run([*_session._agent_browser_argv(browser_cmd), "--session", session_name, *cmd],
                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-                              env=_bt._build_browser_env(), stdin=subprocess.DEVNULL)
+                              env=_real_profile_daemon_env(), stdin=subprocess.DEVNULL)
     except (subprocess.SubprocessError, OSError) as e:
         _bt.logger.debug("real-profile %s failed: %s", log_label, e)
         return None
@@ -68,6 +80,26 @@ def _read_devtools_port(data_dir: str) -> Optional[str]:
             return fh.readline().strip()
     except OSError:
         return None
+
+
+def _surviving_chrome_cdp(data_dir: str) -> Optional[str]:
+    """HTTP CDP root of a Chrome still running on ``data_dir``, or None. ``DevToolsActivePort``
+    outlives a crashed Chrome and its port can be recycled by another local CDP server, so the
+    file's browser id (line 2) must match what ``/json/version`` reports before it is trusted."""
+    try:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
+            port, browser_path = fh.readline().strip(), fh.readline().strip()
+    except OSError:
+        return None
+    if not port.isdigit() or not browser_path.startswith("/devtools/browser/"):
+        return None
+    http_cdp = f"http://127.0.0.1:{port}"
+    try:
+        import requests
+        ws_url = str(requests.get(f"{http_cdp}/json/version", timeout=2).json().get("webSocketDebuggerUrl") or "")
+    except Exception:
+        return None
+    return http_cdp if ws_url.endswith(browser_path) else None
 
 
 def _cdp_on_data_dir(http_cdp: str, data_dir: str) -> bool:
@@ -171,7 +203,7 @@ def _attach_agent_browser_to_real_profile(port: int, copy_dir: str) -> Tuple[Opt
             "--cdp", str(port), "open", "about:blank"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=_bt._get_open_command_timeout(first_open=True), env=_bt._build_browser_env(),
+                              timeout=_bt._get_open_command_timeout(first_open=True), env=_real_profile_daemon_env(),
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return None, _RP + "the real-profile browser took too long to start. Retry, or turn the toggle off."
@@ -226,10 +258,12 @@ def _cdp_owned_by_data_dir(http_cdp: str, data_dir: str) -> bool:
 def _owned_profile_cdp(data_dir: str) -> Optional[str]:
     """Recover a live CDP endpoint owned by an isolated snapshot (survives a gateway crash)."""
     _bt = _origin()
-    port = _read_devtools_port(data_dir)
-    if not port or not port.isdigit() or not 0 < int(port) < 65536:
+    # A matching port and process command line do not establish that the listener is the Chrome
+    # which wrote this marker: a crashed Chrome can leave it behind and its port may be recycled.
+    # Verify the DevTools browser id before treating the endpoint as a recoverable owned runtime.
+    cdp = _surviving_chrome_cdp(data_dir)
+    if not cdp:
         return None
-    cdp = f"http://127.0.0.1:{port}"
     if not _bt._cdp_http_ready(cdp) or not _bt._cdp_owned_by_data_dir(cdp, data_dir):
         return None
     return cdp
@@ -265,7 +299,7 @@ def _attach_agent_browser_to_cdp(session_name: str, cdp: str) -> Optional[str]:
             argv, capture_output=True, text=True, encoding='utf-8', errors='replace',
             stdin=subprocess.DEVNULL,
             timeout=_bt._get_open_command_timeout(first_open=True),
-            env=_bt._build_browser_env())
+            env=_real_profile_daemon_env(session_name))
     except subprocess.TimeoutExpired:
         return "agent-browser took too long to attach"
     except (subprocess.SubprocessError, OSError) as exc:
@@ -363,8 +397,11 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
     with identity_lock, process_lock:
         cached = _bt._real_profile_cdp_cache.get(cache_key)
         if identity is None and cached and _bt._cdp_http_ready(cached):
+            # Re-claim the shared daemon's socket dir so the orphan reaper's idle clock sees
+            # this process still using it (a cache hit never runs a daemon command).
             if conflict := mode_conflict():
                 return None, conflict
+            _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
             return cached, None
 
         browser = identity.browser if identity is not None else detect_default_chromium()
@@ -425,6 +462,18 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
             return existing, None
         if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
             _bt._agent_browser_close_session(session_name)
+        # A Chrome from an earlier hermes process can still hold the copy dir after its attach
+        # daemon was reaped (that owner died). Re-attach to it rather than overlay a live profile;
+        # if the daemon cannot attach, fail closed — never snapshot over an open profile. Not ours
+        # to terminate (no Popen handle): it lives until the user closes it, by design.
+        surviving = _surviving_chrome_cdp(copy_dir)
+        if surviving:
+            cdp, err = _attach_agent_browser_to_real_profile(int(surviving.rsplit(":", 1)[1]), copy_dir)
+            if not cdp:
+                return None, err
+            _bt._real_profile_cdp_cache["cdp"] = cdp
+            _bt.logger.info("real-profile: re-attached to surviving Chrome at %s (%s)", cdp, copy_dir)
+            return cdp, None
 
         # A snapshot browser deliberately survives gateway restarts: recover it BEFORE any overlay.
         recovered = _owned_profile_cdp(copy_dir)
