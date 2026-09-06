@@ -2320,3 +2320,74 @@ def test_refresh_success_declares_cleared_status_to_persist(tmp_path, monkeypatc
 
     assert refreshed is not None and refreshed.last_status == "ok"
     assert read_credential_pool("anthropic")[0].get("last_status") == "ok"
+
+
+class TestRequestCountEveryStrategy:
+    """request_count must count selections under every strategy, not only least_used.
+
+    Before this, the counter only moved inside the least_used branch, so it stayed
+    at 0 under every other strategy and switching a pool to least_used started
+    from a fake all-zero baseline.
+    """
+
+    @staticmethod
+    def _pool(strategy: str):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import CredentialPool, PooledCredential
+
+        entries = [
+            PooledCredential(provider="test", id="a", label="a", auth_type="api_key",
+                             source="a", access_token="tok-a", priority=0),
+            PooledCredential(provider="test", id="b", label="b", auth_type="api_key",
+                             source="b", access_token="tok-b", priority=1),
+        ]
+        with _patch("agent.credential_pool.get_pool_strategy", return_value=strategy):
+            return CredentialPool("test", entries)
+
+    def test_fill_first_counts_repeat_selections(self):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import STRATEGY_FILL_FIRST
+
+        pool = self._pool(STRATEGY_FILL_FIRST)
+        with _patch("agent.credential_pool.persist_pool_entries"):
+            first = pool.select()
+            second = pool.select()
+        assert first is not None and second is not None
+        assert first.id == second.id == "a"
+        assert second.request_count == 2
+        assert {e.id: e.request_count for e in pool.entries()} == {"a": 2, "b": 0}
+
+    def test_round_robin_counts_each_rotation(self):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import STRATEGY_ROUND_ROBIN
+
+        pool = self._pool(STRATEGY_ROUND_ROBIN)
+        with _patch("agent.credential_pool.persist_pool_entries") as persist:
+            first = pool.select()
+            second = pool.select()
+        assert {first.id, second.id} == {"a", "b"}
+        assert {e.id: e.request_count for e in pool.entries()} == {"a": 1, "b": 1}
+        # Rotation persists the pool; the bump must be in the persisted snapshot.
+        persisted = {p["id"]: p["request_count"] for p in persist.call_args_list[0].args[1]}
+        assert persisted["a"] == 1
+
+    def test_refresh_target_lookup_is_not_counted(self):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import STRATEGY_FILL_FIRST
+
+        pool = self._pool(STRATEGY_FILL_FIRST)
+        with _patch("agent.credential_pool.persist_pool_entries"):
+            entry, _pending = pool._select_unlocked(refresh=False, count=False)
+        assert entry is not None and entry.request_count == 0
+        assert sum(e.request_count for e in pool.entries()) == 0
+
+    def test_random_counts_selection(self):
+        from unittest.mock import patch as _patch
+        from agent.credential_pool import STRATEGY_RANDOM
+
+        pool = self._pool(STRATEGY_RANDOM)
+        with _patch("agent.credential_pool.persist_pool_entries"):
+            chosen = pool.select()
+        assert chosen is not None
+        assert chosen.request_count == 1
+        assert sum(e.request_count for e in pool.entries()) == 1

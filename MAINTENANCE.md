@@ -140,6 +140,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-116 | Active | `feat(auth): reset one pooled credential by target` | Let `hermes auth reset <provider> [target]` clear one credential's exhaustion state without returning still-exhausted siblings to rotation. |
 | HERMES-117 | Active | `feat(auth): add hermes auth refresh for pooled OAuth credentials` | Add `hermes auth refresh <provider> [target]` to force one pooled OAuth credential through the pool's refresh path, rotating its tokens and clearing its cooldown. |
 | HERMES-118 | Active | `feat(auth): show entry id and priority in auth list` | Print each credential's entry id and `fill_first` priority in `hermes auth list`. |
+| HERMES-119 | Active | `fix(credential-pool): count selections under every strategy` | Increment `request_count` for the chosen credential under every pool strategy instead of only `least_used`. |
 
 ## Fork-only administrative subject exemptions
 
@@ -253,6 +254,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-119 — Count selections under every strategy
+
+- **Summary:** `CredentialPool._select_unlocked()` bumps the chosen entry's `request_count` under every strategy, before the `round_robin` rotation persists so the bump is in that snapshot. Previously only the `least_used` branch counted, so the counter stayed at a permanent 0 under every other strategy (the 2026-09-06 Codex pool showed 0 on every entry after 3,681 calls in five hours) and switching a pool to `least_used` started from a fake all-zero baseline. The bump stays in memory and reaches `auth.json` on the next persist, as it always did under `least_used`; the forced-refresh target lookup passes `count=False`. Selection order is unchanged under all four strategies.
+- **Surfaces:** `agent/credential_pool.py` (`_select_unlocked`), `tests/agent/test_credential_pool.py`, and this manifest.
+- **Upstream tracking:** Issue #104637 (open, filed 2026-09-06).
+- **Upstream PR:** Direct: #104663 (open, filed 2026-09-06) implements this exact behavior from the same commit.
+- **Regression:** `scripts/run_tests.sh tests/agent/test_credential_pool.py tests/agent/test_credential_pool_key_rotation.py tests/agent/test_credential_pool_anthropic_refresh_race.py -q` covers `fill_first` repeat selections counting to 2, `round_robin` counting each rotation with the bump in the persisted snapshot, `random` counting one, and the refresh target lookup not counting, alongside the existing `least_used` regression. Sabotage: the three new tests fail with the code change removed.
+- **Published commit identity:** Stable subject `fix(credential-pool): count selections under every strategy`.
+- **Rollback:** Revert only that stable-subject commit. Counters already persisted stay in `auth.json` and are harmless; reverting restores the least_used-only bump.
+- **Retirement:** Retire when a released upstream version counts selections under every strategy with equivalent regressions passing.
 
 ### HERMES-118 — Show entry id and priority in auth list
 
