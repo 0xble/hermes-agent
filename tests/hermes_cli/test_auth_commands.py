@@ -1210,3 +1210,166 @@ def test_auth_reset_unknown_target_exits_without_clearing(tmp_path, monkeypatch)
     by_id = _pool_entries_by_id(tmp_path)
     assert by_id["cred-1"]["last_status"] == "exhausted"
     assert by_id["cred-2"]["last_status"] == "exhausted"
+
+
+def _fake_pool_refresh(monkeypatch, *, succeed: bool = True) -> list:
+    """Stand in for ``CredentialPool._refresh_entry``: rotate the token and clear status the
+    way ``_refresh_entry_impl`` does on success, or return None the way a failed refresh does."""
+    calls: list = []
+
+    def fake_refresh(self, entry, *, force):
+        from dataclasses import replace
+        from agent.credential_pool import _MARK_OK
+
+        calls.append((entry.id, force))
+        if not succeed:
+            return None
+        updated = replace(entry, access_token=_jwt_with_email("refreshed@example.com"), **_MARK_OK)
+        self._replace_entry(entry, updated)
+        self._persist()
+        return updated
+
+    monkeypatch.setattr("agent.credential_pool.CredentialPool._refresh_entry", fake_refresh)
+    return calls
+
+
+def _codex_pool_store_with_second_entry(*, exhausted: bool = False) -> dict:
+    store = _codex_pool_only_store(exhausted=exhausted)
+    second = dict(store["credential_pool"]["openai-codex"][0])
+    second.update({"id": "codex-2", "label": "work@example.com", "priority": 1})
+    store["credential_pool"]["openai-codex"].append(second)
+    return store
+
+
+def test_auth_refresh_single_credential_needs_no_target(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_only_store(exhausted=True))
+    calls = _fake_pool_refresh(monkeypatch)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": None})())
+
+    assert calls == [("codex-1", True)]
+    assert "Refreshed openai-codex credential #1 (codex@example.com); status: ok" in capsys.readouterr().out
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    entry = payload["credential_pool"]["openai-codex"][0]
+    assert entry.get("last_status") == "ok"
+    assert entry.get("last_error_reset_at") is None
+    assert entry["access_token"] == _jwt_with_email("refreshed@example.com")
+
+
+def test_auth_refresh_targets_one_of_several_by_label(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_store_with_second_entry(exhausted=True))
+    calls = _fake_pool_refresh(monkeypatch)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": "work@example.com"})())
+
+    assert calls == [("codex-2", True)]
+    assert "credential #2 (work@example.com)" in capsys.readouterr().out
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    by_id = {e["id"]: e for e in payload["credential_pool"]["openai-codex"]}
+    assert by_id["codex-2"].get("last_status") == "ok"
+    assert by_id["codex-1"]["last_status"] == "exhausted"
+
+
+def test_auth_refresh_requires_target_when_pool_has_several(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_store_with_second_entry())
+    calls = _fake_pool_refresh(monkeypatch)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": None})())
+
+    assert "hermes auth list openai-codex" in str(excinfo.value)
+    assert calls == []
+
+
+def test_auth_refresh_rejects_api_key_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "or-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-v1-primary",
+                    }
+                ]
+            },
+        },
+    )
+    calls = _fake_pool_refresh(monkeypatch)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_refresh_command(type("Args", (), {"provider": "openrouter", "target": "primary"})())
+
+    assert "not a refreshable OAuth credential" in str(excinfo.value)
+    assert calls == []
+
+
+def test_auth_refresh_reports_pool_verdict_when_refresh_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_only_store(exhausted=True))
+    calls = _fake_pool_refresh(monkeypatch, succeed=False)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": "1"})())
+
+    assert calls == [("codex-1", True)]
+    assert "Refresh failed for openai-codex credential #1" in str(excinfo.value)
+    assert "status now: exhausted" in str(excinfo.value)
+
+
+def test_auth_refresh_unknown_target_exits(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_only_store())
+    calls = _fake_pool_refresh(monkeypatch)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": "nope"})())
+
+    assert 'No credential matching "nope"' in str(excinfo.value)
+    assert calls == []
+
+
+def test_auth_refresh_reports_adopted_tokens_when_status_not_cleared(tmp_path, monkeypatch, capsys):
+    """When the pool adopts a peer's rotation without clearing status, do not claim a refresh."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_pool_only_store(exhausted=True))
+
+    def adopt_only(self, entry, *, force):
+        return entry  # sync short-circuit: current tokens adopted, status untouched
+
+    monkeypatch.setattr("agent.credential_pool.CredentialPool._refresh_entry", adopt_only)
+
+    from hermes_cli.auth_commands import auth_refresh_command
+
+    auth_refresh_command(type("Args", (), {"provider": "openai-codex", "target": "1"})())
+
+    out = capsys.readouterr().out
+    assert "Adopted current tokens for openai-codex credential #1" in out
+    assert "status still: exhausted" in out
+    assert "Refreshed" not in out

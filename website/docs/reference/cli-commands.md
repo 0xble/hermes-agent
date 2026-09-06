@@ -584,12 +584,13 @@ hermes auth add anthropic --type oauth                   # Add OAuth credential
 hermes auth remove openrouter 2                          # Remove by index
 hermes auth reset openrouter                             # Clear cooldowns
 hermes auth reset openrouter 2                           # Clear the cooldown on one credential
+hermes auth refresh openai-codex work                    # Refresh one OAuth credential and clear its cooldown
 hermes auth status anthropic                             # Show auth status for a provider
 hermes auth logout anthropic                             # Log out and clear stored auth state
 hermes auth spotify                                      # Authenticate Hermes with Spotify via PKCE
 ```
 
-Subcommands: `add`, `list`, `remove`, `reset`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
+Subcommands: `add`, `list`, `remove`, `reset`, `refresh`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
 
 ## `hermes status`
 

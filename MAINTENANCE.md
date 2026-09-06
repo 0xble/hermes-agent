@@ -138,6 +138,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-114 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bound shared gateway outstanding work, disclose queued turns and reject overflow without starting the request or timing out running work. |
 | HERMES-115 | Active | `feat(update): bind promotion to an immutable revision` | Prepare an exact Git revision, retain source rollback identity and reject version drift. |
 | HERMES-116 | Active | `feat(auth): reset one pooled credential by target` | Let `hermes auth reset <provider> [target]` clear one credential's exhaustion state without returning still-exhausted siblings to rotation. |
+| HERMES-117 | Active | `feat(auth): add hermes auth refresh for pooled OAuth credentials` | Add `hermes auth refresh <provider> [target]` to force one pooled OAuth credential through the pool's refresh path, rotating its tokens and clearing its cooldown. |
 
 ## Fork-only administrative subject exemptions
 
@@ -251,6 +252,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-117 — Add hermes auth refresh for pooled OAuth credentials
+
+- **Summary:** New `hermes auth refresh <provider> [target]` resolves one pooled credential (target optional when the pool holds exactly one), refuses `api_key` entries and providers outside `REFRESHABLE_OAUTH_PROVIDERS` (anthropic, nous, openai-codex, xai-oauth, the set `_refresh_entry_impl` actually rotates), and calls `try_refresh_matching(credential_id=...)`. Success rotates the tokens and clears the local exhaustion block through the pool's own `_MARK_OK` (proving the grant is alive, not that quota is back: a still-capped account 429s on its next request); failure leaves the pool's verdict in place and reports it. `_refresh_entry_impl` now persists that success with `status_cleared_ids`, because a borrowed row has no access_token on disk and a plain persist copied the cooldown back. This is the supported form of the 2026-09-06 recovery: a Codex account reset with a banked credit stayed frozen behind a stale `last_error_reset_at` because the quota probe used its expired access token, and a targeted forced refresh returned it to rotation immediately.
+- **Surfaces:** `agent/credential_pool.py` (`REFRESHABLE_OAUTH_PROVIDERS`), `hermes_cli/auth_commands.py` (`auth_refresh_command`), `hermes_cli/subcommands/auth.py`, `tests/hermes_cli/test_auth_commands.py`, `website/docs/user-guide/features/credential-pools.md`, `website/docs/reference/cli-commands.md`, and this manifest.
+- **Upstream tracking:** Issue #104635 (open, filed 2026-09-06). Related open issues #89415 and #44799 describe the frozen-token loop; their threads recommend calling `try_refresh_matching()` from Python, which this command replaces.
+- **Upstream PR:** Direct: #104661 (open, filed 2026-09-06) implements this exact behavior from the same commit.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_auth_commands.py tests/agent/test_credential_pool.py -q` covers single-credential pools needing no target, label targeting among several, the target-required error, the api_key refusal, failure reporting the pool verdict, and unknown targets; the fake refresh mirrors `_refresh_entry_impl`'s success path so the cleared status is proven to survive `persist_pool_entries()`, peer-adopted tokens are reported as adopted rather than refreshed, and `tests/agent/test_credential_pool.py` proves a forced refresh of a borrowed, sanitized-on-disk row persists as `ok`. Sabotage: all eight fail with the code change removed.
+- **Published commit identity:** Stable subject `feat(auth): add hermes auth refresh for pooled OAuth credentials`.
+- **Rollback:** Revert only that stable-subject commit. It adds a command and a constant; nothing in the runtime selection path changes, and reverting removes the command only.
+- **Retirement:** Retire when a released upstream version ships an equivalent per-credential refresh command (or an automatic refresh-before-probe that makes it unnecessary, per #89415) with these regressions passing against it.
 
 ### HERMES-116 — Reset one pooled credential by target
 

@@ -2287,3 +2287,36 @@ def test_reset_status_clears_one_entry_and_declares_it_to_persist():
     assert {e.id: e.last_status for e in pool.entries()} == {"a": STATUS_EXHAUSTED, "b": None}
     persist.assert_called_once()
     assert persist.call_args.kwargs["status_cleared_ids"] == ["b"]
+
+
+def test_refresh_success_declares_cleared_status_to_persist(tmp_path, monkeypatch):
+    """A successful forced refresh must persist with ``status_cleared_ids``. A borrowed
+    row carries no access_token on disk, so the disk merge's token-change bypass cannot
+    apply and a plain persist copies the still-binding cooldown back over the success."""
+    import time as _time
+    from dataclasses import replace
+    from unittest.mock import patch as _patch
+    from agent.credential_pool import CredentialPool, PooledCredential, STATUS_EXHAUSTED
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    now = _time.time()
+    entry = PooledCredential(
+        provider="anthropic", id="a1", label="cc", auth_type="oauth", priority=0,
+        source="claude_code", access_token="sk-ant-oat-A", refresh_token="r1",
+        last_status=STATUS_EXHAUSTED, last_status_at=now, last_error_code=429,
+        last_error_reason="rate_limit", last_error_reset_at=now + 3600,
+    )
+    write_credential_pool("anthropic", [entry.to_dict()])
+    assert "access_token" not in read_credential_pool("anthropic")[0]  # borrowed rows are sanitized
+
+    with _patch("agent.credential_pool.get_pool_strategy", return_value="fill_first"):
+        pool = CredentialPool("anthropic", [entry])
+    with _patch.object(CredentialPool, "_refresh_anthropic",
+                       lambda self, e: replace(e, access_token="sk-ant-oat-B")):
+        refreshed = pool._refresh_entry_impl(entry, force=True)
+
+    assert refreshed is not None and refreshed.last_status == "ok"
+    assert read_credential_pool("anthropic")[0].get("last_status") == "ok"
