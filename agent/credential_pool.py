@@ -916,6 +916,14 @@ class _RefreshDone(Exception):
         self.result = result
 
 
+def _cleared_status_copy(entry: "PooledCredential") -> "PooledCredential":
+    """*entry* with every exhaustion/error field cleared, including ``failure_reason`` in ``extra``."""
+    return replace(
+        entry, **_CLEAR_STATUS,
+        extra={k: v for k, v in entry.extra.items() if k != "failure_reason"},
+    )
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -2281,15 +2289,27 @@ class CredentialPool:
             if stale:
                 stale_ids = {e.id for e in stale}
                 self._entries = [
-                    replace(
-                        e, **_CLEAR_STATUS,
-                        extra={k: v for k, v in e.extra.items() if k != "failure_reason"},
-                    )
-                    if e.id in stale_ids else e
+                    _cleared_status_copy(e) if e.id in stale_ids else e
                     for e in self._entries
                 ]
                 self._persist(status_cleared_ids=list(stale_ids))
             return len(stale)
+
+    def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
+        """Clear exhaustion state on one entry; returns it, or None when the id is unknown.
+
+        The single-entry form of :meth:`reset_statuses`: an operator can return one
+        account to rotation without also un-benching siblings whose cooldowns are
+        still binding. Persists with the cleared id for the same merge reason.
+        """
+        with self._lock:
+            entry = self._find(lambda e: e.id == credential_id)
+            if entry is None:
+                return None
+            cleared = _cleared_status_copy(entry)
+            self._replace_entry(entry, cleared)
+            self._persist(status_cleared_ids=[cleared.id])
+            return cleared
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:

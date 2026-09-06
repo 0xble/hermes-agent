@@ -2253,3 +2253,37 @@ def test_a_persist_without_declared_intent_still_cannot_erase_a_cooldown(
     entry = _disk_entry(tmp_path)
     assert entry["last_status"] == "exhausted"
     assert entry["last_error_code"] == 402
+
+
+def test_reset_status_clears_one_entry_and_declares_it_to_persist():
+    """reset_status() clears a single entry and passes its id as status_cleared so the
+    disk-recency merge cannot copy the still-binding cooldown back."""
+    import time as _time
+    from unittest.mock import patch as _patch
+    from agent.credential_pool import CredentialPool, PooledCredential, STATUS_EXHAUSTED
+
+    now = _time.time()
+
+    def exhausted(cid: str, priority: int) -> PooledCredential:
+        return PooledCredential(
+            provider="test", id=cid, label=cid, auth_type="api_key", source="manual",
+            access_token=f"tok-{cid}", priority=priority, last_status=STATUS_EXHAUSTED,
+            last_status_at=now, last_error_code=429, last_error_reason="rate_limit",
+            last_error_reset_at=now + 3600, extra={"failure_reason": "rate_limit"},
+        )
+
+    with _patch("agent.credential_pool.get_pool_strategy", return_value="fill_first"):
+        pool = CredentialPool("test", [exhausted("a", 0), exhausted("b", 1)])
+
+    with _patch("agent.credential_pool.persist_pool_entries") as persist:
+        cleared = pool.reset_status("b")
+        assert pool.reset_status("missing") is None
+
+    assert cleared is not None
+    assert cleared.last_status is None
+    assert cleared.last_error_reset_at is None
+    assert cleared.last_error_code is None
+    assert cleared.failure_reason is None
+    assert {e.id: e.last_status for e in pool.entries()} == {"a": STATUS_EXHAUSTED, "b": None}
+    persist.assert_called_once()
+    assert persist.call_args.kwargs["status_cleared_ids"] == ["b"]

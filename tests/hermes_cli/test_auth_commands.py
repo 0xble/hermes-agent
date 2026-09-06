@@ -1127,3 +1127,86 @@ def test_qwen_oauth_login_marks_active_through_moved_owner(monkeypatch):
 
     assert auth_commands._qwen_oauth_login(None) is creds
     assert marked == [creds]
+
+
+def _two_exhausted_anthropic_entries() -> dict:
+    now = time.time()
+
+    def entry(idx: int) -> dict:
+        return {
+            "id": f"cred-{idx}",
+            "label": f"acct-{idx}",
+            "auth_type": "api_key",
+            "priority": idx - 1,
+            "source": "manual",
+            "access_token": f"sk-ant-api-{idx}",
+            "last_status": "exhausted",
+            "last_status_at": now,
+            "last_error_code": 429,
+            "last_error_reason": "rate_limit",
+            "last_error_message": "Too many requests",
+            "last_error_reset_at": now + 3600,
+        }
+
+    return {"version": 1, "credential_pool": {"anthropic": [entry(1), entry(2)]}}
+
+
+def _isolate_anthropic_pool(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+
+
+def _pool_entries_by_id(tmp_path) -> dict:
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    return {e["id"]: e for e in payload["credential_pool"]["anthropic"]}
+
+
+def test_auth_reset_target_clears_only_that_credential(tmp_path, monkeypatch, capsys):
+    _isolate_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_exhausted_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_reset_command
+
+    auth_reset_command(type("Args", (), {"provider": "anthropic", "target": "acct-2"})())
+
+    assert "Reset status on anthropic credential #2 (acct-2)" in capsys.readouterr().out
+    by_id = _pool_entries_by_id(tmp_path)
+    assert by_id["cred-2"].get("last_status") is None
+    assert by_id["cred-2"].get("last_error_reset_at") is None
+    assert by_id["cred-2"].get("last_error_code") is None
+    assert by_id["cred-1"]["last_status"] == "exhausted"
+    assert by_id["cred-1"]["last_error_code"] == 429
+
+
+def test_auth_reset_without_target_clears_every_credential(tmp_path, monkeypatch, capsys):
+    _isolate_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_exhausted_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_reset_command
+
+    auth_reset_command(type("Args", (), {"provider": "anthropic", "target": None})())
+
+    assert "Reset status on 2 anthropic credentials" in capsys.readouterr().out
+    by_id = _pool_entries_by_id(tmp_path)
+    assert by_id["cred-1"].get("last_status") is None
+    assert by_id["cred-2"].get("last_status") is None
+
+
+def test_auth_reset_unknown_target_exits_without_clearing(tmp_path, monkeypatch):
+    _isolate_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_exhausted_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_reset_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_reset_command(type("Args", (), {"provider": "anthropic", "target": "nope"})())
+
+    assert 'No credential matching "nope"' in str(excinfo.value)
+    by_id = _pool_entries_by_id(tmp_path)
+    assert by_id["cred-1"]["last_status"] == "exhausted"
+    assert by_id["cred-2"]["last_status"] == "exhausted"

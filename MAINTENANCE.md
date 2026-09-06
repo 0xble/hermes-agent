@@ -137,6 +137,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-113 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bind browser-close candidates to an exact user-data-dir argument and a supported Chromium identity, including Linux wrappers and snaps, never an argv substring. |
 | HERMES-114 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bound shared gateway outstanding work, disclose queued turns and reject overflow without starting the request or timing out running work. |
 | HERMES-115 | Active | `feat(update): bind promotion to an immutable revision` | Prepare an exact Git revision, retain source rollback identity and reject version drift. |
+| HERMES-116 | Active | `feat(auth): reset one pooled credential by target` | Let `hermes auth reset <provider> [target]` clear one credential's exhaustion state without returning still-exhausted siblings to rotation. |
 
 ## Fork-only administrative subject exemptions
 
@@ -250,6 +251,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-116 — Reset one pooled credential by target
+
+- **Summary:** `hermes auth reset <provider> [target]` accepts an optional index, entry id, or exact label resolved through the same `resolve_target()` as `auth remove`, and clears only that entry through a new `CredentialPool.reset_status(credential_id)`, which persists with `status_cleared_ids` so the disk-recency merge cannot copy the still-binding cooldown back. The pool-wide form is unchanged. Motivated by the 2026-09-06 incident where un-benching one recovered Codex account required either the pool-wide reset (which retries every exhausted sibling first under `fill_first`) or hand-editing `auth.json`.
+- **Surfaces:** `agent/credential_pool.py` (`_cleared_status_copy`, `reset_status`), `hermes_cli/auth_commands.py`, `hermes_cli/subcommands/auth.py`, `tests/hermes_cli/test_auth_commands.py`, `tests/agent/test_credential_pool.py`, `website/docs/user-guide/features/credential-pools.md`, `website/docs/reference/cli-commands.md`, and this manifest.
+- **Upstream tracking:** Issue #104634 (open, filed 2026-09-06). Related: #89415 (stale `last_error_reset_at` after a mid-cooldown top-up, open) and #103635 (merged 2026-09-05, made the pool-wide reset persist).
+- **Upstream PR:** Direct: #104660 (open, filed 2026-09-06) implements this exact behavior from the same commit.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_auth_commands.py tests/agent/test_credential_pool.py -q` covers a target clearing only its own entry and persisting, the no-target form clearing every entry, an unknown target exiting without clearing, and `reset_status` stripping `failure_reason` and declaring its id to persist. Sabotage: all four fail with the code change removed.
+- **Published commit identity:** Stable subject `feat(auth): reset one pooled credential by target`.
+- **Rollback:** Revert only that stable-subject commit. It touches no credentials, schema, or persisted state; reverting restores the pool-wide-only `reset`.
+- **Retirement:** Retire when a released upstream version accepts a per-credential target on `hermes auth reset` and clears only that entry with the cooldown surviving persistence, with these regressions passing against it.
 
 ### HERMES-114 — Bound and disclose gateway executor admission
 
