@@ -75,7 +75,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-049 | Active | `fix(send_message): schedule live adapters on the gateway loop` | Keep profile-bound native sends on the event loop that owns the live adapter. |
 | HERMES-053 | Retired | `fix(computer-use): resolve app bundle through driver symlinks`; `refactor(computer-use): retire redundant driver identity patch` | Realpath the resolved driver before deriving CuaDriver.app and accept both observed official signing teams, so symlinked installs (the updater's layout) launch instead of failing closed. |
 | HERMES-054 | Active | `fix(reconcile): restore fork behaviour the v0.21.0 replay dropped` | Require a structure-only FTS5 integrity probe to confirm FTS damage before in-place rebuilds or stale markers, so corruption in unrelated tables stops triggering pointless index rebuilds. |
-| HERMES-055 | Active | `fix(reconcile): restore fork behaviour the v0.21.0 replay dropped` | Defer in-process FTS rebuilds above 1 GiB to startup/offline repair so a multi-minute rebuild cannot starve turns or be killed mid-flight by the liveness watchdog. |
+| HERMES-055 | Retired | `fix(reconcile): restore fork behaviour the v0.21.0 replay dropped`; `fix(hermes): close verified fork improvement gaps (#72)` | Historical 1 GiB runtime FTS cutoff is absent from current source. Preserve current rebuild admission and corruption safeguards rather than restoring or removing the obsolete gate. |
 | HERMES-056 | Active | `fix(skills): trust configured symlink farms` | Stop false skill-security warnings for symlink entries inside explicitly configured external skill roots while preserving warnings for local/profile symlink escapes. |
 | HERMES-050 | Active | `fix(gateway): dispatch quick aliases while busy` | Expand configured aliases for `/steer` and other non-interrupting registered commands before both active-session guards. |
 | HERMES-057 | Retired | `fix(cron): enforce total run budgets`; `fix(cron): enforce monitor read deadlines`; `fix(cron): retain claims until timed-out workers exit`; `fix(cron): bound teardown while retaining worker tombstones`; `fix(cron): preserve teardown after budget exhaustion`; `merge: land reviewed cron cleanup fix for release`; `refactor(cron): remove total run budgets (#70)` | Historical per-job total wall-clock deadline. The scheduler retains its independent inactivity watchdog and claim/worker-ownership safety. |
@@ -134,6 +134,8 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-110 | Retired | `fix(prompt): keep runtime guidance scope-bound`; `fix(prompt): preserve persistent memory after compaction`; `revert(astra): retire instruction support patches` | Historical Astra-specific runtime guidance and bundled blueprint hardening, reverted before runtime promotion at the user's request. |
 | HERMES-111 | Active | `fix(telegram): preserve math and normalize currency entities` | Preserve genuine math and currency across rich, legacy, and draft delivery without a duplicate output-transform rule. |
 | HERMES-112 | Active | `fix(delegate): close named subagent audit findings` | Enforce parent-owned knowledge writes across every mediated tool path, fail loudly on unreadable delegation config, and disclose roles, routes, and real limits honestly. |
+| HERMES-113 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bind browser-close candidates to an exact user-data-dir argument and a supported Chromium identity, including Linux wrappers and snaps, never an argv substring. |
+| HERMES-114 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bound shared gateway outstanding work, disclose queued turns and reject overflow without starting the request or timing out running work. |
 
 
 ## Fork-only administrative subject exemptions
@@ -248,6 +250,27 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-114 — Bound and disclose gateway executor admission
+
+- **Independent hypothesis (2026-09-06):** The shared 32-worker executor queues unlimited work. Controlled saturation of the actual factory blocks the next turn. Bound outstanding submissions to workers plus one waiting wave, disclose queueing at the actual turn entry point, and return an explicit not-started failure on overflow. Cancellation must not free running capacity or allow cancelled queue nodes to grow without bound.
+- **Summary:** Keep the existing worker count and context propagation. No priority scheduler, additional lane, provider timeout, or runtime configuration change.
+- **Surfaces:** `gateway/run_executor.py`; `gateway/run.py`; `gateway/run_turn.py`; `tests/gateway/test_gateway_executor_admission.py`.
+- **Upstream tracking:** Searched open and closed executor/admission/queue issues and PRs on 2026-09-06. Open PR #75802 reserves an optional interactive lane, which exceeds this bounded-admission contract. Open PR #101044 applies a 30-second timeout to all executor work, including legitimate long turns, and does not bound queued submissions. Neither is adopted. Existing capacity, context, and shutdown behavior is retained.
+- **Upstream PR:** https://github.com/NousResearch/hermes-agent/pull/75802 and https://github.com/NousResearch/hermes-agent/pull/101044 are related, not equivalent replacements.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_gateway_executor_admission.py tests/gateway/test_gateway_executor_capacity.py tests/gateway/test_shutdown_executor_quiesce.py`.
+- **Rollback:** Restore the standard executor factory and context wrapper in `gateway/run.py`, direct worker submission in `gateway/run_turn.py`, and remove `gateway/run_executor.py` plus its admission-only tests. Preserve existing worker count, shutdown quiescence, and other turn lifecycle code.
+- **Retirement:** Replace when upstream passes the same saturation, visible-notice, cancellation, and shutdown contracts without introducing blanket running-work timeouts.
+
+### HERMES-113 — Exact browser process profile ownership
+
+- **Independent hypothesis (2026-09-06):** The browser-close selector searched joined argv for a profile-path substring, selecting sibling directories and unrelated URL arguments. Ownership belongs to an explicit user-data-dir flag plus a supported Chromium identity. Exact launcher realpath matching missed Linux wrappers and snaps, so identity also accepts a known Chromium-family basename. Ambiguous or unreadable identities are rejected. Generic same-directory matching is not used because it would select unrelated binaries in shared directories such as ``/usr/bin``.
+- **Surfaces:** `hermes_cli/browser_connect.py`; `tests/tools/test_browser_real_profile.py`.
+- **Upstream tracking:** Existing upstream matcher reproduces both false positives. Searches of open/closed upstream PRs for user-data-dir process ownership and issues for wrong-browser profile matching found no equivalent fix on 2026-09-06. Regression checks also reject Chromium's two-token `--user-data-dir <path>` form (a positional URL, not a switch value), trailing malformed duplicate flags, option-terminator arguments, relative paths whose process cwd is unverified, and unrelated executables, while accepting `--user-data-dir=` / `-user-data-dir=` and wrapper and snap Chromium binaries.
+- **Upstream PR:** None after the source and open/closed PR checks above.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_browser_real_profile.py` with fake process records, never real browser termination.
+- **Rollback:** Revert only the ownership matcher and associated tests. Preserve snapshot selection, refresh policy, user consent, and browser-close call sites.
+- **Retirement:** Upstream exact-argument and executable ownership must pass the same positive and false-positive process-selection tests.
 
 ### HERMES-112 — Close named subagent audit findings
 
@@ -883,15 +906,17 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Rollback:** Remove `_fts_structure_is_corrupt` and its two call-site guards; preserve the rebuild, fail-open, and startup recovery flows.
 - **Retirement:** Retire after released upstream positively attributes malformed errors to FTS structures before automatic index repair, with equivalent regressions.
 
-### HERMES-055 — Defer oversized in-process FTS rebuilds
+### HERMES-055 — Retired oversized runtime FTS cutoff
 
-- **Independent hypothesis (2026-08-27):** The runtime `_try_runtime_fts_rebuild` rebuilds in-process regardless of database size. On a 16.7 GiB state.db a rebuild holds the writer lock for 8–11 minutes at full CPU: concurrent turns fail with lock timeouts, and the gateway liveness watchdog kills the process mid-rebuild (exit 75), producing a crash loop; the startup `_recover_stale_fts` path and offline `hermes sessions optimize-storage` complete the same rebuild safely. The correction belongs in the runtime path only: above `_RUNTIME_FTS_REBUILD_MAX_DB_BYTES` (1 GiB), skip the in-process rebuild and let the existing fail-open path set the stale marker so startup/offline repair owns the rebuild.
-- **Surfaces:** `hermes_state.py`; `tests/state/test_fts_runtime_rebuild.py`.
-- **Upstream tracking:** Same upstream head as HERMES-051; no size gate exists upstream and no matching issue or PR was found on 2026-08-27.
-- **Upstream PR:** None after checked 2026-08-27.
-- **Regression:** `.venv/bin/python -m pytest tests/state/test_fts_runtime_rebuild.py -q -k 'LargeDb'`; proves the oversized path skips rebuild yet heals via fail-open with the stale marker set and the canonical write preserved.
-- **Rollback:** Remove the size gate; preserve HERMES-054's attribution probe independently.
-- **Retirement:** Retire after released upstream bounds or offloads runtime FTS rebuilds so large databases cannot starve turns or trip the liveness watchdog, with equivalent regressions.
+- **Status:** Retired source-level cutoff. No runtime deployment or retirement rollout is claimed by this documentation correction.
+- **Independent hypothesis (2026-08-27):** The former unbounded runtime rebuild could hold the writer lock for minutes on large databases. The historical fix skipped runtime rebuilds above 1 GiB.
+- **Current evidence (2026-09-06):** The old byte-size cutoff is absent. `hermes_state_search.py::_try_runtime_fts_rebuild` uses cross-process rebuild admission and defers on contention. `hermes_state_fts.py::_enter_fts_fail_open` preserves canonical writes while marking damaged indexes stale. HERMES-054 attribution and present rebuild safeguards remain unchanged.
+- **Surfaces:** `hermes_state_search.py`; `hermes_state_fts.py`; `tests/state/test_fts_runtime_rebuild.py`; this record.
+- **Upstream tracking:** Compared current source with the report and integrated upstream behavior. This corrects the obsolete register, not a new upstream-equivalence claim about every FTS safeguard.
+- **Upstream PR:** None required for this fork-register correction.
+- **Regression:** `scripts/run_tests.sh tests/state/test_fts_runtime_rebuild.py`.
+- **Rollback:** Revert only this register correction if its evidence is disproven. Do not remove current FTS attribution, admission, fail-open, or rebuild code.
+- **Retirement:** Historical size cutoff already absent at base `bcf269ec56d45c175ecbd7b83e166b946ed2fb65`. Do not reintroduce it merely to match the old record.
 
 ### HERMES-049 — Schedule live adapter sends on the gateway-owned event loop
 

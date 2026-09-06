@@ -4193,11 +4193,10 @@ class GatewayRunner(
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
-    async def _run_in_executor_with_context(self, func, *args):
+    async def _run_in_executor_with_context(self, func, *args, _on_queued=None, _on_not_started=None):
         """Run blocking work in the thread pool while preserving session contextvars."""
-        loop = asyncio.get_running_loop()
-        ctx = copy_context()
-        return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
+        from gateway.run_executor import run_gateway_work
+        return await run_gateway_work(self._get_executor(), func, args, _on_queued, _on_not_started)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
@@ -4214,7 +4213,8 @@ class GatewayRunner(
                 # an eleventh concurrent long turn queued silently for minutes even though
                 # gateway session admission is uncapped; keep enough bounded I/O capacity
                 # for ordinary multi-topic use while retaining a hard process-level limit.
-                executor = concurrent.futures.ThreadPoolExecutor(
+                from gateway.run_executor import GatewayExecutor
+                executor = GatewayExecutor(
                     max_workers=32, thread_name_prefix="hermes-gateway")
                 self._executor = executor
             return executor
