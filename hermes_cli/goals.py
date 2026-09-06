@@ -1654,6 +1654,19 @@ class GoalManager:
         self._persist_state(self._state)
         return self._state
 
+    def edit(self, goal: str, *, contract: GoalContract) -> GoalState:
+        """Refine a completion contract without restarting the goal lifecycle."""
+        from dataclasses import replace
+
+        state = self.refresh()
+        if state is None:
+            raise ValueError("There is no goal to edit")
+        updated = replace(state, goal=goal, contract=contract)
+        self._touch_state(updated)
+        if not self._persist_state(updated):
+            raise RuntimeError("Failed to persist edited goal")
+        return updated
+
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         self.refresh()
         if not self._state:

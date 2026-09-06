@@ -22041,6 +22041,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        goal_user_text = "" if event.internal else (event.text or "")
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -24007,6 +24008,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _turn_started_monotonic = time.monotonic()
             goal_post_turn_state: Dict[str, bool] = {}
             agent_result = await self._run_agent(
+                goal_user_text=goal_user_text,
                 message=message_text,
                 context_prompt=context_prompt,
                 history=history,
@@ -32580,6 +32582,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _post_delivery_adapter: Optional[BasePlatformAdapter] = None,
         goal_session_entry: Any = None,
         goal_post_turn_state: Optional[Dict[str, bool]] = None,
+        goal_user_text: str = "",
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -32590,40 +32593,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                inbound_message_id=inbound_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
-                turn_reasoning_config=turn_reasoning_config,
-                _post_delivery_adapter=_post_delivery_adapter,
-                goal_session_entry=goal_session_entry,
-                goal_post_turn_state=goal_post_turn_state,
-            )
+        from tools.goal_authority import goal_user_request_scope
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                inbound_message_id=inbound_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
-                turn_reasoning_config=turn_reasoning_config,
-                _post_delivery_adapter=_post_delivery_adapter,
-                goal_session_entry=goal_session_entry,
-                goal_post_turn_state=goal_post_turn_state,
-            )
+        with goal_user_request_scope(session_id, goal_user_text):
+            if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    inbound_message_id=inbound_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                    turn_reasoning_config=turn_reasoning_config,
+                    _post_delivery_adapter=_post_delivery_adapter,
+                    goal_session_entry=goal_session_entry,
+                    goal_post_turn_state=goal_post_turn_state,
+                )
+
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    inbound_message_id=inbound_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                    turn_reasoning_config=turn_reasoning_config,
+                    _post_delivery_adapter=_post_delivery_adapter,
+                    goal_session_entry=goal_session_entry,
+                    goal_post_turn_state=goal_post_turn_state,
+                )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -34496,6 +34502,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
                 followup_result = await self._run_agent(
+                    goal_user_text=(pending_event.text or "") if pending_event is not None and not pending_event.internal else "",
                     message=next_message,
                     context_prompt=context_prompt,
                     history=updated_history,

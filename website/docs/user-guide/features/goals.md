@@ -69,21 +69,19 @@ What you'll see:
 4. **Loop fires if needed** — if `continue`, you'll see `↻ Continuing toward goal (1/20): <judge's reason>` and Hermes takes the next step automatically.
 5. **Terminates** — eventually you see either `✓ Goal achieved: <reason>` or `⏸ Goal paused — N/20 turns used`.
 
-## Natural-language activation
+## Agent-selected goals
 
-On interactive sessions, you can explicitly ask Hermes to create and start a goal without typing `/goal`:
+Hermes can select goal mode for authorized work with one bounded, verifiable outcome that benefits from sustained, result-dependent iteration. You do not need to say “set a goal.” Quick answers, small edits, mechanical checklists, unrelated backlogs, recurring monitoring, and blocked decisions are not good fits.
 
-```
-Set a goal to implement this feature, validate it end to end, and stop if deployment is required.
-```
+Before creating or editing, Hermes calls `set_goal` with `action="guide"`. This read-only action returns the current goal state and concise writing guidance. The always-visible tool description covers selection, not the full writing instructions.
 
-Hermes uses one `set_goal` tool for the complete goal lifecycle. It can inspect status, show contracts, set or draft a goal, pause or resume it, clear it, park or release waits, and list or mutate subgoals and quality gates. Mutations require exact authorization from the current user turn; read-only inspection does not. Writes are reported as successful only after persistent readback.
+Hermes synthesizes your intent and referenced context into a self-contained outcome, verification, constraints, boundaries, and stopping conditions. It does not require you to dictate those fields verbatim. Scope fidelity is an agent responsibility, not a text-matching guarantee. Goals preserve focus, not expand permission to act.
 
-When Hermes writes a goal, it keeps the headline to one concise outcome. Objective proof belongs in `verification`, non-negotiable limits belong in `constraints` and `boundaries`, and the exact stopping condition belongs in `stop_when`. Effective goals omit personas, generic exhortations, duplicated requirements, implementation diaries, speculative edge cases, and repository rules already supplied elsewhere.
+The same tool supports status, set/draft/edit, pause/resume/clear, waits, subgoals, and quality gates. `edit` refines the existing contract without resetting its status, budget, progress, wait barriers, or gates. Omitted contract fields are preserved. Control actions and replacement still require explicit current-turn authorization. Writes are reported as successful only after persistent readback.
 
-This is deliberately authorization-gated. An ordinary task, question, recommendation, or request to draft a possible goal does **not** authorize activation. A model-created goal also cannot silently replace an active or paused goal. Replacement requires explicit language such as "replace the active goal" in the current user turn.
+On messaging platforms, authorization uses the original message body separately from reply, channel, and timestamp context. Quoted instructions do not authorize goal changes. Synthetic turns cannot inherit fresh user authority.
 
-The `set_goal` tool is enabled by default only on interactive CLI, TUI/Desktop, and messaging sessions that own the goal continuation hook. Cron, webhooks, delegated agents, and batch runs are excluded. Synthetic turns may inspect goal state but cannot mutate it. Disable the `goal` toolset with `hermes tools` if you want slash-command-only control.
+The tool is enabled by default only on interactive CLI, TUI/Desktop, and messaging sessions that own the continuation hook. Cron, webhooks, delegated agents, and batch runs are excluded. Disable the `goal` toolset with `hermes tools` for slash-command-only control.
 
 ## Commands
 

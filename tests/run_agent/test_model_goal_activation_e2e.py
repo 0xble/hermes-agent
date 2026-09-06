@@ -67,16 +67,17 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
     agent.valid_tool_names = {"set_goal"}
     agent.enabled_toolsets = ["goal"]
 
-    request = "Set a goal to implement the parser and validate it works."
+    request = "Implement the parser and validate it works."
     tool_call = _tool_call(
         "set_goal",
         {
-            "goal": "Implement the parser and validate it works",
+            "goal": "Parser implementation passes compatibility and regression tests",
             "authorization_text": request,
             "max_turns": 6,
         },
     )
     agent.client.chat.completions.create.side_effect = [
+        _response(content=None, finish_reason="tool_calls", tool_calls=[_tool_call("set_goal", {"action": "guide"})]),
         _response(content=None, finish_reason="tool_calls", tool_calls=[tool_call]),
         _response(
             content="I added the first failing parser test and am implementing it now.",
@@ -97,14 +98,20 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
     state = goals.GoalManager(agent.session_id).state
     assert state is not None
     assert state.status == "active"
-    assert state.goal == "Implement the parser and validate it works"
+    assert state.goal == "Parser implementation passes compatibility and regression tests"
     assert state.max_turns == 6
 
-    second_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    calls = agent.client.chat.completions.create.call_args_list
+    from tools.goal_tool import GOAL_WRITING_GUIDANCE
+    assert GOAL_WRITING_GUIDANCE not in json.dumps(calls[0].kwargs["messages"])
+    assert GOAL_WRITING_GUIDANCE not in json.dumps(calls[0].kwargs.get("tools", []))
+    guide_result = next(m["content"] for m in calls[1].kwargs["messages"] if m["role"] == "tool")
+    assert json.loads(guide_result)["guidance"] == GOAL_WRITING_GUIDANCE
+    second_messages = calls[2].kwargs["messages"]
     roles = [message["role"] for message in second_messages]
     assert all(left != right for left, right in zip(roles[1:], roles[2:]))
     tool_result = next(
-        message["content"] for message in second_messages if message["role"] == "tool"
+        message["content"] for message in reversed(second_messages) if message["role"] == "tool"
     )
     receipt = json.loads(tool_result)
     assert receipt["success"] is True
