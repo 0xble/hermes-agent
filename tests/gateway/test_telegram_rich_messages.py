@@ -879,3 +879,84 @@ async def test_rich_payload_leaves_math_and_code_currency_alone():
     markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
     assert "`$2,000`" in markdown
     assert "$x^2$" in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("math", [
+    "$5$ + $6$ = $11$",
+    "$5.00$ + $6.00$ = $11.00$",
+    "$5x$ + $6y$",
+    "$5/2$ + $6^2$",
+    "$5 + x$ and $6 + y$",
+    "$$5 + 6 = 11$$",
+])
+async def test_rich_currency_preserves_closed_math(math):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    content = f"Math: {math}. Costs $5 or $6."
+    result = await adapter.send("12345", content)
+    assert result.success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert math in markdown
+    assert "Costs `$5` or `$6`." in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_dollar_entities_normalized_before_rich_fallback(operation):
+    adapter = _make_adapter(extra={"rich_messages": "always", "rich_drafts": True})
+    assert adapter._bot is not None
+    adapter._bot.do_api_request.side_effect = EndPointNotFound("endpoint unavailable")
+    content = "Costs &#36;3,000 or &#x24;15,000. Example: `&#36;5`."
+    if operation == "send":
+        result = await adapter.send("12345", content)
+        sent = adapter._bot.send_message.call_args.kwargs["text"]
+    elif operation == "edit":
+        result = await adapter.edit_message("12345", "1", content, finalize=True)
+        sent = adapter._bot.edit_message_text.call_args.kwargs["text"]
+    else:
+        result = await adapter.send_draft("12345", 1, content)
+        sent = adapter._bot.send_message_draft.call_args.kwargs["text"]
+    assert result.success
+    assert "$3,000" in sent and "$15,000" in sent
+    assert "&#36;5" in sent  # Authored code examples remain literal.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content,amounts", [
+    ("Bought $500 ($AAPL) and $300 ($MSFT) today.", ["$500", "$300"]),
+    ("Costs $5 or $6 per US$ unit.", ["$5", "$6"]),
+    ("Costs $5 or $6 ($2x$ is tax).", ["$5", "$6"]),
+])
+async def test_rich_currency_does_not_mask_financial_prose(content, amounts):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    for amount in amounts:
+        assert f"`{amount}`" in markdown
+    if "$2x$" in content:
+        assert "$2x$" in markdown
+
+
+@pytest.mark.asyncio
+async def test_dollar_entities_preserve_multiple_backtick_code():
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    content = "Code: ``&#36;5 and `literal` ``; costs &#36;5 or &#36;6."
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "``&#36;5 and `literal` ``" in markdown
+    assert "costs `$5` or `$6`." in markdown
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ticks", ["`", "``"])
+async def test_stray_backticks_do_not_mask_later_currency(ticks):
+    adapter = _make_adapter(extra={"rich_messages": "always"})
+    assert adapter._bot is not None
+    content = f"Use the {ticks} character.\nCosts &#36;5 or &#x24;6. Run {ticks}ls{ticks}."
+    assert (await adapter.send("12345", content)).success
+    markdown = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]["markdown"]
+    assert "Costs `$5` or `$6`." in markdown
+    assert "&#36;" not in markdown and "&#x24;" not in markdown
+    assert f"{ticks}ls{ticks}" in markdown

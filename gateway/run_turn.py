@@ -1923,6 +1923,7 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        goal_user_text = "" if event.internal else (event.text or "")
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -1962,6 +1963,7 @@ class GatewayTurnMixin:
             _turn_started_monotonic = time.monotonic()
             goal_post_turn_state: Dict[str, Any] = {}
             agent_result = await self._run_agent(
+                goal_user_text=goal_user_text,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
                 session_id=_run_start_session_id, session_key=session_key,
                 run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
@@ -2577,12 +2579,21 @@ class GatewayTurnMixin:
 
     async def _run_agent(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
-        source: SessionSource, session_id: str, **turn_kwargs,
+        source: SessionSource, session_id: str, goal_user_text: str = "", **turn_kwargs,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+        when multiplexing is off).
+
+        ``goal_user_text`` carries the USER's request text for this turn and is bound for the
+        duration of the run so goal mutation can be authorized against it. Internal/synthetic
+        turns must contribute empty text so self-injected content can never authorize a goal
+        change the user never asked for.
+        """
+        from tools.goal_authority import goal_user_request_scope
+
+        with goal_user_request_scope(session_id, goal_user_text):
+            with self._profile_scope_for_source(source):
+                return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3534,6 +3545,7 @@ class GatewayTurnMixin:
         await self._refresh_agent_cache_message_count(session_key, session_id)
 
         followup_result = await self._run_agent(
+            goal_user_text=(pending_event.text or "") if pending_event is not None and not pending_event.internal else "",
             message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,

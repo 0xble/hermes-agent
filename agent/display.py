@@ -551,6 +551,7 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
     if tool_name == "set_goal":
         action = str(args.get("action") or "set").strip().lower()
         verbs = {
+            "guide": "Loading goal-writing guidance", "edit": "Editing goal",
             "set": "Setting goal", "draft": "Drafting goal", "show": "Showing goal",
             "status": "Checking goal status", "pause": "Pausing goal",
             "resume": "Resuming goal", "clear": "Clearing goal", "wait": "Parking goal",
@@ -561,7 +562,7 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
             "gate_clear": "Clearing quality gates",
         }
         verb = verbs.get(action, "Managing goal")
-        preview_key = "goal" if action in {"set", "draft"} else (
+        preview_key = "goal" if action in {"set", "draft", "edit"} else (
             "text" if action == "subgoal_add" else "command" if action == "gate_add" else None
         )
         preview = _oneline(str(args.get(preview_key) or "")) if preview_key else ""

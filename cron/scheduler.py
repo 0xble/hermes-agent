@@ -2798,12 +2798,20 @@ def _teardown_cron_agent(
 def _deferred_agent_cleanup_timeout(agent) -> float:
     """Cap teardown by both the cleanup limit and a run's remaining total budget."""
     timeout = _cron_cleanup_timeout_seconds()
+    # Disabled cleanup stays disabled: an explicit non-positive limit must not be raised to the
+    # 0.1s floor below, which would turn "no cleanup" into "a little cleanup" (origin bcc8857589a,
+    # asserted by test_disabled_cleanup_timeout_preserves_inline_teardown).
+    if timeout <= 0:
+        return timeout
     deadline = getattr(agent, "_cron_total_run_deadline", None) if agent is not None else None
     if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
         return timeout
     remaining = _remaining_run_budget(float(deadline))
     assert remaining is not None
-    return min(timeout, remaining)
+    # Floor at 0.1s: an exhausted budget previously yielded exactly 0.0, which skips teardown
+    # entirely and leaks the agent's client resources. A spent budget still gets a bounded
+    # cleanup chance.
+    return min(timeout, max(0.1, remaining))
 
 
 def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:

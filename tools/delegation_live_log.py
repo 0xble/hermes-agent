@@ -228,6 +228,7 @@ def create_live_transcripts(
     task_list: List[Dict[str, Any]], context: Optional[str] = None,
     delegation_id: Optional[str] = None, model: Optional[str] = None,
     provider: Optional[str] = None,
+    routing: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """One pre-headered writer per task + a manifest.json; prunes stale dirs.
     Returns ``(delegation_id, writers, paths)``; on any top-level failure
@@ -243,7 +244,8 @@ def create_live_transcripts(
         paths: List[str] = [str(w.path) for w in made if w.path is not None]
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        _write_manifest(deleg_id, task_list, paths, model=model,
+                        provider=provider, routing=routing)
         return deleg_id, writers, paths
     return None, [None] * n, []
 
@@ -254,17 +256,43 @@ def _manifest_path(delegation_id: str) -> Path:
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    provider: Optional[str] = None,
+                    routing: Optional[List[Dict[str, Any]]] = None) -> None:
+    """Write the batch manifest, recording each child's OWN resolved route.
+
+    A mixed batch (e.g. one Luna explorer + one Terra worker) used to be
+    labelled with the first child's model at the top level and nothing
+    per-child, so the manifest actively misreported where half the batch ran.
+    Batch-level ``model``/``provider`` now collapse to ``"mixed"`` whenever the
+    children disagree, and the truth lives per task.
+    """
+    routing = routing or []
+
+    def _uniform(field: str, fallback):
+        # Only KNOWN values decide the batch label. An unresolved per-child
+        # field is "unknown", not a second distinct route: treating it as one
+        # would both erase the batch fallback (all unknown) and mislabel a
+        # single-route batch as mixed (some unknown).
+        values = {r.get(field) for r in routing if isinstance(r, dict) and r.get(field)}
+        if not values:
+            return fallback
+        if len(values) == 1:
+            return next(iter(values))
+        return "mixed"
+
     with _best_effort("manifest write"):
         _dump_json(_manifest_path(delegation_id), {
             "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
-            "task_count": len(task_list), "model": model, "provider": provider,
+            "task_count": len(task_list),
+            "model": _uniform("model", model), "provider": _uniform("provider", provider),
             "tasks": [{
                 "index": i,
                 # Same mounted dir as the .log files, so the goal needs the same redaction.
                 "goal": _redact(str(t.get("goal", ""))[:500]),
                 "log": paths[i] if i < len(paths) else None,
-                "status": "running"} for i, t in enumerate(task_list)]})
+                "status": "running",
+                **(routing[i] if i < len(routing) and isinstance(routing[i], dict) else {}),
+            } for i, t in enumerate(task_list)]})
 
 
 def update_manifest_statuses(delegation_id: Optional[str],

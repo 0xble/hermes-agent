@@ -122,6 +122,54 @@ def _source() -> SessionSource:
     )
 
 
+@pytest.mark.asyncio
+async def test_goal_continuation_accepts_queued_turn_controls(monkeypatch):
+    """The real continuation hook must accept the queued-drain call contract."""
+
+    class _ActiveGoalManager:
+        def __init__(self, *, session_id, default_max_turns):
+            self.session_id = session_id
+            self.default_max_turns = default_max_turns
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *_args, **_kwargs):
+            return {
+                "message": "Continuing.",
+                "should_continue": True,
+                "continuation_prompt": "Keep going.",
+            }
+
+    fake_goals = types.ModuleType("hermes_cli.goals")
+    setattr(fake_goals, "GoalManager", _ActiveGoalManager)
+    monkeypatch.setitem(sys.modules, "hermes_cli.goals", fake_goals)
+
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._goal_max_turns_from_config = lambda: 5
+    runner._warm_goals_session_db = AsyncMock()
+
+    async def _run_in_executor_with_context(call):
+        return call()
+
+    setattr(runner, "_run_in_executor_with_context", _run_in_executor_with_context)
+    runner._defer_goal_status_notice_after_delivery = AsyncMock()
+    runner._adapter_for_source = MagicMock()
+
+    await runner._post_turn_goal_continuation(
+        session_entry=SimpleNamespace(session_id="goal-session"),
+        source=_source(),
+        final_response="Done.",
+        session_key="agent:main:telegram:dm:12345",
+        enqueue_continuation=False,
+        emit_status_notice=False,
+    )
+
+    runner._warm_goals_session_db.assert_awaited_once_with("goal continuation")
+    runner._defer_goal_status_notice_after_delivery.assert_not_awaited()
+    runner._adapter_for_source.assert_not_called()
+
+
 def _setup_handler_runner(monkeypatch, tmp_path):
     """Build the smallest real handler harness needed for return-boundary QA."""
     fake_dotenv = types.ModuleType("dotenv")

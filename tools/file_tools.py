@@ -29,6 +29,7 @@ from tools.file_tools_paths import (
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
+    _check_shared_knowledge_write,
     _is_internal_file_tool_content)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
@@ -679,6 +680,9 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
             None if cross_profile else _check_cross_profile_path(p, task_id))
         if err:
             return err
+    knowledge_err = _check_shared_knowledge_write(paths, how="a patch")
+    if knowledge_err:
+        return knowledge_err
     for p in content_paths:
         err = _check_binary_document_write(p, task_id)
         if err:
@@ -723,6 +727,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     """
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
+           or _check_shared_knowledge_write([path], how="a write")
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)

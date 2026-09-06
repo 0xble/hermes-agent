@@ -94,6 +94,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+def _check_shared_knowledge_write(paths: list, how: str = "a write") -> str | None:
+    """Deny a delegated child's write to parent-owned memory/skills.
+
+    The specialized ``memory``/``skill_manage`` tools carried this rule alone,
+    which left write_file/patch as a straight bypass (reproduced against a
+    fixture home). Single owner: tools/knowledge_boundary.
+    """
+    from tools.knowledge_boundary import write_denial_reason
+
+    return write_denial_reason(paths, how=how)
+
+
 # ── Protected agent-instruction files (always-ask approval gate) ─────────
 # Files that steer FUTURE agent behavior are a prompt-injection persistence
 # vector (AGENTS.md / CLAUDE.md / SOUL.md / .cursorrules / project .hermes tree).

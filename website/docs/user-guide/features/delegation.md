@@ -65,13 +65,38 @@ delegate_task(tasks=[
 ])
 ```
 
-Names and concise descriptions appear in the delegation tool schema.
+Each configured role appears in the delegation tool schema with its purpose
+**and its resolved model and reasoning effort**, so the model can weigh cost and
+latency rather than guessing. Configuration — never the call site — fixes a
+role's provider, model, and effort; a named role's settings override the global
+`delegation.model` / `delegation.reasoning_effort` defaults for that role only.
+Omitting `subagent_type` keeps ordinary (legacy) delegation on those global
+defaults, unchanged. There is no keyword-based automatic router: choosing a
+role is the parent's judgment, informed by the advertised descriptions, and
+simple work should stay with the parent rather than be delegated at all.
+
+`delegation.subagents` is a registered configuration key, so
+`hermes config set delegation.subagents.explorer.model ...` validates the field
+name instead of warning about an unknown key. A misspelled field is rejected
+with the correct name suggested.
+
 `description` and `instructions` are required. `provider`, `model`, and
 `reasoning_effort` are optional, inheriting applicable delegation defaults and
 parent settings. An explicit provider requires an explicit model. Names use
 lowercase letters, digits, underscores, and hyphens, starting with a letter.
 Unknown names, malformed definitions, unknown fields, and unsupported explicit
-efforts fail before any member of the batch starts.
+efforts fail before any member of the batch starts, naming the specific invalid
+definition rather than silently dropping the selector. `action=list` / `steer` /
+`stop` never consult the registry, so children already running stay
+controllable while a broken definition is being fixed. If the delegation
+configuration cannot be *loaded* at all, spawning is refused outright — Hermes
+does not quietly substitute legacy defaults for roles you configured.
+
+A named role can only be launched on a route whose final physical request
+Hermes can inspect (`codex_responses`, `chat_completions`, `anthropic_messages`).
+Routes without such a boundary — Bedrock Converse, the in-process `moa`
+facade — are rejected at launch rather than accepted with a pinning guarantee
+that would not hold.
 
 Named children retain one resolved route and effort for their lifetime,
 including tool-loop continuations, retries, output correction, and iteration
@@ -84,22 +109,50 @@ error, not permission to substitute a model.
 
 Named children receive shared authorized skill discovery, launch-time standing
 memory, and read-only memory-provider/session retrieval. They do not receive the
-parent transcript automatically. Pass task context explicitly. Durable memory
-and skill changes remain parent-owned, including indirect tool dispatch and
-provider retention hooks. Provider tools without a declared read-only contract
-are unavailable to these children. Result metadata lists skipped or failed
-providers in `unavailable_memory_providers`; the parent must not claim retrieval
-from those providers. Hindsight `local_embedded` (and its legacy `local` alias)
-is unavailable in read-only children because starting its daemon can mutate
-state. Use an already managed `local_external` or cloud connection for shared
-Hindsight retrieval. This release does not start or reconfigure a daemon.
-This is an agent-tool authority boundary,
-not an OS sandbox: a child with terminal or ordinary file-write access is still
-a trusted coding agent. A persona's request not to edit project files is an
-instruction, not a filesystem permission boundary.
+parent transcript automatically. Pass task context explicitly. Provider tools
+without a declared read-only contract are unavailable to these children. Result
+metadata lists skipped or failed providers in `unavailable_memory_providers`;
+the parent must not claim retrieval from those providers. Hindsight
+`local_embedded` (and its legacy `local` alias) is unavailable in read-only
+children because starting its daemon can mutate state. Use an already managed
+`local_external` or cloud connection for shared Hindsight retrieval. This
+release does not start or reconfigure a daemon.
+
+### What the shared-knowledge boundary actually enforces
+
+Durable memory (`<HERMES_HOME>/memories`) and installed skills
+(`<HERMES_HOME>/skills`) are parent-owned. For a named child this is enforced
+at every write path Hermes mediates, not merely requested in the instructions:
+
+| Path | Behavior for a named child |
+| --- | --- |
+| `memory`, `skill_manage` | Denied |
+| `write_file` | Denied for any path under a protected root |
+| `patch` (replace and V4A `Update`/`Add`/`Delete`/`Move`) | Denied, both `Move` endpoints |
+| `terminal` | Command denied if it references a protected root, read or write |
+| `execute_code` | Source denied if it references a protected root |
+
+Everything else the child does is unaffected: ordinary project files, its own
+workspace, and the rest of the filesystem are writable exactly as before.
+
+**What this is not.** It is an agent-tool authority boundary, not an OS
+sandbox. The child runs in the parent's process, as the parent's user, with no
+kernel-level restriction. A subprocess that builds a protected path at runtime
+from pieces the command scan cannot see is not stopped by any of this. Treat a
+delegated child as a trusted coding agent whose *tool surface* is constrained,
+not as a jailed process. `boundary_report()` in `tools/knowledge_boundary.py`
+reports `shell_enforcement: "command_scan"` for exactly this reason — it never
+claims a sandbox it does not have.
+
+Likewise, a persona's request not to edit project files is an instruction, not
+a permission. Only the table above is enforced.
 
 Results include `subagent_type`, `provider`, `model`, `reasoning_effort`, and a
-nonsecret `route_category`. Cancellation, steering, concurrency, cleanup,
+nonsecret `route_category`. The live-transcript manifest records the same four
+facts **per child**, so a mixed batch (an `explorer` on one model and a `worker`
+on another) reports each child's own route; the batch-level `model`/`provider`
+read `"mixed"` when the children disagree rather than inheriting the first
+child's. Cancellation, steering, concurrency, cleanup,
 background delivery, and output-schema validation use native delegation.
 Omitting `subagent_type` preserves ordinary delegation. No registry means no
 additional schema field. Custom subagents do not define or alter AutoReview.
@@ -115,6 +168,31 @@ restores the ordinary selection surface.
 :::warning Critical: Subagents Know Nothing
 Subagents start with a **completely fresh conversation**. They do not automatically receive the parent's conversation history or prior tool calls. Pass the task-specific brief through `goal` and `context`. Named custom subagents also receive their standing instructions and authorized read-only shared knowledge.
 :::
+
+### Four things "isolated" does not mean
+
+`isolated` in this page always refers to the **conversation**. Four distinctions
+are worth stating outright, because conflating them leads to wrong assumptions
+about what a child can do:
+
+1. **Conversation isolation is not filesystem isolation.** A child gets a fresh
+   conversation and its own terminal session, but by default it shares the
+   parent's working directory and the whole filesystem. Set
+   `delegation.worktree_isolation: true` for a separate git worktree per child;
+   even then, only the working tree is separated, not the machine.
+2. **Read-only *instructions* are not enforced *permissions*.** A persona that
+   says "do not modify project files" is text. The only writes actually blocked
+   are the shared-knowledge paths in the table above.
+3. **Nesting is a global depth setting, not a property of a named role.**
+   Whether a child may delegate further comes from
+   `delegation.max_spawn_depth` / `orchestrator_enabled` and the child's depth.
+   No `subagent_type` grants, removes, or changes that.
+4. **Children are process-local, not durable jobs.** Subagents live inside the
+   parent Hermes process. `/stop`, session reset, or process exit discards
+   running children. Work that must survive the session belongs in `cronjob` or
+   `terminal(background=True, notify_on_complete=True)` — background delegation
+   defers *delivery* of a result, it does not make the child outlive the
+   process.
 
 One exception: when the parent has a resolved workspace directory, every subagent's system prompt embeds that workspace's **project context files** (`.hermes.md` > AGENTS.md chain > CLAUDE.md > `.cursorrules` — the same discovery, priority, and size caps as the main agent's system prompt; SOUL.md is excluded). Subagents working in a repo operate under the repo's own conventions without having to rediscover them.
 

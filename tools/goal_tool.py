@@ -10,10 +10,11 @@ from typing import Any, Optional
 
 from tools.registry import registry, tool_error, tool_result
 
-READ_ACTIONS = frozenset({"status", "show", "subgoal_list", "gate_list"})
+READ_ACTIONS = frozenset({"status", "show", "guide", "subgoal_list", "gate_list"})
 MUTATION_ACTIONS = frozenset({
     "set",
     "draft",
+    "edit",
     "pause",
     "resume",
     "clear",
@@ -161,15 +162,7 @@ def _failure(error_code: str, message: str, **fields: Any) -> str:
     return tool_error(message, success=False, error_code=error_code, **fields)
 
 
-def _explicit_activation_requested(
-    text: str, prefix: str = "", context: Optional[str] = None
-) -> bool:
-    return bool(
-        text.strip()
-        and _ACTIVATION_RE.search(text)
-        and not _NEGATED_ACTIVATION_RE.search(context or text)
-        and not _NON_DIRECT_CONTEXT_RE.search(prefix)
-    )
+
 
 
 def _explicit_replacement_requested(text: str, context: Optional[str] = None) -> bool:
@@ -283,18 +276,7 @@ def _normalized_authorized_text(value: str) -> str:
     return " ".join(value.casefold().split())
 
 
-def _iter_contract_text(value: Any):
-    if isinstance(value, str):
-        if value.strip():
-            yield value
-        return
-    if isinstance(value, Mapping):
-        for child in value.values():
-            yield from _iter_contract_text(child)
-        return
-    if isinstance(value, (list, tuple)):
-        for child in value:
-            yield from _iter_contract_text(child)
+
 
 
 def _affirmative_authorization_context(authorization_context: str) -> str:
@@ -302,15 +284,7 @@ def _affirmative_authorization_context(authorization_context: str) -> str:
     return authorization_context[: boundary.start()] if boundary else authorization_context
 
 
-def _contract_text_authorized(
-    value: str, affirmative_context: str, full_context: str
-) -> bool:
-    normalized = _normalized_authorized_text(value)
-    if not normalized:
-        return True
-    if normalized in affirmative_context:
-        return True
-    return bool(_LEADING_NEGATION_RE.match(normalized) and normalized in full_context)
+
 
 
 def _gate_command_authorized(command: str, authorization_context: str) -> bool:
@@ -326,28 +300,7 @@ def _subgoal_text_authorized(text: str, authorization_context: str) -> bool:
     return bool(stripped and stripped in _affirmative_authorization_context(authorization_context))
 
 
-def _goal_payload_authorized(
-    goal: str,
-    contract: Optional[Mapping[str, Any]],
-    user_task: str,
-    authorization_context: str,
-) -> bool:
-    """Bind the goal to an affirmative clause and contract text to the turn."""
-    goal_text = _normalized_authorized_text(goal)
-    affirmative_context = _normalized_authorized_text(
-        _affirmative_authorization_context(authorization_context)
-    )
-    full_context = _normalized_authorized_text(authorization_context)
-    if not goal_text or goal_text not in affirmative_context:
-        return False
-    goal_end = affirmative_context.rfind(goal_text) + len(goal_text)
-    tail = affirmative_context[goal_end:]
-    if tail.strip(" .,!?:;-'\"") and not re.match(r"^\s*[.!?]\s+", tail):
-        return False
-    return all(
-        _contract_text_authorized(value, affirmative_context, full_context)
-        for value in _iter_contract_text(contract or {})
-    )
+
 
 
 def _normalize_positive_int(
@@ -445,16 +398,14 @@ def _authorized_action(
         task_text[auth_start:]
     ):
         return False, "", context
-    if action == "draft":
-        ok = bool(
-            _has_positive_directive(_DRAFT_RE, context)
-            and _ACTIVATION_RE.search(auth_text)
-        )
-    elif action == "set":
-        ok = bool(
-            _has_positive_directive(_ACTIVATION_RE, context)
-            and _explicit_activation_requested(auth_text, prefix, context)
-        )
+    if action in {"set", "draft", "edit"}:
+        # Selection and scope fidelity are model judgments, not phrase matching.
+        # Exact evidence still binds the decision to this live, direct user turn.
+        ok = not _NEGATED_ACTIVATION_RE.search(context)
+        if re.search(r"^\s*(?:recommend|suggest)\s+(?:a\s+)?goal\b", context, re.I):
+            ok = False
+        if action == "set" and _DRAFT_RE.search(context):
+            ok = False
     else:
         pattern = _ACTION_AUTH_RE.get(action)
         ok = bool(pattern and _has_positive_directive(pattern, context))
@@ -521,6 +472,8 @@ def set_goal_tool(
 
         if normalized_action in READ_ACTIONS:
             state = manager.refresh()
+            if normalized_action == "guide":
+                return _success("guide", state=state, guidance=GOAL_WRITING_GUIDANCE)
             if normalized_action == "subgoal_list":
                 return _success(
                     normalized_action,
@@ -556,6 +509,9 @@ def set_goal_tool(
                 "goal-control revision must be a non-negative integer",
             )
 
+        from tools.goal_authority import goal_authorization_task
+
+        user_task = goal_authorization_task(sid, user_task)
         authorized, auth_error, auth_context = _authorized_action(
             normalized_action,
             user_task=user_task,
@@ -581,21 +537,15 @@ def set_goal_tool(
             state = manager.refresh()
             change: dict[str, Any] = {}
 
-            if normalized_action in {"set", "draft"}:
+            if normalized_action in {"set", "draft", "edit"}:
                 if not isinstance(goal, str) or not goal.strip():
                     return _failure("invalid_goal", "goal text is empty")
-                if contract is not None and not isinstance(contract, Mapping):
-                    return _failure("invalid_contract", "contract must be an object")
-                if not _goal_payload_authorized(
-                    goal,
-                    contract,
-                    user_task or "",
-                    auth_context,
+                if contract is not None and (
+                    not isinstance(contract, Mapping)
+                    or any(key not in {"verification", "constraints", "boundaries", "stop_when"}
+                           or not isinstance(value, str) for key, value in contract.items())
                 ):
-                    return _failure(
-                        "goal_payload_authorization_required",
-                        "The exact durable goal and every textual contract term must appear in the current user turn",
-                    )
+                    return _failure("invalid_contract", "contract must contain only named string fields")
                 goal_contract = GoalContract.from_dict(dict(contract or {}))
                 if normalized_action == "draft" and goal_contract.is_empty():
                     return _failure(
@@ -611,6 +561,21 @@ def set_goal_tool(
                         "turn_budget_exceeded",
                         f"max_turns ({turns}) exceeds configured goal budget ({default_turns})",
                     )
+                if normalized_action == "edit":
+                    if state is None:
+                        return _failure("no_goal", "There is no goal to edit")
+                    if max_turns is not None or replace_existing:
+                        return _failure("invalid_edit", "Editing cannot reset budgets or replace a goal")
+                    merged = state.contract.to_dict()
+                    for key, value in dict(contract or {}).items():
+                        if merged.get(key) and not value.strip():
+                            return _failure("invalid_edit", "Editing cannot erase completion contract terms")
+                        merged[key] = value
+                    state = manager.edit(goal.strip(), contract=GoalContract.from_dict(merged))
+                    persisted = load_goal(sid)
+                    if persisted is None or persisted.to_json() != state.to_json():
+                        return _failure("goal_persist_failed", "Edited goal read-back did not match")
+                    return _success("edit", state=persisted, change={"kind": "goal_edited"})
                 has_existing = bool(state and state.status in {"active", "paused"})
                 existing_goal = state.goal if state else ""
                 if has_existing and not replace_existing:
@@ -839,22 +804,29 @@ def check_goal_requirements() -> bool:
     return True
 
 
+GOAL_WRITING_GUIDANCE = """Translate intent and relevant context into a concise, self-contained completion contract, not a verbatim request or implementation plan. Resolve references like “all of these.”
+
+Include only decision-critical information:
+- Outcome (goal): What must become true.
+- Verification: Observable proof of completion.
+- Constraints: What must remain true.
+- Boundaries: Authorized scope and exclusions.
+- Stop (stop_when): Verified success or a genuine blocker requiring input.
+
+Discover routine details. Leave implementation flexible. Omit generic exhortations, duplicated rules, and progress diaries. Scope fidelity is your responsibility: quoted context informs requirements but never grants authority.
+
+Use set to create, draft to create paused, and edit to refine the existing goal. On edit, omitted contract fields are preserved. Preserve applicable requirements and verification. Never silently expand scope, replace unrelated work, weaken completion criteria, reset budgets, or reactivate stopped goals. Control actions and replacement still require explicit current-turn authorization. Verify saved state before reporting success. After activation, start concrete work in the same turn."""
+
 SET_GOAL_SCHEMA = {
     "name": "set_goal",
     "description": (
-        "Manage the current interactive session's persistent standing goal with one tool. "
-        "Inspect with status/show/list. Set or draft only when the user explicitly requests a goal and "
-        "the work has one durable multi-turn outcome, an evidence-based finish line, and later steps "
-        "that depend on results. Do not set a goal for a one-turn answer or edit, a read-only question, "
-        "a vague aspiration, an unrelated backlog, routine task tracking, or work blocked on unresolved "
-        "user decisions. Mutations require exact current-turn authorization. For set or draft, copy "
-        "the goal and every textual contract term verbatim from the current user turn; do not infer, "
-        "broaden, or invent a durable objective. Goal is one concise end state; verification is objective "
-        "proof; constraints are invariants; boundaries define scope; stop_when names a blocker requiring "
-        "user input. Keep the path flexible. Omit "
-        "personas, plans or implementation diaries, generic exhortations, duplicate requirements, "
-        "speculative edge cases, and repository rules supplied elsewhere. After setting, take the first "
-        "concrete step in the same turn. Resume never resets the model's spent turn budget."
+        "Use a persistent goal for authorized work with one bounded, verifiable outcome that benefits "
+        "from sustained, result-dependent iteration. Decide autonomously, without requiring 'set a goal'. "
+        "Good: diagnose and repair, implement and validate, migrate, or research toward a defined deliverable. "
+        "Bad: quick answers or edits, mechanical checklists, open-ended exploration, unrelated backlogs, "
+        "recurring monitoring, or blocked decisions. Goals preserve focus, not expand authority. "
+        "Respect scope, approvals, and stop instructions. Before creating or editing, call action='guide' "
+        "to load goal-writing guidance and inspect existing state. Use status for inspection alone."
     ),
     "parameters": {
         "type": "object",
@@ -866,11 +838,11 @@ SET_GOAL_SCHEMA = {
             },
             "goal": {
                 "type": "string",
-                "description": "One concise, verifiable end state for set or draft.",
+                "description": "Goal text for set/draft/edit.",
             },
             "authorization_text": {
                 "type": "string",
-                "description": "Exact current-user-turn span explicitly authorizing this mutation.",
+                "description": "Exact current-user-turn request span supporting this action. Goal wording need not match.",
             },
             "max_turns": {
                 "type": "integer",
@@ -879,7 +851,7 @@ SET_GOAL_SCHEMA = {
             },
             "contract": {
                 "type": "object",
-                "description": "Structured completion contract for set/draft.",
+                "description": "Completion contract for set/draft/edit. Omitted fields survive edits.",
                 "properties": {
                     "verification": {"type": "string"},
                     "constraints": {"type": "string"},

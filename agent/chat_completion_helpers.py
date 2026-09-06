@@ -630,6 +630,27 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     return finish(raw_response)
 
 
+def enforce_delegation_pin(agent, kwargs: dict, *, client=None) -> None:
+    """Assert a named subagent's pinned route at the FINAL request boundary.
+
+    ``_build_api_kwargs`` validates early, but middleware, fallback chains and
+    client replacement all run after that — so the only check that proves what
+    was actually sent is this one, immediately before the SDK call, with the
+    client that sends it. No-op for the parent and for unnamed delegation.
+
+    The Codex wire performs the same assertion inside
+    ``agent.codex_runtime._open_codex_stream``; this covers the OpenAI-wire and
+    Anthropic-wire dispatches, streaming and non-streaming alike — a route
+    declared pinnable must be checked on EVERY way it reaches the network, or
+    the guarantee is only true for whichever shape happened to be wired up.
+    Routes with no comparable hook are rejected at launch instead
+    (``custom_subagents.pinning_support_error``).
+    """
+    pin = getattr(agent, "_delegation_runtime_pin", None)
+    if pin is not None:
+        pin.validate_request(agent, kwargs, client=client)
+
+
 def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
@@ -645,6 +666,10 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # Request-local client so the stale/interrupt watchdog aborts sockets
         # from the stranger thread while the worker owns the SDK close (#67142).
         request_client = make_client("anthropic_messages_request", kind="anthropic_messages")
+        # Validate the named-subagent route at the FINAL physical request, with the client that
+        # will actually send it — middleware, fallback chains and client replacement all happen
+        # after launch, so a launch-time check alone can be routed around.
+        enforce_delegation_pin(agent, api_kwargs, client=request_client)
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
         return _bedrock_converse_call(api_kwargs, stream=False)
@@ -658,7 +683,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
         return agent.client.chat.completions.create(**api_kwargs)
-    return make_client("chat_completion_request").chat.completions.create(**api_kwargs)
+    request_client = make_client("chat_completion_request")
+    enforce_delegation_pin(agent, api_kwargs, client=request_client)
+    return request_client.chat.completions.create(**api_kwargs)
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2886,6 +2913,10 @@ class _StreamingCall:
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
+        # Validate the named-subagent route at the FINAL physical request, with the client that
+        # will actually send it. Checking only at launch can be routed around by middleware,
+        # fallback chains, or client replacement — all of which happen after launch.
+        enforce_delegation_pin(self.agent, stream_kwargs, client=request_client)
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
         return request_client.chat.completions.create(**stream_kwargs)
@@ -3175,6 +3206,7 @@ class _StreamingCall:
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(final_kwargs, log_prefix=getattr(self.agent, "log_prefix", ""))
+            enforce_delegation_pin(agent, final_kwargs, client=request_client)
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()
