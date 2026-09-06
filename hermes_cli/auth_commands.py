@@ -400,7 +400,9 @@ def auth_list_command(args) -> None:
             marker = "← " if current is not None and entry.id == current.id else "  "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            print(
+                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} id={entry.id:<8} "
+                f"priority={entry.priority:<2} {source}{status} {marker}".rstrip())
         print()
     _print_oauth_heal_notices()
 

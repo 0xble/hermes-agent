@@ -1373,3 +1373,50 @@ def test_auth_refresh_reports_adopted_tokens_when_status_not_cleared(tmp_path, m
     assert "Adopted current tokens for openai-codex credential #1" in out
     assert "status still: exhausted" in out
     assert "Refreshed" not in out
+
+
+def test_auth_list_shows_entry_id_and_priority(tmp_path, monkeypatch, capsys):
+    """`auth list` must print the id and priority that `remove`/`reset` targets and
+    `fill_first` ordering depend on; neither was visible before."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-api-primary",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-ant-api-secondary",
+                    },
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_list_command
+
+    auth_list_command(type("Args", (), {"provider": "anthropic"})())
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip().startswith("#")]
+    assert len(lines) == 2
+    assert "id=cred-1" in lines[0] and "priority=0" in lines[0]
+    assert "id=cred-2" in lines[1] and "priority=1" in lines[1]

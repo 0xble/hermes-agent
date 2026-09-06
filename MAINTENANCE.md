@@ -139,6 +139,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-115 | Active | `feat(update): bind promotion to an immutable revision` | Prepare an exact Git revision, retain source rollback identity and reject version drift. |
 | HERMES-116 | Active | `feat(auth): reset one pooled credential by target` | Let `hermes auth reset <provider> [target]` clear one credential's exhaustion state without returning still-exhausted siblings to rotation. |
 | HERMES-117 | Active | `feat(auth): add hermes auth refresh for pooled OAuth credentials` | Add `hermes auth refresh <provider> [target]` to force one pooled OAuth credential through the pool's refresh path, rotating its tokens and clearing its cooldown. |
+| HERMES-118 | Active | `feat(auth): show entry id and priority in auth list` | Print each credential's entry id and `fill_first` priority in `hermes auth list`. |
 
 ## Fork-only administrative subject exemptions
 
@@ -252,6 +253,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-118 — Show entry id and priority in auth list
+
+- **Summary:** `hermes auth list` prints `id=<entry id>` and `priority=<n>` on every row. `auth remove`/`auth reset`/`auth priority` accept an entry id and `resolve_target()` tells the user to use one on ambiguous labels, but nothing printed ids; `priority` decides `fill_first` order and was invisible.
+- **Surfaces:** `hermes_cli/auth_commands.py` (`auth_list_command`), `tests/hermes_cli/test_auth_commands.py`, `website/docs/user-guide/features/credential-pools.md`, and this manifest.
+- **Upstream tracking:** Issue #104636 (open, filed 2026-09-06).
+- **Upstream PR:** Direct: #104662 (open, filed 2026-09-06) implements this exact behavior from the same commit.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_auth_commands.py -q` covers both columns on a two-entry pool. Sabotage: fails with the code change removed.
+- **Published commit identity:** Stable subject `feat(auth): show entry id and priority in auth list`.
+- **Rollback:** Revert only that stable-subject commit. Output-only change.
+- **Retirement:** Retire when a released upstream `hermes auth list` shows entry id and priority.
 
 ### HERMES-117 — Add hermes auth refresh for pooled OAuth credentials
 

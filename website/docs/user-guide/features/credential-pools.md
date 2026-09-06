@@ -65,13 +65,13 @@ hermes auth list
 Output:
 ```
 openrouter (2 credentials):
-  #1  OPENROUTER_API_KEY   api_key env:OPENROUTER_API_KEY ←
-  #2  backup-key           api_key manual
+  #1  OPENROUTER_API_KEY   api_key id=3f9a1c   priority=0  env:OPENROUTER_API_KEY ←
+  #2  backup-key           api_key id=b7e204   priority=1  manual
 
 anthropic (3 credentials):
-  #1  hermes_pkce          oauth   hermes_pkce ←
-  #2  claude_code          oauth   claude_code
-  #3  ANTHROPIC_API_KEY    api_key env:ANTHROPIC_API_KEY
+  #1  hermes_pkce          oauth   id=91c0de   priority=0  hermes_pkce ←
+  #2  claude_code          oauth   id=4d8a77   priority=1  claude_code
+  #3  ANTHROPIC_API_KEY    api_key id=e12f5b   priority=2  env:ANTHROPIC_API_KEY
 ```
 
 The `←` marks the currently selected credential.
@@ -162,7 +162,7 @@ When you set up a custom endpoint via `hermes model`, it auto-generates a name l
 hermes auth list
 # Shows:
 #   Together.ai (1 credential):
-#     #1  config key    api_key config:Together.ai ←
+#     #1  config key    api_key id=a0c3f9   priority=0  config:Together.ai ←
 
 # Add a second key for the same endpoint:
 hermes auth add Together.ai --api-key sk-together-second-key
