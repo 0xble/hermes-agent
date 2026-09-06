@@ -41,6 +41,21 @@ def emit_terminal_post_tool_call(
     middleware_trace: Optional[list] = None,
 ) -> None:
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
+    if function_name == "set_goal":
+        try:
+            from agent.credits_tracker import AgentNotice
+
+            receipt = json.loads(result) if isinstance(result, str) else result
+            if (isinstance(receipt, dict) and receipt.get("success") is True
+                    and receipt.get("persisted") is True and receipt.get("change")
+                    and isinstance(receipt.get("notice"), str) and receipt["notice"]):
+                if getattr(agent, "notice_callback", None):
+                    agent._emit_notice(AgentNotice(text=receipt["notice"], level="info"))
+                else:
+                    agent._vprint(receipt["notice"], force=True)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("Goal notice delivery failed", exc_info=True)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(

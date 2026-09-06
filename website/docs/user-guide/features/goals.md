@@ -73,6 +73,8 @@ What you'll see:
 
 Hermes can select goal mode for authorized work with one bounded, verifiable outcome that benefits from sustained, result-dependent iteration. You do not need to say “set a goal.” Quick answers, small edits, mechanical checklists, unrelated backlogs, recurring monitoring, and blocked decisions are not good fits.
 
+Successful agent-driven goal changes emit a separate confirmation through the normal notice channel, not just the transient tool-progress label. Set and edit confirmations include the saved goal, completion contract, and `/goal` controls. Lifecycle, subgoal, and gate changes identify what changed. Read-only checks and rejected changes do not emit success confirmations. The same confirmation text is retained in the tool receipt for audit, and notification formatting does not change goal authority or scheduling.
+
 Before creating or editing, Hermes calls `set_goal` with `action="guide"`. This read-only action returns the current goal state and concise writing guidance. The always-visible tool description covers selection, not the full writing instructions.
 
 Hermes synthesizes your intent and referenced context into a self-contained outcome, verification, constraints, boundaries, and stopping conditions. It does not require you to dictate those fields verbatim. Scope fidelity is an agent responsibility, not a text-matching guarantee. Goals preserve focus, not expand permission to act.

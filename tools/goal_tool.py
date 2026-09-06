@@ -415,6 +415,15 @@ def _authorized_action(
 def _success(
     action: str, *, state: Any, change: Optional[dict[str, Any]] = None, **fields: Any
 ) -> str:
+    from hermes_cli.goal_display import format_goal_change
+
+    if change and state is not None:
+        try:
+            fields["notice"] = format_goal_change(action, state, change)
+        except Exception:
+            # Presentation must not turn a committed mutation into a retryable failure.
+            import logging
+            logging.getLogger(__name__).exception("Could not format goal confirmation")
     return tool_result(
         success=True,
         persisted=True,

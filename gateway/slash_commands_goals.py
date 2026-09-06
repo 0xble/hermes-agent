@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 
 from agent.i18n import t
+from hermes_cli.goal_display import format_goal_change
 from gateway.platforms.base import MessageEvent, MessageType
 
 # Log-record parity with gateway/run.py and the origin module.
@@ -61,7 +62,7 @@ class GatewayGoalCommandsMixin:
             if state is None:
                 return t("gateway.goal.no_goal_set")
             self._clear_goal_continuations(event, "pause")
-            return t("gateway.goal.paused", goal=state.goal)
+            return format_goal_change("pause", state)
         if lower == "resume":
             return self._goal_resume(mgr, event)
         # Verb-prefixed forms take the remainder as their argument.
@@ -109,7 +110,7 @@ class GatewayGoalCommandsMixin:
         self._enqueue_goal_turn(
             event, mgr.next_continuation_prompt(), label="resume: continuation enqueue", kickoff=False
         )
-        return t("gateway.goal.resumed", goal=state.goal)
+        return format_goal_change("resume", state)
 
     @staticmethod
     def _goal_wait(mgr, wait_arg: str, event: MessageEvent) -> str:
@@ -201,10 +202,8 @@ class GatewayGoalCommandsMixin:
             event, state.goal, label="kickoff enqueue", kickoff=True, route=self._adapter_and_key_for(event)
         )
 
-        base = t("gateway.goal.set", budget=state.max_turns, goal=state.goal)
-        if state.has_contract():
-            return f"{base}\nCompletion contract:\n{state.contract.render_block()}"
-        if drafting:
+        base = format_goal_change("set", state)
+        if drafting and not state.has_contract():
             return f"{base}\n(Couldn't draft a contract — running as a free-form goal.)"
         return base
 

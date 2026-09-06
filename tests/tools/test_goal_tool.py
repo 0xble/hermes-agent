@@ -30,7 +30,13 @@ def call_goal(**kwargs):
         )
     if kwargs.get("user_task") is not None:
         kwargs.setdefault("authorization_text", kwargs["user_task"])
-    return json.loads(set_goal(**kwargs))
+    result = json.loads(set_goal(**kwargs))
+    if result.get("success") and result.get("change"):
+        assert result["state"]["goal"] in result["notice"]
+        assert "/goal status" in result["notice"]
+    else:
+        assert "notice" not in result
+    return result
 
 
 def test_explicit_request_persists_contract_and_activates(isolated_goal_db):

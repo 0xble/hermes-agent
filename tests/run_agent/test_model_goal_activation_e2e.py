@@ -57,6 +57,8 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
             skip_memory=True,
         )
 
+    notices = []
+    agent.notice_callback = notices.append
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
@@ -116,5 +118,9 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
     receipt = json.loads(tool_result)
     assert receipt["success"] is True
     assert receipt["goal"] == state.goal
+    assert len(notices) == 1
+    assert state.goal in notices[0].text
+    assert "/goal status" in notices[0].text
+    assert notices[0].text == receipt["notice"]
 
     goals._DB_CACHE.clear()

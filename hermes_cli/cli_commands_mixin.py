@@ -2310,11 +2310,8 @@ class CLICommandsMixin:
                          contract=contract if not contract.is_empty() else None)
         if state is _FAILED:
             return
-        self._print_goal_set(state, "Completion contract:")
-        against = " against the contract above" if state.has_contract() else ""
-        _cp(_dim_line(f"After each turn, a judge model checks if the goal is done{against}. "
-                      "Hermes keeps working until it is, you pause/clear it, or the budget is "
-                      "exhausted. Use /goal status, /goal show, /goal pause, /goal resume, /goal clear."))
+        from hermes_cli.goal_display import format_goal_change
+        _cp(format_goal_change("set", state))
         self._kick_goal(state.goal)
 
     def _print_goal_set(self, state, contract_label: str) -> None:
