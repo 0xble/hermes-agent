@@ -391,6 +391,14 @@ class TestConfig:
         assert p._retain_source == "cogoport"
         assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"
 
+    def test_explicit_empty_retain_settings_do_not_inherit_env(self, provider_with_config, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_RETAIN_TAGS", "parent-tag")
+        monkeypatch.setenv("HINDSIGHT_RETAIN_SOURCE", "parent-source")
+        p = provider_with_config(retain_tags=[], retain_source="")
+        assert p._retain_tags == []
+        assert p._tags is None
+        assert p._retain_source == ""
+
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
             "llm_provider": "openai",
