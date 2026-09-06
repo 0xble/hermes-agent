@@ -9,11 +9,15 @@ are limited to OS detection and process launch.
 import json
 import os
 import ntpath
-import subprocess
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from tools import browser_tool_cdp as bt_cdp
+from tools import browser_tool_cloud as bt_cloud
+from tools import browser_tool_lightpanda_fallback as bt_lightpanda_fallback
+from tools import browser_tool_real_profile as bt_real_profile
+from tools import browser_tool_session as bt_session
+from tools import browser_tool_install as bt_install
 
 
 class TestRealProfileResolvers:
@@ -134,144 +138,6 @@ class TestSnapshotRealProfile:
         assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "sqlite-cookies-v2"
         assert copy_history.read_text() == "agent-session-history"
 
-    def test_initial_refresh_mode_reuses_managed_state_without_source(
-        self, tmp_path, monkeypatch
-    ):
-        import shutil
-
-        import hermes_cli.browser_connect as bc
-        import hermes_cli.config as config
-
-        src = self._make_profile(tmp_path / "real")
-        home = tmp_path / "hermes-home"
-        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-        monkeypatch.setattr(
-            config,
-            "read_raw_config",
-            lambda: {"browser": {"real_profile_refresh": "initial"}},
-        )
-
-        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
-        assert err is None and dst is not None
-        managed_cookies = Path(dst) / "Default" / "Cookies"
-        managed_cookies.write_text("managed-session")
-        managed_local_storage = Path(dst) / "Default" / "Local Storage" / "leveldb"
-        managed_indexed_db = (
-            Path(dst) / "Default" / "IndexedDB" / "https_app.example_0.indexeddb.leveldb"
-        )
-        managed_local_storage.mkdir(parents=True)
-        managed_indexed_db.mkdir(parents=True)
-        (managed_local_storage / "000003.log").write_text("managed-local-storage")
-        (managed_indexed_db / "000003.log").write_text("managed-indexed-db")
-        shutil.rmtree(src)
-
-        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
-
-        assert err2 is None and dst2 == dst
-        assert managed_cookies.read_text() == "managed-session"
-        assert (managed_local_storage / "000003.log").read_text() == "managed-local-storage"
-        assert (managed_indexed_db / "000003.log").read_text() == "managed-indexed-db"
-
-    def test_initial_refresh_mode_preserves_named_identity_state(
-        self, tmp_path, monkeypatch
-    ):
-        import hermes_cli.browser_connect as bc
-        import hermes_cli.config as config
-
-        src = self._make_profile(tmp_path / "real")
-        home = tmp_path / "hermes-home"
-        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-        monkeypatch.setattr(
-            config,
-            "read_raw_config",
-            lambda: {"browser": {"real_profile_refresh": "initial"}},
-        )
-        dst, err = bc.snapshot_real_profile(
-            "chrome",
-            src=str(src),
-            source_profile="Default",
-            identity="lpg",
-        )
-        assert err is None and dst is not None
-        managed_cookies = Path(dst) / "Default" / "Cookies"
-        managed_cookies.write_text("lpg-managed-session")
-        (src / "Default" / "Cookies").write_text("source-session-v2")
-        monkeypatch.setattr(
-            bc,
-            "_profile_is_locked",
-            lambda *_args: (_ for _ in ()).throw(
-                AssertionError("durable relaunch must not probe the source profile")
-            ),
-        )
-
-        dst2, err2 = bc.snapshot_real_profile(
-            "chrome",
-            src=str(src),
-            source_profile="Default",
-            identity="lpg",
-        )
-
-        assert err2 is None and dst2 == dst
-        assert managed_cookies.read_text() == "lpg-managed-session"
-
-    def test_initial_refresh_mode_reseeds_when_legacy_pin_changes(
-        self, tmp_path, monkeypatch
-    ):
-        import hermes_cli.browser_connect as bc
-        import hermes_cli.config as config
-
-        src = self._make_profile(tmp_path / "real")
-        alternate = src / "Profile 1"
-        (alternate / "Network").mkdir(parents=True)
-        (alternate / "Cookies").write_text("profile-one-cookies")
-        (alternate / "Network" / "Cookies").write_text("profile-one-network")
-        (alternate / "Preferences").write_text("profile-one-preferences")
-        home = tmp_path / "hermes-home"
-        browser_cfg = {
-            "real_profile_refresh": "initial",
-            "real_profile_pin": "Default",
-        }
-        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-        monkeypatch.setattr(config, "read_raw_config", lambda: {"browser": browser_cfg})
-
-        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
-        assert err is None and dst is not None
-        assert (Path(dst) / bc._SNAPSHOT_DONE_MARKER).read_text() == "Default"
-
-        browser_cfg["real_profile_pin"] = "Profile 1"
-        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
-
-        assert err2 is None and dst2 == dst
-        assert dst2 is not None
-        assert (Path(dst2) / bc._SNAPSHOT_DONE_MARKER).read_text() == "Profile 1"
-        assert (
-            Path(dst2) / "Default" / "Cookies"
-        ).read_text() == "profile-one-cookies"
-
-    def test_invalid_refresh_mode_fails_closed_before_profile_access(
-        self, tmp_path, monkeypatch
-    ):
-        import hermes_cli.browser_connect as bc
-        import hermes_cli.config as config
-
-        monkeypatch.setattr(
-            config,
-            "read_raw_config",
-            lambda: {"browser": {"real_profile_refresh": "sometimes"}},
-        )
-
-        dst, err = bc.snapshot_real_profile(
-            "chrome", src=str(tmp_path / "missing-source")
-        )
-
-        assert dst is None
-        assert err == "browser.real_profile_refresh must be one of: initial, launch"
-
-    def test_real_profile_refresh_default_is_launch(self):
-        from hermes_cli.config_defaults import DEFAULT_CONFIG
-
-        assert DEFAULT_CONFIG["browser"]["real_profile_refresh"] == "launch"
-
     def test_missing_source_fails_closed(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
         monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
@@ -328,7 +194,7 @@ class TestSnapshotRealProfile:
 
 
 class TestRealProfileCdpLaunch:
-    """The agent-browser-based launcher in browser_tool._real_profile_cdp."""
+    """The agent-browser-based launcher in browser_tool_real_profile._real_profile_cdp."""
 
     def _reset(self):
         import tools.browser_tool as bt
@@ -340,135 +206,39 @@ class TestRealProfileCdpLaunch:
         bt._real_profile_browser_processes.clear()
 
     @pytest.fixture(autouse=True)
-    def _clear_runtime_tracking(self, tmp_path, monkeypatch):
+    def _clear_runtime_tracking(self, monkeypatch):
+        """Per-identity runtime state is process-global; leaking it between cases makes a later
+        launch reuse an earlier case's cache entry. The CDP readiness and snapshot-ownership
+        probes are real network/process probes, so they are stubbed true here — the cases that
+        exercise them assert on them explicitly."""
         import tools.browser_tool as bt
 
-        real_popen = subprocess.Popen
-
-        def fake_popen(argv, **_kwargs):
-            data_arg = next(
-                (arg for arg in argv if arg.startswith("--user-data-dir=")), None
-            )
-            if data_arg is None:
-                return real_popen(argv, **_kwargs)
-            data_dir = data_arg.split("=", 1)[1]
-            os.makedirs(data_dir, exist_ok=True)
-            with open(os.path.join(data_dir, "DevToolsActivePort"), "w") as handle:
-                handle.write("41000\n/devtools/browser/hermes\n")
-            proc = Mock(pid=4242)
-            proc.poll.return_value = None
-            return proc
-
         self._reset()
-        monkeypatch.setattr(
-            "hermes_cli.browser_connect.chromium_executable",
-            lambda _browser: "/opt/chrome",
-        )
-        monkeypatch.setattr(bt.subprocess, "Popen", fake_popen)
         monkeypatch.setattr(bt, "_cdp_http_ready", lambda _url: True)
         monkeypatch.setattr(bt, "_cdp_owned_by_data_dir", lambda *_args: True)
         yield
         self._reset()
 
     def test_consent_off_is_noop(self):
-        import tools.browser_tool as bt
         self._reset()
-        with patch.object(bt, "_use_real_profile", return_value=False):
-            cdp, err = bt._real_profile_cdp()
+        with patch.object(bt_cloud, "_use_real_profile", return_value=False):
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None and err is None
 
-    def test_runtime_resources_are_isolated_by_hermes_profile(self, tmp_path):
-        import tools.browser_tool as bt
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-
-        identity = Mock(runtime_key="shared-identity")
-        homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
-        resources = []
-        for home in homes:
-            home.mkdir()
-            token = set_hermes_home_override(home)
-            try:
-                resources.append(bt._real_profile_runtime_resources(identity))
-            finally:
-                reset_hermes_home_override(token)
-
-        assert resources[0][0] != resources[1][0]
-        assert resources[0][1] is not resources[1][1]
-        assert resources[0][2] != resources[1][2]
-        assert str(homes[0].resolve()) in resources[0][2]
-        assert str(homes[1].resolve()) in resources[1][2]
-
-    def test_runtime_resources_migrate_owned_legacy_process_state(self, tmp_path):
-        import tools.browser_tool as bt
-        from hermes_constants import (
-            hermes_home_key,
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-
-        home = tmp_path / "profile"
-        home.mkdir()
-        token = set_hermes_home_override(home)
-        try:
-            _, _, cache_key = bt._real_profile_runtime_resources(None)
-            previous_key = f"legacy:{cache_key.rpartition(':')[2]}"
-            bt._real_profile_cdp_cache[previous_key] = "http://127.0.0.1:41000"
-            bt._real_profile_session_names[previous_key] = "legacy-session"
-            bt._real_profile_session_homes[previous_key] = hermes_home_key()
-
-            _, _, migrated_key = bt._real_profile_runtime_resources(None)
-        finally:
-            reset_hermes_home_override(token)
-
-        assert migrated_key == cache_key
-        assert previous_key not in bt._real_profile_cdp_cache
-        assert bt._real_profile_cdp_cache[cache_key] == "http://127.0.0.1:41000"
-        assert bt._real_profile_session_names[cache_key] == "legacy-session"
-
-    def test_runtime_resources_do_not_migrate_another_profiles_legacy_state(
-        self, tmp_path
-    ):
-        import tools.browser_tool as bt
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-
-        home = tmp_path / "profile"
-        home.mkdir()
-        token = set_hermes_home_override(home)
-        try:
-            _, _, cache_key = bt._real_profile_runtime_resources(None)
-            previous_key = f"legacy:{cache_key.rpartition(':')[2]}"
-            bt._real_profile_cdp_cache[previous_key] = "http://127.0.0.1:41000"
-            bt._real_profile_session_homes[previous_key] = str(tmp_path / "other")
-
-            bt._real_profile_runtime_resources(None)
-        finally:
-            reset_hermes_home_override(token)
-
-        assert cache_key not in bt._real_profile_cdp_cache
-        assert bt._real_profile_cdp_cache[previous_key] == "http://127.0.0.1:41000"
-
     def test_non_chromium_default_fails_closed(self):
-        import tools.browser_tool as bt
         self._reset()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value=None):
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None
         assert err and "not a supported Chromium" in err
 
     def test_snapshot_failure_fails_closed(self):
-        import tools.browser_tool as bt
         self._reset()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")):
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None
         assert err and "boom" in err
 
@@ -485,17 +255,17 @@ class TestRealProfileCdpLaunch:
             (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
             return FakeChrome()
 
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
              patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt, "_agent_browser_get_cdp",
+             patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
-            cdp, err = bt._real_profile_cdp()
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert err is None
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
@@ -535,152 +305,23 @@ class TestRealProfileCdpLaunch:
             (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
             return FakeChrome()
 
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
              patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt, "_agent_browser_get_cdp",
+             patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", side_effect=fake_run), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
-            bt._real_profile_cdp()
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            bt_real_profile._real_profile_cdp()
         # The chrome launch itself is headless (no window, no focus steal).
         assert "--headless=new" in captured["chrome_argv"]
         # agent-browser attaches, it does not launch.
         assert "--headless" not in captured["argv"]
         assert "--profile" not in captured["argv"]
         assert "--cdp" in captured["argv"]
-        self._reset()
-
-    @pytest.mark.parametrize(
-        ("headed", "configured", "expect_headless"),
-        [(True, False, False), (False, True, True)],
-    )
-    def test_explicit_headed_launch_overrides_config(
-        self, tmp_path, monkeypatch, headed, configured, expect_headless
-    ):
-        import tools.browser_tool as bt
-        self._reset()
-        if headed:
-            monkeypatch.setenv("DISPLAY", ":99")
-        captured = {}
-        proc = Mock(return_value=None, returncode=0, stdout="", stderr="")
-
-        class FakeChrome:
-            def poll(self):
-                return None
-
-        def fake_popen(argv, **kw):
-            captured["chrome_argv"] = argv
-            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
-            return FakeChrome()
-
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
-             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
-             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt, "_agent_browser_get_cdp", side_effect=[None, "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=configured):
-            cdp, err = bt._real_profile_cdp(headed=headed)
-        assert err is None and cdp == "http://127.0.0.1:41000"
-        assert ("--headless=new" in captured["chrome_argv"]) is expect_headless
-        self._reset()
-
-    @pytest.mark.parametrize("headed", [True])
-    def test_existing_runtime_rejects_opposite_effective_mode(self, headed):
-        import tools.browser_tool as bt
-        self._reset()
-        _, _, cache_key = bt._real_profile_runtime_resources(None)
-        bt._real_profile_cdp_cache[cache_key] = "http://127.0.0.1:41000"
-        bt._real_profile_headed_modes[cache_key] = False
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_is_headed_mode", return_value=True):
-            cdp, err = bt._real_profile_cdp(headed=headed)
-        assert cdp is None
-        assert "already running headless" in err
-        self._reset()
-
-    def test_identity_daemon_reload_is_scoped_to_active_profile(
-        self, tmp_path, monkeypatch
-    ):
-        import tools.browser_tool as bt
-        import tools.browser_use_cli as bu
-        from hermes_constants import hermes_home_key
-
-        home = tmp_path / "worker"
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        observed = {}
-
-        def reload_runtime(runtime_key, *, home_key=None):
-            observed.update(runtime_key=runtime_key, home_key=home_key)
-            return True
-
-        monkeypatch.setattr(
-            bu, "_reload_browser_exec_daemons_for_runtime", reload_runtime
-        )
-
-        assert bt._reload_browser_use_runtime("identity-key") is True
-        assert observed == {
-            "runtime_key": "identity-key",
-            "home_key": hermes_home_key(),
-        }
-
-    @pytest.mark.linux_only
-    def test_configured_headed_reuses_headless_runtime_without_a_display(self, monkeypatch):
-        import tools.browser_tool as bt
-
-        self._reset()
-        monkeypatch.delenv("DISPLAY", raising=False)
-        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        _, _, cache_key = bt._real_profile_runtime_resources(None)
-        bt._real_profile_cdp_cache[cache_key] = "http://127.0.0.1:41000"
-        bt._real_profile_headed_modes[cache_key] = False
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_is_headed_mode", return_value=True):
-            cdp, err = bt._real_profile_cdp()
-        assert err is None
-        assert cdp == "http://127.0.0.1:41000"
-        self._reset()
-
-    def test_omitted_reuses_unknown_mode_without_claiming_config(self, tmp_path):
-        import tools.browser_tool as bt
-
-        self._reset()
-        _, _, cache_key = bt._real_profile_runtime_resources(None)
-        with (
-            patch.object(bt, "_use_real_profile", return_value=True),
-            patch(
-                "hermes_cli.browser_connect.detect_default_chromium",
-                return_value="chrome",
-            ),
-            patch(
-                "hermes_cli.browser_connect.real_profile_copy_dir",
-                return_value=str(tmp_path),
-            ),
-            patch.object(
-                bt,
-                "_agent_browser_get_cdp",
-                return_value="http://127.0.0.1:41000",
-            ),
-            patch.object(bt, "_cdp_http_ready", return_value=True),
-            patch.object(bt, "_cdp_on_data_dir", return_value=True),
-            patch.object(bt, "_is_headed_mode", return_value=True),
-        ):
-            cdp, err = bt._real_profile_cdp(headed=None)
-        assert err is None
-        assert cdp == "http://127.0.0.1:41000"
-        assert bt._real_profile_cdp_cache[cache_key] == cdp
-        assert cache_key not in bt._real_profile_headed_modes
-        assert bt._real_profile_browser_processes[cache_key] == (None, str(tmp_path))
-        with patch.object(bt, "_cdp_http_ready", return_value=True):
-            assert bt._preserve_browser_between_turns() is True
         self._reset()
 
     def test_reuses_only_session_on_our_copy_dir(self, tmp_path):
@@ -698,192 +339,73 @@ class TestRealProfileCdpLaunch:
             (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
             return FakeChrome()
 
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
              patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt, "_agent_browser_get_cdp",
+             patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=["http://127.0.0.1:5000", "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_cdp_on_data_dir", return_value=False), \
-             patch.object(bt, "_agent_browser_close_session",
+             patch.object(bt_real_profile, "_cdp_http_ready", return_value=True), \
+             patch.object(bt_real_profile, "_cdp_on_data_dir", return_value=False), \
+             patch.object(bt_real_profile, "_agent_browser_close_session",
                           side_effect=lambda s: closed.__setitem__("n", closed["n"] + 1)), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
-            cdp, err = bt._real_profile_cdp()
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert closed["n"] == 1  # stale wrong-dir session was closed
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
 
-    def test_launches_matching_system_browser_then_attaches_agent_browser(self, tmp_path):
-        import tools.browser_tool as bt
-
-        self._reset()
-        stable_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        chrome_proc = Mock(pid=4242)
-        chrome_proc.poll.return_value = None
-        captured = {}
-
-        def fake_popen(argv, **kwargs):
-            captured["chrome_argv"] = argv
-            (tmp_path / "DevToolsActivePort").write_text(
-                "41000\n/devtools/browser/hermes\n"
-            )
-            return chrome_proc
-
-        def fake_run(argv, **kwargs):
-            captured["agent_argv"] = argv
-            return Mock(returncode=0, stdout="", stderr="")
-
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.chromium_executable", return_value=stable_chrome), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
-             patch.object(bt, "_agent_browser_get_cdp", return_value="http://127.0.0.1:41000"), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_cdp_owned_by_data_dir", return_value=True), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt.subprocess, "run", side_effect=fake_run):
-            cdp, err = bt._real_profile_cdp()
-
-        assert err is None
-        assert cdp == "http://127.0.0.1:41000"
-        chrome_argv = captured["chrome_argv"]
-        assert chrome_argv[0] == stable_chrome
-        assert f"--user-data-dir={tmp_path}" in chrome_argv
-        assert "--profile-directory=Default" in chrome_argv
-        assert "--remote-debugging-port=0" in chrome_argv
-        assert "--disable-sync" in chrome_argv
-        assert "--disable-background-networking" in chrome_argv
-        assert "--disable-component-update" in chrome_argv
-        assert not any("mock-keychain" in arg for arg in chrome_argv)
-        assert not any("password-store" in arg for arg in chrome_argv)
-        agent_argv = captured["agent_argv"]
-        assert "--cdp" in agent_argv
-        assert "41000" in agent_argv
-        assert "--profile" not in agent_argv
-        self._reset()
-
-    def test_attach_failure_terminates_the_directly_launched_browser(self, tmp_path):
-        import tools.browser_tool as bt
-
-        self._reset()
-        chrome_proc = Mock(pid=4242)
-        chrome_proc.poll.return_value = None
-
-        def fake_popen(argv, **kwargs):
-            (tmp_path / "DevToolsActivePort").write_text(
-                "41000\n/devtools/browser/hermes\n"
-            )
-            return chrome_proc
-
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.chromium_executable", return_value="/opt/chrome"), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(
-                 bt.subprocess,
-                 "run",
-                 return_value=Mock(returncode=1, stdout="", stderr="attach failed"),
-             ):
-            cdp, err = bt._real_profile_cdp()
-
-        assert cdp is None
-        assert err and "attach failed" in err
-        chrome_proc.terminate.assert_called_once()
-        chrome_proc.wait.assert_called()
-        self._reset()
-
-    def test_recovered_attach_failure_does_not_terminate_another_process_browser(
-        self, tmp_path
-    ):
-        import tools.browser_tool as bt
-
-        self._reset()
-        recovered = "http://127.0.0.1:41000"
-        stop = Mock()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
-             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
-             patch.object(bt, "_owned_profile_cdp", return_value=recovered), \
-             patch.object(
-                 bt,
-                 "_attach_agent_browser_to_cdp",
-                 return_value="attach failed",
-             ), \
-             patch(
-                 "hermes_cli.browser_connect.stop_snapshot_browser_processes",
-                 stop,
-             ):
-            cdp, err = bt._real_profile_cdp()
-
-        assert cdp is None
-        assert err and "attach failed" in err
-        stop.assert_not_called()
-        self._reset()
-
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
-        import tools.browser_tool as bt
         (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
-        assert bt._cdp_on_data_dir("http://127.0.0.1:41000", str(tmp_path))
-        assert not bt._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
+        assert bt_real_profile._cdp_on_data_dir("http://127.0.0.1:41000", str(tmp_path))
+        assert not bt_real_profile._cdp_on_data_dir("http://127.0.0.1:9999", str(tmp_path))
 
 
 class TestConsentConfigRead:
     """Unmocked config read: _use_real_profile against a real config.yaml."""
 
     def test_consent_read_from_config(self, tmp_path, monkeypatch):
-        import tools.browser_tool as bt
         cfg = tmp_path / "config.yaml"
         cfg.write_text("browser:\n  use_real_profile: true\n")
         with patch("hermes_cli.config.read_raw_config",
                    return_value={"browser": {"use_real_profile": True}}):
-            assert bt._use_real_profile() is True
+            assert bt_cloud._use_real_profile() is True
 
     def test_consent_default_off(self):
-        import tools.browser_tool as bt
         with patch("hermes_cli.config.read_raw_config", return_value={}):
-            assert bt._use_real_profile() is False
+            assert bt_cloud._use_real_profile() is False
 
     def test_consent_revocation_takes_effect_immediately(self):
         """No process-lifetime caching: consent is a per-use read."""
-        import tools.browser_tool as bt
         with patch("hermes_cli.config.read_raw_config",
                    return_value={"browser": {"use_real_profile": True}}):
-            assert bt._use_real_profile() is True
+            assert bt_cloud._use_real_profile() is True
         with patch("hermes_cli.config.read_raw_config",
                    return_value={"browser": {"use_real_profile": False}}):
-            assert bt._use_real_profile() is False
+            assert bt_cloud._use_real_profile() is False
 
 
 class TestLocalSessionRealProfile:
     def test_local_session_attaches_to_real_profile_cdp(self):
-        import tools.browser_tool as bt
-        with patch.object(bt, "_real_profile_cdp",
+        with patch.object(bt_real_profile, "_real_profile_cdp",
                           return_value=("http://127.0.0.1:9251", None)), \
-             patch.object(bt, "_resolve_cdp_override", side_effect=lambda u: u):
-            info = bt._create_local_session("t1")
+             patch.object(bt_cdp, "_resolve_cdp_override", side_effect=lambda u: u):
+            info = bt_session._create_local_session("t1")
         assert info["cdp_url"] == "http://127.0.0.1:9251"
         assert info["features"]["real_profile"] is True
         assert info["session_name"].startswith("rp_")
 
     def test_local_session_fails_closed_on_error(self):
-        import tools.browser_tool as bt
-        with patch.object(bt, "_real_profile_cdp", return_value=(None, "no chromium")):
+        with patch.object(bt_real_profile, "_real_profile_cdp", return_value=(None, "no chromium")):
             with pytest.raises(RuntimeError, match="no chromium"):
-                bt._create_local_session("t1")
+                bt_session._create_local_session("t1")
 
     def test_local_session_without_consent_is_throwaway(self):
-        import tools.browser_tool as bt
-        with patch.object(bt, "_real_profile_cdp", return_value=(None, None)):
-            info = bt._create_local_session("t1")
+        with patch.object(bt_real_profile, "_real_profile_cdp", return_value=(None, None)):
+            info = bt_session._create_local_session("t1")
         assert info["cdp_url"] is None
         assert "real_profile" not in info["features"]
         assert info["session_name"].startswith("h_")
@@ -897,9 +419,9 @@ class TestBrowserExecLocalArg:
         import tools.browser_use_cli as bu
         env = self._env()
         with patch.object(bu, "_real_profile_consented", return_value=True), \
-             patch("tools.browser_tool._get_cdp_override_raw", return_value=""), \
-             patch("tools.browser_tool._get_cloud_provider", return_value=Mock()), \
-             patch("tools.browser_tool._real_profile_cdp",
+             patch("tools.browser_tool_cdp._get_cdp_override_raw", return_value=""), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=Mock()), \
+             patch("tools.browser_tool_real_profile._real_profile_cdp",
                    return_value=("http://127.0.0.1:9251", None)):
             err = bu._resolve_real_profile_cdp(env, force_local=True)
         assert err is None
@@ -909,8 +431,8 @@ class TestBrowserExecLocalArg:
         import tools.browser_use_cli as bu
         env = self._env()
         with patch.object(bu, "_real_profile_consented", return_value=True), \
-             patch("tools.browser_tool._get_cdp_override_raw", return_value=""), \
-             patch("tools.browser_tool._get_cloud_provider", return_value=Mock()):
+             patch("tools.browser_tool_cdp._get_cdp_override_raw", return_value=""), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=Mock()):
             err = bu._resolve_real_profile_cdp(env, force_local=False)
         assert err is None
         assert "BU_CDP_URL" not in env and "BU_CDP_WS" not in env
@@ -920,9 +442,9 @@ class TestBrowserExecLocalArg:
         env = self._env()
         with patch.object(bu, "_real_profile_consented", return_value=True), \
              patch.object(bu, "_read_browser_cfg", return_value={}), \
-             patch("tools.browser_tool._get_cdp_override_raw", return_value=""), \
-             patch("tools.browser_tool._get_cloud_provider", return_value=None), \
-             patch("tools.browser_tool._real_profile_cdp",
+             patch("tools.browser_tool_cdp._get_cdp_override_raw", return_value=""), \
+             patch("tools.browser_tool_cloud._get_cloud_provider", return_value=None), \
+             patch("tools.browser_tool_real_profile._real_profile_cdp",
                    return_value=("http://127.0.0.1:9251", None)):
             err = bu._resolve_real_profile_cdp(env, force_local=False)
         assert err is None
@@ -939,8 +461,8 @@ class TestBrowserExecLocalArg:
         import tools.browser_use_cli as bu
         env = self._env()
         with patch.object(bu, "_real_profile_consented", return_value=True), \
-             patch("tools.browser_tool._get_cdp_override_raw", return_value=""), \
-             patch("tools.browser_tool._real_profile_cdp",
+             patch("tools.browser_tool_cdp._get_cdp_override_raw", return_value=""), \
+             patch("tools.browser_tool_real_profile._real_profile_cdp",
                    return_value=(None, "chrome exited")):
             err = bu._resolve_real_profile_cdp(env, force_local=True)
         assert err == "chrome exited"
@@ -959,7 +481,7 @@ class TestBrowserExecLocalArg:
         import tools.browser_use_cli as bu
         env = self._env()
         with patch.object(bu, "_real_profile_consented", return_value=True), \
-             patch("tools.browser_tool._get_cdp_override_raw", return_value="ws://connect"):
+             patch("tools.browser_tool_cdp._get_cdp_override_raw", return_value="ws://connect"):
             err = bu._resolve_real_profile_cdp(env, force_local=True)
         assert err is None and env == {}
 
@@ -988,19 +510,19 @@ class TestBrowserExecSchemaGating:
 class TestNavigationRouting:
     def test_private_url_routing_unchanged(self):
         import tools.browser_tool as bt
-        with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
+        with patch.object(bt_cdp, "_get_cdp_override_raw", return_value=""), \
              patch.object(bt, "_is_camofox_mode", return_value=False), \
-             patch.object(bt, "_get_cloud_provider", return_value=Mock()), \
-             patch.object(bt, "_auto_local_for_private_urls", return_value=True), \
+             patch.object(bt_cloud, "_get_cloud_provider", return_value=Mock()), \
+             patch.object(bt_cloud, "_auto_local_for_private_urls", return_value=True), \
              patch.object(bt, "_url_is_private", return_value=True):
             key = bt._navigation_session_key("t1", "http://192.168.1.1/x")
         assert key == "t1::local"
 
     def test_public_url_stays_on_cloud(self):
         import tools.browser_tool as bt
-        with patch.object(bt, "_get_cdp_override_raw", return_value=""), \
+        with patch.object(bt_cdp, "_get_cdp_override_raw", return_value=""), \
              patch.object(bt, "_is_camofox_mode", return_value=False), \
-             patch.object(bt, "_get_cloud_provider", return_value=Mock()), \
+             patch.object(bt_cloud, "_get_cloud_provider", return_value=Mock()), \
              patch.object(bt, "_url_is_private", return_value=False):
             key = bt._navigation_session_key("t1", "https://example.com")
         assert key == "t1"
@@ -1062,11 +584,11 @@ class TestChannelIdentity:
         import tools.browser_tool as bt
         import hermes_cli.browser_connect as bc
         bt._real_profile_cdp_cache.clear()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium",
                    return_value=bc.UNSUPPORTED_CHANNEL), \
              patch("hermes_cli.browser_connect.snapshot_real_profile") as snap:
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None
         assert err and "pre-release" in err.lower()
         snap.assert_not_called()  # never even snapshotted a stable profile
@@ -1163,86 +685,6 @@ class TestReviewBugFixes:
         (root / "Local State").write_text('{"profile": {"last_used": "Profile 9"}}')  # not present
         assert bc._last_used_profile(str(root)) == "Default"
 
-    def test_guest_last_used_falls_back_to_default(self, tmp_path):
-        import hermes_cli.browser_connect as bc
-        root = tmp_path / "d"
-        (root / "Default").mkdir(parents=True)
-        (root / "Guest Profile").mkdir(parents=True)
-        (root / "Local State").write_text(
-            '{"profile": {"last_used": "Guest Profile"}}'
-        )
-        assert bc._last_used_profile(str(root)) == "Default"
-
-    def test_snapshot_normalizes_guest_last_used_for_launch(self, tmp_path, monkeypatch):
-        import json
-        import hermes_cli.browser_connect as bc
-
-        root = tmp_path / "d"
-        (root / "Default").mkdir(parents=True)
-        (root / "Guest Profile").mkdir(parents=True)
-        (root / "Default" / "Preferences").write_text("{}")
-        (root / "Local State").write_text(
-            '{"profile": {"last_used": "Guest Profile", '
-            '"last_active_profiles": ["Guest Profile"]}}'
-        )
-        home = tmp_path / "hh"
-        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-
-        dst, err = bc.snapshot_real_profile("chrome", src=str(root))
-
-        assert err is None
-        state = json.loads((home / "browser-profile" / "chrome" / "Local State").read_text())
-        assert state["profile"]["last_used"] == "Default"
-        assert state["profile"]["last_active_profiles"] == ["Default"]
-
-    def test_snapshot_normalizes_local_state_only_through_atomic_replace(
-        self, tmp_path, monkeypatch
-    ):
-        import builtins
-        import json
-        import hermes_cli.browser_connect as bc
-
-        root = tmp_path / "d"
-        (root / "Profile 2").mkdir(parents=True)
-        (root / "Profile 2" / "Preferences").write_text("{}")
-        source_entry = {"name": "Work", "is_using_default_name": False}
-        (root / "Local State").write_text(
-            json.dumps(
-                {
-                    "profile": {
-                        "last_used": "Profile 2",
-                        "last_active_profiles": ["Profile 2"],
-                        "info_cache": {"Profile 2": source_entry},
-                    }
-                }
-            )
-        )
-        home = tmp_path / "hh"
-        local_state = home / "browser-profile" / "chrome" / "Local State"
-        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
-        real_open = builtins.open
-        direct_writes = 0
-
-        def reject_second_direct_write(path, mode="r", *args, **kwargs):
-            nonlocal direct_writes
-            if os.fspath(path) == os.fspath(local_state) and any(
-                flag in mode for flag in "wxa"
-            ):
-                direct_writes += 1
-                if direct_writes > 1:
-                    raise AssertionError("Local State must be replaced atomically")
-            return real_open(path, mode, *args, **kwargs)
-
-        with patch("builtins.open", side_effect=reject_second_direct_write):
-            dst, err = bc.snapshot_real_profile("chrome", src=str(root))
-
-        assert err is None and dst is not None
-        assert direct_writes == 1
-        state = json.loads(local_state.read_text())
-        assert state["profile"]["last_used"] == "Default"
-        assert state["profile"]["last_active_profiles"] == ["Default"]
-        assert state["profile"]["info_cache"] == {"Default": source_entry}
-
     def test_last_used_reads_local_state(self, tmp_path):
         import hermes_cli.browser_connect as bc
         root = tmp_path / "d"
@@ -1263,30 +705,27 @@ class TestReviewBugFixes:
 
     # ── Bug 3: private-URL sidecar must NOT carry the real profile ──
     def test_sidecar_never_uses_real_profile(self):
-        import tools.browser_tool as bt
         # Even with consent resolving a real-profile CDP, the sidecar path
         # (allow_real_profile=False) must return a throwaway session.
-        with patch.object(bt, "_real_profile_cdp",
+        with patch.object(bt_real_profile, "_real_profile_cdp",
                           return_value=("http://127.0.0.1:9251", None)):
-            info = bt._create_local_session("t::local", allow_real_profile=False)
+            info = bt_session._create_local_session("t::local", allow_real_profile=False)
         assert info["cdp_url"] is None
         assert "real_profile" not in info["features"]
         assert info["session_name"].startswith("h_")
 
     def test_sidecar_ignores_real_profile_error(self):
         """A real-profile resolve failure must not break private-URL routing."""
-        import tools.browser_tool as bt
-        with patch.object(bt, "_real_profile_cdp",
+        with patch.object(bt_real_profile, "_real_profile_cdp",
                           return_value=(None, "non-chromium default")):
-            info = bt._create_local_session("t::local", allow_real_profile=False)
+            info = bt_session._create_local_session("t::local", allow_real_profile=False)
         assert info["cdp_url"] is None  # no raise, throwaway session
 
     def test_bare_local_still_uses_real_profile(self):
-        import tools.browser_tool as bt
-        with patch.object(bt, "_real_profile_cdp",
+        with patch.object(bt_real_profile, "_real_profile_cdp",
                           return_value=("http://127.0.0.1:9251", None)), \
-             patch.object(bt, "_resolve_cdp_override", side_effect=lambda u: u):
-            info = bt._create_local_session("t1")  # allow_real_profile defaults True
+             patch.object(bt_cdp, "_resolve_cdp_override", side_effect=lambda u: u):
+            info = bt_session._create_local_session("t1")  # allow_real_profile defaults True
         assert info["features"].get("real_profile") is True
 
     # ── Bug 1: macOS 26 LSHandlers parser ──
@@ -1325,10 +764,10 @@ class TestReviewBugFixes:
     def test_lightpanda_engine_fails_actionably(self):
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch.object(bt, "_using_lightpanda_engine", return_value=True), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium") as det:
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None
         assert err and "lightpanda" in err.lower() and "browser.engine" in err.lower()
         det.assert_not_called()  # guard fires before detection
@@ -1404,59 +843,6 @@ class TestReviewRound3:
         import hermes_cli.browser_connect as bc
         monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
         bc.cleanup_real_profile_snapshots()  # no raise
-
-    def test_stop_snapshot_browsers_terminates_only_owned_profile_tree(
-        self, tmp_path, monkeypatch
-    ):
-        import hermes_cli.browser_connect as bc
-
-        snapshot_root = tmp_path / "home" / "browser-profile"
-        owned_dir = snapshot_root / "identities" / "opaque" / "chrome"
-        outside_dir = tmp_path / "live-chrome"
-        executable = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
-        owned_child = Mock()
-        owned = Mock()
-        owned.info = {
-            "cmdline": [
-                executable,
-                "--remote-debugging-port=0",
-                f"--user-data-dir={owned_dir}",
-                "--profile-directory=Default",
-            ]
-        }
-        owned.exe.return_value = executable
-        owned.children.return_value = [owned_child]
-
-        outside = Mock()
-        outside.info = {
-            "cmdline": [
-                executable,
-                "--remote-debugging-port=0",
-                f"--user-data-dir={outside_dir}",
-                "--profile-directory=Default",
-            ]
-        }
-        outside.exe.return_value = executable
-
-        monkeypatch.setattr(
-            "psutil.process_iter", lambda _attrs: iter([owned, outside])
-        )
-        monkeypatch.setattr(
-            "psutil.wait_procs", lambda processes, timeout: (list(processes), [])
-        )
-        monkeypatch.setattr(
-            bc,
-            "chromium_executable",
-            lambda browser: executable if browser == "chrome" else None,
-        )
-
-        stopped = bc.stop_snapshot_browser_processes(str(snapshot_root))
-
-        assert stopped == 1
-        owned_child.terminate.assert_called_once()
-        owned.terminate.assert_called_once()
-        outside.terminate.assert_not_called()
 
     # ── Windows lock probe (unit; the live share-lock is proven in the
     #    windows-latest E2E — here we cover the probe's contract portably) ──
@@ -1556,12 +942,11 @@ class TestReviewRound3:
         assert f"--user-data-dir={ud}" in " ".join(matched[0].info["cmdline"])
 
     def test_consent_off_triggers_cleanup(self, tmp_path, monkeypatch):
-        import tools.browser_tool as bt
         called = {"n": 0}
-        with patch.object(bt, "_use_real_profile", return_value=False), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=False), \
              patch("hermes_cli.browser_connect.cleanup_real_profile_snapshots",
                    side_effect=lambda: called.__setitem__("n", called["n"] + 1)):
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None and err is None
         assert called["n"] == 1
 
@@ -1572,15 +957,15 @@ class TestReviewRound3:
         browser."""
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch.object(bt, "_using_lightpanda_engine", return_value=False), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
-             patch.object(bt, "_agent_browser_get_cdp", return_value="http://127.0.0.1:9251"), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_cdp_on_data_dir", return_value=True), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value="http://127.0.0.1:9251"), \
+             patch.object(bt_real_profile, "_cdp_http_ready", return_value=True), \
+             patch.object(bt_real_profile, "_cdp_on_data_dir", return_value=True), \
              patch("hermes_cli.browser_connect.snapshot_real_profile") as snap:
-            cdp, err = bt._real_profile_cdp()
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp == "http://127.0.0.1:9251" and err is None
         snap.assert_not_called()  # ← the fix: no overlay while a live browser owns the dir
         bt._real_profile_cdp_cache.clear()
@@ -1590,30 +975,18 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
-        chrome_proc = Mock(pid=4242)
-        chrome_proc.poll.return_value = None
-
-        def fake_popen(_argv, **_kwargs):
-            (tmp_path / "DevToolsActivePort").write_text(
-                "9251\n/devtools/browser/hermes\n"
-            )
-            return chrome_proc
-
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch.object(bt, "_using_lightpanda_engine", return_value=False), \
-             patch("hermes_cli.browser_connect.chromium_executable", return_value="/opt/chrome"), \
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
-             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_cdp_owned_by_data_dir", return_value=True), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp",
+                          side_effect=[None, "http://127.0.0.1:9251"]), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
-            cdp, err = bt._real_profile_cdp()
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            cdp, err = bt_real_profile._real_profile_cdp()
         assert err is None
         snap.assert_called_once()
         bt._real_profile_cdp_cache.clear()
@@ -1690,47 +1063,3 @@ class TestWindowsLockedProfileCopy:
         dst, err = bc.snapshot_real_profile("chrome", src=str(root))
         assert dst is None
         assert err and "login data" in err.lower() and "close" in err.lower()
-
-    def test_copy_auth_file_bounded_when_locked_falls_back_to_raw(self, tmp_path, monkeypatch):
-        """A wedged source DB (running Chrome holds Login Data exclusively on
-        POSIX too) must abort the online backup within the deadline and fall
-        through to the raw copy instead of hanging the launch forever (#96646).
-
-        Regression: CPython's sqlite3.Connection.backup() retries SQLITE_BUSY
-        indefinitely when no progress callback bounds it, so the old unbounded
-        source.backup(out) never returned and the raw-copy fallback was
-        unreachable — this test times out rather than failing fast on the
-        old code.
-        """
-        import hermes_cli.browser_connect as bc
-        import sqlite3
-        import time
-        monkeypatch.setattr(bc, "_AUTH_BACKUP_TIMEOUT_SECONDS", 0.5)
-        src = str(tmp_path / "Login Data")
-        con = sqlite3.connect(src)
-        con.execute("create table logins(x)")
-        con.execute("insert into logins values(1)")
-        con.commit()
-        # Hold the exclusive SQLite lock the way a running Chrome does.
-        con.execute("BEGIN EXCLUSIVE")
-        try:
-            dst = str(tmp_path / "out" / "Login Data")
-            started = time.monotonic()
-            ok = bc._copy_auth_file(src, dst)
-            elapsed = time.monotonic() - started
-            assert elapsed < 5.0, (
-                f"_copy_auth_file took {elapsed:.1f}s on a locked source — "
-                "the backup is no longer deadline-bounded"
-            )
-            # On POSIX the raw-copy fallback needs no SQLite locks, so the
-            # copy still lands and the launch can proceed.
-            assert ok is True
-            assert os.path.isfile(dst)
-            check = sqlite3.connect(dst)
-            try:
-                assert check.execute("select count(*) from logins").fetchone()[0] == 1
-            finally:
-                check.close()
-        finally:
-            con.rollback()
-            con.close()

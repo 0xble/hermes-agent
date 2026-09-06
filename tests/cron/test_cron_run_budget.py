@@ -250,7 +250,7 @@ def _install_run_job_stubs(monkeypatch, tmp_path, agent_type):
             "api_mode": "chat_completions",
         },
     )
-    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    monkeypatch.setattr("tools.mcp_tool_discovery.discover_mcp_tools", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(run_agent, "AIAgent", agent_type)
     return scheduler, fake_db
 

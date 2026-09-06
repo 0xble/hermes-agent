@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import contextlib
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -27,6 +28,28 @@ from hermes_time import now as _hermes_now
 OUTBOUND_FILE: Optional[Path] = None
 _MESSAGE_KEY_RE = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
 _lock = threading.RLock()
+
+
+def _ensure_cron_session_context_vars() -> None:
+    """Install cron's task-local authority variables on decomposed upstreams.
+
+    Older gateway.session_context revisions know only the three auto-delivery
+    variables. Keeping these ContextVars here lets the cron-owned outbound
+    contract remain task-local without mutating process-global ``os.environ``.
+    ``setdefault`` preserves newer gateway-owned definitions.
+    """
+    from gateway.session_context import _UNSET, _VAR_MAP
+
+    for name in (
+        "HERMES_CRON_ALLOW_MESSAGING",
+        "HERMES_CRON_JOB_ID",
+        "HERMES_CRON_RUN_ID",
+        "HERMES_CRON_FIRE_OWNER",
+    ):
+        _VAR_MAP.setdefault(name, ContextVar(name, default=_UNSET))
+
+
+_ensure_cron_session_context_vars()
 
 
 def _outbound_file() -> Path:

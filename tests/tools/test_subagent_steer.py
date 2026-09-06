@@ -9,6 +9,20 @@ the subagent.steer gateway RPC that fronts the helper.
 """
 
 import threading
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_session_cwd_sentinel():
+    """``clear_session_vars`` leaves ``_SESSION_CWD`` at the explicit-"" ISOLATION value rather than
+    the pristine "never set" sentinel, so a later test's ``resolve_tool_cwd()`` answers "no cwd" and
+    TERMINAL_CWD-anchored suites silently fall back to $HOME."""
+    import agent.runtime_cwd as _rc
+
+    yield
+    _rc._SESSION_CWD.set(_rc._UNSET)
+
 from unittest.mock import MagicMock
 
 from tools.delegate_tool import (

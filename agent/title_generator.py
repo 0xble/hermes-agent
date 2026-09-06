@@ -243,7 +243,10 @@ def _title_preferences() -> _TitlePreferences:
             max_characters = int(
                 title_config.get("max_characters", default_max_characters)
             )
-        case_style = str(title_config.get("case_style", "title_case")).strip().lower()
+        # Keep the released default even when newer upstream config defaults omit
+        # the fork's title-shaping keys; explicit profiles can still opt into
+        # Title Case.
+        case_style = str(title_config.get("case_style", "sentence_case")).strip().lower()
         raw_aliases = title_config.get("name_aliases", {})
         aliases = (
             {
@@ -279,7 +282,7 @@ def _title_preferences() -> _TitlePreferences:
             min_words=default_min_words,
             max_words=default_max_words,
             max_characters=default_max_characters,
-            case_style="title_case",
+            case_style="sentence_case",
             name_aliases={},
             instructions="",
         )

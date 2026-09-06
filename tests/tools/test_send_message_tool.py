@@ -27,7 +27,6 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
-    _parse_target_ref,
     _resolve_slack_user_target,
     _send_matrix_via_adapter,
     _send_signal,
@@ -35,6 +34,7 @@ from tools.send_message_tool import (
     _send_to_platform,
     send_message_tool,
 )
+from tools.send_message_targets import _parse_target_ref
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.
@@ -1754,9 +1754,14 @@ class TestCheckSendMessage:
        ``HERMES_HOME`` may be a profile dir without a ``gateway.pid``).
     2. ``HERMES_SESSION_PLATFORM`` resolves to a non-empty, non-``local`` value
        (the session is wired to a messaging platform like Telegram).
-    3. ``is_gateway_running()`` returns True (CLI / orchestrator profile with
-       a live gateway colocated under the same ``HERMES_HOME``).
+    3. A live gateway PID is resolvable (CLI / orchestrator profile with a
+       gateway colocated under the same ``HERMES_HOME``).
     4. None of the above → False, tool is hidden.
+
+    The gateway probe is patched at ``gateway.status.get_running_pid``: that is the defining API the
+    production check calls. The retired ``is_gateway_running`` shim these tests originally patched now
+    lives only in gateway/status.py's plugin-compat block, so patching it would pin a seam production
+    never touches.
     """
 
     def test_kanban_task_env_grants_access(self, monkeypatch):
@@ -1768,9 +1773,8 @@ class TestCheckSendMessage:
         monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
 
         with patch("gateway.session_context.get_session_env", return_value=""), \
-             patch("gateway.status.is_gateway_running", return_value=False):
+             patch("gateway.status.get_running_pid", return_value=None):
             assert _check_send_message() is True
-
 
     def test_gateway_status_import_error_is_swallowed(self, monkeypatch):
         """If gateway.status can't be imported (unusual deployment / partial
@@ -1780,7 +1784,7 @@ class TestCheckSendMessage:
         monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
 
         with patch("gateway.session_context.get_session_env", return_value=""), \
-             patch("gateway.status.is_gateway_running",
+             patch("gateway.status.get_running_pid",
                    side_effect=ImportError("simulated")):
             assert _check_send_message() is False
 
@@ -1801,7 +1805,7 @@ class TestSendTelegramThreadNotFoundRetry:
 
         async def run_test():
             with patch(
-                "tools.send_message_tool._send_telegram_message_with_retry",
+                "tools.send_message_senders._send_telegram_message_with_retry",
                 fake_retry,
             ):
                 # _send_telegram imports Bot locally; we only need to mock

@@ -378,7 +378,7 @@ class TestDelegateTask(unittest.TestCase):
         parent._session_db = MagicMock()
         with (
             patch("run_agent.AIAgent") as MockAgent,
-            patch("hermes_state.get_shared_session_db") as get_shared,
+            patch("hermes_state_registry.acquire") as get_shared,
         ):
             MockAgent.return_value = MagicMock()
 

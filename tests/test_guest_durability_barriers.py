@@ -13,7 +13,7 @@ import sys
 import pytest
 
 import hermes_state
-from hermes_state import apply_durability_barriers
+from hermes_state_repair import apply_durability_barriers
 
 
 def _config(monkeypatch, database_section):

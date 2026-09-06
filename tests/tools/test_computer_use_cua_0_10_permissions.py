@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from tools.computer_use import cua_backend_driver
+
 
 @pytest.fixture(autouse=True)
 def _reset_computer_use_state():
@@ -43,10 +45,11 @@ def test_gateway_session_key_yolo_maps_to_unrestricted_mode():
     not the DB session_id the tool path passes. Mode resolution must consult
     both namespaces or /yolo is silently dead on messaging platforms."""
     from tools import approval
+    from tools import approval_context
     from tools.computer_use import tool as computer_use
 
     gateway_key = "agent:main:telegram:private:12345"
-    token = approval.set_current_session_key(gateway_key)
+    token = approval_context.set_current_session_key(gateway_key)
     try:
         approval.enable_session_yolo(gateway_key)
         # Tool dispatch passes the (different) DB session id.
@@ -56,9 +59,9 @@ def test_gateway_session_key_yolo_maps_to_unrestricted_mode():
     finally:
         approval.disable_session_yolo(gateway_key)
         try:
-            approval.reset_current_session_key(token)
+            approval_context.reset_current_session_key(token)
         except Exception:
-            approval.set_current_session_key("")
+            approval_context.set_current_session_key("")
 
 
 def test_mode_change_replaces_only_that_sessions_backend():
@@ -154,7 +157,7 @@ def test_release_seam_stops_backend_and_clears_session_state():
 def test_yolo_toggle_immediately_releases_mode_dependent_backend():
     from tools import approval
 
-    with patch("tools.computer_use.release_computer_use_session") as release:
+    with patch("tools.computer_use.tool.release_computer_use_session") as release:
         approval.enable_session_yolo("session-a")
         approval.disable_session_yolo("session-a")
 
@@ -165,7 +168,7 @@ def test_yolo_toggle_immediately_releases_mode_dependent_backend():
 
 
 def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
-    from tools.computer_use import cua_backend
+    from tools.computer_use import cua_backend, cua_backend_driver
 
     process = Mock()
     process.poll.return_value = None
@@ -176,7 +179,7 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
 
     daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
     with patch.object(cua_backend.sys, "platform", "linux"), patch.object(
-        cua_backend,
+        cua_backend_driver,
         "_resolve_mcp_invocation",
         return_value=("/opt/cua-driver", ["mcp"]),
     ), patch.object(
@@ -215,7 +218,7 @@ def test_standard_backend_does_not_spawn_an_embedded_daemon():
 
 
 def test_retired_browser_grant_cannot_change_standard_runtime(tmp_path, monkeypatch):
-    from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+    from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
 
     (tmp_path / "config.yaml").write_text(
         "computer_use:\n  grant_existing_profile: true\n",
@@ -231,10 +234,10 @@ def test_retired_browser_grant_cannot_change_standard_runtime(tmp_path, monkeypa
             return MagicMock()
 
         with patch(
-            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            "tools.computer_use.cua_backend_driver.resolve_cua_driver_cmd",
             return_value="/opt/cua-driver",
         ), patch(
-            "tools.computer_use.cua_backend._resolve_mcp_invocation",
+            "tools.computer_use.cua_backend_driver._resolve_mcp_invocation",
             return_value=("/opt/cua-driver", ["mcp"]),
         ), patch(
             "mcp.StdioServerParameters", side_effect=capture_params
@@ -363,7 +366,7 @@ def test_private_daemon_allows_slow_healthy_status_probe():
     Each readiness probe gets up to _STATUS_PROBE_TIMEOUT_SECONDS, bounded by
     the remaining overall startup budget (HERMES-047).
     """
-    from tools.computer_use import cua_backend
+    from tools.computer_use import cua_backend, cua_backend_driver
 
     process = Mock()
     process.poll.return_value = None
@@ -388,7 +391,7 @@ def test_private_daemon_allows_slow_healthy_status_probe():
     daemon = cua_backend._EmbeddedCuaDaemon("cua-driver", "unrestricted")
     daemon._START_TIMEOUT_SECONDS = 6.0
     with patch.object(cua_backend.sys, "platform", "linux"), patch.object(
-        cua_backend,
+        cua_backend_driver,
         "_resolve_mcp_invocation",
         return_value=("/opt/cua-driver", ["mcp"]),
     ), patch.object(

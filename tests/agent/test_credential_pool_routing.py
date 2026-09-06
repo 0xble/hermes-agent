@@ -499,9 +499,9 @@ class TestFailureAttribution:
             pool, failing_key="key-b", credential_id="cred-1", provider="openai-codex"
         )
 
-        from agent.agent_runtime_helpers import _select_alternate_credential
+        from agent.credential_pool import select_alternate_credential
 
-        alternate = _select_alternate_credential(agent)
+        alternate = select_alternate_credential(agent)
         assert alternate is not None
         assert alternate.id == "cred-2"
 
@@ -518,9 +518,9 @@ class TestFailureAttribution:
             pool, failing_key="key-a", credential_id="cred-0", provider="openai-codex"
         )
 
-        from agent.agent_runtime_helpers import _select_alternate_credential
+        from agent.credential_pool import select_alternate_credential
 
-        alternate = _select_alternate_credential(agent)
+        alternate = select_alternate_credential(agent)
         assert alternate is not None
         assert alternate.id == "cred-1"
 
@@ -566,7 +566,7 @@ class TestFailureAttribution:
         )
         agent = self._agent(pool, failing_key="key-b")
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, has_retried = recover_with_credential_pool(
             agent, status_code=429, has_retried_429=False
@@ -598,7 +598,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-b")
         agent._is_entitlement_failure = MagicMock(return_value=False)
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, _ = recover_with_credential_pool(
             agent, status_code=401, has_retried_429=False
@@ -629,7 +629,7 @@ class TestFailureAttribution:
         )
         agent._is_entitlement_failure = MagicMock(return_value=False)
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, _ = recover_with_credential_pool(
             agent, status_code=401, has_retried_429=False
@@ -658,7 +658,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-b")
         agent._is_entitlement_failure = MagicMock(return_value=False)
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recover_with_credential_pool(
             agent,
@@ -680,7 +680,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-b")
         agent._is_entitlement_failure = MagicMock(return_value=False)
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recover_with_credential_pool(
             agent, status_code=403, has_retried_429=False
@@ -711,7 +711,7 @@ class TestFailureAttribution:
         )
         agent = self._agent(pool, failing_key="key-a", provider=provider)
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, has_retried = recover_with_credential_pool(
             agent,
@@ -735,7 +735,7 @@ class TestFailureAttribution:
         self, tmp_path, monkeypatch
     ):
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         pool = self._make_pool(
             tmp_path, monkeypatch,
@@ -777,7 +777,7 @@ class TestFailureAttribution:
         agent.provider = "openai-codex"
         attempted = set()
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         first, _ = recover_with_credential_pool(
             agent,
@@ -807,7 +807,7 @@ class TestFailureAttribution:
     def test_provider_overload_skips_duplicate_codex_account(self, tmp_path, monkeypatch):
         """Two OAuth rows for one ChatGPT account count as one retry identity."""
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         token_a1 = self._codex_token("account-a", "token-a1")
         token_a2 = self._codex_token("account-a", "token-a2")
@@ -845,7 +845,7 @@ class TestFailureAttribution:
         self, tmp_path, monkeypatch
     ):
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         pool = self._make_pool(
             tmp_path,
@@ -898,7 +898,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-a")
         agent.provider = "openai-codex"
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         alternate_recovered, has_retried_429 = recover_with_credential_pool(
             agent,
@@ -923,7 +923,7 @@ class TestFailureAttribution:
     def test_provider_overload_skips_exhausted_alternate(self, tmp_path, monkeypatch):
         """Durably exhausted entries never consume a transient retry slot."""
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         exhausted = self._entry(1, "key-b")
         exhausted.update({
@@ -954,7 +954,7 @@ class TestFailureAttribution:
     ):
         """Transient account rotation must not revive a cooling entry."""
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         pool = self._make_pool(
             tmp_path, monkeypatch,
@@ -987,7 +987,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-a")
         agent.provider = "openai-codex"
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, has_retried = recover_with_credential_pool(
             agent,
@@ -1005,7 +1005,7 @@ class TestFailureAttribution:
     ):
         """A credential swap must never expand the configured request budget."""
         from agent.error_classifier import FailoverReason
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         pool = self._make_pool(
             tmp_path, monkeypatch,
@@ -1041,7 +1041,7 @@ class TestFailureAttribution:
         agent = self._agent(pool, failing_key="key-a")
         agent.provider = "openai-codex"
 
-        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import recover_with_credential_pool
 
         recovered, has_retried = recover_with_credential_pool(
             agent,

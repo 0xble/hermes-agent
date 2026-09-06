@@ -41,6 +41,12 @@ def _clean_queue_and_context(monkeypatch):
     for var in sc._VAR_MAP.values():
         var.set(sc._UNSET)
     sc._SESSION_ASYNC_DELIVERY.set(sc._UNSET)
+    # _SESSION_CWD lives in agent.runtime_cwd, NOT _VAR_MAP: set_session_vars binds it through
+    # set_session_cwd. Leaving it at the explicit-"" isolation value makes every later test's
+    # resolve_tool_cwd() answer "no cwd", so TERMINAL_CWD-anchored suites silently fall back to $HOME.
+    import agent.runtime_cwd as _rc
+
+    _rc._SESSION_CWD.set(_rc._UNSET)
     # set_current_session_id (invoked by the clobber-reproducing fake child
     # build) writes os.environ directly — scrub it so it can't leak into
     # other test modules.

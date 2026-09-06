@@ -16,7 +16,7 @@ def make_child(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _patch_agent_bootstrap(monkeypatch)
     import run_agent
-    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0)
+    monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0)
     children = []
     def make(effort="medium", model="gpt-5.6-luna"):
         child = run_agent.AIAgent(
@@ -201,7 +201,7 @@ def test_transient_retry_keeps_model_route_and_effort(make_child, monkeypatch):
     from tests.run_agent.test_run_agent_codex_responses import _codex_message_response
     child = make_child()
     requests = []
-    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+    monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0)
     def api(kwargs):
         requests.append(deepcopy(kwargs))
         if len(requests) == 1:

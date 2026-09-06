@@ -15,10 +15,14 @@ deliberately ignores live-owner rows. Hence the deferred sweep.
 import asyncio
 import time
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway import delivery_ledger as dl
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.session import SessionSource
 
 
 @pytest.fixture(autouse=True)
@@ -244,3 +248,115 @@ class TestDeferredSweepScheduling:
         task = stub._deferred_obligation_sweeps["telegram:default"]
         assert task._hermes_sweep_at <= time.monotonic() + dl.STALE_AFTER_SECONDS + 1
         task.cancel()
+
+
+class TestFloodRejectionReachesTheScheduler:
+    """The classification half and the scheduler half must stay WIRED TOGETHER.
+
+    Every other test in this file exercises one half in isolation: the parsers above, and
+    ``TestDeferredSweepScheduling`` which binds the scheduler onto a stub. Both can pass while
+    nothing in a live process connects them — that is precisely the state HERMES-085 describes,
+    where a flood-rejected answer is classified retryable and then never re-driven. This test
+    therefore drives the REAL adapter send path against the REAL runner method: it fails loudly if
+    the ``base.py`` call site is dropped again, if the runner loses the scheduler, or if the flood
+    class stops being recognised.
+    """
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter
+
+        class _FloodedAdapter(BasePlatformAdapter):
+            async def connect(self, *, is_reconnect: bool = False):
+                return True
+
+            async def disconnect(self):
+                return None
+
+            async def get_chat_info(self, chat_id):
+                return None
+
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                return SendResult(success=False, error="flood_control:1800")
+
+        adapter = _FloodedAdapter(PlatformConfig(enabled=True), Platform.SLACK)
+        adapter._owner_profile = "reviewer"
+        return adapter
+
+    def _runner(self, calls):
+        from gateway.run import GatewayRunner
+
+        runner = SimpleNamespace(_deferred_obligation_sweeps={})
+
+        async def _redeliver(platform, *, profile=None):
+            calls.append((platform, profile))
+            return 1
+
+        runner._redeliver_failed_obligations_for_platform = _redeliver
+        # The real method, not a stub: losing it upstream must surface here.
+        runner._schedule_deferred_obligation_redelivery = (
+            GatewayRunner._schedule_deferred_obligation_redelivery.__get__(runner)
+        )
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_a_flood_rejected_send_parks_a_sweep_for_its_own_identity(self):
+        adapter = self._adapter()
+        runner = self._runner([])
+        adapter.gateway_runner = runner
+        adapter._adapter_for_source = lambda source: adapter
+
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C1", chat_type="channel",
+            ),
+            message_id="msg-1",
+        )
+        adapter._message_handler = AsyncMock(return_value="the final answer")
+        session_key = "agent:main:slack:channel:C1"
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._process_message_background(event, session_key)
+
+        # The row survives, classified as retryable rather than terminally failed.
+        with dl._connect() as conn:
+            state, last_error = conn.execute(
+                "SELECT state, last_error FROM delivery_obligations"
+            ).fetchone()
+        assert (state, last_error) == ("failed", "flood_control:1800")
+        assert dl.is_runtime_retryable(last_error) is True
+
+        # ...and something will actually come back for it, on this adapter's own identity.
+        assert list(runner._deferred_obligation_sweeps) == ["slack:reviewer"]
+        task = runner._deferred_obligation_sweeps["slack:reviewer"]
+        assert 1795 < task._hermes_sweep_at - time.monotonic() <= 1802
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_rejection_parks_nothing(self):
+        """Only the flood class defers; a permanent reject must not hold a timer open."""
+        adapter = self._adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="chat_not_found")
+        )
+        runner = self._runner([])
+        adapter.gateway_runner = runner
+        adapter._adapter_for_source = lambda source: adapter
+
+        event = MessageEvent(
+            text="hello",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.SLACK, chat_id="C1", chat_type="channel",
+            ),
+            message_id="msg-2",
+        )
+        adapter._message_handler = AsyncMock(return_value="the final answer")
+        session_key = "agent:main:slack:channel:C1"
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._process_message_background(event, session_key)
+
+        assert runner._deferred_obligation_sweeps == {}

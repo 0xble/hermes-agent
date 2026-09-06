@@ -63,7 +63,7 @@ def test_background_review_patch_ledgers_and_rolls_back(ledger_env, monkeypatch)
         reset_current_write_origin,
         set_current_write_origin,
     )
-    from tools.skill_manager_tool import mark_background_review_skill_read
+    from tools.skill_manager_guards import mark_background_review_skill_read
 
     # Background review may update an explicitly curator-managed skill but
     # cannot create one unless opted in. Create in the foreground, adopt it

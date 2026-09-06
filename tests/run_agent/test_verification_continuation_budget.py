@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from run_agent import AIAgent, _is_ephemeral_scaffolding
+from run_agent import AIAgent
+from agent.session_persistence import _is_ephemeral_scaffolding
 from agent.turn_finalizer import (
     _collapse_verification_candidates,
     _compose_verification_receipt_with_answer,
@@ -25,9 +26,9 @@ def _response(content="composed report"):
 def agent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         instance = AIAgent(
             session_id="verify-budget-test",

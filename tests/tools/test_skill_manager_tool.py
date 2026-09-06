@@ -529,6 +529,9 @@ class TestSkillManageDispatcher:
                 "tools.skill_manager_tool._background_review_write_guard",
                 return_value=None,
             ), patch(
+                "tools.skill_manager_guards._background_review_write_guard",
+                return_value=None,
+            ), patch(
                 "tools.skill_manager_tool._background_review_read_before_write_guard",
                 return_value=None,
             ):
@@ -593,7 +596,7 @@ class TestSkillManageDispatcher:
 
     @pytest.mark.parametrize("value", [True, "true", "1", "yes", "on"])
     def test_background_review_create_allowed_for_truthy_config(self, value):
-        from tools.skill_manager_tool import _background_review_create_allowed
+        from tools.skill_manager_guards import _background_review_create_allowed
 
         with patch(
             "hermes_cli.config.load_config_readonly",
@@ -602,14 +605,14 @@ class TestSkillManageDispatcher:
             assert _background_review_create_allowed() is True
 
     def test_background_review_create_allowed_when_config_absent(self):
-        from tools.skill_manager_tool import _background_review_create_allowed
+        from tools.skill_manager_guards import _background_review_create_allowed
 
         with patch("hermes_cli.config.load_config_readonly", return_value={}):
             assert _background_review_create_allowed() is False
 
     @pytest.mark.parametrize("value", [False, "false", "0", "no", "off"])
     def test_background_review_create_blocked_for_false_config(self, value):
-        from tools.skill_manager_tool import _background_review_create_allowed
+        from tools.skill_manager_guards import _background_review_create_allowed
 
         with patch(
             "hermes_cli.config.load_config_readonly",
@@ -619,7 +622,7 @@ class TestSkillManageDispatcher:
 
     @pytest.mark.parametrize("value", ["", "fasle", "enabled", 1, [], {}])
     def test_background_review_create_malformed_config_fails_closed(self, value):
-        from tools.skill_manager_tool import _background_review_create_allowed
+        from tools.skill_manager_guards import _background_review_create_allowed
 
         with patch(
             "hermes_cli.config.load_config_readonly",
@@ -628,7 +631,7 @@ class TestSkillManageDispatcher:
             assert _background_review_create_allowed() is False
 
     def test_background_review_create_config_failure_fails_closed(self):
-        from tools.skill_manager_tool import _background_review_create_allowed
+        from tools.skill_manager_guards import _background_review_create_allowed
 
         with patch(
             "hermes_cli.config.load_config_readonly",
@@ -971,7 +974,7 @@ class TestBackgroundOwnershipPolicyConsistency:
 
     @staticmethod
     def _bg_patch(tmp_path, name, old, new):
-        from tools.skill_manager_tool import mark_background_review_skill_read
+        from tools.skill_manager_guards import mark_background_review_skill_read
         from tools.skill_provenance import (
             BACKGROUND_REVIEW,
             reset_current_write_origin,
@@ -1244,7 +1247,7 @@ class TestCuratorConsolidationDeleteGuard:
     ):
         """A view in one tool worker authorizes a patch in the next worker."""
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):
@@ -1269,7 +1272,7 @@ class TestCuratorConsolidationDeleteGuard:
     ):
         """Copied tool contexts share only their own review's read marks."""
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):
@@ -1297,7 +1300,7 @@ class TestCuratorConsolidationDeleteGuard:
 
     def test_background_review_support_file_overwrite_requires_that_file_read(self, tmp_path, monkeypatch):
         from tools.skills_tool import skill_view
-        from tools.skill_manager_tool import _reset_background_review_read_marks
+        from tools.skill_manager_guards import _reset_background_review_read_marks
 
         _reset_background_review_read_marks()
         with _curator_pass(tmp_path, monkeypatch=monkeypatch):

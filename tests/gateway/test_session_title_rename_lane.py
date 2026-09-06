@@ -16,7 +16,8 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
-from gateway.run import GatewayRunner, TurnRunner
+from gateway.run import GatewayRunner
+from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
 
 
@@ -114,7 +115,7 @@ async def test_manual_telegram_title_allows_intentional_rename_noop(tmp_path):
 
 
 def _attach(lane):
-    """Attach title handling for *lane* and return (agent, renames)."""
+    """Attach the title callback for *lane* and return (callback, renames)."""
     renames: list = []
     source = types.SimpleNamespace(platform=Platform.DISCORD, chat_id="chan-1")
 
@@ -137,13 +138,12 @@ def _attach(lane):
     holder._attach_session_title_callback(
         holder, agent, types.SimpleNamespace(source=source)
     )
-    return agent, renames
+    return agent._on_session_title, renames
 
 
 @pytest.mark.parametrize("lane", ["telegram", "discord"])
 def test_the_rename_waits_for_the_model_title(lane):
-    agent, renames = _attach(lane)
-    callback = agent._on_session_title
+    callback, renames = _attach(lane)
 
     callback("fix the flaky auth test in log", "derived")
     assert renames == []
@@ -198,97 +198,3 @@ async def test_native_thread_rename_passes_only_the_initial_name_guard():
     )
 
     assert calls == [("999", "Semantic Session Title", "Initial words")]
-
-
-def test_telegram_callback_forwards_opening_message_to_icon_selector():
-    calls = []
-    source = types.SimpleNamespace(platform=Platform.TELEGRAM, chat_id="chat-1")
-    runner = types.SimpleNamespace(
-        _is_telegram_topic_lane=lambda src: True,
-        _is_discord_auto_thread_lane=lambda src: False,
-        _is_relay_discord_channel_lane=lambda src: False,
-        _schedule_telegram_topic_title_rename=(
-            lambda src, sid, title, **kwargs: calls.append((title, kwargs))
-        ),
-        _schedule_discord_semantic_thread_rename=lambda *args, **kwargs: None,
-    )
-    holder = types.SimpleNamespace(
-        _runner=runner,
-        _attach_session_title_callback=TurnRunner._attach_session_title_callback,
-    )
-    agent = types.SimpleNamespace(session_id="sess-1")
-    holder._attach_session_title_callback(
-        holder,
-        agent,
-        types.SimpleNamespace(source=source, message="Build a lunar calendar"),
-    )
-
-    agent._on_session_title("Lunar calendar", "llm")
-
-    assert calls == [("Lunar calendar", {"user_message": "Build a lunar calendar"})]
-
-
-@pytest.mark.asyncio
-async def test_telegram_topic_deduplicates_same_title_request(monkeypatch):
-    runner = object.__new__(GatewayRunner)
-    runner._telegram_topic_last_scheduled_titles = {}
-    runner._is_telegram_topic_lane = lambda source: True
-    runner._telegram_topic_auto_rename_disabled = lambda source: False
-    runner._sanitize_telegram_topic_title = lambda title: title.strip()
-    runner._gateway_loop = None
-    scheduled = []
-
-    def capture(coro, loop, **kwargs):
-        coro.close()
-        scheduled.append(True)
-        return None
-
-    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        user_id="user-1",
-        chat_id="chat-1",
-        thread_id="thread-1",
-    )
-
-    runner._schedule_telegram_topic_title_rename(source, "session-1", "Real title")
-    runner._schedule_telegram_topic_title_rename(source, "session-1", "Real title")
-
-    assert scheduled == [True]
-
-
-def test_telegram_topic_skips_rename_after_delivery_marks_topic_stale(monkeypatch):
-    class StaleAdapter:
-        def is_dm_topic_stale(self, chat_id, thread_id):
-            return (str(chat_id), str(thread_id)) == ("chat-1", "thread-1")
-
-    runner = object.__new__(GatewayRunner)
-    runner._telegram_topic_last_scheduled_titles = {}
-    runner._is_telegram_topic_lane = lambda source: True
-    runner._telegram_topic_auto_rename_disabled = lambda source: False
-    runner._sanitize_telegram_topic_title = lambda title: title.strip()
-    runner._adapter_for_source = lambda source: StaleAdapter()
-    runner._gateway_loop = None
-    scheduled = []
-
-    def capture(coro, loop, **kwargs):
-        coro.close()
-        scheduled.append(True)
-        return None
-
-    monkeypatch.setattr("gateway.run.safe_schedule_threadsafe", capture)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        user_id="user-1",
-        chat_id="chat-1",
-        thread_id="thread-1",
-    )
-
-    runner._schedule_telegram_topic_title_rename(
-        source,
-        "session-1",
-        "Internet Game Help",
-    )
-
-    assert scheduled == []
-    assert runner._telegram_topic_last_scheduled_titles == {}

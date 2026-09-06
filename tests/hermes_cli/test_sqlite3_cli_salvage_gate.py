@@ -28,6 +28,8 @@ from unittest.mock import patch
 
 import pytest
 
+import hermes_state_repair
+
 from hermes_cli.session_lost_and_found import (
     _parse_sqlite3_cli_version,
     _wal_reset_vulnerable,
@@ -228,7 +230,7 @@ class TestGuidanceNeverNamesLiveDb:
         assert ".recover" in explanation  # the warning still names the hazard
 
     def test_repair_budget_error_names_safe_lane(self, tmp_path: Path):
-        import hermes_state
+        import hermes_state_repair as hermes_state  # helper lives in the split-out repair module
 
         message = hermes_state._persistent_repair_exhausted_error(
             tmp_path / "state.db"
@@ -255,7 +257,7 @@ class TestGuidanceNeverNamesLiveDb:
             lambda _path: SimpleNamespace(total=10_000, used=10_000, free=0),
         )
 
-        backup, reason = hermes_state._backup_db_file(db_path)
+        backup, reason = hermes_state_repair._backup_db_file(db_path)
 
         assert backup is None
         assert reason is not None
@@ -264,7 +266,7 @@ class TestGuidanceNeverNamesLiveDb:
         assert "--inspect-only" in reason
 
     def test_kanban_manual_recovery_warns_about_live_db(self):
-        import hermes_cli.kanban as kanban
+        import hermes_cli.kanban_ops as kanban  # ``_cmd_repair`` lives here (split from hermes_cli.kanban)
 
         source = inspect.getsource(kanban)
         assert '`sqlite3 kanban.db ".recover"`' not in source

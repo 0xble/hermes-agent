@@ -106,7 +106,7 @@ def test_gateway_watch_formatter_preserves_pre_refactor_subagent_text(monkeypatc
     event = _watch_event()
     event["owner_task_id"] = "sa-child"
     monkeypatch.setattr(
-        "tools.process_registry._delegation_attribution_line",
+        "tools.process_registry_notifications._delegation_attribution_line",
         lambda _event: "Started by subagent reviewer (sa-child).",
     )
 

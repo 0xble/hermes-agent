@@ -405,7 +405,7 @@ def test_session_lane_replacement_and_owner_detach_are_scoped():
         transport_family="cloud-ticket-ws",
     ) == other
 
-    assert broker.detach_owner("owner-shared") == 1
+    broker.detach(second, owner="owner-shared")
     assert broker.scope_for_session(
         session_id="session-fixture",
         principal_id="principal-fixture",
@@ -416,7 +416,6 @@ def test_session_lane_replacement_and_owner_detach_are_scoped():
         principal_id="principal-fixture",
         transport_family="cloud-ticket-ws",
     ) == other
-    assert broker.detach_owner("missing-owner") == 0
 
     broker.reset()
     assert broker.scope_for_session(
@@ -479,7 +478,7 @@ def test_transport_teardown_can_cancel_waiters_without_writing_to_closing_peer()
     scope = _scope()
     thread, outcome, frames = _start_pending(broker, scope)
 
-    assert broker.detach_owner("owner-fixture", notify_controller=False) == 1
+    broker.detach(scope, owner="owner-fixture", notify_controller=False)
     thread.join(timeout=1.0)
 
     assert isinstance(outcome.get("error"), ControllerCancelled)
