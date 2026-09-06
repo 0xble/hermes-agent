@@ -38,6 +38,33 @@ def make_child(monkeypatch, tmp_path):
         child.close()
 
 
+@pytest.mark.parametrize("named", [True, False])
+def test_real_delegation_builder_preserves_child_knowledge_mode(make_child, named):
+    from tools.delegate_tool import _build_child_agent
+
+    parent = make_child("high", "gpt-6-astra")
+    del parent._delegation_runtime_pin
+    definition = parse_definitions({"subagents": {"fixture": {
+        "description": "Read-only fixture", "instructions": "Investigate the fixture.",
+        "model": "gpt-5.6-luna", "provider": "openai-codex", "reasoning_effort": "medium",
+    }}})["fixture"] if named else None
+    child = _build_child_agent(
+        task_index=0, goal="Investigate the fixture", context=None, toolsets=None,
+        model="gpt-5.6-luna", max_iterations=1, task_count=1, parent_agent=parent,
+        subagent_definition=definition,
+        resolved_reasoning={"enabled": True, "effort": "medium"} if named else None,
+    )
+    try:
+        assert child.memory_access_mode == ("read_only" if named else None)
+        assert child._memory_read_only is named
+        assert child.skip_background_review is named
+        assert parent._memory_read_only is False
+        if named:
+            assert child._delegation_runtime_pin.model == definition.model
+    finally:
+        child.close()
+
+
 def test_initial_tool_continuation_and_correction_preserve_effort(make_child, monkeypatch):
     child = make_child()
     responses = [_codex_tool_call_response(), _codex_message_response("done"), _codex_message_response("corrected")]

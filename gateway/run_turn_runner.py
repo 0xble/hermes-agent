@@ -1431,7 +1431,8 @@ class TurnRunner:
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
         # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        mem_notif = ctx.user_config.get("display", {}).get("memory_notifications")
+        platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
+        mem_notif = ctx.resolve_display_setting(ctx.user_config, platform_key, "memory_notifications")
         if isinstance(mem_notif, bool):
             mem_notif = "on" if mem_notif else "off"
         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
