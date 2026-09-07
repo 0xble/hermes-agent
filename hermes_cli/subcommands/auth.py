@@ -49,6 +49,8 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_refresh.add_argument(
         "target", nargs="?",
         help="Credential index, entry id, or exact label (required when the pool holds more than one)")
+    auth_refresh.add_argument("--verify", action="store_true", help="Read back this credential and probe its live quota")
+    auth_refresh.add_argument("--json", action="store_true", help="Emit a machine-readable verification result")
     auth_priority = auth_subparsers.add_parser(
         "priority", help="Move a pooled credential to a priority (0 = tried first under fill_first)")
     auth_priority.add_argument("provider", help="Provider id")
@@ -56,6 +58,9 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_priority.add_argument("priority", type=int, help="New priority; others are renumbered")
     auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
     auth_status.add_argument("provider", help="Provider id")
+    auth_status.add_argument("target", nargs="?", help="Credential index, entry id, or exact label for --live")
+    auth_status.add_argument("--live", action="store_true", help="Read this credential's current provider quota without refresh")
+    auth_status.add_argument("--json", action="store_true", help="Emit a machine-readable live status result")
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state")
     auth_logout.add_argument("provider", help="Provider id")

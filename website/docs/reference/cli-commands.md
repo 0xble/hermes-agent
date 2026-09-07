@@ -1824,3 +1824,34 @@ Additional behavior:
 - [Sessions](../user-guide/sessions.md)
 - [Skills System](../user-guide/features/skills.md)
 - [Skins & Themes](../user-guide/features/skins.md)
+
+### Named credential quota and verified refresh
+
+```bash
+hermes auth status openai-codex meridian --live --json
+hermes auth status openai-codex meridian --json
+hermes auth refresh openai-codex meridian --verify --json
+```
+
+Targets use a unique label, entry ID, or displayed index. Omitting a target is
+allowed only for a pool containing exactly one credential. Targeted status reads
+stored pool rows without auto-import, refresh, repair, or persistence. Without
+`--live`, it reports cached evidence only. Live quota currently supports Codex;
+other providers explicitly return `unsupported`.
+
+`--verify` refreshes through the native credential-owner locking path, reads back
+the selected persisted token pair, then probes that account's quota. It never
+refreshes all accounts. A successful refresh may adopt a peer's rotation and does
+not by itself establish quota availability or successful model inference.
+
+JSON uses `schema_version: 1`, separate `cached` and `quota` objects, observation
+and reset timestamps, and outcomes such as `available`, `exhausted`, `unknown`,
+`refreshed_available`, `refreshed_exhausted`, `refreshed_unknown`, and
+`reauth_required`. A rejected access token alone never establishes reauth.
+`auth refresh --json` without `--verify` reports `refresh_completed` after
+persisted readback, without a quota request.
+
+Exit codes: **0** completed inspection or refresh (including known exhaustion),
+**1** unreadable/unsupported live quota, failed refresh, or failed verification,
+**2** invalid target or unsupported refresh. JSON is written to stdout, startup
+diagnostics to stderr. Provider bodies, tokens, and raw exceptions are excluded.

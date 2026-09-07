@@ -535,6 +535,10 @@ def auth_refresh_command(args) -> None:
     429s and benches it again. Failure leaves the pool's own verdict in place.
     """
     provider = _normalize_provider(getattr(args, "provider", ""))
+    if getattr(args, "verify", False) or getattr(args, "json", False):
+        from hermes_cli.auth_quota import run_refresh
+        args.provider = provider
+        return run_refresh(args)
     target = getattr(args, "target", None)
     pool = load_pool(provider)
     entries = pool.entries()
@@ -573,6 +577,10 @@ def auth_refresh_command(args) -> None:
 
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if getattr(args, "live", False) or getattr(args, "json", False) or getattr(args, "target", None) is not None:
+        from hermes_cli.auth_quota import run_status
+        args.provider = provider
+        return run_status(args)
     if not provider:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     if provider in auth_mod.SINGLE_USE_REFRESH_POOL_PROVIDERS:
