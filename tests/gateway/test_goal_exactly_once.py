@@ -141,6 +141,9 @@ async def test_goal_continuation_accepts_queued_turn_controls(monkeypatch):
                 "continuation_prompt": "Keep going.",
             }
 
+        def claim_transition_notice(self, _decision):
+            return False
+
     fake_goals = types.ModuleType("hermes_cli.goals")
     setattr(fake_goals, "GoalManager", _ActiveGoalManager)
     monkeypatch.setitem(sys.modules, "hermes_cli.goals", fake_goals)

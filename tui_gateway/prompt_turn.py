@@ -297,9 +297,11 @@ def _goal_followup_after_turn(
                 _bg_procs = _gather_bg()
             except Exception:
                 _bg_procs = None
+            from hermes_cli.goals import collect_tool_evidence
             decision = goal_mgr.evaluate_after_turn(
-                raw, user_initiated=True, background_processes=_bg_procs)
-            if verdict_msg := decision.get("message") or "":
+                raw, user_initiated=True, background_processes=_bg_procs,
+                tool_evidence=collect_tool_evidence(result))
+            if goal_mgr.claim_transition_notice(decision) and (verdict_msg := decision.get("message") or ""):
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):

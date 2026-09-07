@@ -22,7 +22,7 @@ def format_goal_change(action: str, state: GoalState, change: dict[str, Any] | N
     elif action == "draft":
         text = f"⊙ Goal drafted ({state.status}, {state.max_turns}-turn budget): {state.goal}"
     elif action == "edit":
-        text = f"⊙ Goal edited ({state.status}): {state.goal}"
+        text = f"⊙ Goal edited{' and resumed' if change.get('resumed') else ''} ({state.status}): {state.goal}"
     elif action == "pause":
         text = t("gateway.goal.paused", goal=state.goal)
         if state.paused_reason:
@@ -32,9 +32,7 @@ def format_goal_change(action: str, state: GoalState, change: dict[str, Any] | N
     elif action == "clear":
         text = f"✓ Goal cleared: {state.goal}"
     elif action == "wait":
-        text = f"⏳ Goal parked on PID {state.waiting_on_pid}: {state.goal}"
-        if state.waiting_reason:
-            text += f"\n{state.waiting_reason}"
+        text = f"⏳ Goal parked on {state.waiting_reason or 'background work'}: {state.goal}"
     elif action == "unwait":
         text = f"▶ Goal wait released: {state.goal}"
     elif action in {"subgoal_add", "subgoal_remove"}:

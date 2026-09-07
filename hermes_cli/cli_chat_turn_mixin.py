@@ -457,6 +457,9 @@ class CLIChatTurnMixin:
         # box; the sleep lets the renderer paint before we draw.
         sys.stdout.flush()
         time.sleep(0.15)
+        # Goal evaluation consumes canonical tool-result messages from this turn.
+        # Keep the full envelope process-local; only redacted metadata is durable.
+        self._last_agent_result = turn.result
         if turn.result:
             self.conversation_history = turn.result.get("messages", self.conversation_history)
         # Mid-turn auto-compression continues in a child session: sync so /status, /resume,

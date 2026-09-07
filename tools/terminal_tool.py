@@ -944,8 +944,11 @@ def _plan_execution(
     # Reject non-positive timeouts before deadline math: ``timeout or
     # default`` would silently turn 0 into the default, and a negative
     # value is truthy and would fire an immediate "-Ns" timeout.
-    if timeout is not None and timeout <= 0:
-        raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
+    if timeout is not None:
+        import math
+
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise _Rejected(tool_error("timeout must be a positive finite number of seconds."))
     if not background:
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
             raise _Rejected(tool_error(
@@ -1203,6 +1206,7 @@ def terminal_tool(
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
+                timeout=timeout,
             )
         return _run_foreground(
             command, env, plan,
@@ -1248,7 +1252,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Runtime limit in seconds. Foreground defaults to 180 (max {FOREGROUND_MAX_TIMEOUT}) and returns immediately on exit. With background=true, an explicit timeout terminates the tracked process at that deadline and reports timed_out; omission leaves servers/watchers unbounded. A timeout does not prove external effects failed: reconcile before retrying.",
                 "minimum": 1
             },
             "workdir": {

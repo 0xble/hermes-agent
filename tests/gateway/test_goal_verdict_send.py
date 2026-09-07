@@ -119,10 +119,7 @@ async def _drain_until(condition, timeout=5.0):
 
 @pytest.mark.asyncio
 async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
-    """When the judge says continue, both the 'continuing' status and the
-    continuation-prompt event must be delivered. The continuation prompt is
-    routed through the adapter's pending-messages FIFO so the goal loop
-    proceeds on the next turn."""
+    """Routine continue is silent; its continuation event stays in the FIFO."""
     runner, adapter, session_entry, src = _make_runner_with_adapter()
 
     from hermes_cli.goals import GoalManager
@@ -136,11 +133,9 @@ async def test_goal_verdict_continue_enqueues_continuation(hermes_home):
             source=src,
             final_response="here's a partial edit",
         )
-        await _drain_until(lambda: adapter.sends and adapter._pending_messages)
+        await _drain_until(lambda: adapter._pending_messages)
 
-    # Status line sent back
-    assert len(adapter.sends) == 1
-    assert "Continuing toward goal" in adapter.sends[0]["content"]
+    assert adapter.sends == []
     # Continuation prompt enqueued for next turn
     assert adapter._pending_messages, "continuation prompt must be enqueued in pending_messages"
 

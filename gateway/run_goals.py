@@ -231,6 +231,7 @@ class GatewayGoalsMixin:
         self, *, session_entry: Any, source: Any, final_response: str,
         session_key: Optional[str] = None, enqueue_continuation: bool = True,
         emit_status_notice: bool = True,
+        tool_evidence: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -254,11 +255,17 @@ class GatewayGoalsMixin:
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
+                tool_evidence=tool_evidence,
             ),
         )
         msg = decision.get("message") or ""
-        # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
-        if emit_status_notice and msg and source is not None:
+        # Shared persisted policy: routine continue is silent, while meaningful
+        # state transitions (including the first wait and resume) emit once.
+        notify = bool(
+            emit_status_notice and msg and source is not None
+            and mgr.claim_transition_notice(decision)
+        )
+        if notify:
             await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not enqueue_continuation or not decision.get("should_continue") or not prompt or source is None:
@@ -300,7 +307,10 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                kwargs = dict(session_entry=session_entry, source=source, final_response=final_text)
+                if label == "goal continuation":
+                    kwargs["tool_evidence"] = self._tool_evidence_for_goal(agent_result)
+                await hook(**kwargs)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 
@@ -317,6 +327,13 @@ class GatewayGoalsMixin:
             return text
         streamed = getattr(event, "_streamed_final_response", None)
         return streamed if isinstance(streamed, str) and streamed.strip() else text
+
+    @staticmethod
+    def _tool_evidence_for_goal(agent_result: Any) -> list[dict[str, Any]]:
+        """Extract evidence from canonical tool messages, never guessed result keys."""
+        from hermes_cli.goals import collect_tool_evidence
+
+        return collect_tool_evidence(agent_result)
 
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
