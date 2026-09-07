@@ -386,6 +386,9 @@ DEFAULT_CONFIG = {
         "record_sessions": False,  # auto-record browser sessions as WebM videos
         # headed: visible Chromium window (local); skips per-turn cleanup, idle reaper still applies
         "headed": False,
+        # Dormant safety gate: exposes and dispatches only reveal/minimize for a verified,
+        # existing headed named-identity browser. It never restarts or closes a browser.
+        "visibility_handoff": False,
         "allow_private_urls": False,  # allow private/internal IPs (localhost, 192.168.x.x, ...)
         # Local browser engine for both drivers. "auto" = Chrome; "lightpanda" = faster navigation,
         # no screenshots (Browser Use mode spawns `lightpanda serve` per session; built-in tools

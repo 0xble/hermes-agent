@@ -867,7 +867,50 @@ def _clamp_timeout(timeout_s: Any) -> int:
         return _DEFAULT_TIMEOUT_S
 
 
-def browser_exec(
+def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
+                 task_id: Optional[str] = None, local: bool = False,
+                 identity: str = "", headed: Optional[bool] = None,
+                 handoff: Optional[str] = None) -> str | dict:
+    """Run Browser Use, optionally changing verified managed-window visibility."""
+    from tools.registry import tool_error, tool_result
+    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
+    from tools import browser_handoff as lifecycle
+    from tools.browser_handoff_cdp import CdpHandoffError
+    try:
+        resolved = resolve_browser_identity(identity)
+        if handoff is not None:
+            if not lifecycle.enabled():
+                raise BrowserIdentityError("Managed-browser visibility handoff is disabled")
+            if resolved is None or not local or not _real_profile_consented():
+                raise BrowserIdentityError("Handoff requires an explicit managed identity, local=true and real-profile consent")
+            if not identity:
+                raise BrowserIdentityError("Handoff requires an explicit identity")
+            if any(line.strip() and not line.lstrip().startswith("#") for line in code.splitlines()):
+                raise BrowserIdentityError("Handoff cannot also execute code; use a comment-only code label")
+            from tools.browser_tool import _get_cdp_override_raw
+            if _has_cdp_env(_base_subprocess_env()) or _get_cdp_override_raw():
+                raise BrowserIdentityError("Handoff cannot control an operator-supplied CDP endpoint")
+            if handoff not in {"reveal", "minimize"}:
+                raise BrowserIdentityError("Handoff action must be 'reveal' or 'minimize'")
+        if resolved is None:
+            return _browser_exec(code, session, timeout_s, task_id, local, identity, headed)
+        effective_session = _effective_browser_exec_session(session, task_id)
+        if effective_session and not _SESSION_RE.fullmatch(effective_session):
+            raise BrowserIdentityError("Invalid browser session name")
+        if handoff is None:
+            if not lifecycle.enabled():
+                return _browser_exec(code, session, timeout_s, task_id, local, identity, headed)
+            with lifecycle.activity(resolved, timeout=_clamp_timeout(timeout_s)):
+                if binding_error := _check_browser_exec_identity_binding(resolved, effective_session):
+                    raise BrowserIdentityError(binding_error)
+                return _browser_exec(code, session, timeout_s, task_id, local, identity, headed)
+        with lifecycle.activity(resolved):
+            return tool_result(lifecycle.handoff(resolved, effective_session, handoff))
+    except (BrowserIdentityError, CdpHandoffError, OSError, TimeoutError) as exc:
+        return tool_error(str(exc))
+
+
+def _browser_exec(
     code: str,
     session: str = "",
     timeout_s: int = _DEFAULT_TIMEOUT_S,
@@ -994,6 +1037,12 @@ def browser_exec(
 
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
+    from tools.browser_handoff import enabled as visibility_handoff_enabled
+    track_visibility_activity = resolved_identity is not None and visibility_handoff_enabled()
+    owns_activity_marker = False
+    if track_visibility_activity:
+        from tools.browser_handoff import mark_executing
+        owns_activity_marker = mark_executing(resolved_identity, env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or "unknown")
     try:
         proc = subprocess.run(
             cmd, input=code, capture_output=True, text=True, timeout=timeout, env=env,
@@ -1006,6 +1055,9 @@ def browser_exec(
     except OSError as e:
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
+    if owns_activity_marker:
+        from tools.browser_handoff import mark_finished
+        mark_finished(resolved_identity)
     result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
     if workspace:
         result["workspace"] = workspace
@@ -1120,6 +1172,16 @@ def _dynamic_schema_overrides() -> dict:
                     "immutably bound to it and cannot later switch cookie jars."
                 ),
             }
+        if aliases and _read_browser_cfg().get("visibility_handoff") is True:
+            props["handoff"] = {
+                "type": "string",
+                "enum": ["reveal", "minimize"],
+                "description": (
+                    "Reveal or minimize an existing headed Hermes-managed browser for this explicit "
+                    "identity. Requires local=true and comment-only code; it never restarts or closes "
+                    "the browser, controls normal Chrome, or attaches to cloud/other sessions."
+                ),
+            }
         required = list(BROWSER_EXEC_SCHEMA["parameters"].get("required") or [])
         if aliases and cfg.get("require_identity") is True and "identity" not in required:
             required.append("identity")
@@ -1182,6 +1244,7 @@ registry.register(
         local=bool(args.get("local", False)),
         identity=args.get("identity", "") or "",
         headed=args.get("headed"),
+        handoff=args.get("handoff"),
     ),
     check_fn=is_browser_use_cli_mode,
     dynamic_schema_overrides=_dynamic_schema_overrides,
