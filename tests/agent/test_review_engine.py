@@ -131,10 +131,50 @@ def test_load_review_credentials_cfg_reads_config(monkeypatch):
     }
 
 
+def test_load_review_credentials_cfg_translates_ordered_fallback_chain(monkeypatch):
+    chain = [
+        {"provider": "anthropic", "model": "claude-opus-4-6"},
+        {"provider": "nous", "model": "astra"},
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "anthropic",
+            "model": "claude-fable-5-1",
+            "fallback_chain": chain,
+        }}},
+    )
+
+    cfg = re_mod._load_review_credentials_cfg()
+
+    assert cfg is not None
+    assert cfg["fallback_providers"] == chain
+    assert cfg["fallback_providers"] is not chain
+
+    from tools.delegate_tool_config import _resolve_child_fallback_chain
+
+    parent = MagicMock()
+    parent._fallback_chain = [
+        {"provider": "openrouter", "model": "unrelated-global"}
+    ]
+    assert _resolve_child_fallback_chain(parent, cfg, pinned=True) == chain
+
+
 def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {"auxiliary": {"review": {"provider": "auto", "model": ""}}},
+    )
+    assert re_mod._load_review_credentials_cfg() is None
+
+
+@pytest.mark.parametrize("chain", [[], None, "not-a-list"])
+def test_load_review_credentials_cfg_ignores_unusable_fallback_chain(monkeypatch, chain):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "auto", "model": "", "fallback_chain": chain,
+        }}},
     )
     assert re_mod._load_review_credentials_cfg() is None
 
@@ -176,8 +216,12 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
 
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    built = {}
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", fake_resolve)
-    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(
+        dt, "_build_child_agent",
+        lambda **kw: built.update(kw) or fake_child,
+    )
     monkeypatch.setattr(
         dt, "_run_single_child",
         lambda *a, **k: {
@@ -187,7 +231,13 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
         },
     )
 
-    override = {"provider": "openrouter", "model": "review-model-x"}
+    override = {
+        "provider": "openrouter",
+        "model": "review-model-x",
+        "fallback_providers": [
+            {"provider": "anthropic", "model": "claude-opus-4-6"},
+        ],
+    }
     out = dt.delegate_task(
         goal="review this",
         background=True,
@@ -197,6 +247,7 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched"
     assert seen["cfg"] == override
+    assert built["routing_cfg"] == override
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +307,7 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
             continue
     assert evt is not None and evt["type"] == "async_delegation"
     assert evt["results"][0]["summary"] == "REVIEW: looks good"
+    assert evt["results"][0]["model"] == "m"
 
 
 def test_start_review_rejects_empty_conversation():
@@ -507,7 +559,7 @@ def test_format_dispatch_note_dispatched():
     note = format_dispatch_note(
         {"status": "dispatched", "review_model": "opus"}, "security"
     )
-    assert "dispatched on opus" in note
+    assert "dispatched starting on opus" in note
     assert "focus: security" in note
     assert "re-enter" in note
 

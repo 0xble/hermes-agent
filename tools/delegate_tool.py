@@ -131,6 +131,9 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Configuration block that owns this route's fallback policy. Internal
+    # callers such as /review pass auxiliary.review here.
+    routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
     # HERMES-108: a trusted named definition from ``delegation.subagents``.
@@ -180,6 +183,7 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_max_tokens=override_max_tokens, override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
+        routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -376,6 +380,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
     task_runtime: Optional[List[tuple]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
@@ -400,7 +405,8 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=_task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
-                subagent_definition=_definition, resolved_reasoning=_reasoning, **_task_overrides,
+                subagent_definition=_definition, resolved_reasoning=_reasoning,
+                routing_cfg=routing_cfg, **_task_overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -517,6 +523,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
+        routing_cfg=credentials_cfg,
     )
     if err:
         return tool_error(err)
