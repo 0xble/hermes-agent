@@ -165,6 +165,36 @@ def test_named_physical_codex_request_rejects_another_client(make_child):
         child._run_codex_stream(kwargs, client=other)
 
 
+def test_nonstream_completion_after_interrupt_is_cancelled(make_child, monkeypatch):
+    """A response completing during the poll join cannot outrun cancellation."""
+    import agent.chat_completion_helpers as helpers
+
+    child = make_child()
+    request = helpers._NonStreamRequest(child, {"model": child.model})
+    request.result["response"] = _codex_message_response("late response")  # type: ignore[assignment]
+    monkeypatch.setattr(child, "_touch_activity", lambda _reason: None)
+
+    class CompletesBeforeNextPoll:
+        def __init__(self, *_args, **_kwargs):
+            self.alive = False
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            # The interrupt arrives after the worker published its response but
+            # before the next poll observes that the worker has finished.
+            child._interrupt_requested = True
+            return self.alive
+
+        def join(self, timeout=None):
+            pytest.fail("The finished worker must not be joined again")
+
+    monkeypatch.setattr(helpers.threading, "Thread", CompletesBeforeNextPoll)
+    with pytest.raises(InterruptedError, match="Agent interrupted during API call"):
+        request.run()
+
+
 def test_named_child_native_cancellation_keeps_parent_configuration(make_child, monkeypatch):
     from threading import Event
     from tools.delegate_tool import _run_single_child

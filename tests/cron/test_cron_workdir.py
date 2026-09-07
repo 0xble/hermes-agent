@@ -472,7 +472,9 @@ class TestRunJobTerminalCwd:
         for thread in threads:
             thread.start()
 
-        overlapped = both_active.wait(timeout=1)
+        # Startup imports/config resolution can be contended by other suite workers;
+        # the event itself, not a short scheduler-dependent interval, proves overlap.
+        overlapped = both_active.wait(timeout=5)
         release.set()
         for thread in threads:
             thread.join(timeout=10)

@@ -244,7 +244,15 @@ class TestOsc11DrainGuard:
         read_fd, write_fd = os.pipe()
         fake_attrs = [0, 0, 0, 0, 0, 0, [b'\x00'] * 32]
         monkeypatch.setattr(termios, "tcgetattr", lambda fd: fake_attrs)
-        monkeypatch.setattr(termios, "tcsetattr", lambda fd, when, attrs: None)
+
+        def flush_then_send_straggler(fd, when, attrs):
+            if when == termios.TCSAFLUSH:
+                # This is the precise boundary between the flush and drain.
+                # A real pipe carries the payload; only its arrival phase is
+                # injected so runner load cannot move it past the drain window.
+                os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
+
+        monkeypatch.setattr(termios, "tcsetattr", flush_then_send_straggler)
         monkeypatch.setattr(_tty, "setcbreak", lambda fd: None)
         monkeypatch.setattr(cli_mod.sys.stdin, "isatty", lambda: True, raising=False)
         monkeypatch.setattr(cli_mod.sys.stdout, "isatty", lambda: True, raising=False)
@@ -252,19 +260,9 @@ class TestOsc11DrainGuard:
         for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"):
             monkeypatch.delenv(v, raising=False)
 
-        # DA1 answered immediately (herdr-style: OSC 11 swallowed) — main
-        # loop exits fast — then a straggler payload lands during teardown.
+        # DA1 answered immediately (herdr-style: OSC 11 swallowed), so the
+        # main loop exits before the deterministic flush-boundary injection.
         os.write(write_fd, b"\x1b[?62;22c")
-
-        import threading
-
-        def straggler():
-            import time
-            time.sleep(0.02)  # inside the 50ms drain window
-            os.write(write_fd, b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\")
-
-        t = threading.Thread(target=straggler, daemon=True)
-        t.start()
 
         result = cli_mod._query_osc11_background()
         assert result is None  # OSC 11 was swallowed; only DA1 answered

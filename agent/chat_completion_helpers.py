@@ -1386,6 +1386,11 @@ class _NonStreamRequest:
                 break
             if agent._interrupt_requested:
                 self._interrupt(elapsed)
+        # The worker can publish a response and exit between the final poll and
+        # its condition check. Cancellation wins that completion race just as it
+        # does while the worker is still alive.
+        if agent._interrupt_requested:
+            self._interrupt(time.time() - self.call_start)
         if self.result["error"] is not None:
             raise self.result["error"]
         # Success — the provider proved responsive: clear the breaker (#58962).

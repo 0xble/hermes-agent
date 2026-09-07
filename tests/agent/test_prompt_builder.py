@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import sys
-import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -1310,20 +1310,26 @@ class TestContextFileReadTimeout:
         monkeypatch.setattr(pb_mod, "_get_context_file_read_timeout", lambda: 0.05)
 
         original_read_text = Path.read_text
+        read_started = threading.Event()
+        release_read = threading.Event()
+        read_finished = threading.Event()
 
         def slow_read_text(self, *args, **kwargs):
             if self.name == ".hermes.md":
-                time.sleep(0.6)
+                read_started.set()
+                release_read.wait(timeout=5)
+                read_finished.set()
             return original_read_text(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", slow_read_text)
 
-        start = time.monotonic()
-        with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
-            result = build_context_files_prompt(cwd=str(tmp_path))
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 0.4, f"context load blocked for {elapsed:.2f}s"
+        try:
+            with caplog.at_level(logging.WARNING, logger=pb_mod.__name__):
+                result = build_context_files_prompt(cwd=str(tmp_path))
+            assert read_started.is_set()
+            assert not read_finished.is_set(), "context load waited for the timed-out read"
+        finally:
+            release_read.set()
         assert "Agent fallback rules" in result
         assert "Hermes project rules" not in result
         assert "timed out" in caplog.text.lower()

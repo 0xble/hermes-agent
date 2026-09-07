@@ -9,6 +9,7 @@ Telegram and Feishu.
 """
 
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,6 +33,13 @@ def _make_event(
         message_type=msg_type,
         source=SessionSource(platform=platform, chat_id=chat_id, chat_type="dm"),
     )
+
+
+def _dispatch_event(handler: Any) -> asyncio.Event:
+    """Return an event that fires when the adapter dispatches its buffered batch."""
+    dispatched = asyncio.Event()
+    handler.side_effect = lambda *_args, **_kwargs: dispatched.set()
+    return dispatched
 
 
 # =====================================================================
@@ -62,14 +70,13 @@ class TestDiscordTextBatching:
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_discord_adapter()
         event = _make_event("hello world", Platform.DISCORD)
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(event)
 
         # Not dispatched yet
         adapter.handle_message.assert_not_called()
-
-        # Wait for flush
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -79,14 +86,13 @@ class TestDiscordTextBatching:
     async def test_split_messages_aggregated(self):
         """Two rapid messages from the same chat should be merged."""
         adapter = _make_discord_adapter()
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(_make_event("Part one of a long", Platform.DISCORD))
-        await asyncio.sleep(0.02)
         adapter._enqueue_text_event(_make_event("message that was split.", Platform.DISCORD))
 
         adapter.handle_message.assert_not_called()
-
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -122,11 +128,12 @@ class TestMatrixTextBatching:
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_matrix_adapter()
         event = _make_event("hello world", Platform.MATRIX)
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -134,13 +141,13 @@ class TestMatrixTextBatching:
     @pytest.mark.asyncio
     async def test_split_messages_aggregated(self):
         adapter = _make_matrix_adapter()
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(_make_event("first part", Platform.MATRIX))
-        await asyncio.sleep(0.02)
         adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -176,11 +183,12 @@ class TestWeComTextBatching:
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_wecom_adapter()
         event = _make_event("hello world", Platform.WECOM)
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -188,13 +196,13 @@ class TestWeComTextBatching:
     @pytest.mark.asyncio
     async def test_split_messages_aggregated(self):
         adapter = _make_wecom_adapter()
+        dispatched_event = _dispatch_event(adapter.handle_message)
 
         adapter._enqueue_text_event(_make_event("first part", Platform.WECOM))
-        await asyncio.sleep(0.02)
         adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -229,10 +237,10 @@ class TestTelegramAdaptiveDelay:
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_telegram_adapter()
+        dispatched_event = _dispatch_event(adapter.handle_message)
         adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
 
-        # Should flush after the normal 0.1s delay
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
         adapter.handle_message.assert_called_once()
 
 
@@ -268,9 +276,10 @@ class TestFeishuAdaptiveDelay:
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_feishu_adapter()
         event = _make_event("short msg", Platform.FEISHU)
+        dispatched_event = _dispatch_event(adapter._handle_message_with_guards)
         await adapter._enqueue_text_event(event)
 
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(dispatched_event.wait(), timeout=2)
         adapter._handle_message_with_guards.assert_called_once()
 
 
