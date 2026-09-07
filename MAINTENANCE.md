@@ -106,6 +106,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-082 | Active | `fix(reconcile): restore fork behaviour the v0.21.0 replay dropped` | Keep internal continuation turns from creating new control-plane effects or quoting unrelated Telegram DM-topic messages. |
 | HERMES-083 | Active | `fix(reconcile): restore fork behaviour the v0.21.0 replay dropped` | Preserve internal-notification provenance across upstream async API changes. Side-routing reconciliation is retired with HERMES-067. |
 | HERMES-084 | Active | `fix(gateway): bound per-chat typing indicator traffic` | Bound the typing indicator's per-CHAT API rate across concurrent sessions and quiesce it during a flood window. |
+| HERMES-122 | Active | `feat(browser): add managed visibility handoff` | Default-disabled reveal/minimize for a verified existing headed named-identity browser. No browser restart or close. |
 | HERMES-085 | Active | `fix(gateway): defer flood-controlled delivery obligations` | Treat a platform flood rejection as a timed deferral rather than a terminal delivery failure. |
 | HERMES-086 | Active | `fix(gateway): preserve queued-turn cleanup callbacks` | Keep each completed turn's temporary progress cleanup when a queued follow-up starts before the prior delivery task unwinds. |
 | HERMES-087 | Active | `fix(skills): stop duplicating root skill names` | Classify root-level skills under `general` so the prompt does not suggest invalid self-qualified lookups. |
@@ -257,6 +258,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ## Patch records
 
+
 ### HERMES-121 — Inspect and verify named credential quota
 
 - **Rationale and contract:** `hermes auth status <provider> [target] --live --json` reads exactly one stored credential without seeding, healing, persisting, selecting, or refreshing. Omitted targets require exactly one row. Cached status and timestamps are separate from live evidence. `auth refresh <provider> [target] --verify --json` uses HERMES-117's native locked refresh, then compares the exact persisted ID and token pair before probing. Successful completion may adopt a peer rotation, not necessarily issue a POST. A successful quota probe is not an inference test.
@@ -323,6 +325,18 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Published commit identity:** Stable subject `feat(auth): reset one pooled credential by target`.
 - **Rollback:** Revert only that stable-subject commit. It touches no credentials, schema, or persisted state; reverting restores the pool-wide-only `reset`.
 - **Retirement:** Retire when a released upstream version accepts a per-credential target on `hermes auth reset` and clears only that entry with the cooldown surviving persistence, with these regressions passing against it.
+
+
+### HERMES-122: Managed Browser Visibility
+
+- **Summary:** Behind `browser.visibility_handoff: false` by default, expose only `browser_exec(handoff="reveal"|"minimize")` for an existing headed Hermes-managed named identity. The action is admitted only after the caller's session binding, managed profile CDP endpoint, and headed-mode record are independently verified. It does not restart, close, inspect downloads, create a browser, attach to normal Chrome, or control cloud and other-session browsers.
+- **Surfaces:** `hermes_cli/config_defaults.py`; `tools/browser_use_cli.py`; `tools/browser_handoff.py`; `tools/browser_handoff_cdp.py`; focused tests, disposable verification, browser documentation, and this manifest.
+- **Upstream tracking:** Local opt-in managed-identity extension. Retire when upstream supplies the equivalent ownership, binding and concurrency contract.
+- **Upstream PR:** None. Owned-fork source delivery only.
+- **Regression:** `scripts/run_tests.sh tests/tools/test_browser_visibility.py tests/tools/test_browser_use_cli.py tests/tools/test_browser_real_profile.py tests/tools/test_browser_identity.py -q`; `python scripts/verify_browser_handoff.py --live` on a local graphical host with a temporary Chrome profile.
+- **Rollback:** Revert only `feat(browser): add managed visibility handoff`, remove the default-disabled key, handoff dispatch/schema, focused tests, disposable verifier, documentation, index row, and this record. Existing browser data and normal Chrome are untouched.
+- **Retirement:** Retire when upstream provides an equivalent default-disabled, ownership-and-binding-verified visibility-only contract with the same no-close/no-restart and ambiguity refusal regressions.
+
 
 ### HERMES-114 — Bound and disclose gateway executor admission
 

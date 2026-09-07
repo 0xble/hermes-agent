@@ -1,0 +1,131 @@
+"""Managed visibility identity, opt-in and transport contracts."""
+import json
+import subprocess
+import sys
+from typing import Any
+from unittest.mock import Mock
+import pytest
+from hermes_cli.browser_identity import BrowserIdentity
+from tools import browser_handoff as life, browser_use_cli as cli
+from tools.browser_handoff_cdp import HandoffCDP, CdpHandoffError
+
+@pytest.fixture
+def identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    value = BrowserIdentity("work", "chrome", "Default", "fixture_identity")
+    monkeypatch.setattr(cli, "_read_browser_cfg", lambda: {"visibility_handoff": True})
+    monkeypatch.setattr(cli, "_real_profile_consented", lambda: True)
+    monkeypatch.setattr("hermes_cli.browser_identity.resolve_browser_identity", lambda name: value if name else None)
+    monkeypatch.setattr("hermes_cli.browser_identity.configured_identity_aliases", lambda cfg: ("work",))
+    monkeypatch.setattr(cli, "_has_cdp_env", lambda env: False)
+    monkeypatch.setattr("tools.browser_tool._get_cdp_override_raw", lambda: None)
+    return value
+
+def invoke(**overrides):
+    args: dict[str, Any] = dict(code="# reveal", identity="work", session="visibility-test", local=True, handoff="reveal")
+    args.update(overrides)
+    return cli.browser_exec(**args)
+
+def test_gate(identity, monkeypatch):
+    monkeypatch.setattr(cli, "_read_browser_cfg", lambda: {})
+    assert "disabled" in invoke()
+    assert "handoff" not in cli.BROWSER_EXEC_SCHEMA["parameters"]["properties"]
+    assert "handoff" not in cli._dynamic_schema_overrides()["parameters"]["properties"]
+
+def test_schema(identity):
+    assert cli._dynamic_schema_overrides()["parameters"]["properties"]["handoff"]["enum"] == ["reveal", "minimize"]
+
+@pytest.mark.parametrize("overrides", [{"code": "print(1)"}, {"identity": ""}, {"local": False}, {"handoff": "restart"}])
+def test_invalid_request(identity, monkeypatch, overrides):
+    action = Mock()
+    monkeypatch.setattr(life, "handoff", action)
+    assert "error" in invoke(**overrides)
+    action.assert_not_called()
+
+def test_unbound_does_not_claim(identity):
+    assert "not verified as bound" in invoke()
+    assert not cli._browser_exec_durable_binding_dir("visibility-test").exists()
+    assert not life._state_path(identity).exists()
+
+def test_wrong_binding(identity):
+    cli._claim_browser_exec_durable_binding("visibility-test", "wrong")
+    assert "not verified as bound" in invoke()
+    assert cli._read_browser_exec_durable_binding("visibility-test") == "wrong"
+
+def test_pending_blocks_visibility_not_retry(identity, monkeypatch):
+    cli._claim_browser_exec_durable_binding("visibility-test", cli._browser_exec_runtime_owner(identity))
+    with life.activity(identity):
+        life.mark_executing(identity, "loopback")
+    assert "unfinished or uncertain" in invoke()
+    assert life.mark_executing(identity, "another") is False
+    assert life._read_state(identity)["pending"] == "loopback"
+    execute = Mock(return_value="retry admitted")
+    monkeypatch.setattr(cli, "_browser_exec", execute)
+    assert invoke(handoff=None) == "retry admitted"
+
+def test_cross_process_lock(identity):
+    program = "from hermes_cli.browser_identity import BrowserIdentityProcessLock, BrowserIdentityError\ntry:\n with BrowserIdentityProcessLock('fixture_identity-visibility', timeout=0): pass\nexcept BrowserIdentityError:\n print('blocked')\n"
+    with life.activity(identity):
+        result = subprocess.run([sys.executable, "-c", program], text=True, capture_output=True, timeout=15)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "blocked"
+
+def test_ownership_and_headless(identity, monkeypatch):
+    cli._claim_browser_exec_durable_binding("visibility-test", cli._browser_exec_runtime_owner(identity))
+    monkeypatch.setattr("tools.browser_tool_real_profile._owned_profile_cdp", lambda path: None)
+    assert "No verified" in invoke()
+    monkeypatch.setattr("tools.browser_tool_real_profile._owned_profile_cdp", lambda path: "http://127.0.0.1:9222")
+    monkeypatch.setattr("tools.browser_tool_real_profile._read_real_profile_headed_mode", lambda path: False)
+    assert "not headed" in invoke()
+
+def test_registry(identity, monkeypatch):
+    from tools.registry import registry
+    action = Mock(return_value={"window_state": "normal"})
+    monkeypatch.setattr(life, "handoff", action)
+    result = registry._tools["browser_exec"].handler(dict(code="# reveal", identity="work", session="visibility-test", local=True, handoff="reveal"))
+    assert json.loads(result)["window_state"] == "normal"
+    action.assert_called_once()
+
+@pytest.fixture
+def cdp():
+    connection = Mock()
+    with HandoffCDP("ws://127.0.0.1:9222/devtools/browser/fixture", ws_factory=lambda *a, **k: connection) as client:
+        yield client, connection
+    connection.close.assert_called_once()
+
+@pytest.mark.parametrize("endpoint", ["ws://example.com/a", "https://localhost/a", "file:///tmp/a"])
+def test_remote_endpoint(endpoint):
+    factory = Mock()
+    with pytest.raises(CdpHandoffError):
+        HandoffCDP(endpoint, ws_factory=factory)
+    factory.assert_not_called()
+
+def test_transport(cdp):
+    client, connection = cdp
+    connection.recv.return_value = json.dumps({"id": 1, "result": {"ok": True}})
+    assert client.call("Target.getTargets") == {"ok": True}
+    assert 0 < connection.recv.call_args.kwargs["timeout"] <= 3
+    connection.recv.side_effect = TimeoutError
+    with pytest.raises(CdpHandoffError, match="timed out"):
+        client.call("Target.getTargets")
+
+@pytest.mark.parametrize("arguments", [[], ["--user-data-dir=/other"], ["--user-data-dir=/tmp/owned", "--headless=new"], None])
+def test_command_ownership(cdp, arguments, monkeypatch):
+    client, _ = cdp
+    client.call = Mock(return_value={"processInfo": [{"type": "browser", "id": 123}]})
+    monkeypatch.setattr("psutil.Process", lambda pid: Mock(cmdline=lambda: arguments))
+    with pytest.raises(CdpHandoffError):
+        client.assert_owned_headed_command_line("/tmp/owned")
+
+@pytest.mark.parametrize("action,state", [("reveal", "normal"), ("minimize", "minimized")])
+def test_readback(cdp, action, state):
+    client, _ = cdp
+    client.call = Mock(side_effect=[{"targetInfos": [{"type": "page", "targetId": "one"}]}, {"windowId": 1}, {}, {"bounds": {"windowState": state}}])
+    assert client.set_visibility(action)["window_state"] == state
+
+def test_multiple_windows(cdp):
+    client, _ = cdp
+    client.call = Mock(side_effect=[{"targetInfos": [{"type": "page", "targetId": "one"}, {"type": "page", "targetId": "two"}]}, {"windowId": 1}, {"windowId": 2}])
+    with pytest.raises(CdpHandoffError, match="multiple"):
+        client.set_visibility("reveal")
+    assert all(c.args[0] != "Browser.setWindowBounds" for c in client.call.call_args_list)

@@ -219,6 +219,18 @@ matching-browser launch avoids. To watch the browser, enable
 [`browser.headed`](#headed-mode-visible-browser-window). A Linux host without a
 display always runs the snapshot headlessly.
 
+### Managed-window visibility (disabled by default)
+
+For an existing **headed**, named-identity Hermes-managed browser, an operator may
+explicitly enable a narrow `browser.visibility_handoff: true` gate. This makes
+`browser_exec(..., local=True, identity="name", handoff="reveal"|"minimize")`
+available. Both actions preserve the running browser and page state; they never
+restart, close, relaunch, inspect downloads, or control normal Chrome, cloud
+browsers, or a different session. Hermes requires comment-only code and verifies
+the named session binding, managed CDP ownership, and headed-mode record before
+changing a window. Timed-out or unfinished Browser Use work and multiple page
+windows fail closed.
+
 To pin several named identities to exact Chromium profile directories, configure
 them explicitly:
 
