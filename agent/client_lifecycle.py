@@ -815,6 +815,11 @@ class ClientLifecycleMixin:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        pin = getattr(self, "_delegation_runtime_pin", None)
+        next_pin = pin.for_pool_swap(self, entry, runtime_key, runtime_base) if pin is not None else None
+        if pin is not None:
+            # Preserve the exact launch spelling, not only normalized endpoint identity.
+            runtime_base = pin.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
@@ -831,14 +836,18 @@ class ClientLifecycleMixin:
             self._anthropic_api_key, self._anthropic_base_url = runtime_key, stripped_base
             self._anthropic_client = self._build_direct_anthropic_client(runtime_key, self._anthropic_base_url)
             self._is_anthropic_oauth = self._anthropic_oauth_flag(runtime_key)
-            self.api_key, self.base_url = runtime_key, stripped_base
+            self.api_key, self.base_url = runtime_key, runtime_base if pin is not None else stripped_base
+            if next_pin is not None:
+                self._delegation_runtime_pin = next_pin
             return
-        self.api_key, self.base_url = runtime_key, stripped_base
+        self.api_key, self.base_url = runtime_key, runtime_base if pin is not None else stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
+        if next_pin is not None:
+            self._delegation_runtime_pin = next_pin
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs (TLS material, default headers) for ``self.base_url``.

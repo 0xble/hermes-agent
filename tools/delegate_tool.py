@@ -217,9 +217,6 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
-    if subagent_definition is not None:
-        from tools.custom_subagents import RuntimePin
-        child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
@@ -240,12 +237,15 @@ def _build_child_agent(
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
-    # A named subagent is pinned to its configured route; sharing the parent's rotating pool could
-    # move it onto a different credential/provider than the definition names.
-    child_pool = (None if subagent_definition is not None
-                  else _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"]))
-    if child_pool is not None:
+    if subagent_definition is not None:
+        from tools.custom_subagents import RuntimePin, inherited_credential_pool
+        child_pool = inherited_credential_pool(child, parent_agent, delegation_cfg)
         child._credential_pool = child_pool
+        child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
+    else:
+        child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
+        if child_pool is not None:
+            child._credential_pool = child_pool
 
     _attach_child(parent_agent, child)  # interrupt propagation
     # spawn_requested now — the child may queue for seconds when the pool is

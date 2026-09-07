@@ -101,11 +101,15 @@ that would not hold.
 Named children retain one resolved route and effort for their lifetime,
 including tool-loop continuations, retries, output correction, and iteration
 summaries. Codex definitions require the parent's currently authorized
-`openai-codex` subscription route. They do not select another account or fall
-back to API billing. An expired credential fails the child instead of
-re-resolving another credential source. Refresh the parent through the normal
-auth flow before retrying. Quota exhaustion or model unavailability is an
-error, not permission to substitute a model.
+`openai-codex` subscription route. When the parent already authorizes a
+same-route credential pool containing the launch credential, named children
+retain that pool's normal account rotation and cooldown policy. Rotation cannot
+change the provider, endpoint, model, or reasoning effort. Explicit delegation
+API keys, fixed parent credentials, and unrelated routes do not gain pool access.
+The request credential pin advances only through a verified pool swap, not an
+arbitrary client or authentication-header replacement. Named children do not
+re-resolve global credentials or fall back to API billing. Exhausted eligible
+accounts or model unavailability produce an error, not a substitute model.
 
 Named children receive shared authorized skill discovery, launch-time standing
 memory, and read-only memory-provider/session retrieval. They do not receive the
