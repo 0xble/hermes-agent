@@ -51,7 +51,10 @@ def test_gate_routes_to_configured_backend_without_yield(monkeypatch):
     import tools.terminal_tool as terminal
     env = Mock()
     env.execute.return_value = {"output": "verified in sandbox", "exit_code": 0}
-    plan = SimpleNamespace(env_type="docker", cwd="/workspace", effective_task_id="goal-session", effective_timeout=42, config={})
+    plan = terminal._ExecPlan(
+        env_type="docker", cwd="/workspace", effective_task_id="goal-session",
+        effective_timeout=42, config={}, image="", host_cwd=None,
+    )
     monkeypatch.setattr(terminal, "_plan_execution", Mock(return_value=plan))
     monkeypatch.setattr(terminal, "_acquire_env", Mock(return_value=env))
     monkeypatch.setattr(terminal, "_pre_exec_block", Mock())
