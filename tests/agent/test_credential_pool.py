@@ -2391,3 +2391,51 @@ class TestRequestCountEveryStrategy:
         assert chosen is not None
         assert chosen.request_count == 1
         assert sum(e.request_count for e in pool.entries()) == 1
+
+
+def test_move_entry_reorders_renumbers_and_clamps():
+    """move_entry() places one entry at the requested priority, keeps priorities
+    contiguous, clamps out-of-range values, and persists the new order."""
+    from unittest.mock import patch as _patch
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    def cred(cid: str, priority: int) -> PooledCredential:
+        return PooledCredential(provider="test", id=cid, label=cid, auth_type="api_key",
+                                source="manual", access_token=f"tok-{cid}", priority=priority)
+
+    with _patch("agent.credential_pool.get_pool_strategy", return_value="fill_first"):
+        pool = CredentialPool("test", [cred("a", 0), cred("b", 1), cred("c", 2)])
+
+    with _patch("agent.credential_pool.persist_pool_entries") as persist:
+        moved = pool.move_entry("c", 0)
+        assert moved is not None and moved.priority == 0
+        assert [e.id for e in pool.entries()] == ["c", "a", "b"]
+        assert [e.priority for e in pool.entries()] == [0, 1, 2]
+        persisted = [(p["id"], p["priority"]) for p in persist.call_args.args[1]]
+        assert persisted == [("c", 0), ("a", 1), ("b", 2)]
+
+        clamped = pool.move_entry("c", 99)
+        assert clamped.priority == 2
+        assert [e.id for e in pool.entries()] == ["a", "b", "c"]
+
+        assert pool.move_entry("a", -5).priority == 0
+        assert pool.move_entry("missing", 0) is None
+
+
+def test_move_entry_keeps_anthropic_manual_rows_ahead_of_seeded():
+    """move_entry() applies the anthropic load-time ordering rule so the persisted order
+    and the returned priority are the ones the next load_pool() would produce."""
+    from unittest.mock import patch as _patch
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    manual = PooledCredential(provider="anthropic", id="m1", label="manual", auth_type="api_key",
+                              source="manual", access_token="sk-ant-api-1", priority=0)
+    seeded = PooledCredential(provider="anthropic", id="p1", label="cc", auth_type="oauth",
+                              source="claude_code", access_token="sk-ant-oat-1", refresh_token="r",
+                              priority=1)
+    with _patch("agent.credential_pool.get_pool_strategy", return_value="fill_first"):
+        pool = CredentialPool("anthropic", [manual, seeded])
+    with _patch("agent.credential_pool.persist_pool_entries"):
+        moved = pool.move_entry("p1", 0)
+    assert moved is not None and moved.priority == 1
+    assert [(e.id, e.priority) for e in pool.entries()] == [("m1", 0), ("p1", 1)]

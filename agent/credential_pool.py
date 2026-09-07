@@ -2339,6 +2339,31 @@ class CredentialPool:
                 self._current_id = None
             return removed
 
+    def move_entry(self, credential_id: str, priority: int) -> Optional[PooledCredential]:
+        """Place one entry at *priority* (0 = tried first) and renumber the rest.
+
+        Priorities stay a contiguous ``0..n-1`` sequence, as ``remove_index`` keeps
+        them, so ``fill_first`` order matches what ``hermes auth list`` shows.
+        Out-of-range values clamp to the ends. Returns the moved entry, or None
+        when the id is unknown.
+        """
+        with self._lock:
+            entry = self._find(lambda e: e.id == credential_id)
+            if entry is None:
+                return None
+            others = [e for e in self._entries if e.id != credential_id]
+            slot = max(0, min(int(priority), len(others)))
+            others.insert(slot, entry)
+            entries = [replace(e, priority=p) for p, e in enumerate(others)]
+            # Apply the same load-time ordering rule now, so the persisted order is
+            # the one the next load_pool() would produce (anthropic keeps manually
+            # added credentials ahead of seeded ones) and the caller sees the
+            # effective priority rather than one that is silently reverted.
+            _normalize_pool_priorities(self.provider, entries)
+            self._entries = sorted(entries, key=lambda e: e.priority)
+            self._persist()
+            return self._find(lambda e: e.id == credential_id)
+
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
         if not raw:

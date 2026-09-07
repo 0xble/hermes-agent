@@ -141,6 +141,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-117 | Active | `feat(auth): add hermes auth refresh for pooled OAuth credentials` | Add `hermes auth refresh <provider> [target]` to force one pooled OAuth credential through the pool's refresh path, rotating its tokens and clearing its cooldown. |
 | HERMES-118 | Active | `feat(auth): show entry id and priority in auth list` | Print each credential's entry id and `fill_first` priority in `hermes auth list`. |
 | HERMES-119 | Active | `fix(credential-pool): count selections under every strategy` | Increment `request_count` for the chosen credential under every pool strategy instead of only `least_used`. |
+| HERMES-120 | Active | `feat(auth): place pooled credentials by priority` | Add `hermes auth add --priority N` and `hermes auth priority <provider> <target> <N>`, backed by `CredentialPool.move_entry()`, to place a credential in the `fill_first` order. |
 
 ## Fork-only administrative subject exemptions
 
@@ -254,6 +255,17 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-120 — Place pooled credentials by priority
+
+- **Summary:** `CredentialPool.move_entry(credential_id, priority)` places one entry at a raw 0-based priority, keeps priorities a contiguous `0..n-1` sequence as `remove_index()` does, clamps out-of-range values, and persists. `hermes auth add <provider> --priority N` moves the credential just added (identified as the one id absent before the add, so every add path is covered) and `hermes auth priority <provider> <target> <N>` moves an existing one by index, id, or exact label. `move_entry` applies `_normalize_pool_priorities` up front so the persisted order is the one the next load produces, and both commands report the effective priority with a stderr note explaining a difference (clamped to the pool size, or `anthropic` keeping manually added credentials ahead of seeded ones) and another when the provider's strategy is not `fill_first` (`round_robin` rewrites priorities on each selection; `random`/`least_used` ignore them). Placement after `add` never fails the command once the credential is saved. Requested on 2026-09-06 so a freshly added Codex account can be drawn before a nearly exhausted one without editing `auth.json`.
+- **Surfaces:** `agent/credential_pool.py` (`move_entry`), `hermes_cli/auth_commands.py` (`auth_add_command`, `_add_credential`, `_place_added_credential`, `_report_priority`, `auth_priority_command`), `hermes_cli/subcommands/auth.py`, `tests/agent/test_credential_pool.py`, `tests/hermes_cli/test_auth_commands.py`, `website/docs/user-guide/features/credential-pools.md`, `website/docs/reference/cli-commands.md`, and this manifest.
+- **Upstream tracking:** Issue #104638 (open, filed 2026-09-06). Related open issues #22407 (pin/select the active credential) and #71095 (pre-emptively deprioritise a healthy credential); this is the deterministic ordering primitive beneath both, with no pin semantics.
+- **Upstream PR:** Direct: #104664 (open, filed 2026-09-06) implements this exact behavior from the same commit.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_auth_commands.py tests/agent/test_credential_pool.py -q` covers `move_entry` reordering, renumbering, clamping, persistence, and unknown ids; `auth priority` moving and renumbering, the non-`fill_first` note, and an unknown target leaving order intact; effective position reported for a seeded anthropic row and a clamped request; `add --priority 0` placing first, plain `add` still appending, an in-place sole-row add being placed, and ambiguous placement being a note rather than a failure. Sabotage: the new tests fail with the code change removed.
+- **Published commit identity:** Stable subject `feat(auth): place pooled credentials by priority`.
+- **Rollback:** Revert only that stable-subject commit. Priorities already rewritten in `auth.json` remain valid contiguous values; reverting restores append-only adds.
+- **Retirement:** Retire when a released upstream version lets a credential be placed at a chosen `fill_first` position at add time and afterwards, with these regressions passing against it.
 
 ### HERMES-119 — Count selections under every strategy
 

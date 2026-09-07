@@ -1420,3 +1420,242 @@ def test_auth_list_shows_entry_id_and_priority(tmp_path, monkeypatch, capsys):
     assert len(lines) == 2
     assert "id=cred-1" in lines[0] and "priority=0" in lines[0]
     assert "id=cred-2" in lines[1] and "priority=1" in lines[1]
+
+
+def _two_manual_anthropic_entries() -> dict:
+    return {
+        "version": 1,
+        "credential_pool": {
+            "anthropic": [
+                {"id": "cred-1", "label": "old", "auth_type": "api_key", "priority": 0,
+                 "source": "manual", "access_token": "sk-ant-api-old"},
+                {"id": "cred-2", "label": "new", "auth_type": "api_key", "priority": 1,
+                 "source": "manual", "access_token": "sk-ant-api-new"},
+            ]
+        },
+    }
+
+
+def _isolate_manual_anthropic_pool(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+
+
+def _anthropic_order(tmp_path) -> list:
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    return [(e["label"], e["priority"]) for e in payload["credential_pool"]["anthropic"]]
+
+
+def test_auth_priority_moves_target_first_and_renumbers(tmp_path, monkeypatch, capsys):
+    _isolate_manual_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_manual_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_priority_command
+
+    auth_priority_command(type("Args", (), {"provider": "anthropic", "target": "new", "priority": 0})())
+
+    out = capsys.readouterr()
+    assert 'Set anthropic credential "new" to priority 0 (#1 in `hermes auth list anthropic`)' in out.out
+    assert "note:" not in out.err
+    assert _anthropic_order(tmp_path) == [("new", 0), ("old", 1)]
+
+
+def test_auth_priority_notes_when_strategy_ignores_priority(tmp_path, monkeypatch, capsys):
+    _isolate_manual_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_manual_anthropic_entries())
+    monkeypatch.setattr("agent.credential_pool.get_pool_strategy", lambda provider: "round_robin")
+    monkeypatch.setattr("hermes_cli.auth_commands.get_pool_strategy", lambda provider: "round_robin")
+
+    from hermes_cli.auth_commands import auth_priority_command
+
+    auth_priority_command(type("Args", (), {"provider": "anthropic", "target": "2", "priority": 0})())
+
+    assert "round_robin strategy; priority only orders fill_first" in capsys.readouterr().err
+
+
+def test_auth_priority_unknown_target_exits(tmp_path, monkeypatch):
+    _isolate_manual_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_manual_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_priority_command
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_priority_command(type("Args", (), {"provider": "anthropic", "target": "nope", "priority": 0})())
+
+    assert 'No credential matching "nope"' in str(excinfo.value)
+    assert _anthropic_order(tmp_path) == [("old", 0), ("new", 1)]
+
+
+def test_auth_add_with_priority_places_new_credential_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openrouter": [
+                    {"id": "or-old", "label": "old", "auth_type": "api_key", "priority": 0,
+                     "source": "manual", "access_token": "sk-or-old"}
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "openrouter"
+        auth_type = "api-key"
+        api_key = "sk-or-new"
+        label = "new"
+        priority = 0
+
+    auth_add_command(_Args())
+
+    out = capsys.readouterr().out
+    assert 'Added openrouter credential #2: "new"' in out
+    assert 'Placed openrouter credential "new" at priority 0 (#1 in `hermes auth list openrouter`)' in out
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert [(e["label"], e["priority"]) for e in payload["credential_pool"]["openrouter"]] == [
+        ("new", 0), ("old", 1)]
+
+
+def test_auth_add_without_priority_still_appends(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openrouter": [
+                    {"id": "or-old", "label": "old", "auth_type": "api_key", "priority": 0,
+                     "source": "manual", "access_token": "sk-or-old"}
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "openrouter"
+        auth_type = "api-key"
+        api_key = "sk-or-new"
+        label = "new"
+
+    auth_add_command(_Args())
+
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert [(e["label"], e["priority"]) for e in payload["credential_pool"]["openrouter"]] == [
+        ("old", 0), ("new", 1)]
+
+
+def test_auth_priority_reports_effective_position_for_seeded_anthropic(tmp_path, monkeypatch, capsys):
+    """anthropic keeps manual credentials ahead of seeded ones on every load; the command
+    must persist that effective order and report it, not a position the next load reverts."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, {"claude_code"}),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {"id": "m1", "label": "manual-key", "auth_type": "api_key", "priority": 0,
+                     "source": "manual", "access_token": "sk-ant-api-1"},
+                    {"id": "p1", "label": "cc", "auth_type": "oauth", "priority": 1,
+                     "source": "claude_code", "access_token": "sk-ant-oat-1", "refresh_token": "r"},
+                ]
+            },
+        },
+    )
+
+    from hermes_cli.auth_commands import auth_priority_command
+
+    auth_priority_command(type("Args", (), {"provider": "anthropic", "target": "cc", "priority": 0})())
+
+    out = capsys.readouterr()
+    assert 'Set anthropic credential "cc" to priority 1 (#2 in `hermes auth list anthropic`)' in out.out
+    assert "requested priority 0; effective priority is 1" in out.err
+    assert _anthropic_order(tmp_path) == [("manual-key", 0), ("cc", 1)]
+
+
+def test_auth_priority_reports_clamped_position(tmp_path, monkeypatch, capsys):
+    _isolate_manual_anthropic_pool(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _two_manual_anthropic_entries())
+
+    from hermes_cli.auth_commands import auth_priority_command
+
+    auth_priority_command(type("Args", (), {"provider": "anthropic", "target": "old", "priority": 9})())
+
+    out = capsys.readouterr()
+    assert 'Set anthropic credential "old" to priority 1' in out.out
+    assert "requested priority 9; effective priority is 1 because the pool has 2 credentials" in out.err
+
+
+def _openrouter_store(labels: list) -> dict:
+    return {
+        "version": 1,
+        "providers": {},
+        "credential_pool": {
+            "openrouter": [
+                {"id": f"or-{i}", "label": label, "auth_type": "api_key", "priority": i,
+                 "source": "manual", "access_token": f"sk-or-{label}"}
+                for i, label in enumerate(labels)
+            ]
+        },
+    }
+
+
+def _isolate_openrouter(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+def test_auth_add_with_priority_places_sole_row_updated_in_place(tmp_path, monkeypatch, capsys):
+    """An add that updates the only existing row in place (a repeat Nous login) still gets placed."""
+    _isolate_openrouter(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _openrouter_store(["only"]))
+    monkeypatch.setattr("hermes_cli.auth_commands._add_credential", lambda *a, **k: None)
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    auth_add_command(type("Args", (), {"provider": "openrouter", "auth_type": "api-key",
+                                       "api_key": "x", "label": None, "priority": 0})())
+
+    assert 'Placed openrouter credential "only" at priority 0' in capsys.readouterr().out
+
+
+def test_auth_add_with_priority_does_not_fail_after_ambiguous_add(tmp_path, monkeypatch, capsys):
+    """The credential is saved by the time placement runs, so an unresolvable placement is a note."""
+    _isolate_openrouter(tmp_path, monkeypatch)
+    _write_auth_store(tmp_path, _openrouter_store(["a", "b"]))
+    monkeypatch.setattr("hermes_cli.auth_commands._add_credential", lambda *a, **k: None)
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    auth_add_command(type("Args", (), {"provider": "openrouter", "auth_type": "api-key",
+                                       "api_key": "x", "label": None, "priority": 0})())
+
+    out = capsys.readouterr()
+    assert "could not identify the credential just added to openrouter" in out.err
+    assert "hermes auth priority openrouter <target> 0" in out.err
+    payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert [e["label"] for e in payload["credential_pool"]["openrouter"]] == ["a", "b"]
