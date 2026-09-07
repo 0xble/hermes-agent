@@ -1508,9 +1508,10 @@ DEFAULT_CONFIG = {
         "channel_prompts": {},
         "allowed_chats": "",  # if set, ONLY respond in these group/supergroup chat IDs
         "extra": {
-            # Bot API 10.1 native rich messages (tables/task lists/math). Off = legacy MarkdownV2,
-            # since rich messages are hard to copy as plain text.
-            "rich_messages": False,
+            # Bot API 10.1 native rich messages (tables/task lists/math). "auto" attempts them for
+            # structures legacy MarkdownV2 degrades; "always" attempts every eligible final reply;
+            # "never" keeps legacy MarkdownV2. true = auto and false = never for compatibility.
+            "rich_messages": "auto",
             # Experimental rich draft previews while streaming DMs; off because Telegram
             # Desktop/macOS can overlay draft frames until the chat redraws.
             "rich_drafts": False,

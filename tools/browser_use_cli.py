@@ -35,6 +35,53 @@ _browser_exec_identity_daemon_homes: dict[str, str] = {}
 _LEGACY_BROWSER_BINDING = "__legacy__"
 
 
+def _daemon_pid_path(name: str, env: dict) -> Path:
+    """Locate the harness PID record without importing the CLI's isolated env."""
+    runtime = env.get("BH_RUNTIME_DIR")
+    if runtime:
+        runtime_dir = Path(runtime).expanduser()
+    else:
+        home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
+        if home:
+            runtime_dir = Path(home).expanduser() / "runtime"
+        elif env.get("XDG_CONFIG_HOME"):
+            runtime_dir = Path(env["XDG_CONFIG_HOME"]).expanduser() / "browser-harness" / "runtime"
+        else:
+            runtime_dir = Path.home() / ".config" / "browser-harness" / "runtime"
+    shared = not runtime or env.get("BH_RUNTIME_DIR_SHARED") == "1"
+    return runtime_dir / (f"bu-{name}.pid" if shared else "bu.pid")
+
+
+def _daemon_process_identity(name: str, env: dict) -> tuple[int, float] | None:
+    """Return a named daemon's PID and immutable creation time, if provable."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        record = json.loads(_daemon_pid_path(name, env).read_text(encoding="utf-8"))
+        pid = record.get("pid") if isinstance(record, dict) else None
+        if type(pid) is not int or not 0 < pid < (1 << 31):
+            return None
+        return pid, psutil.Process(pid).create_time()
+    except (psutil.Error, OSError, ValueError, TypeError):
+        return None
+
+
+def _process_identity_is_live(identity: tuple[int, float]) -> bool | None:
+    """False proves termination; None is deliberately not treated as proof."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return psutil.Process(identity[0]).create_time() == identity[1]
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError, ValueError, TypeError):
+        return None
+
+
 def _browser_exec_durable_binding_dir(session: str) -> Path:
     """Return the profile-scoped immutable binding claim for ``session``."""
     from hermes_constants import get_hermes_home
@@ -239,6 +286,32 @@ def _reload_browser_exec_daemons_for_runtime(
     for name, owner in targets.items():
         env = _base_subprocess_env()
         env["BU_NAME"] = name
+        from tools.browser_handoff import pending_daemon_recovery_state
+
+        recovery_states = pending_daemon_recovery_state(owner, name)
+        daemon_identity: tuple[int, float] = (0, 0.0)
+        if recovery_states:
+            observed_identity = _daemon_process_identity(name, env)
+            if observed_identity is None:
+                logger.warning(
+                    "cannot prove Browser Use daemon %s identity before reload; "
+                    "timeout recovery remains pending", name,
+                )
+                all_stopped = False
+                continue
+            daemon_identity = observed_identity
+        if recovery_states and any(
+            state.get("daemon_pid") != daemon_identity[0]
+            or state.get("daemon_created") != daemon_identity[1]
+            or not isinstance(state.get("generation"), str)
+            for state in recovery_states
+        ):
+            logger.warning(
+                "cannot prove Browser Use daemon %s matches the timed-out execution; "
+                "timeout recovery remains pending", name,
+            )
+            all_stopped = False
+            continue
         try:
             proc = subprocess.run(
                 [*cmd, "--reload"],
@@ -261,7 +334,21 @@ def _reload_browser_exec_daemons_for_runtime(
             )
             all_stopped = False
             continue
+        if recovery_states and _process_identity_is_live(daemon_identity) is not False:
+            logger.warning(
+                "Browser Use daemon %s did not prove termination after reload; "
+                "timeout recovery remains pending", name,
+            )
+            all_stopped = False
+            continue
         _clear_persisted_browser_exec_daemon(name)
+        if recovery_states:
+            from tools.browser_handoff import clear_pending_after_daemon_reload
+            for state in recovery_states:
+                clear_pending_after_daemon_reload(
+                    owner, name, daemon_identity,
+                    expected_generation=state["generation"],
+                )
         with _browser_exec_identity_lock:
             if _browser_exec_identity_daemons.get(name) == owner:
                 _browser_exec_identity_daemons.pop(name, None)
@@ -1042,7 +1129,14 @@ def _browser_exec(
     owns_activity_marker = False
     if track_visibility_activity:
         from tools.browser_handoff import mark_executing
-        owns_activity_marker = mark_executing(resolved_identity, env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or "unknown")
+        daemon_identity = _daemon_process_identity(daemon_name, env) if daemon_name else None
+        owns_activity_marker = mark_executing(
+            resolved_identity,
+            env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or "unknown",
+            daemon_name=daemon_name or "",
+            runtime_owner=_browser_exec_runtime_owner(resolved_identity),
+            daemon_identity=daemon_identity,
+        )
     try:
         proc = subprocess.run(
             cmd, input=code, capture_output=True, text=True, timeout=timeout, env=env,
@@ -1053,11 +1147,22 @@ def _browser_exec(
                           f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "
                           "append to workspace files — anything already written to the workspace is preserved.")
     except OSError as e:
+        if owns_activity_marker:
+            from tools.browser_handoff import mark_finished
+            mark_finished(
+                resolved_identity,
+                daemon_name=daemon_name or "",
+                runtime_owner=_browser_exec_runtime_owner(resolved_identity),
+            )
         return tool_error(f"Failed to launch browser-use CLI: {e}")
 
     if owns_activity_marker:
         from tools.browser_handoff import mark_finished
-        mark_finished(resolved_identity)
+        mark_finished(
+            resolved_identity,
+            daemon_name=daemon_name or "",
+            runtime_owner=_browser_exec_runtime_owner(resolved_identity),
+        )
     result = {"success": proc.returncode == 0, "exit_code": proc.returncode, "output": proc.stdout}
     if workspace:
         result["workspace"] = workspace

@@ -63,6 +63,102 @@ def test_pending_blocks_visibility_not_retry(identity, monkeypatch):
     monkeypatch.setattr(cli, "_browser_exec", execute)
     assert invoke(handoff=None) == "retry admitted"
 
+
+def test_launch_failure_releases_only_its_activity_marker(identity, monkeypatch):
+    """No CLI process started, so this invocation can prove its marker is stale."""
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(
+        cli, "_resolve_real_profile_cdp",
+        lambda env, **_kwargs: (env.update({"BU_CDP_URL": "http://127.0.0.1:9222", cli._REAL_PROFILE_SENTINEL: "1"}) or None),
+    )
+    monkeypatch.setattr(cli, "_resolve_backend_cdp", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli.subprocess, "run", Mock(side_effect=OSError("not executable")))
+
+    result = cli._browser_exec("print(1)", session="launch-failure", identity="work")
+
+    assert "Failed to launch" in result
+    assert life._read_state(identity) == {}
+
+
+def test_timeout_remains_pending_until_exact_daemon_reload(identity, monkeypatch):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+
+    assert life.clear_pending_after_daemon_reload(owner, "rp_other", (41, 1.0)) is False
+    assert life._read_state(identity)["pending"] == "loopback"
+    assert life.clear_pending_after_daemon_reload(owner, daemon, (41, 1.0)) is True
+    assert life._read_state(identity) == {}
+
+
+def test_successful_targeted_daemon_reload_recovers_timeout_marker(identity, monkeypatch):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: (41, 1.0))
+    monkeypatch.setattr(cli, "_process_identity_is_live", lambda *_args: False)
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is True
+    assert life._read_state(identity) == {}
+
+
+@pytest.mark.parametrize("before,after", [((41, 1.0), True), (None, False), ((42, 2.0), False)])
+def test_zero_exit_reload_without_exact_termination_proof_keeps_timeout_marker(
+    identity, monkeypatch, before, after,
+):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    run = Mock(return_value=Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: before)
+    monkeypatch.setattr(cli, "_process_identity_is_live", lambda *_args: after)
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is False
+    assert life._read_state(identity)["pending"] == "loopback"
+    if before is None or before != (41, 1.0):
+        run.assert_not_called()
+
+
+def test_daemon_recovery_does_not_clear_newer_marker(identity):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "newer", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    generation = life._read_state(identity)["generation"]
+
+    assert life.clear_pending_after_daemon_reload(
+        owner, daemon, (41, 1.0), expected_generation="older-generation",
+    ) is False
+    assert life._read_state(identity) == {
+        "pending": "newer", "daemon": daemon, "runtime_owner": owner,
+        "daemon_pid": 41, "daemon_created": 1.0, "generation": generation,
+    }
+
 def test_cross_process_lock(identity):
     program = "from hermes_cli.browser_identity import BrowserIdentityProcessLock, BrowserIdentityError\ntry:\n with BrowserIdentityProcessLock('fixture_identity-visibility', timeout=0): pass\nexcept BrowserIdentityError:\n print('blocked')\n"
     with life.activity(identity):

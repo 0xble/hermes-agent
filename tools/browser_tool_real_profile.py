@@ -375,10 +375,12 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
     scoped_runtime_key = cache_key.rpartition(":")[2] if identity is not None else ""
 
     def mode_conflict() -> Optional[str]:
+        # Omission means reuse the managed runtime's actual mode.  Only an explicit
+        # caller preference may reject a live headed/headless runtime.
+        if headed is None:
+            return None
         running_headed = _bt._real_profile_headed_modes.get(cache_key)
         if running_headed is None:
-            if headed is None:
-                return None
             return ("The Hermes real-profile browser is already running, but its headed mode cannot "
                     "be verified. Close it and retry to apply an explicit headed value safely.")
         if running_headed == wants_headed:
@@ -444,7 +446,7 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
                 return None, ("The Hermes real-profile browser is already running, but its headed mode "
                               "cannot be verified. Close it and retry to apply an explicit headed "
                               "value safely.")
-            if existing_headed is not None and existing_headed != wants_headed:
+            if headed is not None and existing_headed is not None and existing_headed != wants_headed:
                 running, requested = ("headed" if existing_headed else "headless",
                                       "headed" if wants_headed else "headless")
                 return None, (f"The Hermes real-profile browser is already running {running}; it cannot "

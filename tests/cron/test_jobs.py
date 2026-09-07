@@ -492,17 +492,48 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
-    def test_remove_job_rejects_a_durable_fire_claim(self, tmp_cron_dir):
+    def test_remove_job_refuses_a_live_fire_claim_without_raising(self, tmp_cron_dir):
         job = create_job(prompt="Still running", schedule="30m")
         claimed = claim_job_for_fire(job["id"], force=True, return_job=True)
         assert isinstance(claimed, dict)
 
-        with pytest.raises(RuntimeError, match="active fire claim"):
-            remove_job(job["id"])
+        assert remove_job(job["id"]) is False
 
         persisted = get_job(job["id"])
         assert persisted is not None
         assert persisted["fire_claim"] == claimed["fire_claim"]
+
+    def test_remove_job_deletes_a_stale_fire_claim(self, tmp_cron_dir, monkeypatch):
+        from datetime import timedelta
+
+        import cron.jobs as jobs
+
+        job = create_job(prompt="Runner crashed", schedule="in 30m")
+        claimed = claim_job_for_fire(job["id"], force=True, return_job=True)
+        assert isinstance(claimed, dict)
+        claimed_at = jobs._parse_aware(claimed["fire_claim"]["at"])
+        assert claimed_at is not None
+        monkeypatch.setattr(
+            jobs, "_hermes_now",
+            lambda: claimed_at + timedelta(seconds=jobs.FIRE_CLAIM_TTL_SECONDS + 1),
+        )
+
+        assert remove_job(job["id"]) is True
+        assert get_job(job["id"]) is None
+
+    def test_remove_job_returns_false_when_fire_fence_is_busy(self, tmp_cron_dir, monkeypatch):
+        import contextlib
+        import cron.jobs as jobs
+
+        job = create_job(prompt="Fence busy", schedule="30m")
+
+        @contextlib.contextmanager
+        def busy_fence(_job_id):
+            yield False
+
+        monkeypatch.setattr(jobs, "_fire_job_lock", busy_fence)
+        assert remove_job(job["id"]) is False
+        assert get_job(job["id"]) is not None
 
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):

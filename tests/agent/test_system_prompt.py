@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 
@@ -387,17 +389,30 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
 class TestTelegramRichMessagesHint:
     """Verify that TELEGRAM_RICH_MESSAGES_HINT is conditionally included."""
 
-    def test_base_hint_without_rich_messages(self, monkeypatch):
-        """When rich_messages is False, only the base hint is used."""
+    @pytest.mark.parametrize(
+        ("value", "rich_hint_expected"),
+        [
+            (None, True),
+            ("auto", True),
+            ("always", True),
+            ("never", False),
+            (True, True),
+            (False, False),
+            ("true", True),
+            ("false", False),
+            ("invalid-mode", True),
+        ],
+    )
+    def test_rich_hint_matches_adapter_mode_normalization(self, value, rich_hint_expected):
+        """Prompt guidance follows the adapter's bool/string/invalid mode contract."""
         agent = _make_agent(platform="telegram")
         with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
-            mock_cfg.return_value = {
-                "gateway": {"platforms": {"telegram": {"extra": {"rich_messages": False}}}}
-            }
+            extra = {} if value is None else {"rich_messages": value}
+            mock_cfg.return_value = {"gateway": {"platforms": {"telegram": {"extra": extra}}}}
             stable = _stable_prompt(agent)
         assert "Standard Markdown auto-converts" in stable
-        assert "lean into it" not in stable
-        assert "task lists" not in stable
+        assert ("lean into it" in stable) is rich_hint_expected
+        assert ("task lists" in stable) is rich_hint_expected
 
     def test_rich_hint_with_rich_messages_enabled(self, monkeypatch):
         """When rich_messages is True in gateway.platforms, the extension
@@ -450,15 +465,6 @@ class TestTelegramRichMessagesHint:
             stable = _stable_prompt(agent)
         assert "lean into it" in stable
 
-    def test_base_hint_without_config(self, monkeypatch):
-        """When config has no telegram section, only base hint is used."""
-        agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
-            mock_cfg.return_value = {}
-            stable = _stable_prompt(agent)
-        assert "Standard Markdown auto-converts" in stable
-        assert "lean into it" not in stable
-
 
     def test_gateway_rich_messages_integration_via_real_config(self, tmp_path, monkeypatch):
         """End-to-end through the real config-resolution chain: a config.yaml
@@ -488,10 +494,8 @@ class TestTelegramRichMessagesHint:
         assert "lean into it" in stable
         assert "task lists" in stable
 
-    def test_malformed_extra_value_falls_back_to_base_hint(self, tmp_path, monkeypatch):
-        """A truthy non-mapping ``extra`` must not crash prompt construction —
-        it should fail open to the base hint (Tek's fail-open concern).
-        """
+    def test_malformed_extra_value_uses_unset_auto_mode(self, tmp_path, monkeypatch):
+        """A non-mapping ``extra`` must not crash prompt construction or disable auto mode."""
         agent = _make_agent(platform="telegram")
         with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
@@ -499,7 +503,7 @@ class TestTelegramRichMessagesHint:
             }
             stable = _stable_prompt(agent)
         assert "Standard Markdown auto-converts" in stable
-        assert "lean into it" not in stable
+        assert "lean into it" in stable
 
 
 _SKILLS = "SKILLS_INDEX_SENTINEL"

@@ -225,6 +225,35 @@ class TestRealProfileCdpLaunch:
             cdp, err = bt_real_profile._real_profile_cdp()
         assert cdp is None and err is None
 
+    @pytest.mark.parametrize("live_runtime", ["cache", "existing", "recovered"])
+    def test_omitted_headed_reuses_live_runtime_regardless_of_mode(self, tmp_path, monkeypatch, live_runtime):
+        """Omitted headed is no preference; only an explicit mode may conflict."""
+        import tools.browser_tool as bt
+        from hermes_cli.browser_identity import BrowserIdentity
+
+        identity = BrowserIdentity("work", "chrome", "Default", "fixture-runtime")
+        _session, _lock, cache_key = bt._real_profile_runtime_resources(identity)
+        endpoint = "http://127.0.0.1:9222"
+        if live_runtime == "cache":
+            bt._real_profile_cdp_cache[cache_key] = endpoint
+            bt._real_profile_headed_modes[cache_key] = True
+        monkeypatch.setattr(bt_cloud, "_use_real_profile", lambda: True)
+        monkeypatch.setattr("hermes_cli.browser_identity.resolve_browser_identity", lambda _name: identity)
+        monkeypatch.setattr("hermes_cli.browser_connect.real_profile_copy_dir", lambda *_args, **_kwargs: str(tmp_path))
+        monkeypatch.setattr(bt, "_cdp_owned_by_data_dir", lambda *_args: True)
+        monkeypatch.setattr(bt_real_profile, "_agent_browser_get_cdp", lambda _session: endpoint if live_runtime == "existing" else None)
+        monkeypatch.setattr(bt_real_profile, "_read_real_profile_headed_mode", lambda _path: True)
+        monkeypatch.setattr(bt_real_profile, "_surviving_chrome_cdp", lambda _path: None)
+        monkeypatch.setattr(bt_real_profile, "_owned_profile_cdp", lambda _path: endpoint if live_runtime == "recovered" else None)
+        monkeypatch.setattr(bt_real_profile, "_attach_agent_browser_to_cdp", lambda *_args: None)
+
+        cdp, err = bt_real_profile._real_profile_cdp("work")
+
+        assert (cdp, err) == (endpoint, None)
+        cdp, err = bt_real_profile._real_profile_cdp("work", headed=False)
+        assert cdp is None
+        assert "already running headed" in err
+
     def test_non_chromium_default_fails_closed(self):
         self._reset()
         with patch.object(bt_cloud, "_use_real_profile", return_value=True), \

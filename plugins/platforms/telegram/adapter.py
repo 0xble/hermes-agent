@@ -4104,14 +4104,18 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _partial_text_delivery_failure(failure: SendResult, message_ids: List[str], chunks: List[str]) -> SendResult:
-        """A resumable suffix after one or more chunks were already delivered."""
+        """Preserve the failure contract while adding the undelivered suffix."""
+        raw_response = dict(failure.raw_response) if isinstance(failure.raw_response, dict) else {}
+        raw_response.update(
+            telegram_partial_text_delivery=True,
+            message_ids=message_ids,
+            delivered_chunks=len(message_ids),
+            total_chunks=len(chunks),
+            delivery_retry_content="".join(chunks[len(message_ids):]),
+        )
         return SendResult(
-            success=False, error=failure.error, message_id=message_ids[0],
-            raw_response={
-                "telegram_partial_text_delivery": True, "message_ids": message_ids,
-                "delivered_chunks": len(message_ids), "total_chunks": len(chunks),
-                "delivery_retry_content": "".join(chunks[len(message_ids):])},
-            retryable=True, retry_after=failure.retry_after, error_kind=failure.error_kind)
+            success=False, error=failure.error, message_id=message_ids[0], raw_response=raw_response,
+            retryable=failure.retryable, retry_after=failure.retry_after, error_kind=failure.error_kind)
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],

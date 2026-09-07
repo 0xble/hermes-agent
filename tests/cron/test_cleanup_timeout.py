@@ -100,6 +100,25 @@ def test_agent_teardown_is_bounded():
         release.set()
 
 
+def test_configured_zero_cleanup_timeout_runs_teardown_inline():
+    """Configured zero disables the ceiling; it is not an exhausted deadline."""
+    agent = MagicMock()
+
+    with patch("cron.scheduler._cron_cleanup_timeout_seconds", return_value=0):
+        _teardown_cron_agent(agent, "cleanup-zero")
+
+    agent.close.assert_called_once_with()
+
+
+def test_explicit_zero_cleanup_budget_does_not_start_cleanup():
+    """An already-exhausted caller budget must not start unbounded cleanup."""
+    cleanup = MagicMock()
+
+    assert _run_cron_cleanup_with_timeout(
+        cleanup, job_id="cleanup-budget-zero", label="test", timeout_seconds=0) is False
+    cleanup.assert_not_called()
+
+
 def test_detached_worker_teardown_waits_for_future():
     """A timed-out worker keeps its agent and SessionDB until its Future completes."""
     future = Future()

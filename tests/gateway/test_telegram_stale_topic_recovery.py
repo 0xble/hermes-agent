@@ -162,6 +162,48 @@ async def test_partial_topic_delivery_recovers_with_notice_not_duplicate_content
 
 
 @pytest.mark.asyncio
+async def test_partial_private_topic_failure_preserves_stale_metadata_and_suffix():
+    """A failed later chunk must retain the stale-topic signal for root recovery.
+
+    The first chunk is already visible, so a full retry is unsafe; only the
+    adapter-provided suffix is resumable.
+    """
+    from telegram.error import BadRequest
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._bot = SimpleNamespace(
+        send_message=AsyncMock(
+            side_effect=[
+                SimpleNamespace(message_id=42),
+                BadRequest("Message thread not found"),
+                BadRequest("Message thread not found"),
+            ]
+        )
+    )
+    content = "x" * (adapter.MAX_MESSAGE_LENGTH + 200)
+
+    result = await adapter.send(
+        chat_id="2027045491",
+        content=content,
+        reply_to="150565",
+        metadata={
+            "notify": True,
+            "thread_id": "150565",
+            "telegram_reply_to_message_id": "150565",
+            "telegram_dm_topic_reply_fallback": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.raw_response["telegram_stale_topic_partial_delivery"] is True
+    assert result.raw_response["telegram_partial_text_delivery"] is True
+    assert result.raw_response["delivered_chunks"] == 1
+    assert result.raw_response["total_chunks"] == 2
+    assert result.raw_response["delivery_retry_content"].startswith("x" * 200)
+
+
+@pytest.mark.asyncio
 async def test_root_recovery_failure_does_not_reenter_stale_topic_recovery(monkeypatch):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     calls = []

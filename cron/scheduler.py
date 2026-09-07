@@ -2610,7 +2610,7 @@ def run_job(
                 if agent is not None:
                     defer_agent_teardown.append(agent)
             else:
-                _teardown_cron_agent(agent, job_id, timeout_seconds=_cron_cleanup_timeout_seconds())
+                _teardown_cron_agent(agent, job_id)
 
 
 def _teardown_cron_agent(
@@ -3160,10 +3160,7 @@ def _run_one_job_body(
             # Tear down the deferred agent(s) now that save + delivery have run (or raised). Must happen on
             # every path so cron agents never leak their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(
-                    _deferred_agent,
-                    job["id"],
-                    timeout_seconds=_cron_cleanup_timeout_seconds())
+                _teardown_cron_agent(_deferred_agent, job["id"])
 
         _run_kwargs = {
             "defer_agent_teardown": _deferred_agents,

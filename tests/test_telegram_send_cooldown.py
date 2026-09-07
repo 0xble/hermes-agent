@@ -326,7 +326,7 @@ async def test_partial_chunk_cooldown_is_not_retryable(monkeypatch):
     result = await adapter.send("chunk-chat", content)
 
     assert result.success is False
-    assert result.retryable is True
+    assert result.retryable is False
     assert result.message_id == "101"
     assert result.raw_response["telegram_partial_text_delivery"] is True
     assert result.raw_response["delivered_chunks"] == 1
@@ -539,7 +539,10 @@ async def test_extreme_retry_after_after_a_chunk_retries_only_the_remaining_suff
     result = await adapter.send("flood-chat", content, metadata={"notify": True})
 
     assert result.success is False
-    assert result.retryable is True
+    # The rejected second chunk can be resumed via delivery_retry_content, but
+    # the original result deliberately forbids a whole-message retry because
+    # the first chunk is already visible.
+    assert result.retryable is False
     assert result.error == "flood_control:7000.0"
     assert result.retry_after == 7000.0
     assert result.message_id == "42"

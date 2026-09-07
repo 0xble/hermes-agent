@@ -2172,24 +2172,21 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
 
 
 def remove_job(job_id: str) -> bool:
-    """Remove an idle job by ID or name; an active durable fire claim owns the record."""
+    """Remove an idle job by ID or name; live durable fire claims own the record."""
     job = resolve_job_ref(job_id)
     if not job:
         return False
     canonical_id = job["id"]
     with _fire_job_lock(canonical_id) as acquired:
         if not acquired:
-            raise RuntimeError(
-                f"Cannot remove cron job {canonical_id}: its fire-claim fence is busy")
+            return False
         with _jobs_lock():
             jobs = load_jobs()
             current = next((item for item in jobs if item.get("id") == canonical_id), None)
             if current is None:
                 return False
-            if isinstance(current.get("fire_claim"), dict):
-                raise RuntimeError(
-                    f"Cannot remove cron job {canonical_id}: it has an active fire claim; "
-                    "stop the run and release its claim first")
+            if _claim_is_live(current.get("fire_claim"), _hermes_now(), FIRE_CLAIM_TTL_SECONDS):
+                return False
             jobs = [j for j in jobs if j.get("id") != canonical_id]
             job_output_dir = _job_output_dir(canonical_id)
             save_jobs(jobs, removed_ids={canonical_id})

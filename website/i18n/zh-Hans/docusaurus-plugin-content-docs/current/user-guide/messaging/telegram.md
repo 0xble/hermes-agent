@@ -877,7 +877,7 @@ gateway:
 
 ## 渲染：富消息、表格和链接预览
 
-**富消息（Bot API 10.1）。** 最终回复中那些会被旧版 MarkdownV2 路径降级的结构——表格、任务列表、可折叠的 `<details>` 以及块级数学公式——会通过 Telegram 原生的 [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) 发送，使用 Agent 的**原始 markdown**，从而原生渲染、无需客户端展平。在流式传输过程中，最终答案通过 `editMessageText` 的 `rich_message` 参数**就地编辑现有预览**来交付——不发第二条消息、不删除，因此一轮结束时不会出现重复投递的闪烁。在私聊中，实时流式预览也使用 `sendRichMessageDraft`，因此动画草稿与最终的富消息保持一致。普通回复（纯文本、粗体/斜体、简单列表）仍走 MarkdownV2 路径，以在各客户端保持一致的字重和间距。
+**富消息（Bot API 10.1）。** 在 `auto` 模式（默认）下，最终回复中那些会被旧版 MarkdownV2 路径降级的结构——表格、任务列表、可折叠的 `<details>` 以及块级数学公式——会通过 Telegram 原生的 [`sendRichMessage`](https://core.telegram.org/bots/api#sendrichmessage) 发送，使用 Agent 的**原始 markdown**，从而原生渲染、无需客户端展平。`always` 会为每条符合条件的最终回复尝试富消息端点；`never` 保持旧版 MarkdownV2。在流式传输过程中，最终答案通过 `editMessageText` 的 `rich_message` 参数**就地编辑现有预览**来交付——不发第二条消息、不删除，因此一轮结束时不会出现重复投递的闪烁。在私聊中，`rich_drafts: false` 保持可编辑的旧版草稿预览；`rich_drafts: true` 也会让实时预览使用 `sendRichMessageDraft`，但这仍属实验性功能，因为 Telegram Desktop/macOS 可能在聊天重绘前叠加草稿帧。
 
 当内容超过 32,768 字符的富文本上限时，富消息路径会自动跳过；Telegram 的任何拒绝（较旧 `python-telegram-bot` 不支持该端点、解析错误、块/列过多）都会**透明回退**到 MarkdownV2 路径——消息绝不会丢失。瞬时/网络错误**不会**被静默重发（不会产生重复的最终消息）。
 
@@ -886,17 +886,18 @@ gateway:
 - **小表格**被展平为**行组项目符号**——每行在列标题下变为可读的项目符号列表。适合 2-4 列和短单元格。
 - **较大或较宽的表格**回退为带对齐列的**围栏代码块**，以防内容折叠。
 
-富消息现在是**选择启用**。默认保持旧版 MarkdownV2 路径，因为当前 Telegram 客户端可能让 Bot API 富消息难以作为纯文本复制，这对命令片段和移动端交接尤其麻烦。若要为表格、任务列表、折叠 `<details>` 和块级数学启用原生渲染：
+富消息默认使用自适应的 `auto` 模式。若要显式配置模式：
 
 ```yaml
 gateway:
   platforms:
     telegram:
       extra:
-        rich_messages: true
+        rich_messages: auto    # auto（默认）、always 或 never
+        rich_drafts: false     # 设为 true 以启用富消息草稿预览
 ```
 
-这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
+`rich_messages: true` 仍作为 `auto` 的兼容别名接受；`false` 映射为 `never`。这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
 
 **链接预览。** Telegram 会为机器人消息中的 URL 自动生成链接预览。如果你希望抑制这些预览（长 `/tools` 输出、提及十个链接的 Agent 回复等）：
 

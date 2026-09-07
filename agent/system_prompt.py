@@ -434,14 +434,25 @@ def _platform_hint(agent: Any) -> str:
 def _telegram_rich_messages_enabled() -> bool:
     """``rich_messages`` from the Telegram ``extra`` config; same precedence the
     adapter uses (top-level ``platforms.telegram.extra`` overrides
-    ``gateway.platforms.telegram.extra`` at the leaf). False on any read failure."""
+    ``gateway.platforms.telegram.extra`` at the leaf). The standalone coercion
+    mirrors the adapter without importing its gateway dependency graph."""
     try:
         from hermes_cli.config import load_config_readonly
         _cfg = load_config_readonly()
         _gw = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
         _top = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
         merged = {**(_gw if isinstance(_gw, dict) else {}), **(_top if isinstance(_top, dict) else {})}
-        return bool(merged.get("rich_messages"))
+        value = merged.get("rich_messages")
+        if value is None:
+            return True
+        if isinstance(value, (bool, int, float)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {"never", "off", "false", "0", "no"}:
+            return False
+        # ``auto``, ``always``, compatibility truthy strings, and invalid values
+        # all select the adapter's enabled adaptive/attempting modes.
+        return True
     except Exception:
         return False
 
