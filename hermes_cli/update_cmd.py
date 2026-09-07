@@ -544,7 +544,7 @@ def _print_update_check_result(behind: int | None, compare_branch: str) -> None:
 def _repair_venv_on_current_checkout(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, desktop_dir,
     had_desktop_app_before_update, active_lazy_features, active_tool_dependencies,
-    _windows_gateway_resume) -> bool:
+    _windows_gateway_resume, print_completion=None) -> bool:
     """Reinstall ``.[all]`` + lazy/tool deps into an unhealthy (or handed-off) venv; returns
     whether the checkout can be reported complete."""
     # Self-lock deferral: the repair rewrites the venv too (same mapped-extension hazard).
@@ -581,7 +581,8 @@ def _repair_venv_on_current_checkout(
         assume_yes=assume_yes, gateway_mode=gateway_mode, pre_update_snapshot_id=pre_update_snapshot_id)
     # The hand-off child never reaches the commits-pulled rebuild; do it here.
     if _rebuild_desktop_after_update(desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update):
-        return _print_verified_update_completion("✓ Update complete!")
+        printer = _print_verified_update_completion if print_completion is None else print_completion
+        return printer("✓ Update complete!")
     _print_update_completion(
         "⚠ Update partially complete — the desktop app was not rebuilt and is still on the previous build.")
     return False
@@ -605,7 +606,7 @@ def _pip_install_prefix(uv_bin) -> tuple[list[str], dict | None]:
 def _repair_current_checkout(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, desktop_dir,
     had_desktop_app_before_update, active_lazy_features, active_tool_dependencies,
-    upstream_checked, _windows_gateway_resume) -> bool:
+    upstream_checked, _windows_gateway_resume, print_completion=None) -> bool:
     """Already-up-to-date path: keep the managed runtime current, repair a broken venv.
     Returns whether the checkout can be reported complete."""
     # "No new commits" != safe interpreter: uv can keep the same CPython patch while
@@ -628,6 +629,7 @@ def _repair_current_checkout(
         print("⚠ Checkout is current, but the venv is unhealthy:")
         print(f"  {detail}")
         print("→ Repairing Python dependencies...")
+    printer = _print_verified_update_completion if print_completion is None else print_completion
     if handed_off_sync or not healthy:
         current_checkout_complete = _repair_venv_on_current_checkout(
             assume_yes=assume_yes, gateway_mode=gateway_mode,
@@ -635,10 +637,11 @@ def _repair_current_checkout(
             had_desktop_app_before_update=had_desktop_app_before_update,
             active_lazy_features=active_lazy_features,
             active_tool_dependencies=active_tool_dependencies,
-            _windows_gateway_resume=_windows_gateway_resume)
+            _windows_gateway_resume=_windows_gateway_resume,
+            print_completion=printer)
     else:
         current_checkout_complete = _repair_node_deps_on_current_checkout(
-            _print_verified_update_completion, assume_yes=assume_yes, gateway_mode=gateway_mode,
+            printer, assume_yes=assume_yes, gateway_mode=gateway_mode,
             pre_update_snapshot_id=pre_update_snapshot_id,
             completion_message=(
                 "✓ Already up to date!" if upstream_checked
@@ -1002,28 +1005,34 @@ def _begin_update_receipt_and_plan(args):
     return _pre_update_plan
 
 
-def _prepare_git_command() -> tuple[bool, list, bool]:
-    """Return ``(use_zip_update, git_cmd, is_fork)``; ``sys.exit(1)`` when not a git repo
-    on a non-Windows host (Windows falls back to ZIP: broken git file I/O, AV, NTFS filters)."""
+def _prepare_git_command(*, pinned_revision: bool = False) -> tuple[bool, list, bool]:
+    """Return ``(use_zip_update, git_cmd, is_fork)``.
+
+    The immutable-revision path still discards machine-made lockfile/EOL churn, then
+    returns before stash/branch/ZIP logic so it can never bind a moving tip.
+    """
     git_dir = _m().PROJECT_ROOT / ".git"
     use_zip_update = not git_dir.exists()
-    if use_zip_update and sys.platform != "win32":
-        print("✗ Not a git repository. Please reinstall:")
-        print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
-        sys.exit(1)
+    if use_zip_update:
+        if pinned_revision:
+            print("✗ --revision requires a Git checkout; ZIP updates cannot bind an immutable Git object.")
+            sys.exit(1)
+        if sys.platform != "win32":
+            print("✗ Not a git repository. Please reinstall:")
+            print("  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash")
+            sys.exit(1)
 
     git_cmd = _base_git_cmd()
-    if sys.platform == "win32" and git_dir.exists():
+    if sys.platform == "win32" and git_dir.exists() and not pinned_revision:
         _git_run(git_cmd, ["config", "windows.appendAtomically", "false"])
-    # A broken Git-for-Windows trampoline refuses every call with a "BUG (fork bomb)" guard;
-    # swap in a real binary up front so git survives instead of degrading to ZIP.
-    # See #87876.
     git_cmd = _ensure_non_trampoline_git(git_cmd)
-
-    # Before stash/branch logic: npm rewrites package-lock.json non-deterministically and
-    # line-ending churn is machine-made dirt; both would otherwise force an autostash every update.
+    # npm lockfile rewrites and line-ending churn are machine-made dirt. Discard them
+    # before any dirty-tree check, including the pinned path, so retries are not refused
+    # for files the updater itself rewrites.
     _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
     _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    if pinned_revision:
+        return False, git_cmd, False
 
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
@@ -1086,7 +1095,9 @@ def _handle_update_called_process_error(
     e, args, gateway_mode: bool, had_desktop_app_before_update: bool) -> None:
     """Git/installer failure: ZIP-fallback when safe, else report and ``sys.exit(1)``."""
     stage = _format_update_failure_stage(e)
-    if _should_zip_fallback_on_update_error(e):
+    # A requested immutable SHA is a closed update contract: a fallback ZIP/main
+    # would install unapproved moving code.
+    if getattr(args, "revision", None) is None and _should_zip_fallback_on_update_error(e):
         print(f"⚠ {stage}: {e}")
         print("→ Falling back to ZIP download...")
         print()
@@ -1120,7 +1131,8 @@ def _finalize_receipt(status: str, debug_message: str) -> None:
 def _finish_already_up_to_date(
     git_cmd, branch: str, current_branch: str, _plan, *, assume_yes: bool, gateway_mode: bool,
     gw_input_fn, pre_update_snapshot_id, desktop_dir, had_desktop_app_before_update: bool,
-    active_lazy_features, active_tool_dependencies, _windows_gateway_resume) -> None:
+    active_lazy_features, active_tool_dependencies, _windows_gateway_resume,
+    final_head_guard=None) -> None:
     """"Already up to date" path: restore stash/branch, repair the checkout, catch up the fleet.
     ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
     _invalidate_update_cache()
@@ -1148,31 +1160,52 @@ def _finish_already_up_to_date(
         had_desktop_app_before_update=had_desktop_app_before_update,
         active_lazy_features=active_lazy_features,
         active_tool_dependencies=active_tool_dependencies, upstream_checked=_plan.upstream_checked,
-        _windows_gateway_resume=_windows_gateway_resume)
+        _windows_gateway_resume=_windows_gateway_resume,
+        print_completion=(
+            (lambda message: True if message.startswith("✓") else _print_verified_update_completion(message))
+            if final_head_guard is not None else None
+        ),
+    )
     _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-    # A prior pull may still owe the fleet a restart; catch up here too, BEFORE the exit
-    # gate so a partial outcome can't strand the fleet on stale code.
-    # Catch up even on the "Already up to date" path — that early return is what left the gateway on stale
-    # code for two days. Runs BEFORE the runtime-verification exit gate below: a vulnerable SQLite runtime
-    # demotes the outcome to partial, but must not strand the fleet on stale code (#91277 fleet contract —
-    # the pending-restart check always executes).
     _apply_pending_fleet_restart_catchup()
     if not current_checkout_complete:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
         _finalize_receipt("partial", 'Update receipt finalize (current checkout) failed: %s')
         sys.exit(1)
+    if final_head_guard is not None:
+        try:
+            final_head_guard()
+        except RuntimeError as exc:
+            print(f"\n✗ Immutable revision verification failed before completion: {exc}")
+            if gateway_mode:
+                _write_gateway_update_exit_code(False)
+            _finalize_receipt("failed", "Update receipt finalize failed: %s")
+            sys.exit(1)
+        if not _print_verified_update_completion("✓ Already up to date!"):
+            if gateway_mode:
+                _write_gateway_update_exit_code(False)
+            _finalize_receipt("partial", 'Update receipt finalize (current checkout) failed: %s')
+            sys.exit(1)
 
 
 def _apply_pulled_update(
     git_cmd, branch, pre_pull_sha, _plan, opts, *, gateway_mode, is_fork, desktop_dir,
     had_desktop_app_before_update, pre_update_snapshot_id, _pre_update_plan,
-    _windows_gateway_resume) -> None:
+    _windows_gateway_resume, pinned_revision: str | None = None) -> None:
     """Post-pull phase: verify HEAD, sync Python/Node/web/Desktop, maintenance, fleet restart."""
     _invalidate_update_cache()
-    post_pull_sha = _verify_head_after_pull(
-        git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
-        _windows_gateway_resume=_windows_gateway_resume)
+    if pinned_revision:
+        from hermes_cli.update_revision import verify_revision_head
+        post_pull_sha = verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, pinned_revision)
+    else:
+        post_pull_sha = _verify_head_after_pull(
+            git_cmd, branch, pre_pull_sha, in_place_update=_plan.in_place_update,
+            _windows_gateway_resume=_windows_gateway_resume)
+
+    if pinned_revision:
+        from hermes_cli.update_revision import verify_revision_head
+        verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, pinned_revision)
 
     # Gateways still serve pre-pull modules until the restart phase; an interrupt before a
     # completed restart leaves this marker so the next update catches up even when git is
@@ -1180,11 +1213,15 @@ def _apply_pulled_update(
     # See #95294.
     _write_fleet_restart_pending_marker(expected_sha=post_pull_sha or "")
     # Stale .pyc would ImportError on gateway restart when new source references new names.
-    _sweep_bytecode_after_update(branch)
+    _sweep_bytecode_after_update(pinned_revision or branch)
 
-    if is_fork and branch == "main":
+    if is_fork and branch == "main" and not pinned_revision:
         _m()._sync_with_upstream_if_needed(
             git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
+
+    if pinned_revision:
+        from hermes_cli.update_revision import verify_revision_head
+        verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, pinned_revision)
 
     # .[all], falling back to base + extras individually so one broken extra doesn't strip
     # the rest; the ownership preflight refuses first on foreign-owned (sudo-pip) venv files.
@@ -1208,6 +1245,10 @@ def _apply_pulled_update(
         node_failures=node_failures, desktop_build_ok=desktop_build_ok,
         pre_update_version=opts.pre_update_version)
 
+    if pinned_revision:
+        from hermes_cli.update_revision import verify_revision_head
+        verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, pinned_revision)
+
     # Exit code *before* the restart: under --gateway this process lives in the gateway's
     # systemd cgroup and the systemctl-restart fallback SIGKILLs it (KillMode=mixed), so
     # the marker would never land and the new gateway's watcher would time out spuriously.
@@ -1218,7 +1259,85 @@ def _apply_pulled_update(
     _resume_windows_gateways_and_merge_outcome(_restart, _windows_gateway_resume, gateway_mode)
     _verify_fleet_after_update(
         _restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
-        node_failures=node_failures, update_complete=update_complete)
+        node_failures=node_failures, update_complete=update_complete,
+        final_head_guard=(
+            (lambda: _verify_pinned_completion(git_cmd, pinned_revision))
+            if pinned_revision else None
+        ),
+    )
+
+
+def _verify_pinned_completion(git_cmd, expected_sha: str) -> None:
+    from hermes_cli.update_revision import verify_revision_head
+    verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, expected_sha)
+    _verify_pinned_runtime_readback(expected_sha)
+
+
+def _verify_pinned_runtime_readback(expected_sha: str) -> None:
+    """Fail closed when a live runtime cannot prove it uses an explicit pinned SHA.
+
+    This deliberately reads live fleet state rather than trusting a prior receipt, which
+    may be absent or stale after a failed/retried update.
+    """
+    from hermes_cli.update_receipt import collect_fleet_versions
+    rows = collect_fleet_versions(strict=True)
+    invalid = [
+        row for row in rows
+        if row.get("state") in {"stale", "down"} or row.get("code_sha") != expected_sha
+    ]
+    if invalid:
+        raise RuntimeError("live runtime code SHA is unknown or does not match the approved revision")
+
+
+def _run_pinned_revision_update(
+    git_cmd, target, opts, _pre_update_plan, *, gateway_mode, desktop_dir,
+    had_desktop_app_before_update, pre_update_snapshot_id, _windows_gateway_resume,
+) -> None:
+    """Apply an already prepared immutable target without branch, stash, or upstream movement."""
+    from hermes_cli.update_revision import (
+        checkout_revision, record_revision_receipt, retain_precheckout_rollback,
+        verify_revision_head,
+    )
+
+    current_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+    current_branch = _current_branch_name(git_cmd, check=False) or "HEAD"
+    plan = _CheckoutPlan(
+        auto_stash_ref=None, commit_count=0, in_place_update=False,
+        parked_branch_switched=False, prompt_for_restore=False,
+        switch_block_reason=None, upstream_checked=False,
+    )
+    try:
+        if current_sha == target.sha:
+            # Do not apply twice. Prove checkout identity, then run pending
+            # repair/restart catch-up, then refuse completion if live runtimes
+            # still cannot prove the pinned SHA.
+            verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, target.sha)
+            _finish_already_up_to_date(
+                git_cmd, "pinned revision", current_branch, plan, assume_yes=opts.assume_yes,
+                gateway_mode=gateway_mode, gw_input_fn=opts.gw_input_fn,
+                pre_update_snapshot_id=pre_update_snapshot_id, desktop_dir=desktop_dir,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+                active_lazy_features=opts.active_lazy_features,
+                active_tool_dependencies=opts.active_tool_dependencies,
+                _windows_gateway_resume=_windows_gateway_resume,
+                final_head_guard=lambda: _verify_pinned_runtime_readback(target.sha))
+            return
+        rollback = retain_precheckout_rollback(_git_run, git_cmd, _m().PROJECT_ROOT, target)
+        record_revision_receipt(target, rollback)
+        checkout_revision(_git_run, git_cmd, _m().PROJECT_ROOT, target)
+        _apply_pulled_update(
+            git_cmd, "pinned revision", rollback.source_sha, plan, opts, gateway_mode=gateway_mode,
+            is_fork=False, desktop_dir=desktop_dir,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+            pre_update_snapshot_id=pre_update_snapshot_id, _pre_update_plan=_pre_update_plan,
+            _windows_gateway_resume=_windows_gateway_resume, pinned_revision=target.sha)
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        print(f"\n✗ Immutable revision update failed: {exc}")
+        if gateway_mode:
+            _write_gateway_update_exit_code(False)
+        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        _finalize_receipt("failed", "Update receipt finalize failed: %s")
+        sys.exit(1)
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -1232,6 +1351,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     print()
 
     _pre_update_plan = _begin_update_receipt_and_plan(args)
+
+    pinned_target = None
+    git_cmd = None
+    is_fork = False
+    if getattr(args, "revision", None) is not None:
+        from hermes_cli.update_revision import prepare_revision_target, record_revision_receipt
+        try:
+            _, git_cmd, _ = _prepare_git_command(pinned_revision=True)
+            pinned_target = prepare_revision_target(
+                _git_run, git_cmd, _m().PROJECT_ROOT, getattr(args, "revision"))
+            record_revision_receipt(pinned_target)
+        except (ValueError, RuntimeError) as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
 
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
     # the post-update cron-jobs safety net.
@@ -1262,6 +1395,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # distribution.
     desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
     had_desktop_app_before_update = _desktop_app_present(desktop_dir)
+
+    if pinned_target is not None:
+        _run_pinned_revision_update(
+            git_cmd, pinned_target, opts, _pre_update_plan, gateway_mode=gateway_mode,
+            desktop_dir=desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update,
+            pre_update_snapshot_id=pre_update_snapshot_id,
+            _windows_gateway_resume=_windows_gateway_resume)
+        return
 
     use_zip_update, git_cmd, is_fork = _prepare_git_command()
 

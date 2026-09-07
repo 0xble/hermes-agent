@@ -42,12 +42,18 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "stay parked in git stash instead of being restored onto the "
             "updated code. Used by the desktop updater so local source edits "
             "never silently ride along across updates.")
-    update_parser.add_argument(
+    target_group = update_parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--branch", default=None, metavar="NAME",
         help="Update against this branch instead of the default (main). "
-            "If the local checkout is on a different branch, hermes will "
-            "switch to the requested branch first (auto-stashing any "
-            "uncommitted changes).")
+        "If the local checkout is on a different branch, hermes will "
+        "switch to the requested branch first (auto-stashing any "
+        "uncommitted changes).")
+    target_group.add_argument(
+        "--revision", default=None, metavar="SHA",
+        help="Update to this exact 40-character lowercase commit SHA. Refuses dirty or "
+        "divergent state, disables branch/upstream movement and ZIP fallback, and retains "
+        "a source-only rollback ref before checkout.")
     update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "

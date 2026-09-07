@@ -136,7 +136,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-112 | Active | `fix(delegate): close named subagent audit findings` | Enforce parent-owned knowledge writes across every mediated tool path, fail loudly on unreadable delegation config, and disclose roles, routes, and real limits honestly. |
 | HERMES-113 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bind browser-close candidates to an exact user-data-dir argument and a supported Chromium identity, including Linux wrappers and snaps, never an argv substring. |
 | HERMES-114 | Active | `fix(hermes): close verified fork improvement gaps (#72)` | Bound shared gateway outstanding work, disclose queued turns and reject overflow without starting the request or timing out running work. |
-
+| HERMES-115 | Active | `feat(update): bind promotion to an immutable revision` | Prepare an exact Git revision, retain source rollback identity and reject version drift. |
 
 ## Fork-only administrative subject exemptions
 
@@ -1229,12 +1229,12 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-012 — Retired GitHub Actions fork synchronization pipeline
 
-- **Summary:** The former three-workflow GitHub Actions pipeline fetched upstream, rebased the private stack, tested a temporary candidate, and promoted an exact SHA. It remains retired. Unified Hermes job `maintain-targets` (`a6b63c34d53c`) now owns fleet-level scheduling and durable dispatcher receipts; hermes-agent is a heavy target that requires a dedicated repository-bound reconciliation rather than a second product-specific cron.
-- **Surfaces:** Historical commits named in the index above; this lifecycle record. The live scheduler owner is external job `maintain-targets`; its dispatcher ledger and per-target receipts live outside this repository. This repository owns the hermes-agent patch contract and validator used by each dedicated reconciliation.
-- **Upstream tracking:** This was fork-owner release machinery rather than an upstream product defect. The replacement remains Brian-owned and must continue to fail closed, test before publication, use an exact recorded lease, and keep runtime deployment separate.
-- **Upstream PR:** None; fork-owner release machinery is not an upstream product contribution (checked 2026-08-14).
-- **Regression:** Verify live job `a6b63c34d53c` is the only enabled `maintain-targets` owner, runs every 30 minutes in `America/Los_Angeles`, works from `/Users/brianle/dotfiles`, and records accepted per-target receipts before claiming another target. Verify hermes-agent is routed as a heavy dedicated case whose repository-bound run reads this manifest, preserves dirty work, runs affected and canonical gates plus independent review, uses an exact force-with-lease, proves remote readback, and never promotes a runtime. Verify the three retired workflow files and stale `automation/candidate/*` branches are absent.
-- **Rollback:** Do not restore the retired workflows or recreate a `maintain-hermes-fork` job. If unified dispatch is defective, pause `maintain-targets` before its next run, leave fork `main` unchanged, repair the unified dispatcher/receipt owner, and prove one manual dedicated reconciliation plus remote readback before resuming it.
+- **Summary:** The former three-workflow GitHub Actions pipeline remains retired. The external control plane owns scheduling. Dedicated source reconciliation preserves its retained worktree and frozen upstream boundary without requiring runtime deployment.
+- **Surfaces:** Historical subjects in the index, this record, and the repository patch validator. Scheduler state and accepted execution receipts are external.
+- **Upstream tracking:** Fork-owner release machinery, not an upstream product defect.
+- **Upstream PR:** None. No upstream contribution is proposed.
+- **Regression:** Prove the retired GitHub synchronization workflows remain absent. Source reconciliation must preserve dirty work, verify the exact integrated candidate, enforce independent review and remote-head fencing, and read back publication without runtime mutation.
+- **Rollback:** Do not restore the retired workflows. Preserve incomplete source work and repair the existing source owner. Runtime promotion remains separately authorized.
 
 ### HERMES-013 — Pin cron wall-clock schedules to per-job IANA timezones
 
@@ -1512,16 +1512,26 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Rollback:** Revert only `feat(gateway): apply inference controls mid-turn`, restoring busy rejection for `/fast` and `/reasoning` and removing the focused regressions plus this record. Preserve existing idle session/global inference controls, one-turn reasoning prompts and aliases under HERMES-078, and TUI/Desktop live configuration behavior.
 - **Retirement:** Retire after a released upstream version dispatches both controls during active gateway turns, updates the live agent and session intent at the next request boundary without interrupt/rebuild/transcript mutation, preserves provider-specific fast overrides and reasoning reset/global semantics, and passes equivalent focused regressions.
 
+### HERMES-115: Immutable Revision Updates
+
+- **Summary:** Bind explicit revision updates to exact Git objects and retain source rollback identity. Stop checkout drift before service mutation and reject running-version mismatches. Ordinary branch updates retain their existing behavior.
+- **Upstream tracking:** The inspected upstream-derived updater lacks an immutable revision option. Searches for update revision and exact-commit updates found no direct equivalent on 2026-09-06.
+- **Upstream PR:** None after checked 2026-09-06. No upstream PR has been opened.
+- **Regression:** `tests/hermes_cli/test_update_revision.py` covers real Git preparation, rollback references, drift rejection and immutable retry behavior.
+- **Published commit identity:** Stable subject `feat(update): bind promotion to an immutable revision`.
+- **Rollback:** Revert that subject. Retained Git references restore source only, not dependencies or user state. Runtime recovery retains its separate snapshot and health requirements.
+- **Retirement:** Remove this extension when released upstream proves equivalent immutable preparation, retry and verification behavior.
+
 ## Automatic synchronization
 
-Unified Hermes job `maintain-targets` (`a6b63c34d53c`) runs every 30 minutes in `America/Los_Angeles` from `/Users/brianle/dotfiles`. The scheduler is only the trigger: the dispatcher ledger, immutable target snapshot, and accepted per-target receipts are authoritative. Each tick resumes one dispatcher run, processes at most three targets serially, and cannot claim the next target before recording the current target's receipt. Hermes-agent is classified as a heavy dedicated case. Its repository-bound reconciliation works from `/Users/brianle/Repos/hermes-agent`, fetches `origin` and `upstream`, reads this manifest, inventories installed and enabled plugins, resolves the live upstream issue/PR ledger and substantive feedback, rebases maintained `main`, compares conflicts against patch contracts, and checks released upstream for native patch or plugin replacements. It runs affected regressions, canonical gates, and an independent review of the exact rewritten delta. It may advance fork `main` only with the origin SHA fetched for that dedicated run as an explicit force-with-lease, followed by remote readback proving the verified candidate landed and contains upstream.
+Source reconciliation runs in its dedicated, retained maintenance worktree. The control plane owns schedules and execution identity, not this document. Freeze the upstream cutoff for each run, preserve interrupted work, protect the canonical checkout, and inventory active patch and plugin overlap. Integrate before final tests and independent review. Publish only the reviewed immutable candidate through a guarded PR merge or an exact remote-head lease, then read back the remote revision. Source completion never requires runtime deployment.
 
-Neither unified dispatch nor the dedicated reconciliation may push to Nous Research, deploy or restart a runtime, uninstall plugins, edit plugin canonical-source repositories, or guess through an ambiguous conflict. A qualified native replacement must identify every affected profile and canonical owner plus the separately authorized promotion and complete-uninstall work required by “Plugin overlap and retirement.” A failed or ambiguous dedicated reconciliation must leave fork `origin/main` unchanged, restore or retain unrelated dirty work, and record the exact blocker or execution limitation in the unified dispatcher receipt. Runtime promotion remains a separate operation.
+Do not push to Nous Research, deploy or restart runtimes, or retire installed plugins as part of source synchronization. Report required runtime retirement separately under the patch and plugin lifecycle contracts above.
 
 ## Invariants
 
 - Automation never pushes to `NousResearch/hermes-agent`.
-- `main` moves only by explicit SHA and force-with-lease.
+- `main` advances only through exact-candidate publication with remote-head fencing, including a guarded PR merge or explicit force-with-lease.
 - Candidate verification never mutates Personal, LPG, or Meridian runtimes.
 - Runtime promotion remains separate, with its own backup, canary, and rollback proof.
 - A runtime rollback never rewrites the fork or changes another runtime.
@@ -1531,13 +1541,11 @@ Neither unified dispatch nor the dedicated reconciliation may push to Nous Resea
 
 ## Manual recovery
 
-When synchronization is blocked:
+When source reconciliation is blocked:
 
-1. Inspect the `maintain-targets` dispatcher run and accepted hermes-agent target receipt; distinguish a target blocker from a dispatcher, gateway, credential, tool, or host execution limitation.
-2. Reproduce from `/Users/brianle/Repos/hermes-agent`.
-3. Fetch `upstream/main` and rebase maintained `main` locally.
-4. Resolve only after comparing current upstream behavior with every affected patch record above.
-5. Remove a private implementation completely when upstream now satisfies its contract; do not layer both.
-6. Run patch-specific regressions and full gates.
-7. Push repaired `main` to `origin` using the remote SHA observed before reconciliation as the force-with-lease value.
-8. Close the alert only after remote readback and CI pass.
+1. Inspect the execution-specific source checkpoint and retained worktree. Treat interrupted side effects as unknown until reconciled.
+2. Preserve partial integration and the recorded upstream cutoff. New upstream drift is a separate observation, not permission to change the current run's boundary.
+3. Resolve only after comparing current upstream behavior with affected patch contracts. Retire equivalent private implementations rather than retaining duplicates.
+4. Stop source writers before final tests and independent review of the exact candidate.
+5. Publish through a guarded PR merge or an explicit remote-SHA lease. Read back the published revision before claiming source completion.
+6. Report runtime activation and any runtime-only retirement separately. They do not gate truthful source completion.

@@ -1178,7 +1178,10 @@ def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
             return snapshot
 
 
-def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_resume, node_failures, update_complete):
+def _verify_fleet_after_update(
+    restart, *, _pre_update_plan, _windows_gateway_resume, node_failures, update_complete,
+    final_head_guard=None,
+):
     """Post-restart verification: legacy-unit warning, dashboard cleanup, stale serve
     probe, fleet version matrix, plan-vs-execution reconciliation, receipt finalize.
 
@@ -1280,6 +1283,13 @@ def _verify_fleet_after_update(restart, *, _pre_update_plan, _windows_gateway_re
                 import hermes_cli.update_receipt as _ur
                 if _ur._current is not None:
                     _ur._current.data["runtime_outcomes"] = _runtime_outcomes
+
+    if final_head_guard is not None:
+        try:
+            final_head_guard()
+        except RuntimeError as exc:
+            print(f"\n✗ Immutable revision verification failed before completion: {exc}")
+            restart.incomplete = True
 
     with _best_effort('Update receipt finalize failed: %s'):
         from hermes_cli.update_receipt import finalize_update_receipt
