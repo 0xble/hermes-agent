@@ -228,7 +228,7 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
                         "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
                         "--history-baseline "
-                        "1724c48b12a90eb8a76e91e6337eaf2e2965a8e8"
+                        "f66e6d2e504d0d5448bbe227c1766a8bf44a841b"
                     ),
                 },
                 {

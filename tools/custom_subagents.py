@@ -6,8 +6,12 @@ are immutable snapshots, so editing configuration cannot alter a running child.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.credential_pool import CredentialPool
 from copy import deepcopy
 from urllib.parse import urlsplit
 import re
@@ -197,6 +201,24 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     return creds, reasoning
 
 
+def inherited_credential_pool(child, parent, defaults):
+    """Inherit existing account authority, never turn a fixed route into a global pool."""
+    from agent.credential_pool import credential_pool_matches_provider
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    pool = getattr(parent, "_credential_pool", None)
+    if pool is None or defaults.get("api_key"):
+        return None
+    if (
+        child.provider != parent.provider
+        or normalize_route_base_url(child.base_url) != normalize_route_base_url(parent.base_url)
+        or not credential_pool_matches_provider(pool, child.provider, base_url=child.base_url)
+        or pool.entry_id_for_api_key(child.api_key) is None
+    ):
+        return None
+    return pool
+
+
 def resolution_metadata(child):
     pin = getattr(child, "_delegation_runtime_pin", None)
     if not isinstance(pin, RuntimePin):
@@ -258,6 +280,7 @@ class RuntimePin:
     # credential changed" from "this route never had one", which a digest of
     # the empty string cannot express.
     _pinned_credential: bool = field(default=False, repr=False)
+    _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_child(cls, child, definition, reasoning):
@@ -269,7 +292,27 @@ class RuntimePin:
         digest = hashlib.sha256(str(child.api_key or "").encode()).hexdigest()
         return cls(definition.name, child.provider, child.model, child.base_url,
                    child.api_mode, effort, digest,
-                   bool(isinstance(child.api_key, str) and child.api_key))
+                   bool(isinstance(child.api_key, str) and child.api_key),
+                   getattr(child, "_credential_pool", None))
+
+    def for_pool_swap(self, child, entry, api_key, base_url):
+        """Advance only the credential pin at the trusted pool-swap boundary."""
+        from agent.credential_pool import credential_pool_matches_provider
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        pool = self._credential_pool
+        if (
+            pool is None or getattr(child, "_credential_pool", None) is not pool
+            or not credential_pool_matches_provider(pool, self.provider, base_url=self.base_url)
+            or entry.provider != pool.provider
+            or not any(candidate is entry for candidate in pool.entries())
+            or normalize_route_base_url(base_url) != normalize_route_base_url(self.base_url)
+            or (child.provider, child.model, child.base_url, child.api_mode)
+               != (self.provider, self.model, self.base_url, self.api_mode)
+        ):
+            raise ValueError(f"subagent_type {self.subagent_type!r}: unauthorized credential rotation")
+        return replace(self, _credential_digest=hashlib.sha256(api_key.encode()).hexdigest(),
+                       _pinned_credential=bool(api_key))
 
     def validate_request(self, child, kwargs, *, client=None):
         """Assert the pinned route/model/effort/credential for one request.
