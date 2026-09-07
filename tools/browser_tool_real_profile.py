@@ -239,7 +239,7 @@ def _read_real_profile_headed_mode(copy_dir: str) -> Optional[bool]:
     """Persisted effective headed mode for a managed runtime, or None when unverifiable.
 
     Persisted rather than in-memory so cleanup after a gateway restart follows the mode the runtime
-    is ACTUALLY in, not a contradictory global default (HERMES-092).
+    is ACTUALLY in, not a contradictory global default (HERMES-091).
     """
     try:
         value = Path(copy_dir, ".hermes-browser-mode").read_text(encoding="utf-8").strip()

@@ -2378,7 +2378,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     terminal envs (``_cleanup_inactive_envs`` reaps them after ``terminal.lifetime_seconds``)
     and ``cleanup_browser`` in headed mode (the inactivity reaper handles idle sessions)."""
     def _headed() -> bool:
-        # HERMES-092: follow the mode the runtime is ACTUALLY in, not the global
+        # HERMES-091: follow the mode the runtime is ACTUALLY in, not the global
         # ``browser.headed`` default. A headed login handoff started by
         # ``browser_exec(headed=true)`` would otherwise be torn down between turns
         # because config still says headless, killing the login mid-flow.

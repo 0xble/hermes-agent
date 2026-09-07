@@ -1757,7 +1757,7 @@ class GatewayInboundMixin:
             try:
                 from gateway.restart_inbox import mark_handed_off
 
-                await asyncio.to_thread(mark_handed_off, queue_id, token)
+                await asyncio.to_thread(mark_handed_off, queue_id)
             except Exception:
                 logger.exception(
                     "Could not hand restart inbox row %s to active-turn recovery", queue_id)

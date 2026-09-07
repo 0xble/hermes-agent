@@ -378,7 +378,7 @@ def _close_all_real_profile_runtimes(*, all_profiles: bool = False) -> None:
 def _preserve_browser_between_turns() -> bool:
     """Whether this profile has a VISIBLE active local runtime that between-turn cleanup must keep.
 
-    HERMES-092: cleanup must follow the mode the runtime is actually in, not the global
+    HERMES-091: cleanup must follow the mode the runtime is actually in, not the global
     ``browser.headed`` default — a headed login handoff started by ``browser_exec(headed=true)``
     would otherwise be torn down between turns because config still says headless. An unknown or
     malformed mode marker is preserved rather than guessed and destroyed.
