@@ -1468,6 +1468,8 @@ class CredentialPool:
         So never expose or persist the rotated pair; mark the entry terminally
         so it surfaces as an explicit re-auth requirement.
         """
+        if hasattr(self, "_refresh_failures"):
+            self._refresh_failures[entry.id] = "terminal"
         logger.error(
             "Anthropic %s refresh rotated the single-use token but could not commit it "
             "to %s (%s) — failing closed and quarantining the credential; "
@@ -1678,6 +1680,8 @@ class CredentialPool:
             # re-seed the revoked credentials, and drop singleton-seeded
             # entries from the pool (mirrors the Nous quarantine path).
             if getattr(auth_mod, terminal_fn_name)(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 logger.debug("%s OAuth refresh token is terminally invalid; clearing local token state", display)
                 self._clear_terminal_tokens_state(entry, exc)
                 self._quarantine_sources(entry, {"device_code"})
@@ -1697,6 +1701,8 @@ class CredentialPool:
                 logger.debug("Nous refresh skipped: auth store lock busy; not benching entry")
                 return entry
             if auth_mod._is_terminal_nous_refresh_error(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 logger.debug("Nous refresh token is terminally invalid; clearing local token state")
                 self._clear_terminal_nous_state(entry, exc)
                 self._quarantine_sources(
@@ -2253,6 +2259,11 @@ class CredentialPool:
         with self._lock:
             return self._try_refresh_current_unlocked()
 
+    def refresh_failure_reason(self, credential_id: str) -> Optional[str]:
+        """Sanitized evidence from this pool instance's most recent targeted attempt."""
+        with self._lock:
+            return getattr(self, "_refresh_failures", {}).get(credential_id)
+
     def try_refresh_matching(
         self,
         api_key_hint: Optional[str] = None,
@@ -2267,6 +2278,12 @@ class CredentialPool:
         """
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id) if credential_id else None
+            if credential_id and entry is None:
+                return None
+            if not hasattr(self, "_refresh_failures"):
+                self._refresh_failures = {}
+            if entry is not None:
+                self._refresh_failures.pop(entry.id, None)
             if entry is None:
                 if api_key_hint:
                     entry = self._find(lambda e: e.runtime_api_key == api_key_hint)
@@ -3165,3 +3182,33 @@ def load_pool(provider: str) -> CredentialPool:
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         pool._borrowed_root_ids = set(disk_ids)
     return pool
+
+
+def load_pool_read_only(provider: str) -> CredentialPool:
+    """Read persisted rows without seeding, healing, pruning, or persistence."""
+    provider = (provider or "").strip().lower()
+    _, raw_entries = read_pool_snapshot(provider)
+    entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries if isinstance(payload, dict)]
+    return CredentialPool(provider, entries)
+
+
+def read_pool_snapshot(provider: str):
+    """Return owner path and rows without creating even a corrupt-store backup."""
+    import json
+    from hermes_cli import auth as auth_mod
+
+    local = auth_mod._auth_file_path()
+    root = auth_mod._global_auth_file_path()
+    for path in (local, root):
+        if path is None or not path.exists():
+            continue
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        pool = data.get("credential_pool", {})
+        if not isinstance(pool, dict):
+            raise ValueError("Invalid credential pool")
+        rows = pool.get(provider, [])
+        if not isinstance(rows, list):
+            raise ValueError("Invalid provider entries")
+        if rows:
+            return path, rows
+    return local, []
