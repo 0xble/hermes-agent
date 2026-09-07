@@ -84,9 +84,10 @@ def _internal_turn_effect_block(agent, function_name: str, function_args: dict) 
     normalized_name = str(function_name or "").strip()
     action = str((function_args or {}).get("action") or "").strip().lower()
     blocked = normalized_name in _INTERNAL_TURN_ALWAYS_BLOCKED
-    if normalized_name == "set_goal":
-        from tools.goal_tool import READ_ACTIONS
-        blocked = action not in READ_ACTIONS
+    # Ordinary bookkeeping is autonomous. Synthetic turns cannot claim fresh
+    # user direction, regardless of the surface's authority-context plumbing.
+    if normalized_name == "set_goal" and (function_args or {}).get("user_requested"):
+        blocked = True
     if normalized_name == "memory" and (function_args or {}).get("operations"):
         blocked = True
     if not blocked:

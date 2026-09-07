@@ -71,7 +71,7 @@ def _plan_goal_compression_recovery(
         return (
             continuation_prompt,
             "Context compression was exhausted. Retrying the active goal once.")
-    goal_mgr.pause(reason="context compression exhausted twice consecutively")
+    goal_mgr.pause(reason="context compression exhausted twice consecutively", user_requested=False)
     # A later explicit /goal resume gets a fresh bounded recovery cycle.
     session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
     return None, (
@@ -357,7 +357,8 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
     release ``running``."""
     try:
         _emit("message.start", sid)
-        _run_prompt_submit(rid, sid, session, prompt)
+        from tools.goal_authority import InternalGoalPrompt
+        _run_prompt_submit(rid, sid, session, InternalGoalPrompt(prompt))
         if on_done is not None:
             on_done()
     except Exception as exc:
@@ -794,9 +795,13 @@ def _run_prompt_submit(
             if prepared is None:
                 return
             prompt, run_message, cols, streamer = prepared
-            _invoke_agent(
-                sid, session, st, prompt, run_message, streamer, images, display_kind,
-                display_metadata)
+            from tools.goal_authority import InternalGoalPrompt, goal_user_request_scope
+            # Bind on this worker thread, before prompt decoration reaches tools.
+            user_body = text if isinstance(text, str) and not isinstance(text, InternalGoalPrompt) else ""
+            with goal_user_request_scope(str(getattr(st.agent, "session_id", None) or sid), user_body):
+                _invoke_agent(
+                    sid, session, st, prompt, run_message, streamer, images, display_kind,
+                    display_metadata)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)

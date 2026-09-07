@@ -3488,6 +3488,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
 
     def _tui_process_one_input(self, user_input):
         """Route one submitted input: file drop, /resume pick, ! shell, slash command, or a chat turn."""
+        from tools.goal_authority import InternalGoalPrompt
+        is_internal_goal_continuation = isinstance(user_input, InternalGoalPrompt)
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
@@ -3545,7 +3547,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+            self.chat(
+                user_input, images=submit_images or None, voice_input=is_voice_input,
+                internal_goal_continuation=is_internal_goal_continuation,
+            )
         finally:
             self._tui_after_turn()
 

@@ -22,7 +22,8 @@ from typing import Optional
 class CLIChatTurnMixin:
     """chat() and its per-turn phase helpers."""
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(self, message, images: list = None, voice_input: bool = False, *,
+             internal_goal_continuation: bool = False) -> Optional[str]:
         """Run one user turn; returns the agent's response, or None on error.
 
         Input typed while the agent runs goes to ``_interrupt_queue`` (separate from
@@ -80,7 +81,8 @@ class CLIChatTurnMixin:
             self._prompt_start_time = time.time()
             self._prompt_duration = 0.0
             # Daemon: closing the terminal tab (SIGHUP) must not be kept alive by it.
-            agent_thread = threading.Thread(target=self._chat_run_agent, args=(turn, message), daemon=True)
+            agent_thread = threading.Thread(
+                target=self._chat_run_agent, args=(turn, message, internal_goal_continuation), daemon=True)
             agent_thread.start()
             interrupt_msg = self._chat_monitor_agent_thread(turn, agent_thread)
             self._chat_settle_turn(turn)
@@ -265,7 +267,7 @@ class CLIChatTurnMixin:
             turn.voice_prefix = ("[Voice input — respond concisely and conversationally, "
                                  "2-3 sentences max. No code blocks or markdown.] ")
 
-    def _chat_run_agent(self, turn, message):
+    def _chat_run_agent(self, turn, message, internal_goal_continuation: bool = False):
         """Agent-thread body: bind per-thread callbacks/approval key, prepend one-shot notes, run the turn."""
         from cli import (
             _prepend_note_to_message, set_approval_callback, set_secret_capture_callback,
@@ -305,13 +307,23 @@ class CLIChatTurnMixin:
         _one_turn_model_restore = getattr(self, "_pending_one_turn_model_restore", None)
         self._pending_one_turn_model_restore = None
         try:
-            turn.result = self.agent.run_conversation(
-                user_message=agent_message,
-                conversation_history=self.conversation_history[:-1],  # exclude the message just staged
-                stream_callback=turn.stream_callback, task_id=self.session_id,
-                persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
-                **({"turn_reasoning_config": _turn_reasoning_config} if _turn_reasoning_config is not None else {}),
+            from contextlib import nullcontext
+            from tools.goal_authority import goal_user_request_scope
+
+            # This continuation prompt is internal control flow, not a user request.
+            # The model runs in this worker thread, so bind the ContextVar here.
+            authority_scope = (
+                goal_user_request_scope(self.session_id or "default", "")
+                if internal_goal_continuation else nullcontext()
             )
+            with authority_scope:
+                turn.result = self.agent.run_conversation(
+                    user_message=agent_message,
+                    conversation_history=self.conversation_history[:-1],  # exclude the message just staged
+                    stream_callback=turn.stream_callback, task_id=self.session_id,
+                    persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
+                    **({"turn_reasoning_config": _turn_reasoning_config} if _turn_reasoning_config is not None else {}),
+                )
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                 for _key, _value in _restore.items():

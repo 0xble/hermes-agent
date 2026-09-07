@@ -1,4 +1,4 @@
-"""End-to-end model-callable goal activation through AIAgent."""
+"""End-to-end model-callable autonomous goal activation through AIAgent."""
 
 import json
 import uuid
@@ -23,19 +23,16 @@ def _response(*, content, finish_reason, tool_calls=None):
 
 
 def _minimal_tools():
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": "test",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        }
-    ]
+    return [{
+        "type": "function",
+        "function": {
+            "name": "web_search", "description": "test",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
 
 
-def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
+def test_model_can_set_goal_and_same_turn_starts_work(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -50,11 +47,8 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
         patch("run_agent.OpenAI"),
     ):
         agent = AIAgent(
-            api_key="test-key-1234567890",
-            base_url="https://openrouter.ai/api/v1",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
+            api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
         )
 
     notices = []
@@ -70,14 +64,10 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
     agent.enabled_toolsets = ["goal"]
 
     request = "Implement the parser and validate it works."
-    tool_call = _tool_call(
-        "set_goal",
-        {
-            "goal": "Parser implementation passes compatibility and regression tests",
-            "authorization_text": request,
-            "max_turns": 6,
-        },
-    )
+    tool_call = _tool_call("set_goal", {
+        "goal": "Parser implementation passes compatibility and regression tests",
+        "max_turns": 6,
+    })
     agent.client.chat.completions.create.side_effect = [
         _response(content=None, finish_reason="tool_calls", tool_calls=[_tool_call("set_goal", {"action": "guide"})]),
         _response(content=None, finish_reason="tool_calls", tool_calls=[tool_call]),
@@ -105,6 +95,7 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
 
     calls = agent.client.chat.completions.create.call_args_list
     from tools.goal_tool import GOAL_WRITING_GUIDANCE
+
     assert GOAL_WRITING_GUIDANCE not in json.dumps(calls[0].kwargs["messages"])
     assert GOAL_WRITING_GUIDANCE not in json.dumps(calls[0].kwargs.get("tools", []))
     guide_result = next(m["content"] for m in calls[1].kwargs["messages"] if m["role"] == "tool")
@@ -112,9 +103,7 @@ def test_goal_call_persists_and_same_turn_starts_work(tmp_path, monkeypatch):
     second_messages = calls[2].kwargs["messages"]
     roles = [message["role"] for message in second_messages]
     assert all(left != right for left, right in zip(roles[1:], roles[2:]))
-    tool_result = next(
-        message["content"] for message in reversed(second_messages) if message["role"] == "tool"
-    )
+    tool_result = next(message["content"] for message in reversed(second_messages) if message["role"] == "tool")
     receipt = json.loads(tool_result)
     assert receipt["success"] is True
     assert receipt["goal"] == state.goal
