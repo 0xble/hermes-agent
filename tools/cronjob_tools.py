@@ -573,7 +573,6 @@ def _action_create(a: Dict[str, Any]) -> str:
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
-            run_budget_seconds=a["run_budget_seconds"],
             timezone=a["timezone"],
             allow_messaging=bool(a["allow_messaging"]))
     except CronSchedulerRegistrationError as exc:
@@ -772,8 +771,6 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
         updates["enabled_toolsets"] = a["enabled_toolsets"] or None
     if a["attach_to_session"] is not None:
         updates["attach_to_session"] = bool(a["attach_to_session"])
-    if a["run_budget_seconds"] is not None:
-        updates["run_budget_seconds"] = a["run_budget_seconds"]
     if a["timezone"] is not None:
         updates["timezone"] = a["timezone"]
     if a["allow_messaging"] is not None:
@@ -880,7 +877,6 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
-    run_budget_seconds: Optional[float] = None,
     timezone: Optional[str] = None,
     allow_messaging: Optional[bool] = None,
     task_id: str = None,
@@ -975,11 +971,6 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "default": False,
                 "description": "Allow this cron job to call send_message for additional outbound messages to its trusted origin target only. Disabled by default. After those native sends, return [SILENT] so the scheduler does not add a duplicate summary (see the DELIVERY instruction the scheduler injects into the run prompt)."
             },
-            "run_budget_seconds": {
-                "type": "number",
-                "minimum": 0,
-                "description": "Optional total wall-clock budget for one fire, in seconds. This hard cap includes scripts, monitor checks, setup, agent work, and cleanup. On update, zero clears the cap."
-            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1026,7 +1017,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "run_budget_seconds", "timezone", "allow_messaging")
+    "timezone", "allow_messaging")
 
 
 def _cronjob_handler(args, **kw):

@@ -949,20 +949,38 @@ class TestReviewRound3:
         assert "close it for you" in err.lower() or "can close it" in err.lower()
         assert killed["n"] == 0  # snapshot must NOT invoke the killer itself
 
-    def test_processes_holding_profile_identity_binding(self, tmp_path, monkeypatch):
-        """The process matcher requires BOTH a browser binary AND this exact
-        user-data-dir in the cmdline — never a same-name process on another dir."""
+    def test_processes_holding_profile_requires_exact_executable_and_flag(self, tmp_path, monkeypatch):
+        """Only a supported browser executable with one exact profile flag matches."""
         import hermes_cli.browser_connect as bc
 
         class FakeProc:
-            def __init__(self, name, cmdline):
-                self.info = {"name": name, "cmdline": cmdline}
+            def __init__(self, executable, cmdline):
+                self._executable = executable
+                self.info = {"name": os.path.basename(executable), "cmdline": cmdline}
+
+            def exe(self):
+                return self._executable
 
         ud = str(tmp_path / "ud")
+        chrome = str(tmp_path / "Google Chrome")
+        install = tmp_path / "opt" / "google" / "chrome"
+        install.mkdir(parents=True)
+        launcher = str(install / "google-chrome")
+        wrapped = str(install / "chrome")
+        snap_chrome = str(tmp_path / "snap" / "chromium" / "current" / "chrome")
         procs = [
-            FakeProc("chrome.exe", ["chrome.exe", f"--user-data-dir={ud}"]),      # match
-            FakeProc("chrome.exe", ["chrome.exe", "--user-data-dir=C:\\Other"]),  # wrong dir
-            FakeProc("python.exe", ["python.exe", f"--user-data-dir={ud}"]),      # not a browser
+            FakeProc(chrome, [chrome, f"--user-data-dir={ud}"]),
+            FakeProc(chrome, [chrome, f"-user-data-dir={ud}"]),
+            FakeProc(wrapped, [launcher, f"--user-data-dir={ud}"]),
+            FakeProc(snap_chrome, [snap_chrome, f"--user-data-dir={ud}"]),
+            FakeProc(chrome, [chrome, "--user-data-dir", ud]),
+            FakeProc(chrome, [chrome, f"--user-data-dir={ud}-sibling"]),
+            FakeProc(chrome, [chrome, f"https://example.invalid/?dir={ud}"]),
+            FakeProc(chrome, [chrome, f"--user-data-dir={ud}", "--user-data-dir", f"{ud}-sibling"]),
+            FakeProc(chrome, [chrome, f"--user-data-dir={ud}", "--user-data-dir"]),
+            FakeProc(chrome, [chrome, "--", f"--user-data-dir={ud}"]),
+            FakeProc(chrome, [chrome, "--user-data-dir=ud"]),
+            FakeProc(str(tmp_path / "unrelated"), ["unrelated", f"--user-data-dir={ud}"]),
         ]
 
         class FakePsutil:
@@ -974,10 +992,14 @@ class TestReviewRound3:
 
         import sys as _sys
         monkeypatch.setitem(_sys.modules, "psutil", FakePsutil())
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            bc,
+            "chromium_executable",
+            lambda browser: chrome if browser == "chrome" else None,
+        )
         matched = list(bc._processes_holding_profile(ud))
-        assert len(matched) == 1
-        assert matched[0].info["name"] == "chrome.exe"
-        assert f"--user-data-dir={ud}" in " ".join(matched[0].info["cmdline"])
+        assert matched == procs[:4]
 
     def test_consent_off_triggers_cleanup(self, tmp_path, monkeypatch):
         called = {"n": 0}
@@ -1075,6 +1097,29 @@ class TestWindowsLockedProfileCopy:
         dst = str(tmp_path / "out" / "Cookies")
         assert bc._copy_auth_file(src, dst) is True
         assert sqlite3.connect(dst).execute("select count(*) from cookies").fetchone()[0] == 1
+
+    def test_copy_auth_file_returns_quickly_when_source_is_locked(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        import sqlite3
+        import time
+
+        src = str(tmp_path / "Cookies")
+        src_con = sqlite3.connect(src)
+        src_con.execute("create table cookies(x)")
+        src_con.execute("insert into cookies values(1)")
+        src_con.commit()
+        src_con.execute("begin exclusive")
+        dst = str(tmp_path / "out" / "Cookies")
+        monkeypatch.setattr(bc, "_AUTH_BACKUP_TIMEOUT_SECONDS", 0.2)
+        started = time.monotonic()
+        try:
+            result = bc._copy_auth_file(src, dst)
+        finally:
+            src_con.rollback()
+            src_con.close()
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0
+        assert result is True
 
     def test_copy_auth_file_plain_for_non_db(self, tmp_path):
         import hermes_cli.browser_connect as bc

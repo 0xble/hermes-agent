@@ -540,10 +540,35 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
 
                     source = sqlite3.connect(uri, uri=True, timeout=0)
                     try:
-                        out = sqlite3.connect(dst_file)
+                        out = sqlite3.connect(dst_file, timeout=0)
                         try:
+                            busy_deadline = time.monotonic() + max(
+                                0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
+                            )
+
+                            def _check_backup_progress(
+                                status: int, _remaining: int, _total: int
+                            ) -> None:
+                                nonlocal busy_deadline
+                                now = time.monotonic()
+                                if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                                    if now >= busy_deadline:
+                                        raise TimeoutError(
+                                            "database remained locked for "
+                                            f"{_AUTH_BACKUP_TIMEOUT_SECONDS:g} seconds"
+                                        )
+                                else:
+                                    busy_deadline = now + max(
+                                        0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
+                                    )
+
                             with out:
-                                source.backup(out)
+                                source.backup(
+                                    out,
+                                    pages=256,
+                                    progress=_check_backup_progress,
+                                    sleep=0.1,
+                                )
                         finally:
                             out.close()
                     finally:
@@ -627,13 +652,19 @@ def _resolve_source_profile(src: str) -> tuple[str | None, str | None]:
     FAILS CLOSED — falling back would silently browse as the wrong identity (wrong-principal)."""
     pin = _real_profile_pin()
     if pin:
-        if os.path.isdir(os.path.join(src, pin)):
-            return pin, None
-        return None, (
-            f"browser.real_profile_pin is set to '{pin}' but that profile directory does not "
-            f"exist under {src!r}. Profile directories are named like 'Default' or 'Profile 2' "
-            f"— list them with: ls {src!r}. Fix the pin, or remove it to fall back to the "
-            "last-used profile.")
+        pin_error = _validate_explicit_source_profile(src, pin)
+        if pin_error:
+            if os.path.isdir(os.path.join(src, pin)):
+                return None, (
+                    f"browser.real_profile_pin is set to {pin!r} but that is not a usable "
+                    f"real profile ({pin_error}). Guest and System profiles are rejected."
+                )
+            return None, (
+                f"browser.real_profile_pin is set to '{pin}' but that profile directory does not "
+                f"exist under {src!r}. Profile directories are named like 'Default' or 'Profile 2' "
+                f"— list them with: ls {src!r}. Fix the pin, or remove it to fall back to the "
+                "last-used profile.")
+        return pin, None
     return _last_used_profile(src), None
 
 
@@ -667,32 +698,88 @@ def _real_profile_refresh_mode() -> tuple[str | None, str | None]:
     return mode, None
 
 
+def _normalized_host_path(path: str) -> str:
+    """Canonical path comparison key for the current host platform."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _browser_process_names() -> frozenset[str]:
+    """Known Chromium-family process basenames, including wrapper and binary names."""
+    names: set[str] = set()
+    for browser in _BROWSERS:
+        for value in (
+            browser.mac_app,
+            *browser.win_bins,
+            *browser.linux_bins,
+            *(browser.linux_exec or ()),
+            *browser.linux_paths,
+            *(os.path.join(*parts) for parts in browser.win_install),
+        ):
+            if value:
+                names.add(os.path.normcase(os.path.basename(value)))
+    return frozenset(names)
+
+
+_BROWSER_PROCESS_NAMES = _browser_process_names()
+
+
+def _is_supported_browser_executable(executable: str, launchers: set[str]) -> bool:
+    """True when ``executable`` is a supported browser binary or launcher."""
+    path = _normalized_host_path(executable)
+    if path in launchers:
+        return True
+    return os.path.normcase(os.path.basename(path)) in _BROWSER_PROCESS_NAMES
+
+
+def _user_data_dir_argument(cmdline: list[str]) -> str | None:
+    """Return one explicit Chromium ``--user-data-dir=`` value, or None when absent/ambiguous."""
+    values = []
+    for arg in cmdline[1:]:
+        if arg == "--":
+            break
+        if arg.startswith("--user-data-dir="):
+            values.append(arg.split("=", 1)[1])
+        elif arg.startswith("-user-data-dir="):
+            values.append(arg.split("=", 1)[1])
+        elif arg == "--user-data-dir" or arg == "-user-data-dir":
+            # Chromium treats a bare switch as empty and the next token as a URL.
+            return None
+    return values[0] if len(values) == 1 and os.path.isabs(values[0]) else None
+
+
 def _processes_holding_profile(src: str):
-    """Yield psutil.Process instances holding ``src`` open: Chromium-family binaries whose
-    cmdline references THIS user-data-dir — never an unrelated same-PID process. An unreadable
-    cmdline is skipped."""
+    """Yield supported browser processes explicitly bound to ``src``.
+
+    Process ownership requires one exact ``--user-data-dir`` argument plus a
+    supported browser identity. Joined argv or prefix matching could select a
+    sibling profile path or a URL containing the profile path. Executable
+    identity accepts the resolved launcher or a known Chromium-family basename
+    so Linux wrappers and snaps are not skipped. Generic bin-directory matching
+    is rejected because it would select unrelated processes in ``/usr/bin``.
+    """
     try:
         import psutil
     except ImportError:  # hard dep; defensive
         return
-    norm = os.path.normcase(os.path.normpath(src))
-    browser_bins = (
-        "chrome", "chrome.exe", "chromium", "chromium.exe", "chrome_crashpad",
-        "brave", "brave.exe", "msedge", "msedge.exe", "google chrome")
-    for proc in psutil.process_iter(["name", "cmdline"]):
+    profile_path = _normalized_host_path(src)
+    launchers = {
+        _normalized_host_path(path)
+        for browser in _BROWSER_BY_KEY
+        if (path := chromium_executable(browser))
+    }
+    for proc in psutil.process_iter(["cmdline"]):
         try:
-            name = (proc.info.get("name") or "").lower()
             cmd = proc.info.get("cmdline") or []
-            joined = " ".join(cmd)
+            if not all(isinstance(arg, str) for arg in cmd):
+                continue
+            data_dir = _user_data_dir_argument(cmd)
+            if data_dir is None or _normalized_host_path(data_dir) != profile_path:
+                continue
+            if not _is_supported_browser_executable(proc.exe(), launchers):
+                continue
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue
-        argv0 = cmd[0].lower() if cmd else ""  # some platforms report a generic name
-        if not any(b in name or b in argv0 for b in browser_bins):
-            continue
-        # Binding: the exact user-data-dir must appear in the cmdline, normalized.
-        if (norm in os.path.normcase(os.path.normpath(joined))
-                or f"--user-data-dir={src}".lower() in joined.lower()):
-            yield proc
+        yield proc
 
 
 def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool, str]:

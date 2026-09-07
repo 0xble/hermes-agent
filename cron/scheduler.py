@@ -49,51 +49,6 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
-_TOTAL_RUN_BUDGET_MARKER = "total execution budget exhausted"
-
-
-class CronTotalRunBudgetExpired(TimeoutError):
-    """Raised when one cron fire exhausts its total wall-clock budget."""
-
-
-def _remaining_run_budget(deadline: Optional[float]) -> Optional[float]:
-    if deadline is None:
-        return None
-    return max(0.0, deadline - time.monotonic())
-
-
-def _total_run_budget_error(
-    job_name: str, budget_seconds: Optional[float],
-) -> CronTotalRunBudgetExpired:
-    budget = float(budget_seconds or 0.0)
-    return CronTotalRunBudgetExpired(
-        f"Cron job '{job_name}' {_TOTAL_RUN_BUDGET_MARKER} "
-        f"after {budget:g}s"
-    )
-
-
-def _total_run_budget_failure(
-    job: dict, job_name: str, budget_seconds: Optional[float],
-) -> tuple[bool, str, str, str]:
-    """Build the pre-agent/no-agent failure shape for total budget expiry."""
-    job_id = str(job.get("id") or "unknown")
-    exc = _total_run_budget_error(job_name, budget_seconds)
-    error = f"{type(exc).__name__}: {exc}"
-    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-    doc = (
-        f"# Cron Job: {job_name} (FAILED)\n\n"
-        f"**Job ID:** {job_id}\n"
-        f"**Run Time:** {now_iso}\n"
-        f"**Status:** total execution budget exhausted\n\n"
-        f"{error}\n"
-    )
-    alert = (
-        f"⚠ Cron '{job_name}' total execution budget exhausted "
-        f"after {float(budget_seconds or 0.0):g}s."
-    )
-    return False, doc, alert, error
-
-
 # Kept as a scheduler binding because completion-verification tests and the live
 # re-read intentionally patch this seam. The implementation remains in the job store.
 from cron.jobs import resolve_job_ref
@@ -269,13 +224,6 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
-
-    if _TOTAL_RUN_BUDGET_MARKER in lower:
-        return (
-            f"⚠️ Cron '{job_name}' failed: total execution budget exhausted. "
-            "The scheduler's hard wall-clock safety limit stopped the run. "
-            "Full details saved in cron output."
-        )
 
     if "skipped to prevent unintended spend: global inference config drifted" in lower:
         if "finite one-shot job is consumed" in lower:
@@ -585,7 +533,7 @@ _running_lock = threading.Lock()
 # until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
 _running_since: dict = {}
 _running_futures: dict = {}
-# HERMES-057: job ids whose worker thread outlived its timeout and is still running. The claim must
+# Job ids whose worker thread outlived an inactivity timeout and are still running. The claim must
 # stay held (and heartbeated) until the future actually completes — releasing it while the worker
 # still runs is the double-dispatch case this contract exists to prevent.
 _retained_worker_job_ids: set = set()
@@ -679,7 +627,7 @@ def release_running_job(job_id: str) -> None:
 
     A retained job (its worker outlived the timeout and is still running) is NOT released here —
     the fence thread owns that removal once the future completes. Releasing early would let the
-    scheduler dispatch the same job again alongside the still-live worker (HERMES-057).
+    scheduler dispatch the same job again alongside the still-live worker.
     """
     with _running_lock:
         if job_id in _retained_worker_job_ids:
@@ -1329,8 +1277,6 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
 
 def _run_no_agent_job(
     job: dict, job_id: str, job_name: str, cancel_event,
-    *, total_run_deadline: Optional[float] = None,
-    total_run_budget: Optional[float] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
@@ -1354,17 +1300,12 @@ def _run_no_agent_job(
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
     try:
-        script_kwargs = {"workdir": _job_workdir, "cancel_event": cancel_event}
-        remaining = _remaining_run_budget(total_run_deadline)
-        if remaining is not None:
-            script_kwargs["timeout_seconds"] = remaining
-        ok, output = _run_job_script_with_claim_heartbeat(job, script_path, **script_kwargs)
+        ok, output = _run_job_script_with_claim_heartbeat(
+            job, script_path, workdir=_job_workdir, cancel_event=cancel_event)
     except Exception as exc:
         logger.exception("Job '%s': script execution raised unexpectedly", job_id)
         ok, output = False, f"Script execution failed: {exc}"
 
-    if _remaining_run_budget(total_run_deadline) == 0:
-        return _total_run_budget_failure(job, job_name, total_run_budget)
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
@@ -1392,8 +1333,6 @@ def _run_no_agent_job(
 
 def _apply_monitor_gate(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
-    *, total_run_deadline: Optional[float] = None,
-    total_run_budget: Optional[float] = None,
 ) -> tuple[Optional[tuple], Optional[str]]:
     """Monitor gate (hash-suppressed change detection). Must run BEFORE any agent machinery so an
     unchanged tick costs no LLM/delivery. Returns ``(early_result | None, extra_prompt)``; when
@@ -1403,10 +1342,7 @@ def _apply_monitor_gate(
 
     if not job_has_monitor(job):
         return None, extra_prompt
-    remaining = _remaining_run_budget(total_run_deadline)
-    _mon = check_monitor(job) if remaining is None else check_monitor(job, timeout_seconds=remaining)
-    if _remaining_run_budget(total_run_deadline) == 0:
-        return _total_run_budget_failure(job, job_name, total_run_budget), extra_prompt
+    _mon = check_monitor(job)
     _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, _mon_now, "monitor")
     if not _mon.ok:
@@ -1835,9 +1771,7 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
 
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
-    *, total_run_deadline: Optional[float] = None,
-    total_run_budget: Optional[float] = None,
-    worker_state: Optional[dict] = None,
+    *, worker_state: Optional[dict] = None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
@@ -1885,11 +1819,10 @@ def _run_agent_with_watchdog(
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
-    _total_budget_timeout = False
     _watch_stop = threading.Event()
 
     def _wait_for_cron_worker_exit() -> None:
-        """Bound the join, then retain and heartbeat a lingering worker (HERMES-057).
+        """Bound the join, then retain and heartbeat a lingering worker.
 
         A timeout tears down the agent but cannot kill the worker thread. Until that future
         completes the job is still executing, so its run claim must keep being heartbeated —
@@ -1953,7 +1886,6 @@ def _run_agent_with_watchdog(
             _watch_thread.start()
         _must_poll = (
             _cron_inactivity_limit is not None
-            or total_run_deadline is not None
             or _is_oneshot
             or cancel_event is not None
         )
@@ -1966,23 +1898,13 @@ def _run_agent_with_watchdog(
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
                     break
-                remaining_total = _remaining_run_budget(total_run_deadline)
-                if remaining_total is not None and remaining_total <= 0:
-                    _total_budget_timeout = True
-                    break
                 wait_timeout = _POLL_INTERVAL
-                if remaining_total is not None:
-                    wait_timeout = min(wait_timeout, remaining_total)
                 done, _ = concurrent.futures.wait({_cron_future}, timeout=wait_timeout)
                 if done:
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
                     break
                 if _inactivity_timeout:
-                    break
-                remaining_total = _remaining_run_budget(total_run_deadline)
-                if remaining_total is not None and remaining_total <= 0:
-                    _total_budget_timeout = True
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
@@ -1992,16 +1914,6 @@ def _run_agent_with_watchdog(
     finally:
         _watch_stop.set()
         _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-    if _total_budget_timeout:
-        logger.error(
-            "Job '%s' exhausted its %.3fs total execution budget",
-            job_name, total_run_budget)
-        request_hard_interrupt(agent, "Cron total execution budget exhausted")
-        # The worker may still be persisting after interruption.  Leave resource/session cleanup
-        # to run_job's detached-worker callback so close cannot race its late writes.
-        _wait_for_cron_worker_exit()
-        raise _total_run_budget_error(job_name, total_run_budget)
 
     if _inactivity_timeout:
         _wait_for_cron_worker_exit()
@@ -2222,8 +2134,6 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 def _prepare_job_prompt(
     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
-    *, total_run_deadline: Optional[float] = None,
-    total_run_budget: Optional[float] = None,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
@@ -2241,10 +2151,7 @@ def _prepare_job_prompt(
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(
-            job, job_id, job_name, cancel_event,
-            total_run_deadline=total_run_deadline,
-            total_run_budget=total_run_budget), None
+        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
@@ -2252,10 +2159,7 @@ def _prepare_job_prompt(
     if job_payload_is_empty(job):
         return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
 
-    _early, extra_prompt = _apply_monitor_gate(
-        job, job_id, job_name, extra_prompt,
-        total_run_deadline=total_run_deadline,
-        total_run_budget=total_run_budget)
+    _early, extra_prompt = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
         return _early, None
 
@@ -2269,13 +2173,8 @@ def _prepare_job_prompt(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        script_kwargs = {"cancel_event": cancel_event}
-        remaining = _remaining_run_budget(total_run_deadline)
-        if remaining is not None:
-            script_kwargs["timeout_seconds"] = remaining
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path, **script_kwargs)
-        if _remaining_run_budget(total_run_deadline) == 0:
-            return _total_run_budget_failure(job, job_name, total_run_budget), None
+        prerun_script = _run_job_script_with_claim_heartbeat(
+            job, script_path, cancel_event=cancel_event)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
@@ -2489,7 +2388,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
 def _construct_cron_agent(
     AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir,
-    session_id, session_db, run_budget_seconds: Optional[float] = None,
+    session_id, session_db,
 ):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
@@ -2525,8 +2424,6 @@ def _construct_cron_agent(
         session_id=session_id,
         session_db=session_db,
     )
-    if run_budget_seconds is not None:
-        kwargs["run_budget_seconds"] = run_budget_seconds
     return AIAgent(**kwargs)
 
 
@@ -2576,26 +2473,8 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    from cron.jobs import _normalize_run_budget_seconds
 
-    try:
-        total_run_budget = _normalize_run_budget_seconds(job.get("run_budget_seconds"))
-    except ValueError as exc:
-        error = f"ValueError: {exc}"
-        doc = (
-            f"# Cron Job: {job_name} (FAILED)\n\n"
-            f"**Job ID:** {job_id}\n"
-            f"**Status:** invalid run budget\n\n{error}\n"
-        )
-        return False, doc, "", error
-    total_run_deadline = (
-        time.monotonic() + total_run_budget if total_run_budget is not None else None
-    )
-
-    early, prompt = _prepare_job_prompt(
-        job, job_id, job_name, extra_prompt, cancel_event,
-        total_run_deadline=total_run_deadline,
-        total_run_budget=total_run_budget)
+    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2641,58 +2520,14 @@ def run_job(
         model = setup.model
 
         # Open state.db only after every early-return gate has passed.
-        remaining = _remaining_run_budget(total_run_deadline)
-        if remaining is not None and remaining <= 0:
-            raise _total_run_budget_error(job_name, total_run_budget)
-        _session_db = _open_cron_session_db(job, timeout_seconds=remaining)
-        remaining = _remaining_run_budget(total_run_deadline)
-        if remaining is not None and remaining <= 0:
-            raise _total_run_budget_error(job_name, total_run_budget)
-
-        def _construct_agent():
-            return _construct_cron_agent(
-                AIAgent, job, _cfg, setup, workdir=scope.workdir,
-                session_id=_cron_session_id, session_db=_session_db,
-                run_budget_seconds=remaining)
-
-        if remaining is None:
-            agent = _construct_agent()
-        else:
-            agent_future: concurrent.futures.Future = concurrent.futures.Future()
-            agent_context = contextvars.copy_context()
-
-            def _initialize_agent() -> None:
-                try:
-                    agent_future.set_result(agent_context.run(_construct_agent))
-                except BaseException as error:
-                    agent_future.set_exception(error)
-
-            threading.Thread(
-                target=_initialize_agent,
-                name=f"cron-agent-init-{job_id[:8]}",
-                daemon=True,
-            ).start()
-            try:
-                agent = agent_future.result(timeout=remaining)
-            except concurrent.futures.TimeoutError as error:
-                def _teardown_late_agent(future):
-                    try:
-                        late_agent = future.result()
-                    except BaseException:
-                        return
-                    _teardown_cron_agent(late_agent, job_id)
-
-                agent_future.add_done_callback(_teardown_late_agent)
-                raise _total_run_budget_error(job_name, total_run_budget) from error
-
-        if total_run_deadline is not None:
-            setattr(agent, "_cron_total_run_deadline", total_run_deadline)
+        _session_db = _open_cron_session_db(job)
+        agent = _construct_cron_agent(
+            AIAgent, job, _cfg, setup, workdir=scope.workdir,
+            session_id=_cron_session_id, session_db=_session_db)
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
-            total_run_deadline=total_run_deadline,
-            total_run_budget=total_run_budget,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         # Keep final_response clean for delivery logic (empty = no delivery).
@@ -2775,9 +2610,7 @@ def run_job(
                 if agent is not None:
                     defer_agent_teardown.append(agent)
             else:
-                _teardown_cron_agent(
-                    agent, job_id,
-                    timeout_seconds=_deferred_agent_cleanup_timeout(agent))
+                _teardown_cron_agent(agent, job_id, timeout_seconds=_cron_cleanup_timeout_seconds())
 
 
 def _teardown_cron_agent(
@@ -2806,25 +2639,6 @@ def _teardown_cron_agent(
     _run_cron_cleanup_with_timeout(
         _cleanup_agent, job_id=job_id, label="agent resource teardown",
         timeout_seconds=timeout_seconds)
-
-
-def _deferred_agent_cleanup_timeout(agent) -> float:
-    """Cap teardown by both the cleanup limit and a run's remaining total budget."""
-    timeout = _cron_cleanup_timeout_seconds()
-    # Disabled cleanup stays disabled: an explicit non-positive limit must not be raised to the
-    # 0.1s floor below, which would turn "no cleanup" into "a little cleanup" (origin bcc8857589a,
-    # asserted by test_disabled_cleanup_timeout_preserves_inline_teardown).
-    if timeout <= 0:
-        return timeout
-    deadline = getattr(agent, "_cron_total_run_deadline", None) if agent is not None else None
-    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
-        return timeout
-    remaining = _remaining_run_budget(float(deadline))
-    assert remaining is not None
-    # Floor at 0.1s: an exhausted budget previously yielded exactly 0.0, which skips teardown
-    # entirely and leaks the agent's client resources. A spent budget still gets a bounded
-    # cleanup chance.
-    return min(timeout, max(0.1, remaining))
 
 
 def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
@@ -3349,7 +3163,7 @@ def _run_one_job_body(
                 _teardown_cron_agent(
                     _deferred_agent,
                     job["id"],
-                    timeout_seconds=_deferred_agent_cleanup_timeout(_deferred_agent))
+                    timeout_seconds=_cron_cleanup_timeout_seconds())
 
         _run_kwargs = {
             "defer_agent_teardown": _deferred_agents,

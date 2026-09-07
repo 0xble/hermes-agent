@@ -3,10 +3,9 @@
 The gateway relocates per-turn volatile facts OUT of the ephemeral system
 prompt — auto-reset notes, the first-contact intro, voice-channel changes —
 and stages them on ``agent._gateway_turn_context_notes``.
-``build_turn_context`` consumes them once and composes them only for the current
-provider request after plugin context. Stored string content remains clean and
-does not receive a durable ``api_content`` replay sidecar. Multimodal list
-content uses an appended text part because request-only string composition
+``build_turn_context`` consumes them once and delivers them through the same
+api_content sidecar channel as plugin context (string content), or as an
+appended text part on multimodal (list) content, where the string sidecar
 cannot apply and the fact would otherwise silently drop.
 """
 
@@ -20,7 +19,6 @@ import pytest
 from agent.turn_context import (
     append_notes_to_multimodal_content,
     build_turn_context,
-    compose_user_api_content,
     consume_gateway_turn_context_notes,
 )
 
@@ -145,19 +143,16 @@ class TestConsumeIsOneShot:
         assert consume_gateway_turn_context_notes(agent) == ""
 
 
-class TestStringContentRequestScopedDelivery:
-    def test_notes_are_composed_only_for_the_current_request(self):
-        """String notes stay out of stored and replayed message content."""
+class TestStringContentSidecarDelivery:
+    def test_notes_land_in_api_content_not_content(self):
+        """String notes stay out of stored content and into the sidecar."""
         agent = _FakeAgent()
         agent._gateway_turn_context_notes = RESET_NOTE
         with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert "api_content" not in msg
-        assert compose_user_api_content(
-            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
-        ) == "hello\n\n" + RESET_NOTE
+        assert msg["api_content"] == "hello\n\n" + RESET_NOTE
         # Consumed: a later turn on the same cached agent replays nothing.
         assert agent._gateway_turn_context_notes == ""
 
@@ -171,10 +166,7 @@ class TestStringContentRequestScopedDelivery:
             ctx = _build(agent)
         msg = ctx.messages[ctx.current_turn_user_idx]
         assert msg["content"] == "hello"
-        assert "api_content" not in msg
-        assert compose_user_api_content(
-            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
-        ) == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX\n\n" + VC_NOTE
 
     def test_no_notes_means_no_stamp(self):
         agent = _FakeAgent()

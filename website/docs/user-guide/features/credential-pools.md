@@ -65,13 +65,13 @@ hermes auth list
 Output:
 ```
 openrouter (2 credentials):
-  #1  OPENROUTER_API_KEY   api_key env:OPENROUTER_API_KEY ←
-  #2  backup-key           api_key manual
+  #1  OPENROUTER_API_KEY   api_key id=3f9a1c   priority=0  env:OPENROUTER_API_KEY ←
+  #2  backup-key           api_key id=b7e204   priority=1  manual
 
 anthropic (3 credentials):
-  #1  hermes_pkce          oauth   hermes_pkce ←
-  #2  claude_code          oauth   claude_code
-  #3  ANTHROPIC_API_KEY    api_key env:ANTHROPIC_API_KEY
+  #1  hermes_pkce          oauth   id=91c0de   priority=0  hermes_pkce ←
+  #2  claude_code          oauth   id=4d8a77   priority=1  claude_code
+  #3  ANTHROPIC_API_KEY    api_key id=e12f5b   priority=2  env:ANTHROPIC_API_KEY
 ```
 
 The `←` marks the currently selected credential.
@@ -114,8 +114,12 @@ Type [1/2]:
 | `hermes auth add <provider>` | Add a credential (prompts for type and key) |
 | `hermes auth add <provider> --type api-key --api-key <key>` | Add an API key non-interactively |
 | `hermes auth add <provider> --type oauth` | Add an OAuth credential via browser login |
+| `hermes auth add <provider> --priority 0` | Add a credential and place it first in the `fill_first` order |
+| `hermes auth priority <provider> <target> <n>` | Move a credential to priority `n` (0 = tried first); the rest are renumbered |
 | `hermes auth remove <provider> <index>` | Remove credential by 1-based index |
 | `hermes auth reset <provider>` | Clear all cooldowns/exhaustion status |
+| `hermes auth reset <provider> <target>` | Clear the cooldown on one credential by index, id, or label |
+| `hermes auth refresh <provider> [target]` | Refresh one OAuth credential's tokens and return it to rotation (proves the grant is alive; the next request re-checks quota) |
 
 ## Rotation Strategies
 
@@ -129,7 +133,7 @@ credential_pool_strategies:
 
 | Strategy | Behavior |
 |----------|----------|
-| `fill_first` (default) | Use the first healthy key until it's exhausted, then move to the next |
+| `fill_first` (default) | Use the first healthy key until it's exhausted, then move to the next; order is each credential's `priority` (`hermes auth priority` changes it) |
 | `round_robin` | Cycle through keys evenly, rotating after each selection |
 | `least_used` | Always pick the key with the lowest request count |
 | `random` | Random selection among healthy keys |
@@ -160,7 +164,7 @@ When you set up a custom endpoint via `hermes model`, it auto-generates a name l
 hermes auth list
 # Shows:
 #   Together.ai (1 credential):
-#     #1  config key    api_key config:Together.ai ←
+#     #1  config key    api_key id=a0c3f9   priority=0  config:Together.ai ←
 
 # Add a second key for the same endpoint:
 hermes auth add Together.ai --api-key sk-together-second-key

@@ -12,7 +12,6 @@ from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
 from cron.scheduler import (
-    _deferred_agent_cleanup_timeout,
     _run_cron_cleanup_with_timeout,
     _teardown_cron_agent,
     run_job,
@@ -99,44 +98,6 @@ def test_agent_teardown_is_bounded():
         assert elapsed < 5.0
     finally:
         release.set()
-
-
-def test_deferred_agent_cleanup_uses_only_remaining_total_budget(monkeypatch):
-    agent = MagicMock()
-    agent._cron_total_run_deadline = 105.0
-    monkeypatch.setattr("cron.scheduler.time.monotonic", lambda: 104.25)
-    monkeypatch.setattr("cron.scheduler._cron_cleanup_timeout_seconds", lambda: 10.0)
-
-    assert _deferred_agent_cleanup_timeout(agent) == 0.75
-
-
-def test_exhausted_total_budget_still_runs_deferred_cleanup(monkeypatch):
-    called = False
-    agent = MagicMock()
-    agent._cron_total_run_deadline = 100.0
-    monkeypatch.setattr("cron.scheduler.time.monotonic", lambda: 100.0)
-    monkeypatch.setattr("cron.scheduler._cron_cleanup_timeout_seconds", lambda: 10.0)
-
-    def cleanup():
-        nonlocal called
-        called = True
-
-    assert _run_cron_cleanup_with_timeout(
-        cleanup,
-        job_id="cleanup-budget-exhausted",
-        label="agent resource teardown",
-        timeout_seconds=_deferred_agent_cleanup_timeout(agent),
-    )
-    assert called is True
-
-
-def test_disabled_cleanup_timeout_preserves_inline_teardown(monkeypatch):
-    agent = MagicMock()
-    agent._cron_total_run_deadline = 100.0
-    monkeypatch.setattr("cron.scheduler.time.monotonic", lambda: 100.0)
-    monkeypatch.setattr("cron.scheduler._cron_cleanup_timeout_seconds", lambda: 0.0)
-
-    assert _deferred_agent_cleanup_timeout(agent) == 0.0
 
 
 def test_detached_worker_teardown_waits_for_future():

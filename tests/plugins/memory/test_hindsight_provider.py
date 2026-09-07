@@ -225,10 +225,10 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
 
 
 class TestExplicitRecallDefaults:
-    def test_explicit_recall_defaults_provenance_and_entities(self, provider_with_config):
+    def test_explicit_recall_defaults_provenance_without_entities(self, provider_with_config):
         p = provider_with_config()
         kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=True)
-        assert kwargs["include_entities"] is True
+        assert "include_entities" not in kwargs
         # include_provenance is a Hermes formatting control, not a Hindsight API kwarg.
         assert "include_provenance" not in kwargs
         assert p._explicit_recall_include_provenance is True
@@ -241,6 +241,33 @@ class TestExplicitRecallDefaults:
             "authorization for external action."
         )
         assert "Do not call tools" not in formatted
+
+    def test_entity_expansion_is_opt_in_and_can_be_disabled_per_call(self, provider_with_config):
+        p = provider_with_config()
+        kwargs, _ = p._recall_kwargs(p._client, "query", {"include_entities": True}, explicit=True)
+        assert kwargs["include_entities"] is True
+        p = provider_with_config(explicit_recall_include_entities=True)
+        kwargs, _ = p._recall_kwargs(p._client, "query", {}, explicit=True)
+        assert kwargs["include_entities"] is True
+        kwargs, _ = p._recall_kwargs(p._client, "query", {"include_entities": False}, explicit=True)
+        assert "include_entities" not in kwargs
+
+    def test_mixed_recall_preserves_raw_results_without_preference_filter(self, provider_with_config):
+        p = provider_with_config(
+            recall_types="observation,world,experience", prefer_observations=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(id="obs-1", text="Observation", type="observation"),
+            SimpleNamespace(id="raw-1", text="Conflicting raw evidence", type="world"),
+        ])
+        result = json.loads(p.handle_tool_call("hindsight_recall", {"query": "test"}))
+        kwargs = p._client.arecall.call_args.kwargs
+        assert kwargs["types"] == ["observation", "world", "experience"]
+        assert "prefer_observations" not in kwargs
+        assert "Observation" in result["result"]
+        assert "Conflicting raw evidence" in result["result"]
+        assert "obs-1" in result["result"]
+        assert "raw-1" in result["result"]
 
     def test_automatic_recall_does_not_inherit_explicit_expansion(self, provider_with_config):
         p = provider_with_config(provenance_mode="none")
@@ -390,6 +417,14 @@ class TestConfig:
         p = provider_with_config(retain_source="cogoport")
         assert p._retain_source == "cogoport"
         assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"
+
+    def test_explicit_empty_retain_settings_do_not_inherit_env(self, provider_with_config, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_RETAIN_TAGS", "parent-tag")
+        monkeypatch.setenv("HINDSIGHT_RETAIN_SOURCE", "parent-source")
+        p = provider_with_config(retain_tags=[], retain_source="")
+        assert p._retain_tags == []
+        assert p._tags is None
+        assert p._retain_source == ""
 
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
