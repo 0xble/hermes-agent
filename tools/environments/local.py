@@ -673,7 +673,7 @@ def _kill_process_group_posix(proc) -> None:
             _wait_for_group_exit(proc, pgid, 2.0)
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 proc.wait(timeout=0.2)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     _sweep_escaped_descendants(descendants, pgid)
 

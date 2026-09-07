@@ -1019,6 +1019,7 @@ class TestNamedRealProfileProcesses:
     ):
         import hermes_cli.browser_connect as bc
         import tools.browser_tool as bt
+        import tools.browser_tool_real_profile as rp
 
         home = tmp_path / "home"
         source = tmp_path / "source"
@@ -1048,10 +1049,24 @@ class TestNamedRealProfileProcesses:
             ),
         )
         monkeypatch.setattr(bt, "_agent_browser_get_cdp", lambda _name: None)
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *_args, **_kwargs: Mock(
+                json=lambda: {
+                    "webSocketDebuggerUrl": "ws://127.0.0.1:9355/devtools/browser/recovered"
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            rp,
+            "_agent_browser_get_cdp",
+            lambda _name: "http://127.0.0.1:9355",
+        )
         monkeypatch.setattr(bt, "_cdp_http_ready", lambda endpoint: endpoint.endswith("9355"))
         monkeypatch.setattr(bt, "_cdp_owned_by_data_dir", lambda *_args: True)
         monkeypatch.setattr(bt, "_reload_browser_use_runtime", lambda _key: True)
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
+        monkeypatch.setattr(rp._install, "_find_agent_browser", lambda: "/usr/bin/agent-browser")
 
         def attach(argv, **_kwargs):
             attached.append(argv)

@@ -134,6 +134,22 @@ def test_native_cleanup_handles_rg_exiting_before_process_group_lookup(monkeypat
     assert killed == [(ExitedProc.pid, signal.SIGTERM)]
 
 
+def test_native_cleanup_ignores_group_permission_race(monkeypatch):
+    """A finished group can report EPERM while its leader is disappearing."""
+
+    class ExitedProc:
+        pid = 424242
+
+    monkeypatch.setattr(local.os, "getpgid", lambda _pid: ExitedProc.pid)
+    monkeypatch.setattr(
+        local.os,
+        "killpg",
+        lambda _pgid, _sig: (_ for _ in ()).throw(PermissionError),
+    )
+
+    local._kill_process_group_posix(ExitedProc())
+
+
 def test_kill_switch_routes_search_back_to_the_shell(tree, ops_factory, monkeypatch):
     monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "0")
     calls = []

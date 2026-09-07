@@ -61,6 +61,7 @@ def test_extract_dispatch_snippets_per_url_and_missing_key():
     ]}
     with patch.dict(os.environ, {"PERPLEXITY_API_KEY": "pplx-test"}), \
          patch.object(wt, "_get_extract_backend", return_value="perplexity"), \
+         patch.object(wt, "async_is_safe_url", return_value=True), \
          patch("plugins.web.perplexity.provider.httpx.post", return_value=_ok(payload)) as post:
         out = json.loads(asyncio.run(wt.web_extract_tool(urls)))
 
