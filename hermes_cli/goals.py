@@ -456,22 +456,21 @@ def workspace_fingerprint(cwd: Optional[str] = None) -> str:
         return ""
 
 
-def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
-    """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
-    the process and counts as exit code -1."""
+def run_gate(gate: GoalGate, *, cwd: Optional[str] = None, task_id: Optional[str] = None) -> Tuple[bool, int, str]:
+    """Run a synchronous verifier in the configured, policy-guarded terminal."""
     try:
-        # utf-8/replace: operator-configured output is arbitrary bytes; strict codepage decoding of
-        # one unmappable byte (emoji/CJK on a non-UTF-8 Windows console) kills the reader thread and
-        # the tail the agent needs arrives empty.
-        proc = subprocess.run(
-            gate.command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None,
-        )
-        combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-        return proc.returncode == 0, proc.returncode, combined[-_GATE_OUTPUT_TAIL_CHARS:]
-    except subprocess.TimeoutExpired as exc:
-        out = "".join(c if isinstance(c, str) else c.decode("utf-8", "replace") for c in (exc.stdout, exc.stderr) if c)
-        return False, -1, (out + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
+        from tools.terminal_tool import terminal_tool
+        result = json.loads(terminal_tool(
+            gate.command, timeout=max(1, int(gate.timeout_seconds)),
+            workdir=cwd, task_id=task_id, _allow_yield=False,
+        ))
+        code = result.get("exit_code")
+        output = str(result.get("output") or "")
+        if result.get("error"):
+            output += "\n" + str(result["error"])
+        if type(code) is not int or code == 124 or result.get("error"):
+            return False, -1, output[-_GATE_OUTPUT_TAIL_CHARS:]
+        return code == 0, code, output[-_GATE_OUTPUT_TAIL_CHARS:]
     except Exception as exc:
         return False, -1, f"[gate could not run: {type(exc).__name__}: {exc}]"
 
@@ -490,7 +489,8 @@ class GoalState:
     updated_at: float = 0.0
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
-    paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    paused_reason: Optional[str] = None       # why we paused
+    user_stopped: bool = False                # only fresh user direction releases this hold
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
     # auto-pause instead of burning the budget on an unreachable judge.
@@ -528,6 +528,8 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            user_stopped=bool(data.get("user_stopped", data.get("status") == "cleared"
+                                       or str(data.get("paused_reason") or "").startswith("user-"))),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -739,7 +741,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
         return False
     try:
         state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
+        if state is None or (state.status == "cleared" and not state.user_stopped):
             return False
         # Don't clobber a goal already set on the child (e.g. a resumed lineage).
         if load_goal(new_session_id) is not None:
@@ -1192,15 +1194,25 @@ class GoalManager:
         self._pause_state(paused_reason)
         return _decision("paused", False, None, verdict, reason, message)
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
+            paused: bool = False, user_requested: bool = True) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
+        previous = load_goal(self.session_id) or self.refresh()
+        user_stopped = bool(previous and previous.user_stopped)
+        if user_stopped and not paused and not user_requested:
+            raise ValueError("User-stopped goals require user direction to reactivate")
         self._state = GoalState(
-            goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            goal=goal, status="paused" if paused else "active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
+            user_stopped=user_stopped if paused else False,
+            paused_reason="draft" if paused else None,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
+        if previous and previous.last_verdict != "done" and previous.status != "done" and not user_requested:
+            self._state.turns_used = previous.turns_used
+            self._state.max_turns = min(self._state.max_turns, previous.max_turns)
         return self._save()
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
@@ -1223,31 +1235,41 @@ class GoalManager:
             raise RuntimeError("Failed to persist edited goal")
         return updated
 
-    def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
+    def pause(self, reason: str = "user-paused", *, user_requested: bool = True) -> Optional[GoalState]:
         self.refresh()
         if not self._state:
             return None
+        if self._state.status not in {"active", "paused"}:
+            return None
         self._state.status = "paused"
+        self._state.user_stopped = self._state.user_stopped or user_requested
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
         return self._save()
 
-    def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
+    def resume(self, *, reset_budget: bool = True, user_requested: bool = True) -> Optional[GoalState]:
         self.refresh()
         if not self._state:
             return None
+        if self._state.status not in {"active", "paused"}:
+            return None
+        if self._state.user_stopped and not user_requested:
+            raise ValueError("User-stopped goals require user direction to resume")
         self._state.status = "active"
+        self._state.user_stopped = False
         self._state.paused_reason = None
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
         return self._save()
 
-    def clear(self) -> None:
+    def clear(self, *, user_requested: bool = True) -> None:
         self.refresh()
         if self._state is None:
             return
         self._state.status = "cleared"
+        self._state.user_stopped = self._state.user_stopped or user_requested
+        self._state.clear_wait()
         self._save()
         self._state = None
 
@@ -1355,13 +1377,18 @@ class GoalManager:
         if state is None or not state.gates:
             return None
 
-        fingerprint = workspace_fingerprint()
+        from tools.terminal_tool import _get_env_config, get_session_cwd
+        from tools.approval import get_current_session_key
+        config = _get_env_config()
+        terminal_cwd = get_session_cwd(get_current_session_key(default="") or self.session_id) or config["cwd"]
+        # A host checkout cannot prove an unchanged sandbox/remote workspace.
+        fingerprint = workspace_fingerprint(cwd=terminal_cwd) if config["env_type"] == "local" else ""
         for gate in state.gates:
             unchanged = bool(fingerprint) and gate.last_exit_code not in (None, 0) and gate.last_failed_fingerprint == fingerprint
             if unchanged:
                 passed, exit_code, tail = False, int(gate.last_exit_code or -1), gate.last_output_tail
             else:
-                passed, exit_code, tail = run_gate(gate)
+                passed, exit_code, tail = run_gate(gate, task_id=self.session_id)
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:

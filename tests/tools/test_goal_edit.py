@@ -20,8 +20,6 @@ def edit(**kwargs):
     return json.loads(set_goal_tool(
         action="edit", session_id="edit-test", turn_id="turn",
         goal_control_revision=goals.get_goal_control_revision("edit-test"),
-        user_task="Refine the parser completion criteria.",
-        authorization_text="Refine the parser completion criteria.",
         goal="Parser regressions are fixed", **kwargs,
     ))
 
@@ -50,11 +48,21 @@ def test_edit_preserves_lifecycle_and_unspecified_contract(status):
     after = json.loads(saved.to_json())
     for key in before.keys() - {"goal", "contract", "updated_at"}:
         assert after[key] == before[key], key
-    assert after["contract"] == {**before["contract"], "verification": "Parser and compatibility tests pass"}
+    assert after["contract"] == {
+        **before["contract"], "verification": "Parser and compatibility tests pass"
+    }
     assert result["state"] == after
 
 
-@pytest.mark.parametrize("extra", [{"max_turns": 9}, {"replace_existing": True}, {"contract": {"verification": ""}}, {"contract": {"verification": "   "}}])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"max_turns": 9},
+        {"replace_existing": True},
+        {"contract": {"verification": ""}},
+        {"contract": {"verification": "   "}},
+    ],
+)
 def test_edit_cannot_reset_budget_or_erase_verification(extra):
     manager = goals.GoalManager("edit-test")
     before = manager.set("Fix parser", contract=goals.GoalContract(verification="Tests pass"))

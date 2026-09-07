@@ -1023,6 +1023,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    allow_yield: bool = True,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1047,8 +1048,8 @@ def _run_foreground(
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
+                **(_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                                task_id=task_id, session_key=session_key) if allow_yield else {}),
             )
             break
         except Exception as e:
@@ -1145,6 +1146,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    _allow_yield: bool = True,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1156,6 +1158,7 @@ def terminal_tool(
     is hard rate-limited (1 notification / 15s / process) and auto-disabled
     after repeated strikes or a lifetime cap, promoting to notify_on_complete —
     use it only for rare one-shot signals on long-lived processes.
+    ``_allow_yield=False`` keeps internal verifiers synchronous and timeout-bounded.
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
@@ -1205,6 +1208,7 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            allow_yield=_allow_yield,
         )
     except _Rejected as r:
         return r.result_json

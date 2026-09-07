@@ -1,4 +1,5 @@
 """Persisted goal receipts reach the normal notice lane, not progress cleanup."""
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -42,8 +43,7 @@ async def test_mutation_receipt_reaches_origin_thread_and_keeps_full_text(tmp_pa
         return json.loads(result)
 
     goal = ("Validate café parser " + "long complete objective " * 100).strip()
-    first = invoke(action="set", goal=goal, user_task="Implement and validate the parser.",
-                   authorization_text="Implement and validate the parser.",
+    first = invoke(action="set", goal=goal,
                    contract={"verification": "Parser tests pass", "boundaries": "No deployment"})
     assert first["success"] is True
     await asyncio.gather(*pending)
@@ -51,12 +51,12 @@ async def test_mutation_receipt_reaches_origin_thread_and_keeps_full_text(tmp_pa
     assert goal in first["notice"]
     assert "Parser tests pass" in first["notice"]
     assert "No deployment" in first["notice"]
-    assert first["notice"] == format_goal_change(
-        "set", goals.load_goal("notices"))
+    state = goals.load_goal("notices")
+    assert state is not None
+    assert first["notice"] == format_goal_change("set", state)
 
     pending.clear()
-    edited = invoke(action="edit", goal="Parser fully validated", user_task="Refine the goal for the parser.",
-                    authorization_text="Refine the goal for the parser.")
+    edited = invoke(action="edit", goal="Parser fully validated")
     assert edited["success"] is True
     assert "Parser fully validated" in edited["notice"]
     assert "Parser tests pass" in edited["notice"]
@@ -67,9 +67,10 @@ async def test_mutation_receipt_reaches_origin_thread_and_keeps_full_text(tmp_pa
     pending.clear()
     assert invoke(action="status")["success"] is True
     assert invoke(action="guide")["success"] is True
-    assert invoke(action="clear", user_task="What is the goal?")["success"] is False
-    assert pending == []
-    assert adapter.send.await_count == 2
+    assert invoke(action="clear")["success"] is True
+    await asyncio.gather(*pending)
+    assert adapter.send.await_count == 3
+    pending.clear()
     # Obsolete turns cannot publish into a newer session's thread.
     turn._ctx._run_still_current = lambda: False
     emit_terminal_post_tool_call(agent, function_name="set_goal", function_args={},
@@ -81,12 +82,15 @@ async def test_mutation_receipt_reaches_origin_thread_and_keeps_full_text(tmp_pa
 def test_formatter_failure_does_not_claim_committed_mutation_failed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     goals._DB_CACHE.clear()
+
     def broken(*args, **kwargs):
         raise RuntimeError("renderer unavailable")
+
     monkeypatch.setattr("hermes_cli.goal_display.format_goal_change", broken)
-    result = json.loads(set_goal_tool(action="set", goal="Parser validated", session_id="format-failure",
-        turn_id="turn", goal_control_revision=0, user_task="Implement and validate the parser.",
-        authorization_text="Implement and validate the parser."))
+    result = json.loads(set_goal_tool(
+        action="set", goal="Parser validated", session_id="format-failure",
+        turn_id="turn", goal_control_revision=0,
+    ))
     assert result["success"] is True
     assert goals.load_goal("format-failure").goal == result["state"]["goal"]
     goals._DB_CACHE.clear()
