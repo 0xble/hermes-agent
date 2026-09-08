@@ -2595,8 +2595,8 @@ def claim_job_for_fire(
     fence + file lock: reject missing/terminal/paused jobs unless ``force`` (explicit manual
     fire, which also resumes the job atomically; external callbacks must leave it false so a
     stale callback cannot resurrect a paused job). Lose if a claim younger than
-    ``claim_ttl_seconds`` exists (the TTL lets another fire reclaim after a crash; mark_job_run
-    clears the claim). Otherwise stamp ``fire_claim`` and, for recurring jobs, advance
+    ``claim_ttl_seconds`` exists (the live claim is the same-fire idempotency fence; mark_job_run
+    clears it). Otherwise stamp a fresh ``fire_claim`` identity and, for recurring jobs, advance
     ``next_run_at`` so a stale re-delivery cannot re-fire."""
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
@@ -2613,16 +2613,10 @@ def claim_job_for_fire(
         # Per-acquisition token: a process may legitimately reclaim its own stale lease, and the
         # previous runner must not heartbeat the new claim merely because hostname + PID match.
         owner = f"{_machine_id()}:{uuid.uuid4().hex}"
-        existing = job.get("fire_claim")
-        prior_run_id = (
-            str(existing.get("run_id") or "").strip()
-            if isinstance(existing, dict)
-            else ""
-        )
         job["fire_claim"] = {
             "at": now.isoformat(),
             "by": owner,
-            "run_id": prior_run_id or str(uuid.uuid4()),
+            "run_id": str(uuid.uuid4()),
         }
         if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
             nxt = _compute_next_run_for_job(job, now.isoformat())

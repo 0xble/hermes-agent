@@ -15,6 +15,14 @@ _INDEX_ROW_RE = re.compile(
 )
 _RECORD_RE = re.compile(r"^###\s+(HERMES-\d+)\b")
 _SUBJECT_RE = re.compile(r"`([^`]+)`")
+_SQUASH_PR_SUFFIX_RE = re.compile(r" \(#[1-9][0-9]*\)$")
+_GITHUB_MERGE_WRAPPER_RE = re.compile(r"^Merge pull request #[1-9][0-9]* from [^/\s]+/[^\s]+$")
+
+
+def _is_registered_subject(subject: str, registered_subjects: Iterable[str]) -> bool:
+    """Match a stable subject before GitHub appends one squash PR suffix."""
+    registered = set(registered_subjects)
+    return subject in registered or _SQUASH_PR_SUFFIX_RE.sub("", subject) in registered
 
 
 def _duplicates(values: Iterable[str]) -> list[str]:
@@ -53,6 +61,59 @@ def _registered_subjects(text: str) -> set[str]:
                 break
             if line.startswith("|") and not line.startswith("| ---"):
                 subjects.update(_SUBJECT_RE.findall(line))
+    return subjects
+
+
+def _is_registered_github_merge_wrapper(
+    repo: Path, commit: str, subject: str, registered_subjects: Iterable[str]
+) -> bool:
+    """Accept a tree-identical GitHub PR wrapper only for its registered PR title."""
+    if not _GITHUB_MERGE_WRAPPER_RE.fullmatch(subject):
+        return False
+    result = subprocess.run(
+        ["git", "show", "-s", "--format=%P%x00%T%x00%B", commit],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    parents, tree, message = result.stdout.split("\x00", maxsplit=2)
+    parent_ids = parents.split()
+    if len(parent_ids) < 2:
+        return False
+    second_parent_tree = subprocess.run(
+        ["git", "show", "-s", "--format=%T", parent_ids[1]],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    _subject, _separator, pr_body = message.partition("\n\n")
+    pr_title = next((line.strip() for line in pr_body.splitlines() if line.strip()), "")
+    return tree == second_parent_tree and _is_registered_subject(pr_title, registered_subjects)
+
+
+def _registered_github_merge_wrapper_subjects(
+    repo: Path, upstream_ref: str, registered_subjects: Iterable[str]
+) -> set[str]:
+    commits = subprocess.run(
+        ["git", "rev-list", f"{upstream_ref}..HEAD"],
+        cwd=repo,
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.splitlines()
+    subjects: set[str] = set()
+    for commit in commits:
+        subject = subprocess.run(
+            ["git", "show", "-s", "--format=%s", commit],
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        if _is_registered_github_merge_wrapper(repo, commit, subject, registered_subjects):
+            subjects.add(subject)
     return subjects
 
 
@@ -128,7 +189,14 @@ def _validate_registration_history(
             text=True,
             capture_output=True,
         )
-        if manifest.returncode != 0 or subject not in _registered_subjects(manifest.stdout):
+        registered_subjects = _registered_subjects(manifest.stdout)
+        if (
+            manifest.returncode != 0
+            or not _is_registered_subject(subject, registered_subjects)
+            and not _is_registered_github_merge_wrapper(
+                repo, commit, subject, registered_subjects
+            )
+        ):
             errors.append(
                 f"fork subject was not registered in its own commit {commit[:12]}: {subject}"
             )
@@ -249,16 +317,35 @@ def validate_manifest(
         }
         for patch_id, _status, subjects in rows:
             for subject in subjects:
-                if subject not in fork_subject_set:
+                if not any(
+                    _is_registered_subject(observed, {subject})
+                    for observed in fork_subject_set
+                ):
                     errors.append(
                         f"{patch_id} stable subject missing from "
                         f"{coverage_label}: {subject}"
                     )
-        for subject in sorted(fork_subject_set - indexed_subjects - set(exemptions)):
+        registered_subjects = indexed_subjects | set(exemptions)
+        if upstream_ref is not None:
+            registered_subjects |= _registered_github_merge_wrapper_subjects(
+                path.resolve().parent, upstream_ref, registered_subjects
+            )
+        for subject in sorted(
+            observed
+            for observed in fork_subject_set
+            if not _is_registered_subject(observed, registered_subjects)
+        ):
             errors.append(
                 "fork-only subject is neither indexed nor exempt: " + subject
             )
-        for subject in sorted(set(exemptions) - fork_subject_set):
+        for subject in sorted(
+            registered
+            for registered in exemptions
+            if not any(
+                _is_registered_subject(observed, {registered})
+                for observed in fork_subject_set
+            )
+        ):
             errors.append(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )

@@ -955,8 +955,11 @@ def _plan_execution(
     # Reject non-positive timeouts before deadline math: ``timeout or
     # default`` would silently turn 0 into the default, and a negative
     # value is truthy and would fire an immediate "-Ns" timeout.
-    if timeout is not None and timeout <= 0:
-        raise _Rejected(tool_error(f"timeout must be a positive number of seconds (got {timeout})."))
+    if timeout is not None:
+        import math
+
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise _Rejected(tool_error("timeout must be a positive finite number of seconds."))
     promoted = None
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
@@ -1245,6 +1248,7 @@ def terminal_tool(
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
+                timeout=timeout,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
@@ -1293,7 +1297,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. A foreground timeout above {FOREGROUND_MAX_TIMEOUT}s runs the command as a tracked background process with notify_on_complete=true instead (the result says so; do not re-run it).",
+                "description": f"Runtime limit in seconds. Foreground defaults to 180 (max {FOREGROUND_MAX_TIMEOUT}) and returns immediately on exit. A foreground timeout above {FOREGROUND_MAX_TIMEOUT}s promotes to a tracked background process with notify_on_complete=true (do not re-run it). An explicit background timeout terminates the tracked process at that deadline and reports timed_out; omission leaves servers/watchers unbounded. A timeout does not prove external effects failed: reconcile before retrying.",
                 "minimum": 1
             },
             "workdir": {

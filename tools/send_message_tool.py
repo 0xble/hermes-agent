@@ -742,18 +742,11 @@ async def _send_via_adapter(
                 # Text (and possibly some media) already reached the platform,
                 # so this stays an ambiguous (non-pre_send) failure that names
                 # the partial delivery instead of reporting a verified success.
-                if _txt_id is None:
-                    _partial_error = (
-                        f"Adapter delivered {_n} media attachment(s), but a later "
-                        f"attachment failed: {result['error']}"
-                    )
-                else:
-                    _partial_error = (
+                _partial = {
+                    "error": (
                         "Adapter delivered text but media attachment delivery "
                         f"failed: {result['error']}"
-                    )
-                _partial = {
-                    "error": _partial_error,
+                    ),
                     "message_id": _txt_id,
                 }
                 # Deliberately NOT "media_delivered": on a failure that key

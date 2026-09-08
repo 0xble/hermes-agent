@@ -100,8 +100,7 @@ def test_dead_owner_event_is_claimed_once_and_handoff_fences_replay():
         deliverable_targets={("telegram", "default")}
     ) == []
 
-    assert inbox.mark_handed_off(queue_id, "") is False
-    assert inbox.mark_handed_off(queue_id, "turn-token") is True
+    assert inbox.mark_handed_off(queue_id) is True
     _orphan(queue_id)
     assert inbox.claim_recoverable(
         deliverable_targets={("telegram", "default")}

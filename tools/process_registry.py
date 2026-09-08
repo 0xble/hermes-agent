@@ -313,6 +313,7 @@ class ProcessSession:
     env_ref: Any = None                         # Environment object (sandbox spawns)
     cwd: Optional[str] = None
     started_at: float = 0.0                     # time.time() of spawn
+    deadline_at: float = 0.0                    # explicit runtime deadline; zero is unbounded
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
     exited: bool = False
     exit_code: Optional[int] = None             # None while running
@@ -323,6 +324,7 @@ class ProcessSession:
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
+    sandbox_process_group: bool = False         # sandbox wrapper owns PGID=pid (new spawns only)
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     # (#70716)
@@ -348,6 +350,8 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _deadline_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _termination_in_progress: bool = field(default=False, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
 
     def append_output(self, text: str) -> None:
@@ -360,8 +364,13 @@ class ProcessSession:
     def mark_exited(self, exit_code, reason: str = "exited", source: str = "") -> None:
         """Record an exit. A kill that raced the observer already recorded its own
         exit_code/reason; never overwrite it."""
+        if self._termination_in_progress:
+            return
         self.exited = True
-        if self.completion_reason != "killed":
+        if self.termination_source == "terminal.timeout":
+            self.exit_code = 124
+            self.completion_reason = "timed_out"
+        elif self.completion_reason != "killed":
             self.exit_code = exit_code
             self.completion_reason = reason
             if source:
@@ -373,8 +382,8 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 # Session fields persisted verbatim in the crash-recovery checkpoint (plus
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
-    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "cwd",
-    "started_at", "task_id", "owner_task_id", "session_key",
+    "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "sandbox_process_group", "cwd",
+    "started_at", "deadline_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
@@ -921,14 +930,17 @@ class ProcessRegistry:
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
         bg_command = (
-            f"mkdir -p {q(temp_dir)} && "
+            f"set -m; mkdir -p {q(temp_dir)} && "
             f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) < /dev/null & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
         try:
-            result = env.execute(bg_command, timeout=timeout, rewrite_compound_background=False)
+            # The backend's outer shell may be sh/dash/zsh, where set -m is
+            # unsupported without a TTY. Own the job-control shell explicitly.
+            result = env.execute(f"bash -lc {q(bg_command)}", timeout=timeout, rewrite_compound_background=False)
             output = result.get("output", "").strip()
             session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+            session.sandbox_process_group = session.pid is not None
             # No PID from the wrapper (syntax error, broken redirect): a failed launch,
             # not a fake running session.
             if session.pid is None:
@@ -944,6 +956,59 @@ class ProcessRegistry:
             self._track_started(
                 session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
         return session
+
+    def set_deadline(self, session_id: str, seconds: float) -> None:
+        """Bound this process's lifetime, not a caller's poll window.
+
+        Only explicit terminal timeouts use this path. Unbounded servers and
+        watchers never get a deadline. Persist the original wall-clock deadline
+        so recovery cannot silently give a hung verification another full budget.
+        """
+        import math
+
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("background timeout must be a positive finite number")
+        session = self.get(session_id)
+        if session is None:
+            raise ValueError("background process was not found")
+        with session._lock:
+            if session.exited:
+                return
+            if session.deadline_at:
+                raise ValueError("background process already has a deadline")
+            session.deadline_at = session.started_at + seconds
+        self._write_checkpoint()
+        self._start_deadline(session)
+
+    def _start_deadline(self, session: ProcessSession) -> None:
+        if not session.deadline_at or session.exited or session._deadline_thread is not None:
+            return
+
+        def expire() -> None:
+            from agent.deadline import clamp_timeout
+
+            while not session._completion_event.is_set():
+                remaining = session.deadline_at - time.time()
+                if remaining <= 0:
+                    break
+                # Reuse the shared platform-safe primitive, without shortening
+                # the persisted overall deadline when one wait must be capped.
+                if session._completion_event.wait(clamp_timeout(remaining)):
+                    return
+            # Reconcile a natural exit before classifying a deadline. A timeout
+            # never retries the command or proves an external effect failed.
+            self._reconcile_local_exit(session)
+            if not session.exited:
+                result = self.kill_process(session.id, source="terminal.timeout", consume_output=False)
+                if result.get("status") == "error":
+                    session.termination_source = "deadline_unconfirmed"
+                    session.append_output("\nDeadline expired; termination could not be confirmed. Reconcile external effects before retrying.\n")
+                    session.mark_exited(None, reason="lost", source="deadline_unconfirmed")
+                    self._move_to_finished(session)
+
+        thread = threading.Thread(target=expire, daemon=True, name=f"proc-deadline-{session.id}")
+        session._deadline_thread = thread
+        thread.start()
 
     # ----- Reader / Poller Threads -----
 
@@ -1121,11 +1186,14 @@ class ProcessRegistry:
                         exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
                         exit_code = -1
-                    session.exit_code = exit_code  # unlike mark_exited, a raced kill still takes this code
+                    if not session._termination_in_progress:
+                        session.exit_code = exit_code
                     self._finish_exited(session, exit_code)
                     return
             except Exception:
                 # Environment might be gone (sandbox reaped, etc.)
+                if session._termination_in_progress:
+                    return
                 session.exited, session.exit_code = True, -1
                 session.completion_reason, session.termination_source = "lost", "backend_lost"
                 self._move_to_finished(session)
@@ -1170,6 +1238,8 @@ class ProcessRegistry:
         """Move a session from running to finished.
         Idempotent: kill_process() and the reader thread can both call this; only
         the FIRST move enqueues the completion notification, so no duplicates."""
+        if session._termination_in_progress:
+            return
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
@@ -1624,8 +1694,23 @@ class ProcessRegistry:
                 self._completion_consumed.add(session_id)
             return result
         try:
+            if source == "terminal.timeout":
+                # The reader can observe the signal before kill_process returns.
+                # Publish the cause first so its one completion carries timeout,
+                # not an apparently ordinary SIGTERM or successful exit.
+                with session._lock:
+                    session.termination_source = source
+                    session._termination_in_progress = True
             early = self._signal_kill(session, session_id, consume_output)
             if early is not None:
+                if source == "terminal.timeout" and early.get("status") == "already_exited":
+                    # The observer is fenced during tree termination. An
+                    # identity mismatch/dead recovered PID is uncertain, not a
+                    # confirmed timeout, and must still release the wait.
+                    session.exited = True
+                    session.exit_code = None
+                    session.completion_reason = "lost"
+                    session.termination_source = "deadline_unconfirmed"
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
             # descendants reparented inside the cgroup.
@@ -1638,16 +1723,21 @@ class ProcessRegistry:
                 if consume_output:
                     self._completion_consumed.add(session_id)
                 session.exited = True
-                session.exit_code = -15  # SIGTERM
-                session.completion_reason = "killed"
+                session.exit_code = 124 if source == "terminal.timeout" else -15
+                session.completion_reason = "timed_out" if source == "terminal.timeout" else "killed"
                 session.termination_source = source
             self._move_to_finished(session)
             self._write_checkpoint()
             return {
-                "status": "killed", "session_id": session.id, "completion_reason": session.completion_reason,
+                "status": session.completion_reason, "session_id": session.id, "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source, "output": output}
         except Exception as e:
             return {"status": "error", "error": str(e)}
+        finally:
+            if source == "terminal.timeout":
+                session._termination_in_progress = False
+                if session.exited:
+                    self._move_to_finished(session)
 
     def _signal_kill(self, session: ProcessSession, session_id: str, consume_output: bool) -> Optional[dict]:
         """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
@@ -1664,7 +1754,26 @@ class ProcessRegistry:
             # leaves Git Bash descendants behind.
             self._terminate_host_pid(session.process.pid, session.host_start_time)
         elif session.env_ref and session.pid:
-            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            if session.sandbox_process_group:
+                # New sandbox wrappers run as a job-control process group. Kill
+                # the owned group, not just the shell while verification keeps
+                # running underneath it. Legacy sessions retain the old path.
+                target = f"-- -{session.pid}"
+                stop = (
+                    f"kill -TERM {target} 2>/dev/null; "
+                    f"i=0; while kill -0 {target} 2>/dev/null && [ $i -lt 20 ]; do "
+                    "sleep 0.1; i=$((i+1)); done; "
+                    f"if kill -0 {target} 2>/dev/null; then "
+                    f"kill -KILL {target} 2>/dev/null; fi; "
+                    f"i=0; while kill -0 {target} 2>/dev/null && [ $i -lt 20 ]; do "
+                    "sleep 0.1; i=$((i+1)); done; "
+                    f"! kill -0 {target} 2>/dev/null"
+                )
+                result = session.env_ref.execute(f"bash -lc {shlex.quote(stop)}", timeout=5)
+                if result.get("returncode", result.get("exit_code")) != 0:
+                    raise RuntimeError("sandbox process group termination could not be confirmed")
+            else:
+                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:
             # Identity check, not bare liveness: a gone/recycled PID means our
             # process exited — never tree-kill the stranger. Still stop an owned
@@ -1983,6 +2092,10 @@ class ProcessRegistry:
                     "parent_session_id": session.parent_session_id,
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
+        with self._lock:
+            deadline_sessions = list(self._running.values())
+        for session in deadline_sessions:
+            self._start_deadline(session)
         return recovered
 
 

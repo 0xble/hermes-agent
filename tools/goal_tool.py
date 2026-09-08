@@ -110,7 +110,9 @@ def set_goal_tool(
     default_max_turns: Optional[int] = None,
     contract: Optional[Mapping[str, Any]] = None,
     replace_existing: bool = False,
+    resume: bool = False,
     pid: Optional[int] = None,
+    delegation_id: str = "",
     reason: str = "",
     text: str = "",
     index: Optional[int] = None,
@@ -128,6 +130,20 @@ def set_goal_tool(
             f"unsupported goal action: {normalized_action or '<empty>'}",
         )
     sid = session_id.strip() if isinstance(session_id, str) else ""
+    if resume and normalized_action != "edit":
+        return _failure("invalid_parameter", "resume is supported only with action=edit")
+    has_pid = pid is not None
+    has_delegation = bool(str(delegation_id or "").strip())
+    if normalized_action == "wait" and has_pid and has_delegation:
+        return _failure(
+            "ambiguous_dependency",
+            "wait accepts exactly one dependency reference: pid or delegation_id, not both",
+        )
+    if normalized_action != "wait" and (has_pid or has_delegation):
+        return _failure(
+            "invalid_parameter",
+            "pid and delegation_id are supported only with action=wait",
+        )
     if not sid:
         return _failure(
             "missing_session_scope", "set_goal requires trusted active session scope"
@@ -206,7 +222,8 @@ def set_goal_tool(
             stop_state = load_goal(sid) or state  # Cleared audit rows retain user stops.
             # The hold prevents execution, not cleanup of obsolete tracking.
             # Instructions preserve unfinished user requests across that cleanup.
-            if stop_state and stop_state.user_stopped and normalized_action in {"set", "resume"} and not user_requested:
+            edit_resume = normalized_action == "edit" and bool(resume)
+            if stop_state and stop_state.user_stopped and (normalized_action in {"set", "resume"} or edit_resume) and not user_requested:
                 return _failure(
                     "user_stop_requires_direction",
                     "The user stopped this goal. Resume or replace it only when the user directs continuation.",
@@ -247,11 +264,17 @@ def set_goal_tool(
                         if merged.get(key) and not value.strip():
                             return _failure("invalid_edit", "Editing cannot erase completion contract terms")
                         merged[key] = value
-                    state = manager.edit(goal.strip(), contract=GoalContract.from_dict(merged))
+                    state = manager.edit(
+                        goal.strip(), contract=GoalContract.from_dict(merged),
+                        resume=bool(resume), user_requested=user_requested,
+                    )
                     persisted = load_goal(sid)
                     if persisted is None or persisted.to_json() != state.to_json():
                         return _failure("goal_persist_failed", "Edited goal read-back did not match")
-                    return _success("edit", state=persisted, change={"kind": "goal_edited"})
+                    return _success(
+                        "edit", state=persisted,
+                        change={"kind": "goal_edited", "resumed": bool(resume)},
+                    )
                 has_existing = bool(state and state.status in {"active", "paused"})
                 existing_goal = state.goal if state else ""
                 if has_existing and not replace_existing:
@@ -328,6 +351,14 @@ def set_goal_tool(
                     )
                 change = {"kind": "goal_cleared", "previous_goal": previous_goal}
             elif normalized_action == "wait":
+                if delegation_id:
+                    state = manager.wait_on_delegation(delegation_id, reason=reason)
+                    change = {"kind": "goal_parked", "delegation": delegation_id, "reason": (reason or "").strip()}
+                    expected_persisted_json = state.to_json()
+                    persisted = manager.refresh()
+                    if persisted is None or persisted.to_json() != expected_persisted_json:
+                        return _failure("goal_persistence_failed", "Delegation wait was not confirmed by persistent readback")
+                    return _success("wait", state=persisted, change=change)
                 try:
                     wait_pid = _normalize_positive_int(pid, "pid")
                 except ValueError as exc:
@@ -537,10 +568,19 @@ SET_GOAL_SCHEMA = {
                 "default": False,
                 "description": "Deliberately replace active/paused tracking only when all unfinished user-required work remains covered. Prefer edit.",
             },
+            "resume": {
+                "type": "boolean",
+                "default": False,
+                "description": "For edit only: atomically activate the edited objective and clear its obsolete wait. A user-issued stop still requires current user direction.",
+            },
             "pid": {
                 "type": "integer",
                 "minimum": 1,
                 "description": "Process ID for wait.",
+            },
+            "delegation_id": {
+                "type": "string",
+                "description": "Typed background delegation dependency for wait; do not infer it from prose.",
             },
             "reason": {"type": "string", "description": "Optional pause/wait reason."},
             "text": {
@@ -583,7 +623,9 @@ registry.register(
         max_turns=args.get("max_turns"),
         contract=args.get("contract"),
         replace_existing=bool(args.get("replace_existing", False)),
+        resume=bool(args.get("resume", False)),
         pid=args.get("pid"),
+        delegation_id=args.get("delegation_id", ""),
         reason=args.get("reason", ""),
         text=args.get("text", ""),
         index=args.get("index"),

@@ -443,6 +443,10 @@ def _protect_rich_currency(text: str) -> str:
 # clickable; anything else (a bare title, an ``@session:`` reference) shows raw ``[label](target)``
 # syntax to the user (#97497). Code spans/blocks and pipe tables are left verbatim.
 _MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)')
+# Grounded citations deliberately carry an *extra* authored bracket pair:
+# ``[[1](https://source)]``. That syntax, not a numeric link label by itself,
+# identifies a citation marker at the Telegram presentation boundary.
+_EXPLICIT_NUMERIC_CITATION_RE = re.compile(r'\[\[(\d+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)\]')
 _SUPPORTED_LINK_TARGET_RE = re.compile(r'(?i)^(?:https?://|tg://)\S+$')
 # Regions where link syntax is literal content: inline code spans (any backtick run, multi-line included),
 # every rich structural region, and indented code blocks.
@@ -471,24 +475,33 @@ def _degrade_unsupported_markdown_links(text: str) -> str:
     if '[' not in text:
         return text
 
+    def _degrade_citation(m):
+        display, target = m.group(1), m.group(2)
+        if not _tg_link_target_supported(target):
+            return f'[{display}]'
+        return f'[\\[{display}\\]]({target})'
+
     def _degrade(m):
         display, target = m.group(1), m.group(2)
         if not _tg_link_target_supported(target):
             return display
-        # Markdown consumes the authored brackets in ``[3](url)`` and would otherwise show only a
-        # bare linked ``3``. Numeric link labels are citation markers, so keep the complete ``[3]``
-        # marker visible and clickable in Telegram's rich Markdown parser.
-        if re.fullmatch(r'\d+', display):
-            return f'[\\[{display}\\]]({target})'
         return m.group(0)
+
+    def _degrade_segment(segment: str) -> str:
+        # Consume the outer authored brackets first. A normal numeric markdown
+        # link may be a commit, PR, or other ordinary reference, so leave it alone.
+        return _MD_LINK_RE.sub(
+            _degrade,
+            _EXPLICIT_NUMERIC_CITATION_RE.sub(_degrade_citation, segment),
+        )
 
     out: list[str] = []
     pos = 0
     for m in _LINK_SCRUB_PROTECT_RE.finditer(text):
-        out.append(_MD_LINK_RE.sub(_degrade, text[pos : m.start()]))
+        out.append(_degrade_segment(text[pos : m.start()]))
         out.append(m.group(0))  # protected region kept verbatim
         pos = m.end()
-    out.append(_MD_LINK_RE.sub(_degrade, text[pos:]))
+    out.append(_degrade_segment(text[pos:]))
     return ''.join(out)
 
 
@@ -1976,9 +1989,11 @@ class TelegramAdapter(BasePlatformAdapter):
         LaTeX, and unsupported link targets (schemeless destinations, ``@session:`` references) are
         degraded to their display text so raw ``[label](target)`` syntax never reaches the user (#97497).
         """
+        from .rich_markdown import escape_literal_hash_prefixes
+
         payload: Dict[str, Any] = {
             "markdown": _degrade_unsupported_markdown_links(
-                _rich_normalize_linebreaks(_protect_rich_currency(content))
+                _rich_normalize_linebreaks(_protect_rich_currency(escape_literal_hash_prefixes(content)))
             )
         }
         if skip_entity_detection:
@@ -5945,21 +5960,26 @@ class TelegramAdapter(BasePlatformAdapter):
         text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _protect_fenced, text)
         # 2) Protect inline code (`...` or a matching multi-backtick span); escape \ per MarkdownV2 spec.
         text = _INLINE_CODE_SPAN_RE.sub(lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
-        # 3) Links: escape display text; inside the URL only ')' and '\' need escaping. Targets Telegram
+        # 3) Explicit citations and links: escape display text; inside the URL only ')' and '\\' need escaping. Targets Telegram
         # cannot render (schemeless destinations, @session: references) degrade to the escaped display text
         # so the raw bracket syntax is never exposed (#97497).
+        def _convert_explicit_citation(m):
+            display, target = m.group(1), m.group(2)
+            visible_marker = f'\\[{_escape_mdv2(display)}\\]'
+            if not _tg_link_target_supported(target):
+                return _ph(visible_marker)
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[{visible_marker}]({url})')
+
         def _convert_link(m):
             authored_display = m.group(1)
             display = _escape_mdv2(authored_display)
             if not _tg_link_target_supported(m.group(2)):
                 return _ph(display)
-            # Telegram renders the label, not the source delimiters: keep both brackets of a numeric
-            # citation label instead of exposing a bare linked number.
-            if re.fullmatch(r'\d+', authored_display):
-                display = f'\\[{display}\\]'
             url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
+        text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_explicit_citation, text)
         text = _MD_LINK_RE.sub(_convert_link, text)
         # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
         def _convert_header(m):

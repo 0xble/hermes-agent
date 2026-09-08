@@ -57,11 +57,18 @@ class TestLegacyMarkdownV2LinkDegrade:
         result = self._adapter().format_message("See [Docs](https://example.com/x).")
         assert "[Docs](https://example.com/x)" in result
 
-    def test_numeric_https_link_keeps_complete_citation_marker_visible(self):
+    def test_explicitly_bracketed_numeric_citation_keeps_complete_marker_clickable(self):
         result = self._adapter().format_message(
-            "A grounded claim.[3](https://example.com/source)"
+            "A grounded claim.[[3](https://example.com/source)]"
         )
         assert r"[\[3\]](https://example.com/source)" in result
+
+    def test_ordinary_numeric_commit_label_stays_an_ordinary_link(self):
+        result = self._adapter().format_message(
+            "Built from [1234567](https://github.com/acme/project/commit/1234567)."
+        )
+        assert r"[1234567](https://github.com/acme/project/commit/1234567)" in result
+        assert r"[\[1234567\]]" not in result
 
     def test_numeric_link_inside_multi_backtick_code_stays_literal(self):
         text = "``x ` y [3](https://example.com/source)``"
@@ -97,11 +104,18 @@ class TestRichMessageLinkDegrade:
         md = self._payload_markdown("See [Docs](https://example.com/x).")
         assert "[Docs](https://example.com/x)" in md
 
-    def test_numeric_https_link_keeps_complete_citation_marker_visible(self):
+    def test_explicitly_bracketed_numeric_citation_keeps_complete_marker_clickable(self):
         md = self._payload_markdown(
-            "A grounded claim.[3](https://example.com/source)"
+            "A grounded claim.[[3](https://example.com/source)]"
         )
         assert r"A grounded claim.[\[3\]](https://example.com/source)" in md
+
+    def test_ordinary_numeric_pr_label_stays_an_ordinary_link(self):
+        md = self._payload_markdown(
+            "Reviewed in [97](https://github.com/acme/project/pull/97)."
+        )
+        assert r"[97](https://github.com/acme/project/pull/97)" in md
+        assert r"[\[97\]]" not in md
 
 
 class TestDegradeHelper:
@@ -109,6 +123,15 @@ class TestDegradeHelper:
 
     def test_text_without_brackets_untouched(self):
         assert _degrade_unsupported_markdown_links("plain text") == "plain text"
+
+    def test_explicitly_bracketed_numeric_citation_becomes_one_clickable_marker(self):
+        assert _degrade_unsupported_markdown_links(
+            "[[1](https://example.com/source)]"
+        ) == r"[\[1\]](https://example.com/source)"
+
+    def test_ordinary_numeric_link_does_not_become_a_citation_marker(self):
+        text = "[1234567](https://github.com/acme/project/commit/1234567)"
+        assert _degrade_unsupported_markdown_links(text) == text
 
     def test_empty_target_degrades(self):
         assert _degrade_unsupported_markdown_links("see [x]()") == "see x"

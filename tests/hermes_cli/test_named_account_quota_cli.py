@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 import pytest
+from hermes_cli.auth_commands import auth_refresh_command
 from hermes_cli.auth_quota import probe_quota, run_status, run_refresh
 from agent.credential_pool import PooledCredential, CredentialPool
 
@@ -173,6 +174,47 @@ def test_none_not_reauth(monkeypatch, tmp_path, capsys):
     with pytest.raises(SystemExit):
         run_refresh(args())
     assert json.loads(capsys.readouterr().out)["outcome"] == "refresh_failed"
+
+
+def test_nous_non_device_code_refresh_is_unsupported_without_refresh(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "nous": [
+                        PooledCredential.from_dict(
+                            "nous",
+                            {
+                                "id": "nous-manual",
+                                "label": "manual",
+                                "auth_type": "oauth",
+                                "source": "manual",
+                                "access_token": "fake-access",
+                                "refresh_token": "fake-refresh",
+                            },
+                        ).to_dict()
+                    ]
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth_quota._refresh_selected",
+        lambda *args, **kwargs: pytest.fail("unsupported Nous credential must not refresh"),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        auth_refresh_command(args(provider="nous", target="nous-manual", verify=True))
+
+    report = json.loads(capsys.readouterr().out)
+    assert excinfo.value.code == 2
+    assert report["outcome"] == "unsupported"
+    assert report["provider"] == "nous"
+    assert report["credential"]["id"] == "nous-manual"
 
 
 @pytest.mark.parametrize("verify", [True, False])

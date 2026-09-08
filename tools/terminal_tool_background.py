@@ -130,7 +130,7 @@ def spawn_background_process(
     *, command: str, env: Any, env_type: str, effective_task_id: str, task_id: Optional[str],
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
     notify_on_complete: bool, watch_patterns: Optional[List[str]], approval_note: Optional[str],
-    pty_disabled_reason: Optional[str],
+    pty_disabled_reason: Optional[str], timeout: Optional[int] = None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -180,6 +180,10 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
+        if timeout is not None:
+            process_registry.set_deadline(proc_session.id, timeout)
+            result_data["deadline_at"] = proc_session.deadline_at
+            result_data["timeout_seconds"] = timeout
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({

@@ -203,6 +203,43 @@ def test_explicit_administrative_subject_exemption_is_accepted(tmp_path):
     ) == []
 
 
+@pytest.mark.parametrize(
+    ("registered", "observed", "accepted"),
+    [
+        ("fix: one", "fix: one (#42)", True),
+        ("fix: one (#41)", "fix: one (#41) (#42)", True),
+        ("fix: one (#41)", "fix: one (#42)", False),
+        ("fix: one", "fix: one (#0)", False),
+        ("fix: one", "fix: one (#01)", False),
+        ("fix: one", "fix: one(#42)", False),
+        ("fix: one", "fix: one (#abc)", False),
+        ("fix: one", "fix: one (#42) extra", False),
+    ],
+)
+def test_fork_coverage_treats_only_one_github_suffix_as_delivery_metadata(
+    tmp_path, registered, observed, accepted
+):
+    path = _write(
+        tmp_path,
+        INDEX.replace("`fix: one`", f"`{registered}`")
+        + """
+### HERMES-001 — One
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+### HERMES-002 — Two
+- **Upstream tracking:** None.
+- **Upstream PR:** None.
+""",
+    )
+
+    errors = validate_manifest(
+        path,
+        fork_subjects={observed, "fix: two", "docs: retire two"},
+    )
+
+    assert (errors == []) is accepted
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", *args],
@@ -273,6 +310,92 @@ def test_history_validation_accepts_same_commit_registration(tmp_path):
     _git(repo, "commit", "-m", "fix: registered")
 
     assert validate_manifest(manifest, history_baseline=baseline) == []
+
+
+def test_history_validation_accepts_registered_github_merge_wrapper(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", "`fix: one`; `fix: registered`"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "MAINTENANCE.md", "feature.py")
+    _git(repo, "commit", "-m", "fix: registered")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "--hard", baseline)
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        feature,
+        "-m",
+        "Merge pull request #91 from 0xble/registered",
+        "-m",
+        "fix: registered",
+    )
+
+    assert validate_manifest(manifest, history_baseline=baseline) == []
+
+
+def test_history_validation_rejects_unregistered_github_merge_wrapper(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-m", "fix: orphan")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "--hard", baseline)
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        feature,
+        "-m",
+        "Merge pull request #91 from 0xble/orphan",
+        "-m",
+        "fix: orphan",
+    )
+
+    errors = validate_manifest(manifest, history_baseline=baseline)
+
+    assert any(
+        "fork subject was not registered in its own commit" in error
+        and "Merge pull request #91 from 0xble/orphan" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("registered", "observed", "accepted"),
+    [
+        ("fix: registered", "fix: registered (#42)", True),
+        ("fix: registered (#41)", "fix: registered (#41) (#42)", True),
+        ("fix: registered (#41)", "fix: registered (#42)", False),
+        ("fix: registered", "fix: registered (#0)", False),
+        ("fix: registered", "fix: registered (#01)", False),
+        ("fix: registered", "fix: registered(#42)", False),
+        ("fix: registered", "fix: registered (#abc)", False),
+        ("fix: registered", "fix: registered (#42) extra", False),
+    ],
+)
+def test_history_treats_only_one_github_suffix_as_delivery_metadata(
+    tmp_path, registered, observed, accepted
+):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", f"`fix: one`; `{registered}`"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "MAINTENANCE.md", "feature.py")
+    _git(repo, "commit", "-m", observed)
+
+    errors = validate_manifest(manifest, history_baseline=baseline)
+
+    assert (errors == []) is accepted
 
 
 def test_trusted_policy_validates_immutable_pull_request_head():
