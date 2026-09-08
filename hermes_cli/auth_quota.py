@@ -264,13 +264,19 @@ def run_refresh(args):
         args.provider not in REFRESHABLE_OAUTH_PROVIDERS
         or chosen.auth_type != AUTH_TYPE_OAUTH
         or not chosen.refresh_token
+        # Nous's resolver is singleton-bound, not an independent-account refresher.
+        or (args.provider == "nous" and chosen.source != "device_code")
     ):
         _emit(
             args,
             {
                 **report,
                 "outcome": "unsupported",
-                "error": "Credential has no supported refresh grant.",
+                "error": (
+                    "Nous refresh supports only the device_code singleton."
+                    if args.provider == "nous" and chosen.source != "device_code"
+                    else "Credential has no supported refresh grant."
+                ),
             },
             2,
         )
