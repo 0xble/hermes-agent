@@ -316,7 +316,14 @@ class CLIChatTurnMixin:
                 goal_user_request_scope(self.session_id or "default", "")
                 if internal_goal_continuation else nullcontext()
             )
-            with authority_scope:
+            from hermes_cli.session_model import session_model_scope
+            from hermes_cli.session_model_cli import apply_session_model
+            _model_agent = self.agent
+            with authority_scope, session_model_scope(
+                _model_agent, lambda selection: apply_session_model(self, _model_agent, selection),
+                history=self.conversation_history,
+                allowed=not internal_goal_continuation and _moa_cfg is None and not _one_turn_model_restore,
+            ) as model_control:
                 turn.result = self.agent.run_conversation(
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],  # exclude the message just staged
@@ -324,6 +331,7 @@ class CLIChatTurnMixin:
                     persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
                     **({"turn_reasoning_config": _turn_reasoning_config} if _turn_reasoning_config is not None else {}),
                 )
+                turn.result = model_control.finish(turn.result)
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                 for _key, _value in _restore.items():

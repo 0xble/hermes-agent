@@ -1766,7 +1766,22 @@ class TurnRunner:
             # turn so a restart-interrupted turn is recorded WITH its id for drain-window dedup.
             if ctx.inbound_message_id is not None:
                 kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
-            return agent.run_conversation(api_message, **kwargs)
+            from hermes_cli.session_model import session_model_scope
+            from gateway.session_model import apply_session_model
+
+            def apply_selection(selection):
+                future = asyncio.run_coroutine_threadsafe(
+                    apply_session_model(self._runner, agent, ctx.source, session_key, selection),
+                    ctx._loop_for_step,
+                )
+                future.result()
+
+            with session_model_scope(
+                agent, apply_selection, history=agent_history,
+                allowed=(not ctx.persist_user_display_kind and ctx.moa_config is None
+                         and session_key not in getattr(self._runner, "_pending_one_turn_model_restores", {})),
+            ) as control:
+                return control.finish(agent.run_conversation(api_message, **kwargs))
         finally:
             unregister_gateway_notify(session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the

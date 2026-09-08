@@ -148,6 +148,8 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-126 | Active | `fix(review): honor configured fallback routes` | Carry review-owned ordered recovery routes through delegation while preserving ordinary parent fallback inheritance. |
 | HERMES-128 | Active | `fix(telegram): scope citation brackets to explicit markers` | Preserve visible clickable explicitly bracketed citations without converting ordinary numeric commit or PR links into citation markers. |
 
+| HERMES-129 | Active | `feat(session): add explicit model and reasoning tool` | Optional session-only model/reasoning tool using native frontend controls. |
+
 ## Fork-only administrative subject exemptions
 
 These exact subjects are fork-only history but do not define independently retireable product behavior. The validator requires every other fork-only subject to appear in a patch-index row.
@@ -266,6 +268,16 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-129: Explicit session model controls
+
+- **Upstream tracking:** https://github.com/NousResearch/hermes-agent/issues/16525. Prior implementation PRs 43145 and 43153 were closed unmerged at inspection. Retire this patch when a released native agent-callable operation satisfies the contract.
+- **Upstream PR:** None submitted for this implementation. Closed predecessors: https://github.com/NousResearch/hermes-agent/pull/43145 and https://github.com/NousResearch/hermes-agent/pull/43153.
+- **Contract:** One optional `session_model` plugin tool changes model/provider/reasoning only on explicit user direction, with session ownership enforced by the runtime and intent constrained by tool instructions. Combined validation, end-of-turn application, native context/provider handling, rollback, session persistence, and truthful queued/applied/failed receipts. No autonomous routing or global changes.
+- **Source:** `plugins/session-model/`, `hermes_cli/session_model.py`, frontend adapters in `gateway/session_model.py` and `hermes_cli/session_model_cli.py`, the additive PluginContext method, and bounded CLI/gateway turn bindings.
+- **Verification:** `scripts/run_tests.sh -j 2 tests/plugins/test_session_model.py tests/plugins/test_session_model_transport.py`, plus native model persistence, context-switch and inference-control regressions. The transport fixture uses real agent imports and HTTP requests, not paid inference. Runtime promotion is separate.
+- **Rollback:** Revert the commit titled `feat(session): add explicit model and reasoning tool`, including its focused tests and this entry. If later changes share the turn runners or PluginContext, remove only the session-model binding and API after confirming no remaining consumers. Preserve native slash controls.
+- **Retirement:** Remove the plugin, its API/bindings, and duplicate tests when released upstream satisfies the same regressions. Remove enabled-plugin configuration during separately authorized runtime promotion.
 
 ### HERMES-128 — Scope Telegram citation brackets to explicit markers
 

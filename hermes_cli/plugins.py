@@ -243,6 +243,15 @@ class PluginContext:
             logger.warning("Rejected config path %r from plugin %s", key, self.plugin_id)
             raise
 
+    def request_session_model(self, arguments: dict, *, task_id: str | None = None) -> str:
+        """Queue a user-requested model/reasoning change for the current owning turn.
+
+        Session-bound frontend capability. Returns a JSON queued/rejected receipt;
+        unsupported surfaces and child callers cannot mutate the parent session.
+        """
+        from hermes_cli.session_model import request_session_model
+        return request_session_model(arguments, task_id=task_id)
+
     def get_config(self, key: str, default: Any = None) -> Any:
         """Read plugin-relative ``plugins.entries.<plugin_id>.settings.<key>`` (falls back to the
         legacy ``config`` subtree for migration compatibility)."""
