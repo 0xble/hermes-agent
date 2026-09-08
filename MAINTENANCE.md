@@ -4,7 +4,7 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 ## Non-negotiable patch lifecycle
 
-Every Brian-owned core patch must have an active entry in this file **before it is published**. The entry must name its stable commit subject, summarize the behavior, identify upstream tracking, name regression evidence, and give a source-level rollback procedure. A patch is not complete merely because its commit appears in Git history. Retired entries remain in this file as historical lifecycle records even though their private code must be gone.
+This file is a useful inventory of Brian-owned patches and retirement evidence. Keep entries current when practical, but it is advisory: publication, PR validation, promotion, and runtime operation never depend on commit subjects, trailers, or per-commit registration. Retired entries remain as historical lifecycle records even though their private code must be gone.
 
 When official upstream releases behavior that satisfies a patch contract, the private implementation must be **completely retired in favor of upstream**. Do not keep both implementations, a compatibility shim, disabled private code, or duplicate fork-specific tests “just in case.” Inspect the upstream implementation, run this entry's regressions against it, remove the private code, adapt or delete duplicate tests, promote the upstream-backed candidate across every active runtime, and verify the behavior there. Git history is the rollback record.
 
@@ -150,9 +150,9 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | HERMES-129 | Active | `feat(session): add explicit model and reasoning tool`; `fix(session): declare model control tool in plugin metadata` | Optional session-only model/reasoning tool using native frontend controls. |
 
-## Fork-only administrative subject exemptions
+## Historical administrative notes
 
-These exact subjects are fork-only history but do not define independently retireable product behavior. The validator requires every other fork-only subject to appear in a patch-index row.
+These subjects are retained as provenance notes only. They are not validation inputs and never require exceptions, trailers, or history checks.
 
 | Stable commit subject | Narrow non-patch reason |
 | --- | --- |

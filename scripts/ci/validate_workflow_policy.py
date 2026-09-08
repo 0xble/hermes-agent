@@ -2,176 +2,47 @@
 # /// script
 # dependencies = ["PyYAML==6.0.3"]
 # ///
-"""Fail closed on drift in the private mirror's workflow surface."""
+"""Validate candidate GitHub automation without executing candidate code.
+
+This is run by ``fork-policy.yml`` from the immutable default branch.  Candidate
+workflows and composite actions are input data; this validator deliberately has
+no history, manifest, registration, or byte-for-byte workflow-baseline rules.
+"""
 
 from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-import re
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
 
-CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
-CHECKOUT_ACTION_NEXT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-CHECKOUT_ACTION_FAMILY = frozenset({CHECKOUT_ACTION, CHECKOUT_ACTION_NEXT})
-SETUP_UV_ACTION = "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39"
-SETUP_UV_ACTION_NEXT = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
-SETUP_UV_ACTION_FAMILY = frozenset({SETUP_UV_ACTION, SETUP_UV_ACTION_NEXT})
-CACHIX_ACTION_FAMILY = frozenset(
-    {
-        "cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342",
-        "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24",
-    }
-)
-OSV_ACTION_FAMILY = frozenset(
-    {
-        "google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2",
-        "google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67",
-    }
-)
-HADOLINT_ACTION_FAMILY = frozenset(
-    {
-        "hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf",
-        "hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387",
-    }
-)
-TRANSITION_ACTION_FAMILIES = (
-    CHECKOUT_ACTION_FAMILY,
-    SETUP_UV_ACTION_FAMILY,
-    CACHIX_ACTION_FAMILY,
-    OSV_ACTION_FAMILY,
-    HADOLINT_ACTION_FAMILY,
-)
-
-WORKFLOW_TRIGGERS: dict[str, frozenset[str]] = {
-    "case-collision-check.yml": frozenset({"workflow_call"}),
-    "ci.yaml": frozenset({"pull_request", "schedule", "workflow_dispatch"}),
-    "docs-site-checks.yml": frozenset({"workflow_call"}),
-    "docker-lint.yml": frozenset({"workflow_call"}),
-    "e2e-desktop.yml": frozenset({"workflow_call", "workflow_dispatch"}),
-    "fork-policy.yml": frozenset({"pull_request_target"}),
-    "history-check.yml": frozenset({"workflow_call"}),
-    "install-e2e-run.yml": frozenset({"workflow_call"}),
-    "install-e2e.yml": frozenset({"workflow_dispatch"}),
-    "installer-tests.yml": frozenset({"workflow_call"}),
-    "js-tests.yml": frozenset({"workflow_call"}),
-    "lint.yml": frozenset({"workflow_call"}),
-    "lockfile-diff.yml": frozenset({"workflow_call"}),
-    "nix.yml": frozenset({"workflow_dispatch"}),
-    "osv-scanner.yml": frozenset({"schedule", "workflow_call", "workflow_dispatch"}),
-    "profile-artifact-check.yml": frozenset({"workflow_call"}),
-    "rust-tests.yml": frozenset({"workflow_call"}),
-    "supply-chain-audit.yml": frozenset({"workflow_call"}),
-    "tests-os.yml": frozenset({"workflow_call"}),
-    "tests.yml": frozenset({"workflow_call"}),
-    "uv-lockfile-check.yml": frozenset({"workflow_call"}),
-}
-
-# Event names alone are not sufficient policy: branch filters and schedules
-# can silently broaden or narrow when a workflow runs.
-WORKFLOW_TRIGGER_CONFIGS: dict[str, dict[str, Any]] = {
-    "ci.yaml": {
-        "pull_request": {
-            "types": ["opened", "synchronize", "reopened", "ready_for_review", "labeled"]
-        },
-        "workflow_dispatch": "",
-        "schedule": [{"cron": "0 8 * * 1"}],
-    },
-    "fork-policy.yml": {
-        "pull_request_target": {"branches": ["main"]},
-    },
-    "osv-scanner.yml": {
-        "workflow_call": "",
-        "schedule": [{"cron": "0 9 * * 1"}],
-        "workflow_dispatch": "",
-    },
-}
-
-WORKFLOW_PERMISSIONS: dict[str, dict[str, str]] = {
-    name: {"contents": "read"} for name in WORKFLOW_TRIGGERS
-}
-# Artifact download in the scheduled OSV workflow needs Actions read access.
-WORKFLOW_PERMISSIONS["osv-scanner.yml"] = {"actions": "read", "contents": "read"}
-# Reusable workflows cannot elevate permissions beyond their caller.
-WORKFLOW_PERMISSIONS["ci.yaml"] = {"actions": "read", "contents": "read"}
-
-FORBIDDEN_WORKFLOWS = frozenset(
-    {
-        "ci-review-comment.yml",
-        "contributor-check.yml",
-        "deploy-site.yml",
-        "docker.yml",
-        "infographic-check.yml",
-        "js-autofix.yml",
-        "label-rerun.yml",
-        "publish-e2e-evidence.yml",
-        "review-labels.yml",
-        "skills-index-freshness.yml",
-        "skills-index.yml",
-        "windows-venv-e2e.yml",
-    }
-)
-
 STANDARD_RUNNERS = frozenset({"ubuntu-latest", "windows-latest", "macos-latest"})
-# This is the only dynamic runs-on expression. Both the expression and matrix
-# values are checked so no other expression can select a runner.
-DYNAMIC_RUNNER_ALLOWLIST = {
-    "tests-os.yml": {
-        "expression": "${{ matrix.runner }}",
-        "runners": ("macos-latest", "windows-latest"),
-    },
-}
-
-# Every current step action and job-level reusable workflow is listed exactly.
-# A new reference, including a new local reference, requires a trusted policy
-# update before it can pass.
-STEP_ACTION_ALLOWLIST = frozenset(
-    {
-        "./.github/actions/detect-changes",
-        "./.github/actions/retry",
-        "actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809",
-        "actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809",
-        *CHECKOUT_ACTION_FAMILY,
-        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
-        "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
-        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        *SETUP_UV_ACTION_FAMILY,
-        *CACHIX_ACTION_FAMILY,
-        *OSV_ACTION_FAMILY,
-        *HADOLINT_ACTION_FAMILY,
-        "ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38",
-        "nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569",
-    }
+SHA_PIN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+SECRET_EXPR = re.compile(r"\$\{\{[^}]*\bsecrets\b[^}]*\}\}", re.IGNORECASE)
+PUBLISH_COMMAND = re.compile(
+    r"(?:\b(?:npm|pnpm|yarn)\b[^\n;&|]*\bpublish\b|"
+    r"\bdocker\b[^\n;&|]*\bpush\b|"
+    r"\bcargo\b[^\n;&|]*\bpublish\b|"
+    r"\bgh\b[^\n;&|]*\brelease\b[^\n;&|]*\b(?:create|upload)\b|"
+    r"\btwine\b[^\n;&|]*\bupload\b|"
+    r"\b(?:vercel|railway)\b[^\n;&|]*\b(?:deploy|up)\b)",
+    re.IGNORECASE,
 )
-JOB_REUSABLE_WORKFLOW_ALLOWLIST = frozenset(
-    {
-        "./.github/workflows/docker-lint.yml",
-        "./.github/workflows/docs-site-checks.yml",
-        "./.github/workflows/history-check.yml",
-        "./.github/workflows/install-e2e-run.yml",
-        "./.github/workflows/installer-tests.yml",
-        "./.github/workflows/js-tests.yml",
-        "./.github/workflows/lint.yml",
-        "./.github/workflows/lockfile-diff.yml",
-        "./.github/workflows/osv-scanner.yml",
-
-        "./.github/workflows/rust-tests.yml",
-        "./.github/workflows/supply-chain-audit.yml",
-        "./.github/workflows/tests-os.yml",
-        "./.github/workflows/tests.yml",
-        "./.github/workflows/uv-lockfile-check.yml",
-    }
+PUBLISH_NAME = re.compile(r"\b(?:deploy|publish)\b", re.IGNORECASE)
+TRUSTED_VALIDATOR_INVOCATION = (
+    "trusted-policy/scripts/ci/validate_workflow_policy.py "
+    "--root candidate --trusted-root trusted-policy"
 )
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+SETUP_UV_ACTION = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
 
-# The privileged event workflow is deliberately exact, not merely constrained.
-# It can only run trusted default-branch validators against an immutable
-# candidate checkout treated as data.
-FORK_POLICY_WORKFLOW: dict[str, Any] = {
-    "name": "Trusted fork policy",
+# Names are presentation, but all executable semantics in this privileged job
+# are closed over. In particular, only immutable event SHAs select code, the
+# candidate is data, and the security validator cannot be skipped.
+PRIVILEGED_POLICY_CONTRACT: dict[str, Any] = {
     "on": {"pull_request_target": {"branches": ["main"]}},
     "permissions": {"contents": "read"},
     "concurrency": {
@@ -180,580 +51,326 @@ FORK_POLICY_WORKFLOW: dict[str, Any] = {
     },
     "jobs": {
         "policy": {
-            "name": "Validate candidate with trusted policy",
             "runs-on": "ubuntu-latest",
             "timeout-minutes": "5",
             "steps": [
                 {
-                    "name": "Checkout trusted default-branch policy",
                     "uses": CHECKOUT_ACTION,
                     "with": {
-                        "ref": "${{ github.event.repository.default_branch }}",
+                        "ref": "${{ github.event.pull_request.base.sha }}",
                         "path": "trusted-policy",
                         "persist-credentials": "false",
                     },
                 },
                 {
-                    "name": "Checkout immutable candidate as data",
                     "uses": CHECKOUT_ACTION,
                     "with": {
                         "repository": "${{ github.event.pull_request.head.repo.full_name }}",
                         "ref": "${{ github.event.pull_request.head.sha }}",
                         "path": "candidate",
-                        "fetch-depth": "0",
                         "persist-credentials": "false",
+                        "allow-unsafe-pr-checkout": "true",
                     },
                 },
                 {
-                    "name": "Checkout canonical upstream history",
-                    "uses": CHECKOUT_ACTION,
-                    "with": {
-                        "repository": "NousResearch/hermes-agent",
-                        "ref": "main",
-                        "path": "canonical-upstream",
-                        "fetch-depth": "0",
-                        "persist-credentials": "false",
-                    },
-                },
-                {
-                    "name": "Fetch canonical upstream history into candidate checkout",
-                    "run": (
-                        "git -C candidate fetch --no-tags ../canonical-upstream "
-                        "HEAD:refs/remotes/canonical-upstream/main"
-                    ),
-                },
-                {
-                    "name": "Validate maintained patch history with trusted code",
+                    "continue-on-error": "true",
                     "run": (
                         "python3 trusted-policy/scripts/validate_maintenance_manifest.py "
-                        "candidate/MAINTENANCE.md --upstream-ref canonical-upstream/main "
-                        "--history-baseline "
-                        "f66e6d2e504d0d5448bbe227c1766a8bf44a841b"
+                        "candidate/MAINTENANCE.md --json"
                     ),
                 },
                 {
-                    "name": "Install pinned uv for trusted workflow policy",
                     "uses": SETUP_UV_ACTION,
                     "with": {"version": "0.9.28"},
                 },
-                {
-                    "name": "Validate candidate workflow surface with trusted code",
-                    "run": (
-                        "uv run --script "
-                        "trusted-policy/scripts/ci/validate_workflow_policy.py "
-                        "--root candidate --trusted-root trusted-policy"
-                    ),
-                },
+                {"run": f"uv run --script {TRUSTED_VALIDATOR_INVOCATION}"},
             ],
         }
     },
 }
-def _fork_policy_variant(checkout_action: str, setup_uv_action: str) -> dict[str, Any]:
-    policy = deepcopy(FORK_POLICY_WORKFLOW)
-    steps = policy["jobs"]["policy"]["steps"]
-    steps[0]["uses"] = checkout_action
-    steps[1]["uses"] = checkout_action
-    steps[2]["uses"] = checkout_action
-    if checkout_action == CHECKOUT_ACTION_NEXT:
-        steps[1]["with"]["allow-unsafe-pr-checkout"] = "true"
-    steps[5]["uses"] = setup_uv_action
-    return policy
-
-
-FORK_POLICY_WORKFLOWS = tuple(
-    _fork_policy_variant(checkout_action, setup_uv_action)
-    for checkout_action in CHECKOUT_ACTION_FAMILY
-    for setup_uv_action in SETUP_UV_ACTION_FAMILY
-)
-
-# Match publication commands even when global options or a Rust toolchain pin
-# appear between the executable and subcommand. Escaped newlines are folded
-# before matching; unescaped shell separators stop a match.
-PUBLISH_COMMAND = re.compile(
-    r"(?:"
-    r"\b(?:npm|pnpm|yarn)\b[^\n;&|]*\bpublish\b|"
-    r"\bdocker\b[^\n;&|]*\bpush\b|"
-    r"\bcargo\b[^\n;&|]*\bpublish\b|"
-    r"\bgh\b[^\n;&|]*\brelease\b[^\n;&|]*\b(?:create|upload)\b|"
-    r"\btwine\b[^\n;&|]*\bupload\b|"
-    r"\b(?:vercel|railway)\b[^\n;&|]*\b(?:deploy|up)\b"
-    r")",
-    re.IGNORECASE,
-)
-PUBLISH_NAME = re.compile(r"\b(?:deploy|publish)\b", re.IGNORECASE)
-SECRET_EXPR = re.compile(r"\$\{\{[^}]*\bsecrets\b[^}]*\}\}", re.IGNORECASE)
 
 
 def _load(path: Path) -> dict[str, Any]:
     try:
-        # BaseLoader keeps GitHub's `on` key as a string (YAML 1.2 semantics)
-        # while resolving lists, maps, anchors, and aliases.
         data = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     except yaml.YAMLError as exc:
         raise ValueError(f"{path.name}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):
-        raise ValueError(f"{path.name}: workflow root must be a mapping")
+        raise ValueError(f"{path.name}: root must be a mapping")
     return data
 
 
-def _triggers(data: dict[str, Any], path: Path) -> frozenset[str]:
-    value = data.get("on")
-    if isinstance(value, dict):
-        found = frozenset(str(key) for key in value)
-    elif isinstance(value, list):
-        found = frozenset(str(item) for item in value)
-    elif isinstance(value, str):
-        found = frozenset({value})
-    else:
-        raise ValueError(f"{path.name}: 'on' must be a trigger string, list, or mapping")
-    if not found:
-        raise ValueError(f"{path.name}: no workflow triggers found")
-    return found
+def _workflow_paths(root: Path) -> list[Path]:
+    github = root / ".github"
+    directory = github / "workflows"
+    if github.is_symlink() or not github.is_dir():
+        raise ValueError(".github must be a real directory")
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("workflow directory must be a real directory")
+    paths = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{path.name}: workflow files must be regular files")
+    return paths
 
 
-def _validate_permissions(
-    node: Any,
-    location: str,
-    errors: list[str],
-    allowed: dict[str, str],
-) -> None:
-    if isinstance(node, str):
-        errors.append(f"{location}: permissions must be an explicit read-only mapping")
-        return
-    if not isinstance(node, dict):
-        errors.append(f"{location}: permissions must be a read-only mapping")
-        return
-    for scope, access in node.items():
-        scope_text = str(scope)
-        if scope_text not in allowed:
-            errors.append(f"{location}.{scope_text}: permission scope is not allowed")
-        elif str(access) != allowed[scope_text]:
-            errors.append(f"{location}.{scope}: permission {access!r} is forbidden")
+def _required_ci_gate(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the small immutable correctness-gate surface, excluding labels."""
+    jobs = data.get("jobs")
+    selected = {
+        name: jobs.get(name) if isinstance(jobs, dict) else None
+        for name in ("smoke", "result")
+    }
+    return _without_cosmetic_names({"on": data.get("on"), "jobs": selected})
 
 
-def _validate_security(
-    node: Any,
-    location: str,
-    errors: list[str],
-    allowed_permissions: dict[str, str],
-) -> None:
+def _permission_errors(value: Any, location: str) -> list[str]:
+    if not isinstance(value, dict) or not value:
+        return [f"{location}: permissions must be an explicit read-only mapping"]
+    errors: list[str] = []
+    for scope, access in value.items():
+        if str(access) != "read":
+            errors.append(f"{location}.{scope}: {access!r} permission is forbidden")
+    return errors
+
+
+def _validate_value(node: Any, location: str, errors: list[str]) -> None:
     if isinstance(node, dict):
         for key, value in node.items():
-            key_text = str(key)
-            child = f"{location}.{key_text}"
-            if key_text == "permissions":
-                _validate_permissions(value, child, errors, allowed_permissions)
-            elif key_text in {"secrets", "environment"}:
+            child = f"{location}.{key}"
+            if key == "permissions":
+                errors.extend(_permission_errors(value, child))
+            elif key in {"secrets", "environment"}:
                 errors.append(f"{child}: secrets and deployment environments are forbidden")
-            _validate_security(value, child, errors, allowed_permissions)
+            _validate_value(value, child, errors)
     elif isinstance(node, list):
         for index, value in enumerate(node):
-            _validate_security(value, f"{location}[{index}]", errors, allowed_permissions)
+            _validate_value(value, f"{location}[{index}]", errors)
     elif isinstance(node, str) and SECRET_EXPR.search(node):
         errors.append(f"{location}: secret references are forbidden")
 
 
-def _contains_publish_command(run: str) -> bool:
-    return bool(PUBLISH_COMMAND.search(run.replace("\\\n", " ")))
-
-
-def _validate_steps(data: dict[str, Any], name: str, errors: list[str]) -> None:
-    jobs = data.get("jobs")
-    if not isinstance(jobs, dict):
-        errors.append(f"{name}: jobs must be a mapping")
+def _validate_uses(
+    value: Any,
+    location: str,
+    root: Path,
+    errors: list[str],
+    trusted_actions: frozenset[str],
+    *,
+    reusable: bool = False,
+) -> None:
+    uses = str(value)
+    if uses.startswith("./"):
+        allowed = "./.github/workflows/" if reusable else "./.github/actions/"
+        allowed_root = root / allowed[2:-1]
+        local = root / uses[2:]
+        expected_file = reusable
+        valid = local.is_file() if expected_file else local.is_dir()
+        try:
+            resolved_allowed = allowed_root.resolve(strict=True)
+            resolved_local = local.resolve(strict=True)
+            resolved_local.relative_to(resolved_allowed)
+            resolved_local.relative_to(root.resolve(strict=True))
+            lexical = Path(uses[2:])
+            if ".." in lexical.parts:
+                raise ValueError("local reference traverses its trusted root")
+            cursor = root
+            has_symlink = False
+            for part in lexical.parts:
+                cursor /= part
+                if cursor.is_symlink():
+                    has_symlink = True
+                    break
+        except (FileNotFoundError, RuntimeError, ValueError):
+            has_symlink = True
+        if not uses.startswith(allowed) or not valid or has_symlink:
+            kind = "workflow file" if reusable else "action directory"
+            errors.append(f"{location}: local {kind} must be real and under {allowed}")
         return
-    for job_name, job in jobs.items():
-        if not isinstance(job, dict):
-            continue
-        job_uses = job.get("uses")
-        if job_uses is not None and str(job_uses) not in JOB_REUSABLE_WORKFLOW_ALLOWLIST:
-            errors.append(
-                f"{name}.jobs.{job_name}.uses: unapproved reusable workflow reference "
-                f"{job_uses!r}"
-            )
-        steps = job.get("steps", [])
-        if not isinstance(steps, list):
-            errors.append(f"{name}.jobs.{job_name}.steps: must be a list")
-            continue
-        for index, step in enumerate(steps):
-            if not isinstance(step, dict):
-                continue
-            location = f"{name}.jobs.{job_name}.steps[{index}]"
-            uses = step.get("uses")
-            if uses is not None and str(uses) not in STEP_ACTION_ALLOWLIST:
-                errors.append(f"{location}.uses: unapproved action reference {uses!r}")
-            run = str(step.get("run", ""))
-            step_name = str(step.get("name", ""))
-            if _contains_publish_command(run) or PUBLISH_NAME.search(step_name):
-                errors.append(f"{location}: deployment/publish step is forbidden")
-
-
-def _references(data: dict[str, Any]) -> tuple[set[str], set[str]]:
-    step_actions: set[str] = set()
-    reusable_workflows: set[str] = set()
-    jobs = data.get("jobs", {})
-    if not isinstance(jobs, dict):
-        return step_actions, reusable_workflows
-    for job in jobs.values():
-        if not isinstance(job, dict):
-            continue
-        if "uses" in job:
-            reusable_workflows.add(str(job["uses"]))
-        steps = job.get("steps", [])
-        if not isinstance(steps, list):
-            continue
-        for step in steps:
-            if isinstance(step, dict) and "uses" in step:
-                step_actions.add(str(step["uses"]))
-    return step_actions, reusable_workflows
-
-
-def _validate_runners(data: dict[str, Any], name: str, errors: list[str]) -> None:
-    jobs = data.get("jobs")
-    if not isinstance(jobs, dict):
+    if "@" not in uses:
+        errors.append(f"{location}: external actions must be pinned to a full commit SHA")
         return
-    for job_name, job in jobs.items():
-        if not isinstance(job, dict) or "runs-on" not in job:
-            continue
-        runner = job["runs-on"]
-        location = f"{name}.jobs.{job_name}.runs-on"
-        if isinstance(runner, str) and runner in STANDARD_RUNNERS:
-            continue
-        dynamic_policy = DYNAMIC_RUNNER_ALLOWLIST.get(name)
-        if dynamic_policy is not None and isinstance(runner, str):
-            strategy = job.get("strategy")
-            matrix = strategy.get("matrix") if isinstance(strategy, dict) else None
-            includes = matrix.get("include") if isinstance(matrix, dict) else None
-            if (
-                runner == dynamic_policy["expression"]
-                and set(matrix or {}) == {"include"}
-                and isinstance(includes, list)
-                and all(
-                    isinstance(item, dict) and isinstance(item.get("runner"), str)
-                    for item in includes
-                )
-                and tuple(item["runner"] for item in includes)
-                == dynamic_policy["runners"]
-            ):
-                continue
-        errors.append(f"{location}: nonstandard runner {runner!r} is forbidden")
+    _owner, revision = uses.rsplit("@", 1)
+    if not SHA_PIN.fullmatch(revision):
+        errors.append(f"{location}: external actions must be pinned to a full commit SHA")
+    elif uses not in trusted_actions:
+        errors.append(f"{location}: external actions must be approved by the trusted base policy")
 
 
-def _validate_ci_budget(data: dict[str, Any], errors: list[str]) -> None:
-    """Keep automatic fork CI bounded while preserving explicit full lanes."""
-    jobs = data.get("jobs")
-    if not isinstance(jobs, dict):
+def _validate_job(
+    job: dict[str, Any], location: str, root: Path, errors: list[str], trusted_actions: frozenset[str]
+) -> None:
+    if "permissions" in job:
+        errors.extend(_permission_errors(job["permissions"], f"{location}.permissions"))
+    if "uses" in job:
+        _validate_uses(job["uses"], f"{location}.uses", root, errors, trusted_actions, reusable=True)
+    runner = job.get("runs-on")
+    if runner == "${{ matrix.runner }}":
+        matrix = ((job.get("strategy") or {}).get("matrix") or {}) if isinstance(job.get("strategy"), dict) else {}
+        include = matrix.get("include") if isinstance(matrix, dict) else None
+        runners = [item.get("runner") for item in include] if isinstance(include, list) and all(isinstance(item, dict) for item in include) else []
+        if not runners or any(runner not in STANDARD_RUNNERS for runner in runners):
+            errors.append(f"{location}.runs-on: only GitHub-hosted standard runners are allowed")
+    elif runner is not None and str(runner) not in STANDARD_RUNNERS:
+        errors.append(f"{location}.runs-on: only GitHub-hosted standard runners are allowed")
+    steps = job.get("steps", [])
+    if steps is not None and not isinstance(steps, list):
+        errors.append(f"{location}.steps: must be a list")
         return
-    smoke = jobs.get("smoke")
-    if not isinstance(smoke, dict):
-        errors.append("ci.yaml: required local-first smoke job is missing")
+    for index, step in enumerate(steps or []):
+        if not isinstance(step, dict):
+            errors.append(f"{location}.steps[{index}]: must be a mapping")
+            continue
+        step_location = f"{location}.steps[{index}]"
+        if "uses" in step:
+            _validate_uses(step["uses"], f"{step_location}.uses", root, errors, trusted_actions)
+        run = str(step.get("run", ""))
+        if PUBLISH_COMMAND.search(run.replace("\\\n", " ")) or PUBLISH_NAME.search(str(step.get("name", ""))):
+            errors.append(f"{step_location}: deployment or publish execution is forbidden")
+
+
+def _validate_local_actions(root: Path, errors: list[str], trusted_actions: frozenset[str]) -> None:
+    actions = root / ".github" / "actions"
+    if not actions.exists():
         return
-    if smoke.get("runs-on") != "ubuntu-latest" or smoke.get("timeout-minutes") != "3":
-        errors.append("ci.yaml.jobs.smoke: must be a three-minute standard Linux job")
-    expected_smoke_name = (
-        "${{ github.event.action == 'labeled' && "
-        "github.event.label.name != 'ci:full' && "
-        "'Informational smoke for unrelated label' || "
-        "'Hosted smoke and affected areas' }}"
-    )
-    if smoke.get("name") != expected_smoke_name:
-        errors.append(
-            "ci.yaml.jobs.smoke: unrelated labels must use a distinct informational check context"
-        )
-    smoke_steps = smoke.get("steps", [])
-    smoke_steps = smoke_steps if isinstance(smoke_steps, list) else []
-    smoke_step = next(
-        (
-            step
-            for step in smoke_steps
-            if isinstance(step, dict)
-            and step.get("name") == "Run dependency-free smoke gate"
-        ),
-        None,
-    )
-    expected_smoke_run = """base=HEAD
-if [ "${{ github.event_name }}" = pull_request ]; then
-  # actions/checkout provides the synthetic merge and both parents.
-  # Parent one is the immutable base represented by this event.
-  base=HEAD^1
-fi
-python3 scripts/ci/local_check.py --profile smoke --base "$base"
-"""
-    if not isinstance(smoke_step, dict) or smoke_step.get("run") != expected_smoke_run:
-        errors.append("ci.yaml.jobs.smoke: must run the repository-owned smoke profile")
-    risk_step = next(
-        (
-            step
-            for step in smoke_steps
-            if isinstance(step, dict)
-            and step.get("name")
-            == "Require fresh ci:full approval for risk-sensitive changes"
-        ),
-        None,
-    )
-    expected_risk_if = (
-        "github.event_name == 'pull_request' && "
-        "steps.classify.outputs.risk_full == 'true' && "
-        "(github.event.action != 'labeled' || github.event.label.name != 'ci:full')"
-    )
-    expected_risk_run = (
-        'echo "::error::Risk-sensitive changes require a fresh ci:full label '
-        'on the final commit. Remove and re-add ci:full after the last push."\n'
-        "exit 1\n"
-    )
-    if (
-        not isinstance(risk_step, dict)
-        or risk_step.get("if") != expected_risk_if
-        or risk_step.get("run") != expected_risk_run
-    ):
-        errors.append(
-            "ci.yaml.jobs.smoke: risk-sensitive changes must require a fresh "
-            "ci:full label on the final commit"
-        )
-
-    approval = (
-        "(github.event_name != 'pull_request' || "
-        "(github.event.action == 'labeled' && "
-        "github.event.label.name == 'ci:full'))"
-    )
-    output_conditions = {
-        "tests": "python",
-        "tests-os": "python",
-        "lint": "python",
-        "js-tests": "frontend",
-        "installer-tests": "installer",
-        "rust-tests": "rust",
-        "docs-site": "site",
-        "uv-lockfile": "uv_lock",
-        "docker-lint": "docker_meta",
-    }
-    expected_conditions = {
-        name: f"{approval} && needs.smoke.outputs.{output} == 'true'"
-        for name, output in output_conditions.items()
-    }
-    expected_conditions.update(
-        {
-            "lockfile-diff": (
-                "github.event_name == 'pull_request' && "
-                "github.event.action == 'labeled' && "
-                "github.event.label.name == 'ci:full' && "
-                "needs.smoke.outputs.npm_lock == 'true'"
-            ),
-            "supply-chain": (
-                "github.event_name == 'pull_request' && "
-                "github.event.action == 'labeled' && "
-                "github.event.label.name == 'ci:full' && "
-                "(needs.smoke.outputs.scan == 'true' || "
-                "needs.smoke.outputs.deps == 'true')"
-            ),
-            "osv-scanner": (
-                "(github.event_name == 'workflow_dispatch' || "
-                "(github.event_name == 'pull_request' && "
-                "github.event.action == 'labeled' && "
-                "github.event.label.name == 'ci:full')) && "
-                "needs.smoke.outputs.lock_scan == 'true'"
-            ),
-            "all-checks-pass": f"always() && {approval}",
-        }
-    )
-
-    def compact(value: Any) -> str:
-        return " ".join(str(value).split())
-
-    for job_name, expected_condition in sorted(expected_conditions.items()):
-        job = jobs.get(job_name)
-        condition = str(job.get("if", "")) if isinstance(job, dict) else ""
-        if compact(condition) != compact(expected_condition):
-            errors.append(
-                f"ci.yaml.jobs.{job_name}: expensive lane must require ci:full through the exact condition"
-            )
-
-    osv = jobs.get("osv-scanner")
-    if isinstance(osv, dict):
-        condition = str(osv.get("if", ""))
-        if "github.event_name == 'workflow_dispatch'" not in condition:
-            errors.append(
-                "ci.yaml: orchestrated OSV scan must be manual/PR-only; "
-                "osv-scanner.yml already owns the weekly schedule"
-            )
-        if "needs.smoke.outputs.lock_scan" not in condition:
-            errors.append(
-                "ci.yaml: orchestrated OSV scan must use exact lockfile changes"
-            )
-
-
-def _trusted_surface_files(root: Path) -> dict[str, bytes]:
-    files = {}
-    for subdir in (".github/workflows", ".github/actions"):
-        base = root / subdir
-        if base.is_dir():
-            for path in base.rglob("*"):
-                if path.is_file():
-                    files[path.relative_to(root).as_posix()] = path.read_bytes()
-    return files
-
-
-def _protected_surface_symlink_errors(root: Path, *, label: str) -> list[str]:
-    errors: list[str] = []
-    github = root / ".github"
-    try:
-        if github.is_symlink():
-            return [f"{label} protected workflow surface contains symlink: .github"]
-        for subdir in (".github/workflows", ".github/actions"):
-            base = root / subdir
-            if base.is_symlink():
-                errors.append(
-                    f"{label} protected workflow surface contains symlink: {subdir}"
-                )
-                continue
-            if not base.is_dir():
-                continue
-            for path in base.rglob("*"):
-                if path.is_symlink():
-                    errors.append(
-                        f"{label} protected workflow surface contains symlink: "
-                        f"{path.relative_to(root).as_posix()}"
-                    )
-    except OSError as exc:
-        errors.append(f"unable to inspect {label} protected workflow surface: {exc}")
-    return errors
-
-
-def _validate_trusted_surface(root: Path, trusted_root: Path) -> list[str]:
-    errors = _protected_surface_symlink_errors(root, label="candidate")
-    errors.extend(
-        _protected_surface_symlink_errors(trusted_root, label="trusted")
-    )
-    if errors:
-        return errors
-    if _trusted_surface_files(root) == _trusted_surface_files(trusted_root):
-        return []
-    return ["candidate workflows and local actions differ from trusted default branch"]
-
-
-def validate(root: Path, trusted_root: Path | None = None) -> list[str]:
-    workflows = root / ".github" / "workflows"
-    errors = _validate_trusted_surface(root, trusted_root) if trusted_root else []
-
-    for directory in (root / ".github", workflows):
-        if directory.is_symlink():
-            errors.append(f"workflow directory path contains symlink: {directory}")
-    if errors:
-        return errors
-
-    try:
-        candidate_root = root.resolve(strict=True)
-        workflow_root = workflows.resolve(strict=True)
-        workflow_root.relative_to(candidate_root)
-    except (OSError, ValueError) as exc:
-        errors.append(f"workflow directory must resolve inside candidate root: {exc}")
-        return errors
-
-    try:
-        actual_paths = list(workflows.glob("*.yml")) + list(workflows.glob("*.yaml"))
-    except OSError as exc:
-        errors.append(f"unable to discover candidate workflows: {exc}")
-        return errors
-
-    safe_paths: dict[str, Path] = {}
-    for path in actual_paths:
-        if path.is_symlink():
-            errors.append(f"{path.name}: symlinked workflow files are forbidden")
+    if actions.is_symlink() or not actions.is_dir():
+        errors.append(".github/actions must be a real directory")
+        return
+    for definition in sorted(actions.rglob("action.y*ml")):
+        if definition.is_symlink() or not definition.is_file():
+            errors.append(f"{definition.relative_to(root)}: action definitions must be regular files")
             continue
         try:
-            resolved = path.resolve(strict=True)
-            resolved.relative_to(workflow_root)
-        except (OSError, ValueError) as exc:
-            errors.append(
-                f"{path.name}: workflow must resolve inside candidate workflow directory: {exc}"
-            )
-            continue
-        if not resolved.is_file():
-            errors.append(f"{path.name}: workflow entry must be a regular file")
-            continue
-        safe_paths[path.name] = resolved
-
-    actual = {path.name for path in actual_paths}
-    expected = set(WORKFLOW_TRIGGERS)
-
-    reappeared = sorted(actual & FORBIDDEN_WORKFLOWS)
-    if reappeared:
-        errors.append(f"forbidden upstream workflows reappeared: {', '.join(reappeared)}")
-
-    missing = sorted(expected - actual)
-    unexpected = sorted(actual - expected)
-    if missing:
-        errors.append(f"required fork workflows missing: {', '.join(missing)}")
-    if unexpected:
-        errors.append(f"unexpected workflows are not allowed: {', '.join(unexpected)}")
-
-    seen_step_actions: set[str] = set()
-    seen_reusable_workflows: set[str] = set()
-    for name in sorted(safe_paths.keys() & expected):
-        path = safe_paths[name]
-        try:
-            data = _load(path)
-            actual_triggers = _triggers(data, path)
+            data = _load(definition)
         except ValueError as exc:
             errors.append(str(exc))
             continue
-        expected_triggers = WORKFLOW_TRIGGERS[name]
-        if actual_triggers != expected_triggers:
-            errors.append(
-                f"{name}: triggers {sorted(actual_triggers)} != allowed "
-                f"{sorted(expected_triggers)}"
-            )
-        expected_trigger_config = WORKFLOW_TRIGGER_CONFIGS.get(name)
-        if expected_trigger_config is not None and data.get("on") != expected_trigger_config:
-            errors.append(f"{name}: trigger configuration differs from the allowed policy")
+        runs = data.get("runs")
+        if not isinstance(runs, dict) or runs.get("using") != "composite":
+            errors.append(f"{definition.relative_to(root)}: only composite local actions are allowed")
+            continue
+        _validate_value(data, str(definition.relative_to(root)), errors)
+        for index, step in enumerate(runs.get("steps", []) if isinstance(runs.get("steps"), list) else []):
+            if not isinstance(step, dict):
+                errors.append(f"{definition.relative_to(root)}.runs.steps[{index}]: must be a mapping")
+                continue
+            if "uses" in step:
+                _validate_uses(step["uses"], f"{definition.relative_to(root)}.runs.steps[{index}].uses", root, errors, trusted_actions)
+            run = str(step.get("run", ""))
+            if PUBLISH_COMMAND.search(run.replace("\\\n", " ")):
+                errors.append(f"{definition.relative_to(root)}.runs.steps[{index}]: deployment or publish execution is forbidden")
 
-        expected_permissions = WORKFLOW_PERMISSIONS[name]
-        actual_permissions = data.get("permissions")
-        if actual_permissions is None:
-            errors.append(f"{name}: explicit top-level permissions are required")
-        elif actual_permissions != expected_permissions:
-            errors.append(
-                f"{name}.permissions: {actual_permissions!r} != allowed "
-                f"{expected_permissions!r}"
-            )
-        _validate_security(data, name, errors, expected_permissions)
-        _validate_steps(data, name, errors)
-        _validate_runners(data, name, errors)
-        if name == "ci.yaml":
-            _validate_ci_budget(data, errors)
-        step_actions, reusable_workflows = _references(data)
-        seen_step_actions.update(step_actions)
-        seen_reusable_workflows.update(reusable_workflows)
-        if name == "fork-policy.yml" and data not in FORK_POLICY_WORKFLOWS:
-            errors.append("fork-policy.yml: trusted workflow structure differs from exact policy")
 
-    transition_actions = set().union(*TRANSITION_ACTION_FAMILIES)
-    stable_step_actions = set(STEP_ACTION_ALLOWLIST) - transition_actions
-    missing_step_actions = stable_step_actions - seen_step_actions
-    unexpected_step_actions = seen_step_actions - set(STEP_ACTION_ALLOWLIST)
-    transition_selections = {
-        sorted(family)[0].split("@")[0]: sorted(seen_step_actions & set(family))
-        for family in TRANSITION_ACTION_FAMILIES
-    }
-    invalid_transitions = {
-        name: selected
-        for name, selected in transition_selections.items()
-        if len(selected) != 1
-    }
-    if missing_step_actions or unexpected_step_actions or invalid_transitions:
-        errors.append(
-            "step action references differ from exact allowlist: "
-            f"missing={sorted(missing_step_actions)}, "
-            f"extra={sorted(unexpected_step_actions)}, "
-            f"transitions={invalid_transitions}"
+def _validate_privileged_policy(data: dict[str, Any], name: str, errors: list[str]) -> None:
+    triggers = data.get("on")
+    if name != "fork-policy.yml":
+        has_privileged_trigger = (
+            triggers == "pull_request_target"
+            or isinstance(triggers, list) and "pull_request_target" in triggers
+            or isinstance(triggers, dict) and "pull_request_target" in triggers
         )
-    if seen_reusable_workflows != set(JOB_REUSABLE_WORKFLOW_ALLOWLIST):
-        errors.append(
-            "job reusable workflow references differ from exact allowlist: "
-            f"missing={sorted(set(JOB_REUSABLE_WORKFLOW_ALLOWLIST) - seen_reusable_workflows)}, "
-            f"extra={sorted(seen_reusable_workflows - set(JOB_REUSABLE_WORKFLOW_ALLOWLIST))}"
-        )
+        if has_privileged_trigger:
+            errors.append(f"{name}: pull_request_target is reserved for trusted fork policy")
+        return
+    semantic = _without_cosmetic_names(data)
+    if semantic != PRIVILEGED_POLICY_CONTRACT:
+        errors.append("fork-policy.yml: privileged execution contract differs from trusted policy")
 
+
+def _validate_required_ci_gate(data: dict[str, Any], name: str, errors: list[str]) -> None:
+    """Keep the mandatory PR correctness gate from being self-attested away."""
+    if name != "ci.yaml":
+        return
+    if _required_ci_gate(data) != REQUIRED_CI_GATE_CONTRACT:
+        errors.append("ci.yaml: mandatory smoke/result correctness gate differs from trusted policy")
+
+
+def _without_cosmetic_names(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove only workflow/job/step labels, never action inputs named ``name``."""
+    semantic = deepcopy(data)
+    semantic.pop("name", None)
+    jobs = semantic.get("jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if not isinstance(job, dict):
+                continue
+            job.pop("name", None)
+            steps = job.get("steps")
+            if isinstance(steps, list):
+                for step in steps:
+                    if isinstance(step, dict):
+                        step.pop("name", None)
+    return semantic
+
+
+REQUIRED_CI_GATE_CONTRACT = _required_ci_gate(
+    _load(Path(__file__).resolve().parents[2] / ".github/workflows/ci.yaml")
+)
+
+
+def _external_actions(root: Path) -> frozenset[str]:
+    """Read only trusted workflow/action declarations to build the action allowlist."""
+    actions: set[str] = set()
+    try:
+        paths = _workflow_paths(root)
+    except ValueError:
+        return frozenset()
+    definitions = [*paths, *(root / ".github" / "actions").rglob("action.y*ml")] if (root / ".github" / "actions").is_dir() else paths
+    for path in definitions:
+        try:
+            data = _load(path)
+        except ValueError:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                uses = node.get("uses")
+                if isinstance(uses, str) and not uses.startswith("./"):
+                    actions.add(uses)
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    return frozenset(actions)
+
+
+def validate(root: Path, trusted_root: Path | None = None) -> list[str]:
+    """Return security findings for candidate workflow/action data.
+
+    ``trusted_root`` is intentionally accepted for the stable parent contract;
+    policy code is selected by the caller from that immutable checkout, not by
+    importing or executing anything below ``root``.
+    """
+    errors: list[str] = []
+    trusted_actions = _external_actions(trusted_root or root)
+    try:
+        paths = _workflow_paths(root)
+    except ValueError as exc:
+        return [str(exc)]
+    for path in paths:
+        try:
+            data = _load(path)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        location = path.name
+        if "permissions" not in data:
+            errors.append(f"{location}: explicit top-level read-only permissions are required")
+        else:
+            errors.extend(_permission_errors(data["permissions"], f"{location}.permissions"))
+        _validate_value(data, location, errors)
+        jobs = data.get("jobs")
+        if not isinstance(jobs, dict):
+            errors.append(f"{location}: jobs must be a mapping")
+        else:
+            for job_name, job in jobs.items():
+                if not isinstance(job, dict):
+                    errors.append(f"{location}.jobs.{job_name}: must be a mapping")
+                    continue
+                _validate_job(job, f"{location}.jobs.{job_name}", root, errors, trusted_actions)
+        _validate_privileged_policy(data, location, errors)
+        _validate_required_ci_gate(data, location, errors)
+    _validate_local_actions(root, errors, trusted_actions)
     return errors
 
 
@@ -767,7 +384,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
-    print(f"workflow policy OK: {len(WORKFLOW_TRIGGERS)} exact workflows")
+    print("workflow security policy OK")
     return 0
 
 

@@ -1,12 +1,11 @@
 name: Fork CI
 
-# Local-first private-mirror orchestrator. Every PR gets one small, unprivileged
-# Linux smoke job. Risk-sensitive paths must receive a fresh ci:full approval
-# on their final commit. Expensive lanes otherwise run only for ci:full,
-# workflow_dispatch, or the bounded weekly drift schedule.
+# Every PR runs a cheap fast gate and provisioned affected-area jobs. Shared runtime,
+# security, dependency, packaging, platform, and CI changes additionally run
+# the broader hosted matrix. The weekly and manual routes run that matrix too.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   schedule:
     - cron: '0 8 * * 1'
@@ -16,235 +15,162 @@ permissions:
   contents: read
 
 concurrency:
-  # A label event cannot be filtered by label name at trigger time. Keep each
-  # label lane separate so an unrelated label cannot cancel the final-commit
-  # ci:full run (or the ordinary synchronize smoke run).
-  group: fork-ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name || 'main' }}
+  group: fork-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   smoke:
-    # Keep unrelated-label checks informational under a distinct context. This
-    # avoids failing routine label maintenance without allowing that later run
-    # to supersede the required final-commit smoke check.
-    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational smoke for unrelated label' || 'Hosted smoke and affected areas' }}
+    name: Fast correctness and portability
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     outputs:
       python: ${{ steps.classify.outputs.python }}
-      python_prod: ${{ steps.classify.outputs.python_prod }}
       frontend: ${{ steps.classify.outputs.frontend }}
       site: ${{ steps.classify.outputs.site }}
-      scan: ${{ steps.classify.outputs.scan }}
-      deps: ${{ steps.classify.outputs.deps }}
-      uv_lock: ${{ steps.classify.outputs.uv_lock }}
-      npm_lock: ${{ steps.classify.outputs.npm_lock }}
       installer: ${{ steps.classify.outputs.installer }}
-      desktop_updater: ${{ steps.classify.outputs.desktop_updater }}
       rust: ${{ steps.classify.outputs.rust }}
       docker_meta: ${{ steps.classify.outputs.docker_meta }}
-      risk_full: ${{ steps.classify.outputs.risk_full }}
+      uv_lock: ${{ steps.classify.outputs.uv_lock }}
+      scan: ${{ steps.classify.outputs.scan }}
+      deps: ${{ steps.classify.outputs.deps }}
       lock_scan: ${{ steps.classify.outputs.lock_scan }}
-      event_name: ${{ github.event_name }}
+      risk_full: ${{ steps.classify.outputs.risk_full }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
-      - name: Detect affected areas
-        id: classify
+      - id: classify
+        name: Detect affected areas
         uses: ./.github/actions/detect-changes
         with:
           github-token: ${{ github.token }}
-      - name: Require fresh ci:full approval for risk-sensitive changes
-        if: >-
-          github.event_name == 'pull_request' &&
-          steps.classify.outputs.risk_full == 'true' &&
-          (github.event.action != 'labeled' || github.event.label.name != 'ci:full')
-        run: |
-          echo "::error::Risk-sensitive changes require a fresh ci:full label on the final commit. Remove and re-add ci:full after the last push."
-          exit 1
-      - name: Run dependency-free smoke gate
-        shell: bash
+      - name: Install pinned uv for local checks
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.9.28"
+      - name: Run fast checks
         run: |
           base=HEAD
-          if [ "${{ github.event_name }}" = pull_request ]; then
-            # actions/checkout provides the synthetic merge and both parents.
-            # Parent one is the immutable base represented by this event.
-            base=HEAD^1
-          fi
+          if [ "${{ github.event_name }}" = pull_request ]; then base=HEAD^1; fi
           python3 scripts/ci/local_check.py --profile smoke --base "$base"
 
+  history:
+    name: Require a common ancestor
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Reject unrelated histories
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null || {
+            echo "::error::This PR has no common ancestor with its base branch. Rebase it onto current main before merging."
+            exit 1
+          }
+
   tests:
-    name: Python tests
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.python == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.python == 'true' || needs.smoke.outputs.risk_full == 'true'
     uses: ./.github/workflows/tests.yml
 
   tests-os:
-    name: OS-specific tests
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.python == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.risk_full == 'true'
     uses: ./.github/workflows/tests-os.yml
     with:
-      # The Windows lane spawns the real desktop-update hand-off script
-      # (tests/test_desktop_update_windows_*.py) only when that surface
-      # changed; unit-level windows_only tests always run.
-      desktop_updater: ${{ needs.smoke.outputs.desktop_updater == 'true' }}
+      desktop_updater: ${{ needs.smoke.outputs.risk_full == 'true' }}
 
   lint:
-    name: Python static checks
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.python == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.python == 'true' || needs.smoke.outputs.risk_full == 'true'
     uses: ./.github/workflows/lint.yml
 
   js-tests:
-    name: JS and TS checks
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.frontend == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
 
   installer-tests:
-    name: Installer tests
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.installer == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.installer == 'true'
     uses: ./.github/workflows/installer-tests.yml
 
   rust-tests:
-    name: Rust tests
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.rust == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.rust == 'true'
     uses: ./.github/workflows/rust-tests.yml
 
-
   docs-site:
-    name: Docs site
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.site == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.site == 'true'
     uses: ./.github/workflows/docs-site-checks.yml
 
-  history-check:
-    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational history check for unrelated label' || 'Deny unrelated histories' }}
-    needs: smoke
-    if: >-
-      github.event_name == 'pull_request' &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ci:full')
-    uses: ./.github/workflows/history-check.yml
-
   uv-lockfile:
-    name: Check uv.lock
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.uv_lock == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.uv_lock == 'true'
     uses: ./.github/workflows/uv-lockfile-check.yml
 
-
-  lockfile-diff:
-    name: package-lock.json diff
-    needs: smoke
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.action == 'labeled' && github.event.label.name == 'ci:full' &&
-      needs.smoke.outputs.npm_lock == 'true'
-    uses: ./.github/workflows/lockfile-diff.yml
-
   docker-lint:
-    name: Lint Docker inputs
     needs: smoke
-    if: >-
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.docker_meta == 'true'
+    if: github.event_name != 'pull_request' || needs.smoke.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
   supply-chain:
-    name: Supply-chain checks
     needs: smoke
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.action == 'labeled' && github.event.label.name == 'ci:full' &&
-      (needs.smoke.outputs.scan == 'true' || needs.smoke.outputs.deps == 'true')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (needs.smoke.outputs.scan == 'true' || needs.smoke.outputs.deps == 'true'))
     uses: ./.github/workflows/supply-chain-audit.yml
     with:
       scan: ${{ needs.smoke.outputs.scan == 'true' }}
       deps: ${{ needs.smoke.outputs.deps == 'true' }}
 
   osv-scanner:
-    name: OSV dependency scan
     needs: smoke
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'ci:full')) &&
-      needs.smoke.outputs.lock_scan == 'true'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.smoke.outputs.lock_scan == 'true')
     uses: ./.github/workflows/osv-scanner.yml
 
-  all-checks-pass:
-    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && 'Informational aggregate for unrelated label' || 'All requested full checks pass' }}
-    needs:
-      - smoke
-      - tests
-      - tests-os
-      - lint
-      - js-tests
-      - installer-tests
-      - rust-tests
-
-      - docs-site
-      - history-check
-      - uv-lockfile
-
-      - lockfile-diff
-      - docker-lint
-
-      - supply-chain
-      - osv-scanner
-    if: >-
-      always() &&
-      (github.event_name != 'pull_request' ||
-       (github.event.action == 'labeled' && github.event.label.name == 'ci:full'))
+  result:
+    name: CI result
+    needs: [smoke, history, tests, tests-os, lint, js-tests, installer-tests, rust-tests, docs-site, uv-lockfile, docker-lint, supply-chain, osv-scanner]
+    if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 2
     steps:
-      - name: Evaluate requested full jobs
+      - name: Report required job outcomes
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
         run: |
           python3 - <<'PY'
-          import json
-          import os
-          import sys
-
-          needs = json.loads(os.environ["NEEDS"])
-          failed = {
-              name: value["result"]
-              for name, value in needs.items()
-              if value["result"] not in {"success", "skipped"}
-          }
-          for name, value in sorted(needs.items()):
-              print(f"{name}: {value['result']}")
-          if failed:
-              print(f"::error::{len(failed)} requested job(s) did not pass: {failed}")
+          import json, os, sys
+          needs = json.loads(os.environ['NEEDS'])
+          outputs = needs.get('smoke', {}).get('outputs', {})
+          full = os.environ['EVENT'] != 'pull_request'
+          broad = full or outputs.get('risk_full') == 'true'
+          expected = {'smoke'}
+          if os.environ['EVENT'] == 'pull_request':
+              expected.add('history')
+          if broad or outputs.get('python') == 'true':
+              expected.update(('tests', 'lint'))
+          if broad:
+              expected.add('tests-os')
+          for job, lane in {'js-tests': 'frontend', 'installer-tests': 'installer', 'rust-tests': 'rust', 'docs-site': 'site', 'uv-lockfile': 'uv_lock', 'docker-lint': 'docker_meta'}.items():
+              if full or outputs.get(lane) == 'true':
+                  expected.add(job)
+          manual = os.environ['EVENT'] == 'workflow_dispatch'
+          if manual or (os.environ['EVENT'] == 'pull_request' and (outputs.get('scan') == 'true' or outputs.get('deps') == 'true')):
+              expected.add('supply-chain')
+          if manual or (os.environ['EVENT'] == 'pull_request' and outputs.get('lock_scan') == 'true'):
+              expected.add('osv-scanner')
+          problems = {name: needs.get(name, {}).get('result', 'missing') for name in sorted(expected) if needs.get(name, {}).get('result') != 'success'}
+          unexpected = {name: item.get('result') for name, item in needs.items() if item.get('result') in ('failure', 'cancelled')}
+          problems.update(unexpected)
+          if problems:
+              print('Required CI jobs did not pass:', json.dumps(problems, sort_keys=True))
+              print('Inspect the named job: test failures are correctness findings; setup/download failures are infrastructure errors. Neither is a successful check.')
               sys.exit(1)
+          print('All required correctness checks passed; unaffected jobs were skipped.')
           PY
