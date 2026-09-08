@@ -956,3 +956,34 @@ def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypa
     text = format_process_notification(evt)
     assert text is not None
     assert "SUBAGENT MODEL REJECTED" not in text
+
+
+def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    task = {"goal": "review", "completion_contract": {"kind": "native_review_result_v1"}}
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at, updated_at,
+                owner_pid, task_json)
+               VALUES (?, ?, 'running', ?, ?, ?, ?)""",
+            ("deleg_abandoned_review", "parent", 1.0, 1.0, 999999999, json.dumps(task)),
+        )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    seen = []
+    monkeypatch.setattr(ad, "_native_review_result", lambda contract, entry: seen.append((contract, entry)) or {
+        "contract": "native_review_result_v1", "runtime_status": "unknown", "judgment": "unknown",
+    })
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert seen[0][1] == {
+        "status": "unknown",
+        "exit_reason": "owner_abandoned",
+        "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+    }
+    with ad._transaction() as conn:
+        event = json.loads(conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            ("deleg_abandoned_review",),
+        ).fetchone()[0])
+    assert event["native_review_result"]["judgment"] == "unknown"

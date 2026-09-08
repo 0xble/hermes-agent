@@ -44,6 +44,7 @@ class ReviewCandidateV1:
     tracked_patch: str
     untracked_files: tuple[ReviewUntrackedFileV1, ...]
     candidate_id: str
+    tracked_patch_sha256: str = ""
     contract: str = field(default=_CANDIDATE_CONTRACT, init=False)
 
     def evidence_payload(self) -> dict[str, Any]:
@@ -72,6 +73,7 @@ class ReviewCandidateV1:
                 ReviewUntrackedFileV1(**item) for item in payload.get("untracked_files") or ()
             ),
             candidate_id=str(payload.get("candidate_id") or ""),
+            tracked_patch_sha256=str(payload.get("tracked_patch_sha256") or ""),
         )
         canonical = json.dumps(
             _identity_payload(candidate), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -171,13 +173,17 @@ class NativeReviewResultV1:
         )
         raw_coverage = authored.get("coverage")
         coverage = tuple(str(item) for item in raw_coverage) if isinstance(raw_coverage, list) else ()
+        actual_model = str(entry.get("model") or "")
+        provider = str(entry.get("provider") or "").strip()
+        if provider and actual_model:
+            actual_model = f"{provider}/{actual_model}"
         return cls(
             candidate_id=candidate.candidate_id,
             runtime_status=runtime_status,
             exit_reason=str(entry.get("exit_reason") or ""),
             judgment=judgment,
             coverage=coverage,
-            actual_model=str(entry.get("model") or ""),
+            actual_model=actual_model,
             summary=str(authored.get("summary") or ""),
         )
 
@@ -265,6 +271,10 @@ def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
 def _identity_payload(candidate: ReviewCandidateV1) -> dict[str, Any]:
     payload = candidate.evidence_payload()
     payload.pop("candidate_id", None)
+    # Preserve validation of review_candidate_v1 payloads captured before the
+    # exact-byte digest existed. New captures always bind the original patch bytes.
+    if not payload.get("tracked_patch_sha256"):
+        payload.pop("tracked_patch_sha256", None)
     return payload
 
 
@@ -298,6 +308,7 @@ def capture_review_candidate(
         tracked_patch=patch_bytes.decode("utf-8", "replace"),
         untracked_files=untracked,
         candidate_id="",
+        tracked_patch_sha256=hashlib.sha256(patch_bytes).hexdigest(),
     )
     canonical = json.dumps(
         _identity_payload(provisional), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -310,6 +321,7 @@ def capture_review_candidate(
         tracked_patch=provisional.tracked_patch,
         untracked_files=untracked,
         candidate_id="sha256:" + hashlib.sha256(canonical).hexdigest(),
+        tracked_patch_sha256=provisional.tracked_patch_sha256,
     )
 
 

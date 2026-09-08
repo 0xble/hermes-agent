@@ -19,6 +19,7 @@ import time
 import uuid
 import weakref
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -115,6 +116,16 @@ def _open_child_session_db(parent_agent) -> Any:
         return None
     return None
 
+
+def _apply_child_cache_ttl(child) -> None:
+    """A delegated child never uses the 1h cache tier. The tier is priced for a person who steps
+    away between turns (2x write vs 1.25x for 5m, #14971); a subagent calls every few seconds for
+    minutes and is gone, so it pays the 2x on every tool result and never collects the retention.
+    Caching itself stays exactly as configured (disabled stays disabled)."""
+    if getattr(child, "_cache_ttl", None) == "1h":
+        child._cache_ttl = "5m"
+
+
 def _seed_resumed_launch_metadata(child, launch_metadata: dict) -> None:
     """Keep validated launch authority available to compressed continuation rows."""
     metadata = deepcopy(launch_metadata)
@@ -157,6 +168,8 @@ def _build_child_agent(
     resume_workspace_path=None,
     resume_launch_metadata=None,
     resume_claim_id=None,
+    resume_credential_pool=None,
+    resume_credential_id=None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -290,14 +303,15 @@ def _build_child_agent(
     # Shared pool lets children rotate credentials on rate limits.
     if subagent_definition is not None:
         from tools.custom_subagents import (
-            RuntimePin, _nonsecret_mapping, inherited_credential_pool, nonsecret_route_url,
+            RuntimePin, _authority_mapping_fingerprint, _nonsecret_mapping,
+            inherited_credential_pool, nonsecret_route_url,
         )
         child._delegation_named_type = subagent_definition.name
         if child.provider == "moa":
             child._moa_preset_snapshot = moa_snapshot
             from agent.moa_loop import build_moa_facade
             child.client = build_moa_facade(child, child.model)
-        child_pool = inherited_credential_pool(child, parent_agent, delegation_cfg)
+        child_pool = resume_credential_pool or inherited_credential_pool(child, parent_agent, delegation_cfg)
         child._credential_pool = child_pool
         if child.provider != "moa":
             child._delegation_fallback_routes = tuple(resolved_fallback_routes)
@@ -322,6 +336,9 @@ def _build_child_agent(
                 "request_overrides": _nonsecret_mapping(json.loads(getattr(
                     getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
                 ))),
+                "request_overrides_fingerprint": _authority_mapping_fingerprint(json.loads(getattr(
+                    getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
+                ))),
                 "fallbacks": [route.metadata() for route in resolved_fallback_routes],
                 "enabled_toolsets": list(child_toolsets or []),
             }
@@ -341,7 +358,7 @@ def _build_child_agent(
             child._delegation_resume_fail_if_busy = True
             setattr(child, "_delegation_resume_claim_id", resume_claim_id)
             setattr(child, "_delegation_resume_admitted", False)
-            credential_id = resume_launch_metadata.get("credential_pool_entry_id")
+            credential_id = resume_credential_id or resume_launch_metadata.get("credential_pool_entry_id")
             if credential_id:
                 setattr(child, "_delegation_resume_credential_id", credential_id)
             setattr(child, "_delegation_resume_workspace_path", resume_workspace_path)
@@ -394,6 +411,82 @@ def _resume_history_is_safe(messages: Any) -> bool:
             if isinstance(tool_call_id, str) and tool_call_id.strip():
                 pending.discard(tool_call_id.split("|", 1)[0].strip())
     return not pending
+
+
+def _refresh_resumable_launch_metadata(child, launch_metadata: dict) -> dict:
+    """Record the active pool account without putting its credential in durable state."""
+    updated = deepcopy(launch_metadata)
+    credential_id = getattr(child, "_credential_pool_entry_id", None)
+    if not isinstance(credential_id, str) or not credential_id:
+        return updated
+    active = (getattr(child, "provider", None), getattr(child, "model", None))
+    if active == (updated.get("provider"), updated.get("model")):
+        updated["credential_pool_entry_id"] = credential_id
+        updated["authority_fingerprint"] = __import__("hashlib").sha256(
+            str(getattr(child, "api_key", "") or "").encode()
+        ).hexdigest()
+        return updated
+    for fallback in updated.get("fallbacks") or []:
+        if isinstance(fallback, dict) and active == (fallback.get("provider"), fallback.get("model")):
+            fallback["credential_pool_entry_id"] = credential_id
+            fallback["authority_fingerprint"] = __import__("hashlib").sha256(
+                str(getattr(child, "api_key", "") or "").encode()
+            ).hexdigest()
+            break
+    return updated
+
+
+def _restore_fallback_authority(routes, expected, normalize_route_base_url):
+    """Rebind frozen fallbacks to their persisted stable pool account IDs."""
+    if not isinstance(expected, list) or len(routes) != len(expected):
+        return routes
+    restored = []
+    for route, metadata in zip(routes, expected):
+        credential_id = metadata.get("credential_pool_entry_id") if isinstance(metadata, dict) else None
+        if not credential_id:
+            restored.append(route)
+            continue
+        pool = route._credential_pool
+        entries = pool.entries() if pool is not None and callable(getattr(pool, "entries", None)) else ()
+        entry = next((item for item in entries if getattr(item, "id", None) == credential_id), None)
+        api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None)
+        entry_provider = str(getattr(entry, "provider", None) or route.provider)
+        entry_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or route.base_url
+        if (
+            entry is None or not api_key or entry_provider != route.provider
+            or normalize_route_base_url(str(entry_base)) != normalize_route_base_url(route.base_url)
+        ):
+            raise ValueError("delegated child fallback stable credential can no longer be authorized")
+        restored.append(replace(
+            route, api_key=str(api_key),
+            credential_digest=__import__("hashlib").sha256(str(api_key).encode()).hexdigest(),
+            credential_pool_entry_id=str(credential_id),
+        ))
+    return tuple(restored)
+
+
+def _fallback_metadata_matches(routes, expected) -> bool:
+    """Compare public route data plus complete override authority, including legacy-safe metadata."""
+    from tools.custom_subagents import _authority_mapping_matches
+    if not isinstance(expected, list) or len(routes) != len(expected):
+        return False
+    for route, stored in zip(routes, expected):
+        if not isinstance(stored, dict):
+            return False
+        overrides = json.loads(route.request_overrides_json)
+        if not _authority_mapping_matches(
+            overrides, stored.get("request_overrides") or {},
+            stored.get("request_overrides_fingerprint"),
+        ):
+            return False
+        current = route.metadata()
+        if "request_overrides_fingerprint" not in stored:
+            current.pop("request_overrides_fingerprint", None)
+        if "credential_pool_entry_id" not in stored:
+            current.pop("credential_pool_entry_id", None)
+        if current != stored:
+            return False
+    return True
 
 
 def _run_single_child(
@@ -460,13 +553,7 @@ def _run_single_child(
                 try:
                     launch_metadata = deepcopy(getattr(child, "_delegation_launch_metadata", None))
                     if isinstance(launch_metadata, dict):
-                        credential_id = getattr(child, "_credential_pool_entry_id", None)
-                        if (
-                            credential_id
-                            and (launch_metadata.get("provider"), launch_metadata.get("model"))
-                                == (getattr(child, "provider", None), getattr(child, "model", None))
-                        ):
-                            launch_metadata["credential_pool_entry_id"] = credential_id
+                        launch_metadata = _refresh_resumable_launch_metadata(child, launch_metadata)
                     model_config_patch = {
                         "_delegation_completed": True,
                         "_delegation_outcome": entry["status"],
@@ -524,7 +611,7 @@ def _resolve_resume_launch(task, definitions, parent_agent):
     from hermes_constants import parse_reasoning_effort
     from tools.custom_subagents import (
         FallbackDefinition, ResolvedSubagentLaunch, SubagentDefinition,
-        freeze_fallback_routes, nonsecret_route_url, _nonsecret_mapping,
+        freeze_fallback_routes, nonsecret_route_url, _authority_mapping_matches,
     )
 
     requested = task.get("resume_session_id")
@@ -578,6 +665,8 @@ def _resolve_resume_launch(task, definitions, parent_agent):
         ) for item in launch.get("fallbacks") or [] if isinstance(item, dict)),
     )
     snapshot = None
+    resume_credential_pool = None
+    resume_credential_id = None
     if provider == "moa":
         from agent.moa_loop import restore_moa_preset
         snapshot = restore_moa_preset(launch.get("moa") or {})
@@ -623,7 +712,10 @@ def _resolve_resume_launch(task, definitions, parent_agent):
             or normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
                != normalize_route_base_url(str(launch.get("base_url") or ""))
             or not authority_matches
-            or _nonsecret_mapping(creds.get("request_overrides") or {}) != (launch.get("request_overrides") or {})
+            or not _authority_mapping_matches(
+                creds.get("request_overrides") or {}, launch.get("request_overrides") or {},
+                launch.get("request_overrides_fingerprint"),
+            )
         ):
             raise ValueError("delegated child primary route can no longer be authorized exactly")
         reasoning = parse_reasoning_effort(effort) if effort is not None else None
@@ -631,8 +723,11 @@ def _resolve_resume_launch(task, definitions, parent_agent):
             definition, primary_provider=provider, primary_model=model
         )
         expected_fallbacks = launch.get("fallbacks") or []
-        if [route.metadata() for route in fallbacks] != expected_fallbacks:
+        fallbacks = _restore_fallback_authority(fallbacks, expected_fallbacks, normalize_route_base_url)
+        if not _fallback_metadata_matches(fallbacks, expected_fallbacks):
             raise ValueError("delegated child fallback routes no longer match their frozen identities")
+        resume_credential_pool = None
+        resume_credential_id = stable_credential_id
         active = config.get("_delegation_active_route") or {"provider": provider, "model": model}
         active_id = (active.get("provider"), active.get("model")) if isinstance(active, dict) else (None, None)
         if active_id != (provider, model):
@@ -642,6 +737,8 @@ def _resolve_resume_launch(task, definitions, parent_agent):
                 raise ValueError("delegated child active route is not in its frozen fallback chain")
             active_route = fallbacks[active_index]
             creds = active_route.native_entry()
+            resume_credential_pool = active_route._credential_pool
+            resume_credential_id = active_route.credential_pool_entry_id
             reasoning = parse_reasoning_effort(active_route.reasoning_effort) if active_route.reasoning_effort is not None else None
             fallbacks = fallbacks[active_index + 1:]
             definition = SubagentDefinition(
@@ -656,6 +753,8 @@ def _resolve_resume_launch(task, definitions, parent_agent):
         tuple(str(x) for x in launch.get("enabled_toolsets") or ()),
         workspace_path=str(row.get("cwd")) if row.get("cwd") else None,
         launch_metadata=deepcopy(launch),
+        _credential_pool=resume_credential_pool if provider != "moa" else None,
+        resume_credential_id=resume_credential_id if provider != "moa" else None,
     )
 
 
@@ -816,6 +915,8 @@ def _build_children(
                 resume_workspace_path=_launch.workspace_path if _launch else None,
                 resume_launch_metadata=_launch.launch_metadata if _launch else None,
                 resume_claim_id=_launch.resume_claim_id if _launch else None,
+                resume_credential_pool=_launch._credential_pool if _launch else None,
+                resume_credential_id=_launch.resume_credential_id if _launch else None,
                 routing_cfg=routing_cfg,
                 child_tool_policy=child_tool_policy,
                 **_task_overrides,

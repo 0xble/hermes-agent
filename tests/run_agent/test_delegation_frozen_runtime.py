@@ -162,7 +162,7 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
         "api_key": "PRIMARY-API-SENTINEL", "api_mode": "chat_completions",
         "fallback_model": None,
     })
-    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *_a: ([], []))
+    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *_a, **_k: ([], []))
     monkeypatch.setattr(delegate_tool, "_open_child_session_db", lambda _parent: None)
     monkeypatch.setattr(delegate_tool, "_attach_child", lambda *_a: None)
     monkeypatch.setattr("run_agent.AIAgent", Child)
@@ -228,7 +228,7 @@ def test_real_constructor_named_moa_child_has_no_parent_fallback_chain(monkeypat
         "provider": "moa", "model": "review", "base_url": "moa://local", "api_key": None,
         "api_mode": "chat_completions", "fallback_model": None,
     })
-    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *_a: ([], []))
+    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *_a, **_k: ([], []))
     monkeypatch.setattr(delegate_tool, "_open_child_session_db", lambda _parent: None)
     monkeypatch.setattr(delegate_tool, "_attach_child", lambda *_a: None)
 
@@ -648,3 +648,92 @@ def test_resumed_child_leases_the_authorized_stable_credential():
 def test_global_delegation_segment_budget_remains_250():
     from tools.delegate_tool import DEFAULT_MAX_ITERATIONS
     assert DEFAULT_MAX_ITERATIONS == 250
+
+
+def test_resume_rejects_changed_authentication_header_override(monkeypatch):
+    from tools import delegate_tool
+    from tools.custom_subagents import _authority_mapping_fingerprint
+
+    metadata, definitions, parent = _resume_fixture(monkeypatch)
+    original = {"max_output_tokens": 321, "extra_headers": {"X-Api-Key": "first-secret"}}
+    changed = {"max_output_tokens": 321, "extra_headers": {"X-Api-Key": "second-secret"}}
+    metadata["request_overrides"] = {"max_output_tokens": 321}
+    metadata["request_overrides_fingerprint"] = _authority_mapping_fingerprint(original)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_k: {
+        "provider": "fixture", "model": "m", "base_url": "https://fixture/v1",
+        "api_key": "secret", "api_mode": "chat_completions", "request_overrides": changed,
+    })
+
+    with pytest.raises(ValueError, match="primary route can no longer be authorized exactly"):
+        delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
+
+
+def test_moa_resume_rejects_authentication_header_rotation(monkeypatch):
+    from agent import moa_loop
+    auth = {"value": "first-header"}
+    preset = {"reference_models": [{"provider": "p1", "model": "r1"}],
+              "aggregator": {"provider": "pa", "model": "a1"}}
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda _name: (preset, {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda *, requested, target_model: {
+        "provider": requested, "model": target_model,
+        "base_url": f"https://{requested}.fixture/v1", "api_key": f"key-{requested}",
+        "api_mode": "chat_completions", "request_overrides": {
+            "extra_headers": {"Authorization": auth["value"]},
+        },
+    })
+    metadata = moa_loop.snapshot_moa_preset("review").metadata()
+    auth["value"] = "second-header"
+    with pytest.raises(ValueError, match="frozen authority"):
+        moa_loop.restore_moa_preset(metadata)
+
+
+def test_resumable_metadata_records_active_fallback_pool_rotation():
+    from tools.delegate_tool import _refresh_resumable_launch_metadata
+
+    launch = {
+        "provider": "primary", "model": "main", "credential_pool_entry_id": "primary-account",
+        "fallbacks": [{
+            "provider": "fallback", "model": "backup", "authority_fingerprint": "launch-digest",
+        }],
+    }
+    child = SimpleNamespace(
+        provider="fallback", model="backup", api_key="rotated-fallback-secret",
+        _credential_pool_entry_id="fallback-account-b",
+    )
+    updated = _refresh_resumable_launch_metadata(child, launch)
+
+    assert updated["credential_pool_entry_id"] == "primary-account"
+    assert updated["fallbacks"][0]["credential_pool_entry_id"] == "fallback-account-b"
+    assert updated["fallbacks"][0]["authority_fingerprint"] == hashlib.sha256(
+        b"rotated-fallback-secret"
+    ).hexdigest()
+    assert "rotated-fallback-secret" not in json.dumps(updated)
+
+
+def test_fallback_resume_restores_persisted_stable_pool_entry():
+    from tools.custom_subagents import ResolvedRoute
+    from tools.delegate_tool import _fallback_metadata_matches, _restore_fallback_authority
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    entry = SimpleNamespace(
+        id="fallback-account-b", provider="fallback",
+        runtime_api_key="refreshed-fallback-token", runtime_base_url="https://fallback.fixture/v1",
+    )
+    pool = SimpleNamespace(entries=lambda: [entry])
+    launch_key = "launch-fallback-token"
+    route = ResolvedRoute(
+        "fallback", "backup", "https://fallback.fixture/v1", "chat_completions", None,
+        launch_key, hashlib.sha256(launch_key.encode()).hexdigest(), "{}", pool,  # type: ignore[arg-type]
+    )
+    expected = [route.metadata()]
+    expected[0]["credential_pool_entry_id"] = entry.id
+    expected[0]["authority_fingerprint"] = hashlib.sha256(
+        entry.runtime_api_key.encode()
+    ).hexdigest()
+
+    restored = _restore_fallback_authority((route,), expected, normalize_route_base_url)
+
+    assert restored[0].api_key == entry.runtime_api_key
+    assert restored[0].credential_pool_entry_id == entry.id
+    assert _fallback_metadata_matches(restored, expected)
+    assert entry.runtime_api_key not in json.dumps(expected)

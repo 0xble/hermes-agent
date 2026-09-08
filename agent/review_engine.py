@@ -150,14 +150,15 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
     }
     if cfg["provider"].lower() == "auto":
         cfg["provider"] = ""
+    if "reasoning_effort" in review:
+        cfg["reasoning_effort"] = review.get("reasoning_effort")
     if "fallback_chain" in review:
+        from hermes_cli.fallback_config import get_fallback_chain
         chain = review.get("fallback_chain")
-        if isinstance(chain, list):
-            from hermes_cli.fallback_config import get_fallback_chain
-            normalized_chain = get_fallback_chain({"fallback_providers": chain})
-            if normalized_chain:
-                cfg["fallback_providers"] = normalized_chain
-    if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or cfg.get("fallback_providers")):
+        # Its presence is policy: even an empty or invalid chain must prevent
+        # this auxiliary route from silently borrowing the parent's fallbacks.
+        cfg["fallback_providers"] = get_fallback_chain({"fallback_providers": chain})
+    if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or "fallback_providers" in cfg or "reasoning_effort" in cfg):
         return None
     return cfg
 
@@ -210,7 +211,8 @@ def start_review(
         from tools.async_delegation import get_native_review_reuse
         reuse = get_native_review_reuse(candidate, focus=user_prompt)
         if reuse is not None:
-            reuse.setdefault("review_model", (credentials_cfg or {}).get("model") or "")
+            actual = str((reuse.get("native_review_result") or {}).get("actual_model") or "").strip()
+            reuse["review_model"] = actual or str(reuse.get("review_model") or "").strip()
             return reuse
         goal = (
             "Review the captured candidate independently. Do not run repository tests. "

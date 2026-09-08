@@ -57,6 +57,7 @@ class ResolvedRoute:
     credential_digest: str = field(default="", repr=False)
     request_overrides_json: str = "{}"
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
+    credential_pool_entry_id: str | None = None
 
     def native_entry(self) -> dict:
         entry = {
@@ -71,13 +72,19 @@ class ResolvedRoute:
         return entry
 
     def metadata(self) -> dict:
-        return {
+        metadata = {
             "provider": self.provider, "model": self.model,
             "base_url": nonsecret_route_url(self.base_url), "api_mode": self.api_mode,
             "reasoning_effort": self.reasoning_effort,
             "authority_fingerprint": self.credential_digest,
             "request_overrides": _nonsecret_mapping(json.loads(self.request_overrides_json)),
+            "request_overrides_fingerprint": _authority_mapping_fingerprint(
+                json.loads(self.request_overrides_json)
+            ),
         }
+        if self.credential_pool_entry_id:
+            metadata["credential_pool_entry_id"] = self.credential_pool_entry_id
+        return metadata
 
 
 def nonsecret_route_url(value: str) -> str:
@@ -122,6 +129,21 @@ def _nonsecret_mapping(value):
     return value
 
 
+def _authority_mapping_fingerprint(value) -> str:
+    """Bind complete override authority without persisting its secret values."""
+    canonical = json.dumps(
+        value or {}, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(b"hermes-request-overrides-v1\0" + canonical).hexdigest()
+
+
+def _authority_mapping_matches(value, public_value, fingerprint) -> bool:
+    """Validate full authority; legacy metadata is safe only when nothing was redacted."""
+    if isinstance(fingerprint, str) and fingerprint:
+        return _authority_mapping_fingerprint(value) == fingerprint
+    return (value or {}) == (public_value or {})
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedSubagentLaunch:
     definition: SubagentDefinition | None
@@ -134,6 +156,8 @@ class ResolvedSubagentLaunch:
     workspace_path: str | None = None
     launch_metadata: Mapping | None = None
     resume_claim_id: str | None = None
+    _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
+    resume_credential_id: str | None = None
 
 
 _FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort", "inherit_parent", "moa_presets", "fallbacks"})
@@ -410,12 +434,16 @@ def freeze_fallback_routes(
                     f"subagent_type {definition.name!r}: fallback {index} reasoning_effort "
                     f"{route.reasoning_effort!r} unsupported by {provider}/{model}"
                 )
+        pool = runtime.get("credential_pool")
+        credential_id = None
+        if pool is not None and callable(getattr(pool, "entry_id_for_api_key", None)):
+            credential_id = pool.entry_id_for_api_key(str(api_key))
         frozen.append(ResolvedRoute(
             provider, model, base_url, api_mode, route.reasoning_effort,
             str(api_key), hashlib.sha256(str(api_key).encode()).hexdigest(),
             json.dumps(runtime.get("request_overrides") or {}, sort_keys=True,
                        separators=(",", ":"), default=str),
-            runtime.get("credential_pool"),
+            pool, credential_id,
         ))
         seen.add((route.provider, route.model))
     return tuple(frozen)
@@ -568,7 +596,10 @@ class RuntimePin:
         digest = hashlib.sha256(api_key.encode()).hexdigest()
         if fallback is None:
             return replace(self, _credential_digest=digest, _pinned_credential=bool(api_key))
-        rotated = replace(fallback, api_key=api_key, credential_digest=digest)
+        rotated = replace(
+            fallback, api_key=api_key, credential_digest=digest,
+            credential_pool_entry_id=getattr(entry, "id", None),
+        )
         return replace(self, fallback_routes=tuple(
             rotated if route is fallback else route for route in self.fallback_routes
         ))

@@ -272,7 +272,10 @@ def recover_abandoned_delegations() -> int:
             if task.get("completion_contract") is not None:
                 event["completion_contract"] = task["completion_contract"]
                 typed = _native_review_result(
-                    task["completion_contract"], {"status": "unknown", "error": error}
+                    task["completion_contract"], {
+                        "status": "unknown", "exit_reason": "owner_abandoned",
+                        "error": event["error"],
+                    }
                 )
                 if typed is not None:
                     event["native_review_result"] = typed

@@ -169,14 +169,61 @@ def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
 
 
 @pytest.mark.parametrize("chain", [[], None, "not-a-list"])
-def test_load_review_credentials_cfg_ignores_unusable_fallback_chain(monkeypatch, chain):
+def test_load_review_credentials_cfg_keeps_explicit_unusable_fallback_chain_local(monkeypatch, chain):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {"auxiliary": {"review": {
             "provider": "auto", "model": "", "fallback_chain": chain,
         }}},
     )
-    assert re_mod._load_review_credentials_cfg() is None
+    cfg = re_mod._load_review_credentials_cfg()
+    assert cfg is not None and cfg["fallback_providers"] == []
+
+    from tools.delegate_tool_config import _resolve_child_fallback_chain
+    parent = MagicMock()
+    parent._fallback_chain = [{"provider": "unconfigured", "model": "parent-fallback"}]
+    assert _resolve_child_fallback_chain(parent, cfg, pinned=False) is None
+
+
+def test_review_credentials_cfg_preserves_reasoning_effort(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "auto", "reasoning_effort": "high",
+        }}},
+    )
+    cfg = re_mod._load_review_credentials_cfg()
+    assert cfg is not None
+    assert cfg["reasoning_effort"] == "high"
+
+
+def test_review_route_reasoning_reaches_child_constructor_for_manual_and_candidate(monkeypatch):
+    """Both review entry points use the actual delegation routing resolver."""
+    from tools.delegate_tool_config import _resolve_child_runtime
+
+    parent = MagicMock()
+    parent.model = "parent-model"
+    parent.provider = "parent-provider"
+    parent.base_url = "https://parent.invalid/v1"
+    parent.api_mode = "chat_completions"
+    parent.reasoning_config = {"effort": "low", "enabled": True}
+    parent._fallback_chain = [{"provider": "parent", "model": "fallback"}]
+    parent.request_overrides = {}
+    parent.acp_command = None
+    parent.acp_args = []
+    parent.capabilities = {}
+    route = {
+        "provider": "", "model": "review-model", "base_url": "", "api_key": "", "api_mode": "",
+        "reasoning_effort": "high", "fallback_providers": [],
+    }
+    for candidate in (False, True):
+        runtime = _resolve_child_runtime(
+            parent, {"reasoning_effort": "low"}, "parent-key", model="review-model",
+            override_provider=None, override_base_url=None, override_api_key=None, override_api_mode=None,
+            override_max_tokens=None, override_acp_command=None, override_acp_args=None, routing_cfg=route,
+        )
+        assert runtime["reasoning_config"] == {"effort": "high", "enabled": True}
+        assert runtime["fallback_model"] is None
 
 
 def test_load_review_credentials_cfg_missing_section(monkeypatch):

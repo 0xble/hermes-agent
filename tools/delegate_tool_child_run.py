@@ -500,6 +500,7 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
         "child_session_id": _str_or_none(getattr(child, "session_id", None)),
         "route_transitions": list(getattr(child, "_delegation_route_transitions", ()) or ()),
         "exit_reason": exit_reason,

@@ -254,7 +254,7 @@ def test_start_review_reuses_unchanged_durable_outcome(candidate_repo, monkeypat
     reuse = {
         "status": "reused", "delegation_id": "review-old",
         "candidate_id": candidate.candidate_id,
-        "native_review_result": {"judgment": "request_changes"},
+        "native_review_result": {"judgment": "request_changes", "actual_model": "fallback-provider/fallback-model"},
     }
     monkeypatch.setattr("tools.async_delegation.get_native_review_reuse", lambda *_a, **_k: reuse)
     monkeypatch.setattr(
@@ -263,10 +263,12 @@ def test_start_review_reuses_unchanged_durable_outcome(candidate_repo, monkeypat
     )
     from agent.review_engine import start_review
 
-    assert start_review(
+    result = start_review(
         SimpleNamespace(ephemeral_system_prompt=""),
         [{"role": "user", "content": "Review the candidate."}], candidate=candidate,
-    )["delegation_id"] == "review-old"
+    )
+    assert result["delegation_id"] == "review-old"
+    assert result["review_model"] == "fallback-provider/fallback-model"
 
 
 def test_native_async_ledger_reuses_only_valid_unchanged_terminal_result(
@@ -352,3 +354,27 @@ def test_native_review_notification_invalidates_stale_candidate(candidate_repo):
     assert '\"judgment\": \"unknown\"' in text
     assert "not currently admissible" in text
     assert "candidate changed" in text.lower()
+
+
+def test_candidate_identity_preserves_distinct_non_utf8_tracked_patch_bytes(candidate_repo, monkeypatch):
+    from agent import review_candidate
+
+    path = candidate_repo / "invalid-utf8.txt"
+    path.write_bytes(b"value=base\n")
+    _git(candidate_repo, "add", "invalid-utf8.txt")
+    _git(candidate_repo, "commit", "-m", "add invalid utf8 fixture")
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    patch = {"bytes": b"@@ -1 +1 @@\n-value=base\n+value=\x80\n"}
+    real_git = review_candidate._git
+    monkeypatch.setattr(
+        review_candidate, "_git",
+        lambda repo, *args: patch["bytes"] if args and args[0] == "diff" else real_git(repo, *args),
+    )
+
+    first = review_candidate.capture_review_candidate(candidate_repo, base, ["invalid-utf8.txt"])
+    patch["bytes"] = b"@@ -1 +1 @@\n-value=base\n+value=\x81\n"
+    second = review_candidate.capture_review_candidate(candidate_repo, base, ["invalid-utf8.txt"])
+
+    assert first.tracked_patch == second.tracked_patch
+    assert first.candidate_id != second.candidate_id
+    assert first.tracked_patch_sha256 != second.tracked_patch_sha256
