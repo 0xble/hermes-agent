@@ -28,13 +28,17 @@ from cron.jobs import (
 )
 
 
-def test_fire_claim_run_id_survives_stale_reclaim_but_not_new_fire(tmp_cron_dir):
+def test_new_fire_after_stale_claim_gets_fresh_run_id_while_live_claim_is_idempotent(tmp_cron_dir):
     job = create_job(prompt="x", schedule="every 5m", name="durable-run")
     first = claim_job_for_fire(job["id"], force=True, return_job=True)
     assert isinstance(first, dict)
-    first_owner = first["fire_claim"]["by"]
     first_run_id = first["fire_claim"]["run_id"]
 
+    # A duplicate delivery of this still-live fire must not mint a second run.
+    assert claim_job_for_fire(job["id"], force=True, return_job=True) is False
+    assert get_job(job["id"])["fire_claim"]["run_id"] == first_run_id
+
+    # An expired claim no longer identifies the next scheduled/manual fire.
     jobs = list_jobs(include_disabled=True)
     stored = next(item for item in jobs if item["id"] == job["id"])
     stored["fire_claim"]["at"] = (
@@ -42,17 +46,9 @@ def test_fire_claim_run_id_survives_stale_reclaim_but_not_new_fire(tmp_cron_dir)
     ).isoformat()
     save_jobs(jobs)
 
-    retry = claim_job_for_fire(
+    new_fire = claim_job_for_fire(
         job["id"], claim_ttl_seconds=1, force=True, return_job=True
     )
-    assert isinstance(retry, dict)
-    assert retry["fire_claim"]["by"] != first_owner
-    assert retry["fire_claim"]["run_id"] == first_run_id
-
-    assert mark_job_run(
-        job["id"], True, expected_fire_owner=retry["fire_claim"]["by"]
-    )
-    new_fire = claim_job_for_fire(job["id"], force=True, return_job=True)
     assert isinstance(new_fire, dict)
     assert new_fire["fire_claim"]["run_id"] != first_run_id
 
