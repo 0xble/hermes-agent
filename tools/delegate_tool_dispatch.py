@@ -42,6 +42,10 @@ class _Batch:
     origin_owner_transport: Any
     origin_owner_session_record: Any
     overall_start: float
+    completion_contract: Optional[Dict[str, Any]] = None
+    # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
+    group: Optional[str] = None
+    unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
 
     def owner_kwargs(self) -> Dict[str, Any]:
         """Steer/stop authority of the originating session, passed to every child run."""
@@ -287,6 +291,44 @@ def _dispatched_payload(dispatch: dict, goals: List[str], child_agents: List[Any
         payload["live_transcripts"] = list(live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
     return payload
+
+def _units_of(batch: _Batch) -> List[_Batch]:
+    """Partition the call's children into async units: one per distinct task ``group`` (first-appearance order) and
+    one per ungrouped task. Each unit is a ``_Batch`` sharing the call's task_list/transcripts but owning a subset of
+    ``children``, so a unit joins only on itself and its completion re-enters the conversation on its own.
+
+    Off by default (``delegation.independent_completions``): the whole call is ONE unit and returns as one message.
+    A per-task flurry of completions (one new turn each) fragmented orchestrators that had no plan for it."""
+    from tools.delegate_tool_config import _get_independent_completions
+    if not _get_independent_completions():
+        return [batch]
+    members: Dict[Any, List[tuple]] = {}
+    for i, t, c in batch.children:
+        g = t.get("group")
+        key = ("g", str(g)) if g not in (None, "") else ("i", i)
+        members.setdefault(key, []).append((i, t, c))
+    return [replace(batch, children=ch, group=(key[1] if key[0] == "g" else None)) for key, ch in members.items()]
+
+def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str], routing: dict) -> dict:
+    """Hand ONE unit to the async registry; the runner joins on that unit's children only."""
+    from tools.async_delegation import dispatch_async_delegation_batch
+    child_agents = [c for (_, _, c) in unit.children]
+
+    def _interrupt():
+        for c in child_agents:
+            _signal_child_stop(c, "Async delegation cancelled")
+
+    return dispatch_async_delegation_batch(
+        # Call-wide goals: completion formatting indexes them by task_index.
+        goals=[t["goal"] for t in unit.task_list], context=unit.context,
+        toolsets=None,  # metadata for the completion block only; subagents inherit the parent's toolsets
+        role=unit.top_role, model=unit.creds["model"],
+        runner=lambda: _execute_and_aggregate(unit, honor_parent_interrupt=False),
+        interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
+        task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
+        progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        completion_contract=unit.completion_contract,
+    )
 
 def _dispatch_background(batch: _Batch) -> str:
     """Dispatch the WHOLE batch as one async unit and return the tool result JSON. The runner joins on every child and

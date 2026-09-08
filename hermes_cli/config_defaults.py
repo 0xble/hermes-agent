@@ -705,8 +705,12 @@ DEFAULT_CONFIG = {
         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
         # delegation.provider pins. "auto" + "" = main agent's model. api_mode forces transport:
-        # chat_completions | anthropic_messages | codex_responses.
-        "review": {"provider": "auto", "model": "", "base_url": "", "api_key": "", "api_mode": ""},
+        # chat_completions | anthropic_messages | codex_responses. tool_policy preserves the
+        # historical broad capability set unless inspection_only is explicitly selected.
+        "review": {
+            "provider": "auto", "model": "", "base_url": "", "api_key": "", "api_mode": "",
+            "tool_policy": "legacy_unrestricted",
+        },
         "mcp": _aux(30),
         # prefer_fast_model opts in to the provider fast tier; auto otherwise = main model.
         "title_generation": {

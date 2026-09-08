@@ -40,6 +40,12 @@ class TestGetToolset:
         assert "xurl" in description
         assert "authenticated" in description
 
+    def test_review_inspection_toolset_is_exact_and_non_composite(self):
+        ts = get_toolset("review-inspection")
+        assert ts is not None
+        assert set(ts["tools"]) == {"read_file", "search_files", "skills_list", "skill_view"}
+        assert ts.get("includes", []) == []
+
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(

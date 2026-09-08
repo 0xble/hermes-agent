@@ -166,8 +166,31 @@ def _desktop_preview(agent, args: dict, ctx: InlineToolContext) -> Any:
     return _handle_preview(args)
 
 
+def _review_current_work(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.review_candidate import capture_review_candidate
+    from agent.review_engine import start_review
+
+    if getattr(agent, "is_subagent", False) is True or int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
+        raise ValueError("review_current_work is parent-only and cannot be invoked by a delegated child")
+
+    candidate = capture_review_candidate(
+        args["repository"], base_revision=args["base_revision"],
+        accepted_scope=args["accepted_scope"],
+    )
+    result = start_review(
+        parent_agent=agent, messages=ctx.messages or [],
+        user_prompt=args.get("focus", ""), candidate=candidate,
+    )
+    if isinstance(result, dict) and result.get("status") == "dispatched":
+        # The normal durable completion rail owns the next useful turn. Stop
+        # this work phase so the parent cannot continue past its own review gate.
+        agent._review_yield_requested = True
+    return result
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
+    "review_current_work": _review_current_work,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

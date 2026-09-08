@@ -1,0 +1,325 @@
+"""Immutable candidate evidence and typed native-review results.
+
+This module captures Git evidence with read-only commands.  It does not stage,
+reset, checkout, or otherwise write the caller's index or worktree.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+import stat
+import subprocess
+from typing import Any, Iterable, Mapping
+
+
+_CANDIDATE_CONTRACT = "review_candidate_v1"
+_JUDGMENT_CONTRACT = "native_review_judgment_v1"
+_RESULT_CONTRACT = "native_review_result_v1"
+_JUDGMENTS = frozenset({"approve", "request_changes", "needs_human"})
+
+
+class ReviewCandidateStale(ValueError):
+    """The repository no longer matches the candidate sent for review."""
+
+
+@dataclass(frozen=True)
+class ReviewUntrackedFileV1:
+    path: str
+    mode: str
+    content_base64: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class ReviewCandidateV1:
+    repository: str
+    base_commit: str
+    head_commit: str
+    accepted_scope: tuple[str, ...]
+    tracked_patch: str
+    untracked_files: tuple[ReviewUntrackedFileV1, ...]
+    candidate_id: str
+    contract: str = field(default=_CANDIDATE_CONTRACT, init=False)
+
+    def evidence_payload(self) -> dict[str, Any]:
+        """Complete, JSON-safe evidence supplied to the reviewer."""
+        return asdict(self)
+
+    def to_json(self) -> str:
+        """Serialize the complete captured evidence deterministically."""
+        return json.dumps(
+            self.evidence_payload(), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "ReviewCandidateV1":
+        """Restore persisted evidence without silently normalizing its identity."""
+        if payload.get("contract") != _CANDIDATE_CONTRACT:
+            raise ValueError(f"Review candidate contract must be {_CANDIDATE_CONTRACT!r}")
+        candidate = cls(
+            repository=str(payload.get("repository") or ""),
+            base_commit=str(payload.get("base_commit") or ""),
+            head_commit=str(payload.get("head_commit") or ""),
+            accepted_scope=tuple(str(item) for item in payload.get("accepted_scope") or ()),
+            tracked_patch=str(payload.get("tracked_patch") or ""),
+            untracked_files=tuple(
+                ReviewUntrackedFileV1(**item) for item in payload.get("untracked_files") or ()
+            ),
+            candidate_id=str(payload.get("candidate_id") or ""),
+        )
+        canonical = json.dumps(
+            _identity_payload(candidate), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        expected = "sha256:" + hashlib.sha256(canonical).hexdigest()
+        if candidate.candidate_id != expected:
+            raise ValueError("Persisted review candidate identity is invalid")
+        return candidate
+
+
+@dataclass(frozen=True)
+class NativeReviewResultV1:
+    candidate_id: str
+    runtime_status: str
+    exit_reason: str
+    judgment: str
+    coverage: tuple[str, ...]
+    actual_model: str
+    summary: str
+    contract: str = field(default=_RESULT_CONTRACT, init=False)
+    grants_authority: bool = field(default=False, init=False)
+    requires_existing_authority: bool = field(default=True, init=False)
+
+    @classmethod
+    def from_payload(
+        cls, payload: Mapping[str, Any], *, candidate_id: str = "",
+    ) -> "NativeReviewResultV1":
+        """Restore one runtime-authored result without weakening fail-closed invariants."""
+        if payload.get("contract") != _RESULT_CONTRACT:
+            raise ValueError(f"Native review result contract must be {_RESULT_CONTRACT!r}")
+        bound_id = payload.get("candidate_id")
+        if not isinstance(bound_id, str) or not bound_id.startswith("sha256:"):
+            raise ValueError("Native review result has an invalid candidate_id")
+        if candidate_id and bound_id != candidate_id:
+            raise ValueError("Native review result candidate_id does not match the captured candidate")
+        runtime_status = payload.get("runtime_status")
+        exit_reason = payload.get("exit_reason")
+        judgment = payload.get("judgment")
+        coverage = payload.get("coverage")
+        actual_model = payload.get("actual_model")
+        summary = payload.get("summary")
+        if not all(isinstance(value, str) for value in (
+            runtime_status, exit_reason, judgment, actual_model, summary,
+        )):
+            raise ValueError("Native review result contains non-string scalar fields")
+        if judgment not in _JUDGMENTS | {"unknown"}:
+            raise ValueError("Native review result has an invalid judgment")
+        if not isinstance(coverage, (list, tuple)) or not all(isinstance(item, str) for item in coverage):
+            raise ValueError("Native review result coverage must be an array of strings")
+        if judgment in _JUDGMENTS and (runtime_status != "completed" or exit_reason != "completed"):
+            raise ValueError("Only a fully completed runtime may carry a review judgment")
+        if payload.get("grants_authority") is not False or payload.get("requires_existing_authority") is not True:
+            raise ValueError("Native review result cannot grant action authority")
+        return cls(
+            candidate_id=bound_id, runtime_status=str(runtime_status), exit_reason=str(exit_reason),
+            judgment=str(judgment), coverage=tuple(coverage), actual_model=str(actual_model), summary=str(summary),
+        )
+
+    @classmethod
+    def from_delegation_entry(
+        cls, entry: Mapping[str, Any], candidate: ReviewCandidateV1
+    ) -> "NativeReviewResultV1":
+        """Build a result from runtime-owned fields plus model judgment.
+
+        Runtime status and actual model always come from the delegation entry,
+        never from model-authored JSON. A non-completed/invalid run cannot
+        become an approval merely because its summary says so.
+        """
+        require_fresh_candidate(candidate)
+        from tools.delegation_output_schema import extract_json_candidate
+
+        raw_summary = str(entry.get("summary") or "")
+        try:
+            authored = json.loads(extract_json_candidate(raw_summary))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Native review summary is not valid JSON: {exc}") from exc
+        if not isinstance(authored, dict):
+            raise ValueError("Native review summary must be a JSON object")
+        if authored.get("contract") != _JUDGMENT_CONTRACT:
+            raise ValueError(f"Native review contract must be {_JUDGMENT_CONTRACT!r}")
+        if authored.get("candidate_id") != candidate.candidate_id:
+            raise ValueError("Native review candidate_id does not match the captured candidate")
+
+        runtime_status = str(entry.get("status") or "failed")
+        schema_valid = entry.get("schema_valid") is True
+        authored_judgment = str(authored.get("judgment") or "")
+        judgment = (
+            authored_judgment
+            if (
+                runtime_status == "completed"
+                and str(entry.get("exit_reason") or "") == "completed"
+                and entry.get("truncated") is not True
+                and schema_valid
+                and authored_judgment in _JUDGMENTS
+            )
+            else "unknown"
+        )
+        raw_coverage = authored.get("coverage")
+        coverage = tuple(str(item) for item in raw_coverage) if isinstance(raw_coverage, list) else ()
+        return cls(
+            candidate_id=candidate.candidate_id,
+            runtime_status=runtime_status,
+            exit_reason=str(entry.get("exit_reason") or ""),
+            judgment=judgment,
+            coverage=coverage,
+            actual_model=str(entry.get("model") or ""),
+            summary=str(authored.get("summary") or ""),
+        )
+
+
+def native_review_output_schema(candidate_id: str) -> dict[str, Any]:
+    """Model-authored portion of the native review result.
+
+    The delegation runtime supplies execution state and actual model later.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "contract": {"const": _JUDGMENT_CONTRACT},
+            "candidate_id": {"const": candidate_id},
+            "judgment": {"enum": sorted(_JUDGMENTS)},
+            "coverage": {"type": "array", "items": {"type": "string"}},
+            "summary": {"type": "string"},
+        },
+        "required": ["contract", "candidate_id", "judgment", "coverage", "summary"],
+    }
+
+
+def native_review_completion_contract(
+    candidate: ReviewCandidateV1, *, focus: str = "",
+) -> dict[str, Any]:
+    """Durable runtime-owned contract carried beside one review delegation."""
+    return {
+        "kind": _RESULT_CONTRACT,
+        "candidate": candidate.evidence_payload(),
+        "focus": str(focus or "").strip(),
+    }
+
+
+def _git(repo: Path, *args: str) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", b"")
+        rendered = detail.decode("utf-8", "replace").strip() if isinstance(detail, bytes) else str(detail or "")
+        raise ValueError(f"Could not capture review candidate with git: {rendered or exc}") from exc
+
+
+def _normalize_scope(scope: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw in scope:
+        value = str(raw).strip().replace(os.sep, "/")
+        path = Path(value)
+        if not value or path.is_absolute() or value in (".", "..") or ".." in path.parts:
+            raise ValueError("accepted_scope entries must be repository-relative paths")
+        if value.startswith(":"):
+            raise ValueError("accepted_scope entries must be literal repository-relative paths")
+        normalized.append(value.rstrip("/"))
+    if not normalized:
+        raise ValueError("accepted_scope must contain at least one explicit path")
+    return tuple(sorted(set(normalized)))
+
+
+def _literal_pathspecs(scope: tuple[str, ...]) -> list[str]:
+    return [f":(literal){path}" for path in scope]
+
+
+def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
+    path = repo / relative
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        content = os.fsencode(os.readlink(path))
+        mode = "120000"
+    elif stat.S_ISREG(info.st_mode):
+        content = path.read_bytes()
+        mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+    else:
+        raise ValueError(f"Unsupported untracked candidate file type: {relative}")
+    return ReviewUntrackedFileV1(
+        path=relative,
+        mode=mode,
+        content_base64=base64.b64encode(content).decode("ascii"),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def _identity_payload(candidate: ReviewCandidateV1) -> dict[str, Any]:
+    payload = candidate.evidence_payload()
+    payload.pop("candidate_id", None)
+    return payload
+
+
+def capture_review_candidate(
+    repository: str | os.PathLike[str],
+    base_revision: str,
+    accepted_scope: Iterable[str],
+) -> ReviewCandidateV1:
+    """Capture one explicit repository/base/scope candidate without mutations."""
+    if not str(base_revision or "").strip():
+        raise ValueError("base_revision must be explicit")
+    requested_repo = Path(repository).expanduser().resolve()
+    root = Path(_git(requested_repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+    scope = _normalize_scope(accepted_scope)
+    base_commit = _git(root, "rev-parse", "--verify", f"{base_revision}^{{commit}}").decode().strip()
+    head_commit = _git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
+    pathspecs = _literal_pathspecs(scope)
+    patch_bytes = _git(root, "diff", "--binary", "--no-ext-diff", base_commit, "--", *pathspecs)
+    untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
+    untracked_paths = sorted(
+        item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item
+    )
+    untracked = tuple(_untracked_entry(root, path) for path in untracked_paths)
+    if not patch_bytes and not untracked:
+        raise ValueError("Accepted review scope contains no tracked changes or untracked files")
+    provisional = ReviewCandidateV1(
+        repository=str(root),
+        base_commit=base_commit,
+        head_commit=head_commit,
+        accepted_scope=scope,
+        tracked_patch=patch_bytes.decode("utf-8", "replace"),
+        untracked_files=untracked,
+        candidate_id="",
+    )
+    canonical = json.dumps(
+        _identity_payload(provisional), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return ReviewCandidateV1(
+        repository=provisional.repository,
+        base_commit=base_commit,
+        head_commit=head_commit,
+        accepted_scope=scope,
+        tracked_patch=provisional.tracked_patch,
+        untracked_files=untracked,
+        candidate_id="sha256:" + hashlib.sha256(canonical).hexdigest(),
+    )
+
+
+def require_fresh_candidate(candidate: ReviewCandidateV1) -> ReviewCandidateV1:
+    """Re-capture and reject stale/reused results before they are consumed."""
+    current = capture_review_candidate(
+        candidate.repository, candidate.base_commit, candidate.accepted_scope
+    )
+    if current.candidate_id != candidate.candidate_id:
+        raise ReviewCandidateStale(
+            f"Review candidate changed: expected {candidate.candidate_id}, got {current.candidate_id}"
+        )
+    return current

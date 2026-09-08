@@ -162,7 +162,30 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
     return cfg
 
 
-def start_review(parent_agent, messages: List[Dict[str, Any]], user_prompt: str = "") -> Dict[str, Any]:
+def _load_review_tool_policy() -> str:
+    """Resolve the review capability policy; reject malformed explicit values."""
+    from agent.review_policy import LEGACY_UNRESTRICTED, VALID_REVIEW_TOOL_POLICIES
+    try:
+        from hermes_cli.config import load_config_readonly
+        review = (load_config_readonly().get("auxiliary") or {}).get("review") or {}
+    except Exception:
+        review = {}
+    if not isinstance(review, dict):
+        raise ValueError("auxiliary.review must be an object")
+    policy = review.get("tool_policy", LEGACY_UNRESTRICTED)
+    if policy not in VALID_REVIEW_TOOL_POLICIES:
+        allowed = ", ".join(sorted(VALID_REVIEW_TOOL_POLICIES))
+        raise ValueError(f"auxiliary.review.tool_policy must be one of: {allowed}")
+    return policy
+
+
+def start_review(
+    parent_agent,
+    messages: List[Dict[str, Any]],
+    user_prompt: str = "",
+    *,
+    candidate=None,
+) -> Dict[str, Any]:
     """Dispatch the reviewer subagent; returns the parsed ``delegate_task`` dict (``status: "dispatched"`` +
     ``delegation_id``, or the synchronous result on channels without async completions). Raises ValueError
     when there is nothing to review or the dispatch is rejected/errored."""
@@ -173,9 +196,45 @@ def start_review(parent_agent, messages: List[Dict[str, Any]], user_prompt: str 
         raise ValueError("Nothing to review yet — the conversation is empty.")
     goal, context = build_review_task(snapshot, user_prompt, collect_parent_loaded_skills(parent_agent, messages))
     credentials_cfg = _load_review_credentials_cfg()
+    tool_policy = None
+    output_schema = None
+    completion_contract = None
+    if candidate is not None:
+        from agent.review_candidate import (
+            ReviewCandidateV1, native_review_completion_contract, native_review_output_schema,
+        )
+        from agent.review_policy import INSPECTION_ONLY
+        if not isinstance(candidate, ReviewCandidateV1):
+            raise TypeError("candidate must be a ReviewCandidateV1")
+        tool_policy = INSPECTION_ONLY
+        from tools.async_delegation import get_native_review_reuse
+        reuse = get_native_review_reuse(candidate, focus=user_prompt)
+        if reuse is not None:
+            reuse.setdefault("review_model", (credentials_cfg or {}).get("model") or "")
+            return reuse
+        goal = (
+            "Review the captured candidate independently. Do not run repository tests. "
+            "Return the machine-validated judgment and coverage object."
+        )
+        context += (
+            "\n\nAUTHORITATIVE REVIEW CANDIDATE (captured evidence; do not substitute live working-tree state):\n"
+            + candidate.to_json()
+            + "\nInspection-only limits tool capabilities, not filesystem visibility; read any relevant "
+              "repository evidence, but judge exactly the captured candidate."
+        )
+        output_schema = native_review_output_schema(candidate.candidate_id)
+        completion_contract = native_review_completion_contract(candidate, focus=user_prompt)
+    else:
+        # Preserve the historical manual /review behavior unless the operator
+        # explicitly opts it into the stricter policy.
+        tool_policy = _load_review_tool_policy()
 
     from tools.delegate_tool import delegate_task
-    raw = delegate_task(goal=goal, context=context, background=True, parent_agent=parent_agent, credentials_cfg=credentials_cfg)
+    raw = delegate_task(
+        goal=goal, context=context, background=True, parent_agent=parent_agent,
+        credentials_cfg=credentials_cfg, output_schema=output_schema,
+        child_tool_policy=tool_policy, completion_contract=completion_contract,
+    )
     try:
         result = json.loads(raw)
     except Exception:

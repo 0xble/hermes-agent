@@ -144,6 +144,8 @@ def _build_child_agent(
     # Configuration block that owns this route's fallback policy. Internal
     # callers such as /review pass auxiliary.review here.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    # Trusted internal capability contract (currently used by native review).
+    child_tool_policy: Optional[str] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
     # HERMES-108: a trusted named definition from ``delegation.subagents``.
@@ -173,7 +175,27 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
     delegation_cfg = _load_config()
-    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    inspection_only = child_tool_policy == "inspection_only"
+    if inspection_only:
+        from agent.review_policy import INSPECTION_TOOL_NAMES
+        parent_names = set(getattr(parent_agent, "valid_tool_names", None) or ())
+        missing = sorted(INSPECTION_TOOL_NAMES - parent_names)
+        if missing:
+            raise ValueError(
+                "Inspection-only review requires parent access to: " + ", ".join(missing)
+            )
+    # Build from the parent's normal snapshot, then apply_review_tool_policy freezes
+    # the advertised and executable surface to the exact inspection allow-list.
+    # Asking _resolve_child_toolsets for the synthetic review-inspection toolset
+    # would be intersected away unless the parent explicitly enabled that name.
+    requested_toolsets = None if inspection_only else toolsets
+    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(
+        parent_agent,
+        requested_toolsets,
+        effective_role,
+        inherit_mcp_toolsets=not inspection_only,
+    )
+
     child_prompt = _build_child_system_prompt(
         goal, context,
         workspace_path=resume_workspace_path or _resolve_workspace_hint(parent_agent),
@@ -241,6 +263,12 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    from agent.review_policy import remove_parent_only_review_tools
+    remove_parent_only_review_tools(child)
+    if child_tool_policy is not None:
+        from agent.review_policy import apply_review_tool_policy
+        apply_review_tool_policy(child, child_tool_policy)
+    _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
@@ -754,6 +782,7 @@ def _build_children(
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
     task_runtime: Optional[List[Any]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
+    child_tool_policy: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
@@ -788,6 +817,7 @@ def _build_children(
                 resume_launch_metadata=_launch.launch_metadata if _launch else None,
                 resume_claim_id=_launch.resume_claim_id if _launch else None,
                 routing_cfg=routing_cfg,
+                child_tool_policy=child_tool_policy,
                 **_task_overrides,
             )
         except ValueError as exc:
@@ -819,6 +849,8 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    child_tool_policy: Optional[str] = None,
+    completion_contract: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -841,6 +873,8 @@ def delegate_task(
         )
 
     top_role = _normalize_role(role)
+    if child_tool_policy not in (None, "legacy_unrestricted", "inspection_only"):
+        return tool_error(f"Invalid review tool policy: {child_tool_policy!r}")
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
@@ -908,14 +942,14 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
-        routing_cfg=credentials_cfg,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime, routing_cfg=credentials_cfg, child_tool_policy=child_tool_policy,
     )
     if err:
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        completion_contract=completion_contract,
     )
     return _run_batch(batch, background)
 
