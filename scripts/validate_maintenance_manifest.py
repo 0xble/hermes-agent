@@ -15,6 +15,13 @@ _INDEX_ROW_RE = re.compile(
 )
 _RECORD_RE = re.compile(r"^###\s+(HERMES-\d+)\b")
 _SUBJECT_RE = re.compile(r"`([^`]+)`")
+_SQUASH_PR_SUFFIX_RE = re.compile(r" \(#[1-9][0-9]*\)$")
+
+
+def _is_registered_subject(subject: str, registered_subjects: Iterable[str]) -> bool:
+    """Match a stable subject before GitHub appends one squash PR suffix."""
+    registered = set(registered_subjects)
+    return subject in registered or _SQUASH_PR_SUFFIX_RE.sub("", subject) in registered
 
 
 def _duplicates(values: Iterable[str]) -> list[str]:
@@ -128,7 +135,11 @@ def _validate_registration_history(
             text=True,
             capture_output=True,
         )
-        if manifest.returncode != 0 or subject not in _registered_subjects(manifest.stdout):
+        registered_subjects = _registered_subjects(manifest.stdout)
+        if (
+            manifest.returncode != 0
+            or not _is_registered_subject(subject, registered_subjects)
+        ):
             errors.append(
                 f"fork subject was not registered in its own commit {commit[:12]}: {subject}"
             )
@@ -249,16 +260,31 @@ def validate_manifest(
         }
         for patch_id, _status, subjects in rows:
             for subject in subjects:
-                if subject not in fork_subject_set:
+                if not any(
+                    _is_registered_subject(observed, {subject})
+                    for observed in fork_subject_set
+                ):
                     errors.append(
                         f"{patch_id} stable subject missing from "
                         f"{coverage_label}: {subject}"
                     )
-        for subject in sorted(fork_subject_set - indexed_subjects - set(exemptions)):
+        registered_subjects = indexed_subjects | set(exemptions)
+        for subject in sorted(
+            observed
+            for observed in fork_subject_set
+            if not _is_registered_subject(observed, registered_subjects)
+        ):
             errors.append(
                 "fork-only subject is neither indexed nor exempt: " + subject
             )
-        for subject in sorted(set(exemptions) - fork_subject_set):
+        for subject in sorted(
+            registered
+            for registered in exemptions
+            if not any(
+                _is_registered_subject(observed, {registered})
+                for observed in fork_subject_set
+            )
+        ):
             errors.append(
                 f"administrative exemption is not present in {coverage_label}: {subject}"
             )
