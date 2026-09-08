@@ -1198,7 +1198,15 @@ def _create_quick_snapshot_locked(
             "Snapshot incomplete because %d DB(s) failed to capture and/or %d were oversized "
             "— preserving latest recovery copy of each omitted DB",
             len(failed_dbs), len(oversized_skipped))
-    _prune_quick_snapshots(root, keep=retention, preserve_recovery_for=set(failed_dbs) | set(oversized_skipped))
+    _prune_quick_snapshots(
+        root,
+        keep=retention,
+        preserve_recovery_for=set(failed_dbs) | set(oversized_skipped),
+        namespace=_quick_snapshot_namespace(label),
+    )
+    # Damaged manifests cannot identify their original retention policy. Bound
+    # recognizable snapshot artifacts separately using the normal (not updater) window.
+    _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP, namespace="unknown")
     logger.info("quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
                 snap_id, len(manifest), sum(manifest.values()))
     return snap_id
@@ -1215,6 +1223,69 @@ def _snapshot_dirs(root: Path) -> List[Path]:
     """Published snapshot directories under *root*, newest first."""
     return _newest_first(root, lambda d: d.is_dir() and not d.name.startswith(".")
                          and not d.name.endswith(".partial"))
+
+
+def _quick_snapshot_namespace(label: Optional[str]) -> str:
+    """Keep updater safety-net snapshots separate from user-created snapshots."""
+    return "pre-update" if label == "pre-update" else "manual"
+
+
+def _snapshot_retention_namespace(directory: Path, meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    if meta is not None:
+        return _quick_snapshot_namespace(meta.get("label"))
+    # Only published timestamped snapshot names are managed artifacts. Do not
+    # remove arbitrary directories placed beside them when a manifest is absent.
+    name = directory.name
+    try:
+        datetime.strptime(name[:15], "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+    return "unknown" if len(name) == 15 or name[15:16] == "-" else None
+
+
+def _snapshot_metadata(directory: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(directory / "manifest.json", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        logger.warning("Could not inspect snapshot %s for retention: %s", directory.name, exc)
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _verified_snapshot_db(directory: Path, rel: str) -> bool:
+    """Whether *directory* has a readable SQLite recovery copy for *rel*."""
+    if not isinstance(rel, str):
+        return False
+    payload = directory / rel
+    try:
+        if not rel.endswith(".db") or not _is_within(payload, directory.resolve()):
+            return False
+    except OSError:
+        return False
+    return verify_sqlite_integrity(payload).get("valid", False)
+
+
+def _is_complete_quick_snapshot(directory: Path, meta: Dict[str, Any]) -> bool:
+    """A complete generation has no recorded omissions and every payload survives inspection."""
+    if meta.get("failed_dbs") or meta.get("oversized_skipped"):
+        return False
+    files = meta.get("files")
+    if not isinstance(files, dict) or not files:
+        return False
+    root = directory.resolve()
+    for rel, expected_size in files.items():
+        if not isinstance(rel, str):
+            return False
+        payload = directory / rel
+        try:
+            if not _is_within(payload, root) or not payload.is_file() or payload.stat().st_size != expected_size:
+                return False
+        except OSError:
+            return False
+        if rel.endswith(".db") and not _verified_snapshot_db(directory, rel):
+            return False
+    return True
 
 
 def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -1515,36 +1586,58 @@ def _prune_quick_snapshots(
     keep: int = _QUICK_DEFAULT_KEEP,
     *,
     preserve_recovery_for: Optional[set[str]] = None,
+    namespace: Optional[str] = "manual",
 ) -> int:
-    """Remove old snapshots while retaining recovery copies for omitted DBs."""
-    dirs = _snapshot_dirs(root)
+    """Bound one snapshot namespace without discarding recovery generations.
+
+    Retain the configured recent window, newest verified complete generation,
+    and the newest readable SQLite copy for each DB omitted by this run.
+    """
+    if namespace is None:
+        namespaces = {_snapshot_retention_namespace(d, _snapshot_metadata(d))
+                      for d in _snapshot_dirs(root)}
+        return sum(_prune_quick_snapshots(root, keep=keep, namespace=current)
+                   for current in namespaces if current is not None)
+    metadata = {d: _snapshot_metadata(d) for d in _snapshot_dirs(root)}
+    dirs = [d for d, meta in metadata.items()
+            if _snapshot_retention_namespace(d, meta) == namespace]
     retained = set(dirs[:keep])
-    missing = set(preserve_recovery_for or ())
-    if missing:
+    if preserve_recovery_for is None:
+        missing = set()
         for d in dirs:
-            try:
-                with open(d / "manifest.json", encoding="utf-8") as f:
-                    meta = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "Could not inspect snapshot %s while preserving recovery copies: %s",
-                    d.name, exc)
+            meta = _snapshot_metadata(d)
+            if meta is None:
                 continue
-            files = meta.get("files") if isinstance(meta, dict) else None
-            if not isinstance(files, dict):
-                continue
-            covered = missing.intersection(files)
-            if covered:
-                retained.add(d)
-                missing.difference_update(covered)
-                if not missing:
-                    break
+            for key in ("failed_dbs", "oversized_skipped"):
+                omissions = meta.get(key)
+                if isinstance(omissions, list):
+                    missing.update(rel for rel in omissions if isinstance(rel, str))
+    else:
+        missing = set(preserve_recovery_for)
+    for d in dirs:
+        meta = _snapshot_metadata(d)
+        if meta is None:
+            continue
+        if _is_complete_quick_snapshot(d, meta):
+            retained.add(d)
+            break
+    for d in dirs:
+        if not missing:
+            break
+        files = (metadata[d] or {}).get("files")
+        if not isinstance(files, dict):
+            continue
+        # Restore consumes manifest entries: an unlisted file is not recovery coverage.
+        covered = {rel for rel in missing if rel in files and _verified_snapshot_db(d, rel)}
+        if covered:
+            retained.add(d)
+            missing.difference_update(covered)
     return _prune_oldest([d for d in dirs if d not in retained], 0, shutil.rmtree, "snapshot")
 
 
 def prune_quick_snapshots(keep: int = _QUICK_DEFAULT_KEEP, hermes_home: Optional[Path] = None) -> int:
     """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
-    return _prune_oldest(_snapshot_dirs(_quick_snapshot_root(hermes_home)), keep, shutil.rmtree, "snapshot")
+    return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep=keep, namespace=None)
 
 
 def run_quick_backup(args) -> None:
