@@ -144,6 +144,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-120 | Active | `feat(auth): place pooled credentials by priority` | Add `hermes auth add --priority N` and `hermes auth priority <provider> <target> <N>`, backed by `CredentialPool.move_entry()`, to place a credential in the `fill_first` order. |
 | HERMES-121 | Active | `feat(auth): inspect and verify named credential quota` | Add exact-target read-only live quota inspection and an explicitly verified per-credential OAuth refresh without provider-wide fallback. |
 | HERMES-123 | Active | `fix(goals): make continuation dependency-aware` | Enforce explicit background runtime deadlines with owned process-tree cleanup, persisted expiry, and uncertain-result reconciliation. |
+| HERMES-126 | Active | `fix(review): honor configured fallback routes` | Carry review-owned ordered recovery routes through delegation while preserving ordinary parent fallback inheritance. |
 
 ## Fork-only administrative subject exemptions
 
@@ -237,7 +238,9 @@ These exact subjects are fork-only history but do not define independently retir
 | `fix(ci): reconcile post-merge history baseline` | Fork-administrative history reconciliation after concurrent reviewed merges advanced `main`; no shipped Hermes behavior. |
 | `fix(ci): advance trusted baseline past squash suffix (#81)` | Fork-administrative baseline advance past PR #80's GitHub-added squash suffix; exact workflow validation remains fail-closed for every later commit. |
 | `fix(ci): preserve squash-merge subject identity` | Fork-administrative validator repair: treats one terminal GitHub-added PR suffix as delivery metadata while preserving exact stable-subject registration, malformed-suffix rejection, and same-commit history enforcement; no shipped Hermes behavior. |
+| `merge: synchronize review fallback with maintained fork` | Task-owned ancestry integration of the registered HERMES-126 implementation with the landed squash-subject validator repair; no additional shipped behavior. |
 | `fix(ci): register reconciled worktree branch history` | Fork-administrative registration of exact historical and integration subjects exposed by reconciling PR #25 with the current fork base; no shipped Hermes behavior. |
+| `Merge pull request #91 from 0xble/feat/review-fallback-chain-fork` | GitHub-authored merge wrapper around the registered HERMES-126 review-fallback implementation and its registered ancestry integration; no additional behavior. |
 | `Merge pull request #3 from 0xble/dependabot/github_actions/astral-sh/setup-uv-9.0.0` | GitHub-authored merge wrapper around the already-registered setup-uv dependency refresh; no additional behavior. |
 | `Merge pull request #5 from 0xble/dependabot/github_actions/actions/checkout-7.0.1` | GitHub-authored merge wrapper around the already-registered checkout dependency refresh; no additional behavior. |
 | `Merge pull request #13 from 0xble/dependabot/github_actions/actions-minor-patch-f5d4e90336` | GitHub-authored merge wrapper around the already-registered grouped action refresh; no additional behavior. |
@@ -259,6 +262,16 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-126 — Ordered Native Review Fallbacks
+
+- **Upstream tracking:** https://github.com/NousResearch/hermes-agent/issues/105388
+- **Upstream PR:** https://github.com/NousResearch/hermes-agent/pull/105416
+- **Contract:** Translate configured review fallback routes into the native delegated recovery chain. Keep ordinary unpinned parent fallback inheritance intact. No global configuration or runtime activation is part of this patch.
+- **Source:** `agent/review_engine.py`, `tools/delegate_tool.py`, `tools/delegate_tool_config.py` and focused regression tests.
+- **Verification:** `scripts/run_tests.sh -j 4 tests/tools/test_delegate_runtime_fallback_inheritance.py tests/agent/test_review_engine.py tests/tools/test_delegate.py` passed 113 tests. Independent review's inheritance finding was reproduced and fixed, then same-lineage confirmation passed.
+- **Retirement:** Remove this adaptation when the upstream review translation and delegated routing behavior satisfy the same ordered-chain and inheritance regressions on the maintained fork.
+- **Rollback:** Revert the single commit titled `fix(review): honor configured fallback routes`, including its focused tests and this record. If later delegation changes share these files, remove only the review-owned `routing_cfg` plumbing and translation and rerun the listed tests before publication. Preserve unrelated role and native review policy changes.
 
 
 ### HERMES-121 — Inspect and verify named credential quota
