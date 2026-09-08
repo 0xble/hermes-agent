@@ -148,7 +148,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-126 | Active | `fix(review): honor configured fallback routes` | Carry review-owned ordered recovery routes through delegation while preserving ordinary parent fallback inheritance. |
 | HERMES-128 | Active | `fix(telegram): scope citation brackets to explicit markers` | Preserve visible clickable explicitly bracketed citations without converting ordinary numeric commit or PR links into citation markers. |
 
-| HERMES-129 | Active | `feat(session): add explicit model and reasoning tool` | Optional session-only model/reasoning tool using native frontend controls. |
+| HERMES-129 | Active | `feat(session): add explicit model and reasoning tool`; `fix(session): declare model control tool in plugin metadata` | Optional session-only model/reasoning tool using native frontend controls. |
 
 ## Fork-only administrative subject exemptions
 
