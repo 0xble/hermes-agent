@@ -6,7 +6,7 @@ TUI inject into the agent conversation."""
 import time
 from contextlib import suppress
 
-_DONE = ("completed", "success")
+_DONE = ("completed", "success", "budget_exhausted")
 
 
 def _format_age(seconds: float) -> str:

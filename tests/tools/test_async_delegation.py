@@ -799,11 +799,10 @@ def test_gateway_cli_origin_event_left_unrouted():
 
 
 def test_single_task_truncation_banner_when_max_iterations():
-    """A single async subagent that hit its iteration cap (exit_reason=
-    max_iterations) must surface a TRUNCATED marker in the formatted result,
-    even though status stays 'completed' (a summary exists)."""
+    """A budget checkpoint is explicitly non-complete while retaining its
+    summary and truncation notice for a parent's continuation decision."""
     evt = _make_async_evt(
-        status="completed",
+        status="budget_exhausted",
         summary="Did part of the work then ran out of budget.",
         exit_reason="max_iterations",
     )

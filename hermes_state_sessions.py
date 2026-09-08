@@ -693,6 +693,151 @@ class SessionSessionsMixin:
             return
         self._write_model_config_patch(session_id, patch)
 
+    def claim_delegated_resumes(
+        self, session_ids: List[str], *, claim_id: Optional[str] = None,
+    ) -> bool:
+        """Atomically consume a batch of safe delegated-child resume grants.
+
+        ``claim_id`` is an opaque transaction identity used only to compensate a
+        failure before turn admission.  The default timestamp preserves the public
+        single-claim lifecycle for callers that do not need compensation.
+
+        Resume is fail-closed while any selected conversation has an active turn
+        lease or a persisted tool call without its matching result.  Those guards
+        are checked in the same transaction as the all-or-none grant claim, so a
+        rejected parent continuation remains retryable.
+        """
+        ids = [str(session_id or "") for session_id in session_ids]
+        if (
+            not ids or any(not session_id for session_id in ids) or len(set(ids)) != len(ids)
+            or (claim_id is not None and (not isinstance(claim_id, str) or not claim_id))
+        ):
+            return False
+
+        def _has_unresolved_tool_effects(conn, session_id: str) -> bool:
+            pending = set()
+            rows = conn.execute(
+                "SELECT role, tool_calls, tool_call_id FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            for row in rows:
+                role = str(row["role"] or "").lower()
+                raw_calls = row["tool_calls"]
+                if role == "assistant" and raw_calls:
+                    try:
+                        calls = json.loads(raw_calls) if isinstance(raw_calls, str) else raw_calls
+                    except (TypeError, ValueError):
+                        return True
+                    if not isinstance(calls, list):
+                        return True
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            return True
+                        call_id = call.get("call_id") or call.get("id")
+                        if not isinstance(call_id, str) or not call_id.strip():
+                            return True
+                        pending.add(call_id.split("|", 1)[0].strip())
+                elif role == "tool":
+                    tool_call_id = row["tool_call_id"]
+                    if isinstance(tool_call_id, str) and tool_call_id.strip():
+                        pending.discard(tool_call_id.split("|", 1)[0].strip())
+            return bool(pending)
+
+        def _has_active_turn_lease(conn, session_id: str, now: float) -> bool:
+            from hermes_state import _compression_lock_holder_process_is_dead
+
+            conversation_id = getattr(self, "_session_turn_lease_key_on_conn")(conn, session_id)
+            lease = conn.execute(
+                "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            return bool(
+                lease is not None
+                and float(lease["expires_at"]) > now
+                and not _compression_lock_holder_process_is_dead(lease["holder"])
+            )
+
+        def _do(conn):
+            configs = []
+            now = time.time()
+            claimed_at: Any = claim_id if claim_id is not None else now
+            for session_id in ids:
+                row = conn.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+                config = _parse_model_config(row[0])
+                if config.get("_delegation_completed") is not True:
+                    return False
+                if _has_active_turn_lease(conn, session_id, now):
+                    return False
+                if _has_unresolved_tool_effects(conn, session_id):
+                    return False
+                configs.append((session_id, config))
+            for session_id, config in configs:
+                config["_delegation_completed"] = False
+                config["_delegation_resume_claimed_at"] = claimed_at
+                conn.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (json.dumps(config), session_id),
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def claim_delegated_resume(self, session_id: str) -> bool:
+        """Atomically consume one safe delegated-child continuation grant."""
+        return self.claim_delegated_resumes([session_id])
+
+    def release_delegated_resumes(self, session_ids: List[str], *, claim_id: str) -> bool:
+        """Restore an exact batch claim that never reached turn admission.
+
+        The opaque claim identity prevents a stale failure path from restoring a
+        newer continuation grant.  Any active turn lease rejects the whole release.
+        """
+        ids = [str(session_id or "") for session_id in session_ids]
+        if (
+            not ids or any(not session_id for session_id in ids) or len(set(ids)) != len(ids)
+            or not isinstance(claim_id, str) or not claim_id
+        ):
+            return False
+
+        def _do(conn):
+            now = time.time()
+            configs = []
+            for session_id in ids:
+                row = conn.execute(
+                    "SELECT model_config FROM sessions WHERE id = ?", (session_id,)
+                ).fetchone()
+                if row is None:
+                    return False
+                config = _parse_model_config(row[0])
+                if (
+                    config.get("_delegation_completed") is not False
+                    or config.get("_delegation_resume_claimed_at") != claim_id
+                ):
+                    return False
+                conversation_id = getattr(self, "_session_turn_lease_key_on_conn")(conn, session_id)
+                lease = conn.execute(
+                    "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if lease is not None and float(lease["expires_at"]) > now:
+                    return False
+                configs.append((session_id, config))
+            for session_id, config in configs:
+                config["_delegation_completed"] = True
+                config.pop("_delegation_resume_claimed_at", None)
+                conn.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (json.dumps(config), session_id),
+                )
+            return True
+
+        return bool(getattr(self, "_execute_write")(_do))
+
     def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
         """Read one key out of a session's model_config JSON (tolerant parse)."""
         session = self.get_session(session_id) or {}

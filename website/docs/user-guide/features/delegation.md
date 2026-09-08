@@ -81,8 +81,9 @@ name instead of warning about an unknown key. A misspelled field is rejected
 with the correct name suggested.
 
 `description` and `instructions` are required. `provider`, `model`, and
-`reasoning_effort` are optional, inheriting applicable delegation defaults and
-parent settings. An explicit provider requires an explicit model. Names use
+`reasoning_effort` are optional. Set `inherit_parent: true` to make the primary
+route exactly the parent's resolved route; it may still declare an ordered
+`fallbacks` list. An explicit provider requires an explicit model. Names use
 lowercase letters, digits, underscores, and hyphens, starting with a letter.
 Unknown names, malformed definitions, unknown fields, and unsupported explicit
 efforts fail before any member of the batch starts, naming the specific invalid
@@ -92,24 +93,47 @@ controllable while a broken definition is being fixed. If the delegation
 configuration cannot be *loaded* at all, spawning is refused outright — Hermes
 does not quietly substitute legacy defaults for roles you configured.
 
-A named role can only be launched on a route whose final physical request
-Hermes can inspect (`codex_responses`, `chat_completions`, `anthropic_messages`).
-Routes without such a boundary — Bedrock Converse, the in-process `moa`
-facade — are rejected at launch rather than accepted with a pinning guarantee
-that would not hold.
+A named single-model role can only launch when Hermes can inspect its final
+physical request (`codex_responses`, `chat_completions`,
+`anthropic_messages`). A composite role may use `provider: moa`; its `model`
+names a native preset, and optional `moa_presets` limits task-level
+`moa_preset` selection. Hermes validates and freezes every reference and
+aggregator route before creating any child, including privacy options and a
+nonsecret fingerprint.
 
-Named children retain one resolved route and effort for their lifetime,
+Named children retain one resolved primary and ordered fallback chain for their lifetime,
 including tool-loop continuations, retries, output correction, and iteration
-summaries. Codex definitions require the parent's currently authorized
-`openai-codex` subscription route. When the parent already authorizes a
+summaries. Codex definitions require an authorized configured native
+`openai-codex` subscription route, even when the parent uses another provider. When the parent authorizes a
 same-route credential pool containing the launch credential, named children
 retain that pool's normal account rotation and cooldown policy. Rotation cannot
 change the provider, endpoint, model, or reasoning effort. Explicit delegation
 API keys, fixed parent credentials, and unrelated routes do not gain pool access.
 The request credential pin advances only through a verified pool swap, not an
-arbitrary client or authentication-header replacement. Named children do not
-re-resolve global credentials or fall back to API billing. Exhausted eligible
-accounts or model unavailability produce an error, not a substitute model.
+arbitrary client or authentication-header replacement. A configured fallback
+is attempted only for availability failures (rate limit, overload, or timeout),
+never for auth, billing, invalid configuration, refusals, or tool failures. The
+result reports the reason and actual route for each transition. Exhausting the
+frozen chain produces an error rather than consulting current config.
+
+### Continue a completed or budget-exhausted child
+
+Each result includes `child_session_id`. A later task may pass it as
+`resume_session_id` to append a new user turn to the same named child's durable
+conversation. Reaching the global 250-iteration segment limit is reported as
+`status: budget_exhausted` with `exit_reason: max_iterations`; it is a checkpoint,
+not completion. Hermes never starts another segment automatically. The parent
+must explicitly resume, and every resumed turn receives the same configured
+250-iteration limit rather than an unlimited or role-specific budget.
+
+Hermes resolves compression continuations, preserves the existing workspace and
+session lineage, reloads history only after acquiring the native session turn
+lease, and reconstructs the persisted nonsecret role, tools, route chain, and
+MoA snapshot. Foreign parents, another profile, missing or unknown role metadata,
+a non-resumable child, route drift, an active lease, or a persisted tool call
+without a matching result fail before any model request and do not consume the
+resume grant. Running children remain a steering operation. Resume never replays
+an old tool call or interrupted work whose external effects are unknown.
 
 Named children receive shared authorized skill discovery, launch-time standing
 memory, and read-only memory-provider/session retrieval. They do not receive the
@@ -401,15 +425,12 @@ Both roles retain `execute_code` (programmatic tool calling) so children can bat
 
 ## Max Iterations
 
-Each subagent has an iteration limit (default: 50) that controls how many tool-calling turns it can take:
-
-```python
-delegate_task(
-    goal="Quick file check",
-    context="Check if /etc/nginx/nginx.conf exists and print its first 10 lines",
-    max_iterations=10  # Simple task, don't need many turns
-)
-```
+All subagents use the single operator-controlled `delegation.max_iterations`
+limit (default: `250`) for each explicitly started segment. It is not exposed as
+a `delegate_task` argument, and named roles cannot define their own caps. When a
+segment exhausts that limit, Hermes returns a resumable `budget_exhausted`
+checkpoint; it does not silently treat the task as completed, remove the limit,
+or start another segment.
 
 ## Child Timeout
 

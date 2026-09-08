@@ -3260,7 +3260,9 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
 # stay identical.
 _SUBAGENT_FIELDS = frozenset({
     "description", "instructions", "provider", "model", "reasoning_effort",
+    "inherit_parent", "moa_presets", "fallbacks",
 })
+_SUBAGENT_FALLBACK_FIELDS = frozenset({"provider", "model", "reasoning_effort"})
 _SUBAGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*\Z")
 
 
@@ -3288,7 +3290,19 @@ def _validate_subagent_key(segments: list) -> tuple[bool, Optional[str]]:
         if suggestion is not None:
             return False, ".".join(segments[:3] + [suggestion])
         return False, None
-    # Every subagent field is a scalar string; nothing nests below one.
+    if field == "fallbacks" and len(segments) > 4:
+        # Dotted config paths address list members by numeric index.
+        if not segments[4].isdigit():
+            return False, None
+        if len(segments) == 5:
+            return True, None
+        nested = segments[5]
+        if nested not in _SUBAGENT_FALLBACK_FIELDS:
+            suggestion = _suggest_closest_key(nested, set(_SUBAGENT_FALLBACK_FIELDS))
+            return False, ".".join(segments[:5] + [suggestion]) if suggestion else None
+        return (len(segments) == 6), None
+    if field == "moa_presets" and len(segments) > 4:
+        return (len(segments) == 5 and segments[4].isdigit()), None
     if len(segments) > 4:
         return False, ".".join(segments[:4])
     return True, None

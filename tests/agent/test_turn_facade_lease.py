@@ -2,8 +2,11 @@
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 from agent.turn_facade_lease import (
     LEASE_TTL_SECONDS,
+    LEASE_WAIT_SECONDS,
     DurableTurnLease,
     admit_durable_turn_lease,
 )
@@ -122,3 +125,126 @@ def test_interrupt_turn_only_while_active():
     assert calls == ["lost"] and lease.interrupt_message == "lost"
     lease.deactivate_after_liveness_abort()
     assert lease.stop.is_set() and lease.is_turn_active() is False
+
+
+def test_delegated_resume_acquires_without_wait_and_reloads_compression_tip():
+    class ResumeDb(_Db):
+        def acquire_session_turn_lease(self, session_id, holder, **kwargs):
+            self.acquire_kwargs = kwargs
+            return super().acquire_session_turn_lease(session_id, holder, **kwargs)
+        def resolve_resume_session_id(self, session_id):
+            return "s2"
+        def get_resume_conversations(self, session_id):
+            assert session_id == "s2"
+            return ([{"role": "assistant", "content": "prior"}], [])
+    db = ResumeDb()
+    agent = _agent(db, _delegation_resume_needs_reload=True,
+                   _delegation_resume_fail_if_busy=True)
+    task_context = {"session_id": "s1", "task_id": "t", "platform": "cli"}
+    admission = admit_durable_turn_lease(
+        agent, session_id="s1", relay_turn_id="s1:t:resume",
+        task_context=task_context, conversation_history=None)
+    assert db.acquire_kwargs["wait_seconds"] == 0.0
+    assert agent.session_id == "s2" and task_context["session_id"] == "s2"
+    assert admission.conversation_history == [{"role": "assistant", "content": "prior"}]
+    assert admission.lease is not None
+    admission.lease.release()
+
+
+def test_resume_reload_failure_releases_lease_and_restores_grant():
+    from tools.delegate_tool import _restore_unadmitted_resume_grant
+
+    class ResumeDb(_Db):
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+        def get_resume_conversations(self, _session_id):
+            raise RuntimeError("reload failed")
+        def release_delegated_resumes(self, session_ids, *, claim_id):
+            self.events.append(("restore", tuple(session_ids), claim_id))
+            return True
+
+    db = ResumeDb()
+    agent = _agent(db, _delegation_resume_needs_reload=True,
+                   _delegation_resume_claim_id="claim-a", _delegation_resume_admitted=False)
+    with pytest.raises(RuntimeError, match="reload failed"):
+        _admit(agent)
+    assert agent._delegation_resume_admitted is False
+    assert db.events[0][0] == "acquire" and db.events[1][0] == "release"
+    assert _restore_unadmitted_resume_grant(agent) is True
+    assert db.events[2] == ("restore", ("s1",), "claim-a")
+
+
+def test_resume_thread_build_failure_releases_lease_and_restores_grant(monkeypatch):
+    from tools.delegate_tool import _restore_unadmitted_resume_grant
+
+    class ResumeDb(_Db):
+        def release_delegated_resumes(self, session_ids, *, claim_id):
+            self.events.append(("restore", tuple(session_ids), claim_id))
+            return True
+
+    monkeypatch.setattr(DurableTurnLease, "build_threads",
+                        lambda _lease: (_ for _ in ()).throw(RuntimeError("thread build failed")))
+    db = ResumeDb()
+    agent = _agent(db, _delegation_resume_claim_id="claim-a", _delegation_resume_admitted=False)
+    with pytest.raises(RuntimeError, match="thread build failed"):
+        _admit(agent)
+    assert agent._delegation_resume_admitted is False
+    assert db.events[0][0] == "acquire" and db.events[1][0] == "release"
+    assert _restore_unadmitted_resume_grant(agent) is True
+    assert db.events[2] == ("restore", ("s1",), "claim-a")
+
+
+def test_resume_admission_marks_grant_only_after_threads_build(monkeypatch):
+    from tools.delegate_tool import _restore_unadmitted_resume_grant
+
+    observed = []
+    monkeypatch.setattr(DurableTurnLease, "build_threads",
+                        lambda lease: observed.append(lease.agent._delegation_resume_admitted))
+    db = _Db()
+    agent = _agent(db, _delegation_resume_claim_id="claim-a", _delegation_resume_admitted=False)
+    admission = _admit(agent)
+    assert observed == [False]
+    assert agent._delegation_resume_admitted is True
+    assert _restore_unadmitted_resume_grant(agent) is False
+    assert admission.lease is not None
+    admission.lease.release()
+
+
+def test_duplicate_delegated_resume_fails_closed_without_history_read():
+    class BusyDb(_Db):
+        def get_resume_conversations(self, _session_id):
+            raise AssertionError("history must not be read before lease admission")
+    db = BusyDb(acquired=False)
+    agent = _agent(db, _delegation_resume_needs_reload=True,
+                   _delegation_resume_fail_if_busy=True)
+    admission = _admit(agent)
+    assert admission.lease is None
+    assert admission.early_result["error"] == "session_turn_lease_timeout:s1"
+
+
+def test_ordinary_waited_lease_reload_keeps_row_ids_and_repairs_alternation(tmp_path):
+    """The ordinary waited branch reloads the real model projection, not a lossy fallback."""
+    from hermes_state import SessionDB
+
+    class WaitedSessionDB(SessionDB):
+        def acquire_session_turn_lease(self, *args, on_wait=None, **kwargs):
+            self.wait_seconds = kwargs["wait_seconds"]
+            assert on_wait is not None
+            on_wait(1.0)
+            return super().acquire_session_turn_lease(*args, on_wait=on_wait, **kwargs)
+
+    db = WaitedSessionDB(db_path=tmp_path / "state.db")
+    db.create_session("s1", source="tool")
+    db.append_message("s1", role="user", content="prompt")
+    db.append_message("s1", role="assistant", content="candidate", finish_reason="verification_required")
+    db.append_message("s1", role="assistant", content="verified", finish_reason="stop")
+    agent = _agent(db)
+
+    admission = _admit(agent)
+    history = admission.conversation_history
+    assert db.wait_seconds == LEASE_WAIT_SECONDS
+    assert history and all(isinstance(message.get("_row_id"), int) for message in history)
+    assert all(left["role"] != right["role"] for left, right in zip(history, history[1:]))
+    assert [message["content"] for message in history] == ["prompt", "verified"]
+    assert admission.lease is not None
+    admission.lease.release()

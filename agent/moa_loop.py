@@ -8,6 +8,7 @@ context before each model iteration.
 from __future__ import annotations
 
 import contextlib
+import copy
 import functools
 import hashlib
 import json
@@ -16,7 +17,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
-from dataclasses import KW_ONLY, dataclass, replace
+from dataclasses import KW_ONLY, dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -141,6 +142,127 @@ def _resolve_preset_cached(preset_name: str) -> tuple[dict[str, Any], Any]:
     return preset, moa_raw
 
 
+@dataclass(frozen=True, slots=True)
+class FrozenMoaPreset:
+    """One launch's validated composite route plus runtime-only credentials."""
+    name: str
+    preset: dict[str, Any] = field(repr=False, compare=False)
+    options: dict[str, Any]
+    fingerprint: str
+
+    def metadata(self) -> dict[str, Any]:
+        public = copy.deepcopy(self.preset)
+        for slot in [*(public.get("reference_models") or []), public.get("aggregator") or {}]:
+            slot.pop("_frozen_runtime", None)
+        public = _nonsecret_moa_value(public)
+        return {
+            "preset": self.name, "preset_fingerprint": self.fingerprint,
+            "preset_snapshot": public, "options": dict(self.options),
+        }
+
+
+def _nonsecret_moa_value(value: Any) -> Any:
+    """Strip credential-bearing keys from durable/fingerprinted preset data."""
+    from tools.custom_subagents import _nonsecret_mapping
+    return _nonsecret_mapping(value)
+
+
+def _moa_runtime_identity(runtime: dict[str, Any]) -> dict[str, Any]:
+    """Durable nonsecret identity for one frozen physical MoA slot."""
+    from tools.custom_subagents import nonsecret_route_url
+    return {
+        "provider": str(runtime.get("provider") or ""),
+        "model": str(runtime.get("model") or ""),
+        "base_url": nonsecret_route_url(str(runtime.get("base_url") or "")),
+        "api_mode": str(runtime.get("api_mode") or ""),
+        "authority_fingerprint": hashlib.sha256(
+            str(runtime.get("api_key") or "").encode()
+        ).hexdigest(),
+        "request_overrides": _nonsecret_moa_value(
+            copy.deepcopy(runtime.get("request_overrides") or {})
+        ),
+    }
+
+
+def _freeze_moa_slot_runtime(slot: dict[str, Any], runtime: dict[str, Any]) -> None:
+    """Attach the complete in-memory route and its persisted public identity."""
+    provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
+    frozen = {key: copy.deepcopy(runtime[key]) for key in (
+        "base_url", "api_key", "api_mode", "request_overrides"
+    ) if runtime.get(key) is not None}
+    frozen.update(provider=provider, model=model)
+    slot["runtime_identity"] = _moa_runtime_identity(frozen)
+    slot["_frozen_runtime"] = frozen
+
+
+def restore_moa_preset(metadata: dict[str, Any]) -> FrozenMoaPreset:
+    """Re-authorize a persisted nonsecret council snapshot without consulting its registry."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    name = str(metadata.get("preset") or "")
+    preset = copy.deepcopy(metadata.get("preset_snapshot"))
+    if not name or not isinstance(preset, dict):
+        raise ValueError("delegated MoA session is missing its frozen preset")
+    options = dict(metadata.get("options") or {})
+    public_fingerprint = hashlib.sha256(json.dumps(
+        {"preset": preset, "options": options}, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode()).hexdigest()[:16]
+    if public_fingerprint != metadata.get("preset_fingerprint"):
+        raise ValueError("delegated MoA session snapshot fingerprint is invalid")
+    for index, slot in enumerate([*(preset.get("reference_models") or []), preset.get("aggregator") or {}]):
+        if not isinstance(slot, dict):
+            raise ValueError(f"delegated MoA session slot {index} is invalid")
+        provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        if (runtime.get("provider"), runtime.get("model") or model) != (provider, model):
+            raise ValueError(f"delegated MoA session slot {index} no longer resolves to its frozen route")
+        runtime = {**runtime, "provider": provider, "model": model}
+        if _moa_runtime_identity(runtime) != slot.get("runtime_identity"):
+            raise ValueError(f"delegated MoA session slot {index} no longer matches its frozen authority")
+        _freeze_moa_slot_runtime(slot, runtime)
+    return FrozenMoaPreset(name, preset, options, public_fingerprint)
+
+
+def snapshot_moa_preset(preset_name: str) -> FrozenMoaPreset:
+    """Freeze and authorize every physical route in one native preset."""
+    import copy
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    preset, raw = _resolve_preset_cached(preset_name)
+    snapshot = copy.deepcopy(preset)
+    slots = [*(snapshot.get("reference_models") or []), snapshot.get("aggregator") or {}]
+    for index, slot in enumerate(slots):
+        provider = str(slot.get("provider") or "").strip()
+        model = str(slot.get("model") or "").strip()
+        if not provider or not model or provider == "moa":
+            raise ValueError(f"MoA preset {preset_name!r} has invalid physical slot {index}")
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        actual = (str(runtime.get("provider") or ""), str(runtime.get("model") or model))
+        if actual != (provider, model):
+            raise ValueError(
+                f"MoA preset {preset_name!r} slot {index} resolved to a different route: {actual!r}"
+            )
+        required = ("base_url", "api_key", "api_mode")
+        if any(not runtime.get(key) for key in required):
+            raise ValueError(f"MoA preset {preset_name!r} slot {index} is not fully authorized")
+        # Runtime keys never enter metadata/fingerprints. They travel only in
+        # the in-memory frozen launch; runtime_identity is the durable,
+        # credential-free proof used to re-authorize a resumed council.
+        _freeze_moa_slot_runtime(
+            slot, {**runtime, "provider": provider, "model": model}
+        )
+    options = {"privacy_filter": (raw or {}).get("privacy_filter")}
+    public = copy.deepcopy(snapshot)
+    for slot in [*(public.get("reference_models") or []), public.get("aggregator") or {}]:
+        slot.pop("_frozen_runtime", None)
+    public = _nonsecret_moa_value(public)
+    fingerprint = hashlib.sha256(json.dumps(
+        {"preset": public, "options": options}, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode()).hexdigest()[:16]
+    return FrozenMoaPreset(preset_name, snapshot, options, fingerprint)
+
+
 _runtime_cache_lock = threading.Lock()
 _runtime_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
@@ -250,6 +372,39 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """
     provider = str(slot.get("provider") or "").strip()
     model = str(slot.get("model") or "").strip()
+    frozen = slot.get("_frozen_runtime")
+    if isinstance(frozen, dict):
+        if (frozen.get("provider"), frozen.get("model")) != (provider, model):
+            raise RuntimeError("frozen MoA physical route identity changed")
+        if any(not frozen.get(key) for key in ("base_url", "api_key", "api_mode")):
+            raise RuntimeError("frozen MoA physical route is incomplete")
+        if _moa_runtime_identity(frozen) != slot.get("runtime_identity"):
+            raise RuntimeError("frozen MoA physical route authority changed")
+        out = copy.deepcopy(frozen)
+        overrides = out.pop("request_overrides", None)
+        if overrides is not None and not isinstance(overrides, dict):
+            raise RuntimeError("frozen MoA request overrides are invalid")
+        if isinstance(overrides, dict):
+            token_limit_keys = ("max_tokens", "max_output_tokens", "max_completion_tokens")
+            unsupported = set(overrides) - {"extra_body", "extra_headers", *token_limit_keys}
+            if unsupported:
+                raise RuntimeError(
+                    "frozen MoA request overrides are unsupported: "
+                    + ", ".join(sorted(map(str, unsupported)))
+                )
+            token_limits = [overrides[key] for key in token_limit_keys if key in overrides]
+            if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in token_limits):
+                raise RuntimeError("frozen MoA token limit override is invalid")
+            if len(set(token_limits)) > 1:
+                raise RuntimeError("frozen MoA token limit overrides conflict")
+            if token_limits:
+                # call_llm owns provider wire normalization (max_tokens vs
+                # max_completion_tokens); do not forward arbitrary override kwargs.
+                out["max_tokens"] = token_limits[0]
+            for key in ("extra_body", "extra_headers"):
+                if overrides.get(key) is not None:
+                    out[key] = copy.deepcopy(overrides[key])
+        return out
     cache_key = (provider, model)
     now = time.monotonic()
     with _runtime_cache_lock:
@@ -364,7 +519,15 @@ def _run_reference(
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
     label = _slot_label(slot)
+    strict_route = isinstance(slot.get("_frozen_runtime"), dict)
     runtime = _slot_runtime(slot)
+    slot_max_tokens = slot.get("max_tokens")
+    runtime_max_tokens = runtime.pop("max_tokens", None)
+    effective_max_tokens: Any = (
+        slot_max_tokens if slot_max_tokens is not None
+        else max_tokens if max_tokens is not None
+        else runtime_max_tokens
+    )
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
@@ -377,20 +540,24 @@ def _run_reference(
         # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
         # advisory system prompt is prepended so its tokens count against the budget too.
         trimmed = _trim_messages_for_reference(
-            messages, slot, runtime, reserve_output_tokens=max_tokens, context_length_cache=context_length_cache,
+            messages, slot, runtime, reserve_output_tokens=effective_max_tokens, context_length_cache=context_length_cache,
         )
         trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
         # Per-slot max_tokens beats the preset-level reference_max_tokens.
-        slot_max_tokens = slot.get("max_tokens")
         # Copilot gates premium models on request attribution; MoA fan-out serves the
         # user's current turn, so mirror the main agent's x-initiator header.
         from agent.auxiliary_client import _normalize_aux_provider
         is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
+        frozen_extra_body = runtime.pop("extra_body", None)
+        frozen_headers = runtime.pop("extra_headers", None)
         response = call_llm(
             task="moa_reference", messages=trimmed, temperature=temperature,
-            max_tokens=slot_max_tokens if slot_max_tokens is not None else max_tokens,
+            max_tokens=effective_max_tokens,
             timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-            extra_headers={"x-initiator": "user"} if is_copilot else None, **runtime,
+            extra_headers=_merge_slot_extra_body(
+                frozen_headers, {"x-initiator": "user"} if is_copilot else None
+            ),
+            extra_body=frozen_extra_body, strict_route=strict_route, **runtime,
         )
         output_text = _extract_text(response) or "(empty response)"
         acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
@@ -1082,6 +1249,7 @@ class MoAChatCompletions:
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
+        strict_route = isinstance(aggregator.get("_frozen_runtime"), dict)
         agg_runtime = _slot_runtime(aggregator)
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
@@ -1102,13 +1270,23 @@ class MoAChatCompletions:
             stream_kwargs = {"stream": True, "stream_options": api_kwargs.get("stream_options") or {"include_usage": True}}
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
-        # Pop the runtime's extra_body so the explicit kwarg never collides with **agg_runtime.
+        # Pop frozen per-request defaults so explicit kwargs never collide with **agg_runtime.
         agg_extra_body = _merge_slot_extra_body(agg_runtime.pop("extra_body", None), api_kwargs.get("extra_body"))
+        agg_extra_headers = _merge_slot_extra_body(
+            agg_runtime.pop("extra_headers", None), api_kwargs.get("extra_headers")
+        )
+        runtime_max_tokens = agg_runtime.pop("max_tokens", None)
+        effective_max_tokens: Any = (
+            api_kwargs.get("max_tokens")
+            if api_kwargs.get("max_tokens") is not None
+            else runtime_max_tokens
+        )
         agg_response = call_llm(
             task="moa_aggregator", messages=agg_messages, temperature=prepared["aggregator_temperature"],
-            max_tokens=api_kwargs.get("max_tokens"), tools=tools, extra_body=agg_extra_body,
+            max_tokens=effective_max_tokens, tools=tools, extra_body=agg_extra_body,
+            extra_headers=agg_extra_headers,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
-            **stream_kwargs, **agg_runtime,
+            strict_route=strict_route, **stream_kwargs, **agg_runtime,
         )
         if trace is not None:
             # Streaming output lands as the turn's assistant message; the trace marks it.
@@ -1286,7 +1464,13 @@ class MoAChatCompletions:
                 raise TypeError("_moa_prepared_request must be a dict")
             return self._call_prepared_aggregator(prepared_request, api_kwargs)
 
-        preset, moa_raw = _resolve_preset_cached(self.preset_name)
+        snapshot = getattr(self._agent, "_moa_preset_snapshot", None)
+        if isinstance(snapshot, FrozenMoaPreset):
+            if snapshot.name != self.preset_name:
+                raise RuntimeError("frozen MoA preset identity changed")
+            preset, moa_raw = copy.deepcopy(snapshot.preset), dict(snapshot.options)
+        else:
+            preset, moa_raw = _resolve_preset_cached(self.preset_name)
         # Remembered on self so _call_prepared_aggregator redacts the trace consistently.
         self._privacy_mode = _moa_privacy_mode(moa_raw)
         messages = list(api_kwargs.get("messages") or [])

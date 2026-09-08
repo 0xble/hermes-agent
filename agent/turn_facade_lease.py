@@ -268,8 +268,10 @@ def admit_durable_turn_lease(
             f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
         )
 
+    fail_if_busy = bool(getattr(agent, "_delegation_resume_fail_if_busy", False))
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS,
+        wait_seconds=0.0 if fail_if_busy else LEASE_WAIT_SECONDS,
         on_wait=_on_wait, should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
@@ -281,7 +283,7 @@ def admit_durable_turn_lease(
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
+        if waited or getattr(agent, "_delegation_resume_needs_reload", False):
             agent._emit_status("Session is free; loading the latest transcript...")
             # The holder may have compressed/rotated the session while we waited: reload only
             # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
@@ -289,10 +291,15 @@ def admit_durable_turn_lease(
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
-            admission.conversation_history = db.get_messages_as_conversation(
-                agent.session_id, repair_alternation=True, include_row_ids=True
-            )
+            if callable(getattr(db, "get_resume_conversations", None)):
+                admission.conversation_history = db.get_resume_conversations(agent.session_id)[0]
+            else:
+                admission.conversation_history = db.get_messages_as_conversation(
+                    agent.session_id, repair_alternation=True, include_row_ids=True
+                )
         lease.build_threads()
+        if getattr(agent, "_delegation_resume_claim_id", None):
+            setattr(agent, "_delegation_resume_admitted", True)
     except BaseException:
         # The façade never saw this lease; release here so an admitted row is not leaked.
         lease.release()

@@ -1362,6 +1362,12 @@ def route_classified_error(
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or (_is_transport_failure and retry_count >= 2)
     )
+    # Named children have an operator-frozen availability-only chain.  Billing
+    # and auth failures are authority/configuration failures, not evidence that
+    # the next fixed route is available; never cross that trust boundary.
+    _named_pin = getattr(agent, "_delegation_runtime_pin", None)
+    if _named_pin is not None and classified.reason == FailoverReason.billing:
+        _should_fallback = False
     if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
         # No eager fallback while credential pool rotation may recover. Exception: an
         # upstream-aggregator 429 — the pool can't help, always fall back.
@@ -1379,6 +1385,7 @@ def route_classified_error(
     # escalate to the fallback chain once; False -> terminal handling.
     if (
         classified.is_auth
+        and _named_pin is None
         and not _retry.auth_failover_attempted
         and agent._fallback_index < len(agent._fallback_chain)
     ):
