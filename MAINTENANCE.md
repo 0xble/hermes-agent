@@ -147,6 +147,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-120 | Active | `feat(auth): place pooled credentials by priority` | Add `hermes auth add --priority N` and `hermes auth priority <provider> <target> <N>`, backed by `CredentialPool.move_entry()`, to place a credential in the `fill_first` order. |
 | HERMES-121 | Active | `feat(auth): inspect and verify named credential quota` | Add exact-target read-only live quota inspection and an explicitly verified per-credential OAuth refresh without provider-wide fallback. |
 | HERMES-123 | Active | `fix(goals): make continuation dependency-aware` | Enforce explicit background runtime deadlines with owned process-tree cleanup, persisted expiry, and uncertain-result reconciliation. |
+| HERMES-132 | Active | `fix(cli): distinguish saved restart history from live state` | Correct misleading historical restart warnings without changing marker lifecycle, startup probes, or recovery safety. |
 | HERMES-126 | Active | `fix(review): honor configured fallback routes` | Carry review-owned ordered recovery routes through delegation while preserving ordinary parent fallback inheritance. |
 | HERMES-128 | Active | `fix(telegram): scope citation brackets to explicit markers` | Preserve visible clickable explicitly bracketed citations without converting ordinary numeric commit or PR links into citation markers. |
 
@@ -415,6 +416,12 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `scripts/run_tests.sh tests/tools/test_browser_real_profile.py` with fake process records, never real browser termination.
 - **Rollback:** Revert only the ownership matcher and associated tests. Preserve snapshot selection, refresh policy, user consent, and browser-close call sites.
 - **Retirement:** Upstream exact-argument and executable ownership must pass the same positive and false-positive process-selection tests.
+
+### HERMES-132 — Saved restart history is not live runtime state
+
+- **Origin / owner:** Brian's local reproduction on 2026-09-08: update marker expected `fa11f98ea7c48d00da0e6df49e058957db53ce31`; the subsequently restarted default gateway reported exactly that revision, with no discovered serve/dashboard holder. The old warning nevertheless asserted gateways were not restarted. Independent source analysis and upstream issue [#98588](https://github.com/NousResearch/hermes-agent/issues/98588) confirm the diagnostic reads saved history, not live state. Upstream PR #105417 proposes auto-clear semantics and is not adopted by this bounded change.
+- **Preserve / update:** Only the shared warning text and startup guidance change. Marker generation, retention, receipt fallback and explicit updater catch-up remain authoritative and unchanged. No startup fleet probe, automatic marker clearance or unconditional restart guidance. `update --plan` reports discovered runtimes; it is not exhaustive proof that every possible holder is current.
+- **Verify / rollback / retirement:** Run `tests/hermes_cli/test_update_restart_warning_history.py` and `tests/hermes_cli/test_update_fleet_restart_pending.py` in the isolated test runner. Real CLI startup against a temporary home must preserve marker bytes and emit historical wording; no marker remains quiet. Revert the warning-text block and associated assertion/test changes to roll back. Retire this overlay when upstream supplies equally truthful diagnostics or independently verified conservative reconciliation without weakening unresolved-holder safety.
 
 ### HERMES-124 — Frozen custom-subagent fallback, MoA, and resume runtime
 

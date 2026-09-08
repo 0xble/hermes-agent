@@ -143,12 +143,12 @@ def _pending_fleet_restart_needed() -> bool:
 
 
 def _warn_pending_fleet_restart(*, startup: bool = False) -> None:
-    """Print the specific interrupted-update fleet-restart warning."""
+    """Describe the pending record without treating it as a live fleet probe."""
     stream = sys.stderr if startup else sys.stdout
-    print("⚠ A previous `hermes update` pulled new code but did not restart running gateways.", file=stream)
-    print("  Gateways may still be serving pre-update modules (mixed sys.modules).", file=stream)
+    print("⚠ A previous `hermes update` did not verify fleet restart completion.", file=stream)
+    print("  Runtimes may already have been restarted separately; this notice reflects the saved update record.", file=stream)
     if startup:
-        print("  Run `hermes update` or `hermes gateway restart`.", file=stream)
+        print("  Inspect discovered runtimes with `hermes update --plan` before deciding whether to restart.", file=stream)
 
 
 def _warn_pending_fleet_restart_on_startup() -> None:
