@@ -277,7 +277,7 @@ def _fleet_row(
 _NOT_EXPECTED_STATES = {"stopped", "startup_failed"}
 
 
-def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> list[dict[str, Any]]:
+def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None, strict: bool = False) -> list[dict[str, Any]]:
     """Snapshot every profile's gateway code identity vs. the current tree.
 
     Rollout safety: ``down`` requires membership in ``pre_restart_pids`` — a stale state file from a
@@ -329,6 +329,8 @@ def collect_fleet_versions(*, pre_restart_pids: Optional[list[int]] = None) -> l
             if pid in _pre_restart and isinstance(gw_state, str) and gw_state and gw_state not in _NOT_EXPECTED_STATES:
                 results.append(_fleet_row(profile, pid, None, record.get("code_version"), None, state="down"))
     except Exception as exc:
+        if strict:
+            raise RuntimeError('Fleet version probe failed; runtime identity is unknown') from exc
         logger.debug("Fleet version probe failed: %s", exc)
     return results
 

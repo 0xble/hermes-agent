@@ -10,6 +10,10 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Iterator
 
+class InternalGoalPrompt(str):
+    """Runtime-created continuation, never fresh user direction (not a text marker)."""
+
+
 _goal_user_request: ContextVar[tuple[str, str] | None] = ContextVar(
     "goal_user_request", default=None,
 )

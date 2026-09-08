@@ -543,10 +543,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
-            {"key": "prefer_observations", "description": "When mixed recall is enabled, suppress raw facts already covered by returned observations (requires Hindsight 0.9.1)", "default": False},
             {"key": "provenance_mode", "description": "Automatic recall provenance mode; keep none for compact context", "default": "none", "choices": ["none", "compact"]},
             {"key": "explicit_recall_include_provenance", "description": "Default provenance metadata for explicit hindsight_recall only; does not affect automatic recall", "default": True},
-            {"key": "explicit_recall_include_entities", "description": "Default entity context for explicit hindsight_recall only; does not affect automatic recall", "default": True},
+            {"key": "explicit_recall_include_entities", "description": "Default entity context for explicit hindsight_recall only; does not affect automatic recall. Off unless requested.", "default": False},
             {"key": "allow_memory_mutations", "description": "Expose explicit, audited invalidation and restoration tools; does not enable automatic mutation", "default": False},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
@@ -979,21 +978,16 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
         self._recall_types = [t for t in self._recall_types if t in {"world", "experience", "observation"}] or ["observation"]
-        # Mixed recall re-ships raw facts already covered by the observations
-        # they were consolidated into; prefer_observations suppresses those
-        # server-side (Hindsight >= 0.9.1).
-        self._prefer_observations = _coerce_bool(cfg.get("prefer_observations", False), default=False)
         self._provenance_mode = cfg.get("provenance_mode", "none")
         if self._provenance_mode not in {"none", "compact"}:
             self._provenance_mode = "none"
-        # Explicit (tool-driven) recall expands by default: the model asked for
-        # it, so it gets provenance formatting and entity context. Automatic
-        # prefetch must NOT inherit that expansion — it would burn the recall
-        # token budget on every turn.
+        # Explicit (tool-driven) recall includes provenance by default. Entity
+        # expansion is opt-in. Automatic prefetch must NOT inherit that
+        # expansion — it would burn the recall token budget on every turn.
         self._explicit_recall_include_provenance = _coerce_bool(
             cfg.get("explicit_recall_include_provenance", True), default=True)
         self._explicit_recall_include_entities = _coerce_bool(
-            cfg.get("explicit_recall_include_entities", True), default=True)
+            cfg.get("explicit_recall_include_entities", False), default=False)
         # Curation writes are audited mutations of durable memory, so they stay
         # off unless a deployment explicitly opts in.
         self._allow_memory_mutations = _coerce_bool(cfg.get("allow_memory_mutations", False), default=False)
@@ -1132,15 +1126,13 @@ class HindsightMemoryProvider(MemoryProvider):
             optional["tags_match"] = args.get("tags_match") or self._recall_tags_match
         if args.get("tag_groups"):
             optional["tag_groups"] = args["tag_groups"]
-        if self._prefer_observations and "observation" in types and any(t in types for t in ("world", "experience")):
-            optional["prefer_observations"] = True
         for key, default in optional_defaults.items():
             if args.get(key, default):
                 optional[key] = args.get(key, default)
         supported = {key: value for key, value in optional.items() if _supports_kwarg(client, "arecall", key)}
         if (omitted := set(optional) - set(supported)):
             logger.warning("Hindsight recall optional fields unavailable in installed client: %s", sorted(omitted))
-        retryable = {"prefer_observations", "include_provenance", "include_entities", "include_chunks", "include_source_facts"}
+        retryable = {"include_provenance", "include_entities", "include_chunks", "include_source_facts"}
         return {**required, **supported}, {k: v for k, v in supported.items() if k in retryable}
 
     def _compatible_recall(self, query: str, args: Optional[dict] = None, *, explicit: bool = False):
@@ -1556,8 +1548,8 @@ class HindsightMemoryProvider(MemoryProvider):
         query = args["query"]
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                      self._bank_id, len(query), self._budget)
-        # The model asked for this recall, so it defaults to the expanded shape
-        # (provenance formatting + entity context) that automatic prefetch skips.
+        # The model asked for this recall, so it defaults to provenance
+        # formatting. Entity expansion stays opt-in.
         explicit_args = dict(args)
         explicit_args.setdefault("include_provenance", self._explicit_recall_include_provenance)
         explicit_args.setdefault("include_entities", self._explicit_recall_include_entities)

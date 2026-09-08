@@ -581,14 +581,18 @@ hermes auth list                                         # Show all pools
 hermes auth list openrouter                              # Show specific provider
 hermes auth add openrouter --api-key sk-or-v1-xxx        # Add API key
 hermes auth add anthropic --type oauth                   # Add OAuth credential
+hermes auth add openai-codex --type oauth --priority 0   # Add an account and try it first
 hermes auth remove openrouter 2                          # Remove by index
+hermes auth priority openrouter backup-key 0             # Move a credential to the front of fill_first order
 hermes auth reset openrouter                             # Clear cooldowns
+hermes auth reset openrouter 2                           # Clear the cooldown on one credential
+hermes auth refresh openai-codex work                    # Refresh one OAuth credential and clear its cooldown
 hermes auth status anthropic                             # Show auth status for a provider
 hermes auth logout anthropic                             # Log out and clear stored auth state
 hermes auth spotify                                      # Authenticate Hermes with Spotify via PKCE
 ```
 
-Subcommands: `add`, `list`, `remove`, `reset`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
+Subcommands: `add`, `list`, `remove`, `reset`, `refresh`, `priority`, `status`, `logout`, `spotify`. When called with no subcommand, launches the interactive management wizard.
 
 ## `hermes status`
 
@@ -1820,3 +1824,34 @@ Additional behavior:
 - [Sessions](../user-guide/sessions.md)
 - [Skills System](../user-guide/features/skills.md)
 - [Skins & Themes](../user-guide/features/skins.md)
+
+### Named credential quota and verified refresh
+
+```bash
+hermes auth status openai-codex meridian --live --json
+hermes auth status openai-codex meridian --json
+hermes auth refresh openai-codex meridian --verify --json
+```
+
+Targets use a unique label, entry ID, or displayed index. Omitting a target is
+allowed only for a pool containing exactly one credential. Targeted status reads
+stored pool rows without auto-import, refresh, repair, or persistence. Without
+`--live`, it reports cached evidence only. Live quota currently supports Codex;
+other providers explicitly return `unsupported`.
+
+`--verify` refreshes through the native credential-owner locking path, reads back
+the selected persisted token pair, then probes that account's quota. It never
+refreshes all accounts. A successful refresh may adopt a peer's rotation and does
+not by itself establish quota availability or successful model inference.
+
+JSON uses `schema_version: 1`, separate `cached` and `quota` objects, observation
+and reset timestamps, and outcomes such as `available`, `exhausted`, `unknown`,
+`refreshed_available`, `refreshed_exhausted`, `refreshed_unknown`, and
+`reauth_required`. A rejected access token alone never establishes reauth.
+`auth refresh --json` without `--verify` reports `refresh_completed` after
+persisted readback, without a quota request.
+
+Exit codes: **0** completed inspection or refresh (including known exhaustion),
+**1** unreadable/unsupported live quota, failed refresh, or failed verification,
+**2** invalid target or unsupported refresh. JSON is written to stdout, startup
+diagnostics to stderr. Provider bodies, tokens, and raw exceptions are excluded.

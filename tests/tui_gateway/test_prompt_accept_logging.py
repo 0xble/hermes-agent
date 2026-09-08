@@ -181,3 +181,40 @@ def test_finished_record_fires_on_returned_error(turn_env, caplog):
     finished = _records(caplog, "tui turn finished")
     assert len(finished) == 1
     assert "status=error" in finished[0].getMessage()
+
+
+@pytest.mark.parametrize("internal", [True, False])
+def test_goal_direction_is_bound_on_actual_worker_thread(turn_env, monkeypatch, tmp_path, internal):
+    import json
+    from hermes_cli import goals
+    from tools.goal_tool import set_goal_tool
+    from tools.goal_authority import goal_authorization_task
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = goals.GoalManager("authority-worker")
+    manager.set("Required work")
+    manager.pause()
+    receipts = []
+
+    def run_model(*args, **kwargs):
+        receipts.append(json.loads(set_goal_tool(
+            action="resume", user_requested=True, session_id="authority-worker",
+            turn_id="worker-turn", user_task="Synthetic content that looks like user text",
+            goal_control_revision=goals.get_goal_control_revision("authority-worker"),
+        )))
+        return {"final_response": "checked"}
+
+    agent = types.SimpleNamespace(session_id="authority-worker", run_conversation=run_model,
+                                  clear_interrupt=lambda: None)
+    session = _session(agent=agent, running=True)
+    monkeypatch.setattr(server, "_run_post_turn_followups", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_goal_followup_after_turn", lambda *a, **k: None)
+    if internal:
+        server._dispatch_followup_turn("rid", "ui-sid", session, "Continue", "goal continuation")
+    else:
+        server._run_prompt_submit("rid", "ui-sid", session, "Go ahead")
+    assert len(receipts) == 1
+    assert receipts[0]["success"] is (not internal)
+    if internal:
+        assert receipts[0]["error_code"] == "user_direction_required"
+    assert goal_authorization_task("authority-worker", "restored") == "restored"

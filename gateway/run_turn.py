@@ -3143,9 +3143,8 @@ class GatewayTurnMixin:
                 name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                 daemon=True,
             ).start()
-        worker.executor_task = asyncio.ensure_future(
-            self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
-        )
+        from gateway.run_executor import start_turn_work
+        worker.executor_task = start_turn_work(self, turn_ctx, worker, _run_sync_with_timeout_lifecycle)
         return worker
 
     @staticmethod

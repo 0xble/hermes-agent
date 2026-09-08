@@ -889,6 +889,10 @@ _TOKENS_SINGLETON_PROVIDERS: Dict[str, Tuple[str, str, str, str]] = {
     "xai-oauth": ("xAI OAuth", "xAI", "refresh_xai_oauth_pure", "_is_terminal_xai_oauth_refresh_error"),
 }
 
+# Providers whose pooled OAuth entries ``_refresh_entry_impl`` can actually refresh. Any other
+# provider is returned unchanged by that path, so callers must not report a refresh for them.
+REFRESHABLE_OAUTH_PROVIDERS = frozenset({"anthropic", "nous", *_TOKENS_SINGLETON_PROVIDERS})
+
 # Providers whose refresh tokens are single-use: the sync -> POST -> write-back
 # sequence must be serialized across processes under the auth-store flock.
 _SINGLE_USE_REFRESH_PROVIDERS = ("openai-codex", "xai-oauth", "anthropic")
@@ -914,6 +918,14 @@ class _RefreshDone(Exception):
     def __init__(self, result: Optional["PooledCredential"]):
         super().__init__()
         self.result = result
+
+
+def _cleared_status_copy(entry: "PooledCredential") -> "PooledCredential":
+    """*entry* with every exhaustion/error field cleared, including ``failure_reason`` in ``extra``."""
+    return replace(
+        entry, **_CLEAR_STATUS,
+        extra={k: v for k, v in entry.extra.items() if k != "failure_reason"},
+    )
 
 
 class CredentialPool:
@@ -1456,6 +1468,8 @@ class CredentialPool:
         So never expose or persist the rotated pair; mark the entry terminally
         so it surfaces as an explicit re-auth requirement.
         """
+        if hasattr(self, "_refresh_failures"):
+            self._refresh_failures[entry.id] = "terminal"
         logger.error(
             "Anthropic %s refresh rotated the single-use token but could not commit it "
             "to %s (%s) — failing closed and quarantining the credential; "
@@ -1602,7 +1616,10 @@ class CredentialPool:
 
         updated = replace(updated, **_MARK_OK)
         self._replace_entry(entry, updated)
-        self._persist()
+        # Declare the cleared id: a borrowed row carries no access_token on disk, so
+        # the merge's token-change bypass cannot apply and a plain persist would copy
+        # the still-binding cooldown back over this success.
+        self._persist(status_cleared_ids=[updated.id])
         # Sync back so _seed_from_singletons() on the next load_pool() sees
         # fresh state instead of re-seeding consumed tokens.
         self._sync_device_code_entry_to_auth_store(updated)
@@ -1663,6 +1680,8 @@ class CredentialPool:
             # re-seed the revoked credentials, and drop singleton-seeded
             # entries from the pool (mirrors the Nous quarantine path).
             if getattr(auth_mod, terminal_fn_name)(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 logger.debug("%s OAuth refresh token is terminally invalid; clearing local token state", display)
                 self._clear_terminal_tokens_state(entry, exc)
                 self._quarantine_sources(entry, {"device_code"})
@@ -1682,6 +1701,8 @@ class CredentialPool:
                 logger.debug("Nous refresh skipped: auth store lock busy; not benching entry")
                 return entry
             if auth_mod._is_terminal_nous_refresh_error(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 logger.debug("Nous refresh token is terminally invalid; clearing local token state")
                 self._clear_terminal_nous_state(entry, exc)
                 self._quarantine_sources(
@@ -1960,8 +1981,14 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
-        """Select the best available entry; returns ``(entry, pending_refresh)``."""
+    def _select_unlocked(
+        self, *, refresh: bool = True, count: bool = True,
+    ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+        """Select the best available entry; returns ``(entry, pending_refresh)``.
+
+        ``count=False`` skips the ``request_count`` bump for selections that are
+        not going to serve a request (a forced-refresh target lookup).
+        """
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
             self._current_id = None
@@ -1978,19 +2005,19 @@ class CredentialPool:
             entry = random.choice(available)
         elif self._strategy == STRATEGY_LEAST_USED and len(available) > 1:
             entry = min(available, key=lambda e: e.request_count)
-            # Bump the usage counter so subsequent selections distribute load
-            self._current_id = entry.id
-            return self._adopt(entry, persist=False, request_count=entry.request_count + 1), pending_refresh
-        elif self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
+        else:
             entry = available[0]
+        # Count the selection under every strategy. The counter is ``least_used``'s
+        # baseline and reaches auth.json on the next persist (exhaustion, rotation,
+        # refresh); it used to move only while ``least_used`` was active.
+        if count:
+            entry = self._adopt(entry, persist=False, request_count=entry.request_count + 1)
+        if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
             self._persist()
-            self._current_id = entry.id
-            return self._current_unlocked() or entry, pending_refresh
-        else:
-            entry = available[0]
+            entry = self._find(lambda candidate: candidate.id == entry.id) or entry
         self._current_id = entry.id
         return entry, pending_refresh
 
@@ -2232,6 +2259,11 @@ class CredentialPool:
         with self._lock:
             return self._try_refresh_current_unlocked()
 
+    def refresh_failure_reason(self, credential_id: str) -> Optional[str]:
+        """Sanitized evidence from this pool instance's most recent targeted attempt."""
+        with self._lock:
+            return getattr(self, "_refresh_failures", {}).get(credential_id)
+
     def try_refresh_matching(
         self,
         api_key_hint: Optional[str] = None,
@@ -2246,11 +2278,17 @@ class CredentialPool:
         """
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id) if credential_id else None
+            if credential_id and entry is None:
+                return None
+            if not hasattr(self, "_refresh_failures"):
+                self._refresh_failures = {}
+            if entry is not None:
+                self._refresh_failures.pop(entry.id, None)
             if entry is None:
                 if api_key_hint:
                     entry = self._find(lambda e: e.runtime_api_key == api_key_hint)
                 else:
-                    entry = self._current_unlocked() or self._select_unlocked(refresh=False)[0]
+                    entry = self._current_unlocked() or self._select_unlocked(refresh=False, count=False)[0]
             if entry is None:
                 return None
             self._current_id = entry.id
@@ -2281,15 +2319,27 @@ class CredentialPool:
             if stale:
                 stale_ids = {e.id for e in stale}
                 self._entries = [
-                    replace(
-                        e, **_CLEAR_STATUS,
-                        extra={k: v for k, v in e.extra.items() if k != "failure_reason"},
-                    )
-                    if e.id in stale_ids else e
+                    _cleared_status_copy(e) if e.id in stale_ids else e
                     for e in self._entries
                 ]
                 self._persist(status_cleared_ids=list(stale_ids))
             return len(stale)
+
+    def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
+        """Clear exhaustion state on one entry; returns it, or None when the id is unknown.
+
+        The single-entry form of :meth:`reset_statuses`: an operator can return one
+        account to rotation without also un-benching siblings whose cooldowns are
+        still binding. Persists with the cleared id for the same merge reason.
+        """
+        with self._lock:
+            entry = self._find(lambda e: e.id == credential_id)
+            if entry is None:
+                return None
+            cleared = _cleared_status_copy(entry)
+            self._replace_entry(entry, cleared)
+            self._persist(status_cleared_ids=[cleared.id])
+            return cleared
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:
@@ -2305,6 +2355,31 @@ class CredentialPool:
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
+
+    def move_entry(self, credential_id: str, priority: int) -> Optional[PooledCredential]:
+        """Place one entry at *priority* (0 = tried first) and renumber the rest.
+
+        Priorities stay a contiguous ``0..n-1`` sequence, as ``remove_index`` keeps
+        them, so ``fill_first`` order matches what ``hermes auth list`` shows.
+        Out-of-range values clamp to the ends. Returns the moved entry, or None
+        when the id is unknown.
+        """
+        with self._lock:
+            entry = self._find(lambda e: e.id == credential_id)
+            if entry is None:
+                return None
+            others = [e for e in self._entries if e.id != credential_id]
+            slot = max(0, min(int(priority), len(others)))
+            others.insert(slot, entry)
+            entries = [replace(e, priority=p) for p, e in enumerate(others)]
+            # Apply the same load-time ordering rule now, so the persisted order is
+            # the one the next load_pool() would produce (anthropic keeps manually
+            # added credentials ahead of seeded ones) and the caller sees the
+            # effective priority rather than one that is silently reverted.
+            _normalize_pool_priorities(self.provider, entries)
+            self._entries = sorted(entries, key=lambda e: e.priority)
+            self._persist()
+            return self._find(lambda e: e.id == credential_id)
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
@@ -3107,3 +3182,33 @@ def load_pool(provider: str) -> CredentialPool:
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         pool._borrowed_root_ids = set(disk_ids)
     return pool
+
+
+def load_pool_read_only(provider: str) -> CredentialPool:
+    """Read persisted rows without seeding, healing, pruning, or persistence."""
+    provider = (provider or "").strip().lower()
+    _, raw_entries = read_pool_snapshot(provider)
+    entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries if isinstance(payload, dict)]
+    return CredentialPool(provider, entries)
+
+
+def read_pool_snapshot(provider: str):
+    """Return owner path and rows without creating even a corrupt-store backup."""
+    import json
+    from hermes_cli import auth as auth_mod
+
+    local = auth_mod._auth_file_path()
+    root = auth_mod._global_auth_file_path()
+    for path in (local, root):
+        if path is None or not path.exists():
+            continue
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        pool = data.get("credential_pool", {})
+        if not isinstance(pool, dict):
+            raise ValueError("Invalid credential pool")
+        rows = pool.get(provider, [])
+        if not isinstance(rows, list):
+            raise ValueError("Invalid provider entries")
+        if rows:
+            return path, rows
+    return local, []

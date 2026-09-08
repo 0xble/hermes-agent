@@ -14,7 +14,7 @@ import uuid
 from agent.credential_pool import (
     AUTH_TYPE_API_KEY, AUTH_TYPE_OAUTH, CUSTOM_POOL_PREFIX, SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE, STATUS_EXHAUSTED, STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN,
-    STRATEGY_RANDOM, STRATEGY_LEAST_USED, PooledCredential, _exhausted_until,
+    STRATEGY_RANDOM, STRATEGY_LEAST_USED, PooledCredential, REFRESHABLE_OAUTH_PROVIDERS, _exhausted_until,
     _normalize_custom_pool_name, get_pool_strategy, label_from_token, list_custom_pool_providers,
     load_pool)
 import hermes_cli.auth as auth_mod
@@ -349,6 +349,14 @@ def auth_add_command(args) -> None:
     if not is_custom:
         _unsuppress_provider_sources(provider)
 
+    wanted_priority = getattr(args, "priority", None)
+    before = {entry.id for entry in pool.entries()}
+    _add_credential(args, provider, pool, requested_type)
+    if wanted_priority is not None:
+        _place_added_credential(provider, before, int(wanted_priority))
+
+
+def _add_credential(args, provider: str, pool, requested_type: str) -> None:
     if requested_type == AUTH_TYPE_API_KEY:
         _add_api_key_credential(args, provider, pool)
         return
@@ -379,6 +387,64 @@ def auth_add_command(args) -> None:
     print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
 
 
+def _place_added_credential(provider: str, before_ids: set, priority: int) -> None:
+    """Move the credential `auth add` just created to *priority*.
+
+    Every add path (api key, OAuth spec, Nous) persists through the pool, so the
+    new row is the one id that was not there before the add. Reloading rather
+    than reusing the add's pool object keeps this correct for paths that write
+    their own store.
+    """
+    pool = load_pool(provider)
+    entries = pool.entries()
+    added = [entry for entry in entries if entry.id not in before_ids]
+    if len(added) == 1:
+        target = added[0]
+    elif not added and len(entries) == 1:
+        # The add updated the sole existing row in place (a repeat Nous login).
+        target = entries[0]
+    else:
+        # The credential was saved; only the placement is unresolved, so do not fail.
+        print(f"note: could not identify the credential just added to {provider}; set its "
+              f"priority with `hermes auth priority {provider} <target> {priority}`.",
+              file=sys.stderr)
+        return
+    moved = pool.move_entry(target.id, priority)
+    _report_priority(provider, pool, moved, priority, "Placed", "at")
+
+
+def _report_priority(provider: str, pool, moved, requested: int, verb: str, prep: str) -> None:
+    """Print the effective priority and say why it differs from the request, if it does."""
+    print(f'{verb} {provider} credential "{moved.label}" {prep} priority {moved.priority} '
+          f"(#{moved.priority + 1} in `hermes auth list {provider}`)")
+    size = len(pool.entries())
+    if moved.priority != requested:
+        if requested < 0 or requested >= size:
+            reason = f"the pool has {size} credentials, so it was clamped"
+        else:
+            reason = "anthropic keeps manually added credentials ahead of seeded ones"
+        print(f"note: requested priority {requested}; effective priority is {moved.priority} "
+              f"because {reason}.", file=sys.stderr)
+    strategy = get_pool_strategy(provider)
+    if strategy != STRATEGY_FILL_FIRST:
+        print(f"note: {provider} uses the {strategy} strategy; priority only orders "
+              f"fill_first selection.", file=sys.stderr)
+
+
+def auth_priority_command(args) -> None:
+    """`hermes auth priority <provider> <target> <priority>`: reorder one pooled credential."""
+    provider = _normalize_provider(getattr(args, "provider", ""))
+    pool = load_pool(provider)
+    index, matched, error = pool.resolve_target(getattr(args, "target", None))
+    if matched is None or index is None:
+        raise SystemExit(f"{error} Provider: {provider}.")
+    requested = int(getattr(args, "priority"))
+    moved = pool.move_entry(matched.id, requested)
+    if moved is None:
+        raise SystemExit(f'No credential matching "{getattr(args, "target", None)}" for provider {provider}.')
+    _report_priority(provider, pool, moved, requested, "Set", "to")
+
+
 def auth_list_command(args) -> None:
     provider_filter = _normalize_provider(getattr(args, "provider", "") or "")
     if provider_filter:
@@ -400,7 +466,9 @@ def auth_list_command(args) -> None:
             marker = "← " if current is not None and entry.id == current.id else "  "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            print(
+                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} id={entry.id:<8} "
+                f"priority={entry.priority:<2} {source}{status} {marker}".rstrip())
         print()
     _print_oauth_heal_notices()
 
@@ -442,13 +510,77 @@ def auth_remove_command(args) -> None:
 
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
+    target = getattr(args, "target", None)
     pool = load_pool(provider)
-    count = pool.reset_statuses()
-    print(f"Reset status on {count} {provider} credentials")
+    if target is None or not str(target).strip():
+        count = pool.reset_statuses()
+        print(f"Reset status on {count} {provider} credentials")
+        return
+    index, matched, error = pool.resolve_target(target)
+    if matched is None or index is None:
+        raise SystemExit(f"{error} Provider: {provider}.")
+    cleared = pool.reset_status(matched.id)
+    if cleared is None:
+        raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
+    print(f"Reset status on {provider} credential #{index} ({cleared.label})")
+
+
+def auth_refresh_command(args) -> None:
+    """`hermes auth refresh <provider> [target]`: force one pooled OAuth entry to refresh.
+
+    A successful refresh rotates the stored tokens and clears the entry's local
+    exhaustion block, returning it to rotation before its persisted
+    ``last_error_reset_at`` elapses. It proves the grant is alive, not that the
+    provider's quota is back: if the account is still capped, the next request
+    429s and benches it again. Failure leaves the pool's own verdict in place.
+    """
+    provider = _normalize_provider(getattr(args, "provider", ""))
+    if getattr(args, "verify", False) or getattr(args, "json", False):
+        from hermes_cli.auth_quota import run_refresh
+        args.provider = provider
+        return run_refresh(args)
+    target = getattr(args, "target", None)
+    pool = load_pool(provider)
+    entries = pool.entries()
+    if not entries:
+        raise SystemExit(f"No {provider} credentials in the pool.")
+    if target is None or not str(target).strip():
+        if len(entries) != 1:
+            raise SystemExit(
+                f"{provider} has {len(entries)} credentials; pass an index, entry id, or exact "
+                f"label (see `hermes auth list {provider}`).")
+        index, matched = 1, entries[0]
+    else:
+        index, matched, error = pool.resolve_target(target)
+        if matched is None or index is None:
+            raise SystemExit(f"{error} Provider: {provider}.")
+    if (provider not in REFRESHABLE_OAUTH_PROVIDERS or matched.auth_type != AUTH_TYPE_OAUTH
+            or not matched.refresh_token):
+        raise SystemExit(
+            f"{provider} credential #{index} ({matched.label}) is not a refreshable OAuth "
+            f"credential.")
+    refreshed = pool.try_refresh_matching(credential_id=matched.id)
+    if refreshed is None:
+        after = next((e for e in pool.entries() if e.id == matched.id), None)
+        state = "removed from pool" if after is None else (after.last_status or "unknown")
+        raise SystemExit(
+            f"Refresh failed for {provider} credential #{index} ({matched.label}); "
+            f"status now: {state}.")
+    status = refreshed.last_status or "ok"
+    if status == "ok":
+        print(f"Refreshed {provider} credential #{index} ({refreshed.label}); status: ok")
+    else:
+        # A peer already rotated this grant and the pool adopted it without clearing status.
+        print(f"Adopted current tokens for {provider} credential #{index} ({refreshed.label}); "
+              f"status still: {status}")
 
 
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if getattr(args, "live", False) or getattr(args, "json", False) or getattr(args, "target", None) is not None:
+        from hermes_cli.auth_quota import run_status
+        args.provider = provider
+        return run_status(args)
     if not provider:
         raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
     if provider in auth_mod.SINGLE_USE_REFRESH_POOL_PROVIDERS:
@@ -651,7 +783,10 @@ def _interactive_strategy() -> None:
 
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
-    "reset": auth_reset_command, "status": auth_status_command, "logout": auth_logout_command,
+    "reset": auth_reset_command, "refresh": auth_refresh_command,
+    "priority": auth_priority_command, "status": auth_status_command,
+    "logout": auth_logout_command,
+    "logout": auth_logout_command,
     "spotify": auth_spotify_command}
 
 

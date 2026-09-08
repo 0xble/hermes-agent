@@ -2255,7 +2255,6 @@ class TestConcurrentToolExecution:
                 "set_goal",
                 {
                     "goal": "Implement this and validate it",
-                    "authorization_text": "Set a goal to implement this and validate it.",
                     "contract": {"verification": "Focused tests pass"},
                 },
                 "task-1",

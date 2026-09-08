@@ -543,6 +543,7 @@ class CLILoopsMixin:
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    from tools.goal_authority import InternalGoalPrompt
+                    self._pending_input.put(InternalGoalPrompt(prompt))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
