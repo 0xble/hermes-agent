@@ -150,19 +150,43 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
     }
     if cfg["provider"].lower() == "auto":
         cfg["provider"] = ""
+    if "reasoning_effort" in review:
+        cfg["reasoning_effort"] = review.get("reasoning_effort")
     if "fallback_chain" in review:
+        from hermes_cli.fallback_config import get_fallback_chain
         chain = review.get("fallback_chain")
-        if isinstance(chain, list):
-            from hermes_cli.fallback_config import get_fallback_chain
-            normalized_chain = get_fallback_chain({"fallback_providers": chain})
-            if normalized_chain:
-                cfg["fallback_providers"] = normalized_chain
-    if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or cfg.get("fallback_providers")):
+        # Its presence is policy: even an empty or invalid chain must prevent
+        # this auxiliary route from silently borrowing the parent's fallbacks.
+        cfg["fallback_providers"] = get_fallback_chain({"fallback_providers": chain})
+    if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or "fallback_providers" in cfg or "reasoning_effort" in cfg):
         return None
     return cfg
 
 
-def start_review(parent_agent, messages: List[Dict[str, Any]], user_prompt: str = "") -> Dict[str, Any]:
+def _load_review_tool_policy() -> str:
+    """Resolve the review capability policy; reject malformed explicit values."""
+    from agent.review_policy import LEGACY_UNRESTRICTED, VALID_REVIEW_TOOL_POLICIES
+    try:
+        from hermes_cli.config import load_config_readonly
+        review = (load_config_readonly().get("auxiliary") or {}).get("review") or {}
+    except Exception:
+        review = {}
+    if not isinstance(review, dict):
+        raise ValueError("auxiliary.review must be an object")
+    policy = review.get("tool_policy", LEGACY_UNRESTRICTED)
+    if policy not in VALID_REVIEW_TOOL_POLICIES:
+        allowed = ", ".join(sorted(VALID_REVIEW_TOOL_POLICIES))
+        raise ValueError(f"auxiliary.review.tool_policy must be one of: {allowed}")
+    return policy
+
+
+def start_review(
+    parent_agent,
+    messages: List[Dict[str, Any]],
+    user_prompt: str = "",
+    *,
+    candidate=None,
+) -> Dict[str, Any]:
     """Dispatch the reviewer subagent; returns the parsed ``delegate_task`` dict (``status: "dispatched"`` +
     ``delegation_id``, or the synchronous result on channels without async completions). Raises ValueError
     when there is nothing to review or the dispatch is rejected/errored."""
@@ -173,9 +197,46 @@ def start_review(parent_agent, messages: List[Dict[str, Any]], user_prompt: str 
         raise ValueError("Nothing to review yet — the conversation is empty.")
     goal, context = build_review_task(snapshot, user_prompt, collect_parent_loaded_skills(parent_agent, messages))
     credentials_cfg = _load_review_credentials_cfg()
+    tool_policy = None
+    output_schema = None
+    completion_contract = None
+    if candidate is not None:
+        from agent.review_candidate import (
+            ReviewCandidateV1, native_review_completion_contract, native_review_output_schema,
+        )
+        from agent.review_policy import INSPECTION_ONLY
+        if not isinstance(candidate, ReviewCandidateV1):
+            raise TypeError("candidate must be a ReviewCandidateV1")
+        tool_policy = INSPECTION_ONLY
+        from tools.async_delegation import get_native_review_reuse
+        reuse = get_native_review_reuse(candidate, focus=user_prompt)
+        if reuse is not None:
+            actual = str((reuse.get("native_review_result") or {}).get("actual_model") or "").strip()
+            reuse["review_model"] = actual or str(reuse.get("review_model") or "").strip()
+            return reuse
+        goal = (
+            "Review the captured candidate independently. Do not run repository tests. "
+            "Return the machine-validated judgment and coverage object."
+        )
+        context += (
+            "\n\nAUTHORITATIVE REVIEW CANDIDATE (captured evidence; do not substitute live working-tree state):\n"
+            + candidate.to_json()
+            + "\nInspection-only limits tool capabilities, not filesystem visibility; read any relevant "
+              "repository evidence, but judge exactly the captured candidate."
+        )
+        output_schema = native_review_output_schema(candidate.candidate_id)
+        completion_contract = native_review_completion_contract(candidate, focus=user_prompt)
+    else:
+        # Preserve the historical manual /review behavior unless the operator
+        # explicitly opts it into the stricter policy.
+        tool_policy = _load_review_tool_policy()
 
     from tools.delegate_tool import delegate_task
-    raw = delegate_task(goal=goal, context=context, background=True, parent_agent=parent_agent, credentials_cfg=credentials_cfg)
+    raw = delegate_task(
+        goal=goal, context=context, background=True, parent_agent=parent_agent,
+        credentials_cfg=credentials_cfg, output_schema=output_schema,
+        child_tool_policy=tool_policy, completion_contract=completion_contract,
+    )
     try:
         result = json.loads(raw)
     except Exception:

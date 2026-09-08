@@ -36,7 +36,7 @@ Lanes:
   and only the TypeScript matrix ran.
 * ``mcp_catalog`` — bundled MCP catalog / installer review.
 * ``risk_full``   — CI, dependency, packaging, installer, or platform changes
-  that require fresh full-hosted approval on the final commit.
+  that automatically select broader hosted checks.
 * ``lock_scan``   — changed lockfiles only; unlike broad fail-open lanes, a
   workflow-only PR does not rescan and fail on unrelated existing CVEs.
 
@@ -159,9 +159,13 @@ _RISK_FULL_FILES = {
     "uv.lock",
 }
 _RISK_FULL_PATHS = (
+    "agent/",
+    "gateway/",
+    "tools/",
     "apps/desktop/",
     "apps/bootstrap-installer/",
     "docker/",
+    "scripts/ci/",
     "scripts/tests/",
 )
 _PLATFORM_PATH_MARKERS = (

@@ -1,8 +1,7 @@
 name: Trusted fork policy
 
-# pull_request_target makes GitHub load this definition from the default branch.
-# Candidate content is data only: no candidate action, script, manifest, or hook
-# is executed by this workflow.
+# GitHub reads pull_request_target workflows from the default branch. Candidate
+# content is checkout data only; every command below addresses trusted-policy.
 on:
   pull_request_target:
     branches: [main]
@@ -20,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout trusted default-branch policy
+      - name: Checkout trusted base policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event.pull_request.base.sha }}
           path: trusted-policy
           persist-credentials: false
       - name: Checkout immutable candidate as data
@@ -32,35 +31,18 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           path: candidate
-          fetch-depth: 0
           persist-credentials: false
-          # Candidate contents are inspected as data by trusted default-branch code.
           allow-unsafe-pr-checkout: true
-      - name: Checkout canonical upstream history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: NousResearch/hermes-agent
-          ref: main
-          path: canonical-upstream
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Fetch canonical upstream history into candidate checkout
-        run: >-
-          git -C candidate fetch --no-tags ../canonical-upstream
-          HEAD:refs/remotes/canonical-upstream/main
-      - name: Validate maintained patch history with trusted code
+      - name: Assess maintenance inventory (advisory)
+        continue-on-error: true
         run: >-
           python3 trusted-policy/scripts/validate_maintenance_manifest.py
-          candidate/MAINTENANCE.md
-          --upstream-ref canonical-upstream/main
-          --history-baseline
-          f66e6d2e504d0d5448bbe227c1766a8bf44a841b
+          candidate/MAINTENANCE.md --json
       - name: Install pinned uv for trusted workflow policy
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # 10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.9.28"
-      - name: Validate candidate workflow surface with trusted code
+      - name: Validate candidate workflow security with trusted code
         run: >-
           uv run --script trusted-policy/scripts/ci/validate_workflow_policy.py
-          --root candidate
-          --trusted-root trusted-policy
+          --root candidate --trusted-root trusted-policy

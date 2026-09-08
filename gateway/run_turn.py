@@ -3332,6 +3332,22 @@ class GatewayTurnMixin:
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            state = self._peek_session_state(session_key)
+            override = state.conversation.model_override if state is not None else None
+            if pending_event is not None and not self._draining and (
+                pending_event.get_command() == "moa"
+                or (override is not None and override.get("provider") == "moa")
+            ):
+                # MoA needs normal command dispatch, not recursive _run_agent (which treats
+                # pending text as a prompt). Leave it for the adapter's post-handler drain:
+                # the current handler's finally restores its model before MoA prepares one.
+                # Put the promoted successor back at the FIFO head without reordering it.
+                successor = adapter._pending_messages.get(session_key)
+                if successor is not None:
+                    self._session_state(session_key).conversation.queued_events.insert(0, successor)
+                adapter._pending_messages[session_key] = pending_event
+                pending_event._fifo_dispatch_pending = True
+                return None, None
             if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):

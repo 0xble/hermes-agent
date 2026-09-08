@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resume_history_is_safe,
 )
 from hermes_state import SessionDB
 
@@ -881,12 +882,9 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
         self.assertEqual(entry["exit_reason"], "completed")
         self.assertFalse(entry["truncated"])
 
-    def test_genuine_truncation_stays_completed_max_iterations(self):
-        """REGRESSION GUARD: a child that genuinely exhausts its iteration
-        budget (completed=False, no failed flag, no error) but still returns a
-        summary must keep status=completed, exit_reason=max_iterations, and
-        truncated=True. This is the legitimate truncation path we must not
-        break while making failure labels honest."""
+    def test_genuine_truncation_is_budget_exhausted_not_completed(self):
+        """A genuine iteration limit is a resumable segment boundary, not task
+        completion.  The parent must decide whether to continue it."""
         entry = self._delegate_single(
             {
                 "final_response": "made partial progress before the budget ran out",
@@ -896,9 +894,21 @@ class TestDelegateFailedChildStatus(unittest.TestCase):
                 "messages": [],
             }
         )
-        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["status"], "budget_exhausted")
         self.assertEqual(entry["exit_reason"], "max_iterations")
         self.assertTrue(entry["truncated"])
+
+    def test_resume_history_never_admits_unmatched_tool_call(self):
+        tool_call = {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"id": "call-1", "function": {"name": "write", "arguments": "{}"}}],
+        }
+        self.assertFalse(_resume_history_is_safe([tool_call]))
+        self.assertTrue(_resume_history_is_safe([
+            tool_call,
+            {"role": "tool", "tool_call_id": "call-1", "content": "written"},
+            {"role": "assistant", "content": "checkpoint"},
+        ]))
 
     def test_interrupted_unchanged(self):
         """Interrupted children keep status=interrupted + exit_reason=interrupted

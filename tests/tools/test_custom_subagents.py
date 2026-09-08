@@ -114,6 +114,43 @@ def test_unsupported_explicit_effort_never_clamps():
         resolve_named_credentials(selected, {}, parent)
 
 
+def test_exact_anthropic_primary_and_codex_fallback_use_transport_efforts(monkeypatch):
+    """Profile catalogs may omit a native transport's authoritative effort vocabulary."""
+    from types import SimpleNamespace
+    from hermes_cli import runtime_provider
+    from tools.custom_subagents import freeze_fallback_routes, resolve_named_credentials
+
+    parent = SimpleNamespace(provider="openai-codex", model="gpt-6-astra",
+        base_url="https://chatgpt.com/backend-api/codex", api_mode="codex_responses",
+        api_key="parent-token", reasoning_config={"effort": "high"}, request_overrides={})
+    role = parse_definitions({"subagents": {"advisor": {
+        "description": "Exact advisor", "instructions": "Fixture only",
+        "provider": "anthropic", "model": "claude-fable-5-1", "reasoning_effort": "high",
+        "fallbacks": [{"provider": "openai-codex", "model": "gpt-6-astra",
+                       "reasoning_effort": "high"}],
+    }}})["advisor"]
+
+    def resolve(*, requested, target_model):
+        return {"provider": requested, "model": target_model,
+            "base_url": ("https://api.anthropic.com/v1" if requested == "anthropic"
+                         else "https://chatgpt.com/backend-api/codex"),
+            "api_key": "fixture-token",
+            "api_mode": ("anthropic_messages" if requested == "anthropic"
+                         else "codex_responses")}
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+                        lambda cfg, _parent: resolve(requested=cfg["provider"], target_model=cfg["model"]))
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", resolve)
+    creds, reasoning = resolve_named_credentials(role, {}, parent)
+    fallbacks = freeze_fallback_routes(role, primary_provider="anthropic",
+                                       primary_model="claude-fable-5-1")
+    assert (creds["provider"], creds["model"], reasoning) == (
+        "anthropic", "claude-fable-5-1", {"enabled": True, "effort": "high"})
+    assert [(route.provider, route.model, route.reasoning_effort, route.api_mode)
+            for route in fallbacks] == [
+                ("openai-codex", "gpt-6-astra", "high", "codex_responses")]
+
+
 def test_invalid_batch_never_constructs_valid_sibling(monkeypatch):
     import json
     from types import SimpleNamespace

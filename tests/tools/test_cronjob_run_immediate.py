@@ -39,7 +39,9 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1", return_job=True)
+        m_claim.assert_called_once_with(
+            "job-run-1", force=True, preserve_paused=True, return_job=True
+        )
         m_run.assert_called_once_with(claimed, adapters=None, loop=None, extra_prompt=None)
 
     def test_run_reconciles_external_provider_after_claimed_execution(self):
@@ -93,7 +95,7 @@ class TestCronjobRunExecutesImmediately:
              patch("tools.cronjob_tools._notify_provider_jobs_changed_safe") as m_notify:
             out = json.loads(cronjob(action="run", job_id="job-run-1"))
 
-        assert out["success"] is True
+        assert out["success"] is False
         assert out["job"]["executed"] is False
         assert out["job"]["execution_success"] is False
         assert "execution_skipped" in out["job"]

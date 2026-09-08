@@ -1,0 +1,5 @@
+{
+  "schema": 1,
+  "security_validator": "scripts/ci/validate_workflow_policy.py",
+  "maintenance_validator": "scripts/validate_maintenance_manifest.py"
+}

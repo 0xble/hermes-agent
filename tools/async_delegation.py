@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -159,6 +160,26 @@ def _capture_routing_origin() -> Dict[str, Any]:
         return {}
 
 
+def _native_review_result(contract: Any, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a fail-closed typed review result from durable runtime metadata."""
+    if not isinstance(contract, dict) or contract.get("kind") != "native_review_result_v1":
+        return None
+    from agent.review_candidate import NativeReviewResultV1, ReviewCandidateV1
+
+    try:
+        candidate = ReviewCandidateV1.from_payload(contract.get("candidate") or {})
+        return asdict(NativeReviewResultV1.from_delegation_entry(entry, candidate))
+    except Exception as exc:
+        candidate_id = str((contract.get("candidate") or {}).get("candidate_id") or "")
+        return asdict(NativeReviewResultV1(
+            candidate_id=candidate_id,
+            runtime_status=str(entry.get("status") or "failed"),
+            exit_reason=str(entry.get("exit_reason") or ""), judgment="unknown", coverage=(),
+            actual_model=str(entry.get("model") or ""),
+            summary=f"Native review result rejected: {exc}",
+        ))
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -168,7 +189,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", *_ROUTING_KEYS)
+        for key in (
+            "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "task_indexes", "completion_contract", *_ROUTING_KEYS,
+        )
         if key in record}
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""INSERT OR REPLACE INTO async_delegations
@@ -282,6 +306,16 @@ def recover_abandoned_delegations() -> int:
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
                 **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
+            if task.get("completion_contract") is not None:
+                event["completion_contract"] = task["completion_contract"]
+                typed = _native_review_result(
+                    task["completion_contract"], {
+                        "status": "unknown", "exit_reason": "owner_abandoned",
+                        "error": event["error"],
+                    }
+                )
+                if typed is not None:
+                    event["native_review_result"] = typed
             result = {"status": "unknown", "summary": None, "error": event["error"],
                       **({"results": recovered_results} if recovered_results else {})}
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
@@ -442,13 +476,69 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("""SELECT origin_session, origin_ui_session_id, parent_session_id,
                       state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, event_json
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
     return None if row is None else {
         "delegation_id": delegation_id, "origin_session": row[0], "origin_ui_session_id": row[1] or "",
         "parent_session_id": row[2] or "", "state": row[3], "dispatched_at": row[4],
         "completed_at": row[5], "result": json.loads(row[6]) if row[6] else None,
-        "delivery_state": row[7], "delivery_attempts": row[8], "origin_session_id": row[9] or ""}
+        "delivery_state": row[7], "delivery_attempts": row[8], "origin_session_id": row[9] or "",
+        "event": json.loads(row[10]) if row[10] else None}
+
+
+def get_native_review_reuse(candidate, *, focus: str = "") -> Optional[Dict[str, Any]]:
+    """Reuse a valid terminal review for exactly unchanged evidence.
+
+    This reads the native async-delegation ledger rather than adding a second
+    persistence lifecycle. Failed, stale, truncated, malformed, and unknown
+    outcomes are deliberately skipped so they can never suppress a fresh review.
+    Live reviews are not reused: their durable delivery route belongs to the
+    dispatching session, so another parent must not yield waiting for that event.
+    """
+    from agent.review_candidate import (
+        NativeReviewResultV1, ReviewCandidateV1, native_review_completion_contract,
+        require_fresh_candidate,
+    )
+
+    if not isinstance(candidate, ReviewCandidateV1):
+        raise TypeError("candidate must be a ReviewCandidateV1")
+    require_fresh_candidate(candidate)
+    expected = json.loads(json.dumps(
+        native_review_completion_contract(candidate, focus=focus),
+        sort_keys=True,
+    ))
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute("""SELECT delegation_id, state, task_json, event_json
+               FROM async_delegations
+               WHERE state NOT IN ('running','stalling','finalizing') AND event_json IS NOT NULL
+               ORDER BY updated_at DESC, delegation_id DESC
+               LIMIT ?""", (_MAX_RETAINED_COMPLETED,)).fetchall()
+
+    for delegation_id, state, task_json, event_json in rows:
+        try:
+            task = json.loads(task_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        if task.get("completion_contract") != expected:
+            continue
+        try:
+            event = json.loads(event_json or "{}")
+            result = NativeReviewResultV1.from_payload(
+                event.get("native_review_result") or {}, candidate_id=candidate.candidate_id,
+            )
+        except (TypeError, ValueError):
+            continue
+        if (
+            result.runtime_status == "completed"
+            and result.exit_reason == "completed"
+            and result.judgment in {"approve", "request_changes", "needs_human"}
+        ):
+            return {
+                "status": "reused", "delegation_id": delegation_id,
+                "candidate_id": candidate.candidate_id,
+                "native_review_result": asdict(result),
+            }
+    return None
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
@@ -547,7 +637,7 @@ def _dispatch(
     parent_session_id: Optional[str], runner: Callable[[], Dict[str, Any]], origin_ui_session_id: str,
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
-    task_indexes: Optional[List[int]] = None,
+    task_indexes: Optional[List[int]] = None, completion_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -571,6 +661,7 @@ def _dispatch(
         "slot_key": slot_key or delegation_id,
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
+        **({"completion_contract": completion_contract} if completion_contract is not None else {}),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
@@ -641,7 +732,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
-    task_indexes: Optional[List[int]] = None,
+    task_indexes: Optional[List[int]] = None, completion_contract: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -659,7 +750,7 @@ def dispatch_async_delegation_batch(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
-        task_indexes=task_indexes,
+        task_indexes=task_indexes, completion_contract=completion_contract,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -732,6 +823,14 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
+    contract = record.get("completion_contract")
+    if contract is not None:
+        evt["completion_contract"] = contract
+        entries = payload.get("results") if is_batch else [result]
+        entry = entries[0] if isinstance(entries, list) and len(entries) == 1 else {"status": status}
+        typed = _native_review_result(contract, entry)
+        if typed is not None:
+            evt["native_review_result"] = typed
     _persist_completion(evt, result)
     try:
         process_registry.completion_queue.put(evt)

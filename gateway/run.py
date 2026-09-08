@@ -3994,8 +3994,7 @@ class GatewayRunner(
     # entry here); all other rejected commands get the generic text in _dispatch_busy_slash_command.
     _BUSY_REJECT_TEXT: Dict[str, str] = {
         "model": "Agent is running — wait or /stop first, then switch models.",
-        "codex-runtime": "Agent is running — wait or /stop first, then change runtime.",
-        "moa": "Agent is running — wait or /stop first, then run /moa."}
+        "codex-runtime": "Agent is running — wait or /stop first, then change runtime."}
 
     def _active_profile_name(self) -> str:
         """Return the profile name this gateway represents."""

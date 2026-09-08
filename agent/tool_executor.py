@@ -699,7 +699,14 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
-    block_message, block_error_type = scope_block, "tool_scope_block"
+    from agent.review_policy import review_tool_policy_block
+
+    policy_block = review_tool_policy_block(agent, ref.name)
+    block_message, block_error_type = (
+        (policy_block, "review_tool_policy_block")
+        if policy_block is not None
+        else (scope_block, "tool_scope_block")
+    )
     if block_message is None:
         block_message = _internal_turn_effect_block(agent, ref.name, ref.args)
         if block_message is not None:
@@ -1749,6 +1756,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i, budget=_tool_budget):
             return
 
+        if ref.name == "review_current_work" and not managed.blocked:
+            # Candidate capture and dispatch form a hard boundary: later calls in
+            # the same model batch could mutate the evidence while its review is
+            # running. Preserve tool-call pairing by emitting explicit skips.
+            agent._review_tool_batch_boundary = True
+            if i < len(tool_calls) and not _skip_remaining_sequential(
+                agent, messages, tool_calls[i:], effective_task_id,
+                notice="post-review tool call(s)",
+                content=(
+                    "[Tool execution skipped — {name} was not started because "
+                    "review_current_work ended this tool batch]"
+                ),
+                flush_stage="post-review skipped tool result",
+            ):
+                return
+            break
+
         if agent._interrupt_requested and i < len(tool_calls):
             if not _skip_remaining_sequential(
                 agent, messages, tool_calls[i:], effective_task_id,
@@ -1776,7 +1800,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    agent._review_tool_batch_boundary = False
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -1784,10 +1809,24 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         run_segment(agent, segment_message, messages, effective_task_id, api_call_count, finalize=False)
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_review_tool_batch_boundary", False):
+            remaining = [call for _, later_calls in segments[segment_index + 1:] for call in later_calls]
+            if remaining:
+                _skip_remaining_sequential(
+                    agent, messages, remaining, effective_task_id,
+                    notice="post-review tool call(s)",
+                    content=(
+                        "[Tool execution skipped — {name} was not started because "
+                        "review_current_work ended this tool batch]"
+                    ),
+                    flush_stage="post-review skipped tool result",
+                )
+            break
 
     total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
         _finalize_tool_batch(agent, messages, effective_task_id, total_tools, _budget_for_agent(agent))
+    agent._review_tool_batch_boundary = False
 
 
 __all__ = [

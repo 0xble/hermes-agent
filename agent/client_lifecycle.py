@@ -867,7 +867,8 @@ class ClientLifecycleMixin:
         next_pin = pin.for_pool_swap(self, entry, runtime_key, runtime_base) if pin is not None else None
         if pin is not None:
             # Preserve the exact launch spelling, not only normalized endpoint identity.
-            runtime_base = pin.base_url
+            assert next_pin is not None
+            runtime_base = next_pin.pinned_base_url_for(self)
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)

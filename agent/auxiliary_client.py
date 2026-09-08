@@ -7083,7 +7083,7 @@ def call_llm(
     extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
     stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
-    require_complete_response: bool = False,
+    require_complete_response: bool = False, strict_route: bool = False,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -7118,6 +7118,7 @@ def call_llm(
                 max_tokens=max_tokens, tools=tools, timeout=timeout, extra_body=extra_body,
                 reasoning_config=reasoning_config, extra_headers=extra_headers, api_mode=api_mode,
                 stream=stream, stream_options=stream_options, route_info=route_info,
+                strict_route=strict_route,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -7229,6 +7230,7 @@ def _call_llm_impl(
     timeout: float = None, extra_body: dict = None, reasoning_config: Optional[dict] = None,
     extra_headers: Optional[Dict[str, str]] = None, api_mode: str = None, stream: bool = False,
     stream_options: dict = None, route_info: Optional[Dict[str, str]] = None,
+    strict_route: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call: resolve provider/model, auth, kwargs, fallbacks.
     task: aux task whose provider:model comes from config (ignored if provider set); api_mode
@@ -7243,6 +7245,19 @@ def _call_llm_impl(
         extra_headers=extra_headers, api_mode=api_mode, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
+    if strict_route:
+        expected = (
+            str(provider or ""), str(model or ""), str(base_url or "").rstrip("/"),
+            str(api_mode or ""), hashlib.sha256(str(api_key or "").encode()).hexdigest(),
+        )
+        actual = (
+            str(request_provider or ""), str(req.final_model or ""),
+            str(getattr(client, "base_url", "") or "").rstrip("/"),
+            str(req.resolved_api_mode or ""),
+            hashlib.sha256(str(getattr(client, "api_key", "") or "").encode()).hexdigest(),
+        )
+        if actual != expected:
+            raise RuntimeError("strict auxiliary route changed before physical request")
     # Streaming path (MoA aggregator): return the raw SDK stream, skipping validation and
     # the fallback chain (they assume a complete response); the caller owns reassembly/fallback.
     if stream:
@@ -7303,6 +7318,8 @@ def _call_llm_impl(
                     _last_transient = retry_transient
             raise _last_transient
     except Exception as first_err:
+        if strict_route:
+            raise
         def _perform(step: _LadderStep) -> Any:
             kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
             if kind == "call":

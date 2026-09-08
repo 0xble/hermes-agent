@@ -1972,9 +1972,21 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
     return "chat_completions"
 
 
-def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> None:
+_FROZEN_FALLBACK_POOL_UNSET = object()
+
+
+def _rebind_fallback_credential_pool(
+    agent, fb_provider: str, fb_model: str, *,
+    frozen_pool=_FROZEN_FALLBACK_POOL_UNSET,
+) -> None:
     """Rebind the credential pool when the provider changes (else rate_limit/billing/auth recovery
     mutates the wrong credentials and overwrites the fallback's base_url). Same-provider pool: kept."""
+    if frozen_pool is not _FROZEN_FALLBACK_POOL_UNSET:
+        # Named routes carry the pool resolved during preflight.  Re-loading here
+        # would let mutable provider config widen the frozen credential authority.
+        agent._credential_pool = frozen_pool
+        agent._credential_pool_entry_id = None
+        return
     existing_pool = getattr(agent, "_credential_pool", None)
     if existing_pool is not None:
         pool_provider = (getattr(existing_pool, "provider", "") or "").strip().lower()
@@ -2195,6 +2207,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
 
         fb_base_url = str(fb_client.base_url)
+        if (getattr(agent, "_delegation_runtime_pin", None) is not None
+                and fb_provider == "openai-codex" and fb_base_url_hint):
+            # The SDK appends one slash; keep the frozen spelling on the agent.
+            # Do not hide a different endpoint behind the configured hint.
+            sdk_base_url = (fb_base_url_hint if fb_base_url_hint.endswith("/")
+                            else fb_base_url_hint + "/")
+            if fb_base_url not in (fb_base_url_hint, sdk_base_url):
+                raise ValueError("named subagent fallback client endpoint changed")
+            fb_base_url = fb_base_url_hint
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
             fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
@@ -2212,8 +2233,37 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
-        _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
+        named_pin = getattr(agent, "_delegation_runtime_pin", None)
+        frozen_pool = _FROZEN_FALLBACK_POOL_UNSET
+        if named_pin is not None:
+            route = next((candidate for candidate in named_pin.fallback_routes
+                          if (candidate.provider, candidate.model) == (fb_provider, fb_model)), None)
+            frozen_pool = route._credential_pool if route is not None else None
+        _rebind_fallback_credential_pool(
+            agent, fb_provider, fb_model, frozen_pool=frozen_pool,
+        )
         _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
+
+        if named_pin is not None:
+            # Named fallback entries are already fully resolved and frozen.
+            # Never reload mutable provider/reasoning config at this boundary.
+            from hermes_constants import parse_reasoning_effort
+            configured_effort = fb.get("reasoning_effort")
+            agent.reasoning_config = (
+                parse_reasoning_effort(configured_effort) if configured_effort is not None else None
+            )
+            agent.request_overrides = dict(fb.get("request_overrides") or {})
+            request_probe = {"model": fb_model}
+            if configured_effort is not None:
+                if fb_api_mode == "codex_responses":
+                    request_probe["reasoning"] = {"effort": configured_effort}
+                else:
+                    request_probe["reasoning_effort"] = configured_effort
+            named_pin.validate_request(
+                agent, request_probe,
+                client=(getattr(agent, "_anthropic_client", None)
+                        if fb_api_mode == "anthropic_messages" else fb_client),
+            )
 
         from agent.agent_runtime_helpers import sync_credential_pool_entry_id
         sync_credential_pool_entry_id(agent)
@@ -2222,8 +2272,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             provider=fb_provider, base_url=fb_base_url, api_mode=fb_api_mode, model=fb_model)
         agent._ensure_lmstudio_runtime_loaded()  # LM Studio: preload before probing context length
         _update_fallback_context_compressor(agent)
-        _reresolve_fallback_reasoning_config(agent)
-        _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+        if named_pin is None:
+            _reresolve_fallback_reasoning_config(agent)
+            _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
         _buffer_fallback_notice(agent, (
@@ -2233,6 +2284,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # provenance so the restore path only emits a recovery notice after a real fallback.
         agent._provider_fallback_active = True
         agent._provider_fallback_route = (str(fb_model), str(fb_provider))
+        transitions = getattr(agent, "_delegation_route_transitions", None)
+        if transitions is None:
+            transitions = agent._delegation_route_transitions = []
+        transitions.append({
+            "reason": getattr(reason, "value", None) or str(reason or "unknown"),
+            "from": {"provider": old_provider, "model": old_model},
+            "to": {"provider": fb_provider, "model": fb_model},
+        })
         logger.info("Fallback activated: %s → %s (%s)", old_model, fb_model, fb_provider)
         # The stale-call streak measured the OLD provider; carrying it over would
         # short-circuit the fresh fallback before its first stream attempt.

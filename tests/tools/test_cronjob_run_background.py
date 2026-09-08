@@ -79,7 +79,7 @@ class TestBackgroundDispatch:
             assert res["claimed"] is True
             assert res["dispatched"] is True
             assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
+            m_claim.assert_called_once_with("job-bg-01", force=True, preserve_paused=True, return_job=True)
             # The job actually starts on the daemon executor.
             assert run_started.wait(timeout=5.0), "job never started in background"
         finally:
@@ -153,7 +153,7 @@ class TestBackgroundDispatch:
         assert "provider exploded" in (found.get("error") or "")
 
     def test_claim_lost_reports_immediately_without_dispatch(self):
-        """Paused/already-firing jobs report in the tool response, not as a
+        """Lost claims report in the tool response, not as a
         delayed completion event."""
         with _bound_session_key():
             with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
@@ -162,7 +162,7 @@ class TestBackgroundDispatch:
                  patch("tools.async_delegation.dispatch_async_delegation") as m_disp:
                 res = _try_dispatch_background_run(_job('job-bg-04'))
         assert res["claimed"] is False
-        assert "paused/disabled" in res["error"]
+        assert "could not be claimed" in res["error"]
         m_disp.assert_not_called()
 
 
@@ -201,15 +201,15 @@ class TestInFlightDedupe:
     routinely outlived by real jobs, so the claim alone can't prevent it."""
 
     def test_run_claimed_job_skips_when_already_running(self):
-        """The authoritative guard: _run_claimed_job refuses to fire a job
-        whose id is already registered in the scheduler running set."""
+        """The claim boundary refuses a second run before consuming a fire claim."""
         from cron import scheduler as sched
-        from tools.cronjob_tools import _run_claimed_job
+        from tools.cronjob_tools import _claim_for_manual_run
 
         assert sched.try_register_running_job("job-bg-08")   # simulate ticker mid-run
         try:
             with patch("cron.scheduler.run_one_job") as m_run:
-                res = _run_claimed_job(_job('job-bg-08'))
+                claimed, res = _claim_for_manual_run('job-bg-08', 'test')
+            assert claimed is None
             assert res["success"] is False
             assert "already running" in res["error"]
             m_run.assert_not_called()
@@ -220,7 +220,7 @@ class TestInFlightDedupe:
         """A normal run holds the registration for run_one_job's duration and
         releases it after — visible to get_running_job_ids mid-run."""
         from cron import scheduler as sched
-        from tools.cronjob_tools import _run_claimed_job
+        from tools.cronjob_tools import _claim_for_manual_run, _run_claimed_job
 
         seen_during_run = {}
 
@@ -229,9 +229,12 @@ class TestInFlightDedupe:
             return True
 
         with patch("cron.scheduler.run_one_job", side_effect=probe_run), \
+             patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
              patch("tools.cronjob_tools.get_job",
                    return_value={"last_status": "ok", "last_error": None}):
-            res = _run_claimed_job(_job('job-bg-09'))
+            claimed, error = _claim_for_manual_run("job-bg-09", "test")
+            assert error is None
+            res = _run_claimed_job(claimed)
 
         assert res["success"] is True
         assert seen_during_run["registered"] is True
@@ -308,7 +311,7 @@ class TestCronjobRunToolIntegration:
                 out = json.loads(cronjob(action="run", job_id="job-bg-12"))
 
         assert out["success"] is True
-        assert out["job"]["executed"] is True
+        assert out["job"]["executed"] is False
         assert out["job"]["execution_mode"] == "background"
         assert out["job"]["delegation_id"]
         assert "background" in out["note"]
@@ -326,5 +329,5 @@ class TestCronjobRunToolIntegration:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-bg-13", return_job=True)
+        m_claim.assert_called_once_with("job-bg-13", force=True, preserve_paused=True, return_job=True)
         m_run.assert_called_once()

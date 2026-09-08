@@ -272,7 +272,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/heartbeat every <interval> <prompt>` (alias: `/hb`) | Set a recurring prompt that re-enters this session when idle. Subcommands: `status`, `pause`, `resume`, `clear`. On Slack use `/hermes heartbeat …`. |
 | `/refine [focus]` | Run the memory/skill self-improvement review now, optionally with focus instructions. On Slack use `/hermes refine …`. |
 | `/review [instructions]` | Spawn an independent reviewer subagent for the work just discussed (PR, code, docs); its review re-enters this chat when done. On Slack use `/hermes review …`. |
-| `/moa <prompt>` | Run one prompt through the default [Mixture of Agents](/user-guide/features/mixture-of-agents) preset, then restore the session model. |
+| `/moa <prompt>` | Run one prompt through the default [Mixture of Agents](/user-guide/features/mixture-of-agents) preset, then restore the session model. While busy, accept it immediately and queue a separate turn after the current reply, preserving attachments and reply context. No interruption or resubmission needed. |
 | `/branch [name]` (alias: `/fork`) | Branch the current session (explore a different path). |
 | `/agents` (alias: `/tasks`) | Show active agents and running tasks. |
 | `/sessions` | Browse and resume previous sessions. |

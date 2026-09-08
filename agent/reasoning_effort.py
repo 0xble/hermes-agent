@@ -83,6 +83,38 @@ def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
 
 
+def transport_supported_reasoning_efforts(
+    provider: Optional[str], model: Optional[str], api_mode: Optional[str],
+) -> Optional[tuple[str, ...]]:
+    """Return the wire vocabulary declared by the selected transport, if known.
+
+    Profiles may provide a more-specific declaration. When they do not, use
+    the native Codex and Anthropic transport contracts. Unknown transports
+    intentionally remain unknown so callers can fail closed.
+    """
+    from providers import get_provider_profile
+
+    profile = get_provider_profile(provider) if isinstance(provider, str) else None
+    declared = profile.supported_reasoning_efforts(model) if profile else None
+    if declared is not None:
+        return tuple(declared)
+    if api_mode == "codex_responses":
+        return codex_supported_efforts(model)
+    if api_mode == "anthropic_messages":
+        from agent.anthropic_adapter import (
+            _accepts_thinking_disable, _supports_adaptive_thinking, _supports_xhigh_effort,
+        )
+
+        if _supports_adaptive_thinking(model or ""):
+            supported = ("low", "medium", "high", "max")
+            if _supports_xhigh_effort(model or ""):
+                supported += ("xhigh",)
+            if _accepts_thinking_disable(model or ""):
+                supported += ("none",)
+            return supported
+    return None
+
+
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for a Moonshot/Kimi slug (bare ``k3``, ``k3-256k``, ``kimi-k3*`` → K3).
 

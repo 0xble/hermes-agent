@@ -96,6 +96,9 @@ def refresh_agent_mcp_tools(
     slot (schemas still refresh), a still-registered tool whose ``check_fn`` merely flapped is
     carried forward (``check_fn`` gates exposure, never invocation), a deregistered tool is
     dropped, new tools append at the tail. The caller owns the prompt-cache contract."""
+    from agent.review_policy import review_registry_refresh_allowed
+    if not review_registry_refresh_allowed(agent):
+        return set()
     from model_tools import get_tool_definitions
     from tools.registry import registry
     enabled, disabled = _resolve_refresh_toolsets(agent, enabled_override, disabled_override)

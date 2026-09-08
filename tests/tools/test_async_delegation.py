@@ -799,11 +799,10 @@ def test_gateway_cli_origin_event_left_unrouted():
 
 
 def test_single_task_truncation_banner_when_max_iterations():
-    """A single async subagent that hit its iteration cap (exit_reason=
-    max_iterations) must surface a TRUNCATED marker in the formatted result,
-    even though status stays 'completed' (a summary exists)."""
+    """A budget checkpoint is explicitly non-complete while retaining its
+    summary and truncation notice for a parent's continuation decision."""
     evt = _make_async_evt(
-        status="completed",
+        status="budget_exhausted",
         summary="Did part of the work then ran out of budget.",
         exit_reason="max_iterations",
     )
@@ -964,7 +963,7 @@ def test_batch_model_rejection_notice_requires_configured_model_in_text(monkeypa
 # together, and the units of one call share ONE capacity slot.
 # ---------------------------------------------------------------------------
 
-def _grouped_fanout(monkeypatch, tasks, gates):
+def _grouped_fanout(monkeypatch, tasks, gates, *, completion_contract=None):
     """delegate_task(tasks) in the background with gated fake children; returns the parsed handle."""
     from unittest.mock import MagicMock
     import tools.delegate_tool as dt
@@ -992,7 +991,36 @@ def _grouped_fanout(monkeypatch, tasks, gates):
     monkeypatch.setattr(dt, "_build_child_agent", build)
     monkeypatch.setattr(dt, "_run_single_child", child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    return json.loads(dt.delegate_task(tasks=tasks, background=True, parent_agent=parent))
+    return json.loads(dt.delegate_task(
+        tasks=tasks, background=True, parent_agent=parent, completion_contract=completion_contract,
+    ))
+
+
+def test_native_review_contract_survives_grouped_dispatch(tmp_path, monkeypatch):
+    """The actual delegate -> unit -> ledger -> formatter rail must keep typed review metadata.
+
+    An invalid candidate deliberately yields unknown, never an ordinary completed-child notice.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    gate = threading.Event()
+    contract = {"kind": "native_review_result_v1", "candidate": {"candidate_id": "invalid-candidate"}}
+    handle = _grouped_fanout(
+        monkeypatch, [{"goal": "inspect the accepted candidate and report", "group": "review"}],
+        [gate], completion_contract=contract,
+    )
+    try:
+        assert handle["status"] == "dispatched"
+        gate.set()
+        event = _drain_for(handle["delegation_id"])
+        assert event is not None
+        assert event["completion_contract"] == contract
+        assert event["native_review_result"]["judgment"] == "unknown"
+        durable = ad.get_durable_delegation(handle["delegation_id"])
+        assert durable is not None
+        assert durable["event"]["native_review_result"] == json.loads(json.dumps(event["native_review_result"]))
+        assert "NATIVE REVIEW" in (format_process_notification(event) or "")
+    finally:
+        gate.set()
 
 
 def test_ungrouped_task_completes_alone_and_group_completes_together(monkeypatch):
@@ -1083,3 +1111,34 @@ print(json.dumps(q.get_nowait(), sort_keys=True))
     assert by_index[1]["status"] == "unknown"
     assert "1/2 child results were recorded" in evt["error"]
     assert "done: fast member" in format_process_notification(evt)
+
+
+def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    task = {"goal": "review", "completion_contract": {"kind": "native_review_result_v1"}}
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at, updated_at,
+                owner_pid, task_json)
+               VALUES (?, ?, 'running', ?, ?, ?, ?)""",
+            ("deleg_abandoned_review", "parent", 1.0, 1.0, 999999999, json.dumps(task)),
+        )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    seen = []
+    monkeypatch.setattr(ad, "_native_review_result", lambda contract, entry: seen.append((contract, entry)) or {
+        "contract": "native_review_result_v1", "runtime_status": "unknown", "judgment": "unknown",
+    })
+
+    assert ad.recover_abandoned_delegations() == 1
+    assert seen[0][1] == {
+        "status": "unknown",
+        "exit_reason": "owner_abandoned",
+        "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+    }
+    with ad._transaction() as conn:
+        event = json.loads(conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            ("deleg_abandoned_review",),
+        ).fetchone()[0])
+    assert event["native_review_result"]["judgment"] == "unknown"

@@ -67,7 +67,8 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     )
 
 def _resolve_child_toolsets(
-    parent_agent, toolsets: Optional[List[str]], effective_role: str
+    parent_agent, toolsets: Optional[List[str]], effective_role: str, *,
+    inherit_mcp_toolsets: bool = True,
 ) -> tuple[List[str], List[str]]:
     """``(enabled_toolsets, disabled_toolsets)`` for a child. Children never gain tools the parent lacks: explicit
     ``toolsets`` are intersected with the parent's (composite-expanded) set, else the parent's enabled set is
@@ -90,7 +91,7 @@ def _resolve_child_toolsets(
     if toolsets:
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if inherit_mcp_toolsets and _get_inherit_mcp_toolsets():
             # Append any parent MCP toolsets missing from the narrowed child.
             child_toolsets += [
                 name for name in sorted(parent_toolsets) if _is_mcp_toolset_name(name) and name not in child_toolsets

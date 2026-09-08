@@ -154,12 +154,16 @@ def run_tool_round(
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to
         # the model or project later events from this turn.
+        agent._review_yield_requested = False
         _turn_exit_reason = "session_persistence_failed"
         final_response = ""
         failed = True
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:
+        # Safety halts outrank an auxiliary review phase boundary. Do not let a
+        # simultaneous review dispatch mask the halt or leak into a later turn.
+        agent._review_yield_requested = False
         decision = agent._tool_guardrail_halt_decision
         _turn_exit_reason = "guardrail_halt"
         final_response = agent._toolguard_controlled_halt_response(decision)
@@ -173,6 +177,15 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        return _verdict("break")
+
+    if getattr(agent, "_review_yield_requested", False):
+        # A dispatched review is a phase boundary. Its typed result re-enters
+        # through the durable delegation rail; do not make another model call
+        # in the work phase that requested the review.
+        agent._review_yield_requested = False
+        _turn_exit_reason = "review_dispatched"
+        final_response = "Review dispatched. Yielding until the review result returns."
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.

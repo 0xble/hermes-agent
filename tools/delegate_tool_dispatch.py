@@ -44,6 +44,7 @@ class _Batch:
     origin_owner_transport: Any
     origin_owner_session_record: Any
     overall_start: float
+    completion_contract: Optional[Dict[str, Any]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
@@ -85,7 +86,8 @@ def _report_child_done(parent_agent, spinner_ref, entry, tag, task_labels, n_tas
     label = task_labels[idx] if idx < len(task_labels) else f"Task {idx}"
     status = entry.get("status", "?")
     _slot = f"{tag} · {idx+1}/{n_tasks}" if tag else f"{idx+1}/{n_tasks}"
-    completion_line = f"{'✓' if status == 'completed' else '✗'} [{_slot}] {label}  ({entry.get('duration_seconds', 0)}s)"
+    icon = "✓" if status == "completed" else ("⏸" if status == "budget_exhausted" else "✗")
+    completion_line = f"{icon} [{_slot}] {label}  ({entry.get('duration_seconds', 0)}s)"
     _err_line = _clean_error_text(entry.get("error"), max_chars=120) if status in SUBAGENT_FAILURE_STATUSES else ""
     if _err_line:
         completion_line += f" — {_err_line}"
@@ -346,6 +348,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         interrupt_fn=_interrupt, delegation_id=unit_id, slot_key=slot_key,
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
+        completion_contract=unit.completion_contract,
     )
 
 def _dispatch_background(batch: _Batch) -> str:
