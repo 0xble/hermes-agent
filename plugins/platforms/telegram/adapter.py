@@ -1976,9 +1976,11 @@ class TelegramAdapter(BasePlatformAdapter):
         LaTeX, and unsupported link targets (schemeless destinations, ``@session:`` references) are
         degraded to their display text so raw ``[label](target)`` syntax never reaches the user (#97497).
         """
+        from .rich_markdown import escape_literal_hash_prefixes
+
         payload: Dict[str, Any] = {
             "markdown": _degrade_unsupported_markdown_links(
-                _rich_normalize_linebreaks(_protect_rich_currency(content))
+                _rich_normalize_linebreaks(_protect_rich_currency(escape_literal_hash_prefixes(content)))
             )
         }
         if skip_entity_detection:

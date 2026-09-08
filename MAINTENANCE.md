@@ -24,6 +24,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
+| HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
 | HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(review): preserve reconciliation safety contracts`; `fix(state): guard directory fsync by platform` | Make raw SQLite backup and quarantine connection-safe and portable. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
@@ -1625,6 +1626,16 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Published commit identity:** Stable subject `feat(update): bind promotion to an immutable revision`.
 - **Rollback:** Revert that subject. Retained Git references restore source only, not dependencies or user state. Runtime recovery retains its separate snapshot and health requirements.
 - **Retirement:** Remove this extension when released upstream proves equivalent immutable preparation, retry and verification behavior.
+
+### HERMES-127 — Literal hash references in Rich Messages
+
+- **Summary:** Escape literal block-start hashes such as `#89`, including list and blockquote prefixes, before Telegram's permissive rich parser consumes them as headings. Preserve genuine spaced headings, inline references, code, math, and existing escapes. The shared payload boundary covers sends, finalized edits, and optional rich drafts. Keep the fork's currency/link/paragraph normalization and `rich_messages: always` behavior intact.
+- **Upstream tracking:** [NousResearch/hermes-agent#105483](https://github.com/NousResearch/hermes-agent/issues/105483). Live Bot API reproduction returns a heading for raw `#89` and a paragraph retaining the hash for `\#89`. Related typography issue #45762 and line-break PR #76368 do not cover this literal-prefix defect.
+- **Upstream PR:** [NousResearch/hermes-agent#105487](https://github.com/NousResearch/hermes-agent/pull/105487), proposed fix closing #105483. Fork adaptation keeps the same normalizer and transport regressions, composed with the existing fork-only currency/link/paragraph normalizers.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram*.py` passed 849 tests across 71 files with 0 failures and 3 skips. New send/edit/draft regressions fail on unpatched upstream. Live Bot API send and exact stored-message forward readback passed for both upstream and fork payloads, proving preserved paragraph references, list references, real headings, inline code, and native tables. Ruff, diff checks, and maintenance validation pass. The upstream-only broad suite has two existing DNS-dependent image timeout failures also reproduced on its clean base. Independent Claude review of the upstream candidate found no P0–P2 defects.
+- **Published commit identity:** Stable subject `fix(telegram): preserve literal hash references in rich messages`.
+- **Rollback:** Revert this subject, removing `rich_markdown.py`, its adapter call, and focused regressions. Preserve the existing currency/link/paragraph normalizers and all runtime configuration. Runtime rollout and rollback remain separate.
+- **Retirement:** Replace with released upstream behavior after equivalent literal-prefix, code/heading preservation, transport regressions, and live rich-message readback pass. Remove the fork-only implementation rather than retaining duplicate normalization.
 
 ## Automatic synchronization
 
