@@ -149,17 +149,19 @@ class TestFutureDatedClaims:
 
 
 class TestHonestRunSkipMessages:
-    def test_paused_job_not_reported_as_already_firing(self):
+    def test_paused_job_is_claimed_for_explicit_manual_run(self):
         from tools.cronjob_tools import _execute_job_now
 
         job = create_job(name="paused job", schedule="0 7 * * *", prompt="x")
         from cron.jobs import pause_job
 
-        pause_job(job["id"])
+        paused = pause_job(job["id"])
         res = _execute_job_now(get_job(job["id"]))
-        assert res["claimed"] is False
-        assert "paused" in (res["error"] or "").lower()
-        assert "already being fired" not in (res["error"] or "").lower()
+        assert res["claimed"] is True
+        after = get_job(job["id"])
+        assert after["enabled"] is False
+        assert after["state"] == "paused"
+        assert after["paused_at"] == paused["paused_at"]
 
     def test_missing_job_not_reported_as_already_firing(self):
         from tools.cronjob_tools import _execute_job_now

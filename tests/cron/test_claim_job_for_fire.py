@@ -9,6 +9,7 @@ E2E-over-mocks discipline for file-touching code.
 """
 import threading
 import time
+from datetime import timedelta
 
 import pytest
 
@@ -74,6 +75,94 @@ def test_forced_claim_atomically_resumes_paused_job(temp_home):
     assert claimed["paused_at"] is None
     assert claimed["paused_reason"] is None
     assert claimed["fire_claim"] is not None
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_paused_manual_fire_preserves_schedule_and_stays_excluded(temp_home, success):
+    """A completed explicit fire is observable, but never resumes or consumes a paused schedule."""
+    from cron.jobs import (
+        _hermes_now,
+        claim_job_for_fire,
+        create_job,
+        get_due_jobs,
+        get_job,
+        load_jobs,
+        mark_job_run,
+        pause_job,
+        save_jobs,
+    )
+
+    job = create_job(prompt="x", schedule="every 5m", name="paused manual")
+    paused = pause_job(job["id"], reason="operator hold")
+    preserved_next_run = (_hermes_now() - timedelta(minutes=1)).isoformat()
+    records = load_jobs()
+    records[0]["next_run_at"] = preserved_next_run
+    save_jobs(records)
+
+    claimed = claim_job_for_fire(
+        job["id"], force=True, preserve_paused=True, return_job=True
+    )
+    assert isinstance(claimed, dict)
+    owner = claimed["fire_claim"]["by"]
+    assert claimed["fire_claim"]["preserve_paused_next_run_at"] == preserved_next_run
+    assert mark_job_run(job["id"], success, expected_fire_owner=owner) is True
+
+    after = get_job(job["id"])
+    assert after is not None
+    assert after["next_run_at"] == preserved_next_run
+    assert after["enabled"] is False
+    assert after["state"] == "paused"
+    assert after["paused_at"] == paused["paused_at"]
+    assert after["paused_reason"] == "operator hold"
+    assert after["fire_claim"] is None
+    assert job["id"] not in {due["id"] for due in get_due_jobs()}
+
+
+def test_stale_owners_cannot_cancel_fire_or_release_running_reservation(temp_home):
+    """Replacement owners keep both the store claim and local manual/ticker reservation."""
+    from cron import scheduler
+    from cron.jobs import (
+        claim_job_for_fire,
+        create_job,
+        get_job,
+        load_jobs,
+        release_fire_claim,
+        save_jobs,
+    )
+
+    job = create_job(prompt="x", schedule="every 5m", name="owner fenced")
+    claimed = claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    stale_owner = claimed["fire_claim"]["by"]
+    next_run_at = claimed["next_run_at"]
+    records = load_jobs()
+    records[0]["fire_claim"]["by"] = "replacement-owner"
+    save_jobs(records)
+
+    assert release_fire_claim(job["id"], expected_owner=stale_owner) is False
+    replacement = get_job(job["id"])
+    assert replacement is not None
+    assert replacement["fire_claim"]["by"] == "replacement-owner"
+    assert release_fire_claim(job["id"], expected_owner="replacement-owner") is True
+    released = get_job(job["id"])
+    assert released is not None
+    assert released["fire_claim"] is None
+    assert released["next_run_at"] == next_run_at
+
+    manual_token = object()
+    stale_token = object()
+    assert scheduler.try_register_running_job(job["id"], reservation_token=manual_token) is True
+    try:
+        assert scheduler.try_register_running_job(job["id"], reservation_token=stale_token) is False
+        assert scheduler.release_running_job(
+            job["id"], expected_reservation_token=stale_token
+        ) is False
+        assert job["id"] in scheduler.get_running_job_ids()
+    finally:
+        assert scheduler.release_running_job(
+            job["id"], expected_reservation_token=manual_token
+        ) is True
+    assert job["id"] not in scheduler.get_running_job_ids()
 
 
 def test_stale_claim_is_reclaimable(temp_home, monkeypatch):

@@ -251,6 +251,39 @@ def test_agent_cannot_replace_its_completion_verifier(monkeypatch, tmp_path):
     assert error is not None
 
 
+@pytest.mark.parametrize("mutation", [None, "pause", "owner", "verifier"])
+def test_paused_manual_run_verifies_without_resuming(monkeypatch, tmp_path, mutation):
+    """An owner-bound manual pause survives verification; later changes fail closed."""
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "verify.py").write_text("print('verifier ran')\n", encoding="utf-8")
+    from cron.jobs import create_job, pause_job, claim_job_for_fire
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    stored = create_job(prompt="x", schedule="every 5m")
+    pause_job(stored["id"], reason="operator hold")
+    claimed = claim_job_for_fire(stored["id"], force=True, preserve_paused=True, return_job=True)
+    assert isinstance(claimed, dict)
+    mutations = {
+        "pause": {"paused_at": "later-pause"},
+        "owner": {"fire_claim": {"by": "replacement", "run_id": "replacement"}},
+        "verifier": {"completion_script": "replacement.py"},
+    }
+    _, result = _run_booked_job(
+        monkeypatch, tmp_path, completion_script="verify.py",
+        live_job_updates=mutations.get(mutation),
+        **{k: claimed[k] for k in ("id", "enabled", "state", "paused_at", "paused_reason", "fire_claim")},
+    )
+    success, output, _, error = result
+    assert success is (mutation is None)
+    if mutation:
+        assert "verifier ran" not in output
+        assert error is not None
+    else:
+        assert "verifier ran" in output
+        assert error is None
+
+
 def test_agent_cannot_disable_completion_verification_mid_run(monkeypatch, tmp_path):
     scripts = tmp_path / "scripts"
     scripts.mkdir()

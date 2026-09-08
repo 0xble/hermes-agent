@@ -522,6 +522,7 @@ def _is_cron_silence_response(text: str) -> bool:
 _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
+_running_reservation_tokens: dict[str, object] = {}
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 # Parent gateway threads synchronously waiting on restart-safe scope workers.
 # Shutdown must not misclassify these as ownerless in-process runs: the tool
@@ -599,7 +600,7 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids | _running_fire_owners.keys())
 
 
-def try_register_running_job(job_id: str) -> bool:
+def try_register_running_job(job_id: str, *, reservation_token: Optional[object] = None) -> bool:
     """Atomically add ``job_id`` to the in-flight set; False (caller must skip) if already mid-run.
     Single dedupe owner for ticker + manual runs (the fire claim's 300s TTL is outlived by real
     jobs). Callers MUST pair success with ``release_running_job`` in a ``finally``.
@@ -612,9 +613,13 @@ def try_register_running_job(job_id: str) -> bool:
     and ``mark_running_jobs_interrupted``.
     """
     with _running_lock:
-        if job_id in _running_job_ids:
+        if job_id in _running_job_ids or job_id in _running_fire_owners:
             return False
         _running_job_ids.add(job_id)
+        if reservation_token is None:
+            _running_reservation_tokens.pop(job_id, None)
+        else:
+            _running_reservation_tokens[job_id] = reservation_token
         # Same critical section as the add: no window where an in-flight id lacks an age the sweep
         # can bound. Sentinel is replaced by the real future once ``pool.submit`` returns.
         _running_since[job_id] = time.time()
@@ -622,19 +627,24 @@ def try_register_running_job(job_id: str) -> bool:
         return True
 
 
-def release_running_job(job_id: str) -> None:
-    """Remove ``job_id`` from the in-flight running set (idempotent).
-
-    A retained job (its worker outlived the timeout and is still running) is NOT released here —
-    the fence thread owns that removal once the future completes. Releasing early would let the
-    scheduler dispatch the same job again alongside the still-live worker.
-    """
+def release_running_job(
+    job_id: str, *, expected_reservation_token: Optional[object] = None,
+) -> bool:
+    """Release a local guard only when its reservation still owns the job."""
     with _running_lock:
         if job_id in _retained_worker_job_ids:
-            return
+            return False
+        current_token = _running_reservation_tokens.get(job_id)
+        if expected_reservation_token is None:
+            if current_token is not None:
+                return False
+        elif current_token != expected_reservation_token:
+            return False
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+        _running_reservation_tokens.pop(job_id, None)
+        return True
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -1992,7 +2002,22 @@ def _completion_configuration_failure(job: dict[str, Any]) -> Optional[str]:
     if live_job is None:
         return "job was removed during its run"
     if live_job.get("enabled") is not True:
-        return "job was disabled during its run"
+        claim = job.get("fire_claim")
+        live_claim = live_job.get("fire_claim")
+        unchanged_manual_pause = (
+            job.get("enabled") is False
+            and job.get("state") == live_job.get("state") == "paused"
+            and isinstance(claim, dict)
+            and "preserve_paused_next_run_at" in claim
+            and isinstance(live_claim, dict)
+            and bool(claim.get("by"))
+            and claim.get("by") == live_claim.get("by")
+            and claim.get("run_id") == live_claim.get("run_id")
+            and all(job.get(field) == live_job.get(field)
+                    for field in ("paused_at", "paused_reason"))
+        )
+        if not unchanged_manual_pause:
+            return "job was disabled during its run"
     protected_fields = ("script", "completion_script", "completion_script_sha256", "workdir")
     changed = [field for field in protected_fields if live_job.get(field) != job.get(field)]
     if changed:
