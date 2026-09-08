@@ -312,6 +312,60 @@ def test_history_validation_accepts_same_commit_registration(tmp_path):
     assert validate_manifest(manifest, history_baseline=baseline) == []
 
 
+def test_history_validation_accepts_registered_github_merge_wrapper(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace(
+            "`fix: one`", "`fix: one`; `fix: registered`"
+        ),
+        encoding="utf-8",
+    )
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "MAINTENANCE.md", "feature.py")
+    _git(repo, "commit", "-m", "fix: registered")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "--hard", baseline)
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        feature,
+        "-m",
+        "Merge pull request #91 from 0xble/registered",
+        "-m",
+        "fix: registered",
+    )
+
+    assert validate_manifest(manifest, history_baseline=baseline) == []
+
+
+def test_history_validation_rejects_unregistered_github_merge_wrapper(tmp_path):
+    repo, manifest, baseline = _init_history_repo(tmp_path)
+    (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "feature.py")
+    _git(repo, "commit", "-m", "fix: orphan")
+    feature = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "reset", "--hard", baseline)
+    _git(
+        repo,
+        "merge",
+        "--no-ff",
+        feature,
+        "-m",
+        "Merge pull request #91 from 0xble/orphan",
+        "-m",
+        "fix: orphan",
+    )
+
+    errors = validate_manifest(manifest, history_baseline=baseline)
+
+    assert any(
+        "fork subject was not registered in its own commit" in error
+        and "Merge pull request #91 from 0xble/orphan" in error
+        for error in errors
+    )
+
+
 @pytest.mark.parametrize(
     ("registered", "observed", "accepted"),
     [
