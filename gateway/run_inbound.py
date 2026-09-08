@@ -1206,6 +1206,10 @@ class GatewayInboundMixin:
         never promoted, e.g. a compression-demoted follow-up) silently orphaned those events. The
         oldest orphan runs as THIS turn and the incoming event is parked behind the chain. Skipped
         for control commands and internal events."""
+        # This is the FIFO head deliberately handed back to normal dispatch (e.g. after
+        # one-shot MoA). Its overflow is not orphaned and must not jump ahead of it.
+        if getattr(event, "_fifo_dispatch_pending", False):
+            return event, source, is_internal
         try:
             # ── FIFO orphan rescue (#99882) ──────────────────────────────── If this session went idle with
             # a populated overflow (queued during a busy window whose post-turn drain never promoted — e.g.

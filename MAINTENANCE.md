@@ -25,6 +25,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
 | HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
+| HERMES-130 | Active | `feat(gateway): queue MoA requests during active turns` | Accept MoA requests immediately for a separate queued one-shot turn. |
 | HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
 | HERMES-002 | Active | `chore(local): carry Brian-owned working-tree patches into the fork`; `fix(review): preserve reconciliation safety contracts`; `fix(state): guard directory fsync by platform` | Make raw SQLite backup and quarantine connection-safe and portable. |
 | HERMES-003 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire fd soft-limit patch` | Historical fixed 8192 file-descriptor floor, replaced by upstream's configurable runtime limit. |
@@ -269,6 +270,17 @@ These subjects are retained as provenance notes only. They are not validation in
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-130 — Accept MoA requests during active replies
+
+- **Hypothesis (2026-09-07):** The registry and runner deliberately reject busy `/moa` because the idle handler changes the session model override and evicts its cached agent. Queue the intact command through the existing session FIFO instead, and defer one-shot preparation until the normal idle dispatcher owns the turn. Runner drain must hand MoA boundaries back to adapter dispatch rather than discard slash commands or recursively inherit the temporary model. Mark handed-off FIFO heads so orphan rescue cannot reorder them. Immediate concurrent execution would require a separate conversation and is not this patch's contract.
+- **Summary:** Accept `/moa <prompt>` during an active reply without interruption or manual resubmission. Each request runs in FIFO order as its own one-shot MoA turn. Bare commands return usage immediately. Reply, attachment, and source metadata survive queueing. No new configuration, dependencies, or persistence schema.
+- **Surfaces:** `hermes_cli/commands.py`; `gateway/run_busy.py`; `gateway/run.py`; `gateway/run_turn.py`; `gateway/run_inbound.py`; gateway regression tests and MoA documentation.
+- **Upstream tracking:** All-state searches for `moa busy` PRs and `moa queue` issues returned no matches on 2026-09-07. The inspected fork base retains the explicit busy rejection.
+- **Upstream PR:** None after checked 2026-09-07. No public contribution authorized.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_queue_command.py tests/gateway/test_moa_one_shot_restore.py tests/gateway/test_queue_consumption.py tests/hermes_cli/test_busy_policy_invariants.py -q`. Exercise actual adapter and runner busy dispatch, FIFO preservation, metadata, no active-model mutation, and idle one-shot restoration.
+- **Rollback:** Revert `feat(gateway): queue MoA requests during active turns`, removing its busy handler and registration, restoring the rejection entry, and removing only its dedicated tests/documentation.
+- **Retirement:** Remove this private implementation when released upstream accepts busy MoA requests without interrupting active work, preserves FIFO and message context, and restores the model after each queued one-shot turn.
 
 ### HERMES-129: Explicit session model controls
 

@@ -753,7 +753,7 @@ class GatewayBusySessionMixin:
 
     # busy_handler key (hermes_cli/commands.py CommandDef) → mid-run variant ``_busy_<key>_command``.
     _BUSY_SPECIAL_HANDLERS: Dict[str, str] = {
-        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
+        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "moa", "steer", "egress", "goal", "loop")
     }
 
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
@@ -842,6 +842,22 @@ class GatewayBusySessionMixin:
             quick_key, source, interrupt_reason=_INTERRUPT_REASON_RESET, invalidation_reason="new_command",
         )
         return await self._handle_reset_command(event)
+
+    async def _busy_moa_command(self, event: MessageEvent, quick_key: str, source):
+        # Keep the command intact: idle dispatch prepares/restores the one-shot model only
+        # when this event owns a turn. Switching here would mutate the active run's state.
+        from hermes_cli.moa_config import moa_usage
+
+        if not event.get_command_args().strip():
+            return moa_usage()
+        adapter = self._adapter_for_source(source)
+        if adapter is None or getattr(adapter, "_pending_messages", None) is None:
+            return "MoA queue unavailable. Please retry when the current reply finishes."
+        event._fifo_dispatch_pending = True
+        self._enqueue_fifo(quick_key, event, adapter)
+        depth = self._queue_depth(quick_key, adapter=adapter)
+        return "MoA queued for its own turn after the current reply." + (
+            f" ({depth} queued)" if depth > 1 else "")
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # Each /queue is its own full agent turn, run FIFO after the current run; never merged.
