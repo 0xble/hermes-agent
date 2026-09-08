@@ -2116,6 +2116,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
 
         fb_base_url = str(fb_client.base_url)
+        if (getattr(agent, "_delegation_runtime_pin", None) is not None
+                and fb_provider == "openai-codex" and fb_base_url_hint):
+            # The SDK appends one slash; keep the frozen spelling on the agent.
+            # Do not hide a different endpoint behind the configured hint.
+            sdk_base_url = (fb_base_url_hint if fb_base_url_hint.endswith("/")
+                            else fb_base_url_hint + "/")
+            if fb_base_url not in (fb_base_url_hint, sdk_base_url):
+                raise ValueError("named subagent fallback client endpoint changed")
+            fb_base_url = fb_base_url_hint
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
             fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
