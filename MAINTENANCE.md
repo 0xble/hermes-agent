@@ -146,6 +146,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-121 | Active | `feat(auth): inspect and verify named credential quota` | Add exact-target read-only live quota inspection and an explicitly verified per-credential OAuth refresh without provider-wide fallback. |
 | HERMES-123 | Active | `fix(goals): make continuation dependency-aware` | Enforce explicit background runtime deadlines with owned process-tree cleanup, persisted expiry, and uncertain-result reconciliation. |
 | HERMES-126 | Active | `fix(review): honor configured fallback routes` | Carry review-owned ordered recovery routes through delegation while preserving ordinary parent fallback inheritance. |
+| HERMES-128 | Active | `fix(telegram): scope citation brackets to explicit markers` | Preserve visible clickable explicitly bracketed citations without converting ordinary numeric commit or PR links into citation markers. |
 
 ## Fork-only administrative subject exemptions
 
@@ -265,6 +266,18 @@ These exact subjects are fork-only history but do not define independently retir
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-128 — Scope Telegram citation brackets to explicit markers
+
+- **Independent hypothesis (2026-09-07):** HERMES-098 inferred citation semantics solely from an all-numeric Markdown link label, so ordinary numeric commit and PR links were rewritten to show extra brackets. Grounded citations already emit an explicit outer bracket pair (`[[1](URL)]`); that syntax is the reliable presentation signal. The correction belongs in the existing Telegram outbound renderer, not in portable model output or upstream, because the overbroad branch is fork-only.
+- **Summary:** Convert only explicitly bracketed numeric citations into one Telegram-clickable visible `[n]` marker. Preserve ordinary `[label](URL)` links, including numeric labels, in legacy MarkdownV2 and rich-message paths. Unsupported targets still degrade to readable label text, and protected code/table regions remain literal.
+- **Surfaces:** `plugins/platforms/telegram/adapter.py`; `tests/gateway/test_telegram_unsupported_link_targets.py`; this manifest.
+- **Upstream tracking:** Fork-only correction to HERMES-098. The current upstream adapter contains neither HERMES-098's numeric-label branch nor this explicit-marker correction.
+- **Upstream PR:** Not applicable — the local-only source means no upstream issue or PR is applicable.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_telegram_unsupported_link_targets.py tests/gateway/test_telegram_format.py tests/gateway/test_telegram_rich_messages.py tests/gateway/test_telegram_send_draft_format.py -q`. Coverage proves rich, legacy, draft/fallback format parity, visible clickable `[[n](URL)]` markers, ordinary numeric commit/PR links, and existing unsupported-target/code protections.
+- **Published commit identity:** Stable subject `fix(telegram): scope citation brackets to explicit markers`.
+- **Rollback:** Revert only this stable-subject commit, restoring HERMES-098's numeric-label inference. Remove this index row and record with the same revert; no schema, configuration, credentials, or persistent data changes are involved.
+- **Retirement:** Retire if HERMES-098 itself is removed or an upstream release owns the same explicit-marker-only contract across both Telegram delivery paths and equivalent regressions pass; remove the fork-only implementation rather than retaining duplicate behavior.
 
 ### HERMES-126 — Ordered Native Review Fallbacks
 
