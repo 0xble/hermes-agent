@@ -48,6 +48,9 @@ def _make_agent(provider="openai-codex", model="gpt-5.5",
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._fallback_chain = []
+    # Ordinary agents have no frozen named-subagent authority. MagicMock would
+    # otherwise synthesize a truthy runtime pin and exercise the pinned path.
+    agent._delegation_runtime_pin = None
     agent._primary_runtime = {
         "provider": provider,
         "model": model,

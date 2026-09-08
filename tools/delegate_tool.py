@@ -11,11 +11,15 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+import json
 import logging
 import os
 import threading
 import time
+import uuid
 import weakref
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -112,6 +116,23 @@ def _open_child_session_db(parent_agent) -> Any:
         return None
     return None
 
+
+def _apply_child_cache_ttl(child) -> None:
+    """A delegated child never uses the 1h cache tier. The tier is priced for a person who steps
+    away between turns (2x write vs 1.25x for 5m, #14971); a subagent calls every few seconds for
+    minutes and is gone, so it pays the 2x on every tool result and never collects the retention.
+    Caching itself stays exactly as configured (disabled stays disabled)."""
+    if getattr(child, "_cache_ttl", None) == "1h":
+        child._cache_ttl = "5m"
+
+
+def _seed_resumed_launch_metadata(child, launch_metadata: dict) -> None:
+    """Keep validated launch authority available to compressed continuation rows."""
+    metadata = deepcopy(launch_metadata)
+    child._session_init_model_config["_delegation_launch"] = metadata
+    setattr(child, "_delegation_launch_metadata", metadata)
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -134,11 +155,21 @@ def _build_child_agent(
     # Configuration block that owns this route's fallback policy. Internal
     # callers such as /review pass auxiliary.review here.
     routing_cfg: Optional[Dict[str, Any]] = None,
+    # Trusted internal capability contract (currently used by native review).
+    child_tool_policy: Optional[str] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
     # HERMES-108: a trusted named definition from ``delegation.subagents``.
     subagent_definition=None,
     resolved_reasoning=None,
+    resolved_fallback_routes=(),
+    moa_snapshot=None,
+    resume_session_id=None,
+    resume_workspace_path=None,
+    resume_launch_metadata=None,
+    resume_claim_id=None,
+    resume_credential_pool=None,
+    resume_credential_id=None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -157,9 +188,31 @@ def _build_child_agent(
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
     delegation_cfg = _load_config()
-    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    inspection_only = child_tool_policy == "inspection_only"
+    if inspection_only:
+        from agent.review_policy import INSPECTION_TOOL_NAMES
+        parent_names = set(getattr(parent_agent, "valid_tool_names", None) or ())
+        missing = sorted(INSPECTION_TOOL_NAMES - parent_names)
+        if missing:
+            raise ValueError(
+                "Inspection-only review requires parent access to: " + ", ".join(missing)
+            )
+    # Build from the parent's normal snapshot, then apply_review_tool_policy freezes
+    # the advertised and executable surface to the exact inspection allow-list.
+    # Asking _resolve_child_toolsets for the synthetic review-inspection toolset
+    # would be intersected away unless the parent explicitly enabled that name.
+    requested_toolsets = None if inspection_only else toolsets
+    child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(
+        parent_agent,
+        requested_toolsets,
+        effective_role,
+        inherit_mcp_toolsets=not inspection_only,
+    )
+
     child_prompt = _build_child_system_prompt(
-        goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        goal, context,
+        workspace_path=resume_workspace_path or _resolve_workspace_hint(parent_agent),
+        role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
     if subagent_definition is not None:
@@ -209,7 +262,8 @@ def _build_child_agent(
                     (lambda text: _safe_progress(child_progress_cb, "_thinking", text) if text else None)
                     if child_progress_cb else None
                 ),
-                session_db=child_session_db, parent_session_id=parent_sid, request_overrides=request_overrides,
+                session_db=child_session_db, parent_session_id=parent_sid,
+                session_id=resume_session_id, request_overrides=request_overrides,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
@@ -222,6 +276,12 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    from agent.review_policy import remove_parent_only_review_tools
+    remove_parent_only_review_tools(child)
+    if child_tool_policy is not None:
+        from agent.review_policy import apply_review_tool_policy
+        apply_review_tool_policy(child, child_tool_policy)
+    _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
@@ -242,10 +302,66 @@ def _build_child_agent(
         child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
     if subagent_definition is not None:
-        from tools.custom_subagents import RuntimePin, inherited_credential_pool
-        child_pool = inherited_credential_pool(child, parent_agent, delegation_cfg)
+        from tools.custom_subagents import (
+            RuntimePin, _authority_mapping_fingerprint, _nonsecret_mapping,
+            inherited_credential_pool, nonsecret_route_url,
+        )
+        child._delegation_named_type = subagent_definition.name
+        if child.provider == "moa":
+            child._moa_preset_snapshot = moa_snapshot
+            from agent.moa_loop import build_moa_facade
+            child.client = build_moa_facade(child, child.model)
+        child_pool = resume_credential_pool or inherited_credential_pool(child, parent_agent, delegation_cfg)
         child._credential_pool = child_pool
-        child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
+        if child.provider != "moa":
+            child._delegation_fallback_routes = tuple(resolved_fallback_routes)
+            child._fallback_chain = [route.native_entry() for route in resolved_fallback_routes]
+            child._fallback_index = 0
+            child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
+        if getattr(child, "_session_init_model_config", None) is not None and not resume_session_id:
+            parent_root = parent_sid
+            if child_session_db is not None and parent_sid:
+                with _quiet(None):
+                    parent_root = child_session_db.get_compression_lineage(parent_sid)[0]
+            launch = {
+                "version": 1,
+                "subagent_type": subagent_definition.name,
+                "description": subagent_definition.description,
+                "instructions": subagent_definition.instructions,
+                "parent_session_root": parent_root,
+                "provider": child.provider, "model": child.model,
+                "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
+                "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
+                "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
+                "request_overrides": _nonsecret_mapping(json.loads(getattr(
+                    getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
+                ))),
+                "request_overrides_fingerprint": _authority_mapping_fingerprint(json.loads(getattr(
+                    getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
+                ))),
+                "fallbacks": [route.metadata() for route in resolved_fallback_routes],
+                "enabled_toolsets": list(child_toolsets or []),
+            }
+            if moa_snapshot is not None:
+                launch["moa"] = moa_snapshot.metadata()
+            if child_pool is not None and callable(getattr(child_pool, "entry_id_for_api_key", None)):
+                credential_id = child_pool.entry_id_for_api_key(getattr(child, "api_key", None))
+                if credential_id:
+                    launch["credential_pool_entry_id"] = credential_id
+            child._session_init_model_config["_delegation_launch"] = launch
+            setattr(child, "_delegation_launch_metadata", launch)
+        if resume_session_id:
+            if not isinstance(resume_launch_metadata, dict):
+                raise ValueError("resumed delegated child is missing validated launch metadata")
+            _seed_resumed_launch_metadata(child, resume_launch_metadata)
+            child._delegation_resume_needs_reload = True
+            child._delegation_resume_fail_if_busy = True
+            setattr(child, "_delegation_resume_claim_id", resume_claim_id)
+            setattr(child, "_delegation_resume_admitted", False)
+            credential_id = resume_credential_id or resume_launch_metadata.get("credential_pool_entry_id")
+            if credential_id:
+                setattr(child, "_delegation_resume_credential_id", credential_id)
+            setattr(child, "_delegation_resume_workspace_path", resume_workspace_path)
     else:
         child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
         if child_pool is not None:
@@ -265,6 +381,114 @@ def _build_child_agent(
         )
     return child
 
+def _resume_history_is_safe(messages: Any) -> bool:
+    """True when every persisted tool request has a matching result.
+
+    A missing result is an unknown external-effect boundary: resuming could make
+    the model repeat an already-started action, so parent continuation fails
+    closed instead of replaying it.
+    """
+    if not isinstance(messages, list):
+        return False
+    pending = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        if role == "assistant" and message.get("tool_calls"):
+            calls = message.get("tool_calls")
+            if not isinstance(calls, list):
+                return False
+            for call in calls:
+                if not isinstance(call, dict):
+                    return False
+                call_id = call.get("call_id") or call.get("id")
+                if not isinstance(call_id, str) or not call_id.strip():
+                    return False
+                pending.add(call_id.split("|", 1)[0].strip())
+        elif role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id.strip():
+                pending.discard(tool_call_id.split("|", 1)[0].strip())
+    return not pending
+
+
+def _refresh_resumable_launch_metadata(child, launch_metadata: dict) -> dict:
+    """Record the active pool account without putting its credential in durable state."""
+    updated = deepcopy(launch_metadata)
+    credential_id = getattr(child, "_credential_pool_entry_id", None)
+    if not isinstance(credential_id, str) or not credential_id:
+        return updated
+    active = (getattr(child, "provider", None), getattr(child, "model", None))
+    if active == (updated.get("provider"), updated.get("model")):
+        updated["credential_pool_entry_id"] = credential_id
+        updated["authority_fingerprint"] = __import__("hashlib").sha256(
+            str(getattr(child, "api_key", "") or "").encode()
+        ).hexdigest()
+        return updated
+    for fallback in updated.get("fallbacks") or []:
+        if isinstance(fallback, dict) and active == (fallback.get("provider"), fallback.get("model")):
+            fallback["credential_pool_entry_id"] = credential_id
+            fallback["authority_fingerprint"] = __import__("hashlib").sha256(
+                str(getattr(child, "api_key", "") or "").encode()
+            ).hexdigest()
+            break
+    return updated
+
+
+def _restore_fallback_authority(routes, expected, normalize_route_base_url):
+    """Rebind frozen fallbacks to their persisted stable pool account IDs."""
+    if not isinstance(expected, list) or len(routes) != len(expected):
+        return routes
+    restored = []
+    for route, metadata in zip(routes, expected):
+        credential_id = metadata.get("credential_pool_entry_id") if isinstance(metadata, dict) else None
+        if not credential_id:
+            restored.append(route)
+            continue
+        pool = route._credential_pool
+        entries = pool.entries() if pool is not None and callable(getattr(pool, "entries", None)) else ()
+        entry = next((item for item in entries if getattr(item, "id", None) == credential_id), None)
+        api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None)
+        entry_provider = str(getattr(entry, "provider", None) or route.provider)
+        entry_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or route.base_url
+        if (
+            entry is None or not api_key or entry_provider != route.provider
+            or normalize_route_base_url(str(entry_base)) != normalize_route_base_url(route.base_url)
+        ):
+            raise ValueError("delegated child fallback stable credential can no longer be authorized")
+        restored.append(replace(
+            route, api_key=str(api_key),
+            credential_digest=__import__("hashlib").sha256(str(api_key).encode()).hexdigest(),
+            credential_pool_entry_id=str(credential_id),
+        ))
+    return tuple(restored)
+
+
+def _fallback_metadata_matches(routes, expected) -> bool:
+    """Compare public route data plus complete override authority, including legacy-safe metadata."""
+    from tools.custom_subagents import _authority_mapping_matches
+    if not isinstance(expected, list) or len(routes) != len(expected):
+        return False
+    for route, stored in zip(routes, expected):
+        if not isinstance(stored, dict):
+            return False
+        overrides = json.loads(route.request_overrides_json)
+        if not _authority_mapping_matches(
+            overrides, stored.get("request_overrides") or {},
+            stored.get("request_overrides_fingerprint"),
+        ):
+            return False
+        current = route.metadata()
+        if "request_overrides_fingerprint" not in stored:
+            current.pop("request_overrides_fingerprint", None)
+        if "credential_pool_entry_id" not in stored:
+            current.pop("credential_pool_entry_id", None)
+        if current != stored:
+            return False
+    return True
+
+
 def _run_single_child(
     task_index: int, goal: str, child=None, parent_agent=None, *, owner_session_id: Optional[str] = None,
     owner_transport: Any = None, owner_session_record: Any = None, **_kwargs,
@@ -272,15 +496,18 @@ def _run_single_child(
     """Run a pre-built child agent (called from a worker thread) and return its result entry.
 
     Contract, derived from the child's structured completion fields:
-      status      ∈ {completed, interrupted, failed} — a structured failure
-                    (failed=True / non-empty error) or an invalid terminal state
-                    is "failed" even when a summary exists.
+      status      ∈ {completed, budget_exhausted, interrupted, failed} —
+                    budget exhaustion is a parent-resumable segment boundary,
+                    never task completion; a structured failure (failed=True /
+                    non-empty error) or invalid terminal state is "failed".
       exit_reason ∈ {completed, max_iterations, interrupted, error} —
                     "max_iterations" only for genuine budget exhaustion
                     (completed=False with no failure fields), never for errors.
       truncated   == (exit_reason == "max_iterations").
 
-    * ``"completed"``       — normal finish. See #97655.
+    * ``"completed"``        — normal task finish. See #97655.
+    * ``"budget_exhausted"`` — safe checkpoint; only an explicit parent resume
+      starts another configured segment.
     """
     child_progress_cb = getattr(child, "tool_progress_callback", None)
     child_pool, leased_cred_id = _lease_child_credential(child)
@@ -314,6 +541,38 @@ def _run_single_child(
 
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
+        if entry.get("status") in {"completed", "budget_exhausted"}:
+            db = getattr(child, "_session_db", None)
+            named_child = getattr(child, "_delegation_named_type", None) is not None
+            if named_child:
+                entry["resume_available"] = False
+            safe_history = _resume_history_is_safe((result or {}).get("messages"))
+            if not safe_history:
+                entry["resume_blocked_reason"] = "unresolved_tool_effects"
+            if db is not None and safe_history:
+                try:
+                    launch_metadata = deepcopy(getattr(child, "_delegation_launch_metadata", None))
+                    if isinstance(launch_metadata, dict):
+                        launch_metadata = _refresh_resumable_launch_metadata(child, launch_metadata)
+                    model_config_patch = {
+                        "_delegation_completed": True,
+                        "_delegation_outcome": entry["status"],
+                        "_delegation_resume_claimed_at": None,
+                        "_delegation_active_route": {
+                            "provider": getattr(child, "provider", None),
+                            "model": getattr(child, "model", None),
+                        },
+                    }
+                    if isinstance(launch_metadata, dict):
+                        model_config_patch["_delegation_launch"] = launch_metadata
+                    db.patch_session_model_config(
+                        getattr(child, "session_id", ""), model_config_patch,
+                    )
+                    if named_child:
+                        entry["resume_available"] = True
+                except Exception as exc:
+                    logger.warning("Could not mark delegated child resumable: %s", exc, exc_info=True)
+                    entry["resume_error"] = "durable continuation marker could not be persisted"
         run.append_sibling_write_reminder(entry)
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
@@ -327,7 +586,176 @@ def _run_single_child(
             preview=str(exc), summary=str(exc), status="failed",
         )
     finally:
+        with _quiet("Could not restore unadmitted delegated resume grant: %s"):
+            _restore_unadmitted_resume_grant(child)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+
+
+def _parse_model_config(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _resolve_resume_launch(task, definitions, parent_agent):
+    """Restore one completed child from durable, nonsecret launch metadata."""
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_cli.route_identity import normalize_route_base_url
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_constants import parse_reasoning_effort
+    from tools.custom_subagents import (
+        FallbackDefinition, ResolvedSubagentLaunch, SubagentDefinition,
+        freeze_fallback_routes, nonsecret_route_url, _authority_mapping_matches,
+    )
+
+    requested = task.get("resume_session_id")
+    if not isinstance(requested, str) or not requested.strip():
+        raise ValueError("resume_session_id must be a nonempty delegated child session id")
+    db = getattr(parent_agent, "_session_db", None)
+    if db is None:
+        raise ValueError("child resume requires the parent's durable session database")
+    tip = db.resolve_resume_session_id(requested.strip())
+    row = db.get_session(tip) if tip else None
+    if not row:
+        raise ValueError("resume_session_id does not name an existing session")
+    row_profile = row.get("profile_name")
+    if row_profile and row_profile != get_active_profile_name():
+        raise ValueError("resume_session_id belongs to another Hermes profile")
+    config = _parse_model_config(row.get("model_config"))
+    launch = config.get("_delegation_launch")
+    if not isinstance(launch, dict) or launch.get("version") != 1:
+        raise ValueError("resume_session_id is not a resumable delegated child")
+    if not config.get("_delegation_completed"):
+        raise ValueError("delegated child has no verified resumable checkpoint")
+    role = launch.get("subagent_type")
+    if not isinstance(role, str) or role not in definitions:
+        raise ValueError("delegated child references an unknown configured role")
+    if task.get("subagent_type") not in (None, role):
+        raise ValueError("requested subagent_type conflicts with the delegated child")
+    requested_preset = task.get("moa_preset")
+    stored_preset = (launch.get("moa") or {}).get("preset") if isinstance(launch.get("moa"), dict) else None
+    if requested_preset is not None and requested_preset != stored_preset:
+        raise ValueError("requested moa_preset conflicts with the delegated child")
+    parent_sid = getattr(parent_agent, "session_id", None)
+    parent_lineage = db.get_compression_lineage(parent_sid) if parent_sid else []
+    parent_root = parent_lineage[0] if parent_lineage else parent_sid
+    if not parent_root or launch.get("parent_session_root") != parent_root:
+        raise ValueError("resume_session_id is foreign to the requesting parent lineage")
+    delegated_from = config.get("_delegate_from")
+    delegated_lineage = db.get_compression_lineage(delegated_from) if delegated_from else []
+    delegated_root = delegated_lineage[0] if delegated_lineage else delegated_from
+    if not delegated_root or delegated_root != parent_root:
+        raise ValueError("resume_session_id is not a delegated child of the requesting parent lineage")
+
+    provider, model = str(launch.get("provider") or ""), str(launch.get("model") or "")
+    effort = launch.get("reasoning_effort")
+    definition = SubagentDefinition(
+        name=role, description=str(launch.get("description") or ""),
+        instructions=str(launch.get("instructions") or ""), provider=provider,
+        model=model, reasoning_effort=effort,
+        fallbacks=tuple(FallbackDefinition(
+            provider=str(item.get("provider") or ""), model=str(item.get("model") or ""),
+            reasoning_effort=item.get("reasoning_effort"),
+        ) for item in launch.get("fallbacks") or [] if isinstance(item, dict)),
+    )
+    snapshot = None
+    resume_credential_pool = None
+    resume_credential_id = None
+    if provider == "moa":
+        from agent.moa_loop import restore_moa_preset
+        snapshot = restore_moa_preset(launch.get("moa") or {})
+        # Reuse the same virtual transport contract as a fresh named MoA child;
+        # physical authority remains inside the restored frozen snapshot.
+        creds = {
+            "provider": "moa", "model": model, "base_url": "moa://local",
+            "api_key": None, "api_mode": "chat_completions",
+            "request_overrides": None, "max_output_tokens": None,
+        }
+        reasoning = None
+        fallbacks = ()
+    else:
+        creds = resolve_runtime_provider(requested=provider, target_model=model)
+        stable_credential_id = launch.get("credential_pool_entry_id")
+        if stable_credential_id is not None:
+            pool = _resolve_child_credential_pool(provider, parent_agent, creds.get("base_url"))
+            entries = pool.entries() if pool is not None and callable(getattr(pool, "entries", None)) else []
+            entry = next((item for item in entries if getattr(item, "id", None) == stable_credential_id), None)
+            if entry is None:
+                raise ValueError("delegated child stable credential identity is no longer authorized")
+            entry_provider = str(getattr(entry, "provider", "") or provider)
+            entry_base = getattr(entry, "runtime_base_url", None) or creds.get("base_url")
+            if (
+                entry_provider != provider
+                or normalize_route_base_url(nonsecret_route_url(str(entry_base or "")))
+                   != normalize_route_base_url(str(launch.get("base_url") or ""))
+            ):
+                raise ValueError("delegated child stable credential identity changed route authority")
+            runtime_key = getattr(entry, "runtime_api_key", None)
+            if not isinstance(runtime_key, str) or not runtime_key:
+                raise ValueError("delegated child stable credential identity has no usable runtime credential")
+            creds = {**creds, "api_key": runtime_key, "base_url": entry_base}
+        authority_matches = (
+            stable_credential_id is not None
+            or __import__("hashlib").sha256(str(creds.get("api_key") or "").encode()).hexdigest()
+               == str(launch.get("authority_fingerprint") or "")
+        )
+        if (
+            creds.get("provider") != provider
+            or (creds.get("model") or model) != model
+            or str(creds.get("api_mode") or "") != str(launch.get("api_mode") or "")
+            or normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
+               != normalize_route_base_url(str(launch.get("base_url") or ""))
+            or not authority_matches
+            or not _authority_mapping_matches(
+                creds.get("request_overrides") or {}, launch.get("request_overrides") or {},
+                launch.get("request_overrides_fingerprint"),
+            )
+        ):
+            raise ValueError("delegated child primary route can no longer be authorized exactly")
+        reasoning = parse_reasoning_effort(effort) if effort is not None else None
+        fallbacks = freeze_fallback_routes(
+            definition, primary_provider=provider, primary_model=model
+        )
+        expected_fallbacks = launch.get("fallbacks") or []
+        fallbacks = _restore_fallback_authority(fallbacks, expected_fallbacks, normalize_route_base_url)
+        if not _fallback_metadata_matches(fallbacks, expected_fallbacks):
+            raise ValueError("delegated child fallback routes no longer match their frozen identities")
+        resume_credential_pool = None
+        resume_credential_id = stable_credential_id
+        active = config.get("_delegation_active_route") or {"provider": provider, "model": model}
+        active_id = (active.get("provider"), active.get("model")) if isinstance(active, dict) else (None, None)
+        if active_id != (provider, model):
+            active_index = next((index for index, route in enumerate(fallbacks)
+                                 if (route.provider, route.model) == active_id), None)
+            if active_index is None:
+                raise ValueError("delegated child active route is not in its frozen fallback chain")
+            active_route = fallbacks[active_index]
+            creds = active_route.native_entry()
+            resume_credential_pool = active_route._credential_pool
+            resume_credential_id = active_route.credential_pool_entry_id
+            reasoning = parse_reasoning_effort(active_route.reasoning_effort) if active_route.reasoning_effort is not None else None
+            fallbacks = fallbacks[active_index + 1:]
+            definition = SubagentDefinition(
+                name=role, description=definition.description, instructions=definition.instructions,
+                provider=active_route.provider, model=active_route.model,
+                reasoning_effort=active_route.reasoning_effort,
+                fallbacks=tuple(FallbackDefinition(route.provider, route.model, route.reasoning_effort)
+                                for route in fallbacks),
+            )
+    return ResolvedSubagentLaunch(
+        definition, creds, reasoning, fallbacks, snapshot, tip,
+        tuple(str(x) for x in launch.get("enabled_toolsets") or ()),
+        workspace_path=str(row.get("cwd")) if row.get("cwd") else None,
+        launch_metadata=deepcopy(launch),
+        _credential_pool=resume_credential_pool if provider != "moa" else None,
+        resume_credential_id=resume_credential_id if provider != "moa" else None,
+    )
 
 
 def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legacy_creds):
@@ -336,7 +764,11 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
     Resolution is a preflight, not a per-child step: an unknown ``subagent_type`` anywhere must fail
     the batch before the first child exists, so a partially-valid batch cannot spawn its valid half.
     """
-    from tools.custom_subagents import parse_definitions, resolve_definition, resolve_named_credentials
+    from dataclasses import replace
+    from tools.custom_subagents import (
+        ResolvedSubagentLaunch, freeze_fallback_routes, parse_definitions,
+        resolve_definition, resolve_named_credentials,
+    )
 
     # Registry validation is not a per-task failure: report it as the config error it is, naming the
     # invalid definition (item 3). list/steer/stop never consult definitions, so running children
@@ -349,19 +781,63 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
             "this is fixed; action=list/steer/stop still control running children."
         )
 
-    task_runtime: List[tuple] = []
+    task_runtime: List[ResolvedSubagentLaunch] = []
     try:
         for task in task_list:
+            if task.get("resume_session_id") is not None:
+                if credentials_cfg:
+                    raise ValueError("resumed named subagents cannot override credentials_cfg")
+                task_runtime.append(_resolve_resume_launch(task, definitions, parent_agent))
+                continue
             definition = resolve_definition(definitions, task.get("subagent_type"))
             if definition is not None and credentials_cfg:
                 raise ValueError("named subagents cannot override an internal credentials_cfg route")
             if definition is None:
-                task_runtime.append((None, legacy_creds, None))
+                if task.get("moa_preset") is not None:
+                    raise ValueError("moa_preset is only valid for a named MoA subagent")
+                task_runtime.append(ResolvedSubagentLaunch(None, legacy_creds, None))
                 continue
+            selected_preset = task.get("moa_preset")
+            if selected_preset is not None:
+                if definition.provider != "moa":
+                    raise ValueError("moa_preset is only valid for a named MoA subagent")
+                if not isinstance(selected_preset, str) or not selected_preset.strip():
+                    raise ValueError("moa_preset must be a nonempty preset name")
+                allowed = definition.moa_presets or (definition.model,)
+                if selected_preset not in allowed:
+                    raise ValueError(f"moa_preset {selected_preset!r} is not allowed for subagent_type {definition.name!r}")
+                definition = replace(definition, model=selected_preset)
             task_creds, reasoning = resolve_named_credentials(definition, cfg, parent_agent)
-            task_runtime.append((definition, task_creds, reasoning))
+            snapshot = task_creds.pop("moa_snapshot", None)
+            fallback_routes = freeze_fallback_routes(
+                definition,
+                primary_provider=str(task_creds.get("provider") or getattr(parent_agent, "provider", "")),
+                primary_model=str(task_creds.get("model") or getattr(parent_agent, "model", "")),
+            ) if definition.provider != "moa" else ()
+            task_runtime.append(ResolvedSubagentLaunch(
+                definition, task_creds, reasoning, fallback_routes, snapshot
+            ))
     except ValueError as exc:
         return [], f"Task {len(task_runtime)} preflight failed: {exc}"
+
+    resume_ids = [
+        launch.resume_session_id for launch in task_runtime
+        if launch.resume_session_id is not None
+    ]
+    if resume_ids:
+        db = getattr(parent_agent, "_session_db", None)
+        claim_batch = getattr(db, "claim_delegated_resumes", None)
+        claim_id = uuid.uuid4().hex
+        if not callable(claim_batch) or not claim_batch(resume_ids, claim_id=claim_id):
+            return [], (
+                "Delegated child resume batch is unsafe, already claimed, or no longer resumable. "
+                "No child was started."
+            )
+        task_runtime = [
+            replace(launch, resume_claim_id=claim_id)
+            if launch.resume_session_id is not None else launch
+            for launch in task_runtime
+        ]
     return task_runtime, None
 
 
@@ -376,11 +852,36 @@ def _creds_overrides(creds: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _release_resume_launches(parent_agent, launches: List[Any]) -> bool:
+    """Compensate one claimed batch when construction failed before admission."""
+    claimed = [launch for launch in launches if getattr(launch, "resume_claim_id", None)]
+    if not claimed:
+        return False
+    claim_ids = {launch.resume_claim_id for launch in claimed}
+    if len(claim_ids) != 1:
+        return False
+    release = getattr(getattr(parent_agent, "_session_db", None), "release_delegated_resumes", None)
+    return bool(callable(release) and release(
+        [launch.resume_session_id for launch in claimed], claim_id=next(iter(claim_ids)),
+    ))
+
+
+def _restore_unadmitted_resume_grant(child) -> bool:
+    """Restore one exact claim only when the native turn lease never admitted it."""
+    claim_id = getattr(child, "_delegation_resume_claim_id", None)
+    if not claim_id or getattr(child, "_delegation_resume_admitted", False):
+        return False
+    release = getattr(getattr(child, "_session_db", None), "release_delegated_resumes", None)
+    session_id = getattr(child, "session_id", None)
+    return bool(callable(release) and session_id and release([session_id], claim_id=claim_id))
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
-    task_runtime: Optional[List[tuple]] = None,
+    task_runtime: Optional[List[Any]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
+    child_tool_policy: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure.
@@ -396,20 +897,36 @@ def _build_children(
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
-        _definition, _task_creds, _reasoning = (
-            task_runtime[i] if task_runtime and i < len(task_runtime) else (None, creds, None))
+        _launch = task_runtime[i] if task_runtime and i < len(task_runtime) else None
+        _definition = _launch.definition if _launch else None
+        _task_creds = _launch.credentials if _launch else creds
+        _reasoning = _launch.reasoning if _launch else None
         _task_overrides = overrides if _definition is None else _creds_overrides(_task_creds)
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
-                toolsets=None,  # always inherit the parent's toolsets
+                toolsets=list(_launch.enabled_toolsets) if _launch and _launch.enabled_toolsets is not None else None,
                 model=_task_creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
                 subagent_definition=_definition, resolved_reasoning=_reasoning,
-                routing_cfg=routing_cfg, **_task_overrides,
+                resolved_fallback_routes=_launch.fallback_routes if _launch else (),
+                moa_snapshot=_launch.moa_snapshot if _launch else None,
+                resume_session_id=_launch.resume_session_id if _launch else None,
+                resume_workspace_path=_launch.workspace_path if _launch else None,
+                resume_launch_metadata=_launch.launch_metadata if _launch else None,
+                resume_claim_id=_launch.resume_claim_id if _launch else None,
+                resume_credential_pool=_launch._credential_pool if _launch else None,
+                resume_credential_id=_launch.resume_credential_id if _launch else None,
+                routing_cfg=routing_cfg,
+                child_tool_policy=child_tool_policy,
+                **_task_overrides,
             )
         except ValueError as exc:
+            _release_resume_launches(parent_agent, task_runtime or [])
             return [], str(exc)
+        except BaseException:
+            _release_resume_launches(parent_agent, task_runtime or [])
+            raise
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -433,6 +950,8 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
+    child_tool_policy: Optional[str] = None,
+    completion_contract: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -455,6 +974,8 @@ def delegate_task(
         )
 
     top_role = _normalize_role(role)
+    if child_tool_policy not in (None, "legacy_unrestricted", "inspection_only"):
+        return tool_error(f"Invalid review tool policy: {child_tool_policy!r}")
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
@@ -507,7 +1028,7 @@ def delegate_task(
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
-    creds = task_runtime[0][1]
+    creds = dict(task_runtime[0].credentials)
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -522,14 +1043,14 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
-        routing_cfg=credentials_cfg,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime, routing_cfg=credentials_cfg, child_tool_policy=child_tool_policy,
     )
     if err:
         return tool_error(err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
+        completion_contract=completion_contract,
     )
     return _run_batch(batch, background)
 
@@ -549,7 +1070,11 @@ def _task_routing_metadata(task_runtime: list, parent_agent=None) -> list:
     inherited_effort = requested_effort(getattr(parent_agent, "reasoning_config", None))
 
     routing = []
-    for definition, task_creds, reasoning in task_runtime:
+    for launch in task_runtime:
+        if hasattr(launch, "definition"):
+            definition, task_creds, reasoning = launch.definition, launch.credentials, launch.reasoning
+        else:
+            definition, task_creds, reasoning = launch
         creds = task_creds or {}
         if reasoning and reasoning.get("enabled") is False:
             effort = "none"
@@ -817,6 +1342,16 @@ DELEGATE_TASK_SCHEMA = {
                             "string",
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
+                        ),
+                        "resume_session_id": _p(
+                            "string",
+                            "Stable child_session_id from a completed or budget-exhausted delegation. Continues that exact "
+                            "named child's durable session and frozen route; omit subagent_type or repeat the same role.",
+                        ),
+                        "moa_preset": _p(
+                            "string",
+                            "Optional native MoA preset for a named provider: moa role. The preset must be in "
+                            "that role's configured moa_presets allowlist; omission uses the role default.",
                         ),
                         "output_schema": _p(
                             "object",

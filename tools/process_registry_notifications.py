@@ -3,10 +3,11 @@ watch_match, watch_disabled, watch_overflow_*, async_delegation) into the
 ``[IMPORTANT: ...]`` / ``[ASYNC DELEGATION ...]`` text the CLI drain loop, gateway and
 TUI inject into the agent conversation."""
 
+import json
 import time
 from contextlib import suppress
 
-_DONE = ("completed", "success")
+_DONE = ("completed", "success", "budget_exhausted")
 
 
 def _format_age(seconds: float) -> str:
@@ -157,12 +158,84 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
     return "\n".join(lines)
 
 
+def _format_native_review(evt: dict, deleg_id: str, completed_at: float) -> str:
+    """Render the runtime-owned candidate result, rechecking freshness at delivery."""
+    from agent.review_candidate import (
+        NativeReviewResultV1, ReviewCandidateV1, require_fresh_candidate,
+    )
+
+    contract = evt.get("completion_contract") or {}
+    rejection = ""
+    try:
+        candidate = ReviewCandidateV1.from_payload(contract.get("candidate") or {})
+        result = NativeReviewResultV1.from_payload(
+            evt.get("native_review_result") or {}, candidate_id=candidate.candidate_id,
+        )
+        require_fresh_candidate(candidate)
+    except Exception as exc:
+        candidate_id = str((contract.get("candidate") or {}).get("candidate_id") or "")
+        result = NativeReviewResultV1(
+            candidate_id=candidate_id,
+            runtime_status=str(evt.get("status") or "failed"),
+            exit_reason="", judgment="unknown", coverage=(),
+            actual_model=str(evt.get("model") or ""), summary="",
+        )
+        rejection = f"Result is not currently admissible: {exc}"
+
+    lines = _preamble(
+        evt,
+        f"[NATIVE REVIEW COMPLETE — {deleg_id}]",
+        "A candidate-bound inspection-only review has finished. Runtime execution status and model "
+        "judgment are separate; only judgment=approve on the unchanged candidate is approval.",
+        completed_at, with_goal=False,
+    )
+    typed_payload = {
+        "contract": result.contract,
+        "candidate_id": result.candidate_id,
+        "runtime_status": result.runtime_status,
+        "exit_reason": result.exit_reason,
+        "judgment": result.judgment,
+        "coverage": list(result.coverage),
+        "actual_model": result.actual_model,
+        "summary": result.summary,
+        "grants_authority": result.grants_authority,
+        "requires_existing_authority": result.requires_existing_authority,
+    }
+    lines += ["--- TYPED RESULT ---", json.dumps(typed_payload, sort_keys=True, ensure_ascii=False)]
+    if rejection:
+        lines += ["--- FRESHNESS / VALIDATION ---", rejection]
+    return "\n".join(lines)
+
+
+def _process_accounting_lines(r: dict) -> list:
+    """Runtime-truth lines about a child's background processes: what it handed to you (you own it now, its
+    completion lands here) and what it left running (terminated at teardown — never trust a child's "watcher running")."""
+    lines = []
+    for h in r.get("handed_off_processes") or []:
+        lines.append(f"Handed off to you: {h.get('session_id')} ({h.get('command', '')[:120]}) — {h.get('note', '')}. "
+                     "You own it now; its completion notice will arrive here.")
+    orphans = r.get("orphaned_processes") or []
+    if orphans:
+        lines.append(f"Child left {len(orphans)} background process(es) running that were TERMINATED with it "
+                     "(subagent process notices never reach you): "
+                     + "; ".join(f"{o.get('session_id')} `{o.get('command', '')[:100]}` ({o.get('runtime_seconds')}s)" for o in orphans)
+                     + ". Re-launch in this session anything you still need.")
+    for u in r.get("unread_completions") or []:
+        lines.append(f"Child's process {u.get('session_id')} `{u.get('command', '')[:100]}` finished (exit code "
+                     f"{u.get('exit_code')}) but the child never read its result; output tail:\n{u.get('output_tail', '')}")
+    return lines
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
     and result, so an agent deep in unrelated context can act on it or re-dispatch."""
     deleg_id = evt.get("delegation_id", "unknown")
     completed_at = evt.get("completed_at") or time.time()
+    if evt.get("task_failure_notice"):
+        return _format_task_failure_notice(evt, deleg_id)
+    if (evt.get("completion_contract") or {}).get("kind") == "native_review_result_v1":
+        return _format_native_review(evt, deleg_id, completed_at)
     if evt.get("is_batch") or isinstance(evt.get("results"), list):
         return _format_batch_delegation(evt, deleg_id, completed_at)
     status, summary, error = evt.get("status") or "completed", evt.get("summary"), evt.get("error")

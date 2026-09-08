@@ -60,7 +60,7 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
 
     def run_synchronized_relay_finalizer(managed_stream, attempt):
         relay_finalizer_started.set()
-        assert allow_relay_finalizer.wait(5), "consumer did not release Relay's finalizer"
+        assert allow_relay_finalizer.wait(30), "consumer did not release Relay's finalizer"
         try:
             return run_relay_finalizer(managed_stream, attempt)
         finally:
@@ -71,11 +71,22 @@ def _stream_through_relay(tmp_path, monkeypatch, response_body: bytes, *, finali
     count_chunk = chat_completion_helpers._StreamingCall._count_chunk
 
     def count_chunk_after_relay_finalizes(self, diag, chunk):
-        # ``_count_chunk`` is the first thing the consumer does with every chunk.
+        # Relay's producer is pumped by the consumer thread's OWN event loop (``ManagedLlmStream.
+        # __next__`` -> ``run_until_complete``), so the finalizer can only start while that loop runs.
+        # Blocking the consumer thread here and waiting for it therefore deadlocked whenever the loop
+        # had not reached EOF yet. Instead: release the finalizer and pump the stream's loop until it
+        # has completed, then hand the chunk to the consumer. That is a real happens-before.
         if finalize_before(chunk):
-            assert relay_finalizer_started.wait(5), "Relay's finalizer did not start"
+            import asyncio
+
+            stream = self.managed_stream_holder["stream"]
             allow_relay_finalizer.set()
-            assert relay_finalizer_finished.wait(5), "Relay's finalizer did not finish"
+
+            async def finalizer_done():
+                return await asyncio.to_thread(relay_finalizer_finished.wait, 30)
+
+            assert stream._loop.run_until_complete(finalizer_done()), "Relay's finalizer did not finish"
+            assert relay_finalizer_started.is_set()
         return count_chunk(self, diag, chunk)
 
     monkeypatch.setattr(chat_completion_helpers._StreamingCall, "_count_chunk", count_chunk_after_relay_finalizes)

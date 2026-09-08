@@ -149,6 +149,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | HERMES-128 | Active | `fix(telegram): scope citation brackets to explicit markers` | Preserve visible clickable explicitly bracketed citations without converting ordinary numeric commit or PR links into citation markers. |
 
 | HERMES-129 | Active | `feat(session): add explicit model and reasoning tool`; `fix(session): declare model control tool in plugin metadata` | Optional session-only model/reasoning tool using native frontend controls. |
+| HERMES-124 | Active | `feat(delegate): freeze named subagent fallback, MoA, and resume runtime` | Freeze named-child routes and support atomic completed- or budget-checkpoint continuation with fail-closed lease and tool-effect admission. |
 
 ## Historical administrative notes
 
@@ -401,6 +402,16 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Regression:** `scripts/run_tests.sh tests/tools/test_browser_real_profile.py` with fake process records, never real browser termination.
 - **Rollback:** Revert only the ownership matcher and associated tests. Preserve snapshot selection, refresh policy, user consent, and browser-close call sites.
 - **Retirement:** Upstream exact-argument and executable ownership must pass the same positive and false-positive process-selection tests.
+
+### HERMES-124 — Frozen custom-subagent fallback, MoA, and resume runtime
+
+- **Summary:** Extends named subagents with explicit parent inheritance, fully preflighted ordered availability fallbacks, native MoA preset selection with frozen physical routes, and parent-controlled continuation on the existing durable session lineage. The global 250-iteration limit is a segment boundary: exhaustion is reported as `budget_exhausted`, never completion, and no new or unlimited segment starts automatically. Persisted launch metadata is versioned and nonsecret; resume fail-closes without consuming its grant on foreign lineage/profile, role or route drift, active turn leases, and unmatched persisted tool calls whose external effects are unresolved.
+- **Surfaces:** `tools/custom_subagents.py`, `tools/delegate_tool.py`, `tools/delegate_tool_child_run.py`, `tools/delegate_tool_dispatch.py`, `tools/process_registry_notifications.py`, `hermes_state_sessions.py`, `agent/moa_loop.py`, `agent/chat_completion_helpers.py`, `agent/turn_recovery.py`, `agent/turn_facade_lease.py`, `website/docs/user-guide/features/delegation.md`, `tests/tools/test_custom_subagents.py`, `tests/tools/test_delegate.py`, `tests/run_agent/test_custom_subagent_runtime.py`, `tests/run_agent/test_delegation_frozen_runtime.py`.
+- **Upstream tracking:** Extends fork-only HERMES-108/HERMES-112; no direct upstream equivalent was identified.
+- **Upstream PR:** None. This extends the fork-specific named-role contract.
+- **Retirement:** Remove this extension when released upstream provides equivalent named-role inheritance, authorized fallback routing, frozen MoA presets, and isolated durable child follow-ups with the same acceptance tests passing.
+- **Regression:** Run `scripts/run_tests.sh tests/tools/test_custom_subagents.py tests/tools/test_delegate.py tests/run_agent/test_custom_subagent_runtime.py tests/run_agent/test_delegation_frozen_runtime.py tests/agent/test_moa_reasoning_effort.py tests/run_agent/test_moa_fanout_cadence.py tests/agent/test_turn_facade_lease.py` plus the full suite before publication.
+- **Rollback:** Revert this extension without changing live profile configuration. Existing unnamed delegation and the original explorer/worker roles remain the compatibility baseline.
 
 ### HERMES-112 — Close named subagent audit findings
 

@@ -365,7 +365,12 @@ def _lease_child_credential(child: Any) -> tuple[Any, Optional[str]]:
     child_pool = getattr(child, "_credential_pool", None)
     if child_pool is None:
         return None, None
-    leased_cred_id = child_pool.acquire_lease()
+    preferred_id = getattr(child, "_delegation_resume_credential_id", None)
+    if not isinstance(preferred_id, str) or not preferred_id:
+        preferred_id = None
+    leased_cred_id = (
+        child_pool.acquire_lease(preferred_id) if preferred_id else child_pool.acquire_lease()
+    )
     if leased_cred_id is not None:
         with _quiet("Failed to bind child to leased credential: %s"):
             leased_entry = child_pool.current()
@@ -476,12 +481,14 @@ def _build_result_entry(
         # provider rejection as "max_iterations" — that is only truthful for real budget exhaustion.
         status, exit_reason = "failed", "error"
     else:
-        # exit_reason ("completed" vs "max_iterations") tells the parent HOW the task ended; completed=False with no
-        # failure = budget exhaustion. A declared schema still violated after the bounded retry makes the summary
-        # unusable under the contract, so status must not say completed (orchestrators reading only status/icon would
-        # accept an empty verdict).
+        # A false completed flag with no failure is a clean iteration-segment
+        # boundary, not task completion.  Its summary is a checkpoint for the
+        # parent, which may explicitly resume the durable child session.
         exit_reason = "completed" if result.get("completed", False) else "max_iterations"
-        status = "completed" if schema.valid is not False and usable_summary else "failed"
+        if schema.valid is False or not usable_summary:
+            status = "failed"
+        else:
+            status = "completed" if exit_reason == "completed" else "budget_exhausted"
 
     _cost = getattr(child, "session_estimated_cost_usd", 0.0)
     _cost_status = getattr(child, "session_cost_status", None)
@@ -493,9 +500,11 @@ def _build_result_entry(
         "api_calls": result.get("api_calls", 0),
         "duration_seconds": duration,
         "model": _str_or_none(getattr(child, "model", None)),
+        "provider": _str_or_none(getattr(child, "provider", None)),
+        "child_session_id": _str_or_none(getattr(child, "session_id", None)),
+        "route_transitions": list(getattr(child, "_delegation_route_transitions", ()) or ()),
         "exit_reason": exit_reason,
-        # A budget-exhausted child still returns a summary (status stays
-        # "completed"), so the parent needs this explicit flag.
+        # Explicit segment state; a checkpoint summary does not imply task completion.
         "truncated": exit_reason == "max_iterations",
         "tokens": {
             "input": _num(getattr(child, "session_prompt_tokens", 0)),
@@ -593,15 +602,25 @@ class _ChildRun:
         import uuid as _uuid
         self.child_task_id = self.subagent_id or f"subagent-{self.task_index}-{_uuid.uuid4().hex[:8]}"
         self.parent_task_id = getattr(self.parent_agent, "_current_task_id", None)
-        # Seed the child's cwd record from the parent's: same starting directory,
-        # but the child's later `cd`s stay in its own record. Per-session container
-        # isolation keys containers by task_id; the child must share the PARENT's.
+        # Seed the child's cwd record. New children start in the parent's workspace;
+        # resumed children retain the cwd persisted on their durable session. Per-session
+        # container isolation keys containers by task_id; the child must share the PARENT's.
         with _quiet("Child cwd seed failed: %s"):
             from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
-            record_session_cwd(self.child_task_id, get_session_cwd(self.parent_task_id))
+            resume_workspace = getattr(self.child, "_delegation_resume_workspace_path", None)
+            record_session_cwd(
+                self.child_task_id,
+                resume_workspace or get_session_cwd(self.parent_task_id),
+            )
             register_container_alias(self.child_task_id, self.parent_task_id)
 
-        self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+        # A resumed child stays in the workspace persisted on its durable session.
+        # Creating a fresh isolated worktree here would silently move the continuation
+        # away from the files produced by the previous segment.
+        resume_workspace = getattr(self.child, "_delegation_resume_workspace_path", None)
+        self.worktree_info = None if resume_workspace else _create_isolated_worktree(
+            self.parent_agent, self.parent_task_id, self.subagent_id,
+        )
         if self.worktree_info is not None:
             with _quiet("worktree cwd seed failed: %s"):
                 from tools.terminal_tool import record_session_cwd as _rsc

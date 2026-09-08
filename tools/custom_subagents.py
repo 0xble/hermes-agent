@@ -8,19 +8,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from agent.credential_pool import CredentialPool
 from copy import deepcopy
-from urllib.parse import urlsplit
 import re
 from typing import Mapping
 
 from agent.reasoning_effort import EFFORT_LADDER
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class FallbackDefinition:
+    provider: str
+    model: str
+    reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SubagentDefinition:
     name: str
     description: str
@@ -28,9 +36,131 @@ class SubagentDefinition:
     provider: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    inherit_parent: bool = False
+    moa_presets: tuple[str, ...] | None = None
+    fallbacks: tuple[FallbackDefinition, ...] = ()
 
 
-_FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort"})
+@dataclass(frozen=True, slots=True)
+class ResolvedRoute:
+    """One fully authorized runtime route frozen for a child launch.
+
+    The API key is runtime-only and excluded from repr/comparison/metadata.  The
+    digest is retained for the final physical-request guard.
+    """
+    provider: str
+    model: str
+    base_url: str
+    api_mode: str
+    reasoning_effort: str | None
+    api_key: str | None = field(default=None, repr=False, compare=False)
+    credential_digest: str = field(default="", repr=False)
+    request_overrides_json: str = "{}"
+    _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
+    credential_pool_entry_id: str | None = None
+
+    def native_entry(self) -> dict:
+        entry = {
+            "provider": self.provider, "model": self.model,
+            "base_url": self.base_url, "api_mode": self.api_mode,
+        }
+        if self.reasoning_effort is not None:
+            entry["reasoning_effort"] = self.reasoning_effort
+        if self.api_key:
+            entry["api_key"] = self.api_key
+        entry["request_overrides"] = json.loads(self.request_overrides_json)
+        return entry
+
+    def metadata(self) -> dict:
+        metadata = {
+            "provider": self.provider, "model": self.model,
+            "base_url": nonsecret_route_url(self.base_url), "api_mode": self.api_mode,
+            "reasoning_effort": self.reasoning_effort,
+            "authority_fingerprint": self.credential_digest,
+            "request_overrides": _nonsecret_mapping(json.loads(self.request_overrides_json)),
+            "request_overrides_fingerprint": _authority_mapping_fingerprint(
+                json.loads(self.request_overrides_json)
+            ),
+        }
+        if self.credential_pool_entry_id:
+            metadata["credential_pool_entry_id"] = self.credential_pool_entry_id
+        return metadata
+
+
+def nonsecret_route_url(value: str) -> str:
+    """Credential-free canonical URL suitable for durable launch metadata."""
+    try:
+        parsed = urlsplit(str(value or ""))
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return ""
+
+
+_NONSECRET_TOKEN_LIMIT_KEYS = frozenset({
+    "max_tokens", "max_output_tokens", "max_completion_tokens",
+    "reference_max_tokens", "token_limit", "input_token_limit",
+    "output_token_limit", "context_token_limit",
+})
+
+
+def _mapping_key_is_secret(key, value) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    if (
+        normalized in _NONSECRET_TOKEN_LIMIT_KEYS
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
+    ):
+        return False
+    return any(marker in normalized for marker in (
+        "api_key", "token", "credential", "authorization", "headers", "cookie",
+    ))
+
+
+def _nonsecret_mapping(value):
+    if isinstance(value, dict):
+        return {key: _nonsecret_mapping(item) for key, item in value.items()
+                if not _mapping_key_is_secret(key, item)}
+    if isinstance(value, list):
+        return [_nonsecret_mapping(item) for item in value]
+    return value
+
+
+def _authority_mapping_fingerprint(value) -> str:
+    """Bind complete override authority without persisting its secret values."""
+    canonical = json.dumps(
+        value or {}, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(b"hermes-request-overrides-v1\0" + canonical).hexdigest()
+
+
+def _authority_mapping_matches(value, public_value, fingerprint) -> bool:
+    """Validate full authority; legacy metadata is safe only when nothing was redacted."""
+    if isinstance(fingerprint, str) and fingerprint:
+        return _authority_mapping_fingerprint(value) == fingerprint
+    return (value or {}) == (public_value or {})
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSubagentLaunch:
+    definition: SubagentDefinition | None
+    credentials: Mapping
+    reasoning: Mapping | None
+    fallback_routes: tuple[ResolvedRoute, ...] = ()
+    moa_snapshot: object | None = None
+    resume_session_id: str | None = None
+    enabled_toolsets: tuple[str, ...] | None = None
+    workspace_path: str | None = None
+    launch_metadata: Mapping | None = None
+    resume_claim_id: str | None = None
+    _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
+    resume_credential_id: str | None = None
+
+
+_FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort", "inherit_parent", "moa_presets", "fallbacks"})
 # Public aliases for the configuration system, which validates
 # ``delegation.subagents.<name>.<field>`` without importing the runtime.
 SUBAGENT_FIELDS = _FIELDS
@@ -70,6 +200,33 @@ def parse_definitions(config: Mapping) -> dict[str, SubagentDefinition]:
             if required not in fields:
                 raise ValueError(f"{where}.{required} is required")
         for key, value in fields.items():
+            if key == "inherit_parent":
+                if not isinstance(value, bool):
+                    raise ValueError(f"{where}.inherit_parent must be a boolean")
+                continue
+            if key == "moa_presets":
+                if not isinstance(value, list) or not value or any(not isinstance(p, str) or not p.strip() for p in value):
+                    raise ValueError(f"{where}.moa_presets must be a nonempty list of preset names")
+                if len(set(value)) != len(value):
+                    raise ValueError(f"{where}.moa_presets must not contain duplicates")
+                continue
+            if key == "fallbacks":
+                if not isinstance(value, list) or any(not isinstance(route, dict) for route in value):
+                    raise ValueError(f"{where}.fallbacks must be a list of route mappings")
+                fallback_ids = set()
+                for route in value:
+                    if set(route) - {"provider", "model", "reasoning_effort"} or not isinstance(route.get("provider"), str) or not isinstance(route.get("model"), str):
+                        raise ValueError(f"{where}.fallbacks entries require provider and model, with optional reasoning_effort")
+                    if not route["provider"].strip() or not route["model"].strip() or route["provider"] != route["provider"].strip() or route["model"] != route["model"].strip():
+                        raise ValueError(f"{where}.fallbacks provider/model must be nonempty without surrounding whitespace")
+                    route_id = (route["provider"], route["model"])
+                    if route_id in fallback_ids:
+                        raise ValueError(f"{where}.fallbacks must not contain duplicate routes: {route_id!r}")
+                    fallback_ids.add(route_id)
+                    effort = route.get("reasoning_effort")
+                    if effort is not None and (not isinstance(effort, str) or effort not in EFFORT_LADDER):
+                        raise ValueError(f"{where}.fallbacks reasoning_effort is invalid: {effort!r}")
+                continue
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{where}.{key} must be a nonempty string")
         for key in ("provider", "model", "reasoning_effort"):
@@ -77,10 +234,24 @@ def parse_definitions(config: Mapping) -> dict[str, SubagentDefinition]:
                 raise ValueError(f"{where}.{key} must not contain surrounding whitespace")
         if "provider" in fields and "model" not in fields:
             raise ValueError(f"{where}: an explicit provider requires an explicit model")
+        if fields.get("inherit_parent") and any(key in fields for key in ("provider", "model", "reasoning_effort", "moa_presets")):
+            raise ValueError(f"{where}.inherit_parent cannot be combined with primary route settings")
+        if fields.get("provider") == "moa":
+            if "reasoning_effort" in fields or "fallbacks" in fields:
+                raise ValueError(f"{where}: MoA roles own effort and fallbacks in their native preset")
+            if fields.get("moa_presets") is not None and fields.get("model") not in fields["moa_presets"]:
+                raise ValueError(f"{where}.model must be included in moa_presets")
+        elif "moa_presets" in fields:
+            raise ValueError(f"{where}.moa_presets is only valid for provider: moa")
         effort = fields.get("reasoning_effort")
         if effort is not None and effort not in EFFORT_LADDER:
             raise ValueError(f"{where}.reasoning_effort is invalid: {effort!r}")
-        definitions[name] = SubagentDefinition(name=name, **fields)
+        normalized = dict(fields)
+        if "moa_presets" in normalized:
+            normalized["moa_presets"] = tuple(normalized["moa_presets"])
+        if "fallbacks" in normalized:
+            normalized["fallbacks"] = tuple(FallbackDefinition(**route) for route in normalized["fallbacks"])
+        definitions[name] = SubagentDefinition(name=name, **normalized)
     return definitions
 
 
@@ -104,9 +275,9 @@ def advertised_settings(definition: SubagentDefinition, defaults: Mapping) -> di
     so anything that would only be known at launch is reported as inherited
     rather than guessed. Never touches credentials.
     """
-    model = definition.model or (defaults.get("model") or None)
-    provider = definition.provider or (defaults.get("provider") or None)
-    effort = definition.reasoning_effort or (defaults.get("reasoning_effort") or None)
+    model = definition.model or (None if definition.inherit_parent else defaults.get("model") or None)
+    provider = definition.provider or (None if definition.inherit_parent else defaults.get("provider") or None)
+    effort = definition.reasoning_effort or (None if definition.inherit_parent else defaults.get("reasoning_effort") or None)
     return {
         "name": definition.name,
         "description": definition.description,
@@ -115,7 +286,8 @@ def advertised_settings(definition: SubagentDefinition, defaults: Mapping) -> di
         "reasoning_effort": effort or "inherits the parent effort",
         # A named role's settings are fixed at launch: the model chooses the
         # identifier, configuration chooses everything else.
-        "pinned": bool(definition.model or definition.reasoning_effort),
+        "pinned": bool(definition.model or definition.reasoning_effort or definition.inherit_parent),
+        **({"moa_presets": list(definition.moa_presets or (definition.model,))} if definition.provider == "moa" else {}),
     }
 
 
@@ -129,17 +301,22 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     from agent.reasoning_effort import codex_supported_efforts, requested_effort, clamp_effort
     from hermes_constants import parse_reasoning_effort
 
-    provider = definition.provider or defaults.get("provider") or getattr(parent, "provider", None)
-    model = definition.model or defaults.get("model") or getattr(parent, "model", None)
+    provider = definition.provider or (getattr(parent, "provider", None) if definition.inherit_parent else defaults.get("provider")) or getattr(parent, "provider", None)
+    model = definition.model or (getattr(parent, "model", None) if definition.inherit_parent else defaults.get("model")) or getattr(parent, "model", None)
+    if provider == "moa":
+        from agent.moa_loop import snapshot_moa_preset
+        snapshot = snapshot_moa_preset(str(model))
+        return {"provider": "moa", "model": model, "base_url": "moa://local", "api_key": None,
+                "api_mode": "chat_completions", "request_overrides": None, "max_output_tokens": None,
+                "moa_snapshot": snapshot}, None
     if not isinstance(model, str) or not model:
         raise ValueError(f"subagent_type {definition.name!r}: no resolved model")
-    if provider == "openai-codex":
+    if provider == "openai-codex" and getattr(parent, "provider", None) == "openai-codex":
         base_url = getattr(parent, "base_url", "") or ""
         url = urlsplit(base_url)
         key = getattr(parent, "api_key", None) or getattr(parent, "_client_kwargs", {}).get("api_key")
         if (
-            getattr(parent, "provider", None) != "openai-codex"
-            or getattr(parent, "api_mode", None) != "codex_responses"
+            getattr(parent, "api_mode", None) != "codex_responses"
             or url.scheme != "https" or url.netloc != "chatgpt.com"
             or url.path.rstrip("/") != "/backend-api/codex"
             or url.query or url.fragment
@@ -152,6 +329,22 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
             "request_overrides": deepcopy(getattr(parent, "request_overrides", {}) or {}),
             "max_output_tokens": None,
         }
+        supported = codex_supported_efforts(model)
+    elif provider == "openai-codex":
+        # An explicit Codex route has its own configured OAuth authority.  It is
+        # not required to match the parent provider, but it must resolve through
+        # the native runtime-provider cache (never an arbitrary API-key fallback).
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        try:
+            creds = resolve_runtime_provider(requested=provider, target_model=model)
+        except Exception as exc:
+            raise ValueError(
+                f"subagent_type {definition.name!r}: requires an authorized configured Codex subscription route: {exc}"
+            ) from exc
+        if creds.get("provider") != "openai-codex" or creds.get("api_mode") != "codex_responses":
+            raise ValueError(
+                f"subagent_type {definition.name!r}: configured Codex route did not resolve to subscription authority"
+            )
         supported = codex_supported_efforts(model)
     else:
         from tools.delegate_tool import _resolve_delegation_credentials
@@ -172,7 +365,7 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     explicit = definition.reasoning_effort
     effort = explicit
     if effort is None:
-        inherited = defaults.get("reasoning_effort")
+        inherited = None if definition.inherit_parent else defaults.get("reasoning_effort")
         if inherited is not None:
             parsed = parse_reasoning_effort(inherited)
         else:
@@ -201,6 +394,61 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     return creds, reasoning
 
 
+def freeze_fallback_routes(
+    definition: SubagentDefinition, *, primary_provider: str, primary_model: str,
+) -> tuple[ResolvedRoute, ...]:
+    """Authorize and freeze every optional route before a child can spawn."""
+    if not definition.fallbacks:
+        return ()
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    frozen: list[ResolvedRoute] = []
+    seen = {(primary_provider, primary_model)}
+    for index, route in enumerate(definition.fallbacks):
+        if (route.provider, route.model) in seen:
+            continue
+        try:
+            runtime = resolve_runtime_provider(requested=route.provider, target_model=route.model)
+        except Exception as exc:
+            raise ValueError(
+                f"subagent_type {definition.name!r}: fallback {index} cannot be authorized: {exc}"
+            ) from exc
+        provider = str(runtime.get("provider") or route.provider).strip()
+        model = str(runtime.get("model") or route.model).strip()
+        base_url = str(runtime.get("base_url") or "").rstrip("/")
+        api_mode = str(runtime.get("api_mode") or "").strip()
+        api_key = runtime.get("api_key")
+        if not provider or not model or not base_url or not api_mode or not api_key:
+            raise ValueError(
+                f"subagent_type {definition.name!r}: fallback {index} resolved an incomplete runtime route"
+            )
+        unsupported = pinning_support_error(provider, api_mode)
+        if unsupported:
+            raise ValueError(f"subagent_type {definition.name!r}: fallback {index}: {unsupported}")
+        if route.reasoning_effort is not None:
+            from providers import get_provider_profile
+            profile = get_provider_profile(provider)
+            supported = profile.supported_reasoning_efforts(model) if profile else None
+            if not supported or route.reasoning_effort not in supported:
+                raise ValueError(
+                    f"subagent_type {definition.name!r}: fallback {index} reasoning_effort "
+                    f"{route.reasoning_effort!r} unsupported by {provider}/{model}"
+                )
+        pool = runtime.get("credential_pool")
+        credential_id = None
+        if pool is not None and callable(getattr(pool, "entry_id_for_api_key", None)):
+            credential_id = pool.entry_id_for_api_key(str(api_key))
+        frozen.append(ResolvedRoute(
+            provider, model, base_url, api_mode, route.reasoning_effort,
+            str(api_key), hashlib.sha256(str(api_key).encode()).hexdigest(),
+            json.dumps(runtime.get("request_overrides") or {}, sort_keys=True,
+                       separators=(",", ":"), default=str),
+            pool, credential_id,
+        ))
+        seen.add((route.provider, route.model))
+    return tuple(frozen)
+
+
 def inherited_credential_pool(child, parent, defaults):
     """Inherit existing account authority, never turn a fixed route into a global pool."""
     from agent.credential_pool import credential_pool_matches_provider
@@ -221,10 +469,7 @@ def inherited_credential_pool(child, parent, defaults):
 
 def resolution_metadata(child):
     pin = getattr(child, "_delegation_runtime_pin", None)
-    if not isinstance(pin, RuntimePin):
-        return {}
-    return {
-        **pin.metadata(),
+    common = {
         "parent_session_id": getattr(child, "_parent_session_id", None),
         "child_session_id": getattr(child, "session_id", None),
         "unavailable_memory_providers": deepcopy(getattr(
@@ -232,6 +477,25 @@ def resolution_metadata(child):
             "_read_only_unavailable_providers", [],
         )),
     }
+    if isinstance(pin, RuntimePin):
+        child_provider = getattr(child, "provider", pin.provider)
+        child_model = getattr(child, "model", pin.model)
+        active = next((route for route in pin.fallback_routes
+                       if (route.provider, route.model) == (child_provider, child_model)), None)
+        return {
+            **pin.metadata(), **common,
+            "provider": child_provider, "model": child_model,
+            "reasoning_effort": active.reasoning_effort if active else pin.reasoning_effort,
+            "route_transitions": list(getattr(child, "_delegation_route_transitions", ()) or ()),
+        }
+    snapshot = getattr(child, "_moa_preset_snapshot", None)
+    if snapshot is not None and callable(getattr(snapshot, "metadata", None)):
+        return {
+            **common, "subagent_type": getattr(child, "_delegation_named_type", None),
+            "provider": "moa", "model": getattr(child, "model", None),
+            "route_category": "frozen_moa", **snapshot.metadata(),
+        }
+    return {}
 
 
 # API modes whose FINAL physical request Hermes can inspect and therefore
@@ -266,7 +530,7 @@ def pinning_support_error(provider: str | None, api_mode: str | None) -> str | N
     return None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RuntimePin:
     """Nonsecret launch configuration retained for the child's full lifetime."""
     subagent_type: str
@@ -281,6 +545,8 @@ class RuntimePin:
     # the empty string cannot express.
     _pinned_credential: bool = field(default=False, repr=False)
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
+    fallback_routes: tuple[ResolvedRoute, ...] = ()
+    request_overrides_json: str = "{}"
 
     @classmethod
     def from_child(cls, child, definition, reasoning):
@@ -290,29 +556,65 @@ class RuntimePin:
             raise ValueError(f"subagent_type {definition.name!r}: {unsupported}")
         effort = "none" if reasoning and reasoning.get("enabled") is False else requested_effort(reasoning)
         digest = hashlib.sha256(str(child.api_key or "").encode()).hexdigest()
+        fallbacks = tuple(getattr(child, "_delegation_fallback_routes", ()))
+        request_overrides = json.dumps(
+            getattr(child, "request_overrides", {}) or {}, sort_keys=True,
+            separators=(",", ":"), default=str,
+        )
         return cls(definition.name, child.provider, child.model, child.base_url,
                    child.api_mode, effort, digest,
                    bool(isinstance(child.api_key, str) and child.api_key),
-                   getattr(child, "_credential_pool", None))
+                   getattr(child, "_credential_pool", None), fallbacks,
+                   request_overrides)
 
     def for_pool_swap(self, child, entry, api_key, base_url):
-        """Advance only the credential pin at the trusted pool-swap boundary."""
+        """Advance only the active route's credential at its frozen pool boundary."""
         from agent.credential_pool import credential_pool_matches_provider
         from hermes_cli.route_identity import normalize_route_base_url
 
-        pool = self._credential_pool
+        current = (child.provider, child.model, child.base_url, child.api_mode)
+        primary = (self.provider, self.model, self.base_url, self.api_mode)
+        fallback = next((route for route in self.fallback_routes if current == (
+            route.provider, route.model, route.base_url, route.api_mode
+        )), None)
+        pool = self._credential_pool if current == primary else (
+            fallback._credential_pool if fallback is not None else None
+        )
+        expected_provider = self.provider if fallback is None else fallback.provider
+        expected_base_url = self.base_url if fallback is None else fallback.base_url
         if (
             pool is None or getattr(child, "_credential_pool", None) is not pool
-            or not credential_pool_matches_provider(pool, self.provider, base_url=self.base_url)
+            or not credential_pool_matches_provider(
+                pool, expected_provider, base_url=expected_base_url
+            )
             or entry.provider != pool.provider
             or not any(candidate is entry for candidate in pool.entries())
-            or normalize_route_base_url(base_url) != normalize_route_base_url(self.base_url)
-            or (child.provider, child.model, child.base_url, child.api_mode)
-               != (self.provider, self.model, self.base_url, self.api_mode)
+            or normalize_route_base_url(base_url) != normalize_route_base_url(expected_base_url)
+            or (current != primary and fallback is None)
         ):
             raise ValueError(f"subagent_type {self.subagent_type!r}: unauthorized credential rotation")
-        return replace(self, _credential_digest=hashlib.sha256(api_key.encode()).hexdigest(),
-                       _pinned_credential=bool(api_key))
+        digest = hashlib.sha256(api_key.encode()).hexdigest()
+        if fallback is None:
+            return replace(self, _credential_digest=digest, _pinned_credential=bool(api_key))
+        rotated = replace(
+            fallback, api_key=api_key, credential_digest=digest,
+            credential_pool_entry_id=getattr(entry, "id", None),
+        )
+        return replace(self, fallback_routes=tuple(
+            rotated if route is fallback else route for route in self.fallback_routes
+        ))
+
+    def pinned_base_url_for(self, child) -> str:
+        """Return the exact frozen spelling for the child's active route."""
+        current = (child.provider, child.model, child.base_url, child.api_mode)
+        if current == (self.provider, self.model, self.base_url, self.api_mode):
+            return self.base_url
+        fallback = next((route for route in self.fallback_routes if current == (
+            route.provider, route.model, route.base_url, route.api_mode
+        )), None)
+        if fallback is None:
+            raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
+        return fallback.base_url
 
     def validate_request(self, child, kwargs, *, client=None):
         """Assert the pinned route/model/effort/credential for one request.
@@ -325,14 +627,43 @@ class RuntimePin:
         current = (child.provider, child.model, child.base_url, child.api_mode)
         expected = (self.provider, self.model, self.base_url, self.api_mode)
         digest = hashlib.sha256(str(child.api_key or "").encode()).hexdigest()
-        if current != expected or digest != self._credential_digest:
+        fallback = next((route for route in self.fallback_routes
+                         if (route.provider, route.model) == current[:2]), None)
+        if current != expected and (
+            fallback is None or current[2:] != (fallback.base_url, fallback.api_mode)
+        ):
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
+        expected_digest = self._credential_digest if fallback is None else fallback.credential_digest
+        if digest != expected_digest:
+            raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
+        actual_request_overrides = getattr(child, "request_overrides", {}) or {}
+        active_provider = fallback.provider if fallback else self.provider
+        override_headers = (
+            actual_request_overrides.get("extra_headers", {})
+            if isinstance(actual_request_overrides, dict) else {}
+        )
+        if active_provider == "openai-codex" and any(
+            str(key).lower() in _AUTH_HEADER_NAMES for key in override_headers
+        ):
+            raise ValueError("Named Codex subagents cannot override authentication headers")
+        expected_overrides = self.request_overrides_json if fallback is None else fallback.request_overrides_json
+        actual_overrides = json.dumps(
+            actual_request_overrides, sort_keys=True,
+            separators=(",", ":"), default=str,
+        )
+        if actual_overrides != expected_overrides:
+            raise ValueError(f"subagent_type {self.subagent_type!r}: pinned request overrides changed")
         extra = kwargs.get("extra_body") or {}
-        if kwargs.get("model") != self.model or extra.get("model", self.model) != self.model:
+        active_model = current[1]
+        if kwargs.get("model") != active_model or extra.get("model", active_model) != active_model:
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned request model changed")
-        if self.reasoning_effort is not None:
-            self._validate_request_effort(kwargs, extra)
-        if self.provider == "openai-codex":
+        active_effort = fallback.reasoning_effort if fallback else self.reasoning_effort
+        if active_effort is not None:
+            self._validate_request_effort(
+                kwargs, extra, active_effort,
+                api_mode=fallback.api_mode if fallback else self.api_mode,
+            )
+        if (fallback.provider if fallback else self.provider) == "openai-codex":
             # Codex subscription auth rides in headers, so a per-request header
             # override IS a credential swap. Other wires carry credentials on
             # the client, which _validate_client checks instead.
@@ -342,9 +673,23 @@ class RuntimePin:
         if client is None:
             client = getattr(child, "client", None)
         if client is not None:
-            self._validate_client(client)
+            if fallback is None:
+                self._validate_client(client)
+            else:
+                self._validate_fallback_client(client, fallback)
 
-    def _validate_request_effort(self, kwargs, extra) -> None:
+    @staticmethod
+    def _validate_fallback_client(client, route: ResolvedRoute) -> None:
+        from hermes_cli.route_identity import normalize_route_base_url
+        if (
+            normalize_route_base_url(str(getattr(client, "base_url", "") or ""))
+            != normalize_route_base_url(route.base_url)
+            or hashlib.sha256(str(getattr(client, "api_key", "") or "").encode()).hexdigest()
+            != route.credential_digest
+        ):
+            raise ValueError("named subagent fallback client changed after launch")
+
+    def _validate_request_effort(self, kwargs, extra, expected_effort=None, api_mode=None) -> None:
         """Compare effort only where the request actually states one.
 
         Codex always carries ``reasoning.effort``, so an absent or different
@@ -359,15 +704,15 @@ class RuntimePin:
         dispatch boundary — a hard outage, not a caught tampering event. The
         route, model, and credential remain pinned in all cases.
         """
-        if self.api_mode == "codex_responses":
+        if (api_mode or self.api_mode) == "codex_responses":
             reasoning = extra.get("reasoning", kwargs.get("reasoning")) or {}
-            if reasoning.get("effort") != self.reasoning_effort:
+            if reasoning.get("effort") != (expected_effort or self.reasoning_effort):
                 raise ValueError(
                     f"subagent_type {self.subagent_type!r}: pinned request reasoning changed"
                 )
             return
         stated = self._stated_effort(kwargs, extra)
-        if stated is not None and stated != self.reasoning_effort:
+        if stated is not None and stated != (expected_effort or self.reasoning_effort):
             raise ValueError(
                 f"subagent_type {self.subagent_type!r}: pinned request reasoning changed"
             )
@@ -443,5 +788,6 @@ class RuntimePin:
             "provider": self.provider,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "authority_fingerprint": self._credential_digest,
             "route_category": "codex_subscription" if self.provider == "openai-codex" else "pinned_provider",
         }
