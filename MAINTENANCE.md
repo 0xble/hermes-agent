@@ -24,6 +24,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
+| HERMES-131 | Active | `fix(backup): retain verified quick-snapshot recovery generations` | Bound partial snapshot retention while preserving complete and verified per-database recovery coverage. |
 | HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
 | HERMES-130 | Active | `feat(gateway): queue MoA requests during active turns` | Accept MoA requests immediately for a separate queued one-shot turn. |
 | HERMES-001 | Retired | `chore(local): carry Brian-owned working-tree patches into the fork`; `docs(fork): retire state repair patch` | Historical malformed `state.db` repair serialization, replaced by released upstream commit `923d86e09`. |
@@ -1686,6 +1687,17 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Published commit identity:** Stable subject `fix(telegram): preserve literal hash references in rich messages`.
 - **Rollback:** Revert this subject, removing `rich_markdown.py`, its adapter call, and focused regressions. Preserve the existing currency/link/paragraph normalizers and all runtime configuration. Runtime rollout and rollback remain separate.
 - **Retirement:** Replace with released upstream behavior after equivalent literal-prefix, code/heading preservation, transport regressions, and live rich-message readback pass. Remove the fork-only implementation rather than retaining duplicate normalization.
+
+### HERMES-131 — Verified bounded quick-snapshot recovery
+
+- **Summary:** Keep a bounded recovery set (recent configured window, newest complete generation and needed verified per-database coverage) rather than an unbounded history of partial snapshots. Separate automatic snapshot families from manual snapshots. This is recovery retention, not an archive of every historical config version.
+- **Source surfaces:** `hermes_cli/backup.py`, `tests/hermes_cli/test_backup.py`, `tests/hermes_cli/test_quick_retention_repro.py`. Preserve the fork's existing full-backup session exclusions.
+- **Upstream tracking:** [NousResearch/hermes-agent#106087](https://github.com/NousResearch/hermes-agent/issues/106087), independently reproduced missing/corrupt recovery-payload and complete-generation hardening follow-up. Related #58672 concerns global automatic keep=1 scope; closed #90613 concerns source-side corruption detection rather than existing recovery-payload validation.
+- **Upstream PR:** Source proposal [#97768](https://github.com/NousResearch/hermes-agent/pull/97768), open when checked 2026-09-08. Reuses @tachyon-r's `f1b317f9dd21f192339f6fbe3951176f401e43e1` and `aaad9f482eb3c8fc077a4ca06dee61a9b01d96cb` with original authorship. Hardening follow-up [#106101](https://github.com/NousResearch/hermes-agent/pull/106101) closes #106087 and preserves that dependency explicitly.
+- **Regression:** `scripts/run_tests.sh tests/hermes_cli/test_quick_retention_repro.py tests/hermes_cli/test_backup.py tests/hermes_cli/test_backup_stability.py tests/hermes_cli/test_backup_all_profiles.py tests/hermes_cli/test_backup_path_errors.py tests/agent/test_curator_backup.py`. Disposable homes and real SQLite databases only; sparse-file reproduction crosses the actual 1 GiB cap without allocating that payload.
+- **Rollback:** Revert only this retention candidate's `backup.py` pruning/copy-metadata hunks and focused tests, including the two source-proposal commits, or revert its landed fork PR. Do not remove other full-backup exclusions or touch any existing snapshots. Rollback prevents future pruning behavior; it cannot recreate snapshots already expired under the configured retention contract.
+- **Retirement:** Remove the fork-only implementation when released upstream passes bounded incomplete retention, newest complete generation, readable omitted-DB coverage, alternating failures, and snapshot-family/profile isolation regressions. Preserve useful behavior tests only when not duplicated upstream.
+- **Runtime scope:** Source-only. No live snapshot cleanup, configuration change, B2 action, deployment or restart authorized or performed.
 
 ## Automatic synchronization
 
