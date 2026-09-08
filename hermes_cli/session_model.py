@@ -44,27 +44,15 @@ def _validate_reasoning(route, config) -> None:
     """
     if config is None:
         return
-    from providers import get_provider_profile
-    from agent.reasoning_effort import codex_supported_efforts
+    from agent.reasoning_effort import transport_supported_reasoning_efforts
     from utils import base_url_host_matches
 
     level = _level(config)
-    profile = get_provider_profile(route.target_provider)
-    supported = profile.supported_reasoning_efforts(route.new_model) if profile else None
+    supported = transport_supported_reasoning_efforts(
+        route.target_provider, route.new_model, route.api_mode,
+    )
     mandatory = False
-    if supported is None and route.api_mode == "codex_responses":
-        supported = codex_supported_efforts(route.new_model)
-    elif supported is None and route.api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import (
-            _accepts_thinking_disable, _supports_adaptive_thinking, _supports_xhigh_effort,
-        )
-        if _supports_adaptive_thinking(route.new_model):
-            supported = ("low", "medium", "high", "max")
-            if _supports_xhigh_effort(route.new_model):
-                supported += ("xhigh",)
-            if _accepts_thinking_disable(route.new_model):
-                supported += ("none",)
-    elif supported is None and base_url_host_matches(route.base_url, "openrouter.ai"):
+    if supported is None and base_url_host_matches(route.base_url, "openrouter.ai"):
         from hermes_cli.models_reasoning_caps import openrouter_model_reasoning_capabilities
         caps = openrouter_model_reasoning_capabilities(route.new_model)
         if caps is not None:

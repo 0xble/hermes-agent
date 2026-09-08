@@ -298,7 +298,9 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     token, rather than consulting the global credential pool (which may select
     another account). Unavailable parent subscription auth fails closed.
     """
-    from agent.reasoning_effort import codex_supported_efforts, requested_effort, clamp_effort
+    from agent.reasoning_effort import (
+        clamp_effort, requested_effort, transport_supported_reasoning_efforts,
+    )
     from hermes_constants import parse_reasoning_effort
 
     provider = definition.provider or (getattr(parent, "provider", None) if definition.inherit_parent else defaults.get("provider")) or getattr(parent, "provider", None)
@@ -329,7 +331,6 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
             "request_overrides": deepcopy(getattr(parent, "request_overrides", {}) or {}),
             "max_output_tokens": None,
         }
-        supported = codex_supported_efforts(model)
     elif provider == "openai-codex":
         # An explicit Codex route has its own configured OAuth authority.  It is
         # not required to match the parent provider, but it must resolve through
@@ -345,10 +346,8 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
             raise ValueError(
                 f"subagent_type {definition.name!r}: configured Codex route did not resolve to subscription authority"
             )
-        supported = codex_supported_efforts(model)
     else:
         from tools.delegate_tool import _resolve_delegation_credentials
-        from providers import get_provider_profile
 
         config = dict(defaults)
         config.update({"model": model})
@@ -359,8 +358,9 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
             config["provider"] = definition.provider
         creds = _resolve_delegation_credentials(config, parent)
         provider = creds.get("provider") or getattr(parent, "provider", None)
-        profile = get_provider_profile(provider) if isinstance(provider, str) else None
-        supported = profile.supported_reasoning_efforts(model) if profile else None
+    supported = transport_supported_reasoning_efforts(
+        provider, model, creds.get("api_mode") or getattr(parent, "api_mode", None),
+    )
 
     explicit = definition.reasoning_effort
     effort = explicit
@@ -426,9 +426,8 @@ def freeze_fallback_routes(
         if unsupported:
             raise ValueError(f"subagent_type {definition.name!r}: fallback {index}: {unsupported}")
         if route.reasoning_effort is not None:
-            from providers import get_provider_profile
-            profile = get_provider_profile(provider)
-            supported = profile.supported_reasoning_efforts(model) if profile else None
+            from agent.reasoning_effort import transport_supported_reasoning_efforts
+            supported = transport_supported_reasoning_efforts(provider, model, api_mode)
             if not supported or route.reasoning_effort not in supported:
                 raise ValueError(
                     f"subagent_type {definition.name!r}: fallback {index} reasoning_effort "

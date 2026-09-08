@@ -174,6 +174,21 @@ def _route_evidence(requests: list) -> list:
     ]
 
 
+def _result_for_task(results: list, task_index: int, role: str) -> dict:
+    """Join public delegation results by their emitted batch identity."""
+    matches = [result for result in results if isinstance(result, dict)
+               and result.get("task_index") == task_index]
+    if not matches:
+        raise RuntimeError(
+            f"{role} result identity missing: no result emitted task_index {task_index}"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"{role} result identity duplicate: {len(matches)} results emitted task_index {task_index}"
+        )
+    return matches[0]
+
+
 # ── fixture mode ─────────────────────────────────────────────────────────────
 
 def run_fixture() -> dict:
@@ -433,9 +448,9 @@ def run_active() -> dict:
         }], parent_agent=parent, background=False))
 
         results = result.get("results", [])
-        explorer = next((r for r in results if r.get("subagent_type") == reader), {})
+        explorer = _result_for_task(results, 0, reader)
         text = explorer.get("summary", "") or explorer.get("result", "")
-        worker = next((r for r in results if r.get("subagent_type") == doer), {})
+        worker = _result_for_task(results, 1, doer)
         tool_outputs = _child_tool_outputs(home, worker.get("child_session_id"))
 
         import runpy
