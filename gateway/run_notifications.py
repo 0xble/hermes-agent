@@ -1033,6 +1033,10 @@ class GatewayNotificationsMixin:
                 metadata["delegation_parent_task_id"] = evt["parent_task_id"]
                 metadata["delegation_owner"] = evt.get("owner")
                 metadata["delegation_thread_refs"] = evt.get("thread_refs", [])
+            if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
+                # Native review status retirement is tied to this exact durable
+                # completion, never a generic task-card batch or session guess.
+                metadata["delegation_id"] = evt["delegation_id"]
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,

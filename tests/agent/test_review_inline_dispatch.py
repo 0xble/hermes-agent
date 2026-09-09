@@ -26,6 +26,18 @@ def test_review_tool_dispatches_with_parent_and_candidate():
     assert dispatch.call_args.kwargs["messages"] is messages
 
 
+def test_review_tool_keeps_phase_boundary_and_short_fallback_when_native_delivery_fails():
+    parent = SimpleNamespace(review_status_callback=lambda delegation_id: False)
+    messages = [{"role": "user", "content": "Review the accepted change"}]
+    args = {"repository": "/candidate", "base_revision": "HEAD", "accepted_scope": ["a.py"]}
+    with patch("agent.review_candidate.capture_review_candidate", return_value=object()), patch(
+        "agent.review_engine.start_review", return_value={"status": "dispatched", "delegation_id": "review-1"}
+    ):
+        INLINE_TOOL_EXECUTORS["review_current_work"](parent, args, InlineToolContext("parent-task", messages=messages))
+    assert parent._review_yield_requested is True
+    assert parent._review_status_delivered is False
+
+
 def test_review_tool_is_parent_only():
     child = SimpleNamespace(is_subagent=True, _delegate_depth=1)
     with pytest.raises(ValueError, match="parent-only"):
