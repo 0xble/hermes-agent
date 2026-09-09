@@ -164,7 +164,7 @@ class DelegationCards:
             if card.get("retired"):
                 continue
             for ref, row in card["rows"].items():
-                if ref in card.get("handled", ()) and row["state"] in _TERMINAL | {"unknown"}:
+                if ref in (card.get("handled") or ()) and row["state"] in _TERMINAL | {"unknown"}:
                     continue
                 rows[task_key + ref] = {**row, "thread_ref": row.get("display_ref", ref)}
         return {"started_at": anchor["started_at"], "rows": rows}
@@ -282,12 +282,14 @@ class DelegationCards:
     async def _flush(self, key):
         revision = None
         try:
-            await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0))))
+            await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0)),
+                                    self.cards[key].get("retry_at", 0) - time.time()))
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 card = self.cards[key]
                 projection = self._projection(key)
                 if not projection["rows"]:
                     await self._delete(card)
+                    await self._delete_obsolete(key)
                     return
                 text = render_card(projection)
                 if text == card["rendered"]:
@@ -300,7 +302,8 @@ class DelegationCards:
                 revision = card.get("revision", 0)
                 message_id = card["message_id"]
                 if message_id:
-                    result = await adapter.edit_message(card["source"]["chat_id"], message_id, text, finalize=True)
+                    result = await adapter.edit_message(source.chat_id, card["message_id"], text, finalize=True,
+                                                        metadata={"hermes_status": True})
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
                     if missing and card["recoveries"] < 1:
                         card["recoveries"] += 1
@@ -319,8 +322,15 @@ class DelegationCards:
                         card["rejections"] = card.get("rejections", 0) + 1
                         card["send_attempts"] = 0  # one retry, on a subsequent observed event only
                 if getattr(result, "success", False):
+                    card.pop("retry_at", None)
                     card["rendered"] = text
                     await self._delete_obsolete(key)
+                elif getattr(result, "retryable", False) and getattr(result, "retry_after", None) is not None:
+                    # Only explicit flood/cooldown rejection may reset an initial
+                    # send attempt. Ambiguous network sends never enter this path.
+                    if not card.get("message_id"):
+                        card["send_attempts"] = 0
+                    card["retry_at"] = time.time() + max(0.05, float(result.retry_after))
                 self.last_edit[key] = time.monotonic()
                 self._save()
 
@@ -330,7 +340,7 @@ class DelegationCards:
             self.pending.pop(key, None)
         # Events arriving during transport awaits are coalesced, not dropped.
         card = self.cards[key]
-        if revision is not None and revision != card.get("revision", 0):
+        if revision is not None and self._projection(key)["rows"] and (revision != card.get("revision", 0) or card.get("retry_at")):
             self._queue(key)
 
     def receipt(self, event, session_key, generation):
@@ -365,7 +375,7 @@ class DelegationCards:
                         or proof.get("epoch", 0) != card.get("receipt_epoch", 0)
                         or proof["generation"] > card["generation"]):
                     continue
-                handled = set(card.get("handled", [])) | (set(proof["refs"]) & set(card["rows"]))
+                handled = set(card.get("handled") or []) | (set(proof["refs"]) & set(card["rows"]))
                 card["handled"] = sorted(handled)
                 self._save()
                 if _handled_terminal(card):

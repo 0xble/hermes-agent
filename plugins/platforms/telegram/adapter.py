@@ -554,6 +554,7 @@ _POLLING_STALL_TIMEOUT = 150.0
 # to hear the attachment failed, so kept modest.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
+_EXPENDABLE_TRAFFIC: ContextVar[bool] = ContextVar("telegram_expendable_traffic", default=False)
 
 
 class _PollingLifecycleAbort(RuntimeError):
@@ -1595,7 +1596,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 cooldowns.pop(chat_key, None)
                 users.pop(chat_key, None)
 
-    async def _run_send_call(self, cooldown_chat_id: Any, send_fn: Any, *args: Any, _reserve_gap: bool = True, **kwargs: Any):
+    async def _run_send_call(self, cooldown_chat_id: Any, send_fn: Any, *args: Any, _reserve_gap: bool = True, _expendable: Optional[bool] = None, **kwargs: Any):
         """Run one outbound Bot API call under the chat's atomic gate.
 
         The lock stays held through the API call so a concurrent sender cannot commit to a stale wake-up
@@ -1612,8 +1613,16 @@ class TelegramAdapter(BasePlatformAdapter):
             users[chat_key] = users.get(chat_key, 0) + 1
         max_wait = float(getattr(self, "_send_cooldown_max_wait", 5.0))
         deadline = time.monotonic() + max_wait
+        expendable = _EXPENDABLE_TRAFFIC.get() if _expendable is None else _expendable
+        finals = getattr(self, "_send_final_waiters", None)
+        if finals is None:
+            finals = self._send_final_waiters = {}
+        if not expendable:
+            finals[chat_key] = finals.get(chat_key, 0) + 1
         acquired = False
         try:
+            if expendable and finals.get(chat_key, 0):
+                raise _TelegramSendCooldownExceeded(max(0.05, cooldowns.get(chat_key, 0) - time.monotonic()))
             try:
                 await asyncio.wait_for(lock.acquire(), timeout=max_wait)
             except asyncio.TimeoutError as error:
@@ -1630,6 +1639,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if wait > 0:
                 logger.debug("[%s] send cooldown for chat %s: sleeping %.2fs", self.name, chat_key, wait)
                 await asyncio.sleep(wait)
+            # A final queued while this expendable update slept wins the next slot.
+            # The caller retains its latest state; no status request backlog is queued here.
+            if expendable and finals.get(chat_key, 0):
+                raise _TelegramSendCooldownExceeded(0.05)
             started_at = time.monotonic()
             stamp_gap = _reserve_gap
             try:
@@ -1646,6 +1659,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     gap = max(0.0, float(getattr(self, "_send_cooldown_seconds", 1.1)))
                     cooldowns[chat_key] = max(float(cooldowns.get(chat_key, 0.0) or 0.0), started_at + gap)
         finally:
+            if not expendable:
+                finals[chat_key] -= 1
+                if not finals[chat_key]:
+                    finals.pop(chat_key, None)
             if acquired:
                 lock.release()
             if users is not None:
@@ -2151,7 +2168,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # No topic routing on edits: message_thread_id/direct_messages_topic_id make Telegram reject it.
         payload = {**self._rich_payload_base(chat_id, content), "message_id": int(message_id)}
         try:
-            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+            await self._run_send_call(chat_id, self._bot.do_api_request, "editMessageText", api_kwargs=payload)
         except Exception as exc:
             # "Message is not modified" = successful no-op; skip the redundant legacy edit.
             if "not modified" in str(exc).lower():
@@ -2160,7 +2177,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=message_id)
             if self._rich_rejected(exc, "rich editMessageText", "MarkdownV2 edit"):
                 return None
-            return self._rich_transient_result(exc, "rich editMessageText")
+            if isinstance(exc, _TelegramSendCooldownExceeded):
+                return self._send_cooldown_failure(exc)
+            return self._rich_transient_result(exc, "rich editMessageText", retry_after=self._telegram_retry_after(exc))
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
         self._record_rich_sent(chat_id, message_id, content)
         return SendResult(success=True, message_id=message_id)
@@ -2180,7 +2199,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id), "rich_message": self._rich_message_payload(content)}
         payload.update(self._thread_kwargs_for_draft(chat_id, metadata))
         try:
-            return bool(await self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload))
+            return bool(await self._run_send_call(chat_id, self._bot.do_api_request, "sendRichMessageDraft", api_kwargs=payload, _expendable=True))
         except Exception as exc:
             if self._is_rich_capability_error(exc):
                 self._rich_draft_disabled = True
@@ -3225,7 +3244,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 kwargs["icon_color"] = icon_color
             if icon_custom_emoji_id:
                 kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
-            topic = await self._bot.create_forum_topic(**kwargs)
+            topic = await self._run_send_call(chat_id, self._bot.create_forum_topic, **kwargs, _reserve_gap=False, _expendable=True)
             thread_id = topic.message_thread_id
             self._remember_dm_topic_creation_icon(str(chat_id), str(thread_id), icon_custom_emoji_id)
             logger.info("[%s] Created DM topic '%s' in chat %s -> thread_id=%s", self.name, name, chat_id, thread_id)
@@ -3391,8 +3410,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._persist_dm_topic_thread_id(int(chat_id), topic_name, thread_id)
                 # Seed message: Telegram's client hides empty topics until they contain one.
                 try:
-                    await self._bot.send_message(
-                        chat_id=normalize_telegram_chat_id(chat_id), message_thread_id=thread_id, text=f"\U0001f4cc {topic_name}")
+                    await self._run_send_call(chat_id, self._bot.send_message,
+                        chat_id=normalize_telegram_chat_id(chat_id), message_thread_id=thread_id, text=f"\U0001f4cc {topic_name}", _expendable=True)
                 except Exception as seed_err:
                     logger.debug("[%s] Could not send seed message to topic '%s': %s", self.name, topic_name, seed_err)
 
@@ -4252,6 +4271,13 @@ class TelegramAdapter(BasePlatformAdapter):
             await self.send_typing(chat_id, metadata=metadata)
 
     async def send_delegation_card(self, source, content: str) -> SendResult:
+        token = _EXPENDABLE_TRAFFIC.set(True)
+        try:
+            return await self._send_delegation_card(source, content)
+        finally:
+            _EXPENDABLE_TRAFFIC.reset(token)
+
+    async def _send_delegation_card(self, source, content: str) -> SendResult:
         """One thread-strict, non-notifying card. Never retry an ambiguous send."""
         from telegram.error import BadRequest, RetryAfter, Forbidden
         metadata = {"thread_id": source.thread_id, "notify": False}
@@ -4266,11 +4292,23 @@ class TelegramAdapter(BasePlatformAdapter):
                     **self._link_preview_kwargs(),
                 })
             return SendResult(success=True, message_id=str(message.message_id))
+        except _TelegramSendCooldownExceeded as exc:
+            return self._send_cooldown_failure(exc)
+        except RetryAfter as exc:
+            return _flood_cap_result(self._telegram_retry_after(exc), retryable=True)
         except Exception as exc:
             return SendResult(success=False, error=_redact_telegram_error_text(exc),
-                raw_response={"definite_rejection": isinstance(exc, (BadRequest, RetryAfter, Forbidden))})
+                raw_response={"definite_rejection": isinstance(exc, (BadRequest, Forbidden))})
 
     async def send(
+        self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        token = _EXPENDABLE_TRAFFIC.set(bool((metadata or {}).get("hermes_status")))
+        try:
+            return await self._send_impl(chat_id, content, reply_to=reply_to, metadata=metadata)
+        finally:
+            _EXPENDABLE_TRAFFIC.reset(token)
+
+    async def _send_impl(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
         content = _normalize_dollar_entities(content)
@@ -4405,11 +4443,22 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
+            if isinstance(fmt_err, _TelegramSendCooldownExceeded) or self._telegram_retry_after(fmt_err) is not None:
+                raise
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
             await self._edit_text(chat_id, message_id, plain)
         return False
 
     async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
+       ) -> SendResult:
+        token = _EXPENDABLE_TRAFFIC.set(not finalize or bool((metadata or {}).get("hermes_status")))
+        try:
+            return await self._edit_message_impl(chat_id, message_id, content, finalize=finalize, metadata=metadata)
+        finally:
+            _EXPENDABLE_TRAFFIC.reset(token)
+
+    async def _edit_message_impl(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
        ) -> SendResult:
         """Edit a previously sent Telegram message.
@@ -4468,6 +4517,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
                 "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
             return SendResult(success=True, message_id=message_id)
+        except _TelegramSendCooldownExceeded as e:
+            return self._send_cooldown_failure(e)
         except Exception as e:
             err_str = str(e).lower()
             if "not modified" in err_str:
@@ -4545,7 +4596,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
-                return await self._bot.send_message(
+                return await self._run_send_call(chat_id, self._bot.send_message,
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base)
             except Exception as send_err:
@@ -4555,15 +4606,15 @@ class TelegramAdapter(BasePlatformAdapter):
                         {} if self._dm_topic_fallback(metadata)
                         else self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=None))
                     try:
-                        return await self._bot.send_message(
+                        return await self._run_send_call(chat_id, self._bot.send_message,
                             chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
                             **retry_thread_kwargs, **base)
                     except Exception as _retry_err:
                         logger.warning(
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
                         return None
-                if use_markdown:
-                    continue  # try plain text on next loop iteration
+                if use_markdown and self._is_bad_request_error(send_err):
+                    continue  # only a definite formatting rejection permits a plain retry
                 logger.warning("[%s] Overflow continuation send failed: %s", self.name, _redact_telegram_error_text(send_err))
                 return None
         return None
@@ -4633,12 +4684,15 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return bool(outcome)
         try:
-            await self._bot.delete_message(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+            # Cleanup respects published flood waits without assuming send-message quotas.
+            await self._run_send_call(chat_id, self._bot.delete_message,
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _reserve_gap=False, _expendable=True)
             self._forget_status_message_id(chat_id, message_id)
             return True
         except Exception as e:
             if "message to delete not found" in str(e).lower() or "message_id_invalid" in str(e).lower():
                 self._forget_status_message_id(chat_id, message_id)
+                return True  # exact remote absence satisfies idempotent cleanup
             logger.debug("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, _redact_telegram_error_text(e))
             return False
 
@@ -4682,7 +4736,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
             try:
-                if await self._bot.send_message_draft(**kwargs):
+                if await self._run_send_call(chat_id, self._bot.send_message_draft, **kwargs, _expendable=True):
                     return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error="draft_rejected")
             except Exception as e:

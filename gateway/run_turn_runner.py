@@ -121,8 +121,8 @@ class TurnRunner:
                 and ctx.source.platform == Platform.TELEGRAM):
             from gateway.review_status import statuses_for
             statuses = statuses_for(self._runner)
-            if statuses.owns(ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, kwargs["delegation_id"]):
-                self._schedule(statuses.observe(
+            if kwargs.get("native_review") or statuses.owns(ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, kwargs["delegation_id"]):
+                self._schedule(statuses.lifecycle(
                     ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
                     kwargs["delegation_id"], event_type,
                 ), "review status update scheduling error")
@@ -1176,7 +1176,9 @@ class TurnRunner:
             ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, delegation_id,
         ), "review status dispatch scheduling error")
         try:
-            return bool(future.result(timeout=10))
+            # The adapter owns bounded network deadlines. An arbitrary shorter
+            # wait must not race a still-pending send against a textual fallback.
+            return bool(future.result())
         except Exception:
             return False
 

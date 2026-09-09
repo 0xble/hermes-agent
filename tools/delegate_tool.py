@@ -1136,6 +1136,7 @@ def delegate_task(
             _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
                         task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
                         subagent_type=vars(_child).get("_delegation_named_type"),
+                        native_review=(completion_contract or {}).get("kind") == "native_review",
                         owner=_owner, background=bool(background))
     _metadata["threads"] = [
         {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],

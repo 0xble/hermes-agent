@@ -114,7 +114,7 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     await asyncio.gather(*list(cards.pending.values()))
     assert "Last tool:" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
-    assert adapter.edit_message.call_args.kwargs == {"finalize": True}
+    assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
     relay.progress_callback("subagent.complete", status="completed", **data)
     await asyncio.gather(*tasks)
@@ -341,6 +341,8 @@ async def test_telegram_card_send_never_falls_back_to_other_topic():
         _notification_kwargs=lambda _: {"disable_notification": True},
         _link_preview_kwargs=lambda: {},
         _send_chunk_markdown_or_plain=AsyncMock(side_effect=BadRequest("Message thread not found")))
+    from types import MethodType
+    transport._send_delegation_card = MethodType(TelegramAdapter._send_delegation_card, transport)
     result = await TelegramAdapter.send_delegation_card(transport, source, "Test")
     assert not result.success
     assert result.raw_response["definite_rejection"]
@@ -524,3 +526,26 @@ async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference
     await drain_cards(again)
     assert adapter.send_delegation_card.await_count == 2
     assert again.cards["b" * 32]["obsolete_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_flood_retry_sends_only_latest_card_state_and_preserves_one_message(tmp_path):
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(side_effect=[
+        SendResult(success=False, error="flood_control:0.05", retryable=True, retry_after=0.05),
+        SendResult(success=True, message_id="one")]),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    data = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check display", owner=dict(
+        profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""))
+    await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
+    await list(cards.pending.values())[0]
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "terminal", data)
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "computer_use", data)
+    await drain_cards(cards)
+    assert adapter.send_delegation_card.await_count == 2  # first was explicitly rejected, not ambiguous
+    text = adapter.send_delegation_card.call_args.args[1]
+    assert "computer_use" in text and "terminal" not in text
+    assert cards.cards["a" * 32]["message_id"] == "one"
+    assert "retry_at" not in cards.cards["a" * 32]
+    adapter.edit_message.assert_not_awaited()

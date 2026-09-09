@@ -52,7 +52,7 @@ async def test_native_review_status_lifecycle_uses_exact_enum_adapter_and_parent
     statuses = ReviewStatuses(runner, home=tmp_path)
     assert await statuses.dispatch(source, "route", "parent", 1, "review-1")
     assert adapter.send.call_args.args == ("42", "⚖ **Review dispatched**")
-    assert adapter.send.call_args.kwargs == {"metadata": {"thread_id": "8"}}
+    assert adapter.send.call_args.kwargs == {"metadata": {"thread_id": "8", "hermes_status": True}}
 
     assert await statuses.observe(source, "route", "parent", 1, "review-1", "subagent.start")
     assert "⚖ **Reviewing · 0 min**" == adapter.edit_message.call_args.args[2]

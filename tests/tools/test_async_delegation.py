@@ -1222,6 +1222,10 @@ def test_retry_exhaustion_parks_result_until_one_explicit_bounded_recovery(tmp_p
     recovered = ad.recover_completion_delivery("recover-me")
     assert recovered and recovered["summary"] == "unchanged result"
     assert ad.recover_completion_delivery("recover-me") is None  # no poll-loop reset
+    after_recovery_restart = queue.Queue()
+    assert ad.restore_undelivered_completions(after_recovery_restart) == 1
+    assert after_recovery_restart.get_nowait()["summary"] == "unchanged result"
+    assert ad.get_durable_delegation("recover-me")["delivery_state"] == "pending"
     for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
         claim = f"recovered-{attempt}"
         assert ad.claim_completion_delivery("recover-me", claim)
