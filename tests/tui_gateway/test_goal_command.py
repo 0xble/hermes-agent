@@ -224,6 +224,29 @@ def test_goal_resume_after_budget_exhaustion_dispatches_continuation(
     assert state.turns_used == 0, "resume must reset the turn budget"
 
 
+def test_goal_resume_preserves_external_prerequisites(server, session):
+    from hermes_cli.goals import GoalManager
+
+    sid, session_key, _ = session
+    mgr = GoalManager(session_key)
+    mgr.set("Verify restricted provider")
+    blocker = {
+        "kind": "external_dependency", "detail": "Provider access denied.",
+        "evidence": "403 after authorized read-only checks.",
+        "resume_when": "Owner grants access; verify read-only access before proceeding.",
+    }
+    with patch("hermes_cli.goals.judge_goal", return_value=(
+        "blocked", blocker["detail"], False, {"blocker": blocker}, False,
+    )):
+        assert mgr.evaluate_after_turn("403")["status"] == "paused"
+    result = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)["result"]
+    assert result["type"] == "send"
+    for key in ("notice", "message"):
+        assert blocker["resume_when"] in result[key]
+        assert "not permission" in result[key]
+    assert GoalManager(session_key).state.blocker == blocker
+
+
 def test_goal_resume_without_goal_stays_exec(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)

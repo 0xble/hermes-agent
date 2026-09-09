@@ -796,13 +796,13 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     """Goal judge for every terminal worker handoff (including review).
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
-    unachievable; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
+    blocked on external change; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
     the handoff (logged).
 
     See #100954.
     ``{"done", None}`` means the judge allows the handoff; anything else is a rejection whose verdict
     disambiguates the guidance the caller gives the worker (``continue`` = not done yet, ``blocked`` =
-    judged unachievable — see #100954).
+    blocked on external change — see #100954).
     """
     if task is None or not task.goal_mode:
         return ("done", None)
@@ -819,13 +819,16 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
     verdict, reason = "done", ""
     try:
-        verdict, reason, _, _, _ = judge_goal(goal=f"{task.title}\n\n{task.body or ''}".strip(),
+        verdict, reason, _, directive, _ = judge_goal(goal=f"{task.title}\n\n{task.body or ''}".strip(),
                                               last_response=evidence.strip())
     except Exception as judge_exc:
         import logging as _logging
 
         _logging.getLogger(__name__).warning("goal judge check failed, allowing lifecycle handoff: %s",
                                              judge_exc, exc_info=True)
+    if verdict == "blocked":
+        from hermes_cli.goals_blockers import normalize_blocker, blocker_summary
+        reason = blocker_summary(normalize_blocker((directive or {}).get("blocker"), reason))
     return (verdict, None if verdict == "done" else reason)
 
 
@@ -837,7 +840,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
-                f"the goal unachievable — {rejection}. {blocked_hint}")
+                f"the goal blocked — {rejection}. {blocked_hint}")
     if rejection is not None:
         return f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. {continue_hint}"
     return None

@@ -2240,7 +2240,8 @@ class CLICommandsMixin:
         state = mgr.resume()
         if state is None:
             return _cp(_dim_line('No goal to resume.'))
-        _cp(f"  ▶ Goal resumed: {state.goal}")
+        from hermes_cli.goal_display import format_goal_change
+        _cp(format_goal_change("resume", state))
         # Resume must restart work, not just flip state: queue the continuation prompt the same
         # way /goal <text> queues its kickoff.
         # Resume must restart work, not just flip persisted state (#75362): enqueue the canonical

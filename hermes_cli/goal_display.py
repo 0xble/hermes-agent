@@ -51,6 +51,11 @@ def format_goal_change(action: str, state: GoalState, change: dict[str, Any] | N
         return ""
     if action in {"set", "draft", "edit"} and state.has_contract():
         text += "\n\nCompletion contract:\n" + state.contract.render_block()
+    if action == "resume" or (action == "edit" and change.get("resumed")):
+        text += "\nResume requests reassessment, not permission or confirmation that prerequisites are resolved."
+        if state.blocker:
+            from hermes_cli.goals_blockers import blocker_summary
+            text += "\nPrevious blocker: " + blocker_summary(state.blocker)
     if action != "set":
         text += "\n" + GOAL_CONTROLS
     return text

@@ -355,7 +355,7 @@ def _goal_judge_available() -> bool:
 _GOAL_GATE_MESSAGES = {
     "kanban_complete": {
         "blocked": (
-            "Goal completion rejected: judge ruled the goal unachievable — {reason}. The task "
+            "Goal completion rejected: judge found an external blocker — {reason}. The task "
             "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
             "the block with kanban_block and hand the decision to a human / reviewer."),
         "continue": (
@@ -364,7 +364,7 @@ _GOAL_GATE_MESSAGES = {
             "create continuation tasks with parents=[{tid}] and keep this task alive.")},
     "kanban_request_review": {
         "blocked": (
-            "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
+            "Goal review handoff rejected: judge found an external blocker — {reason}. "
             "Record the block with kanban_block instead of requesting review."),
         "continue": (
             "Goal review handoff rejected by judge: {reason}. Provide acceptance evidence "
@@ -379,7 +379,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, _, directive, _ = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
     except Exception as judge_exc:
         logger.warning(
@@ -387,6 +387,9 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         return
     if verdict == "done":
         return
+    if verdict == "blocked":
+        from hermes_cli.goals_blockers import normalize_blocker, blocker_summary
+        reason = blocker_summary(normalize_blocker((directive or {}).get("blocker"), reason))
     key = "blocked" if verdict == "blocked" else "continue"
     raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
 

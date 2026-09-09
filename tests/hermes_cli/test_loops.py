@@ -455,7 +455,8 @@ class TestTickLifecycle:
             decision = mgr.complete_tick("The repository was deleted; there is no CI to watch.")
         assert decision["stopped"] is True
         assert decision["status"] == "paused"
-        assert "unachievable" in decision["message"]
+        assert "blocked" in decision["message"]
+        assert "unachievable" not in decision["message"]
 
     def test_until_judge_error_fails_open(self, hermes_home):
         from hermes_cli.loops import LoopManager
