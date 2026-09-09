@@ -20,6 +20,15 @@ from typing import Any
 import yaml
 
 STANDARD_RUNNERS = frozenset({"ubuntu-latest", "windows-latest", "macos-latest"})
+# Authorization is staged on the trusted base before any workflow selects these
+# labels. No generic self-hosted selection, expressions, or runner groups.
+ISOLATED_RUNNER = ["self-hosted", "Linux", "ARM64", "hermes-ci-isolated"]
+ISOLATED_JOBS = frozenset({
+    "hybrid-pilot.yml.jobs.proof",
+    "tests.yml.jobs.test",
+    "tests.yml.jobs.e2e",
+    "js-tests.yml.jobs.check",
+})
 SHA_PIN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 SECRET_EXPR = re.compile(r"\$\{\{[^}]*\bsecrets\b[^}]*\}\}", re.IGNORECASE)
 PUBLISH_COMMAND = re.compile(
@@ -205,7 +214,9 @@ def _validate_job(
     if "uses" in job:
         _validate_uses(job["uses"], f"{location}.uses", root, errors, trusted_actions, reusable=True)
     runner = job.get("runs-on")
-    if runner == "${{ matrix.runner }}":
+    if runner == ISOLATED_RUNNER and location in ISOLATED_JOBS:
+        pass
+    elif runner == "${{ matrix.runner }}":
         matrix = ((job.get("strategy") or {}).get("matrix") or {}) if isinstance(job.get("strategy"), dict) else {}
         include = matrix.get("include") if isinstance(matrix, dict) else None
         runners = [item.get("runner") for item in include] if isinstance(include, list) and all(isinstance(item, dict) for item in include) else []
