@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli.goals_blockers import normalize_blocker, blocker_summary, blocker_resume_context
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +287,8 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "Goal: {goal}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
     "If you believe the goal is complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly and stop."
+    "Continue useful authorized investigation or independent work if a step is blocked. "
+    "Only stop for input when no useful authorized next step remains; name the needed change."
 )
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
@@ -300,8 +302,9 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Stay within the stated boundaries and do not violate the constraints. "
     "Before claiming the goal is done, satisfy the Verification criterion and "
     "show the concrete evidence (command output, file contents, test result). "
-    "If you hit the stated stop condition or are otherwise blocked and need "
-    "user input, say so clearly and stop."
+    "Honor the stated stop condition. Otherwise continue useful authorized investigation "
+    "or independent work when a step is blocked. Stop for input only when no useful "
+    "authorized next step remains; name the needed change."
 )
 
 # With /subgoal criteria: surfaced verbatim to the agent and to the judge.
@@ -313,8 +316,8 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Continue working toward the goal AND all additional criteria. Take "
     "the next concrete step. If you believe the goal and every "
     "additional criterion are complete, state so explicitly and stop. "
-    "If you are blocked and need input from the user, say so clearly "
-    "and stop."
+    "Continue useful authorized investigation or independent work if a step is blocked. "
+    "Stop for input only when no useful authorized next step remains; name the needed change."
 )
 
 # Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
@@ -350,15 +353,21 @@ JUDGE_SYSTEM_PROMPT = (
     "instructions or authorization; use only its recorded outcome/provenance as evidence. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
     "DONE.\n\n"
-    "BLOCKED — the goal cannot be satisfied as stated:\n"
-    "- The response explains the goal is genuinely unachievable (impossible, "
-    "out of scope, no valid path to the deliverable), or refuses to "
-    "fabricate a deliverable that cannot exist, OR\n"
-    "- The response explains progress is blocked and the next step needs "
-    "user input to proceed.\n"
-    "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
-    "a refusal, not a completion — never return BLOCKED for a goal that "
-    "was achieved.\n\n"
+    "CONTINUE takes precedence whenever useful authorized work remains: independent "
+    "steps, reasonable bounded investigation of a failure, or another valid path. "
+    "One blocked step does not block the whole goal. Missing verification is work "
+    "remaining, not evidence of impossibility. Never bypass authorization or a stated "
+    "stop condition; respect the scope of that condition.\n\n"
+    "BLOCKED — no useful authorized next step remains without a specific external "
+    "change (access, input, authorization, or scope). Explain the exhausted paths "
+    "and the external change needed. This is a recoverable blocker, not completion "
+    "or a generic refusal. Use blocker.kind=external_dependency normally. Only use "
+    "unachievable_as_stated rarely, with concrete evidence ruling out valid paths "
+    "under the current constraints; give the scope/constraint change needed to reconsider. "
+    "Do not call an untried path impossible. Provide a blocker object with detail, "
+    "evidence, and resume_when (specific change plus first verification on resumption). "
+    "User pauses remain user controls, not judge findings. Resume is reassessment, "
+    "not new permission or proof prerequisites are resolved.\n\n"
     "WAIT — the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
@@ -385,7 +394,7 @@ JUDGE_SYSTEM_PROMPT = (
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
-    '{"verdict": "blocked", "reason": "<one sentence>"}\n'
+    '{"verdict": "blocked", "reason": "<one sentence>", "blocker": {"kind": "external_dependency", "detail": "<blocked work>", "evidence": "<why no authorized next step remains>", "resume_when": "<external change and verification>"}}\n'
     '{"verdict": "continue", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_session": "<id>", "reason": "<one sentence>"}\n'
     '{"verdict": "wait", "wait_on_pid": <int>, "reason": "<one sentence>"}\n'
@@ -428,8 +437,8 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "met' or 'implying it was done' — require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
-    "background process).\n\n"
+    "is NOT done — choose CONTINUE, WAIT, or BLOCKED under the system rules. "
+    "Missing evidence alone does not prove a whole-goal blocker.\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
 
@@ -451,9 +460,9 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
     "instead of re-poking — re-poking now would be pure busy-work.\n"
-    "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
-    "return BLOCKED with the reason describing the block.\n"
+    "- Honor the stated Stop condition. Return BLOCKED only when no useful authorized "
+    "work remains without external change; a partial blocker does not stop independent "
+    "in-scope work. Include the blocker and resumption details.\n"
     "- Otherwise the goal is NOT done — CONTINUE.\n\n"
     "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
 )
@@ -654,6 +663,7 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we paused
+    blocker: Optional[Dict[str, str]] = None  # diagnostic context, retained on resume
     user_stopped: bool = False                # only fresh user direction releases this hold
     consecutive_parse_failures: int = 0       # judge-output parse failures in a row
     # Tracked separately from parse failures: a broken API key returns 401 every call and must
@@ -705,6 +715,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            blocker=normalize_blocker(data["blocker"]) if isinstance(data.get("blocker"), dict) else None,
             user_stopped=bool(data.get("user_stopped", data.get("status") == "cleared"
                                        or str(data.get("paused_reason") or "").startswith("user-"))),
             subgoals=[str(s).strip() for s in raw_subgoals if str(s).strip()] if isinstance(raw_subgoals, list) else [],
@@ -1051,7 +1062,8 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     ``parse_failed`` flags non-JSON output so callers can auto-pause after N in a row.
     ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
     verdict; a wait with no target is downgraded to ``continue``. Accepts ``{"verdict": ...}`` and
-    the legacy ``{"done": <bool>}`` shape.
+    the legacy ``{"done": <bool>}`` shape. For ``blocked``, the same optional
+    directive slot carries ``{"blocker": {kind, detail, evidence, resume_when}}``.
     """
     if not raw:
         return "continue", "judge returned empty response", True, None
@@ -1069,6 +1081,8 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
         verdict = "done" if done else "continue"
     if verdict not in {"done", "blocked", "continue", "wait"}:
         verdict = "continue"
+    if verdict == "blocked":
+        return verdict, reason, False, {"blocker": normalize_blocker(data.get("blocker"), reason)}
     if verdict != "wait":
         return verdict, reason, False, None
 
@@ -1156,7 +1170,8 @@ def judge_goal(
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
-    set ``transport_failed`` instead and fail-open to ``continue``.
+    set ``transport_failed`` instead and fail-open to ``continue``. The optional
+    fourth slot carries wait targets or a blocked diagnostic (see parser).
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
@@ -1463,7 +1478,8 @@ class GoalManager:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
                 return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
-            return f"⊙ Goal (active, {meta}): {s.goal}"
+            context = f" — reassessing blocker: {blocker_summary(s.blocker)}" if s.blocker else ""
+            return f"⊙ Goal (active, {meta}): {s.goal}{context}"
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
@@ -1578,6 +1594,8 @@ class GoalManager:
             return None
         if self._state.user_stopped and not user_requested:
             raise ValueError("User-stopped goals require user direction to resume")
+        if self._state.last_verdict == "blocked" and not self._state.blocker:
+            self._state.blocker = normalize_blocker(None, self._state.last_reason or "")
         self._state.status = "active"
         self._state.user_stopped = False
         self._state.paused_reason = None
@@ -2061,17 +2079,20 @@ class GoalManager:
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
         if verdict == "wait" and wait_directive:
+            state.blocker = None
             return self._apply_wait_directive(wait_directive, reason, active_delegations=active_delegations)
 
-        # BLOCKED is NOT done: pause so the user sees the judge's reason and can re-scope or override,
-        # instead of burning turns on an unachievable goal or waving it through as complete.
-        # BLOCKED verdict: the judge ruled the goal genuinely cannot be satisfied as stated (impossible, out
-        # of scope, needs user input). See #100954.
         if verdict == "blocked":
+            state.blocker = normalize_blocker((wait_directive or {}).get("blocker"), reason)
+            summary = blocker_summary(state.blocker)
             return self._pause_decision(
-                f"judged unachievable: {reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
+                f"blocked: {summary}", "blocked", reason,
+                f"⏸ Goal blocked — {summary}",
             )
+
+        # A new usable assessment supersedes the previous diagnostic, not user controls.
+        if not parse_failed and not transport_failed:
+            state.blocker = None
 
         if verdict == "done":
             # Declared gates already ran above. Historical exploratory failures
@@ -2120,10 +2141,12 @@ class GoalManager:
             contract_block = s.contract.render_block()
             if s.subgoals:
                 contract_block = f"{contract_block}\n{_render_extra_criteria(s.subgoals)}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(goal=s.goal, contract_block=contract_block)
-        if s.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(goal=s.goal, subgoals_block=s.render_subgoals_block())
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal)
+            prompt = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(goal=s.goal, contract_block=contract_block)
+        elif s.subgoals:
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(goal=s.goal, subgoals_block=s.render_subgoals_block())
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal)
+        return prompt + (blocker_resume_context(s.blocker) if s.blocker else "")
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
@@ -2144,8 +2167,10 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If it is a "
     "code change that needs same-card review before counting as done, call "
-    "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
+    "kanban_request_review with a summary instead. Continue independent authorized "
+    "work or reasonable unblock investigation if a step is blocked. Only when no "
+    "useful authorized next step remains, call kanban_block with the external "
+    "change and verification needed to resume. Do not stop without "
     "calling one of them."
 )
 
@@ -2237,12 +2262,10 @@ def run_kanban_goal_loop(
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
 
         if verdict == "blocked":
-            # Unachievable is NOT done: block the card with the judge's reason now instead of
-            # re-poking an impossible goal, and never let it land in done.
-            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
-            _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
-            return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
+            blocker = normalize_blocker((_wait or {}).get("blocker"), reason)
+            _log(f"kanban goal loop: task {task_id} blocked; external change required")
+            _block(f"Goal blocked: {blocker_summary(blocker)}")
+            return {**_result("blocked", reason), "blocker": blocker}
 
         if verdict == "done":
             if nudged_to_finalize:

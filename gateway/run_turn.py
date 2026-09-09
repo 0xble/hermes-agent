@@ -1729,6 +1729,14 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        # Freeze the task generation whose results this parent actually handled.
+        # Initial asynchronous acknowledgement turns have no such receipt.
+        cards = getattr(self, "_delegation_cards", None)
+        if cards is not None and not agent_result.get("failed"):
+            receipt = cards.receipt(event, session_key, run_generation)
+            event._delegation_card_receipt = receipt
+            if _intentional_silence or agent_result.get("already_sent"):
+                await cards.delivered(receipt)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)

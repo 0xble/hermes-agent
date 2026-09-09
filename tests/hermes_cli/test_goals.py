@@ -869,7 +869,8 @@ class TestBlockedVerdict:
         assert decision["verdict"] == "blocked"
         assert decision["status"] == "paused"
         assert decision["should_continue"] is False
-        assert "unachievable" in decision["message"].lower()
+        assert "blocked" in decision["message"].lower()
+        assert "unachievable" not in decision["message"].lower()
         assert mgr.state is not None
         assert mgr.state.status == "paused"
-        assert "unachievable" in (mgr.state.paused_reason or "").lower()
+        assert "blocked" in (mgr.state.paused_reason or "").lower()

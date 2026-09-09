@@ -690,11 +690,12 @@ def _cmd_goal(rid, params, session, name, arg):
         state = mgr.resume()
         if state is None:
             return _exec_out(rid, "No goal to resume.")
+        from hermes_cli.goal_display import format_goal_change
+        notice = format_goal_change("resume", state)
         # Resume must restart work: `exec` is display-only, so return a `send`; `display`
         # keeps model-facing scaffolding out of the transcript.
         if not (prompt := mgr.next_continuation_prompt()):
-            return _exec_out(rid, f"▶ Goal resumed: {state.goal}")
-        notice = f"▶ Goal resumed: {state.goal}\nContinuing now — taking the next step."
+            return _exec_out(rid, notice)
         return _ok(rid, {"type": "send", "notice": notice, "message": prompt, "display": "/goal resume"})
     if lower in {"clear", "stop", "done"}:
         had = mgr.has_goal()

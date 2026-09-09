@@ -4084,6 +4084,10 @@ class BasePlatformAdapter(ABC):
             chat_id=event.source.chat_id, content=text_content,
             reply_to=_reply_anchor_for_event(event), metadata=metadata)
         record_delivery(result)
+        if getattr(result, "success", False):
+            cards = getattr(self.gateway_runner, "_delegation_cards", None)
+            if cards is not None:
+                await cards.delivered(getattr(event, "_delegation_card_receipt", {}))
         if _obligation_id is not None:
             await self._finalize_delivery_obligation(_obligation_id, result, event, delivery_adapter)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:

@@ -45,6 +45,8 @@ class _Batch:
     origin_owner_session_record: Any
     overall_start: float
     completion_contract: Optional[Dict[str, Any]] = None
+    # Reserved before child construction; copied to dispatches and completions.
+    delegation_metadata: Optional[Dict[str, Any]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
@@ -296,7 +298,8 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
+def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]],
+                        delegation_metadata: Optional[Dict[str, Any]] = None) -> dict:
     """Model-facing handle for an accepted background call: one entry per async unit."""
     goals = [t["goal"] for t in batch.task_list]
     n = len(goals)
@@ -317,6 +320,8 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     if batch.live_paths:
         payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
+    if delegation_metadata:
+        payload["delegation_metadata"] = delegation_metadata
     return payload
 
 def _units_of(batch: _Batch) -> List[_Batch]:
@@ -349,6 +354,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
         completion_contract=unit.completion_contract,
+        delegation_metadata=unit.delegation_metadata,
     )
 
 def _dispatch_background(batch: _Batch) -> str:
@@ -372,7 +378,7 @@ def _dispatch_background(batch: _Batch) -> str:
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),
     )
-
+    
     units = _units_of(batch)
     dispatched: List[tuple[_Batch, str]] = []
     inline_results: List[dict] = []

@@ -565,10 +565,10 @@ class LoopManager:
                 return self._stop("done", f"stop condition met: {reason}",
                                   f"✓ Loop finished after {ticks} — {reason}")
             if verdict == "blocked":
-                # Unachievable stop condition: pause so the user can re-scope, don't spin.
-                why = f"stop condition judged unachievable: {reason}"
-                return self._stop("paused", why,
-                                  f"⏸ Loop paused — {why}. /loop resume to keep going, /loop stop to end it.")
+                from hermes_cli.goals_blockers import normalize_blocker, blocker_summary
+                why = blocker_summary(normalize_blocker((_wait or {}).get("blocker"), reason))
+                return self._stop("paused", f"stop condition blocked: {why}",
+                                  f"⏸ Loop blocked — {why}. Resume only requests reassessment.")
 
         # 3. --times user cap.
         if s.times and s.ticks_fired >= s.times:

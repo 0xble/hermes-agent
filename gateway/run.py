@@ -4205,7 +4205,10 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            # Source carries a routed multiplex profile when present; default-profile
+            # turns bind the gateway's active profile explicitly rather than leaving
+            # a consumer to consult ambient HERMES_HOME.
+            profile=getattr(context.source, "profile", "") or self._active_profile_name(),
             # Frozen startup cwd, never the live env var a cron job may have redirected.
             cwd=_GATEWAY_TERMINAL_CWD,
             async_delivery=_async_delivery,
