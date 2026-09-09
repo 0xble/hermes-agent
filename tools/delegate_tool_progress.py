@@ -90,11 +90,12 @@ _LEGACY_EVENT_MAP: Dict[str, DelegateEvent] = {
 # Event → _ChildProgressRelay method name. Lifecycle strings are emitted by the orchestrator itself (not
 # DelegateEvent). Any other DelegateEvent (TASK_TOOL_STARTED and the reserved TASK_* values) takes the tool-started
 # path; None means "recognised but ignored".
-_LIFECYCLE_EVENTS = frozenset({"subagent.start", "subagent.complete", "subagent.text"})
+_LIFECYCLE_EVENTS = frozenset({"subagent.start", "subagent.complete", "subagent.text", "subagent.tool"})
 _EVENT_HANDLERS: Dict[Any, Optional[str]] = {
     "subagent.start": "_on_start",
     "subagent.complete": "_on_complete",
     "subagent.text": "_on_text",
+    "subagent.tool": "_on_tool_started",
     DelegateEvent.TASK_THINKING: "_on_thinking",
     DelegateEvent.TASK_PROGRESS: "_on_progress",
     DelegateEvent.TASK_TOOL_COMPLETED: None,
@@ -292,7 +293,9 @@ class _ChildProgressRelay:
         # the child exists, so every relayed event lets UIs open its session.
         for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id"),
                          ("parent_task_id", "parent_task_id"), ("thread_ref", "thread_ref"),
-                         ("task_label", "task_label"), ("role", "role"), ("owner", "owner"),
+                         ("card_parent_task_id", "card_parent_task_id"),
+                         ("card_parent_thread_ref", "card_parent_thread_ref"),
+                         ("task_label", "task_label"), ("role", "role"), ("owner", "owner"), ("card_owner", "card_owner"),
                          ("subagent_type", "subagent_type"), ("native_review", "native_review"),
                          ("background", "background")):
             if self.session_ref.get(src) is not None:
@@ -369,7 +372,7 @@ class _ChildProgressRelay:
             short = _short(preview, 35) if preview else ""
             self._tree_line(f'{line}  "{short}"' if short else line)
         if self.parent_cb:
-            self._relay("subagent.tool", tool_name, preview, args)
+            self._relay("subagent.tool", tool_name, preview, args, **kwargs)
             self.batch.append(tool_name or "")
             if len(self.batch) >= self._BATCH_SIZE:
                 self._flush()

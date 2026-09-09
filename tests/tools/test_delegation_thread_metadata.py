@@ -30,6 +30,16 @@ def test_empty_parent_identity_is_independent_and_uses_safe_label(tmp_path, monk
     assert metadata["task_labels"] == ["Run delegated task"]
 
 
+def test_explicit_card_label_is_not_truncated_by_metadata_reservation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    owner = {"profile": "p", "session_id": "s", "chat_id": "c", "topic_id": "t", "session_key": "k"}
+    label = "retain-full-label-" * 10
+
+    metadata = ad.reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=[label])
+
+    assert metadata["task_labels"] == [label]
+
+
 def test_thread_refs_continue_past_z(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     owner = {"profile": "p", "session_id": "s", "chat_id": "c", "topic_id": "t", "session_key": "k"}

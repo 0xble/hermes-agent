@@ -83,10 +83,9 @@ async def test_legacy_ambiguous_send_does_not_hide_known_aggregate_anchor(tmp_pa
     adapter.send_delegation_card.assert_not_awaited()
     assert adapter.edit_message.call_args.args[1] == 'known'
     rendered = adapter.edit_message.call_args.args[2]
-    # #129 simplified the card, so rows are no longer bold ('**A.' -> 'A.'). What this test
-    # guards is that BOTH cards land in the one known aggregate anchor, not the emphasis;
-    # anchor on the row starts so a future style change does not read as a lost row.
+    # Both cards share the known aggregate anchor; only the heading uses bold.
     assert '\nA. ' in rendered and '\nB. ' in rendered
+    assert '**A.' not in rendered and '**B.' not in rendered
     assert cards.cards['a'*32]['presentation_key'] == 'b'*32
     assert not any(c.get('handled') or c.get('retired') for c in cards.cards.values())
 

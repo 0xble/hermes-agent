@@ -5,8 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.display import build_tool_preview, get_tool_emoji
-from agent.codex_runtime import _codex_item_to_preview
+from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
@@ -113,33 +112,18 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
         profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""),
         preview="PRIVATE_PREVIEW", args={"token": "PRIVATE_ARGUMENT"}, goal="PRIVATE_GOAL")
     await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
-    await cards.observe(source, "r", "s", 1, "subagent.tool", tool, data,
-                        preview=build_tool_preview("web_search", {"query": "Inspecting gateway tool usage " + "details " * 40}, max_len=0))
+    await cards.observe(source, "r", "s", 1, "subagent.tool", tool, data)
     await drain_cards(cards)
-    expected = tool[:60]
+    expected = tool[:40]
     plain = render_card(cards.cards["a" * 32], now=0)
-    detail = cards.cards["a" * 32]["rows"]["A"]["tool_detail"]
-    assert len(detail) == 160 and detail.endswith("…")
-    assert "Inspecting gateway tool usage" in detail
-    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected} · `{detail}`"
+    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected}"
     sent = adapter._bot.send_message.call_args.kwargs["text"]
     assert expected.replace("_", "\\_") in sent
     # A distinct update must exercise edit formatting, not unchanged suppression.
     await cards.observe(source, "r", "s", 1, "subagent.tool", "next_" + tool, data)
     await drain_cards(cards)
     edited = adapter._bot.edit_message_text.call_args.kwargs["text"]
-    assert "Inspecting gateway" not in edited  # missing preview clears stale detail
-    await cards.observe(source, "r", "s", 1, "subagent.tool", "terminal", data,
-                        preview=_codex_item_to_preview(dict(type="commandExecution", command="false || echo retry || true")))
-    await drain_cards(cards)
-    literal = adapter._bot.edit_message_text.call_args.kwargs["text"]
-    assert "`false || echo retry || true`" in literal
-    markdown = "**bold** [link](https://example.test) ~~strike~~ \u005c\u005cpath"
-    await cards.observe(source, "r", "s", 1, "subagent.tool", "terminal", data,
-                        preview=_codex_item_to_preview(dict(type="commandExecution", command=markdown)))
-    await drain_cards(cards)
-    assert "`" + markdown.replace("\\", "\\\\") + "`" in adapter._bot.edit_message_text.call_args.kwargs["text"]
-    assert ("next_" + tool)[:60].replace("_", "\\_") in edited
+    assert ("next_" + tool)[:40].replace("_", "\\_") in edited
     for text in (plain, sent, edited, cards.path.read_text(encoding="utf-8")):
         assert "PRIVATE_" not in text
     for text in (sent, edited):
@@ -147,28 +131,144 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
         assert len(text.encode("utf-16-le")) // 2 < 4096
     row = cards.cards["a" * 32]["rows"]["A"]
     many = dict(started_at=0, rows={str(i): {**row, "thread_ref": str(i)} for i in range(100)})
-    assert len(render_card(many, now=0)) <= 3500
+    # Card row guidance is not a renderer hard cap: authored rows are preserved.
+    assert "99. Check display" in render_card(many, now=0)
 
 
-def test_tool_detail_redacts_before_truncation_and_fails_closed(monkeypatch):
-    from gateway import delegation_cards
-    secret = "synthetic-private-token-123456789"
-    preview = "https://example.test/check?token=" + secret + "&q=checks"
-    detail = delegation_cards._tool_detail(preview)
-    assert detail == ""
-    assert secret not in delegation_cards._tool_detail("API_KEY=" + secret + "x" * 200)
-    from agent.codex_runtime import _codex_item_to_preview
-    native = _codex_item_to_preview(dict(type="mcpToolCall", arguments={"password": "z" * 200}))
-    assert "z" * 20 not in delegation_cards._tool_detail(native)
-    truncated_url = "https://user:" + "z" * 200
-    assert "z" * 20 not in delegation_cards._tool_detail(truncated_url[:120])
-    ordinary = build_tool_preview("web_search", {"query": "ordinary preview"}, max_len=0)
-    assert delegation_cards._tool_detail(ordinary) == "ordinary preview"
-    # String-only transport loses proof rather than admitting unverifiable text.
-    assert delegation_cards._tool_detail(str(ordinary)) == ""
-    assert delegation_cards._tool_detail(build_tool_preview("web_search", {"query": "echo `whoami`"})) == ""
-    monkeypatch.setattr(delegation_cards, "redact_sensitive_text", lambda *a, **k: 1 / 0)
-    assert delegation_cards._tool_detail(ordinary) == ""
+@pytest.mark.asyncio
+async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layout(tmp_path):
+    """Observed nested lifecycle events share one card without inferring parentage from labels."""
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    adapter = SimpleNamespace(
+        send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)),
+        delete_message=AsyncMock(return_value=True),
+    )
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    owner = dict(profile="default", session_id="s", session_key="***", chat_id="42", thread_id="")
+    root, child, grandchild, deeper = ("a" * 32, "b" * 32, "c" * 32, "d" * 32)
+
+    async def event(key, ref, label, *, parent=None, tool="computer_use"):
+        data = dict(parent_task_id=key, thread_ref=ref, task_label=label, subagent_type="worker", owner=owner,
+                    preview="PRIVATE_PREVIEW", args={"token": "PRIVATE_ARGUMENT"})
+        if parent:
+            data.update(card_parent_task_id=parent[0], card_parent_thread_ref=parent[1])
+        await cards.observe(source, "***", "s", 1, "subagent.start", None, data)
+        await cards.observe(source, "***", "s", 1, "subagent.tool", tool, data)
+        return data
+
+    root_data = await event(root, "A", "Check Telegram edits")
+    child_data = await event(child, "A", "Verify card edit", parent=(root, "A"))
+    grandchild_data = await event(grandchild, "A", "Check Telegram edits", parent=(child, "A"))
+    deeper_data = await event(deeper, "A", "Bound deep descendant", parent=(grandchild, "A"))
+    await drain_cards(cards)
+
+    rendered = adapter.send_delegation_card.call_args.args[1]
+    lines = rendered.splitlines()
+    assert lines[0] == "🧵 **Delegating · 0 min**"
+    assert "A. Check Telegram edits · Worker" in lines
+    assert "  A.1. Verify card edit · Worker" in lines
+    assert "    A.1.1. Check Telegram edits · Worker" in lines
+    assert "    ↳ ⚡ computer_use" in lines
+    assert "    A.1.1.1. Bound deep descendant · Worker · ↑A.1.1" in lines
+    assert any(len(line) > 32 for line in lines[1::2])  # guidance never truncates authored labels
+    assert all("Last tool:" not in line and "PRIVATE_" not in line for line in lines)
+    assert not any(line.startswith(">") for line in lines)
+
+    for data in (root_data, child_data, grandchild_data, deeper_data):
+        await cards.observe(source, "***", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
+    receipt = {key: {"generation": cards.cards[key]["generation"], "epoch": cards.cards[key].get("receipt_epoch", 0), "refs": ["A"]}
+               for key in (root, child, grandchild, deeper)}
+    await cards.delivered(receipt)
+    assert all(card["retired"] for card in cards.cards.values())
+    await cards.observe(source, "***", "s", 1, "subagent.tool", "terminal", root_data)
+    assert all(card["retired"] for card in cards.cards.values())
+
+
+@pytest.mark.asyncio
+async def test_nested_relays_reach_root_card_with_root_display_owner(tmp_path):
+    """Gateway accepts a trusted root card owner while actual child ownership stays distinct."""
+    from tools.delegate_tool import _build_child_progress_callback
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    runner = SimpleNamespace(_adapter_for_source=lambda _: adapter)
+    cards = runner._delegation_cards = DelegationCards(runner, home=tmp_path, interval=0)
+    ctx = TurnContext(source=source, session_id="root", session_key="route", run_generation=1,
+        tool_progress_enabled=True, progress_mode="all", _run_still_current=lambda: False)
+    gateway_relay = TurnRunner(runner, ctx)
+    scheduled = []
+    gateway_relay._schedule = lambda coro, *_: scheduled.append(asyncio.create_task(coro))
+    owner = dict(profile="default", session_id="root", session_key="route", chat_id="42", thread_id="")
+
+    root = SimpleNamespace(_delegate_spinner=None, tool_progress_callback=gateway_relay.progress_callback)
+    root_ref = dict(parent_task_id="a" * 32, thread_ref="A", task_label="root", owner=owner, card_owner=owner)
+    first = _build_child_progress_callback(0, "first", root, session_ref=root_ref)
+    middle = SimpleNamespace(_delegate_spinner=None, tool_progress_callback=first)
+    middle_ref = dict(parent_task_id="b" * 32, thread_ref="A", task_label="child", owner={**owner, "session_id": "child-1"},
+                      card_owner=owner, card_parent_task_id="a" * 32, card_parent_thread_ref="A")
+    second = _build_child_progress_callback(0, "second", middle, session_ref=middle_ref)
+    leaf_parent = SimpleNamespace(_delegate_spinner=None, tool_progress_callback=second)
+    leaf_ref = dict(parent_task_id="c" * 32, thread_ref="A", task_label="grandchild", owner={**owner, "session_id": "child-2"},
+                    card_owner=owner, card_parent_task_id="b" * 32, card_parent_thread_ref="A")
+    leaf = _build_child_progress_callback(0, "leaf", leaf_parent, session_ref=leaf_ref)
+
+    first("subagent.start")
+    second("subagent.start")
+    leaf("subagent.start")
+    leaf("tool.started", "read_file")
+    await asyncio.gather(*scheduled)
+    await drain_cards(cards)
+
+    assert cards.cards["c" * 32]["delegation_owner"]["session_id"] == "child-2"
+    rendered = adapter.send_delegation_card.call_args.args[1]
+    assert "A. root" in rendered
+    assert "  A.1. child" in rendered
+    assert "    A.1.1. grandchild" in rendered
+    assert "    ↳ ⚡ read_file" in rendered
+
+
+@pytest.mark.asyncio
+async def test_root_receipt_consumes_only_terminal_nested_descendants(tmp_path):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    owner = dict(profile="default", session_id="root", session_key="route", chat_id="42", thread_id="")
+
+    async def lifecycle(key, *, parent=None, state="completed"):
+        data = dict(parent_task_id=key, thread_ref="A", owner={**owner, "session_id": key}, card_owner=owner)
+        if parent:
+            data.update(card_parent_task_id=parent, card_parent_thread_ref="A")
+        await cards.observe(source, "route", "root", 1, "subagent.start", None, data)
+        if state != "running":
+            await cards.observe(source, "route", "root", 1, "subagent.complete", None, {**data, "status": state})
+
+    await lifecycle("a" * 32)
+    await lifecycle("b" * 32, parent="a" * 32)
+    await lifecycle("c" * 32, parent="b" * 32)
+    await lifecycle("d" * 32, parent="c" * 32, state="running")
+    await lifecycle("e" * 32)  # Same root display owner but unrelated lineage.
+    event = MessageEvent(source=source, text="root result", internal=True, metadata={
+        "delegation_parent_task_id": "a" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
+
+    receipt = cards.receipt(event, "route", 2)
+    assert set(receipt) == {"a" * 32, "b" * 32, "c" * 32}
+    await cards.delivered(receipt)
+
+    assert cards.cards["d" * 32].get("handled", []) == []
+    assert cards.cards["e" * 32].get("handled", []) == []
+
+
+def test_render_card_preserves_full_explicit_label_without_card_truncation():
+    label = "keep-every-character-" * 250
+    rendered = render_card({"started_at": 0, "rows": {"A": {
+        "thread_ref": "A", "task_label": label, "state": "running", "last_tool": None,
+    }}}, now=0)
+
+    assert label in rendered
+    assert len(rendered) > 3500
 
 
 @pytest.mark.asyncio
@@ -192,33 +292,13 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     assert adapter.send_delegation_card.call_args.args[1].startswith("🧵 **Delegating · ")
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
-    relay.progress_callback("subagent.tool", "terminal", preview="API_KEY=supersecret123456789", args={"secret": "raw"}, **data)
+    relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert f"↳ {get_tool_emoji('terminal')} terminal" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
-    assert "supersecret123456789" not in adapter.edit_message.call_args.args[2]
-    assert cards.cards["a" * 32]["rows"]["A"]["tool_detail"] == ""
-    # Exercise native/raw partial previews through the real callback and persistence path.
-    secret = "syntheticPASSWORD" * 30
-    previews = [
-        _codex_item_to_preview(dict(type="mcpToolCall", arguments={"password": secret})),
-        ("https://alice:" + secret + "@example.test")[:120],
-        build_tool_preview("browser_navigate", {"url": "https://alice:" + secret + "@example.test"}, max_len=120),
-        _codex_item_to_preview(dict(type="commandExecution", command="curl https://alice:" + secret + "@example.test")),
-    ]
-    for preview in previews:
-        relay.progress_callback("subagent.tool", "terminal", preview=preview, **data)
-        await asyncio.gather(*tasks)
-        await drain_cards(cards)
-        for text in (cards.path.read_text(encoding="utf-8"), render_card(cards.cards["a" * 32])):
-            assert "syntheticPASSWORD" not in text
-    ordinary = _codex_item_to_preview(dict(type="commandExecution", command="python -m pytest tests/gateway/test_delegation_cards.py"))
-    relay.progress_callback("subagent.tool", "terminal", preview=ordinary, **data)
-    await asyncio.gather(*tasks)
-    await drain_cards(cards)
-    assert "python -m pytest" in cards.path.read_text(encoding="utf-8")
+    assert "SECRET" not in adapter.edit_message.call_args.args[2]
     relay.progress_callback("subagent.complete", status="completed", **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))

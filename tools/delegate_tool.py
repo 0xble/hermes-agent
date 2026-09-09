@@ -268,6 +268,19 @@ def _build_child_agent(
     # Shared ref: session_id once the child exists, delegation_id once
     # delegate_task stamps it — both ride on every relayed event.
     child_session_ref: Dict[str, Any] = {}
+    # A nested delegation retains its own receipt identity, while its observed
+    # card activity names the actual parent row. This is display-only metadata:
+    # it neither changes delegation depth/roles nor infers ancestry from labels.
+    parent_card_ref = getattr(parent_agent, "_progress_identity_ref", None)
+    if isinstance(parent_card_ref, dict):
+        parent_task_id = parent_card_ref.get("parent_task_id")
+        parent_thread_ref = parent_card_ref.get("thread_ref")
+        if isinstance(parent_task_id, str) and isinstance(parent_thread_ref, str):
+            child_session_ref.update(card_parent_task_id=parent_task_id,
+                                     card_parent_thread_ref=parent_thread_ref)
+        card_owner = parent_card_ref.get("card_owner")
+        if isinstance(card_owner, dict):
+            child_session_ref["card_owner"] = card_owner
     child_progress_cb = _build_child_progress_callback(
         task_index, goal, parent_agent, task_count, subagent_id=subagent_id, parent_id=parent_subagent_id,
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
@@ -1098,6 +1111,10 @@ def delegate_task(
     _owner = {"profile": _profile, "session_id": str(getattr(parent_agent, "session_id", "") or ""),
               "session_key": _session_env("HERMES_SESSION_KEY"), "chat_id": _session_env("HERMES_SESSION_CHAT_ID"),
               "thread_id": _thread_id, "topic_id": _thread_id}
+    _card_owner = getattr(parent_agent, "_progress_identity_ref", {})
+    _card_owner = _card_owner.get("card_owner") if isinstance(_card_owner, dict) else None
+    if not isinstance(_card_owner, dict):
+        _card_owner = _owner
     try:
         from tools.async_delegation import reserve_delegation_metadata
         _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
@@ -1137,7 +1154,7 @@ def delegate_task(
                         task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
                         subagent_type=vars(_child).get("_delegation_named_type"),
                         native_review=(completion_contract or {}).get("kind") == "native_review",
-                        owner=_owner, background=bool(background))
+                        owner=_owner, card_owner=_card_owner, background=bool(background))
     _metadata["threads"] = [
         {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
          "role": getattr(child, "_delegate_role", None),
@@ -1465,7 +1482,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Use a short, imperative display label of at most 24 characters, including spaces. Keep it privacy-safe; never use the goal as a display label."),
+                        "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 32-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit."),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1497,7 +1514,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Use a short, imperative display label of at most 24 characters, including spaces. Keep it privacy-safe; never use the goal as a display label. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
+            "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 32-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

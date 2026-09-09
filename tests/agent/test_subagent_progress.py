@@ -147,6 +147,54 @@ class TestBuildChildProgressCallback:
         output = buf.getvalue()
         assert "[3/3]" in output
 
+    def test_nested_card_parentage_is_relayed_from_explicit_identity(self):
+        parent = MagicMock()
+        parent._delegate_spinner = None
+        parent_cb = MagicMock()
+        parent.tool_progress_callback = parent_cb
+        ref = dict(parent_task_id="a" * 32, thread_ref="A", card_parent_task_id="b" * 32,
+                   card_parent_thread_ref="B")
+        cb = _build_child_progress_callback(0, "nested", parent, session_ref=ref)
+        assert cb is not None
+
+        cb("tool.started", "computer_use", None, {})
+
+        kwargs = parent_cb.call_args.kwargs
+        assert kwargs["parent_task_id"] == "a" * 32
+        assert kwargs["thread_ref"] == "A"
+        assert kwargs["card_parent_task_id"] == "b" * 32
+        assert kwargs["card_parent_thread_ref"] == "B"
+
+    def test_nested_tool_relay_preserves_the_leaf_card_identity(self):
+        """A tool from a grandchild survives both relay hops with its own card row."""
+        root = MagicMock()
+        root._delegate_spinner = None
+        root.tool_progress_callback = MagicMock()
+        owner = {"profile": "p", "session_id": "root", "session_key": "route", "chat_id": "42", "thread_id": ""}
+        first_ref = {"parent_task_id": "a" * 32, "thread_ref": "A", "owner": owner, "card_owner": owner}
+        first = _build_child_progress_callback(0, "first", root, session_ref=first_ref)
+
+        middle_parent = MagicMock()
+        middle_parent._delegate_spinner = None
+        middle_parent.tool_progress_callback = first
+        second_ref = {"parent_task_id": "b" * 32, "thread_ref": "A", "owner": {**owner, "session_id": "child-1"},
+                      "card_owner": owner, "card_parent_task_id": "a" * 32, "card_parent_thread_ref": "A"}
+        second = _build_child_progress_callback(0, "second", middle_parent, session_ref=second_ref)
+
+        leaf_parent = MagicMock()
+        leaf_parent._delegate_spinner = None
+        leaf_parent.tool_progress_callback = second
+        leaf_ref = {"parent_task_id": "c" * 32, "thread_ref": "A", "owner": {**owner, "session_id": "child-2"},
+                    "card_owner": owner, "card_parent_task_id": "b" * 32, "card_parent_thread_ref": "A"}
+        leaf = _build_child_progress_callback(0, "leaf", leaf_parent, session_ref=leaf_ref)
+
+        leaf("tool.started", "read_file", None, {})
+
+        event = root.tool_progress_callback.call_args
+        assert event.args[:2] == ("subagent.tool", "read_file")
+        assert event.kwargs["parent_task_id"] == "c" * 32
+        assert event.kwargs["card_owner"] == owner
+
 
 
 # =========================================================================

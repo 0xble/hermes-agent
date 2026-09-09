@@ -14,8 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.display import SanitizedToolPreview, get_tool_emoji
-from agent.redact import redact_sensitive_text
+from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
@@ -29,7 +28,7 @@ _TERMINAL = {"completed", "failed", "error", "timeout", "cancelled", "interrupte
 def _label(value, default, limit=60):
     # Labels are explicit display data, never goals, tool args or child text.
     text = re.sub(r"[\x00-\x1f\x7f*_`\[\]<>]", "", str(value or ""))
-    return " ".join(text.split())[:limit] or default
+    return " ".join(text.split()) or default
 
 
 def _tool_label(value, default="tool", limit=40):
@@ -38,26 +37,60 @@ def _tool_label(value, default="tool", limit=40):
     return text[:limit] or default
 
 
-def _tool_detail(preview):
-    """Persist only previews sanitized by their producer before any truncation."""
-    if not isinstance(preview, SanitizedToolPreview) or "`" in preview:
-        return ""  # Partial/native/custom previews cannot prove their redaction boundary.
-    try:
-        text = redact_sensitive_text(preview, force=True, redact_url_credentials=True)
-        text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", text).split())
-        return text[:159] + "…" if len(text) > 160 else text
-    except Exception:
-        return ""  # Redaction failure must never expose the original preview.
+def _row_identity(task_key, ref):
+    return f"{task_key}:{ref}"
+
+
+def _row_prefix(depth):
+    return "  " * min(max(0, depth), 2)
 
 
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
     # Plain rich text: cards must never render as a native quote or fake border.
     lines = [f"🧵 **Delegating · {elapsed} min**"]
-    for row in card["rows"].values():
-        named_type = _label(row.get("subagent_type"), "", 24)
+    rows = card["rows"]
+    identities = set(rows)
+    children = {}
+    for identity, row in rows.items():
+        parent = row.get("card_parent_identity")
+        if parent in identities and parent != identity:
+            children.setdefault(parent, []).append(identity)
+    ordered = []
+    visited = set()
+
+    def add(identity, depth=0, ancestry=()):
+        if identity in visited:
+            return
+        visited.add(identity)
+        row = rows[identity]
+        actual_depth = depth
+        row = {**row, "_display_depth": min(actual_depth, 2), "_actual_depth": actual_depth}
+        if actual_depth > 2:
+            parent_ref = _label(rows.get(row.get("card_parent_identity"), {}).get("thread_ref"), "parent", 24)
+            row["_parent_marker"] = f" · ↑{parent_ref}"
+        ordered.append(row)
+        for child in children.get(identity, ()):
+            if child not in ancestry:
+                add(child, actual_depth + 1, ancestry + (identity,))
+
+    for identity in rows:
+        if rows[identity].get("card_parent_identity") not in identities:
+            add(identity)
+    for identity in rows:
+        add(identity)
+
+    for row in ordered:
+        depth = row["_display_depth"]
+        prefix = _row_prefix(depth)
+        named_type = _label(row.get("subagent_type"), "", 10_000)
         role_suffix = f" · {named_type.capitalize()}" if named_type else ""
-        lines.append(f"{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}{role_suffix}")
+        parent_marker = row.get("_parent_marker", "")
+        # The model receives a 32-character row-budget guideline, but authored
+        # labels are never truncated or rejected here. Telegram's proportional
+        # fonts likewise cannot guarantee physical width.
+        label = _label(row.get("task_label"), "Task " + row["thread_ref"], 10_000)
+        lines.append(f"{prefix}{row['thread_ref']}. {label}{role_suffix}{parent_marker}")
         state = row.get("state")
         if state == "completed":
             activity = "Returned · awaiting parent"
@@ -67,16 +100,14 @@ def render_card(card, now=None):
             activity = "Interrupted / unknown · gateway restarted"
         elif row.get("last_tool"):
             tool = row["last_tool"]
-            activity = f"{get_tool_emoji(tool)} {_tool_label(tool, 'tool', 60)}"
-            if detail := row.get("tool_detail"):
-                # The adapter protects inline code before interpreting Markdown.
-                # Backtick-bearing previews are omitted at ingestion.
-                activity += f" · `{detail}`"
+            # Only canonical tool identifiers are visible: no previews, args or usage summaries.
+            activity = f"{get_tool_emoji(tool)} {_tool_label(tool, 'tool', 40)}"
         else:
             activity = "Started · awaiting activity"
-        lines.append(f"↳ {activity}")
-    # Keep a single Telegram message, never split into a second card.
-    return "\n".join(lines)[:3500]
+        lines.append(f"{prefix}↳ {activity}")
+    # Do not invent a row/card truncation policy. The platform adapter reports
+    # an over-limit send honestly rather than silently hiding authored labels.
+    return "\n".join(lines)
 
 
 def _handled_terminal(card):
@@ -183,7 +214,12 @@ class DelegationCards:
             for ref, row in card["rows"].items():
                 if ref in (card.get("handled") or ()) and row["state"] in _TERMINAL | {"unknown"}:
                     continue
-                rows[task_key + ref] = {**row, "thread_ref": row.get("display_ref", ref)}
+                rows[_row_identity(task_key, ref)] = {
+                    **row,
+                    "thread_ref": row.get("display_ref", ref),
+                    "card_parent_identity": _row_identity(row["card_parent_task_id"], row["card_parent_thread_ref"])
+                    if row.get("card_parent_task_id") and row.get("card_parent_thread_ref") else None,
+                }
         return {"started_at": anchor["started_at"], "rows": rows}
 
     def _bind(self, key):
@@ -212,6 +248,21 @@ class DelegationCards:
         used = {r.get("display_ref", ref) for k, c in self._members(anchor) if k != key
                 for ref, r in c["rows"].items()}
         for ref, row in card["rows"].items():
+            if row.get("display_ref"):
+                used.add(row["display_ref"])
+                continue
+            parent_card = self.cards.get(row.get("card_parent_task_id"))
+            parent_row = parent_card and parent_card.get("rows", {}).get(row.get("card_parent_thread_ref"))
+            if parent_row and parent_row.get("display_ref"):
+                child_index = parent_row.get("next_child_display_index", 1)
+                display = f"{parent_row['display_ref']}.{child_index}"
+                while display in used:
+                    child_index += 1
+                    display = f"{parent_row['display_ref']}.{child_index}"
+                parent_row["next_child_display_index"] = child_index + 1
+                row["display_ref"] = display
+                used.add(display)
+                continue
             display = ref
             suffix = 2
             while display in used:
@@ -242,32 +293,44 @@ class DelegationCards:
         if key not in self.pending:
             self.pending[key] = asyncio.create_task(self._flush(key))
 
-    async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data, *, preview=None):
+    async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data, preview=None):
+        # Kept for the runner's lifecycle callback compatibility; cards intentionally
+        # project canonical tool names only and never persist/render preview detail.
         scope = ((data.get("owner") or {}).get("profile", ""), getattr(source, "profile", None),
                  source.platform.value, str(source.chat_id), str(source.thread_id or ""))
         async with self.locks.setdefault(scope, asyncio.Lock()):
-            await self._observe(source, session_key, session_id, generation, event_type, tool_name, data, preview=preview)
+            await self._observe(source, session_key, session_id, generation, event_type, tool_name, data)
 
-    async def _observe(self, source, session_key, session_id, generation, event_type, tool_name, data, *, preview=None):
+    async def _observe(self, source, session_key, session_id, generation, event_type, tool_name, data):
         key, ref = data.get("parent_task_id"), data.get("thread_ref")
         owner = data.get("owner") or {}
+        # ``owner`` is the child delegation's actual ownership. ``card_owner``
+        # is a trusted identity copied from its spawning card lineage solely for
+        # gateway display routing; it never replaces durable delegation ownership.
+        card_owner = data.get("card_owner") or owner
         if (source.platform != Platform.TELEGRAM or not isinstance(key, str)
                 or not re.fullmatch(r"[a-f0-9]{32}", key)
                 or not isinstance(ref, str) or not re.fullmatch(r"[A-Z]+", ref)
-                or str(owner.get("session_id", "")) != str(session_id)
-                or str(owner.get("session_key", "")) != str(session_key)
-                or str(owner.get("chat_id", "")) != str(source.chat_id)
-                or str(owner.get("thread_id", "")) != str(source.thread_id or "")):
+                or not isinstance(owner, dict) or not isinstance(card_owner, dict)
+                or str(card_owner.get("session_id", "")) != str(session_id)
+                or str(card_owner.get("session_key", "")) != str(session_key)
+                or str(card_owner.get("chat_id", "")) != str(source.chat_id)
+                or str(card_owner.get("thread_id", "")) != str(source.thread_id or "")
+                or str(owner.get("profile", "")) != str(card_owner.get("profile", ""))
+                or str(owner.get("session_key", "")) != str(card_owner.get("session_key", ""))
+                or str(owner.get("chat_id", "")) != str(card_owner.get("chat_id", ""))
+                or str(owner.get("thread_id", "")) != str(card_owner.get("thread_id", ""))):
             return
         card = self.cards.get(key)
-        if card and (card["owner"] != owner or card.get("retired")):
+        if card and (card["owner"] != card_owner
+                     or card.get("delegation_owner", card["owner"]) != owner or card.get("retired")):
             return
         if not card:
             if event_type != "subagent.start":
                 return  # no resurrection from a late tool/completion
             source_data = {k: getattr(source, k) for k in source.__dataclass_fields__}
             source_data["platform"] = source.platform.value
-            card = self.cards[key] = dict(owner=copy.deepcopy(owner), source=source_data,
+            card = self.cards[key] = dict(owner=copy.deepcopy(card_owner), delegation_owner=copy.deepcopy(owner), source=source_data,
                 started_at=time.time(), generation=0, rows={}, message_id=None,
                 rendered="", recoveries=0, send_attempts=0, retired=False)
         row = card["rows"].get(ref)
@@ -278,6 +341,8 @@ class DelegationCards:
                 return
             row = card["rows"][ref] = {"thread_ref": ref, "task_label": data.get("task_label"),
                 "role": data.get("role"), "subagent_type": data.get("subagent_type"),
+                "card_parent_task_id": data.get("card_parent_task_id"),
+                "card_parent_thread_ref": data.get("card_parent_thread_ref"),
                 "state": "running", "last_tool": None}
             card["generation"] += 1
             if data.get("background") is False:
@@ -286,7 +351,6 @@ class DelegationCards:
             row["state"] = data.get("status") if data.get("status") in _TERMINAL else "completed"
         elif row and event_type == "subagent.tool" and tool_name:
             row["last_tool"] = _tool_label(tool_name, "tool", 60)
-            row["tool_detail"] = _tool_detail(preview)
         else:
             return
         self._bind(key)
@@ -367,23 +431,51 @@ class DelegationCards:
 
     def receipt(self, event, session_key, generation):
         metadata = event.metadata or {}
-        keys = set(self.turn_tasks.get((session_key, generation), ()))
-        if event.internal and metadata.get("delegation_parent_task_id"):
-            keys.add(metadata["delegation_parent_task_id"])
         receipt = {}
-        for key in keys:
+        turn_refs = self.turn_tasks.get((session_key, generation), {})
+
+        def add_terminal(key, refs):
             card = self.cards.get(key)
-            if (card and not card.get("retired") and card["rows"]
+            if not (card and not card.get("retired") and card["rows"]
                     and str(event.source.chat_id) == str(card["source"]["chat_id"])
                     and str(event.source.thread_id or "") == str(card["source"].get("thread_id") or "")):
-                refs = set(self.turn_tasks.get((session_key, generation), {}).get(key, ()))
-                if (event.internal and metadata.get("delegation_parent_task_id") == key
-                        and metadata.get("delegation_owner") == card["owner"]):
-                    refs.update(metadata.get("delegation_thread_refs", []))
-                if not refs:
-                    continue
+                return
+            refs = {ref for ref in refs if ref in card["rows"]
+                    and card["rows"][ref].get("state") in _TERMINAL | {"unknown"}}
+            if refs:
+                existing = receipt.get(key, {}).get("refs", [])
                 receipt[key] = {"generation": card["generation"], "epoch": card.get("receipt_epoch", 0),
-                                "refs": sorted(refs & set(card["rows"]))}
+                                "refs": sorted(set(existing) | refs)}
+
+        for key, refs in turn_refs.items():
+            add_terminal(key, refs)
+
+        root_key = metadata.get("delegation_parent_task_id") if event.internal else None
+        root_owner = metadata.get("delegation_owner") if event.internal else None
+        root_refs = set(metadata.get("delegation_thread_refs", [])) if root_key else set()
+        root = self.cards.get(root_key)
+        if not (root and root_owner == root["owner"]):
+            return receipt
+
+        # A background root's eventual receipt owns only terminal nodes linked
+        # to its exact card rows.  This consumes completed synchronous children
+        # without sweeping up still-running descendants or other root cards.
+        pending = [(root_key, ref) for ref in root_refs if ref in root["rows"]]
+        seen = set(pending)
+        while pending:
+            parent_key, parent_ref = pending.pop()
+            for key, card in self.cards.items():
+                if card.get("retired") or card.get("owner") != root_owner:
+                    continue
+                for ref, row in card.get("rows", {}).items():
+                    if (row.get("card_parent_task_id"), row.get("card_parent_thread_ref")) != (parent_key, parent_ref):
+                        continue
+                    node = (key, ref)
+                    if node not in seen:
+                        seen.add(node)
+                        pending.append(node)
+        for key, ref in seen:
+            add_terminal(key, {ref})
         return receipt
 
     async def delivered(self, receipt):

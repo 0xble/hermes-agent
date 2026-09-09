@@ -152,7 +152,7 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
         raise ValueError("parent_task_id must be an existing lowercase 32-character hexadecimal reference")
     parent_task_id = parent_task_id if supplied_parent_task_id else uuid.uuid4().hex
     owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
-    labels = [str(x or "").strip()[:120] or "Run delegated task" for x in task_labels]
+    labels = [str(x or "").strip() or "Run delegated task" for x in task_labels]
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("SELECT owner_json FROM delegation_parent_tasks WHERE parent_task_id=?", (parent_task_id,)).fetchone()
         if supplied_parent_task_id:
