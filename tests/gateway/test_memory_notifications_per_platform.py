@@ -29,7 +29,7 @@ def wire_notifications(monkeypatch):
         monkeypatch.setattr(turn, "_merge_turn_request_overrides", Mock())
         monkeypatch.setattr(turn, "_make_bg_review_callbacks", lambda: (None, None))
         monkeypatch.setattr(turn, "_attach_session_title_callback", Mock())
-        turn._wire_turn_agent_callbacks(agent, None, None, None, None, None, False)
+        turn._wire_turn_agent_callbacks(agent, None, None, None, None, False)
         assert ctx.agent_holder[0] is agent
         return agent.memory_notifications
 

@@ -2701,8 +2701,11 @@ class SlackAdapter(BasePlatformAdapter):
         rather than treating a partially delivered batch as all-or-nothing."""
         results: List[SendResult] = []
         if self._suppressed_ignored(chat_id, "multi-image upload in"):
-            return results
-        if not self._app or not images:
+            return [SendResult(success=False, error="ignored_channel")]
+        if not self._app:
+            # Upstream's diagnostics, kept in the fork's per-image shape.
+            return [SendResult(success=False, error="Not connected")]
+        if not images:
             return results
         chat_id = await self._dm_target(chat_id, metadata)
         try:
@@ -2714,6 +2717,7 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts = self._resolve_thread_ts(None, metadata)
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
+        delivered = False
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)

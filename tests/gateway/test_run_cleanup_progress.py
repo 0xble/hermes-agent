@@ -79,7 +79,11 @@ class CleanupCaptureAdapter(BasePlatformAdapter):
             {"chat_id": chat_id, "content": content, "message_id": mid, "metadata": metadata}
         )
         return SendResult(
-            success=not (self.fail_final_response and content == "done-1"),
+            # Containment, not ==: the queued lane now goes through _send_with_retry, whose
+            # permanent-failure fallback re-sends the same text PREFIXED with
+            # "(Response formatting failed, plain text:)". Matching the exact string let that
+            # fallback report success, so the injected failure never reached the caller's gate.
+            success=not (self.fail_final_response and "done-1" in content),
             message_id=mid,
         )
 
@@ -124,7 +128,7 @@ class ProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
@@ -139,7 +143,7 @@ class FailingAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         cb = self.tool_progress_callback
         if cb is not None:
             cb("tool.started", "terminal", "pwd", {})
@@ -169,7 +173,7 @@ class QueuedProgressAgent:
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
         type(self).run_count += 1
         if type(self).run_count == 2:
             adapter = type(self).replacement or type(self).adapter
@@ -361,7 +365,7 @@ async def test_cleanup_chains_with_existing_callback(
 @pytest.mark.asyncio
 async def test_failed_run_keeps_progress_breadcrumbs(monkeypatch, tmp_path):
     class BreadcrumbFailingAgent(FailingAgent):
-        def run_conversation(self, message, conversation_history=None, task_id=None):
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
             callback = self.tool_progress_callback
             assert callback is not None
             callback("tool.started", "terminal", "pwd", {})
@@ -449,7 +453,7 @@ async def test_cleanup_uses_replacement_after_mid_turn_adapter_swap(
             self.tool_progress_callback = kwargs.get("tool_progress_callback")
             self.tools = []
 
-        def run_conversation(self, message, conversation_history=None, task_id=None):
+        def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
             callback = self.tool_progress_callback
             assert callback is not None
             callback("tool.started", "terminal", "pwd", {})

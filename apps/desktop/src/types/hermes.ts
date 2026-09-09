@@ -603,7 +603,7 @@ export interface SessionMessage {
   reasoning_content?: null | string
   reasoning_details?: unknown
   display_kind?:
-    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | string
+    'async_delegation_complete' | 'auto_continue' | 'hidden' | 'model_switch' | 'personality_switch' | 'steer' | string
   /**
    * A backend older than this app can still serve this as unparsed JSON text,
    * so readers must narrow before indexing into it.
@@ -1497,7 +1497,6 @@ export interface CronModelImpactJob {
 
 export interface CronModelImpact {
   available: boolean
-  guard_enabled: boolean
   affected_count: number
   truncated: boolean
   jobs: CronModelImpactJob[]

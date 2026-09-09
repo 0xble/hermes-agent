@@ -49,6 +49,10 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     final_event._delegation_card_receipt = cards.receipt(final_event, "route", 2)
     transport = SimpleNamespace(name="test")
     transport._send_final_text = BasePlatformAdapter._send_final_text.__get__(transport)
+    # Upstream moved the ledger bracket out of _send_final_text into send_final_ledgered; bind the
+    # real method too so this still exercises the production path rather than stubbing it out.
+    transport.send_final_ledgered = BasePlatformAdapter.send_final_ledgered.__get__(transport)
+    transport._finalize_delivery_obligation = AsyncMock(return_value=None)
     transport.gateway_runner = runner
     transport._final_delivery_adapter = lambda _: transport
     transport.name = "test"

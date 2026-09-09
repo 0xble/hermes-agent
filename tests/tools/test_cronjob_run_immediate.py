@@ -40,7 +40,7 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with(
-            "job-run-1", force=True, preserve_paused=True, return_job=True
+            "job-run-1", force=True, preserve_paused=True, manual=True, return_job=True
         )
         m_run.assert_called_once_with(claimed, adapters=None, loop=None, extra_prompt=None)
 

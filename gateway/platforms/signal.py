@@ -790,6 +790,8 @@ class SignalAdapter(BasePlatformAdapter):
         see which part of a partially delivered batch still owes the user something."""
         results: List[SendResult] = []
         if not images:
+            # Empty -> _aggregate_image_results renders upstream's "no images to send" outcome;
+            # the adapter stays purely per-image.
             return results
         scheduler = get_scheduler()
         logger.info("Signal send_multiple_images: received %d image(s) for %s — scheduler state: %s", len(images),
@@ -808,12 +810,15 @@ class SignalAdapter(BasePlatformAdapter):
         if not attachments:
             logger.error("Signal: no valid images in batch of %d (download=%d missing=%d oversize=%d)", len(images),
                          skipped["download"], skipped["missing"], skipped["oversize"])
+            # results already holds one failure per rejected image (HERMES-029); adding an
+            # aggregate here would double-count — tests pin exactly one result per bad file.
             return results
         logger.info("Signal send_multiple_images: %d/%d images valid, sending in chunks", len(attachments), len(images))
         base_params = await self._with_target({"account": self.account, "message": ""}, chat_id)
         per = SIGNAL_MAX_ATTACHMENTS_PER_MSG
         att_batches = [attachments[i:i + per] for i in range(0, len(attachments), per)]
         n_batches = len(att_batches)
+        delivered = False
         for idx, att_batch in enumerate(att_batches, start=1):
             n = len(att_batch)
             estimated = scheduler.estimate_wait(n)

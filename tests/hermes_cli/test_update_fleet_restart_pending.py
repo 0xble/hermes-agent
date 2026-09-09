@@ -360,6 +360,10 @@ def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
         (scope, cmd, SimpleNamespace(returncode=0, stdout=""))
         for scope, cmd in update_cmd_fleet._SYSTEMD_SCOPES
     ])
+    # Without this the macOS branch shells out to the REAL `launchctl` and restarts the developer's
+    # own running gateway, making the result depend on whether that restart happens to succeed.
+    # This case is about the supervisor scopes answering empty, not about the launchd path.
+    monkeypatch.setattr("hermes_cli.gateway.is_macos", lambda: False)
     assert update_cmd._run_pending_fleet_restart() is True
     assert "Pending fleet restart completed" in capsys.readouterr().out
 

@@ -203,7 +203,7 @@ def _claim_for_manual_run(job_id: str, log_label: str):
         return None, {"claimed": False, "success": False, "error": _ALREADY_RUNNING_ERROR}
     try:
         claimed_job = claim_job_for_fire(
-            job_id, force=True, preserve_paused=True, return_job=True
+            job_id, force=True, preserve_paused=True, manual=True, return_job=True
         )
         if isinstance(claimed_job, dict):
             claimed_job = dict(claimed_job)

@@ -5688,7 +5688,10 @@ class TelegramAdapter(BasePlatformAdapter):
         Returns one SendResult per delivered message so a flood deferral mid-album keeps the ids that
         already landed instead of reporting the whole batch as lost."""
         results: List[SendResult] = []
-        if not self._bot or not images:
+        if not self._bot:
+            # Keep upstream's diagnostic, in the fork's per-image shape.
+            return [SendResult(success=False, error="Not connected")]
+        if not images:
             return results
         try:
             from telegram import InputMediaPhoto
@@ -5699,6 +5702,7 @@ class TelegramAdapter(BasePlatformAdapter):
         is_anim = lambda url: not url.startswith("file://") and self._is_animation_url(url)  # noqa: E731
         animations = [img for img in images if is_anim(img[0])]
         photos = [img for img in images if not is_anim(img[0])]
+        delivered = False
         if animations:
             results.extend(await super().send_multiple_images(chat_id, animations, metadata, human_delay=human_delay) or [])
         if not photos:

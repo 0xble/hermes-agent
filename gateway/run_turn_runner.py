@@ -1527,8 +1527,10 @@ class TurnRunner:
         agent._gateway_turn_request_overrides = turn_overrides
 
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
-                                   stream_delta_cb, interim_assistant_cb, clarify_context_cb,
-                                   want_interim_messages):
+                                   stream_delta_cb, interim_assistant_cb, want_interim_messages,
+                                   clarify_context_cb=None):
+        # clarify_context_cb is fork-added and trails with a default so the first six positions
+        # keep upstream's arity; upstream keeps writing tests against its own signature.
         """Per-message state — callbacks and reasoning config change every turn, so they aren't
         baked into the cached agent."""
         ctx = self._ctx
@@ -1568,8 +1570,14 @@ class TurnRunner:
                 if pdc is not None:
                     pdc[ctx.session_key] = bg_release
         # display.memory_notifications: off | on (generic "💾 Memory updated", default) | verbose.
-        platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
-        mem_notif = ctx.resolve_display_setting(ctx.user_config, platform_key, "memory_notifications")
+        # Per-platform override (fork) on top of upstream's `display or {}` null guard, which
+        # lives inside resolve_display_setting (display_config.py:87) — the fix for #105674.
+        # Read through the module helper and a defensive source lookup so a ctx without a
+        # source, or without the resolve_display_setting attribute, still wires cleanly.
+        from gateway.display_config import resolve_display_setting
+        _plat = getattr(getattr(ctx, "source", None), "platform", None)
+        platform_key = "cli" if _plat == Platform.LOCAL else getattr(_plat, "value", None)
+        mem_notif = resolve_display_setting(ctx.user_config, platform_key, "memory_notifications")
         if isinstance(mem_notif, bool):
             mem_notif = "on" if mem_notif else "off"
         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
@@ -2189,8 +2197,8 @@ class TurnRunner:
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
         self._wire_turn_agent_callbacks(
-            agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, clarify_cb,
-            want_interim)
+            agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim,
+            clarify_context_cb=clarify_cb)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         self._goal_history_before_invoke = list(getattr(agent, "_session_messages", None) or [])
