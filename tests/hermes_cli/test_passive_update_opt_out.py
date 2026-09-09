@@ -12,6 +12,9 @@ def test_passive_check_obeys_config_before_using_cached_notice(monkeypatch):
     home = get_hermes_home()
     (home / ".update_check").write_text(json.dumps({
         "ts": time.time(), "behind": 17, "rev": None, "ver": banner.VERSION,
+        # #133 added `source` to the cache so a notice computed against the previous
+        # upstream is not trusted after the updater was repointed at the fork.
+        "source": banner._UPSTREAM_REPO_URL,
     }), encoding="utf-8")
     monkeypatch.delenv("HERMES_REVISION", raising=False)
     config = home / "config.yaml"

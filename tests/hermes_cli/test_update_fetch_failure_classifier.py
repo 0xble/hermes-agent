@@ -111,14 +111,27 @@ def test_update_network_git_calls_never_prompt_for_credentials():
     src = inspect.getsource(update_cmd) + inspect.getsource(update_cmd_git)
     # Every subprocess.run(...) whose argv is a fetch/pull must spread the kwargs.
     calls = []
-    for m in re.finditer(r"subprocess\.run\(", src):
-        depth, i = 1, m.end()
-        while depth:
-            depth += {"(": 1, ")": -1}.get(src[i], 0)
-            i += 1
-        call = src[m.start():i]
-        if re.search(r'git_cmd \+ \["(fetch|pull|push)"', call):
+    # #133 funnelled the network calls through `_git_run(..., network=True)`, which applies
+    # `_no_prompt_git_kwargs()` centrally, so scanning for a literal `git_cmd + ["fetch"...]`
+    # inside `subprocess.run(` no longer finds them. Assert the invariant, not the old spelling:
+    # every fetch/pull/push must be a `_git_run` with network=True, and none may be a raw
+    # subprocess.run.
+    def _spans(needle):
+        for m in re.finditer(re.escape(needle), src):
+            depth, i = 1, m.end()
+            while depth:
+                depth += {"(": 1, ")": -1}.get(src[i], 0)
+                i += 1
+            yield src[m.start():i]
+
+    network_verb = re.compile(r'\["(fetch|pull|push)"')
+    for call in _spans("subprocess.run("):
+        if network_verb.search(call):
+            assert "_no_prompt_git_kwargs()" in call, f"raw network subprocess.run without prompts disabled: {call}"
+
+    for call in _spans("_git_run("):
+        if network_verb.search(call):
             calls.append(call)
     assert calls, "expected network git calls in update_cmd"
-    missing = [c for c in calls if "_no_prompt_git_kwargs()" not in c]
+    missing = [c for c in calls if "network=True" not in c]
     assert not missing, missing
