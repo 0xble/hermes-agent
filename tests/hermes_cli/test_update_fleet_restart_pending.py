@@ -518,7 +518,7 @@ def test_already_up_to_date_runs_pending_restart_when_marker_present(
     assert seen["ran"] is True
     assert not update_cmd._fleet_restart_pending_marker_path().exists()
     out = capsys.readouterr().out
-    assert "did not restart running gateways" in out
+    assert "did not verify fleet restart completion" in out
 
 
 def test_already_up_to_date_runs_pending_restart_when_receipt_skewed(
@@ -570,7 +570,7 @@ def test_already_up_to_date_runs_pending_restart_when_receipt_skewed(
 
     assert seen["ran"] is True
     out = capsys.readouterr().out
-    assert "did not restart running gateways" in out
+    assert "did not verify fleet restart completion" in out
 
 
 def test_already_up_to_date_skips_restart_when_nothing_pending(
@@ -594,15 +594,15 @@ def test_already_up_to_date_skips_restart_when_nothing_pending(
     hermes_main.cmd_update(args)
 
     assert seen["ran"] is False
-    assert "did not restart running gateways" not in capsys.readouterr().out
+    assert "did not verify fleet restart completion" not in capsys.readouterr().out
 
 
 def test_startup_warn_prints_when_marker_present(capsys):
     update_cmd._write_fleet_restart_pending_marker()
     update_cmd._warn_pending_fleet_restart_on_startup()
     err = capsys.readouterr().err
-    assert "did not restart running gateways" in err
-    assert "hermes gateway restart" in err
+    assert "did not verify fleet restart completion" in err
+    assert "hermes update --plan" in err
 
 
 def test_startup_warn_silent_when_nothing_pending(capsys):
