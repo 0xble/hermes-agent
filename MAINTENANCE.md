@@ -1753,6 +1753,8 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 
 ## Automatic synchronization
 
+Every maintenance run must synchronize the maintained default branch with the latest upstream default while preserving each intentional registered patch. Reconcile and test the exact candidate, then publish it to the owned remote, or report `Blocked` with the concrete unresolved conflict, failed proof, or unavailable authority. Before reporting `Updated` or `Already current`, perform a fresh upstream fetch, prove zero upstream-only commits with `git rev-list --left-right --count <upstream-default>...<maintained-default>`, and read back owned-remote/default SHA parity.
+
 Source reconciliation runs in its dedicated, retained maintenance worktree. The control plane owns schedules and execution identity, not this document. Freeze the upstream cutoff for each run, preserve interrupted work, protect the canonical checkout, and inventory active patch and plugin overlap. Integrate before final tests and independent review. Publish only the reviewed immutable candidate through a guarded PR merge or an exact remote-head lease, then read back the remote revision. Source completion never requires runtime deployment.
 
 Do not push to Nous Research, deploy or restart runtimes, or retire installed plugins as part of source synchronization. Report required runtime retirement separately under the patch and plugin lifecycle contracts above.
