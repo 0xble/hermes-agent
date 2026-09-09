@@ -1052,23 +1052,41 @@ class TestAutoTtsEmptyTextGuard:
 class TestStreamTtsToSpeaker:
     """Functional tests for the streaming TTS pipeline."""
 
-    def test_none_sentinel_flushes_buffer(self):
-        """None sentinel causes remaining buffer to be spoken."""
+    def test_none_sentinel_flushes_buffer(self, monkeypatch):
+        """None sentinel flushes text through isolated synthesis and playback seams."""
+        import tools.tts_tool as tts_tool
+        import tools.voice_mode as voice_mode
         from tools.tts_tool_speaker import stream_tts_to_speaker
+
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
         spoken = []
+        synthesized = []
+        played = []
 
         def display(text):
             spoken.append(text)
 
+        def fake_synthesize(*, text, output_path, **_kwargs):
+            synthesized.append(text)
+            with open(output_path, "wb") as audio_file:
+                audio_file.write(b"test audio")
+
+        def fake_play(path):
+            played.append(path)
+
+        monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_synthesize)
+        monkeypatch.setattr(voice_mode, "play_audio_file", fake_play)
         text_q.put("Hello world.")
         text_q.put(None)
 
         stream_tts_to_speaker(text_q, stop_evt, done_evt, display_callback=display)
+
         assert done_evt.is_set()
-        assert any("Hello" in s for s in spoken)
+        assert spoken == ["Hello world."]
+        assert synthesized == ["Hello world."]
+        assert len(played) == 1
 
     def test_stop_event_aborts_early(self):
         """Setting stop_event causes early exit."""
