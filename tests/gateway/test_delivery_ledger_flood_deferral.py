@@ -126,12 +126,26 @@ class TestFloodRowsAreClaimable:
         assert _row("ob-1")["state"] == "failed"
 
     def test_dead_owner_sweep_also_honors_the_flood_deadline(self, monkeypatch):
+        """The boot sweep must never SEND inside the platform's wait.
+
+        Upstream superseded the fork's plain skip with adoption: the row is
+        re-stamped to this process so this process's flood timer owns it,
+        without spending an attempt or losing the deadline. It comes back
+        flagged ``adopted`` precisely so the caller clears the session's resume
+        flag and leaves the send to the timer.
+        """
         _record()
         dl.mark_failed("ob-1", "flood_control:60")
         monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
 
-        assert dl.sweep_recoverable(now=time.time() + 59) == []
-        assert _row("ob-1")["state"] == "failed"
+        claimed = dl.sweep_recoverable(now=time.time() + 59)
+
+        assert [r["obligation_id"] for r in claimed] == ["ob-1"]
+        assert claimed[0]["adopted"] is True          # not sendable
+        assert claimed[0]["not_before"] > time.time() + 58
+        assert _row("ob-1")["state"] == "failed"      # state and error untouched
+        assert _row("ob-1")["attempts"] == 0          # no redelivery budget spent
+        assert _row("ob-1")["last_error"] == "flood_control:60"
 
     def test_attempts_cap_still_bounds_flood_rows(self):
         """Deferral must not create a poison row that retries forever."""

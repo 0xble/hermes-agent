@@ -65,16 +65,18 @@ hermes auth list
 Output:
 ```
 openrouter (2 credentials):
-  #1  OPENROUTER_API_KEY   api_key id=3f9a1c   priority=0  env:OPENROUTER_API_KEY ←
-  #2  backup-key           api_key id=b7e204   priority=1  manual
+  #1  OPENROUTER_API_KEY   api_key id=3f9a1c priority=0 env:OPENROUTER_API_KEY ←
+  #2  backup-key           api_key id=b7e204 priority=1 manual
 
 anthropic (3 credentials):
-  #1  hermes_pkce          oauth   id=91c0de   priority=0  hermes_pkce ←
-  #2  claude_code          oauth   id=4d8a77   priority=1  claude_code
-  #3  ANTHROPIC_API_KEY    api_key id=e12f5b   priority=2  env:ANTHROPIC_API_KEY
+  #1  hermes_pkce          oauth   id=91c0de priority=0 hermes_pkce ←
+  #2  claude_code          oauth   id=4d8a77 priority=1 claude_code
+  #3  ANTHROPIC_API_KEY    api_key id=e12f5b priority=2 env:ANTHROPIC_API_KEY
 ```
 
-The `←` marks the currently selected credential.
+The `←` marks the currently selected credential. `id=` is the entry id accepted by
+`hermes auth remove <provider> <target>` when a label is ambiguous, and `priority=` is
+the order the pool tries credentials in under the `fill_first` strategy.
 
 ## Interactive Management
 
@@ -121,7 +123,27 @@ Type [1/2]:
 | `hermes auth reset <provider> <target>` | Clear the cooldown on one credential by index, id, or label |
 | `hermes auth refresh <provider> [target]` | Refresh one OAuth credential's tokens and return it to rotation (proves the grant is alive; the next request re-checks quota) |
 
+For Nous, `auth refresh` supports only the login's `device_code` singleton.
+Independent Nous pool accounts are rejected before refresh; their tokens and
+cooldowns are preserved. Reauthenticate with `hermes auth add nous --type oauth`
+to update the singleton; this does not refresh an independent account. Other
+providers retain their existing source-specific refresh support.
+
 ## Rotation Strategies
+
+Priority positions are zero-based and clamp to the pool's ends; displayed targets
+are one-based indices, entry IDs, or unambiguous exact labels. `auth add --priority`
+also places an existing entry updated by reauthentication. Anthropic keeps manual
+credentials ahead of seeded credentials, so the command reports the effective
+position when that rule changes it. Other strategies may override priority, and
+reordering does not rebind credentials already held by a running session.
+
+Every successful pool selection increments `request_count`, regardless of strategy.
+Refresh-only lookups and peeks do not count. These are selection counters, not
+billing totals or a count of every inference request: a cached credential can serve
+multiple requests. Counts remain in memory until the next existing pool write
+(for example rotation, exhaustion, refresh, or an administrative change); this does
+not add a disk write per selection.
 
 Configure via `hermes auth` → "Set rotation strategy" or in `config.yaml`:
 
@@ -220,7 +242,7 @@ For the full data flow diagram, see [`docs/credential-pool-flow.excalidraw`](htt
 
 The credential pool integrates at the provider resolution layer:
 
-1. **`agent/credential_pool.py`** — Pool manager: storage, selection, rotation, cooldowns
+1. **`agent/credential_pool.py`** — Pool manager: storage, selection, rotation, cooldowns; **`agent/credential_pool_admin.py`** owns locked target resolution, reset, add, removal, and priority mutations
 2. **`hermes_cli/auth_commands.py`** — CLI commands and interactive wizard
 3. **`hermes_cli/runtime_provider.py`** — Pool-aware credential resolution
 4. **`agent/turn_api_error.py`** — Error recovery: 429/402/401 → pool rotation → fallback

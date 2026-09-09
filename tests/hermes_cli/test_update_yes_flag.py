@@ -18,20 +18,21 @@ from hermes_cli.main import cmd_update
 
 
 @pytest.fixture(autouse=True)
-def _isolate_update_host(monkeypatch):
-    """Keep prompt tests away from real gateways and the macOS TCC anchor."""
-    import hermes_cli.gateway as hermes_gateway
-    import hermes_cli.main as hermes_main
-    import hermes_cli.macos_tcc_anchor as macos_tcc_anchor
+def _isolate_update(isolated_update_runtime, monkeypatch):
+    """Keep prompt tests off real uv, gateways and the macOS TCC anchor.
 
-    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
-    monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
-    )
-    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
+    ``isolated_update_runtime`` covers the checkout, module purge and gateway
+    discovery; the macOS pair below stays fork-local because ``ensure_tcc_anchor``
+    resolves its own project root and would touch this machine's real venv.
+    """
+    import shutil
+    from hermes_cli import macos_tcc_anchor, managed_uv, update_cmd
+    import hermes_cli.gateway as hermes_gateway
+
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **kw: shutil.which("uv"))
+    monkeypatch.setattr(managed_uv, "update_managed_uv", lambda **kw: None)
+    monkeypatch.setattr(update_cmd, "_post_update_sqlite_runtime_status", lambda: (True, None))
     monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
     monkeypatch.setattr(macos_tcc_anchor, "ensure_tcc_anchor", lambda *a, **k: None)
 

@@ -79,24 +79,20 @@ def _patch_managed_uv(request):
 
 
 @pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
-    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+def _patch_gateway_discovery(isolated_update_runtime, monkeypatch):
+    """Keep cmd_update's post-update phases off this machine.
 
-    The restart phase used to swallow every exception at debug level, so these
-    end-to-end tests never noticed it touching real gateway discovery. Since
-    the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
-    conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    ``isolated_update_runtime`` now owns gateway discovery and the module purge
+    (#78574: an aborted restart fails the update, so unmocked discovery on a box
+    with a live gateway trips the conftest live-system guard). The macOS pair
+    below stays fork-local: ``ensure_tcc_anchor`` resolves its own project root,
+    so the isolated checkout does not keep it off the real venv.
     """
-    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
-         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
-         patch("hermes_cli.gateway.is_macos", return_value=False), \
-         patch("hermes_cli.main._purge_stale_hermes_modules", return_value=None), \
-         patch("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", return_value=None):
-        yield
+    from hermes_cli import macos_tcc_anchor
+    import hermes_cli.gateway as hermes_gateway
+
+    monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(macos_tcc_anchor, "ensure_tcc_anchor", lambda *a, **k: None)
 
 
 class TestCmdUpdateNpmLockfileCache:
@@ -1137,6 +1133,7 @@ class TestNodeRuntimeNpmResolution:
         from hermes_cli import update_cmd
 
         desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        (desktop_dir / "package.json").write_text("{}", encoding="utf-8")
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 

@@ -118,7 +118,7 @@ TIPS = [
     "provider_routing controls OpenRouter provider sorting, whitelisting, and blacklisting.",
     # --- Tools & Capabilities ---
     "execute_code runs Python scripts that call Hermes tools programmatically — results stay out of context.",
-    "delegate_task spawns up to 3 concurrent sub-agents by default (delegation.max_concurrent_children) with isolated contexts for parallel work.",
+    "delegate_task spawns up to 10 concurrent sub-agents by default (delegation.max_concurrent_children) with isolated contexts for parallel work.",
     "web_extract works on PDF URLs — pass any PDF link and it converts to markdown.",
     "search_files is ripgrep-backed and faster than grep — use it instead of terminal grep.",
     "patch uses 9 fuzzy matching strategies so minor whitespace differences won't break edits.",
@@ -254,7 +254,7 @@ TIPS = [
     "The terminal tool annotates common exit codes: grep returning 1 = 'No matches found (not an error)'.",
     "Failed foreground terminal commands auto-retry up to 3 times with exponential backoff (2s, 4s, 8s).",
     "Bare sudo commands are auto-rewritten to pipe SUDO_PASSWORD from .env — no interactive prompt needed.",
-    "execute_code has built-in helpers: json_parse() for tolerant parsing, shell_quote(), and retry() with backoff.",
+    "execute_code helpers require explicit imports: from hermes_tools import json_parse, shell_quote, retry.",
     "execute_code's 7 sandbox tools (web_search, terminal, read/write/search/patch) use RPC — never enter context.",
     "Reading the same file region 3+ times triggers a warning. At 4+, it's hard-blocked to prevent loops.",
     "write_file and patch detect if a file was externally modified since the last read and warn about staleness.",

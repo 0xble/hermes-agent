@@ -97,15 +97,21 @@ def test_build_review_task_includes_excerpt_and_prompt():
         {"role": "user", "text": "review my PR"},
         {"role": "assistant", "text": "PR #99 opened"},
     ]
-    goal, context = build_review_task(snap, "focus on security")
-    assert "reviewer" in goal.lower()
+    prompt = "focus on security\n" + "keep these instructions intact " * 20
+    goal, context = build_review_task(snap, prompt)
+    assert goal.startswith("Review: focus on security ")
+    assert len(goal) <= 80 and "\n" not in goal
+    assert goal.endswith("…")
+    assert re_mod._REVIEW_GOAL in context
     assert "[USER]" in context and "[PRIMARY AGENT]" in context
     assert "PR #99 opened" in context
-    assert "focus on security" in context
+    assert prompt.strip() in context
 
 
 def test_build_review_task_without_prompt_has_no_instruction_block():
     goal, context = build_review_task([{"role": "user", "text": "hi"}])
+    assert goal == "Review recent work"
+    assert re_mod._REVIEW_GOAL in context
     assert "Additional review instructions" not in context
 
 
@@ -220,7 +226,7 @@ def test_review_route_reasoning_reaches_child_constructor_for_manual_and_candida
         runtime = _resolve_child_runtime(
             parent, {"reasoning_effort": "low"}, "parent-key", model="review-model",
             override_provider=None, override_base_url=None, override_api_key=None, override_api_mode=None,
-            override_max_tokens=None, override_acp_command=None, override_acp_args=None, routing_cfg=route,
+            override_acp_command=None, override_acp_args=None, routing_cfg=route,
         )
         assert runtime["reasoning_config"] == {"effort": "high", "enabled": True}
         assert runtime["fallback_model"] is None
@@ -341,7 +347,8 @@ def test_start_review_dispatches_background_and_completes(monkeypatch):
     # The reviewer briefing carries the conversation excerpt + user prompt.
     assert "PR #77 opened" in built["context"]
     assert "check the tests" in built["context"]
-    assert "reviewer" in built["goal"].lower()
+    assert built["goal"].startswith("Review: ")
+    assert re_mod._REVIEW_GOAL in built["context"]
 
     # The completion re-enters via the shared queue like any subagent.
     deadline = time.monotonic() + 5.0
@@ -603,12 +610,16 @@ def test_review_registered_in_every_aux_surface():
 # ---------------------------------------------------------------------------
 
 def test_format_dispatch_note_dispatched():
+    prompt = "security\n" * 100
     note = format_dispatch_note(
-        {"status": "dispatched", "review_model": "opus"}, "security"
+        {"status": "dispatched", "review_model": "opus"}, prompt
     )
+    # Fork contract: name the *starting* route, since configured fallbacks may
+    # move the review off it. Upstream contract: bounded, no echoed prompt.
     assert "dispatched starting on opus" in note
-    assert "focus: security" in note
-    assert "re-enter" in note
+    assert "return here" in note
+    assert "security" not in note and "\n" not in note
+    assert len(note) < 80
 
 
 def test_format_dispatch_note_sync_fallback():

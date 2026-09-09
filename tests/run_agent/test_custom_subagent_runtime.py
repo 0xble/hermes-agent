@@ -167,10 +167,16 @@ def test_named_physical_codex_request_rejects_another_client(make_child):
 
 def test_nonstream_completion_after_interrupt_is_cancelled(make_child, monkeypatch):
     """A response completing during the poll join cannot outrun cancellation."""
+    # Two different live seams after upstream split this out of chat_completion_helpers:
+    # the CLASS now lives in agent.chat_completion_nonstream (helpers imports it lazily inside the
+    # dispatch function, so it is not a module attribute there), while the THREAD is still spawned as
+    # ``h.threading.Thread`` with ``h`` = chat_completion_helpers (nonstream.py:249). Patch each where
+    # production actually resolves it.
     import agent.chat_completion_helpers as helpers
+    import agent.chat_completion_nonstream as nonstream
 
     child = make_child()
-    request = helpers._NonStreamRequest(child, {"model": child.model})
+    request = nonstream._NonStreamRequest(child, {"model": child.model})
     request.result["response"] = _codex_message_response("late response")  # type: ignore[assignment]
     monkeypatch.setattr(child, "_touch_activity", lambda _reason: None)
 

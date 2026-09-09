@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -39,16 +40,108 @@ _MAX_ROWS = 500
 RECOVERED_MARKER = "♻️ Recovered reply — the gateway restarted during delivery, so this may be a duplicate:\n\n"
 RECONNECTED_MARKER = ("♻️ Recovered reply — the messaging platform reconnected after the original "
                       "delivery failed, so this may be a duplicate:\n\n")
+# A reply refused by flood control may have gone out as several requests (the adapter chunks long replies,
+# and MarkdownV2 escaping alone can push a reply that fits one message into two), and the platform may have
+# accepted the first chunk(s) before refusing the rest; the send result does not say which landed. The raw
+# length of the stored text says nothing about that, so every flood redelivery carries a marker, and neither
+# of the markers above tells the truth here (no restart, no reconnect): the rate limit gets its own.
+FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit refused the original, so part of "
+                "it may already have arrived above:\n\n")
 
 # Runtime replay is fail-closed: only errors whose send contract proves they are transient reconnect
 # failures. Permanent rejects (blocked bot, bad auth, missing chat) must not be retried on reconnect.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
 
-# Flood-control rejections carry their own wait in the error string (``flood_control:3459``), so they can
-# never match a fixed allowlist by equality — yet they are the MOST retryable class the ledger sees: the
-# server states exactly when to come back. Treating them as terminal let a penalty outliving the send's
-# short retry budget destroy a completed answer (three rows stuck 'failed' attempts=0 behind a 67-min ban).
-FLOOD_CONTROL_ERROR_PREFIX = "flood_control:"
+# A final send the platform refused with flood control is the other transient case: a 429 means the
+# refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
+# closed as ``flood_control:<seconds>`` on purpose (#91969) so that this ledger owns the wait instead of
+# the send coroutine sleeping through it. Before this the row simply sat in ``failed`` until the next
+# restart's sweep, which then redelivered it hours late under the "gateway restarted during delivery"
+# marker.
+FLOOD_ERROR_PREFIX = "flood_control:"
+FLOOD_RETRY_DEFAULT_SECONDS = 60.0
+FLOOD_RETRY_CAP_SECONDS = 15 * 60.0
+FLOOD_RETRY_SLACK_SECONDS = 2.0
+
+# The canonical prefix above is what the adapters produce for a flood they decide not to sleep. It is
+# not the only shape that reaches this ledger. PTB raises ``RetryAfter``, whose own text reads
+# "Flood control exceeded. Retry in 185 seconds", and that text is what lands in ``last_error``
+# whenever a send fails on a path that has not been normalized, or was written by an older build
+# before it was. Such a row has to be recognised too: unrecognised, it is treated as an ordinary
+# failure, so no redelivery timer is armed for it and a boot sweep claims it immediately instead of
+# adopting it until its deadline, spending the one attempt inside the penalty that caused it.
+# Matching requires the "flood control" wording as well as the delay, so an unrelated error that
+# merely suggests retrying is never mistaken for a flood.
+_RAW_FLOOD_RE = re.compile(r"flood control exceeded.*?retry in\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _raw_flood_wait(text: str) -> Optional[float]:
+    """Seconds asked for by a flood error still carrying the platform's own wording, else ``None``."""
+    match = _RAW_FLOOD_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_flood_error(error: Any) -> bool:
+    """True for a flood refusal: the adapters' fail-closed ``flood_control:<seconds>`` result, or a
+    row still carrying the platform's own flood wording (see ``_RAW_FLOOD_RE``)."""
+    text = str(error or "").strip().lower()
+    return text.startswith(FLOOD_ERROR_PREFIX) or _raw_flood_wait(text) is not None
+
+
+def flood_wait_seconds(error: Any, default: float = FLOOD_RETRY_DEFAULT_SECONDS) -> float:
+    """The wait the platform asked for, read from ``flood_control:<seconds>``; ``default`` when unreadable."""
+    text = str(error or "").strip().lower()
+    wait = default
+    if text.startswith(FLOOD_ERROR_PREFIX):
+        try:
+            wait = float(text[len(FLOOD_ERROR_PREFIX):].strip())
+        except ValueError:
+            wait = default
+    else:
+        # A row still carrying the platform's own flood wording states its delay just as precisely,
+        # and the deadline must use it rather than the generic default.
+        raw = _raw_flood_wait(text)
+        if raw is not None:
+            wait = raw
+    return wait if wait > 0 else default
+
+
+def flood_retry_delay(seconds: Any) -> float:
+    """How long a redelivery timer sleeps for a wait of ``seconds``: capped so a huge or bogus value cannot
+    park the timer for hours (the row's own deadline, not the timer, decides eligibility when it fires),
+    plus a little slack so the timer lands after the deadline rather than on it."""
+    try:
+        wait = float(seconds)
+    except (TypeError, ValueError):
+        wait = FLOOD_RETRY_DEFAULT_SECONDS
+    return min(max(wait, 0.0), FLOOD_RETRY_CAP_SECONDS) + FLOOD_RETRY_SLACK_SECONDS
+
+
+def flood_not_before(updated_at: Any, last_error: Any) -> float:
+    """Earliest moment a flood-refused row may be resent: the refusal's timestamp (``mark_failed`` sets
+    ``updated_at``) plus the platform's wait. Enforced by the sweeps so neither an early timer nor a
+    reconnect sweep spends a redelivery attempt inside the penalty window."""
+    try:
+        stamp = float(updated_at or 0.0)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    return stamp + flood_wait_seconds(last_error)
+
+
+def _runtime_retryable(last_error: Any) -> bool:
+    text = str(last_error or "").strip().lower()
+    return text in _RUNTIME_RETRYABLE_ERRORS or is_flood_error(text)
+
+# HERMES-085 kept these two names public after upstream grew its own flood machinery above: the fork's
+# send path (gateway/platforms/base.py) reads an exact wait off the error to park a deferred sweep, and a
+# garbled suffix must yield None there rather than a made-up deadline. Classification itself has ONE
+# owner — ``_runtime_retryable`` — so the ledger and the send path cannot drift apart.
+FLOOD_CONTROL_ERROR_PREFIX = FLOOD_ERROR_PREFIX
 
 
 def parse_flood_retry_after(error: Any) -> Optional[float]:
@@ -68,8 +161,7 @@ def parse_flood_retry_after(error: Any) -> Optional[float]:
 
 def is_runtime_retryable(error: Any) -> bool:
     """True when a failed row may be re-claimed live: the exact-match allowlist plus the flood class."""
-    text = str(error or "").strip().lower()
-    return text in _RUNTIME_RETRYABLE_ERRORS or parse_flood_retry_after(text) is not None
+    return _runtime_retryable(error)
 
 
 def _db_path():
@@ -262,15 +354,23 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
-                 needs_marker: bool, runtime: bool = False, obligation_kind: Optional[str] = None,
-                 turn_token: Optional[str] = None, last_error: Optional[str] = None) -> Dict[str, Any]:
-    """Claimed-row dict handed back for redelivery; ``runtime`` adds the reconnect-marker fields and
-    carries ``last_error`` so a release restores the row's own failure class instead of flattening it to
-    ``send_path_degraded`` (which would re-send inside a flood penalty window and extend the ban)."""
+                 needs_marker: bool, runtime: bool = False, flood: bool = False,
+                 obligation_kind: Optional[str] = None, turn_token: Optional[str] = None,
+                 last_error: Optional[str] = None) -> Dict[str, Any]:
+    """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
+    the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
+    ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
+    restart marker default. ``last_error`` is the row's pre-claim error, carried so a runtime claim that is
+    released unsent goes back to ``failed`` with the same error and keeps its retry eligibility — its own
+    failure class rather than a flattened ``send_path_degraded``, which would re-send inside a flood
+    penalty window and extend the ban. ``obligation_kind``/``turn_token`` ride along so the caller
+    discharges recovery against the matching agent-final obligation instead of the legacy path."""
+    marker = FLOOD_MARKER if flood else (RECONNECTED_MARKER if runtime else None)
     return {"obligation_id": oid, "session_key": session_key, "platform": platform, "chat_id": chat_id,
             "thread_id": thread_id, "content": content, "needs_marker": needs_marker,
-            **({"marker": RECONNECTED_MARKER} if runtime else {}), "profile": profile,
-            **({"runtime_recovery": True, "last_error": last_error} if runtime else {}),
+            **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
+            **({"runtime_recovery": True} if runtime else {}),
+            **({"last_error": last_error} if last_error else {}),
             "attempts": attempts + 1, "obligation_kind": obligation_kind, "turn_token": turn_token}
 
 
@@ -285,7 +385,14 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
     must only be spent on a real send, else a platform that failed to connect burns one attempt per boot
     and hits the cap having never been sent once (the stale cutoff still bounds untouched rows).
     ``deliverable_targets`` further scopes multiplexed gateways by exact ``(platform, adapter_profile)``
-    so one connected bot cannot spend another disconnected bot's retry budget."""
+    so one connected bot cannot spend another disconnected bot's retry budget.
+
+    A flood-refused row still inside its wait is adopted (owner re-stamped, no attempt spent) and
+    returned flagged ``adopted`` with its ``not_before``: the caller clears its session's resume flag
+    like any other claimed row, since the answer is in the ledger, but must not send it; the flood
+    timer does once the wait has passed. A legacy row without ``adapter_profile`` is normalised to
+    ``'default'`` on claim or adoption (the caller only accepts such rows when it is not multiplexed),
+    because the runtime sweep matches profiles exactly and could otherwise never claim it."""
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
     claimed: List[Dict[str, Any]] = []
     with _DB_LOCK, _transaction() as conn:
@@ -310,19 +417,42 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             if ((deliverable_platforms is not None and platform not in deliverable_platforms)
                     or (deliverable_targets is not None and (platform, adapter_profile) not in deliverable_targets)):
                 continue  # no adapter this boot — claiming would spend an attempt on a no-op
-            retry_after = parse_flood_retry_after(last_error)
-            if retry_after is not None and now < updated_at + retry_after:
-                continue  # the platform stated when to come back; sending early extends the penalty
+            flood_row = state == "failed" and is_flood_error(last_error)
+            if flood_row and now < flood_not_before(updated_at, last_error):
+                # Still inside the platform's wait: adopt the dead owner's row without spending an attempt
+                # (state and error kept) so this process's flood timer can claim it once the wait passes.
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET owner_pid=?, owner_started_at=?,
+                           adapter_profile=COALESCE(adapter_profile, 'default')
+                       WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
+                    (pid, started, oid, owner_pid, owner_pid))
+                if cursor.rowcount:
+                    claimed.append({
+                        "obligation_id": oid, "session_key": session_key, "platform": platform,
+                        "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                        "profile": adapter_profile or "default", "attempts": attempts,
+                        "adopted": True, "not_before": flood_not_before(updated_at, last_error),
+                        "obligation_kind": obligation_kind, "turn_token": turn_token})
+                continue
+            # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
+            # resend is seen as 'attempting' with no error by the next boot and gets the marker.
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1, updated_at=?,
+                       adapter_profile=COALESCE(adapter_profile, 'default'),
+                       state=CASE WHEN ? THEN 'attempting' ELSE state END,
+                       last_error=CASE WHEN ? THEN NULL ELSE last_error END
                    WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid))
-            if cursor.rowcount:  # pending = never started, redeliver plainly; else carry marker
+                (pid, started, now, 1 if flood_row else 0, 1 if flood_row else 0, oid, owner_pid, owner_pid))
+            if cursor.rowcount:
+                # pending = never started, redeliver plainly; anything else (crashed mid-await, other
+                # rejection, a flood refusal whose earlier chunks the platform may have accepted) carries
+                # the marker.
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
-                                            adapter_profile, needs_marker=state != "pending",
-                                            obligation_kind=obligation_kind, turn_token=turn_token))
+                                            adapter_profile or "default", needs_marker=state != "pending",
+                                            flood=flood_row, obligation_kind=obligation_kind,
+                                            turn_token=turn_token))
     return claimed
 
 
@@ -336,8 +466,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     rejected with ``send_path_degraded`` would stay stranded when only the adapter reconnects; this closes
     that gap without weakening ownership: only rows stamped to this exact process instance, only
     allowlisted transient errors, same attempts/staleness bounds, every update guarded by the prior owner
-    stamp and ``failed`` state. Claimed rows always carry the reconnect marker (the failed send's ack is
-    not safe to infer)."""
+    stamp and ``failed`` state. Claimed rows always carry a marker (the failed send's ack is not safe to
+    infer): the reconnect one, or the rate-limit one for a flood-refused row."""
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
     if started is None:  # PID alone cannot distinguish this process from a stale row left after PID
         return []        # reuse; runtime replay is optional, so fail closed (startup recovery remains).
@@ -356,7 +486,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
              updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
-                    or not is_runtime_retryable(last_error)):
+                    or not _runtime_retryable(last_error)):
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -366,20 +496,49 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                        WHERE obligation_id=? AND state='failed'
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
                 continue
-            retry_after = parse_flood_retry_after(last_error)
-            if retry_after is not None and now < updated_at + retry_after:
-                continue  # still inside the server's stated wait
+            if is_flood_error(last_error) and now < flood_not_before(updated_at, last_error):
+                continue  # the platform's wait has not passed; the flood timer comes back for it
+            # The claim clears the stale error: this is a fresh attempt, and if it is interrupted the next
+            # boot must see 'attempting' with no proof of non-delivery, hence the marker.
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET state='attempting', attempts=attempts+1, updated_at=?
+                   SET state='attempting', attempts=attempts+1, updated_at=?, last_error=NULL
                    WHERE obligation_id=? AND state='failed'
                      AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
             if cursor.rowcount:
+                # The failed send's ack may have been lost (reconnect) or its earlier chunks accepted
+                # (flood): every runtime redelivery carries a marker. The pre-claim error rides along so a
+                # claim released unsent keeps its flood retry eligibility.
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
-                                            obligation_kind=obligation_kind, turn_token=turn_token,
-                                            last_error=last_error))
+                                            flood=is_flood_error(last_error), last_error=last_error,
+                                            obligation_kind=obligation_kind, turn_token=turn_token))
     return claimed
+
+
+def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """This process's flood-refused rows that still await redelivery, one entry per adapter identity
+    with the earliest deadline (``not_before``). The runner arms one redelivery timer per entry, so a
+    row adopted at boot, skipped because its wait had not passed, or refused again is never stranded.
+    Rows past the attempts cap or stale cutoff are left for the sweeps to abandon."""
+    now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
+    if started is None:
+        return []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
+               FROM delivery_obligations
+               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
+    earliest: Dict[tuple, float] = {}
+    for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
+        if not is_flood_error(last_error) or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+            continue
+        due = flood_not_before(updated_at, last_error)
+        key = (platform, adapter_profile or "default")
+        if key not in earliest or due < earliest[key]:
+            earliest[key] = due
+    return [{"platform": platform, "profile": profile, "not_before": due}
+            for (platform, profile), due in sorted(earliest.items())]
 
 
 def _prune(now: Optional[float] = None) -> None:

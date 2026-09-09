@@ -13,6 +13,6 @@ def test_resolved_model_preserves_unpinned_parent_fallback():
     runtime = _resolve_child_runtime(
         parent, {}, None, model=parent.model, override_provider=None,
         override_base_url=None, override_api_key=None, override_api_mode=None,
-        override_max_tokens=None, override_acp_command=None, override_acp_args=None,
+        override_acp_command=None, override_acp_args=None,
     )
     assert runtime["fallback_model"] == chain

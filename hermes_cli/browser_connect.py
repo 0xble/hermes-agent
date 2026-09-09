@@ -505,92 +505,67 @@ _AUTH_BACKUP_TIMEOUT_SECONDS = 10.0
 def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     """Copy one auth file, lock-aware. Returns True on success.
 
-    For SQLite DBs (Cookies/Login Data/…), use a deadline-bounded online
-    backup so the copy works even while the browser holds the file's write
-    lock (Windows) and never hangs on a wedged source (POSIX, running
-    Chrome). Everything else is a plain copy. A DB whose backup fails falls
-    through to a raw copy attempt; only if BOTH fail do we report failure to
-    the caller.
+    SQLite DBs (Cookies/Login Data/…) are snapshotted through a
+    deadline-bounded online backup, so a live browser holding the source
+    write lock can never strand the caller inside CPython's unbounded
+    ``backup()`` retry loop (#96646). Everything else is a plain copy.
+
+    Fork contract (#82042/#92495/#84475): ``immutable=1`` is tried FIRST.
+    A running Chrome holds Login Data / Web Data with exclusive locks, and a
+    plain ``mode=ro`` backup then burns the whole budget and fails — measured
+    on macOS with live Chrome, ``mode=ro`` times out after the full
+    ``_AUTH_BACKUP_TIMEOUT_SECONDS`` on Login Data and Web Data while
+    ``immutable=1`` returns a complete snapshot in ~0.00 s. Failing those two
+    fails the entire launch via ``_mirror_profile_auth``, so upstream's
+    coordinated-only path would break real-profile launch whenever the browser
+    is open.
+
+    Upstream's objection to ``immutable=1`` is real but conditional: it
+    bypasses lock negotiation and therefore ignores a committed-but-uncheckpointed
+    WAL. That only matters when a WAL sidecar actually holds data, so we probe
+    for one and fall back to the coordinated read in exactly that case rather
+    than paying its cost unconditionally. Chrome ships these DBs in rollback-journal
+    mode (``-journal``, zero length), where no such WAL exists.
     """
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-    if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
-        # With a live Chrome on macOS, mode=ro WITHOUT immutable=1 can hang connect/backup
-        # forever (blocked inside lock negotiation, so the busy-timeout never fires).
-        # immutable=1 reads instantly and is correct: we want a committed snapshot, not
-        # coordinated writes. A torn read raises → next mode, then the plain-copy fallback.
-        for uri in (f"file:{src_file}?mode=ro&immutable=1", f"file:{src_file}?mode=ro"):
-            try:
-                # The online-backup API must be bounded: CPython's backup()
-                # retries SQLITE_BUSY forever unless a progress callback
-                # interrupts it, and a running Chrome holds Login Data / Web
-                # Data exclusively on POSIX too — so a plain source.backup(out)
-                # hangs the launch until the tool times out (#96646). Reuse the
-                # bounded family helper from the backup walker
-                # (#82042/#92495/#84475): read-only connect, deadline-bounded
-                # progress callback, fail-closed False. On failure the raw-copy
-                # fallback below runs — file-level copies don't need SQLite's
-                # cross-process locks on POSIX.
-                from hermes_cli.backup import _safe_copy_db
-
-                if "immutable=1" in uri:
-                    # The immutable snapshot path cannot participate in the
-                    # source browser's lock negotiation, so it remains the
-                    # fastest first attempt for live macOS profiles.
-                    import sqlite3
-
-                    source = sqlite3.connect(uri, uri=True, timeout=0)
-                    try:
-                        out = sqlite3.connect(dst_file, timeout=0)
-                        try:
-                            busy_deadline = time.monotonic() + max(
-                                0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
-                            )
-
-                            def _check_backup_progress(
-                                status: int, _remaining: int, _total: int
-                            ) -> None:
-                                nonlocal busy_deadline
-                                now = time.monotonic()
-                                if status in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
-                                    if now >= busy_deadline:
-                                        raise TimeoutError(
-                                            "database remained locked for "
-                                            f"{_AUTH_BACKUP_TIMEOUT_SECONDS:g} seconds"
-                                        )
-                                else:
-                                    busy_deadline = now + max(
-                                        0.0, _AUTH_BACKUP_TIMEOUT_SECONDS
-                                    )
-
-                            with out:
-                                source.backup(
-                                    out,
-                                    pages=256,
-                                    progress=_check_backup_progress,
-                                    sleep=0.1,
-                                )
-                        finally:
-                            out.close()
-                    finally:
-                        source.close()
-                    return True
-                if _safe_copy_db(
-                    Path(src_file),
-                    Path(dst_file),
-                    timeout_seconds=_AUTH_BACKUP_TIMEOUT_SECONDS,
-                ):
-                    return True
-                logger.debug(
-                    "real-profile: bounded sqlite-backup of %s failed; trying raw copy",
-                    src_file,
-                )
-            except Exception as e:
-                logger.debug("real-profile: sqlite-backup of %s failed (%s); trying next mode",
-                             src_file, e)
     try:
+        if os.path.basename(src_file) in _SQLITE_AUTH_DBS:
+            deadline = time.monotonic() + max(0.0, _AUTH_BACKUP_TIMEOUT_SECONDS)
+
+            def check_deadline(_status: int, _remaining: int, _total: int) -> None:
+                if _status != sqlite3.SQLITE_DONE and time.monotonic() >= deadline:
+                    raise TimeoutError("auth database backup exceeded "
+                                       f"{_AUTH_BACKUP_TIMEOUT_SECONDS:g} seconds")
+
+            # A non-empty WAL sidecar means committed pages live outside the main
+            # DB file; only a coordinated (non-immutable) reader can see them.
+            try:
+                wal_pending = os.path.getsize(src_file + "-wal") > 0
+            except OSError:
+                wal_pending = False
+            base_uri = Path(src_file).resolve().as_uri()
+            uris = ([base_uri + "?mode=ro"] if wal_pending
+                    else [base_uri + "?mode=ro&immutable=1", base_uri + "?mode=ro"])
+
+            last_error: Exception | None = None
+            for uri in uris:
+                try:
+                    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=0.0)) as source:
+                        with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as out:
+                            source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
+                    return True
+                except (OSError, sqlite3.Error, TimeoutError) as e:
+                    # A torn immutable read or an exhausted budget falls through to the
+                    # coordinated mode; the deadline is shared so we never double-spend it.
+                    last_error = e
+                    logger.debug("real-profile: sqlite-backup of %s via %s failed (%s)",
+                                 src_file, uri.rsplit("?", 1)[-1], e)
+            raise last_error if last_error is not None else sqlite3.Error("backup failed")
         shutil.copy2(src_file, dst_file)
         return True
-    except OSError as e:
+    except (OSError, sqlite3.Error, TimeoutError) as e:
+        # Fail closed: a raw DB copy can lose committed WAL or overwrite a locked
+        # destination, handing the agent a silently signed-out profile.
         logger.debug("real-profile: could not copy %s: %s", src_file, e)
         return False
 
@@ -1026,7 +1001,7 @@ def snapshot_real_profile(
         failed_dbs = _mirror_profile_auth(src, dst, source_profile)
         if failed_dbs:  # even online-backup failed: never launch a silently signed-out session
             return None, (f"could not read the '{browser}' profile's login data ({failed_dbs} "
-                          f"database(s) locked). Close {browser} and retry, or turn "
+                          f"database(s) unavailable). Close {browser} and retry, or turn "
                           "browser.use_real_profile off.")
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):

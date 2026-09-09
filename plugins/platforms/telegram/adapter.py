@@ -146,9 +146,11 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 from gateway.authz_mixin import _coerce_allow_set
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
-    BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult, classify_send_error,
+    BasePlatformAdapter, SendResult, classify_send_error,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, SUPPORTED_VIDEO_TYPES,
-    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len)
+    SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len,
+)
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
@@ -1692,9 +1694,17 @@ class TelegramAdapter(BasePlatformAdapter):
             # Telegram did not accept it; once an earlier chunk landed, a full retry would duplicate.
             return True, _flood_cap_result(retry_after, retryable=not prior_chunks_delivered)
         if attempt >= 2:
-            return True, SendResult(
-                success=False, error=_redact_telegram_error_text(error), retryable=True,
-                retry_after=self._bounded_send_retry_after(retry_after))
+            # Retries exhausted and still flooded: fail closed with the CANONICAL flood error so
+            # delivery_ledger.is_runtime_retryable recognises the row and arms a redelivery timer.
+            # A redacted platform string matches neither the exact allowlist nor
+            # parse_flood_retry_after, so the ledger called it terminal and the reply sat until the
+            # next restart. Same duplicate guard as the over-cap branch above.
+            logger.warning(
+                "[%s] Telegram flood control on send persisted across %d attempts; failing closed "
+                "so the delivery ledger owns the wait: %s",
+                self.name, attempt + 1, _redact_telegram_error_text(error))
+            return True, _flood_cap_result(
+                self._bounded_send_retry_after(retry_after), retryable=not prior_chunks_delivered)
         logger.warning(
             "[%s] Telegram flood control on send (attempt %d/3); retrying through the shared per-chat gate: %s",
             self.name, attempt + 1, _redact_telegram_error_text(error))
@@ -4475,6 +4485,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
                     logger.error("[%s] Edit retry failed after flood wait: %s", self.name, safe_retry_error)
+                    retry_wait = getattr(retry_err, "retry_after", None)
+                    if retry_wait is not None or "retry after" in str(retry_err).lower():
+                        # Still flooded after the inline wait, and typically for much longer than the
+                        # first refusal asked for. Fail closed canonically so the ledger arms its
+                        # timer on this delay rather than storing the platform's raw wording, which
+                        # it would read as an ordinary failure and never redeliver.
+                        return _flood_cap_result(
+                            float(retry_wait) if retry_wait is not None else wait)
                     return SendResult(success=False, error=safe_retry_error)
             safe_error = _redact_telegram_error_text(e)
             # Transient network errors must not permanently disable progress-message editing.

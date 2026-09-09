@@ -57,6 +57,8 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     turn_reasoning_config: Optional[dict[str, Any]] = None
+
+    persist_user_display_metadata: Optional[dict] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

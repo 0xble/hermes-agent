@@ -12,6 +12,14 @@ from hermes_cli import auth_commands
 from hermes_cli.auth import read_credential_pool, write_credential_pool
 
 
+@pytest.fixture(autouse=True)
+def isolated_external_auth_stores(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(tmp_path / "shared"))
+
+
 def _rows():
     return [dict(id=f"row{i}", label=f"account{i}", source="manual:device_code",
                  auth_type="oauth", access_token=f"fixture-access-{i}",
@@ -92,6 +100,9 @@ def test_add_priority_places_reauthenticated_row_in_multi_entry_pool(monkeypatch
 
 
 def test_add_priority_preserves_success_when_saved_identity_is_unavailable(monkeypatch, capsys):
+    # HERMES-120 regression: a successfully saved add with no returned pool
+    # identity must still succeed, leave the pool order untouched, and print the
+    # manual `auth priority` fallback. Dropped by upstream's rewrite; kept here.
     rows = _rows()
     monkeypatch.setattr(auth_commands.auth_mod, "_read_shared_nous_state", lambda: None)
     monkeypatch.setattr(auth_commands.auth_mod, "_nous_device_code_login", lambda **_kwargs: {

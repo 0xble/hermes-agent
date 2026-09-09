@@ -23,6 +23,8 @@ from gateway.platforms.base import (
     ProcessingOutcome,
     SendResult,
 )
+from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -188,6 +190,27 @@ class _DiscordMediaFailureAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
+class _DiscordMediaFailureAdapter(BasePlatformAdapter):
+    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+        self.notices: list[str] = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content=None, **kwargs):
+        self.notices.append(content or "")
+        return SendResult(success=True, message_id="notice")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
+
+
 @pytest.mark.asyncio
 async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     """Attachmentless send_video results must surface a user-visible notice (#66797)."""
@@ -209,27 +232,6 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
 
     adapter.send_video.assert_awaited_once()
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
-
-
-class _DiscordMediaFailureAdapter(BasePlatformAdapter):
-    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
-
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
-        self.notices: list[str] = []
-
-    async def connect(self, *, is_reconnect: bool = False):
-        return True
-
-    async def disconnect(self):
-        pass
-
-    async def send(self, chat_id, content=None, **kwargs):
-        self.notices.append(content or "")
-        return SendResult(success=True, message_id="notice")
-
-    async def get_chat_info(self, chat_id):
-        return {"id": chat_id, "type": "dm"}
 
 
 @pytest.mark.asyncio

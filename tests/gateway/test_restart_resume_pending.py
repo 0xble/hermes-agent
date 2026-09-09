@@ -33,7 +33,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import EphemeralReply, SendResult
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     GatewayRunner,

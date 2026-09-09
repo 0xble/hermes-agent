@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 from unittest.mock import Mock, patch
@@ -171,7 +172,15 @@ class TestIdentitySnapshots:
             (profile_dir / "Network").mkdir(parents=True)
             (profile_dir / "Cache").mkdir()
             (profile_dir / "Preferences").write_text(marker)
-            (profile_dir / "Network" / "Cookies").write_text(f"{marker}-cookies")
+            # A real cookie store is SQLite, and the snapshot fails closed on a DB it cannot
+            # back up (HERMES-133 keeps upstream's removal of the raw-copy fallthrough), so the
+            # fixture must be a genuine database. Verified: a plain-text file named Cookies
+            # returns False, while a non-DB name like Preferences still plain-copies.
+            cookie_db = sqlite3.connect(profile_dir / "Network" / "Cookies")
+            cookie_db.execute("create table cookies(marker text)")
+            cookie_db.execute("insert into cookies values(?)", (marker,))
+            cookie_db.commit()
+            cookie_db.close()
             (profile_dir / "Cache" / "discard").write_text("cache")
         (root / "Local State").write_text(
             json.dumps({"profile": {"last_used": "Profile 1"}})

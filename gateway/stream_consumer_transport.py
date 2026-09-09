@@ -182,6 +182,19 @@ class StreamTransportMixin:
             if getattr(result, "success", False):
                 self._last_sent_text = text  # parity with the edit-based no-op skip
                 return True
+            # P5(b): an AUTHORIZATION decline is terminal for the whole run, not
+            # merely "drafts are unusable". Disabling drafts alone routes the
+            # turn-final to _first_send — a plain send into the chat the
+            # connector just refused. Verified: ops were ['draft', 'send'].
+            from gateway.relay.egress import declined_send
+
+            if declined_send(result):
+                logger.warning(
+                    "send_draft DECLINED by the connector's egress guard; "
+                    "suppressing every later send for this run (the destination "
+                    "is not approved for this connection)"
+                )
+                self._egress_declined = True
             logger.debug("send_draft returned success=False, disabling draft transport: %s",
                          getattr(result, "error", "unknown"))
         self._draft_failures += 1
@@ -425,6 +438,16 @@ class StreamTransportMixin:
 
     async def _first_send(self, text: str, *, finalize: bool) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
+        if getattr(self, "_egress_declined", False):
+            # The connector refused this destination earlier in the run (see
+            # _send_draft_frame). This is where every fallback path converges,
+            # so the check belongs here rather than at each caller. Checked BEFORE the
+            # boundary is opened: a suppressed send must not leave one parked.
+            logger.warning(
+                "suppressing the plain-send fallback: the connector already "
+                "declined this destination for this run"
+            )
+            return False
         # Announce the provisional boundary before the send starts so a slow adapter
         # cannot let later tool progress overtake this content entry.
         self._open_preview_boundary()
@@ -514,6 +537,22 @@ class StreamTransportMixin:
                                ) -> bool:
         """Classify a failed edit: partial overflow, flood backoff, or fallback mode.  Always
         False; the caller's finalize path may still deliver the tail."""
+        # P5(b): an AUTHORIZATION decline is terminal for the run. Every branch
+        # below treats a failed edit as "editing is unavailable" and hands the
+        # unseen tail to the fallback, which SENDS it as a new message to the
+        # chat the connector just refused. Measured: ops were
+        # ['edit', 'edit', 'send'].
+        from gateway.relay.egress import declined_send
+
+        if declined_send(result):
+            logger.warning(
+                "edit DECLINED by the connector's egress guard; suppressing "
+                "every later send for this run (the destination is not "
+                "approved for this connection)"
+            )
+            self._egress_declined = True
+            self._edit_supported = False
+            return False
         turn_final = finalize and is_turn_final
         if (turn_final and self.cfg.cursor and self._last_sent_text.endswith(self.cfg.cursor)
                 and self._visible_prefix() == text):

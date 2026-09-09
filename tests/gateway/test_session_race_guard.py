@@ -14,7 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType, merge_pending_message_event
+from gateway.platforms.base import merge_pending_message_event
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
@@ -247,7 +248,11 @@ async def test_active_session_quick_alias_dispatches_to_steer_handler():
     result = await runner._handle_message(event)
 
     assert result is not None and "Steer queued" in result
-    fake_agent.steer.assert_called_once_with("also check auth.log")
+    # The contract here is alias-expansion ORDER, not the exact payload: upstream now
+    # prepends routing origin metadata via _steer_text_with_origin, so assert the
+    # expanded command reaches steer rather than pinning the decorated string.
+    fake_agent.steer.assert_called_once()
+    assert fake_agent.steer.call_args.args[0].endswith("also check auth.log")
     fake_agent.interrupt.assert_not_called()
     assert session_key not in runner.adapters[Platform.TELEGRAM]._pending_messages
 
@@ -275,7 +280,11 @@ async def test_active_session_quick_alias_uses_routed_profile_snapshot():
     result = await runner._handle_message(event)
 
     assert result is not None and "Steer queued" in result
-    fake_agent.steer.assert_called_once_with("keep the secondary profile")
+    # The contract here is alias-expansion ORDER, not the exact payload: upstream now
+    # prepends routing origin metadata via _steer_text_with_origin, so assert the
+    # expanded command reaches steer rather than pinning the decorated string.
+    fake_agent.steer.assert_called_once()
+    assert fake_agent.steer.call_args.args[0].endswith("keep the secondary profile")
 
 
 # ------------------------------------------------------------------
