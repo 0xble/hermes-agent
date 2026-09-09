@@ -113,7 +113,8 @@ def _run_children_parallel(batch: _Batch, results: list, *, honor_parent_interru
     # while a child is wedged, the abandoned worker must not block interpreter exit.
     from tools.daemon_pool import DaemonThreadPoolExecutor
     parent_agent, n_tasks = batch.parent_agent, len(batch.task_list)
-    task_labels = [t["goal"][:40] for t in batch.task_list]
+    metadata = batch.delegation_metadata or {}
+    task_labels = list(metadata.get("task_labels") or [])
     spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
     _tag = format_batch_tag(batch.live_deleg_id, parent_agent)
     # Fabricated entries for still-pending / raised futures carry the correct _delegate_role.
@@ -329,6 +330,13 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]],
     if any(isinstance(s, str) and s for s in sids):
         payload["subagent_ids"] = sids
         payload["control_hint"] = _BACKGROUND_NOTES["control_hint"]
+    child_session_ids = [getattr(c, "session_id", None) for (_, _, c) in batch.children]
+    if any(isinstance(session_id, str) and session_id for session_id in child_session_ids):
+        payload["child_session_ids"] = child_session_ids
+        payload["identity_note"] = (
+            "subagent_ids (sa-*) are control-only for list/steer/stop. "
+            "child_session_ids are durable identities for a later resume_session_id after a resumable checkpoint."
+        )
     if batch.live_paths:
         payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]

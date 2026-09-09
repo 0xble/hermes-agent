@@ -33,11 +33,10 @@ def _label(value, default, limit=60):
 
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
-    # Every physical line is a Markdown blockquote line. Telegram's formatter
-    # keeps this as one native card instead of rendering a fake text border.
-    lines = [f"> 🧵 **Delegating · {elapsed} min**"]
+    # Plain rich text: cards must never render as a native quote or fake border.
+    lines = [f"🧵 **Delegating · {elapsed} min**"]
     for row in card["rows"].values():
-        lines.append(f"> **{row['thread_ref']}. {_label(row.get('task_label'), 'Run delegated task')}** · {_label(row.get('role'), 'Worker', 24)}")
+        lines.append(f"**{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}** · {_label(row.get('role'), 'Worker', 24)}")
         state = row.get("state")
         if state == "completed":
             activity = "Returned · awaiting parent"
@@ -50,7 +49,7 @@ def render_card(card, now=None):
             activity = f"Last tool: {get_tool_emoji(tool)} {_label(tool, 'tool', 40)}"
         else:
             activity = "Started · awaiting activity"
-        lines.append(f"> ↳ {activity}")
+        lines.append(f"↳ {activity}")
     # Keep a single Telegram message, never split into a second card.
     return "\n".join(lines)[:3500]
 

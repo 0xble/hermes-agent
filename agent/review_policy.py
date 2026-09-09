@@ -22,14 +22,29 @@ def tool_name_from_definition(definition: Any) -> str:
 
 
 def remove_parent_only_review_tools(agent: Any) -> None:
-    """Hide parent lifecycle controls from delegated children."""
-    agent.tools = [
-        definition for definition in (getattr(agent, "tools", None) or [])
-        if tool_name_from_definition(definition) not in PARENT_ONLY_REVIEW_TOOLS
+    """Install the persistent parent-only contract on a delegated child."""
+    agent._tool_contract_excluded_names = PARENT_ONLY_REVIEW_TOOLS
+    tools, names = filter_child_tool_snapshot(agent, getattr(agent, "tools", None) or [])
+    agent.tools = tools
+    agent.valid_tool_names = names
+
+
+def filter_child_tool_snapshot(agent: Any, definitions: Any) -> tuple[list, set]:
+    """Apply a child's durable tool exclusions to a staged snapshot.
+
+    MCP refreshes and eviction restores construct a new list, so removing a
+    parent-only tool only at child creation is not sufficient.  The contract is
+    agent-scoped (never a mutable registry/global policy), and ordinary children
+    remain eligible for normal refreshes.
+    """
+    excluded = getattr(agent, "_tool_contract_excluded_names", frozenset())
+    if not isinstance(excluded, (set, frozenset)):
+        excluded = frozenset()
+    tools = [
+        definition for definition in (definitions or [])
+        if tool_name_from_definition(definition) not in excluded
     ]
-    valid = getattr(agent, "valid_tool_names", None)
-    if isinstance(valid, set):
-        valid.difference_update(PARENT_ONLY_REVIEW_TOOLS)
+    return tools, {tool_name_from_definition(definition) for definition in tools if tool_name_from_definition(definition)}
 
 
 def apply_review_tool_policy(agent: Any, policy: str) -> None:
@@ -40,6 +55,7 @@ def apply_review_tool_policy(agent: Any, policy: str) -> None:
     """
     if policy not in VALID_REVIEW_TOOL_POLICIES:
         raise ValueError(f"Invalid review tool policy: {policy!r}")
+    remove_parent_only_review_tools(agent)
     agent._review_tool_policy = policy
     if policy == LEGACY_UNRESTRICTED:
         return
@@ -60,6 +76,9 @@ def review_registry_refresh_allowed(agent: Any) -> bool:
 
 def review_tool_policy_block(agent: Any, tool_name: str) -> str | None:
     """Return a dispatch-block reason, or ``None`` when the call is allowed."""
+    excluded = getattr(agent, "_tool_contract_excluded_names", frozenset())
+    if isinstance(excluded, (set, frozenset)) and tool_name in excluded:
+        return f"Tool {tool_name!r} is parent-only and cannot be invoked by a delegated child."
     policy = getattr(agent, "_review_tool_policy", None)
     # Test doubles and third-party facades may synthesize arbitrary non-string
     # attributes. This module only installs explicit string policies.

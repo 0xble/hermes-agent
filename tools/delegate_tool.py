@@ -661,10 +661,15 @@ def _resolve_resume_launch(task, definitions, parent_agent):
     requested = task.get("resume_session_id")
     if not isinstance(requested, str) or not requested.strip():
         raise ValueError("resume_session_id must be a nonempty delegated child session id")
+    requested = requested.strip()
+    if requested.startswith("sa-"):
+        raise ValueError(
+            "resume_session_id must be a durable child_session_id, not a control-only subagent_id (sa-*)."
+        )
     db = getattr(parent_agent, "_session_db", None)
     if db is None:
         raise ValueError("child resume requires the parent's durable session database")
-    tip = db.resolve_resume_session_id(requested.strip())
+    tip = db.resolve_resume_session_id(requested)
     row = db.get_session(tip) if tip else None
     if not row:
         raise ValueError("resume_session_id does not name an existing session")
@@ -1096,7 +1101,7 @@ def delegate_task(
     try:
         from tools.async_delegation import reserve_delegation_metadata
         _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
-            task_labels=[t.get("task_label") or task_label or "Run delegated task" for t in (task_list or [])])
+            task_labels=[t.get("task_label") or task_label or "" for t in (task_list or [])])
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -1457,11 +1462,12 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Optional safe, short imperative display label; never use the goal as a display label."),
+                        "task_label": _p("string", "Required for new calls: safe, short imperative display label. Never use the goal as a display label."),
                         "resume_session_id": _p(
                             "string",
-                            "Stable child_session_id from a completed or budget-exhausted delegation. Continues that exact "
-                            "named child's durable session and frozen route; omit subagent_type or repeat the same role.",
+                            "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
+                            "completed or budget-exhausted delegation. Continues that exact named child's durable session and "
+                            "frozen route; omit subagent_type or repeat the same role.",
                         ),
                         "moa_preset": _p(
                             "string",
@@ -1488,7 +1494,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Optional safe short imperative label for a legacy single task; defaults to 'Run delegated task'."),
+            "task_label": _p("string", "Legacy single-task display label. New calls use tasks[].task_label; omitted legacy labels are assigned by metadata."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

@@ -319,6 +319,29 @@ def test_eviction_rebuild_restores_the_sessions_saved_tool_order(monkeypatch):
     assert rebuilt.valid_tool_names == set(saved)
 
 
+@pytest.mark.parametrize("role", ["leaf", "orchestrator"])
+def test_delegated_child_refresh_and_restore_keep_parent_only_review_tool_excluded(monkeypatch, role):
+    """Children can refresh normally, but no rebuild may restore a parent review control."""
+    from agent.review_policy import remove_parent_only_review_tools
+    from tools import registry as registry_mod
+
+    agent = _agent(["read_file", "review_current_work"])
+    agent._delegate_role = role
+    remove_parent_only_review_tools(agent)
+    _serve(monkeypatch, [_tool("read_file"), _tool("review_current_work"), _tool("mcp_late")])
+    entries = {
+        name: types.SimpleNamespace(name=name, schema=_tool(name)["function"])
+        for name in ("read_file", "review_current_work", "mcp_late")
+    }
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries", lambda: list(entries.values()), raising=False)
+    monkeypatch.setattr(registry_mod.registry, "get_entry", lambda name, **_kw: entries.get(name), raising=False)
+
+    assert _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True) == {"mcp_late"}
+    assert agent.valid_tool_names == {"read_file", "mcp_late"}
+    assert _mcp_agent.restore_agent_tool_prefix(agent, ["review_current_work", "read_file", "mcp_late"]) is False
+    assert agent.valid_tool_names == {"read_file", "mcp_late"}
+
+
 def test_reprobe_tool_availability_drops_cached_check_fn_verdicts(monkeypatch):
     """/reload-mcp is the explicit hatch: a cached False must be re-probed."""
     from tools import registry as registry_mod

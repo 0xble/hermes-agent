@@ -44,10 +44,14 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
-# Cap retried deliveries so an unroutable row converges to terminal 'dropped'.
+# One failed admission budget is bounded.  Exhaustion is an obligation awaiting
+# an explicit recovery/destination-availability trigger, not evidence that the
+# result was delivered or that its target was permanently gone.
 _MAX_DELIVERY_ATTEMPTS = 8
-# Pending completions older than this are dropped on restart replay instead of
-# re-run as a full-context turn; 48h keeps weekend results deliverable.
+_MAX_DELIVERY_RECOVERIES = 1
+# A pending (never-exhausted) replay may still be stale enough to be unsafe as
+# a fresh parent turn. ``pending_recovery`` is explicitly exempt: it is a
+# durable obligation awaiting an availability-triggered retry, never an age cap.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 
@@ -126,7 +130,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # origin_session_id: raw api_server session id of the ORIGINATING request
     # (wake target); without it restart-recovered completions are unroutable there.
     for name, sql_type in (("owner_pid", "INTEGER"), ("owner_started_at", "INTEGER"), ("task_json", "TEXT"),
-                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT"),
+                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"),
+                           ("delivery_recovery_attempts", "INTEGER NOT NULL DEFAULT 0"), ("origin_session_id", "TEXT"),
                            ("parent_task_id", "TEXT"), ("thread_number", "INTEGER"), ("task_label", "TEXT"),
                            ("owner_json", "TEXT")):
         if name not in columns:
@@ -174,6 +179,36 @@ def _thread_ref(number: int) -> str:
         number, remainder = divmod(number - 1, 26)
         chars.append(chr(ord("A") + remainder))
     return "".join(reversed(chars))
+
+
+def _thread_number(ref: Any) -> Optional[int]:
+    """Inverse of ``_thread_ref`` for the denormalized ledger projection."""
+    text = str(ref or "").strip().upper()
+    if not text or not re.fullmatch(r"[A-Z]+", text):
+        return None
+    number = 0
+    for char in text:
+        number = number * 26 + ord(char) - ord("A") + 1
+    return number
+
+
+def _ledger_label_projection(metadata: Any) -> Dict[str, Any]:
+    """Project the first allocated card label into legacy ledger columns.
+
+    The complete multi-task mapping remains in ``task_json.delegation_metadata``;
+    these columns are a searchable/indexable summary and must come from that
+    nested metadata rather than raw goal text.
+    """
+    if not isinstance(metadata, dict):
+        return {"parent_task_id": None, "thread_number": None, "task_label": None, "owner_json": None}
+    threads = metadata.get("threads")
+    first = next((item for item in threads if isinstance(item, dict)), {}) if isinstance(threads, list) else {}
+    return {
+        "parent_task_id": metadata.get("parent_task_id"),
+        "thread_number": _thread_number(first.get("thread_ref")),
+        "task_label": first.get("task_label") or (metadata.get("task_labels") or [None])[0],
+        "owner_json": metadata.get("owner_json"),
+    }
 
 
 @contextmanager
@@ -240,42 +275,39 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
             "task_indexes", "completion_contract", "delegation_metadata", *_ROUTING_KEYS,
         )
         if key in record}
+    projection = _ledger_label_projection(record.get("delegation_metadata"))
     with _DB_LOCK, _transaction() as conn:
         conn.execute("""INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_started_at, task_json, origin_session_id, parent_task_id,
+                thread_number, task_label, owner_json)
+               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record["delegation_id"], record.get("session_key", ""), record.get("origin_ui_session_id", ""),
              record.get("parent_session_id"), record["dispatched_at"], now, os.getpid(), owner_started_at,
-             json.dumps(task_payload), record.get("origin_session_id", "")))
+             json.dumps(task_payload), record.get("origin_session_id", ""), projection["parent_task_id"],
+             projection["thread_number"], projection["task_label"], projection["owner_json"]))
     _prune_durable_records()
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Bound only settled history; pending delivery obligations are never retention-pruned."""
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')").fetchone()[0]
+            """SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')
+               AND delivery_state IN ('delivered','dropped')""").fetchone()[0]
         if terminal_count > _MAX_RETAINED_COMPLETED:
             conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
+                       AND delivery_state IN ('delivered','dropped')
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                             updated_at ASC LIMIT ?
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
-        pending_count = conn.execute("""SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'""").fetchone()[0]
-        if pending_count > _MAX_DURABLE_PENDING:
-            conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""", (pending_count - _MAX_DURABLE_PENDING,))
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -384,7 +416,8 @@ def restore_undelivered_completions(target_queue) -> int:
     no consumer in THIS process implicitly owns them: drain paths that run without an ownership filter (the
     legacy single-session behavior) must leave them queued for a consumer that can positively prove
     ownership, otherwise a brand-new session adopts a dead session's delegation results seconds after boot
-    (#64484).
+    (#64484). Retry-exhausted rows are deliberately excluded: only an explicit recovery or the
+    gateway's one-time destination-availability pass can reactivate their bounded next budget.
     """
     recover_abandoned_delegations()
     now, restored = time.time(), 0
@@ -396,13 +429,14 @@ def restore_undelivered_completions(target_queue) -> int:
         for delegation_id, payload, completed_at, dispatched_at in rows:
             age_basis = completed_at or dispatched_at
             if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+                # This state is *only* ordinary pending. Retry-exhausted rows use
+                # pending_recovery and are never selected or erased by this cap.
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
-                              delivery_claim=NULL, delivery_claimed_at=NULL,
-                              updated_at=?
+                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                        WHERE delegation_id=? AND delivery_state='pending'""", (now, delegation_id))
-                logger.warning("Async delegation %s: pending completion is %.1fh old "
-                               "(cap %.1fh); terminally dropping the replay (result remains queryable).",
-                               delegation_id, (now - age_basis) / 3600.0, _MAX_COMPLETION_REPLAY_AGE_S / 3600.0)
+                logger.warning("Async delegation %s: pending completion is %.1fh old; dropping unsafe replay "
+                               "(retry-exhausted obligations are retained separately).",
+                               delegation_id, (now - age_basis) / 3600.0)
                 continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
@@ -410,6 +444,52 @@ def restore_undelivered_completions(target_queue) -> int:
             target_queue.put(evt)
             restored += 1
     return restored
+
+
+def retry_exhausted_completions() -> List[Dict[str, Any]]:
+    """Read durable recovery candidates without changing their budget or state."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute("""SELECT delegation_id, event_json FROM async_delegations
+            WHERE delivery_state='pending_recovery' AND event_json IS NOT NULL
+            AND delivery_recovery_attempts < ? ORDER BY updated_at, delegation_id""",
+            (_MAX_DELIVERY_RECOVERIES,)).fetchall()
+    candidates = []
+    for delegation_id, payload in rows:
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(event, dict):
+            candidates.append(event)
+    return candidates
+
+
+def recover_completion_delivery(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Explicitly grant one fresh, bounded delivery budget to an exhausted obligation.
+
+    This is intentionally a compare-and-swap transition, not a polling reset. Callers must first
+    establish that the destination is currently available. ``None`` means it was already recovered,
+    settled, malformed, or consumed its recovery budget.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute("SELECT event_json FROM async_delegations WHERE delegation_id=?", (delegation_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            event = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        changed = conn.execute("""UPDATE async_delegations SET delivery_state='pending', delivery_attempts=0,
+                delivery_recovery_attempts=delivery_recovery_attempts+1, delivery_claim=NULL,
+                delivery_claimed_at=NULL, updated_at=? WHERE delegation_id=?
+                AND delivery_state='pending_recovery' AND delivery_recovery_attempts < ?""",
+            (now, delegation_id, _MAX_DELIVERY_RECOVERIES)).rowcount
+        if changed != 1:
+            return None
+    return event
 
 
 def _update_delivery(sql: str, params: tuple) -> bool:
@@ -462,18 +542,18 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry. Attempts are
-    counted at claim time; once the budget is exhausted the row converges to
-    terminal ``dropped`` (only pending rows replay on restart)."""
+    counted at claim time; exhaustion parks the durable obligation in
+    ``pending_recovery`` until an explicit recovery/destination-availability trigger."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        capped = conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
+        capped = conn.execute("""UPDATE async_delegations SET delivery_state='pending_recovery',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS))
         if capped.rowcount == 1:
             logger.warning("Async delegation %s exhausted its %d delivery attempts; "
-                           "marking terminally dropped (result remains queryable).",
+                           "parking durable delivery pending explicit recovery.",
                            delegation_id, _MAX_DELIVERY_ATTEMPTS)
             return True
         cur = conn.execute("""UPDATE async_delegations SET delivery_claim=NULL,

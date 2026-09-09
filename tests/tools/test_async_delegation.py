@@ -1196,3 +1196,52 @@ def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path
             ("deleg_abandoned_review",),
         ).fetchone()[0])
     assert event["native_review_result"]["judgment"] == "unknown"
+
+
+def test_retry_exhaustion_parks_result_until_one_explicit_bounded_recovery(tmp_path, monkeypatch):
+    """A bad destination cannot erase a completed result or spin forever after restart."""
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    event = {"type": "async_delegation", "delegation_id": "recover-me", "session_key": "unavailable",
+             "status": "completed", "summary": "unchanged result", "dispatched_at": 1.0, "completed_at": 2.0}
+    ad._persist_dispatch({"delegation_id": "recover-me", "session_key": "unavailable", "dispatched_at": 1.0})
+    ad._persist_completion(event, {"summary": "unchanged result"})
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        claim = f"claim-{attempt}"
+        assert ad.claim_completion_delivery("recover-me", claim)
+        assert ad.release_completion_delivery("recover-me", claim)
+    item = ad.get_durable_delegation("recover-me")
+    assert item["delivery_state"] == "pending_recovery"
+    assert item["result"] == {"summary": "unchanged result"}
+
+    restarted = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted) == 0
+    assert restarted.empty()
+    assert [e["delegation_id"] for e in ad.retry_exhausted_completions()] == ["recover-me"]
+
+    recovered = ad.recover_completion_delivery("recover-me")
+    assert recovered and recovered["summary"] == "unchanged result"
+    assert ad.recover_completion_delivery("recover-me") is None  # no poll-loop reset
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        claim = f"recovered-{attempt}"
+        assert ad.claim_completion_delivery("recover-me", claim)
+        assert ad.release_completion_delivery("recover-me", claim)
+    assert ad.get_durable_delegation("recover-me")["delivery_state"] == "pending_recovery"
+    assert ad.retry_exhausted_completions() == []  # bounded recovery prevents a bad-target loop
+
+
+def test_pending_recovery_survives_retention_and_projects_nested_card_label(tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    metadata = {"parent_task_id": "a" * 32, "owner_json": '{"owner":"exact"}',
+                "threads": [{"thread_ref": "B", "task_label": "Task B", "role": "worker"}]}
+    ad._persist_dispatch({"delegation_id": "labelled", "session_key": "route", "dispatched_at": 1.0,
+                          "delegation_metadata": metadata})
+    ad._persist_completion({"type": "async_delegation", "delegation_id": "labelled", "status": "completed",
+                            "summary": "done", "completed_at": 2.0}, {"summary": "done"})
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_state='pending_recovery', updated_at=0 WHERE delegation_id='labelled'")
+    ad._prune_durable_records()
+    with ad._transaction() as conn:
+        row = conn.execute("SELECT parent_task_id, thread_number, task_label, owner_json, delivery_state "
+                           "FROM async_delegations WHERE delegation_id='labelled'").fetchone()
+    assert row == ("a" * 32, 2, "Task B", '{"owner":"exact"}', "pending_recovery")

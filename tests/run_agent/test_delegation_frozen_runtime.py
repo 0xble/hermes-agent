@@ -326,6 +326,24 @@ def test_resume_rejects_role_conflict_and_schema_exposes_handle(monkeypatch):
     assert "resume_session_id" in props
 
 
+def test_resume_rejects_control_only_subagent_id_before_database_lookup():
+    from tools import delegate_tool
+
+    db = SimpleNamespace(resolve_resume_session_id=lambda _sid: pytest.fail("control id reached database"))
+    parent = SimpleNamespace(_session_db=db)
+    with pytest.raises(ValueError, match="durable child_session_id.*control-only subagent_id"):
+        delegate_tool._resolve_resume_launch({"resume_session_id": "sa-0-deadbeef"}, {}, parent)
+
+
+def test_delegation_schema_uses_safe_new_task_label_and_distinguishes_ids():
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+    props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]
+    assert set(props["required"]) == {"goal"}
+    assert "never use the goal" in props["properties"]["task_label"]["description"].lower()
+    assert "control-only subagent_id" in props["properties"]["resume_session_id"]["description"]
+
+
 def test_named_launch_metadata_path_accepts_resolved_launch_object():
     from tools.delegate_tool import _task_routing_metadata
     from tools.custom_subagents import ResolvedSubagentLaunch, SubagentDefinition

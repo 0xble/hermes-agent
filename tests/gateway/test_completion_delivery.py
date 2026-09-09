@@ -141,6 +141,29 @@ def test_unroutable_async_event_remains_retryable(
     assert not isolated.empty()
 
 
+def test_startup_recovery_only_reactivates_destination_ready_rows(monkeypatch, isolated_registry):
+    """The existing watcher consumer performs one availability-gated, bounded recovery pass."""
+    from gateway.run_notifications import GatewayNotificationsMixin
+    from tools import async_delegation as ad
+
+    event = _async_event("recover-at-startup")
+    _persist_pending_completion(event)
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET delivery_state='pending_recovery', delivery_attempts=8 "
+                     "WHERE delegation_id=?", (event["delegation_id"],))
+    runner = object.__new__(GatewayNotificationsMixin)
+    runner._completion_delivery_recovery_ready = AsyncMock(return_value=False)
+    assert asyncio.run(runner._recover_ready_async_delegation_deliveries(isolated_registry.completion_queue)) == 0
+    assert isolated_registry.completion_queue.empty()
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "pending_recovery"
+
+    runner._completion_delivery_recovery_ready = AsyncMock(return_value=True)
+    assert asyncio.run(runner._recover_ready_async_delegation_deliveries(isolated_registry.completion_queue)) == 1
+    recovered = isolated_registry.completion_queue.get_nowait()
+    assert recovered["delegation_id"] == event["delegation_id"] and recovered["restored"] is True
+    assert asyncio.run(runner._recover_ready_async_delegation_deliveries(isolated_registry.completion_queue)) == 0
+
+
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     """Concurrent consumers in one runner cannot both enter the adapter."""
     entered = asyncio.Event()

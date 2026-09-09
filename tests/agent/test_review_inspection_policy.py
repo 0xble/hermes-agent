@@ -140,6 +140,20 @@ def test_delegated_child_schema_hides_parent_only_review_tool():
     assert child.valid_tool_names == {"read_file"}
 
 
+def test_parent_only_contract_blocks_a_child_even_if_a_stale_schema_reintroduces_it(monkeypatch):
+    monkeypatch.setattr(tool_executor, "_pre_tool_block", lambda *_args: (None, {}))
+    child = _agent("legacy_unrestricted")
+    remove_parent_only_review_tools(child)
+    called = []
+    state = tool_executor._ManagedToolResult(None, {}, [], False, False)
+    result = tool_executor._dispatch_authorized_once(
+        child, state, _ref("review_current_work"), execute=lambda _args: called.append(True),
+        scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
+    )
+    assert called == [] and state.blocked is True
+    assert "parent-only" in json.loads(result)["error"].lower()
+
+
 def test_mcp_refresh_skipped_for_inspection_reviewer(monkeypatch):
     agent = SimpleNamespace(_skip_mcp_refresh=True)
     called = []

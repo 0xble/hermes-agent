@@ -14,7 +14,7 @@ from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 
 
-def test_render_card_is_one_native_markdown_blockquote_with_task_first_rows():
+def test_render_card_is_plain_rich_text_with_task_first_rows():
     card = {
         "started_at": 0,
         "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "Orchestrator",
@@ -24,15 +24,15 @@ def test_render_card_is_one_native_markdown_blockquote_with_task_first_rows():
     rendered = render_card(card, now=0)
 
     lines = rendered.splitlines()
-    assert lines[0] == "> 🧵 **Delegating · 0 min**"
-    assert lines[1] == "> **A. Repair restart receipt** · Orchestrator"
-    assert lines[2].startswith("> ↳ Last tool: ")
-    assert all(line.startswith("> ") for line in lines)
+    assert lines[0] == "🧵 **Delegating · 0 min**"
+    assert lines[1] == "**A. Repair restart receipt** · Orchestrator"
+    assert lines[2].startswith("↳ Last tool: ")
+    assert not any(line.startswith(">") for line in lines)
 
 
 @pytest.mark.asyncio
-async def test_telegram_card_send_and_edit_keep_blockquote_and_bold_entities():
-    """Cards use the normal MarkdownV2 formatter on both transport operations."""
+async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
+    """Cards use the normal MarkdownV2 formatter without quote entities on both operations."""
     from gateway.config import PlatformConfig
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -42,7 +42,7 @@ async def test_telegram_card_send_and_edit_keep_blockquote_and_bold_entities():
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    content = "> 🧵 **Delegating · 0 min**\n> **A. Repair receipt** · Worker\n> ↳ Started · awaiting activity"
+    content = "🧵 **Delegating · 0 min**\n**A. Repair receipt** · Worker\n↳ Started · awaiting activity"
 
     sent = await adapter.send_delegation_card(source, content)
     edited = await adapter.edit_message("42", "7", content, finalize=True)
@@ -51,8 +51,9 @@ async def test_telegram_card_send_and_edit_keep_blockquote_and_bold_entities():
     send_kwargs = adapter._bot.send_message.call_args.kwargs
     edit_kwargs = adapter._bot.edit_message_text.call_args.kwargs
     assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
-    assert send_kwargs["text"].startswith("> 🧵 *Delegating · 0 min*")
-    assert "> *A\. Repair receipt* · Worker" in send_kwargs["text"]
+    assert send_kwargs["text"].startswith("🧵 *Delegating · 0 min*")
+    assert "*A\\. Repair receipt* · Worker" in send_kwargs["text"]
+    assert not any(line.startswith(">") for line in send_kwargs["text"].splitlines())
     assert edit_kwargs["text"] == send_kwargs["text"]
 
 
@@ -74,14 +75,14 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert adapter.send_delegation_card.await_count == 1
-    assert adapter.send_delegation_card.call_args.args[1].startswith("> 🧵 **Delegating · ")
+    assert adapter.send_delegation_card.call_args.args[1].startswith("🧵 **Delegating · ")
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert "Last tool:" in adapter.edit_message.call_args.args[2]
-    assert all(line.startswith("> ") for line in adapter.edit_message.call_args.args[2].splitlines())
+    assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
     relay.progress_callback("subagent.complete", status="completed", **data)

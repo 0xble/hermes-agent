@@ -1186,6 +1186,44 @@ class GatewayNotificationsMixin:
                 return False
         return True
 
+    async def _completion_delivery_recovery_ready(self, evt: dict) -> bool:
+        """Whether a parked obligation has a live, non-terminal destination at startup.
+
+        ``_completion_delivery_ready`` deliberately treats a terminal parent session as ready so
+        the ordinary preflight can claim and record its honest terminal disposition. A recovery
+        budget must not be spent on that path: it is reserved for a destination that can accept a
+        new completion injection.
+        """
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if parent_session_id and await self._classify_completion_target(parent_session_id) != "deliver":
+            return False
+        return await self._completion_delivery_ready(evt)
+
+    async def _recover_ready_async_delegation_deliveries(self, completion_queue) -> int:
+        """One startup-only recovery pass for exhausted durable deliveries.
+
+        A row is reactivated only after this live gateway can resolve its destination. This is a
+        destination-availability trigger, not a watcher-poll reset: the ledger's compare-and-swap
+        grants at most one additional bounded budget and an unavailable/bad target stays parked.
+        """
+        from tools.async_delegation import recover_completion_delivery, retry_exhausted_completions
+
+        recovered = 0
+        for candidate in retry_exhausted_completions():
+            if not await self._completion_delivery_recovery_ready(candidate):
+                continue
+            delegation_id = str(candidate.get("delegation_id") or "")
+            if not delegation_id:
+                continue
+            event = recover_completion_delivery(delegation_id)
+            if event is not None:
+                event["restored"] = True
+                completion_queue.put(event)
+                recovered += 1
+        if recovered:
+            logger.info("Reactivated %d retry-exhausted async delegation delivery obligation(s)", recovered)
+        return recovered
+
     async def _preflight_completion_delivery(self, evt: dict) -> "_CompletionClaim":
         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
 
@@ -1526,6 +1564,10 @@ class GatewayNotificationsMixin:
         from gateway.delegation_cards import cards_for
         await cards_for(self).reconcile()
         from tools.process_registry import process_registry as _pr
+        # ProcessRegistry restores ordinary pending rows before adapters connect. Do this separate,
+        # one-time pass only after connection so retry-exhausted rows cannot spin on unavailable
+        # destinations and are never reset on each watcher poll.
+        await self._recover_ready_async_delegation_deliveries(_pr.completion_queue)
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
                 # Pattern events also need an idle consumer; foreground turns are optional.
