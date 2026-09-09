@@ -31,6 +31,12 @@ def _label(value, default, limit=60):
     return " ".join(text.split())[:limit] or default
 
 
+def _tool_label(value, default="tool", limit=40):
+    """Bound visible tool names without rewriting their canonical identifier."""
+    text = str(value or default).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] or default
+
+
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
     # Plain rich text: cards must never render as a native quote or fake border.
@@ -46,7 +52,7 @@ def render_card(card, now=None):
             activity = "Interrupted / unknown · gateway restarted"
         elif row.get("last_tool"):
             tool = row["last_tool"]
-            activity = f"Last tool: {get_tool_emoji(tool)} {_label(tool, 'tool', 40)}"
+            activity = f"Last tool: {get_tool_emoji(tool)} {_tool_label(tool, 'tool', 40)}"
         else:
             activity = "Started · awaiting activity"
         lines.append(f"↳ {activity}")

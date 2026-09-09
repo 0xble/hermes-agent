@@ -27,6 +27,7 @@ def test_render_card_is_plain_rich_text_with_task_first_rows():
     assert lines[0] == "🧵 **Delegating · 0 min**"
     assert lines[1] == "**A. Repair restart receipt** · Orchestrator"
     assert lines[2].startswith("↳ Last tool: ")
+    assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
     assert not any(line.startswith(">") for line in lines)
 
 
