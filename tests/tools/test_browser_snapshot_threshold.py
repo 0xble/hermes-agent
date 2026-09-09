@@ -168,7 +168,7 @@ def test_camofox_navigation_applies_same_profile_threshold(
         "_rewrite_loopback_url_for_camofox",
         lambda url: (url, None),
     )
-    monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id: session)
+    monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id, identity=None: session)
     monkeypatch.setattr(
         browser_camofox,
         "_post",
@@ -201,7 +201,7 @@ def test_camofox_snapshot_applies_same_profile_threshold(
     snapshot = _long_snapshot(1500)
     session = {"tab_id": "tab-1", "user_id": "user-1"}
 
-    monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id: session)
+    monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id, identity=None: session)
     monkeypatch.setattr(
         browser_camofox,
         "_camofox_private_page_block",

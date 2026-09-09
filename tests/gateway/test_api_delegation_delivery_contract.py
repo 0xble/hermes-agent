@@ -19,7 +19,11 @@ async def test_detached_dispatch_requires_a_declared_consumer(monkeypatch):
         import inspect
         if capability is not None and "session_history_delivery" in inspect.signature(APIServerAdapter._bind_api_server_session).parameters:
             kw["session_history_delivery"] = capability
-        tokens = APIServerAdapter._bind_api_server_session(**kw)
+        # The fork's _bind_api_server_session is an INSTANCE method (its body reads
+        # self._gateway_cwd); upstream keeps it a staticmethod and calls it on the class.
+        # Pass a minimal self so the unbound call works against the fork's signature.
+        tokens = APIServerAdapter._bind_api_server_session(
+            SimpleNamespace(_gateway_cwd=None), **kw)
         try:
             args = ["api-parent"]
             if len(inspect.signature(_resolve_async_wake_sid).parameters) > 1:

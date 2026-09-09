@@ -80,7 +80,8 @@ def restart_service(key: str, allowed_users: set[str]) -> None:
     active_users = {str(tab.get("userId")) for tab in tabs if isinstance(tab, dict) and tab.get("userId")}
     unsafe = active_users - allowed_users
     assert not unsafe, f"refusing to restart Camofox with non-test active users: {sorted(unsafe)}"
-    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=True, timeout=30)
+    # launchctl is macOS-only, so os.getuid() is reachable wherever this line runs.
+    subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=True, timeout=30)  # windows-footgun: ok
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
