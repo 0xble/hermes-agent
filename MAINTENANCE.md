@@ -1692,8 +1692,8 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 3. Implement and verify the patch.
 4. Update the record with final surfaces, tests, published commit identity, and live upstream issue/PR state.
 5. If a direct upstream PR exists, inspect all current feedback and apply every valid item to the fork first, then update the PR from the verified fork correction.
-6. Verify the manifest row is `Active`; run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation so duplicate IDs, unindexed records, missing stable subjects, upstream-association fields, and fork-only patch coverage block publication. The unified `maintain-targets` dispatcher records the accepted result; it is not a substitute for repository validation.
-7. Ship the code and manifest together. A source patch without a complete record is not publishable.
+6. Verify the manifest row is `Active` and run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation. The current validator is an advisory structural inventory check: it reports duplicate or mismatched index/record IDs and exits successfully even when it cannot assess the inventory. It does not inspect stable subjects, upstream associations, or fork-only patch coverage, and a passing invocation does not establish publication eligibility. The unified `maintain-targets` dispatcher records that advisory result; it is not a substitute for candidate verification.
+7. When a patch record is maintained, ship its source change and record together. Missing or incomplete manifest coverage is an inventory defect to resolve, but the current advisory validator does not itself block publication.
 8. On every upstream rebase, inspect patch equivalence and associated issue/PR feedback; never resolve a conflict by retaining both private and upstream implementations.
 
 ### HERMES-091 — Choose and recover headed mode per managed browser session
@@ -1768,7 +1768,7 @@ Do not push to Nous Research, deploy or restart runtimes, or retire installed pl
 - A runtime rollback never rewrites the fork or changes another runtime.
 - Patch retirement is behavioral: a clean Git apply/revert or matching commit message is not proof of upstream equivalence.
 - Plugin retirement is also behavioral: a native replacement is not complete until its contract passes and the overlapping plugin, canonical source, configuration, dependencies, schedules, skills, and generated copies are removed from every affected profile during promotion.
-- This manifest must describe every active Brian-owned patch; stale, missing, or non-actionable records block publication.
+- This manifest is an advisory inventory of active Brian-owned patches. Stale, missing, or non-actionable records require follow-up, but the current validator does not make them a publication gate.
 
 ## Manual recovery
 
