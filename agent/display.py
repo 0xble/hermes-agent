@@ -450,6 +450,23 @@ _PREVIEW_BUILDERS = {
 }
 
 
+class SanitizedToolPreview(str):
+    """In-process provenance: full display text was sanitized before any clipping.
+
+    Legacy/native previews without this marker must not enter persistent cards.
+    String serialization intentionally drops the marker and therefore fails closed.
+    """
+
+
+def sanitize_tool_preview(text: str, max_len: int, *, shell: bool = False) -> SanitizedToolPreview | None:
+    try:
+        text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+        text = summarize_shell_command(text) if shell else _oneline(text)
+        return SanitizedToolPreview(_truncate_preview(text, max_len)) if text else None
+    except Exception:
+        return None
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -460,15 +477,19 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if not args:
         return None
     args = redact_tool_args_for_display(tool_name, args) or args
+    if tool_name in ("terminal", "execute_code"):
+        value = args.get("command" if tool_name == "terminal" else "code")
+        return sanitize_tool_preview(str(value), max_len, shell=True) if value is not None else None
     builder = _PREVIEW_BUILDERS.get(tool_name)
     if builder is not None:
+        # Custom builders can clip internally; do not certify their partial text.
         return builder(args, max_len)
     key = _PRIMARY_ARGS.get(tool_name) or next((k for k in _FALLBACK_PREVIEW_KEYS if k in args), None)
     if not key or key not in args:
         return None
     value = args[key]
-    preview = _oneline(str((value[0] if value else "") if isinstance(value, list) else value))
-    return _tail_trunc(preview, max_len) if preview else None
+    preview = str((value[0] if value else "") if isinstance(value, list) else value)
+    return sanitize_tool_preview(preview, max_len)
 
 
 def prepare_tool_preview(tool_name: str, args: dict | None, *, fallback: str, max_len: int) -> ToolPreview:

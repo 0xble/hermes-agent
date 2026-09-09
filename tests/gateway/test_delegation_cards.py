@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.display import get_tool_emoji
+from agent.display import build_tool_preview, get_tool_emoji
+from agent.codex_runtime import _codex_item_to_preview
 from gateway.config import Platform
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
@@ -112,17 +113,32 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
         profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""),
         preview="PRIVATE_PREVIEW", args={"token": "PRIVATE_ARGUMENT"}, goal="PRIVATE_GOAL")
     await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
-    await cards.observe(source, "r", "s", 1, "subagent.tool", tool, data)
+    await cards.observe(source, "r", "s", 1, "subagent.tool", tool, data,
+                        preview=build_tool_preview("web_search", {"query": "Inspecting gateway tool usage " + "details " * 40}, max_len=0))
     await drain_cards(cards)
     expected = tool[:60]
     plain = render_card(cards.cards["a" * 32], now=0)
-    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected}"
+    detail = cards.cards["a" * 32]["rows"]["A"]["tool_detail"]
+    assert len(detail) == 160 and detail.endswith("…")
+    assert "Inspecting gateway tool usage" in detail
+    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected} · `{detail}`"
     sent = adapter._bot.send_message.call_args.kwargs["text"]
     assert expected.replace("_", "\\_") in sent
     # A distinct update must exercise edit formatting, not unchanged suppression.
     await cards.observe(source, "r", "s", 1, "subagent.tool", "next_" + tool, data)
     await drain_cards(cards)
     edited = adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert "Inspecting gateway" not in edited  # missing preview clears stale detail
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "terminal", data,
+                        preview=_codex_item_to_preview(dict(type="commandExecution", command="false || echo retry || true")))
+    await drain_cards(cards)
+    literal = adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert "`false || echo retry || true`" in literal
+    markdown = "**bold** [link](https://example.test) ~~strike~~ \u005c\u005cpath"
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "terminal", data,
+                        preview=_codex_item_to_preview(dict(type="commandExecution", command=markdown)))
+    await drain_cards(cards)
+    assert "`" + markdown.replace("\\", "\\\\") + "`" in adapter._bot.edit_message_text.call_args.kwargs["text"]
     assert ("next_" + tool)[:60].replace("_", "\\_") in edited
     for text in (plain, sent, edited, cards.path.read_text(encoding="utf-8")):
         assert "PRIVATE_" not in text
@@ -132,6 +148,27 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
     row = cards.cards["a" * 32]["rows"]["A"]
     many = dict(started_at=0, rows={str(i): {**row, "thread_ref": str(i)} for i in range(100)})
     assert len(render_card(many, now=0)) <= 3500
+
+
+def test_tool_detail_redacts_before_truncation_and_fails_closed(monkeypatch):
+    from gateway import delegation_cards
+    secret = "synthetic-private-token-123456789"
+    preview = "https://example.test/check?token=" + secret + "&q=checks"
+    detail = delegation_cards._tool_detail(preview)
+    assert detail == ""
+    assert secret not in delegation_cards._tool_detail("API_KEY=" + secret + "x" * 200)
+    from agent.codex_runtime import _codex_item_to_preview
+    native = _codex_item_to_preview(dict(type="mcpToolCall", arguments={"password": "z" * 200}))
+    assert "z" * 20 not in delegation_cards._tool_detail(native)
+    truncated_url = "https://user:" + "z" * 200
+    assert "z" * 20 not in delegation_cards._tool_detail(truncated_url[:120])
+    ordinary = build_tool_preview("web_search", {"query": "ordinary preview"}, max_len=0)
+    assert delegation_cards._tool_detail(ordinary) == "ordinary preview"
+    # String-only transport loses proof rather than admitting unverifiable text.
+    assert delegation_cards._tool_detail(str(ordinary)) == ""
+    assert delegation_cards._tool_detail(build_tool_preview("web_search", {"query": "echo `whoami`"})) == ""
+    monkeypatch.setattr(delegation_cards, "redact_sensitive_text", lambda *a, **k: 1 / 0)
+    assert delegation_cards._tool_detail(ordinary) == ""
 
 
 @pytest.mark.asyncio
@@ -155,13 +192,33 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     assert adapter.send_delegation_card.call_args.args[1].startswith("🧵 **Delegating · ")
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
-    relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
+    relay.progress_callback("subagent.tool", "terminal", preview="API_KEY=supersecret123456789", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert f"↳ {get_tool_emoji('terminal')} terminal" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
-    assert "SECRET" not in adapter.edit_message.call_args.args[2]
+    assert "supersecret123456789" not in adapter.edit_message.call_args.args[2]
+    assert cards.cards["a" * 32]["rows"]["A"]["tool_detail"] == ""
+    # Exercise native/raw partial previews through the real callback and persistence path.
+    secret = "syntheticPASSWORD" * 30
+    previews = [
+        _codex_item_to_preview(dict(type="mcpToolCall", arguments={"password": secret})),
+        ("https://alice:" + secret + "@example.test")[:120],
+        build_tool_preview("browser_navigate", {"url": "https://alice:" + secret + "@example.test"}, max_len=120),
+        _codex_item_to_preview(dict(type="commandExecution", command="curl https://alice:" + secret + "@example.test")),
+    ]
+    for preview in previews:
+        relay.progress_callback("subagent.tool", "terminal", preview=preview, **data)
+        await asyncio.gather(*tasks)
+        await drain_cards(cards)
+        for text in (cards.path.read_text(encoding="utf-8"), render_card(cards.cards["a" * 32])):
+            assert "syntheticPASSWORD" not in text
+    ordinary = _codex_item_to_preview(dict(type="commandExecution", command="python -m pytest tests/gateway/test_delegation_cards.py"))
+    relay.progress_callback("subagent.tool", "terminal", preview=ordinary, **data)
+    await asyncio.gather(*tasks)
+    await drain_cards(cards)
+    assert "python -m pytest" in cards.path.read_text(encoding="utf-8")
     relay.progress_callback("subagent.complete", status="completed", **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))

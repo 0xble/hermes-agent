@@ -14,7 +14,8 @@ import threading
 import time
 from pathlib import Path
 
-from agent.display import get_tool_emoji
+from agent.display import SanitizedToolPreview, get_tool_emoji
+from agent.redact import redact_sensitive_text
 from gateway.config import Platform
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
@@ -37,6 +38,18 @@ def _tool_label(value, default="tool", limit=40):
     return text[:limit] or default
 
 
+def _tool_detail(preview):
+    """Persist only previews sanitized by their producer before any truncation."""
+    if not isinstance(preview, SanitizedToolPreview) or "`" in preview:
+        return ""  # Partial/native/custom previews cannot prove their redaction boundary.
+    try:
+        text = redact_sensitive_text(preview, force=True, redact_url_credentials=True)
+        text = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", text).split())
+        return text[:159] + "…" if len(text) > 160 else text
+    except Exception:
+        return ""  # Redaction failure must never expose the original preview.
+
+
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
     # Plain rich text: cards must never render as a native quote or fake border.
@@ -54,8 +67,11 @@ def render_card(card, now=None):
             activity = "Interrupted / unknown · gateway restarted"
         elif row.get("last_tool"):
             tool = row["last_tool"]
-            # Show the full stored name excerpt; never ingest previews or args.
             activity = f"{get_tool_emoji(tool)} {_tool_label(tool, 'tool', 60)}"
+            if detail := row.get("tool_detail"):
+                # The adapter protects inline code before interpreting Markdown.
+                # Backtick-bearing previews are omitted at ingestion.
+                activity += f" · `{detail}`"
         else:
             activity = "Started · awaiting activity"
         lines.append(f"↳ {activity}")
@@ -226,13 +242,13 @@ class DelegationCards:
         if key not in self.pending:
             self.pending[key] = asyncio.create_task(self._flush(key))
 
-    async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data):
+    async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data, *, preview=None):
         scope = ((data.get("owner") or {}).get("profile", ""), getattr(source, "profile", None),
                  source.platform.value, str(source.chat_id), str(source.thread_id or ""))
         async with self.locks.setdefault(scope, asyncio.Lock()):
-            await self._observe(source, session_key, session_id, generation, event_type, tool_name, data)
+            await self._observe(source, session_key, session_id, generation, event_type, tool_name, data, preview=preview)
 
-    async def _observe(self, source, session_key, session_id, generation, event_type, tool_name, data):
+    async def _observe(self, source, session_key, session_id, generation, event_type, tool_name, data, *, preview=None):
         key, ref = data.get("parent_task_id"), data.get("thread_ref")
         owner = data.get("owner") or {}
         if (source.platform != Platform.TELEGRAM or not isinstance(key, str)
@@ -270,6 +286,7 @@ class DelegationCards:
             row["state"] = data.get("status") if data.get("status") in _TERMINAL else "completed"
         elif row and event_type == "subagent.tool" and tool_name:
             row["last_tool"] = _tool_label(tool_name, "tool", 60)
+            row["tool_detail"] = _tool_detail(preview)
         else:
             return
         self._bind(key)

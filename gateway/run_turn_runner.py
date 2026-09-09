@@ -133,7 +133,8 @@ class TurnRunner:
             from gateway.delegation_cards import cards_for
             self._schedule(cards_for(self._runner).observe(
                 ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
-                event_type, tool_name, kwargs), "delegation card scheduling error")
+                event_type, tool_name, kwargs,
+                preview=preview if event_type == "subagent.tool" else None), "delegation card scheduling error")
             return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.

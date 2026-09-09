@@ -235,7 +235,8 @@ def _codex_item_to_preview(item: dict) -> Any:
     """Short preview for the tool.started bubble; None when nothing useful (UI tolerates None)."""
     item_type = item.get("type") or ""
     if item_type in _PREVIEW_FIELDS:
-        return (item.get(_PREVIEW_FIELDS[item_type]) or "")[:120] or None
+        from agent.display import sanitize_tool_preview
+        return sanitize_tool_preview(item.get(_PREVIEW_FIELDS[item_type]) or "", 120)
     if item_type == "fileChange":
         paths = [c.get("path") for c in _item_changes(item) if c.get("path")]
         return (", ".join(paths[:3]) + (f", +{len(paths) - 3} more" if len(paths) > 3 else "")) if paths else None
