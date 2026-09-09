@@ -41,6 +41,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
+| HERMES-135 | Active | `fix(telegram): preserve nested and multiline legacy emphasis` | Resolve valid asterisk emphasis without stripping unmatched literals. |
 | HERMES-131 | Active | `fix(backup): retain verified quick-snapshot recovery generations` | Bound partial snapshot retention while preserving complete and verified per-database recovery coverage. |
 | HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
 | HERMES-130 | Active | `feat(gateway): queue MoA requests during active turns` | Accept MoA requests immediately for a separate queued one-shot turn. |
@@ -1750,6 +1751,20 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Rollback:** Revert only this retention candidate's `backup.py` pruning/copy-metadata hunks and focused tests, including the two source-proposal commits, or revert its landed fork PR. Do not remove other full-backup exclusions or touch any existing snapshots. Rollback prevents future pruning behavior; it cannot recreate snapshots already expired under the configured retention contract.
 - **Retirement:** Remove the fork-only implementation when released upstream passes bounded incomplete retention, newest complete generation, readable omitted-DB coverage, alternating failures, and snapshot-family/profile isolation regressions. Preserve useful behavior tests only when not duplicated upstream.
 - **Runtime scope:** Source-only. No live snapshot cleanup, configuration change, B2 action, deployment or restart authorized or performed.
+
+
+
+### HERMES-135 — Valid nested and multiline legacy Telegram emphasis
+
+- **Status:** Published-source candidate only. No managed checkout mutation, promotion, configuration change, or restart.
+- **Contract and provenance:** Reproduced sequential bold/italic regex corruption of `***bold italic***`, `**bold *italic* text**`, and multiline bold on upstream `2db0c7a2d8f29debe7d1cbfb4a72f4f98dc00808`. The earlier investigation had already inspected prior art; this is not an unanchored hypothesis. Reuse the installed markdown-it delimiter resolver rather than inventing a tokenizer; preserve code placeholders, unsupported/literal markers and existing surrounding syntax. Valid syntax repair does not repair malformed model Markdown or the separate rich-message renderer.
+- **Source surfaces:** `plugins/platforms/telegram/adapter.py`, `plugins/platforms/telegram/emphasis.py`, `tests/gateway/test_telegram_emphasis.py`. No new dependency, state, schema, or configuration. The legacy send path remains the integration boundary.
+- **Upstream tracking:** [Issue #106891](https://github.com/NousResearch/hermes-agent/issues/106891). Related open #55887 strips leftover markers and does not fulfill nested-emphasis/literal-preservation semantics; #11287 proposes a broad entities rewrite. Quote issue #90773 and PR #90781 have a different contract. No matching nested-emphasis issue or emphasis PR was found in the immediate pre-filing search on 2026-09-09.
+- **Upstream PR:** [#106906](https://github.com/NousResearch/hermes-agent/pull/106906), contribution commit `37f872bad1706c6c50ccdccb825fc4d5ffd2c246`. Same implementation, without fork-specific metadata. Publication is not upstream acceptance; do not merge upstream automatically.
+- **Regression:** `scripts/run_tests.sh -j 8 tests/gateway/test_telegram*.py tests/gateway/test_table_helpers.py` passed 904 tests across 74 fork files, zero failures, three platform skips. Two parametrized invariants exercise actual legacy send payloads and preservation of literals/protected syntax. Final upstream red: ten failing cases and twenty passing preservation cases; final focused suite: 72 passed. Final broader upstream suite: 695 passed, two image-timeout failures also reproduced on clean baseline, two skips. No live Telegram server/rendering or full-repository test claim.
+- **Review:** Final autoreview `f2d17067772a4c14bef722ce05bf0dd2` is clean at P0–P2 with `satisfies_review_gate=true`; candidate `1902d66a509a94842886a809b6c9459e3daca1907eac492694286218d604beb6`. Policy selected Claude Fable/Opus but that route was unavailable, so the supported isolated Codex Astra fallback completed review. Earlier passes identified seven findings, all reproduced and fixed (underscore and block boundaries, crossing strike/spoiler spans, hardbreak preservation, quote continuation). Same lineage continued throughout. Final receipt/evidence retained under `~/.hermes/logs/patch-evidence/telegram-emphasis-2026-09-09/`. After review, only publication/evidence metadata changed; source integration onto newer fork main changed no behavior.
+- **Rollback:** Revert only the scoped HERMES-135 landed commit (adapter emphasis hunk, helper, focused tests and this entry), preserving all rich-message and other Telegram fork patches. No persistent state needs rollback.
+- **Retirement:** Replace this implementation when released upstream passes equivalent valid combined/nested/multiline asterisk emphasis and literal/code/link/bullet/quote preservation regressions. Do not retain duplicate fork code or tests.
 
 ## Automatic synchronization
 
