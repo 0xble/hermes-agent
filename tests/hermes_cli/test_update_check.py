@@ -2,12 +2,47 @@
 
 import json
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _git(args: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_passive_check_reads_only_configured_fork_origin(tmp_path):
+    """A real checkout learns a fork update without an upstream remote or fallback."""
+    from hermes_cli import banner
+
+    remote = tmp_path / "brian-fork.git"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    _git(["init", "--bare", "-b", "main", str(remote)], tmp_path)
+    _git(["init", "-b", "main", str(seed)], tmp_path)
+    _git(["config", "user.email", "test@example.com"], seed)
+    _git(["config", "user.name", "Test User"], seed)
+    (seed / "tracked.txt").write_text("first\n", encoding="utf-8")
+    _git(["add", "tracked.txt"], seed)
+    _git(["commit", "-m", "initial"], seed)
+    _git(["remote", "add", "origin", str(remote)], seed)
+    _git(["push", "origin", "main"], seed)
+    _git(["clone", str(remote), str(checkout)], tmp_path)
+
+    (seed / "tracked.txt").write_text("second\n", encoding="utf-8")
+    _git(["commit", "-am", "fork release"], seed)
+    _git(["push", "origin", "main"], seed)
+
+    assert _git(["remote"], checkout).splitlines() == ["origin"]
+    assert banner._check_via_local_git(checkout) == 1
+    assert _git(["remote"], checkout).splitlines() == ["origin"]
 
 
 
@@ -24,7 +59,10 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
 
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(
-        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}),
+        json.dumps({
+            "ts": time.time(), "behind": 3, "ver": __version__,
+            "source": "git@github.com:0xble/hermes-agent.git",
+        }),
         encoding="utf-8",
     )
 
@@ -61,8 +99,8 @@ def test_prefetch_non_blocking():
         assert banner._update_result == 5
 
 
-def test_upstream_main_sha_disables_git_prompts(monkeypatch):
-    """The passive HTTPS probe must never inherit the interactive terminal."""
+def test_fork_main_sha_disables_git_prompts(monkeypatch):
+    """The passive fork probe must never inherit the interactive terminal."""
     from hermes_cli import banner
 
     completed = MagicMock(returncode=1, stdout="", stderr="auth required")
@@ -74,6 +112,7 @@ def test_upstream_main_sha_disables_git_prompts(monkeypatch):
     assert kwargs["stdin"] is banner.subprocess.DEVNULL
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"
+    assert kwargs["env"]["GIT_SSH_COMMAND"] == "ssh -o BatchMode=yes"
 
 
 def test_check_via_local_git_fetch_failure_returns_none(tmp_path, monkeypatch):
@@ -132,10 +171,8 @@ def test_check_via_local_git_fetch_failure_returns_none(tmp_path, monkeypatch):
     assert fetch_kwargs["env"]["GCM_INTERACTIVE"] == "Never"
 
 
-def test_check_via_local_git_fetch_failure_keeps_positive_stale_count(tmp_path, monkeypatch):
-    """A failed fetch must preserve sound evidence: if the stale origin/main
-    ref already shows HEAD behind, that positive count is still an update
-    signal and must be returned (review #92578)."""
+def test_check_via_local_git_fetch_failure_never_uses_stale_ref(tmp_path, monkeypatch):
+    """A failed fork fetch is inconclusive; stale refs cannot authorize a notice."""
     from hermes_cli import banner
 
     repo_dir = tmp_path / "hermes-agent"
@@ -154,26 +191,20 @@ def test_check_via_local_git_fetch_failure_keeps_positive_stale_count(tmp_path, 
     failed_proc.stdout = ""
     failed_proc.stderr = "fatal: could not reach remote"
 
-    stale_behind_proc = MagicMock()
-    stale_behind_proc.returncode = 0
-    stale_behind_proc.stdout = "5"
-
     def mock_run(args, **kwargs):
         if args[:2] == ["git", "fetch"]:
             return failed_proc
-        if args[:2] == ["git", "rev-list"]:
-            return stale_behind_proc
         raise AssertionError(f"unexpected subprocess.run: {args}")
 
     monkeypatch.setattr(banner, "_git_stdout", mock_git_stdout)
     monkeypatch.setattr(banner.subprocess, "run", mock_run)
 
     result = banner._check_via_local_git(repo_dir)
-    assert result == 5, "Stale positive behind-count must be preserved on fetch failure"
+    assert result is None
 
 
-def test_check_via_local_git_fetch_failure_rev_list_error_returns_none(tmp_path, monkeypatch):
-    """If the stale rev-list itself fails, the check stays inconclusive (None)."""
+def test_check_via_local_git_fetch_failure_does_not_run_rev_list(tmp_path, monkeypatch):
+    """A failed fork fetch stops before any stale-ref comparison."""
     from hermes_cli import banner
 
     repo_dir = tmp_path / "hermes-agent"

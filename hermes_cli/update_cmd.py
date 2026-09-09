@@ -94,7 +94,7 @@ from hermes_cli.update_cmd_git import (  # noqa: F401
     _has_upstream_remote, _is_fork, _locate_real_git, _mark_skip_upstream_prompt,
     _normalize_managed_eol, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
-    _prune_orphan_rescue_refs, _should_skip_upstream_prompt, _sync_fork_with_upstream,
+    _prune_orphan_rescue_refs, _should_skip_upstream_prompt,
     _sync_with_upstream_if_needed)
 from hermes_cli.update_cmd_maint import (  # noqa: F401
     _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE, _STALE_PURGE_PREFIXES,
@@ -491,24 +491,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     if swept:
         print(f"  (removed {len(swept)} aborted-fetch pack temp file(s))")
 
-    # Fetch only <branch> (a bare fetch pulls thousands of auto-generated branches). Prefer
-    # upstream only for main (a fork's other branches have no upstream counterpart). Installer
-    # checkouts are shallow: a plain fetch would unshallow them and rev-list would report a
-    # bogus huge "behind" count, so fetch --depth 1 and report presence-only.
+    # The maintained fork is the release authority; upstream integration is maintenance,
+    # never part of a runtime check. Preserve shallow checkout boundaries.
     is_shallow = _is_shallow_checkout(git_cmd)
     depth_args = ["--depth", "1"] if is_shallow else []
-
-    # Probe locally for an 'upstream' remote before a network fetch non-forks always fail.
-    fetch_result = None
-    if branch == "main" and _git_run(git_cmd, ["remote", "get-url", "upstream"]).returncode == 0:
-        print("→ Fetching from upstream...")
-        fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + ["upstream", branch], network=True)
-    if fetch_result is not None and fetch_result.returncode == 0:
-        compare_branch = f"upstream/{branch}"
-    else:
-        print("→ Fetching from origin...")
-        fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + ["origin", branch], network=True)
-        compare_branch = f"origin/{branch}"
+    print("→ Fetching from origin...")
+    fetch_result = _git_run(git_cmd, ["fetch"] + depth_args + ["origin", branch], network=True)
+    compare_branch = f"origin/{branch}"
 
     if fetch_result.returncode != 0:
         _print_fetch_failure(fetch_result.stderr)
@@ -701,7 +690,7 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
             print("  Then re-run the update. Local work is untouched.")
             sys.exit(1)
         return
-    # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
+    # Same branch: a true remote force-push/rebase; local changes are stashed, so reset.
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
     # local graph, so park pre_pull_sha behind a rescue ref first.
     merge_base_result = _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"])
@@ -903,26 +892,7 @@ def _prepare_checkout_for_update(
         # counted == 0 means local-ahead: falls through to the up-to-date path.
         commit_count = counted if counted is not None else -1
 
-    # A fork can match origin yet trail upstream, so the sync can move HEAD with
-    # commit_count == 0; detect that BEFORE the no-update return so deps, restarts AND the
-    # fleet matrix still run (it used to live in the early-return branch and verified nothing).
-    # The sync can therefore advance HEAD even though the origin comparison found no commits. Detect that
-    # BEFORE taking the no-update return so dependency refreshes, gateway restarts, AND the fleet version
-    # matrix still run for the pulled code (#73108 — previously the sync lived inside the commit_count == 0
-    # branch, which returns immediately after: an update that pulled hundreds of upstream commits printed
-    # "Already up to date!" and verified nothing). Non-fork checkouts have no upstream question: origin IS
-    # the official repo, so "Already up to date!" is fully verified there.
-    upstream_checked = True
-    if commit_count == 0 and is_fork and branch == "main":
-        pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        upstream_checked = _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
-        post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
-            synced_count = _count_commits_between(
-                git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
-            # HEAD moving is proof of an update even if the count can't be read.
-            commit_count = max(1, synced_count)
+    upstream_checked = True  # Origin is the sole release authority in this fork.
 
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
@@ -1239,10 +1209,6 @@ def _apply_pulled_update(
     _write_fleet_restart_pending_marker(expected_sha=post_pull_sha or "")
     # Stale .pyc would ImportError on gateway restart when new source references new names.
     _sweep_bytecode_after_update(pinned_revision or branch)
-
-    if is_fork and branch == "main" and not pinned_revision:
-        _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=opts.assume_yes, input_fn=opts.gw_input_fn)
 
     if pinned_revision:
         from hermes_cli.update_revision import verify_revision_head

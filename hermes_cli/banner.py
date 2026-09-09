@@ -131,7 +131,7 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600  # avoid repeated git fetches
 # Returned when an update is known to exist but commits can't be counted (e.g. nix builds).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+_UPSTREAM_REPO_URL = "git@github.com:0xble/hermes-agent.git"
 _OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
@@ -174,7 +174,13 @@ def _git_run(args: list[str], *, cwd: Optional[Path] = None, timeout: int = 5, t
     # ``hermes serve``), where a bare git child flashes a console window.
     kwargs: dict = {"creationflags": windows_hide_flags()}
     if network:
-        kwargs.update({"stdin": subprocess.DEVNULL, "env": noninteractive_git_env()})
+        # Git honors an inherited GIT_SSH_COMMAND over core.sshCommand.  The banner runs this
+        # path in a background thread, so a user override such as `ssh -o BatchMode=no` must not
+        # reopen /dev/tty for a host-key or password prompt.  Losing a custom SSH wrapper makes
+        # this best-effort check inconclusive; stealing the interactive CLI is never acceptable.
+        env = noninteractive_git_env()
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes"
+        kwargs.update({"stdin": subprocess.DEVNULL, "env": env})
     try:
         return subprocess.run(
             ["git", *args], capture_output=True, timeout=timeout, cwd=str(cwd) if cwd is not None else None,
@@ -219,7 +225,7 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     """
     if not (_is_full_sha(current_rev) and _is_full_sha(target_rev)):
         return None
-    url = f"https://api.github.com/repos/nousresearch/hermes-agent/compare/{current_rev}...{target_rev}"
+    url = f"https://api.github.com/repos/0xble/hermes-agent/compare/{current_rev}...{target_rev}"
 
     def _fetch():
         import urllib.request
@@ -265,23 +271,7 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     """Count commits behind origin/main in a local checkout."""
-    # Probe the origin URL under the same config-isolated env as the fetch below. A plain
-    # get-url applies a global url.<https>.insteadOf rewrite, so an SSH origin masquerades as
-    # HTTPS, the SSH-avoiding fast path is skipped — and the fetch, whose env drops global
-    # config (GIT_CONFIG_GLOBAL=/dev/null), dials the raw SSH origin; its host-key prompt opens
-    # /dev/tty directly and steals the CLI's keystrokes (#104591).
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir, network=True)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        if not head_rev:
-            return None
-        # Passive probe via HTTPS ls-remote (never SSH — no hardware-key prompts). Tip SHAs alone
-        # can't distinguish "behind" from a local commit AHEAD of origin/main, and misreporting an
-        # ahead checkout nudges the user into `hermes update`, which can wipe carried work — hence
-        # the ancestor check, against the FRESH upstream SHA (a stale tracking ref can't fake an
-        # up-to-date report).
-        return _tips_behind(head_rev, _upstream_main_sha(), repo_dir)
-
+    # Use the checkout's authenticated origin, including private-fork SSH remotes.
     # Installer checkouts are shallow (`git clone --depth 1`): a plain `git fetch` would unshallow
     # the repo and `rev-list --count HEAD..origin/main` would report a bogus "12492 commits
     # behind". Fetch with --depth 1 to preserve the boundary and compare tip SHAs instead. Full
@@ -305,9 +295,8 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         return _git_ok(fetch_args, cwd=repo_dir, timeout=10, network=True)
 
     fetch_ok = _quiet(_fetch, False)  # Offline or timeout — don't use stale refs
-    # When the fetch fails the local origin/main ref is stale: it cannot prove *currentness*, but
-    # if it already shows HEAD behind, that is sound evidence an update exists. Return the positive
-    # stale count; None (inconclusive) otherwise so the caller doesn't cache a false "up to date".
+    if not fetch_ok:
+        return None  # A failed fork fetch is inconclusive, never an upstream fallback.
     if is_shallow:
         # (#82166, review #92578)
         if not fetch_ok:
@@ -357,7 +346,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     now = time.time()
     cached = _read_json(cache_file)
     if (cached is not None and now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-            and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION):
+            and cached.get("rev") == embedded_rev and cached.get("ver") == VERSION
+            and cached.get("source") == _UPSTREAM_REPO_URL):
         return cached.get("behind")
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
@@ -369,7 +359,7 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     # fetch), and caching it would suppress retries for the full 6-hour window (#82166).
     if behind is not None:
         _quiet(lambda: cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}), encoding="utf-8"))
+            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION, "source": _UPSTREAM_REPO_URL}), encoding="utf-8"))
     return behind
 
 
@@ -417,13 +407,13 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
-_RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
+_RELEASE_URL_BASE = "https://github.com/0xble/hermes-agent/releases/tag"
 
 
 def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     """Return ``(tag, release_url)`` for the latest local git tag, or None (a miss is cached too).
 
-    Release URL always points at the canonical NousResearch/hermes-agent repo (forks get no link).
+    Release URL always points at the maintained fork (unversioned installs get no link).
     """
     def _compute():
         rd = repo_dir or _resolve_repo_dir()
