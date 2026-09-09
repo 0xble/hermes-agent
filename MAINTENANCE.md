@@ -8,9 +8,9 @@ This file is a useful inventory of Brian-owned patches and retirement evidence. 
 
 When official upstream releases behavior that satisfies a patch contract, the private implementation must be **completely retired in favor of upstream**. Do not keep both implementations, a compatibility shim, disabled private code, or duplicate fork-specific tests “just in case.” Inspect the upstream implementation, run this entry's regressions against it, remove the private code, adapt or delete duplicate tests, promote the upstream-backed candidate across every active runtime, and verify the behavior there. Git history is the rollback record.
 
-Record the removal commit's stable subject on the `Retired` row so fork-only code history remains attributable. An upstream issue, pull request, merge, or similar-looking commit is not enough. Retirement requires equivalent released behavior proven against the patch contract. If upstream only partially covers the contract, narrow and re-document the remaining private patch rather than claiming retirement.
+When useful, record the removal commit subject or resolved SHA on the `Retired` row as historical provenance. An upstream issue, pull request, merge, or similar-looking commit is not enough to establish equivalent behavior. Retirement requires equivalent released behavior proven against the patch contract. If upstream only partially covers the contract, narrow and re-document the remaining private patch rather than claiming retirement.
 
-Stable commit subjects survive rebases and are the manifest keys. Resolve the current SHA from the fetched fork history instead of persisting a value that the next upstream rebase will invalidate.
+Commit subjects and resolved SHAs are optional, human-readable provenance, not manifest keys or publication requirements. Resolve a current SHA from fetched fork history only when it materially helps attribution or review; do not reconstruct or rewrite history to complete this inventory.
 
 ## Goal instruction contract — active
 
