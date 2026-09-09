@@ -37,7 +37,7 @@ def test_renamed_file_without_source_path_fails_closed() -> None:
         extract_complete_file_list(payload)
 
 
-def test_compare_file_cap_fails_so_action_can_fail_open() -> None:
+def test_compare_file_cap_fails_closed() -> None:
     payload = _compare_payload([f"docs/{index}.md" for index in range(300)])
     with pytest.raises(ValueError, match="300-file cap"):
         extract_complete_file_list(payload)

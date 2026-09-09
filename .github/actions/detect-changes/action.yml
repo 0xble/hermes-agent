@@ -2,8 +2,8 @@ name: Detect affected areas
 description: >-
   Classify a PR's changed files into CI work lanes (python, frontend, site,
   scan, deps, mcp_catalog) so the orchestrator can conditionally call only
-  the sub-workflows a PR or main push can affect. Classification fails open
-  (everything "true") when the immutable compare cannot be computed.
+  the sub-workflows a PR or main push can affect. Classification fails closed
+  when the immutable compare cannot be computed.
 
 inputs:
   github-token:
@@ -92,7 +92,10 @@ runs:
 
         # PRs and main pushes both have immutable before/after SHAs. Classify
         # both so a docs-only merge does not expand into every product lane.
-        # Other callers fail open by leaving CHANGED empty.
+        # Explicit dispatches and schedules intentionally leave CHANGED empty
+        # so they run every lane. PRs and pushes must have a complete immutable
+        # compare; an unavailable compare blocks rather than substituting a
+        # mutable PR-files listing or widening an untrusted diff to all lanes.
         if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "push" ]; then
           # Use the compare endpoint with the pinned base/head SHAs from the
           # event payload instead of the "current PR files" endpoint. The SHAs
@@ -100,13 +103,12 @@ runs:
           # if the PR receives a new push between trigger and detect.
           #
           # Retried: a rate-limit blip or eventual-consistency 404 on a
-          # freshly-pushed HEAD would otherwise silently fall open (all lanes
-          # run — safe, but wasteful and it masks the API failure).
+          # freshly-pushed HEAD would otherwise block this run.
           #
           # The compare endpoint caps `files` at 300 even when `total_files` is
           # larger. compare_files.py rejects any incomplete or malformed
-          # response so this action takes the safe fail-open path instead of
-          # silently skipping lanes affected only by omitted files.
+          # response so this action blocks instead of silently skipping lanes
+          # affected only by omitted files.
           CHANGED=""
           for i in 1 2 3; do
             if CHANGED="$(gh api \
@@ -115,9 +117,8 @@ runs:
               break
             fi
             if [ "$i" = 3 ]; then
-              echo "::warning::compare API failed after 3 attempts — failing open (all lanes run)"
-              CHANGED=""
-              break
+              echo "::error::compare API failed after 3 attempts; refusing to classify an incomplete diff"
+              exit 1
             fi
             echo "::warning::compare API failed (attempt $i); retrying in 10s"
             sleep 10

@@ -8,11 +8,9 @@ change could have broken.
 from __future__ import annotations
 
 import importlib.util
-import io
-import json
+import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -25,8 +23,7 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify = _mod.classify
 ci_review_files = _mod.ci_review_files
-pull_request_changed_files = _mod.pull_request_changed_files
-main = _mod.main
+
 
 DEFAULT = {
     "python": True,
@@ -345,6 +342,127 @@ def _yaml(rel: str) -> dict:
     return yaml.safe_load((_REPO / rel).read_text(encoding="utf-8"))
 
 
+def _run_detect_changes(
+    tmp_path: Path, responses: list[str], event_name: str = "pull_request"
+) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
+    """Run the composite action's actual shell with deterministic API doubles."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    response_dir = tmp_path / "responses"
+    response_dir.mkdir()
+    for index, response in enumerate(responses, start=1):
+        (response_dir / str(index)).write_text(response, encoding="utf-8")
+
+    calls = tmp_path / "gh-calls"
+    sleeps = tmp_path / "sleeps"
+    (fake_bin / "gh").write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "calls = Path(os.environ['FAKE_GH_CALLS'])\n"
+        "attempt = int(calls.read_text() or '0') + 1 if calls.exists() else 1\n"
+        "calls.write_text(str(attempt))\n"
+        "Path(os.environ['FAKE_GH_ARGS']).write_text(' '.join(os.sys.argv[1:]))\n"
+        "response = (Path(os.environ['FAKE_GH_RESPONSES']) / str(attempt)).read_text()\n"
+        "if response == '__FAIL__':\n"
+        "    raise SystemExit(1)\n"
+        "print(response, end='')\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "sleep").write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_SLEEPS\"\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "gh").chmod(0o755)
+    (fake_bin / "sleep").chmod(0o755)
+
+    output = tmp_path / "github-output"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "EVENT_NAME": event_name,
+        "REPO": "NousResearch/hermes-agent",
+        "BASE_SHA": "base-sha",
+        "HEAD_SHA": "head-sha",
+        "GITHUB_OUTPUT": str(output),
+        "FAKE_GH_CALLS": str(calls),
+        "FAKE_GH_ARGS": str(tmp_path / "gh-args"),
+        "FAKE_GH_RESPONSES": str(response_dir),
+        "FAKE_SLEEPS": str(sleeps),
+    }
+    run = _yaml(".github/actions/detect-changes/action.yml")["runs"]["steps"][0]["run"]
+    completed = subprocess.run(
+        ["bash", "-c", run],
+        cwd=_REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed, output, calls, sleeps
+
+
+def test_detect_changes_retries_then_classifies_with_immutable_compare(tmp_path: Path) -> None:
+    completed, output, calls, sleeps = _run_detect_changes(
+        tmp_path,
+        ["not json", '{"files": [{"filename": "README.md"}]}'],
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert calls.read_text() == "2"
+    assert sleeps.read_text().splitlines() == ["10"]
+    assert "repos/NousResearch/hermes-agent/compare/base-sha...head-sha" in (
+        (tmp_path / "gh-args").read_text()
+    )
+    assert "/pulls/" not in (tmp_path / "gh-args").read_text()
+    assert "python=false" in output.read_text()
+    assert "ci_review_files=[]" in output.read_text()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "__FAIL__",
+        "not json",
+        '{"files": [' + ",".join('{"filename": "docs/%s.md"}' % i for i in range(300)) + "]}",
+        '{"files": [{}]}',
+    ],
+    ids=["api-exhausted", "malformed", "truncated", "invalid-file"],
+)
+def test_detect_changes_blocks_after_exhausted_untrusted_compare(
+    tmp_path: Path, response: str
+) -> None:
+    completed, output, calls, sleeps = _run_detect_changes(tmp_path, [response] * 3)
+
+    assert completed.returncode != 0
+    assert calls.read_text() == "3"
+    assert sleeps.read_text().splitlines() == ["10", "10"]
+    assert not output.exists(), "the classifier must not emit lane outputs after compare failure"
+
+
+def test_detect_changes_accepts_a_valid_empty_immutable_diff(tmp_path: Path) -> None:
+    completed, output, calls, sleeps = _run_detect_changes(tmp_path, ['{"files": []}'])
+
+    assert completed.returncode == 0, completed.stderr
+    assert calls.read_text() == "1"
+    assert not sleeps.exists()
+    assert "python=true" in output.read_text()
+    assert "risk_full=true" in output.read_text()
+
+
+@pytest.mark.parametrize("event_name", ["workflow_dispatch", "schedule"])
+def test_detect_changes_keeps_explicit_non_compare_events_broad(
+    tmp_path: Path, event_name: str
+) -> None:
+    completed, output, calls, sleeps = _run_detect_changes(tmp_path, [], event_name)
+
+    assert completed.returncode == 0, completed.stderr
+    assert not calls.exists()
+    assert not sleeps.exists()
+    assert "python=true" in output.read_text()
+    assert "risk_full=true" in output.read_text()
+
+
 def test_every_lane_reaches_the_composite_action():
     """The action is the one surface every consumer reads, so it must carry all
     of them — ci.yaml, nix.yml and docker.yml each re-export a different subset.
@@ -396,82 +514,3 @@ def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():
         ".github/workflows/ci.yml",
         "apps/desktop/eslint.config.mjs",
     ]
-
-
-def _write_event(tmp_path, number: int | None = 88442) -> Path:
-    payload = {"pull_request": {"number": number}} if number is not None else {}
-    path = tmp_path / "event.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
-
-
-def test_pull_request_changed_files_skips_non_pr_events(monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "push")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    assert pull_request_changed_files() == []
-
-
-def test_pull_request_changed_files_skips_without_pr_number(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path, number=None)))
-    assert pull_request_changed_files() == []
-
-
-def test_pull_request_changed_files_parses_gh_output(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path)))
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args[0],
-            0,
-            stdout="scripts/install.sh\ntests/test_install_sh_node_deps_workspaces.py\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
-    assert pull_request_changed_files() == [
-        "scripts/install.sh",
-        "tests/test_install_sh_node_deps_workspaces.py",
-    ]
-
-
-def test_pull_request_changed_files_returns_empty_when_gh_fails(tmp_path, monkeypatch):
-    monkeypatch.setenv("EVENT_NAME", "pull_request")
-    monkeypatch.setenv("REPO", "NousResearch/hermes-agent")
-    monkeypatch.setenv("GITHUB_EVENT_PATH", str(_write_event(tmp_path)))
-
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="gh: Not Found")
-
-    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
-    assert pull_request_changed_files() == []
-
-
-def test_main_recovers_pr_files_instead_of_fail_open_ci_review(monkeypatch, capsys):
-    """A fork compare 404 must not demand ci-reviewed for a CLI-only install."""
-    monkeypatch.setattr(
-        _mod,
-        "pull_request_changed_files",
-        lambda: ["scripts/install.sh", "tests/test_install_sh_node_deps_workspaces.py"],
-    )
-    monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
-    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-
-    assert main() == 0
-    out = capsys.readouterr().out
-    assert "ci_review=false" in out
-    assert "python=true" in out
-    assert "python_prod=true" in out
-
-
-def test_main_still_fail_opens_when_recovery_is_empty(monkeypatch, capsys):
-    monkeypatch.setattr(_mod, "pull_request_changed_files", lambda: [])
-    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
-    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-
-    assert main() == 0
-    out = capsys.readouterr().out
-    assert "ci_review=true" in out
