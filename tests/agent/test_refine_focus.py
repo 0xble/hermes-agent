@@ -23,17 +23,18 @@ def test_no_focus_prompt_is_byte_identical():
     _target, prompt = spawn_background_review_thread(
         agent, [], review_memory=True, review_skills=True
     )
-    assert prompt == _COMBINED_REVIEW_PROMPT
+    baseline = prompt
+    assert baseline.startswith(_COMBINED_REVIEW_PROMPT)
 
     _target, prompt = spawn_background_review_thread(
         agent, [], review_memory=True, review_skills=True, focus=None
     )
-    assert prompt == _COMBINED_REVIEW_PROMPT
+    assert prompt == baseline
 
     _target, prompt = spawn_background_review_thread(
         agent, [], review_memory=True, review_skills=True, focus="   "
     )
-    assert prompt == _COMBINED_REVIEW_PROMPT
+    assert prompt == baseline
 
 
 def test_focus_is_appended_to_prompt():

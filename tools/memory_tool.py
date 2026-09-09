@@ -126,55 +126,67 @@ def _validate_single_op(store, action, target, content, old_text) -> Optional[st
     return None
 
 
-_BG_DELETE_ACTIONS = ("replace", "remove")
+def _normalized_operations(action: str, content: Optional[str], old_text: Optional[str],
+                           operations: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if operations is not None:
+        return operations
+    return [{"action": action, "content": content, "old_text": old_text}]
 
 
-def _background_delete_gate(action, operations, target="memory", content=None, old_text=None) -> Optional[str]:
-    """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
-    stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
-    store instead of merely denied: the fork's own review summary is never published back, so
-    a plain denial would drop the consolidation request with no surfacing path at all. A
-    staging failure fails closed to a plain denial."""
+def _validate_operations(store: MemoryStore, target: str, operations: List[Dict[str, Any]], *, allow_empty: bool = False) -> Optional[str]:
+    if not isinstance(operations, list):
+        return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+    # The store validates every member as one final-state transaction while its
+    # file lock is held. That prevents invalid batches becoming pending writes.
+    invalid = store.validate_batch(target, operations, allow_empty=allow_empty)
+    return json.dumps(invalid, ensure_ascii=False) if invalid else None
+
+
+def _background_policy() -> Optional[str]:
+    """Return the parent-owned policy only for unattended review forks."""
     from tools.skill_provenance import is_unattended_review
-
     if not is_unattended_review():
         return None
-    hit = action in _BG_DELETE_ACTIONS or any(
-        isinstance(op, dict) and op.get("action") in _BG_DELETE_ACTIONS for op in (operations or []))
-    if not hit:
-        return None
-    payload = ({"action": "batch", "target": target, "operations": operations}
-               if operations is not None else
-               {"action": action, "target": target, "content": content, "old_text": old_text})
-    detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
-              else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
-        from tools import write_approval as wa
-        record = wa.stage_write(
-            wa.MEMORY, payload,
-            summary=(f"background review consolidation ({'batch' if operations is not None else action} "
-                     f"on {target}): {detail}")[:200],
-            origin=wa.current_origin())
-        return json.dumps({
-            "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
-            "message": ("Background review may not delete memory entries unattended. The proposed "
-                        f"{'batch' if operations is not None else action} was staged for your approval — "
-                        "review it with /memory pending (approve to apply, discard to drop)."),
-        }, ensure_ascii=False)
+        from tools.self_learning_policies import memory_policy
+        mode = memory_policy()
     except Exception:
-        logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)
-        return tool_error(
-            "Background review may not delete memory entries ('replace'/'remove', including in a "
-            "batch); 'add' is still available.", success=False)
+        mode = "approve_changes"  # fail closed if a partially-installed parent cannot resolve policy
+    return mode if mode in {"automatic", "approve_changes", "observe_only"} else "approve_changes"
+
+
+def _stage_policy(target: str, operations: List[Dict[str, Any]], *, single: bool = False) -> str:
+    from tools import write_approval as wa
+    payload = ({"target": target, **operations[0]} if single else
+               {"action": "batch", "target": target, "operations": operations})
+    record = wa.stage_write(wa.MEMORY, payload,
+                            summary=f"background memory policy: {len(operations)} op(s) on {target}",
+                            origin=wa.current_origin())
+    return json.dumps({"success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
+                       "message": "Background replace/remove proposal staged for your approval. Review with /memory pending; /memory approve <id> or /memory reject <id>."}, ensure_ascii=False)
+
+
+def _observe_policy(target: str, operations: List[Dict[str, Any]]) -> str:
+    try:
+        from tools.review_observations import record_observation
+        row = record_observation("memory", {"target": target, "operations": operations})
+    except Exception as exc:
+        logger.warning("Could not record memory observation", exc_info=True)
+        return tool_error(f"Memory observation was not recorded: {exc}", success=False)
+    return json.dumps({"success": True, "observed": True,
+                       "observation_id": row.get("id") if isinstance(row, dict) else None,
+                       "message": "Memory change observed but not applied."}, ensure_ascii=False)
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
                 new_text: str = None, operations: Optional[List[Dict[str, Any]]] = None,
                 store: Optional[MemoryStore] = None) -> str:
-    """Tool entry point; returns a JSON string. Single op (action + content/old_text)
-    or batch (``operations``, atomic against the final budget). ``new_text``
-    aliases ``content`` — callers mirror ``old_text`` with it (patch-tool shape)."""
+    """Apply one memory change or an atomic batch.
+
+    Unattended review writes resolve through the parent-owned memory policy:
+    automatic journals a recoverable before/after record; approve_changes stages
+    destructive changes; observe_only records an observation and never writes.
+    """
     from agent.delegation_context import is_read_only_knowledge_context
     if is_read_only_knowledge_context():
         return tool_error("Durable memory writes are parent-owned for named subagents.", success=False)
@@ -182,29 +194,42 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     if content is None and new_text is not None:
         content = new_text
-    # Strict providers send JSON null for optional fields; treat as omitted.
     target = "memory" if target is None else target
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return json.dumps(target_error)
-    if operations:
-        if not isinstance(operations, list):
-            return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
-        denied = _background_delete_gate(action, operations, target)
-        if denied is not None:
-            return denied
-        # Approval gate: stages (background/gateway) or prompts inline (CLI); off by default.
-        gate_result = _apply_write_gate("batch", target, None, None, operations)
-        if gate_result is not None:
-            return gate_result
-        return json.dumps(store.apply_batch(target, operations), ensure_ascii=False)
-    if action not in _STORE_ACTIONS:
+    if operations is None and action not in _STORE_ACTIONS:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
-    invalid = (_validate_single_op(store, action, target, content, old_text)
-               or _background_delete_gate(action, None, target, content, old_text)
-               or _apply_write_gate(action, target, content, old_text))
+    if operations is None:
+        invalid = _validate_single_op(store, action, target, content, old_text)
+        if invalid is not None:
+            return invalid
+    ops = _normalized_operations(action, content, old_text, operations)
+    invalid = _validate_operations(store, target, ops,
+                                   allow_empty=(operations is None and action == "remove"))
     if invalid is not None:
         return invalid
+
+    policy = _background_policy()
+    destructive = any(op.get("action") in {"replace", "remove"} for op in ops if isinstance(op, dict))
+    if policy == "observe_only":
+        return _observe_policy(target, ops)
+    if policy == "approve_changes" and destructive:
+        return _stage_policy(target, ops, single=operations is None)
+
+    # General write approval is always evaluated after validation and remains
+    # authoritative even when the background policy says automatic.
+    gate_result = _apply_write_gate("batch" if operations is not None else action, target, content, old_text,
+                                    ops if operations is not None else None)
+    if gate_result is not None:
+        return gate_result
+    if policy == "automatic":
+        from tools.memory_history import HistoryTransaction
+        return json.dumps(store.apply_batch(
+            target, ops, transaction=HistoryTransaction(target, ops),
+            allow_empty=(operations is None and action == "remove")), ensure_ascii=False)
+    if operations is not None:
+        return json.dumps(store.apply_batch(target, ops), ensure_ascii=False)
     return json.dumps(_STORE_ACTIONS[action][0](store, target, content, old_text), ensure_ascii=False)
 
 

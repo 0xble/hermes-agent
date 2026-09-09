@@ -22,6 +22,13 @@ Stable commit subjects survive rebases and are the manifest keys. Resolve the cu
 - **Delivery:** integrated PR from `fix/telegram-card-heading-emphasis`; Personal/default runtime remains untouched at integration, on main `4ed45eb208af5bedba77b3cb15902c02437691ca`, gateway worker PID 46979. Organization deployments excluded. Supported updater promotion entails a restart and requires explicit informed approval; publication alone is not activation.
 - **Rollback/retirement:** revert this focused commit only; no state migration. Retire the delta when an upstream replacement displays the same bounded detail without adding private payloads. Stable subject: `fix(telegram): show longer tool names without redundant label`.
 
+## Self-learning review policies — source candidate
+
+- **Stable subject:** `feat(review): add observation policies and recoverable memory writes`.
+- **Contract:** `docs/self-learning-policies.md` documents direct/observe/off skill review, automatic/approve_changes/observe_only unattended built-in memory, private idempotent evidence consumption, and conflict-safe rollback. Missing memory policy retains approve_changes; /refine remains attended for memory but respects skill observe/off. Preserve upstream #106310 trigger protections for #105921. Upstream #106918/#106919 are proposals, not acceptance.
+- **Surfaces and regression:** background review/skill and memory tool boundaries, profile-local observation/history modules, shared `/memory` display; `tests/tools/test_{self_learning_policies,memory_policy,review_policy_boundaries}.py` plus whole memory/skill/approval/review test modules. No new model tool or provider integration.
+- **Rollback/retirement:** revert the scoped source commit without deleting retained history, observations or pending writes. Retire only after released upstream passes the complete documented contracts. Source publication/landing only: no runtime promotion, restart, config activation, or live memory edits.
+
 ## Goal instruction contract — active
 
 - **Contract and provenance:** User-approved rewrite of fork-owned autonomous goal controls, based on `3ea56599d0bd6e6ab193c77b3fc9ceb39de45a35`. The exposed schema still permitted clearing “completed” tracking and the guide conflated success with stop conditions. Align the tool description, progressive guide, parameter help, continuation and evaluator/drafter prompts: clear is removal, never completion; preserve every user obligation, evidence, limits and user stop while managing routine tracking autonomously. Stable subject: `fix(goals): separate tracking removal from verified completion`.

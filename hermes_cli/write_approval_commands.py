@@ -11,7 +11,14 @@ from tools import write_approval as wa
 
 def _fmt_state(subsystem: str) -> str:
     on = wa.write_approval_enabled(subsystem)
-    return f"{subsystem}.write_approval = {'on' if on else 'off'}"
+    state = f"{subsystem}.write_approval = {'on' if on else 'off'}"
+    if subsystem == wa.MEMORY:
+        from tools.self_learning_policies import memory_policy, skill_mode
+        state += (f"\nmemory.background_policy = {memory_policy()}"
+                  f"\nauxiliary.background_review.skill_mode = {skill_mode()}"
+                  "\nUnattended approve_changes stages replace/remove; general write approval still applies."
+                  "\n/refine is attended for memory, but does not override skill observe/off.")
+    return state
 
 
 def _fmt_pending_list(subsystem: str) -> str:

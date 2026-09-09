@@ -749,6 +749,23 @@ def skill_manage(
             "return proposed skill changes to the parent agent.",
             success=False,
         )
+    from tools.skill_provenance import is_background_review
+    from tools.self_learning_policies import skill_mode
+    mode = skill_mode() if is_background_review() else "direct"
+    if mode != "direct":
+        if mode == "off":
+            return tool_error("Background skill review is off, including explicit /refine.", success=False)
+        from tools.review_observations import record_observation
+        payload = dict(action=action, name=name, content=content, category=category,
+                       file_path=file_path, file_content=file_content, old_string=old_string,
+                       new_string=new_string, replace_all=replace_all,
+                       absorbed_into=absorbed_into, operations=operations)
+        try:
+            row = record_observation("skills", payload)
+        except Exception as exc:
+            return tool_error(f"Could not persist skill observation: {exc}", success=False)
+        return json.dumps({"success": True, "observed": True, "observation_id": row["id"],
+                           "message": "Skill recommendation recorded; no skill files changed."})
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)

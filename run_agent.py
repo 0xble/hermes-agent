@@ -747,12 +747,17 @@ class AIAgent(
         if focus is None and getattr(self, "_delegate_depth", 0) > 0:
             return
         task_cfg = None
-        if focus is None:
+        if focus is None and not explicit:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
                 return
 
+        from tools.self_learning_policies import skill_mode
+        if skill_mode(task_cfg) == "off":
+            review_skills = False
+            if not review_memory:
+                return
         # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
         # alias the live history's nested tool_calls/content.
         # Structural clone at the single chokepoint every review path (automatic, /refine, idle-queue

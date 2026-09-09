@@ -612,6 +612,8 @@ def _prior_tool_keys(prior_snapshot: List[Dict]) -> Tuple[set, set]:
 
 def _action_lines(data: Dict, detail: Dict, verbose: bool) -> List[str]:
     """Summary line(s) for one successful notify-tool result (``[]`` when nothing to report)."""
+    if data.get("observed"):
+        return [data.get("message", "Review observation recorded; no files changed.")]
     if data.get("staged"):
         # The fork's own review summary is never published back, so an unattended-review
         # consolidation proposal must surface here or it is silently lost (#105921).
@@ -994,6 +996,16 @@ def _review_tool_whitelist(
             configured_extra_tools = {name.strip() for name in extra_raw if isinstance(name, str) and name.strip()}
     except Exception:
         logger.debug("background_review extra_tools parse failed", exc_info=True)
+    from tools.self_learning_policies import skill_mode
+    mode = skill_mode(_background_review_task_config(task_cfg))
+    if mode != "direct":
+        # Observe/off cannot admit arbitrary write-capable tools via extra_tools.
+        configured_extra_tools = set()
+    if mode == "off":
+        whitelist -= {"skill_manage", "skill_view", "skills_list"}
+    if not (memory_on and review_memory):
+        configured_extra_tools.discard("memory")
+        whitelist.discard("memory")
     return whitelist | configured_extra_tools, configured_extra_tools
 
 
@@ -1034,7 +1046,7 @@ def _run_review_fork(
     prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
     # Keep the deny/prompt wording in sync with the whitelist: a memory-less review must not
     # tell the model that memory is available, or it will burn iterations on denied calls.
-    memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
+    memory_phrase_deny = " and memory (subject to memory.background_policy and write approval)" if "memory" in review_whitelist else ""
     memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
     set_thread_tool_whitelist(
         review_whitelist,
@@ -1122,7 +1134,8 @@ def _run_review_in_thread(
         # driving a Telegram long-poll — for the full duration of the review (tens of seconds), swallowing
         # their console output (#55769 / #55925). ``thread_scoped_silence`` routes only this thread's writes
         # to devnull and leaves all other threads on the real streams.
-        with thread_scoped_silence():
+        from tools.review_observations import bind_review_source
+        with thread_scoped_silence(), bind_review_source(getattr(agent, "session_id", None), messages_snapshot):
             _run_review_fork(agent, messages_snapshot, prompt, task_cfg, review_run, st, review_memory, explicit)
         # A buggy/legacy tool response shape must NOT take down the whole review (the outer
         # except would discard every action the fork DID complete), so coerce to an empty list.
@@ -1190,9 +1203,20 @@ def spawn_background_review_thread(
     memory operation set."""
     if task_cfg is None:
         task_cfg = _background_review_task_config()
+    from tools.self_learning_policies import skill_mode, memory_policy
+    mode = skill_mode(task_cfg)
+    if mode == "off":
+        review_skills = False
     # Per-agent overrides (agent._MEMORY_REVIEW_PROMPT etc.) keep working.
     name = _PROMPT_NAME_BY_SCOPE[(review_memory, review_skills)]
     prompt = getattr(agent, name, globals()[name])
+    if mode == "observe":
+        prompt += ("\nSkill observation-only policy: read skills, including external skills, and submit "
+                   "recommendations with skill_manage. They are recorded in a private inbox, NOT applied. "
+                   "Do not attempt any other write path. /refine does not override this policy.")
+    elif mode == "off":
+        prompt += "\nSkill review is off. Do not review or change skills."
+    prompt += f"\nUnattended memory policy: {memory_policy()}; general write approval still applies."
     if focus := (focus or "").strip():
         prompt = (
             f"{prompt}\n\nThe user explicitly requested this review with the following "

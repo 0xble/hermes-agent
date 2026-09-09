@@ -187,7 +187,7 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message, current_entries=self._entries_for(target), usage=self._usage(target)))
 
-    def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
+    def _mutate(self, target: str, mutate, *, skip_drift: bool = False, transaction=None) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -206,10 +206,22 @@ class MemoryStore:
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 return result
+            history_id = transaction.prepare(path, raw, result[0]) if transaction else None
             self._set_entries(target, result[0])
             path.parent.mkdir(parents=True, exist_ok=True)
             self._write_file(path, result[0])
-            return self._success_response(target, result[1])
+            if transaction:
+                # A status-write failure must not turn a committed memory write into
+                # a reported failure. The durable prepared record is reconciled by
+                # memory_history.list_history() from before/after fingerprints.
+                try:
+                    transaction.applied()
+                except Exception:
+                    logger.exception("Memory history completion failed; recovery will reconcile it")
+            response = self._success_response(target, result[1])
+            if history_id:
+                response["history_id"] = history_id
+            return response
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
@@ -296,16 +308,23 @@ class MemoryStore:
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None
 
-    def apply_batch(self, target: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def apply_batch(self, target: str, operations: List[Dict[str, Any]], *, transaction=None, allow_empty: bool = False, validate_only: bool = False) -> Dict[str, Any]:
         """Apply add/replace/remove ops atomically against the FINAL budget, so one call
         can free space and add entries. All-or-nothing: any malformed / unmatched op or
         an over-limit result writes NOTHING and returns the first failure plus live state."""
         if not operations:
             return _error("operations list is empty.")
-        ops = [op or {} for op in operations]
+        if not isinstance(operations, list) or any(not isinstance(op, dict) for op in operations):
+            return _error("operations must be a list of objects.")
+        ops = operations
+        for op in ops:
+            if any(op.get(key) is not None and not isinstance(op[key], str)
+                   for key in ("action", "content", "new_text", "old_text")):
+                return _error("Operation action, content, new_text and old_text must be strings.")
         # Scan every add/replace content BEFORE touching disk -- one poisoned op rejects the batch.
         for i, op in enumerate(ops):
-            scan_error = op.get("action") in {"add", "replace"} and op.get("content") and _scan_memory_content(op["content"])
+            content = op.get("content") or op.get("new_text") or ""
+            scan_error = op.get("action") in {"add", "replace"} and content and _scan_memory_content(content)
             if scan_error:
                 return _error(f"Operation {i + 1}: {scan_error}")
 
@@ -317,7 +336,7 @@ class MemoryStore:
                                            (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})")
                 if msg:
                     return self._failure_with_entries(target, msg + " No operations were applied (batch is all-or-nothing).")
-            if entries and not working:
+            if entries and not working and not allow_empty:
                 # #103419: a consolidation batch that removes the last entry would
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
@@ -335,7 +354,24 @@ class MemoryStore:
                     f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
                     f"entries in the same batch (see current_entries below), then retry."))
             return working, f"Applied {len(operations)} operation(s)."
-        return self._mutate(target, _apply)
+        if validate_only:
+            path = self._path_for(target)
+            with self._file_lock(path):
+                raw, readable = self._read_raw_checked(path)
+                if not readable:
+                    return _read_failed_error(path)
+                drift = self._detect_external_drift(target, raw)
+                if drift:
+                    return _drift_error(path, drift)
+                self._set_entries(target, list(dict.fromkeys(self._parse_entries(raw))))
+                result = _apply(self._entries_for(target), self._char_limit(target))
+                return result if isinstance(result, dict) else {"success": True}
+        return self._mutate(target, _apply, transaction=transaction)
+
+    def validate_batch(self, target: str, operations: List[Dict[str, Any]], *, allow_empty: bool = False) -> Optional[Dict[str, Any]]:
+        """Run the same locked validation as application, without persisting changes."""
+        result = self.apply_batch(target, operations, allow_empty=allow_empty, validate_only=True)
+        return None if result.get("success") else result
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
