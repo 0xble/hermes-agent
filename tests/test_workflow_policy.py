@@ -53,6 +53,32 @@ def test_normal_edits_and_privileged_cosmetics_are_allowed(tmp_path: Path) -> No
     assert validate(root, ROOT) == []
 
 
+@pytest.mark.parametrize("selection", [
+    ["self-hosted", "Linux", "ARM64", "hermes-ci-isolated"],
+    ["self-hosted"],
+    ["self-hosted", "Linux", "ARM64", "other-worker"],
+    {"group": "hermes-ci-isolated"},
+    "${{ inputs.runner }}",
+])
+def test_isolated_runner_requires_exact_authorized_selection(tmp_path: Path, selection) -> None:
+    root = candidate(tmp_path)
+    path = root / ".github/workflows/tests.yml"
+    data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    data["jobs"]["test"]["runs-on"] = selection
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    allowed = selection == ["self-hosted", "Linux", "ARM64", "hermes-ci-isolated"]
+    assert bool(validate(root, ROOT)) is not allowed
+
+
+def test_isolated_runner_cannot_escape_job_scope(tmp_path: Path) -> None:
+    root = candidate(tmp_path)
+    path = root / ".github/workflows/lint.yml"
+    data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    next(iter(data["jobs"].values()))["runs-on"] = ["self-hosted", "Linux", "ARM64", "hermes-ci-isolated"]
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    assert any("runs-on" in error for error in validate(root, ROOT))
+
+
 def test_untrusted_external_actions_are_rejected(tmp_path: Path) -> None:
     root = candidate(tmp_path)
     replace(

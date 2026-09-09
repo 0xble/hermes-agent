@@ -1,0 +1,43 @@
+name: Isolated ARM64 pilot
+
+# Manual only: prove self-hosted scheduling without any hosted precursor.
+# This is not a required check and cannot attest to normal CI success.
+on:
+  workflow_dispatch:
+    inputs:
+      outcome:
+        description: Deliberate lifecycle exercise (not a required status)
+        type: choice
+        options: [success, failure]
+        default: success
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: Isolated ARM64 execution proof
+    runs-on: [self-hosted, Linux, ARM64, hermes-ci-isolated]
+    timeout-minutes: 5
+    steps:
+      - name: Verify platform and network dependencies
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(uname -s)" = Linux
+          test -z "${SSH_AUTH_SOCK:-}"
+          if findmnt -rn -t 9p,virtiofs; then
+            printf 'Unexpected shared host mount\n' >&2
+            exit 1
+          fi
+          uname -a
+          curl -fsS --max-time 30 https://pypi.org/simple/ --output /dev/null
+          curl -fsS --max-time 30 https://registry.npmjs.org/npm/latest --output /dev/null
+          rg --version
+          node --version
+          npm --version
+      - name: Requested failure exercise
+        if: inputs.outcome == 'failure'
+        # The choice controls an expression, never interpolated shell text.
+        run: exit 23

@@ -45,7 +45,7 @@ def test_autonomous_lifecycle_without_new_user_instruction():
     assert invoke("resume")["success"]
     assert invoke("edit", goal="Ship and validate the requested parser")["success"]
     goals.GoalManager("lifecycle").mark_done("Verified parser and tests")
-    assert invoke("clear", reason="Remove completed tracking")["success"]
+    assert invoke("clear", reason="Remove demonstrably duplicate tracking; verified completion is retained")["success"]
     assert saved().status == "cleared"
     assert saved().last_verdict == "done"
     assert not saved().user_stopped

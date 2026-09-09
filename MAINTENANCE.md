@@ -12,6 +12,13 @@ Record the removal commit's stable subject on the `Retired` row so fork-only cod
 
 Stable commit subjects survive rebases and are the manifest keys. Resolve the current SHA from the fetched fork history instead of persisting a value that the next upstream rebase will invalidate.
 
+## Goal instruction contract — active
+
+- **Contract and provenance:** User-approved rewrite of fork-owned autonomous goal controls, based on `3ea56599d0bd6e6ab193c77b3fc9ceb39de45a35`. The exposed schema still permitted clearing “completed” tracking and the guide conflated success with stop conditions. Align the tool description, progressive guide, parameter help, continuation and evaluator/drafter prompts: clear is removal, never completion; preserve every user obligation, evidence, limits and user stop while managing routine tracking autonomously. Stable subject: `fix(goals): separate tracking removal from verified completion`.
+- **Boundary:** Instruction strings and focused surfaced-contract regressions only, in `tools/goal_tool.py`, `hermes_cli/goals.py`, and `tests/tools/test_goal*.py`. No state-machine, authorization gate, API, configuration, migration, deployment, or runtime changes. This is a local instruction overlay; no upstream issue or PR association, and no upstream contribution requested.
+- **Verification:** Both new delivered-instruction regressions fail on the base and pass on the candidate. Canonical `scripts/run_tests.sh -j 8` over all 34 goal-named test files: 350 passed, zero failures, retries disabled. Tests exercise actual tool-definition assembly, registry guide/status dispatch, SQLite readback and all three normal continuation variants; existing coverage exercises evaluator, gates, user-stop authority and gateway/CLI/TUI goal paths. Scoped Ruff and `git diff --check` pass. Instruction assertions establish surfaced policy, not probabilistic model compliance; no live-model reliability claim.
+- **Rollback/retirement:** Revert this scoped commit, preserving earlier autonomous-control and blocker behavior. Retire the overlay when adopted upstream delivers the complete removal/completion, obligation-preservation and stop/resume contract through these same model-facing surfaces. Runtime promotion and restart remain separate and were explicitly excluded.
+
 ## Goal blocker semantics — candidate
 
 - **Independent hypothesis frozen before upstream comparison:** On base `6f593afc4666ab6816709d8e8851656e230eb228`, the goal judge conflates an externally blocked step with an impossible whole goal; the manager and Kanban then call every block unachievable and suggest a resume override. Correct the existing four-verdict contract at its prompt/parser/state boundary: prefer useful authorized investigation or independent work, park only on real waits, and retain a bounded optional blocker record (kind, detail, evidence, resume condition). Resume preserves this context, not permission. A new state or permission flag would unnecessarily duplicate lifecycle/authorization owners. Legacy records and verdicts remain readable; no migration or runtime changes. Regression: drive real judge parsing through GoalManager into isolated SQLite, reload/resume/user-pause, and exercise Kanban rejection; live semantic cases cover the model decision rather than prompt snapshots. Uncertainty: model judgment is probabilistic; this is not an authorization engine. The current configured judge already passes explicit baseline semantic cases, but baseline persistence/presentation do not implement the contract.
@@ -34,6 +41,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
+| HERMES-135 | Active | `fix(telegram): preserve nested and multiline legacy emphasis` | Resolve valid asterisk emphasis without stripping unmatched literals. |
 | HERMES-131 | Active | `fix(backup): retain verified quick-snapshot recovery generations` | Bound partial snapshot retention while preserving complete and verified per-database recovery coverage. |
 | HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
 | HERMES-130 | Active | `feat(gateway): queue MoA requests during active turns` | Accept MoA requests immediately for a separate queued one-shot turn. |
@@ -1685,8 +1693,8 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 3. Implement and verify the patch.
 4. Update the record with final surfaces, tests, published commit identity, and live upstream issue/PR state.
 5. If a direct upstream PR exists, inspect all current feedback and apply every valid item to the fork first, then update the PR from the verified fork correction.
-6. Verify the manifest row is `Active`; run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation so duplicate IDs, unindexed records, missing stable subjects, upstream-association fields, and fork-only patch coverage block publication. The unified `maintain-targets` dispatcher records the accepted result; it is not a substitute for repository validation.
-7. Ship the code and manifest together. A source patch without a complete record is not publishable.
+6. Verify the manifest row is `Active` and run the repository maintenance-manifest validator during the dedicated hermes-agent reconciliation. The current validator is an advisory structural inventory check: it reports duplicate or mismatched index/record IDs and exits successfully even when it cannot assess the inventory. It does not inspect stable subjects, upstream associations, or fork-only patch coverage, and a passing invocation does not establish publication eligibility. The unified `maintain-targets` dispatcher records that advisory result; it is not a substitute for candidate verification.
+7. When a patch record is maintained, ship its source change and record together. Missing or incomplete manifest coverage is an inventory defect to resolve, but the current advisory validator does not itself block publication.
 8. On every upstream rebase, inspect patch equivalence and associated issue/PR feedback; never resolve a conflict by retaining both private and upstream implementations.
 
 ### HERMES-091 — Choose and recover headed mode per managed browser session
@@ -1744,7 +1752,23 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Retirement:** Remove the fork-only implementation when released upstream passes bounded incomplete retention, newest complete generation, readable omitted-DB coverage, alternating failures, and snapshot-family/profile isolation regressions. Preserve useful behavior tests only when not duplicated upstream.
 - **Runtime scope:** Source-only. No live snapshot cleanup, configuration change, B2 action, deployment or restart authorized or performed.
 
+
+
+### HERMES-135 — Valid nested and multiline legacy Telegram emphasis
+
+- **Status:** Published-source candidate only. No managed checkout mutation, promotion, configuration change, or restart.
+- **Contract and provenance:** Reproduced sequential bold/italic regex corruption of `***bold italic***`, `**bold *italic* text**`, and multiline bold on upstream `2db0c7a2d8f29debe7d1cbfb4a72f4f98dc00808`. The earlier investigation had already inspected prior art; this is not an unanchored hypothesis. Reuse the installed markdown-it delimiter resolver rather than inventing a tokenizer; preserve code placeholders, unsupported/literal markers and existing surrounding syntax. Valid syntax repair does not repair malformed model Markdown or the separate rich-message renderer.
+- **Source surfaces:** `plugins/platforms/telegram/adapter.py`, `plugins/platforms/telegram/emphasis.py`, `tests/gateway/test_telegram_emphasis.py`. No new dependency, state, schema, or configuration. The legacy send path remains the integration boundary.
+- **Upstream tracking:** [Issue #106891](https://github.com/NousResearch/hermes-agent/issues/106891). Related open #55887 strips leftover markers and does not fulfill nested-emphasis/literal-preservation semantics; #11287 proposes a broad entities rewrite. Quote issue #90773 and PR #90781 have a different contract. No matching nested-emphasis issue or emphasis PR was found in the immediate pre-filing search on 2026-09-09.
+- **Upstream PR:** [#106906](https://github.com/NousResearch/hermes-agent/pull/106906), contribution commit `37f872bad1706c6c50ccdccb825fc4d5ffd2c246`. Same implementation, without fork-specific metadata. Publication is not upstream acceptance; do not merge upstream automatically.
+- **Regression:** `scripts/run_tests.sh -j 8 tests/gateway/test_telegram*.py tests/gateway/test_table_helpers.py` passed 904 tests across 74 fork files, zero failures, three platform skips. Two parametrized invariants exercise actual legacy send payloads and preservation of literals/protected syntax. Final upstream red: ten failing cases and twenty passing preservation cases; final focused suite: 72 passed. Final broader upstream suite: 695 passed, two image-timeout failures also reproduced on clean baseline, two skips. No live Telegram server/rendering or full-repository test claim.
+- **Review:** Final autoreview `f2d17067772a4c14bef722ce05bf0dd2` is clean at P0–P2 with `satisfies_review_gate=true`; candidate `1902d66a509a94842886a809b6c9459e3daca1907eac492694286218d604beb6`. Policy selected Claude Fable/Opus but that route was unavailable, so the supported isolated Codex Astra fallback completed review. Earlier passes identified seven findings, all reproduced and fixed (underscore and block boundaries, crossing strike/spoiler spans, hardbreak preservation, quote continuation). Same lineage continued throughout. Final receipt/evidence retained under `~/.hermes/logs/patch-evidence/telegram-emphasis-2026-09-09/`. After review, only publication/evidence metadata changed; source integration onto newer fork main changed no behavior.
+- **Rollback:** Revert only the scoped HERMES-135 landed commit (adapter emphasis hunk, helper, focused tests and this entry), preserving all rich-message and other Telegram fork patches. No persistent state needs rollback.
+- **Retirement:** Replace this implementation when released upstream passes equivalent valid combined/nested/multiline asterisk emphasis and literal/code/link/bullet/quote preservation regressions. Do not retain duplicate fork code or tests.
+
 ## Automatic synchronization
+
+Every maintenance run must synchronize the maintained default branch with the latest upstream default while preserving each intentional registered patch. Reconcile and test the exact candidate, then publish it to the owned remote, or report `Blocked` with the concrete unresolved conflict, failed proof, or unavailable authority. Before reporting `Updated` or `Already current`, perform a fresh upstream fetch, prove zero upstream-only commits with `git rev-list --left-right --count <upstream-default>...<maintained-default>`, and read back owned-remote/default SHA parity.
 
 Source reconciliation runs in its dedicated, retained maintenance worktree. The control plane owns schedules and execution identity, not this document. Freeze the upstream cutoff for each run, preserve interrupted work, protect the canonical checkout, and inventory active patch and plugin overlap. Integrate before final tests and independent review. Publish only the reviewed immutable candidate through a guarded PR merge or an exact remote-head lease, then read back the remote revision. Source completion never requires runtime deployment.
 
@@ -1759,7 +1783,7 @@ Do not push to Nous Research, deploy or restart runtimes, or retire installed pl
 - A runtime rollback never rewrites the fork or changes another runtime.
 - Patch retirement is behavioral: a clean Git apply/revert or matching commit message is not proof of upstream equivalence.
 - Plugin retirement is also behavioral: a native replacement is not complete until its contract passes and the overlapping plugin, canonical source, configuration, dependencies, schedules, skills, and generated copies are removed from every affected profile during promotion.
-- This manifest must describe every active Brian-owned patch; stale, missing, or non-actionable records block publication.
+- This manifest is an advisory inventory of active Brian-owned patches. Stale, missing, or non-actionable records require follow-up, but the current validator does not make them a publication gate.
 
 ## Manual recovery
 
