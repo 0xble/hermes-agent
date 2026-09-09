@@ -43,6 +43,7 @@ ALLOWED_EXACT_HOSTS = frozenset({
 ALLOWED_SUFFIXES = (
     ".github.com", ".githubusercontent.com", ".githubassets.com",
     ".githubapp.com", ".actions.githubusercontent.com", ".actions.github.com",
+    ".blob.core.windows.net",  # GitHub logs/artifacts; DNS must still be public
 )
 
 

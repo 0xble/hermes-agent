@@ -1,5 +1,12 @@
 # Isolated ARM64 CI worker — pilot, not production routing
 
+## Observed first pilot and log transport
+
+Run [34408550067](https://github.com/0xble/hermes-agent/actions/runs/34408550067)
+executed successfully on JIT runner 21. The API reports 38,000 ms total duration and an empty billable map. The ephemeral registration removed itself. However, GitHub log download returned `log not found`: guest diagnostics contained proxy HTTP 403 upload failures. This was scheduling proof, not complete operational acceptance.
+
+GitHub's [network requirements](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#communication-requirements-for-self-hosted-runners) require `*.blob.core.windows.net` for logs, summaries, artifacts and caches. The proxy now permits that suffix while retaining public-IP validation and exact-address dialing. The manual pilot also offers an explicit failure exercise; it cannot satisfy any required CI status.
+
 Trusted runner authorization landed first in PR #123 (`19b64f4a1d5a307f9828e83fe31c13821b028044`). This change adds only a manual, non-required scheduling pilot. Heavy Python/JS jobs, real native OS lanes, coverage and required status names remain unchanged until full workload and disposable-worker acceptance passes.
 
 ## Independently enforced network boundary

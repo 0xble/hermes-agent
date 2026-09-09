@@ -4,6 +4,13 @@ name: Isolated ARM64 pilot
 # This is not a required check and cannot attest to normal CI success.
 on:
   workflow_dispatch:
+    inputs:
+      outcome:
+        description: Deliberate lifecycle exercise (not a required status)
+        type: choice
+        options: [success, failure]
+        default: success
+        required: true
 
 permissions:
   contents: read
@@ -30,3 +37,7 @@ jobs:
           rg --version
           node --version
           npm --version
+      - name: Requested failure exercise
+        if: inputs.outcome == 'failure'
+        # The choice controls an expression, never interpolated shell text.
+        run: exit 23

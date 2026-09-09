@@ -60,11 +60,15 @@ class ParserTests(unittest.TestCase):
                          ("api.github.com", 443))
         self.assertEqual(proxy.parse_connect_request(b"CONNECT pypi.org:443 HTTP/1.1\r\nHost: pypi.org\r\n\r\n"),
                          ("pypi.org", 443))
+        self.assertEqual(proxy.parse_connect_request(
+            b"CONNECT results.blob.core.windows.net:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ("results.blob.core.windows.net", 443))
 
     def test_malicious_authorities_are_rejected(self):
         bad = [
             b"localhost:443", b"127.0.0.1:443", b"[::1]:443", b"169.254.169.254:443",
             b"github.com.evil.test:443", b"evilgithub.com:443", b"github.com:80",
+            b"results.blob.core.windows.net.evil.test:443", b"evilblob.core.windows.net:443",
             b"user@github.com:443", b"github.com:443/path", b"github.com",
         ]
         for authority in bad:
