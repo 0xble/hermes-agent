@@ -1359,7 +1359,7 @@ class GatewayTurnMixin:
         response = agent_result.get("final_response") or ""
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text doubles as final_response
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
-        if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+        if _is_gateway_hidden_reasoning_incomplete_turn(agent_result) and not agent_result.get("_goal_outcome_prepared"):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
 
@@ -1659,7 +1659,7 @@ class GatewayTurnMixin:
                     "platform": source.platform.value if source.platform else "",
                     "timestamp": ts,
                 })
-            if agent_failed_early or hidden_reasoning_incomplete:
+            if (agent_failed_early or hidden_reasoning_incomplete) and not agent_result.get("_goal_outcome_prepared"):
                 # Transient failure / hidden-reasoning incomplete: persist only the user message (the
                 # assistant error text is a gateway hint, not model output). Dedupe on platform
                 # message_id (Telegram retries after transient failures).
@@ -3671,9 +3671,19 @@ class GatewayTurnMixin:
         payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
         record) keeps legacy trust."""
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
-        if not isinstance(response, dict) or response.get("failed"):
+        if not isinstance(response, dict):
             return
         _final = response.get("final_response") or ""
+        # Goal outcomes were composed before stream sealing, including genuine
+        # failure envelopes. Suppress only a positively matched normal delivery.
+        if response.get("_goal_outcome_prepared") and _sc is not None:
+            matcher = getattr(_sc, "delivered_final_matches", None)
+            if (getattr(_sc, "final_content_delivered", False) and callable(matcher)
+                    and matcher(_final) is True):
+                response["already_sent"] = True
+                return
+        if response.get("failed"):
+            return
         _is_empty_sentinel = not _final or _final == "(empty)"
         # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
         # Unrelated commentary/progress must not be mistaken for the final response (#14238).
@@ -4018,6 +4028,7 @@ class GatewayTurnMixin:
                         session_key=session_key,
                         enqueue_continuation=not same_goal_session_pending,
                         emit_status_notice=not same_goal_session_pending,
+                        agent_result=result,
                     )
                 if goal_post_turn_state is not None:
                     goal_post_turn_state["handled"] = True

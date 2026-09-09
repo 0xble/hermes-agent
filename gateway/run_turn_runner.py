@@ -1904,8 +1904,9 @@ class TurnRunner:
         # diagnostic AND suppress the gateway's own error delivery.
         _final_for_stream = None
         if (
-            isinstance(result, dict) and not result.get("failed") and not result.get("interrupted")
-            and result.get("completed") is not False
+            isinstance(result, dict) and not result.get("interrupted")
+            and (result.get("_goal_outcome_prepared") or
+                 (not result.get("failed") and result.get("completed") is not False))
         ):
             fr = result.get("final_response")
             if isinstance(fr, str) and fr.strip() and fr != "(empty)":
@@ -2037,6 +2038,39 @@ class TurnRunner:
         return final_response + "\n" + "\n".join(unique_tags)
 
     def run_sync(self):
+        try:
+            return self._run_sync()
+        except Exception as exc:
+            from hermes_cli.goals import GoalManager
+            sid = str(getattr(self._ctx.agent_holder[0], "session_id", None) or self._ctx.session_id or "")
+            if not GoalManager(sid).is_active():
+                raise
+            logger.exception("Gateway goal turn failed before normal completion")
+            return self._prepare_failed_goal_result(exc)
+
+    def _prepare_failed_goal_result(self, exc, prefix="Agent turn failed"):
+        from types import SimpleNamespace
+        from hermes_cli.goals import GoalManager, _get_session_db
+        from hermes_cli.goal_outcomes import prepare_goal_turn
+        ctx = self._ctx
+        agent = ctx.agent_holder[0]
+        sid = str(getattr(agent, "session_id", None) or ctx.session_id or "")
+        # Preserve real current-turn evidence when present; otherwise persist the
+        # actual inbound user message, never an instruction to resume work.
+        messages = list(getattr(agent, "_session_messages", None) or [])
+        baseline = getattr(self, "_goal_history_before_invoke", None)
+        if not messages or messages == ctx.history or messages == baseline:
+            messages = list(ctx.history or []) + [{"role": "user", "content": ctx.message}]
+        if agent is None:
+            agent = SimpleNamespace(session_id=sid, _session_db=_get_session_db(), _session_messages=messages)
+        result = {"final_response": f"⚠️ {prefix}: {exc}", "messages": messages,
+                  "failed": True, "error": str(exc), "turn_exit_reason": "exception",
+                  "completed": False, "api_calls": 0, "tools": [], "session_id": sid}
+        prepare_goal_turn(GoalManager(sid), agent, result, is_current=ctx._run_still_current)
+        ctx.result_holder[0] = result
+        return result
+
+    def _run_sync(self):
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
@@ -2069,7 +2103,7 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+            return self._prepare_failed_goal_result(exc, "Provider authentication failed")
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
@@ -2085,7 +2119,24 @@ class TurnRunner:
             want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
-        result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        self._goal_history_before_invoke = list(getattr(agent, "_session_messages", None) or [])
+        try:
+            result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
+        except Exception as exc:
+            from hermes_cli.goals import GoalManager
+            goal_session_id = str(getattr(agent, "session_id", None) or ctx.session_id or "")
+            if not GoalManager(goal_session_id).is_active():
+                raise
+            logger.exception("Agent conversation raised")
+            result = self._prepare_failed_goal_result(exc)
+        from hermes_cli.goals import GoalManager
+        from hermes_cli.goal_outcomes import prepare_goal_turn
+        if result.get("failed") and not result.get("messages"):
+            result["messages"] = list(agent_history or []) + [{
+                "role": "user", "content": persist_msg if persist_msg is not None else ctx.message}]
+        goal_session_id = str(getattr(agent, "session_id", None) or ctx.session_id or "")
+        prepare_goal_turn(GoalManager(goal_session_id), agent, result,
+                          is_current=ctx._run_still_current)
         self._finish_stream_consumer(result, agent_history, stream_consumer)
         # The streaming-TTS consumer's finish() runs on the outer loop thread after the executor
         # returns, so early run_sync returns are also finalised.
@@ -2113,6 +2164,10 @@ class TurnRunner:
             "partial": result.get("partial", False), "completed": result.get("completed"),
             "interrupted": result.get("interrupted", False), "interrupt_message": result.get("interrupt_message"),
             "error": result.get("error"),
+            "turn_exit_reason": result.get("turn_exit_reason"),
+            "agent_persisted": result.get("agent_persisted", getattr(agent, "_session_db", None) is not None),
+            "_goal_decision": result.get("_goal_decision", {}),
+            "_goal_outcome_prepared": result.get("_goal_outcome_prepared", False),
             "compression_exhausted": result.get("compression_exhausted", False),
             "compression_deferred": result.get("compression_deferred", False),
             "tools": ctx.tools_holder[0] or [],

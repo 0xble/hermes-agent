@@ -7,7 +7,7 @@ import threading
 import types
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -277,6 +277,7 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
         session_key="agent:main:telegram:dm:12345",
         enqueue_continuation=True,
         emit_status_notice=True,
+        agent_result=ANY,
     )
 
 

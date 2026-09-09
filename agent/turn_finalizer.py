@@ -188,6 +188,41 @@ def _collapse_verification_candidates(messages, final_response, agent) -> bool:
     return True
 
 
+def synchronize_terminal_response(agent, result, final_response):
+    """Commit a pre-delivery augmentation to this turn only (including failed tails).
+
+    Use the same active-history replacement as output transforms. Never search an
+    earlier turn for equal prose, and never replace a tool-call assistant message.
+    """
+    messages = result.get("messages")
+    if not isinstance(messages, list) or not messages:
+        messages = list(getattr(agent, "_session_messages", None) or [])
+        result["messages"] = messages
+    last_user = max((i for i, m in enumerate(messages)
+                     if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+    tail = messages[-1] if messages else None
+    if (last_user >= 0 and len(messages) - 1 > last_user and isinstance(tail, dict)
+            and tail.get("role") == "assistant" and not tail.get("tool_calls")):
+        tail["content"] = final_response
+        tail.pop(_DB_PERSISTED_MARKER, None)
+        tail.pop("_row_id", None)
+    else:
+        tail = {"role": "assistant", "content": final_response}
+        stamp_message_timestamp(tail)
+        messages.append(tail)
+    result["final_response"] = final_response
+    result["response_transformed"] = True
+    agent._session_messages = messages
+    agent._db_flush_scan_prefix = None
+    db = getattr(agent, "_session_db", None)
+    if db is not None and agent.session_id:
+        db.replace_messages(agent.session_id, messages, active_only=True)
+        result["agent_persisted"] = True
+    save_log = getattr(agent, "_save_session_log", None)
+    if callable(save_log):
+        save_log(messages)
+
+
 def _clone_background_review_messages(messages):
     """Copy the review input without aliasing the live transcript."""
     # Lazy: conversation_loop imports this module (cycle).

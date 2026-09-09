@@ -263,7 +263,7 @@ class GatewayGoalsMixin:
         self, *, session_entry: Any, source: Any, final_response: str,
         session_key: Optional[str] = None, enqueue_continuation: bool = True,
         emit_status_notice: bool = True,
-        tool_evidence: Optional[list[dict[str, Any]]] = None,
+        tool_evidence: Optional[list[dict[str, Any]]] = None, agent_result: Optional[dict] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -273,7 +273,9 @@ class GatewayGoalsMixin:
             return lambda sid: GoalManager(session_id=sid, default_max_turns=max_turns)
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
-        if mgr is None or not mgr.is_active():
+        from hermes_cli.goal_outcomes import consume_goal_decision, automatic_goal_notices_enabled
+        decision = consume_goal_decision(agent_result)
+        if mgr is None or (decision is None and not mgr.is_active()):
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -287,18 +289,24 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
-                tool_evidence=tool_evidence,
-            ),
-        )
-        msg = decision.get("message") or ""
+        if decision is None:
+            if not final_response.strip():
+                return
+            decision = await self._run_in_executor_with_context(
+                lambda: mgr.evaluate_after_turn(
+                    final_response, user_initiated=True, background_processes=_bg_procs,
+                    active_delegations=_active_deleg,
+                    tool_evidence=tool_evidence))
+        # Paused outcomes already belong to the normal assistant reply.
+        msg = "" if (agent_result or {}).get("_goal_outcome_prepared") else decision.get("message") or ""
         # Shared persisted policy: routine continue is silent, while meaningful
         # state transitions (including the first wait and resume) emit once.
+        # All automatic bookkeeping shares ``goals.auto_notices``.  This does
+        # not affect manual /goal output or the mandatory normal reply prepared
+        # at the terminal-delivery boundary.
+        auto_notices = automatic_goal_notices_enabled()
         notify = bool(
-            emit_status_notice and msg and source is not None
+            auto_notices and emit_status_notice and msg and source is not None
             and mgr.claim_transition_notice(decision)
         )
         if notify:
@@ -336,16 +344,20 @@ class GatewayGoalsMixin:
                 delattr(event, "_goal_post_turn_complete")
             except AttributeError:
                 pass
-        # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
-        # still needs to be released and rescheduled.
+        # Routine empty replies must not start a goal continuation (notably a /loop wakeup with no
+        # agent output). Failed turns remain observable to the lifecycle even when their final text
+        # is empty, so persisted stop/failure replies cannot be silently dropped.
+        failed_turn = isinstance(agent_result, dict) and bool(agent_result.get("failed"))
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip() and not goal_already_handled:
+        prepared_goal = isinstance(agent_result, dict) and bool(agent_result.get("_goal_decision"))
+        if not goal_already_handled and (final_text.strip() or failed_turn or prepared_goal):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
                 kwargs = dict(session_entry=session_entry, source=source, final_response=final_text)
                 if label == "goal continuation":
                     kwargs["tool_evidence"] = self._tool_evidence_for_goal(agent_result)
+                    kwargs["agent_result"] = agent_result
                 await hook(**kwargs)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)

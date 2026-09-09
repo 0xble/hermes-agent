@@ -279,12 +279,24 @@ def _goal_followup_after_turn(
     """/goal continuation (mirrors gateway/run._post_turn_goal_continuation): the prompt to
     chain once ``running`` is released, or None.  Compression failures are never judge
     input: the error text is not work toward the goal, and judging it spends a turn."""
+    from hermes_cli.goal_outcomes import consume_goal_decision, automatic_goal_notices_enabled
+    prepared = consume_goal_decision(result, allow_continuation=(
+        status == "complete" and not getattr(session.get("agent"), "_interrupt_requested", False)))
+    if prepared is not None and not (isinstance(result, dict) and result.get("compression_exhausted")):
+        if status == "complete":
+            session.pop(_GOAL_COMPRESSION_RECOVERY_ATTEMPTS, None)
+        if prepared.get("message") and not prepared.get("stop_explanation") and automatic_goal_notices_enabled():
+            from hermes_cli.goals import GoalManager
+            manager = GoalManager(str(session.get("session_key") or ""))
+            if manager.claim_transition_notice(prepared):
+                _emit("status.update", sid, {"kind": "goal", "text": prepared["message"]})
+        return prepared.get("continuation_prompt") if prepared.get("should_continue") else None
     goal_followup = None
     compression_exhausted = bool(isinstance(result, dict) and result.get("compression_exhausted"))
     try:
         recovery_prompt, recovery_notice = _plan_goal_compression_recovery(
             session, result, status=status, raw=raw)
-        if recovery_notice:
+        if recovery_notice and automatic_goal_notices_enabled():
             _emit("status.update", sid, {"kind": "goal", "text": recovery_notice})
         goal_followup = recovery_prompt or None
     except Exception as _goal_recovery_exc:
@@ -305,7 +317,7 @@ def _goal_followup_after_turn(
             from hermes_cli.goals import collect_tool_evidence
             decision = goal_mgr.evaluate_after_turn(
                 raw, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg, tool_evidence=collect_tool_evidence(result))
-            if goal_mgr.claim_transition_notice(decision) and (verdict_msg := decision.get("message") or ""):
+            if automatic_goal_notices_enabled() and goal_mgr.claim_transition_notice(decision) and (verdict_msg := decision.get("message") or ""):
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):
@@ -798,9 +810,26 @@ def _run_prompt_submit(
             # Bind on this worker thread, before prompt decoration reaches tools.
             user_body = text if isinstance(text, str) and not isinstance(text, InternalGoalPrompt) else ""
             with goal_user_request_scope(str(getattr(st.agent, "session_id", None) or sid), user_body):
-                _invoke_agent(
-                    sid, session, st, prompt, run_message, streamer, images, display_kind,
-                    display_metadata)
+                try:
+                    _invoke_agent(
+                        sid, session, st, prompt, run_message, streamer, images, display_kind,
+                        display_metadata)
+                except Exception as exc:
+                    from hermes_cli.goals import GoalManager
+                    if not GoalManager(str(getattr(st.agent, "session_id", None) or session.get("session_key") or "")).is_active():
+                        raise
+                    history = list(getattr(st.agent, "_session_messages", None) or st.history or [])
+                    if history == st.history:
+                        history.append({"role": "user", "content": run_message})
+                    st.result = {"final_response": "", "messages": history, "failed": True,
+                                 "error": str(exc), "turn_exit_reason": "exception", "completed": False}
+            from hermes_cli.goals import GoalManager
+            from hermes_cli.goal_outcomes import prepare_goal_turn
+            if isinstance(st.result, dict) and st.result.get("failed") and not st.result.get("messages"):
+                st.result["messages"] = list(st.history or []) + [{"role": "user", "content": text}]
+            prepare_goal_turn(GoalManager(str(getattr(st.agent, "session_id", None) or session.get("session_key") or "")),
+                              st.agent, st.result,
+                              is_current=lambda: not session.get("_closing") and session.get("agent") is st.agent)
             status_note = _absorb_turn_result(
                 sid, session, st, text, display_kind, display_metadata)
             payload, raw, status = _complete_turn_payload(session, st, status_note, cols)

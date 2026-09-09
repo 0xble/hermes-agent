@@ -222,6 +222,23 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("goal_fields", [{"failed": True}, {"_goal_decision": {"should_continue": True}}])
+async def test_empty_failed_result_still_runs_goal_lifecycle(loop_env, goal_fields):
+    """Failure bookkeeping must not disappear merely because delivery has no text."""
+    runner = _make_runner()
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    await GatewayRunner._run_post_turn_hooks(
+        runner,
+        agent_result={"final_response": "", **goal_fields},
+        source=_make_event("wakeup").source,
+        is_internal=True,
+    )
+
+    runner._post_turn_goal_continuation.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))

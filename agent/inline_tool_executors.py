@@ -15,6 +15,12 @@ from importlib import import_module
 from typing import Any, Callable, Dict, Optional, Tuple
 
 
+def _automatic_goal_notices_enabled() -> bool:
+    """Whether agent-initiated goal mutation receipts use the notice lane."""
+    from hermes_cli.goal_outcomes import automatic_goal_notices_enabled
+    return automatic_goal_notices_enabled()
+
+
 def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) -> Dict[str, str]:
     """Identity kwargs every tool hook/middleware call carries (all coerced to ``""``)."""
     return {
@@ -41,7 +47,7 @@ def emit_terminal_post_tool_call(
     middleware_trace: Optional[list] = None,
 ) -> None:
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
-    if function_name == "set_goal":
+    if function_name == "set_goal" and _automatic_goal_notices_enabled():
         try:
             from agent.credits_tracker import AgentNotice
 

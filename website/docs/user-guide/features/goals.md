@@ -261,7 +261,16 @@ goals:
   # /goal resume. Default 20. Lower this if you want tighter loops;
   # raise it for long-running refactors.
   max_turns: 20
+  # Show automatic goal receipts and transition notices. Default true.
+  # This does not hide manual /goal confirmations or an unexpected-stop explanation.
+  auto_notices: true
 ```
+
+`auto_notices: false` suppresses automatic persisted goal-change receipts (for example, an agent calling `set_goal`) and automatic transition notices. It does not change execution or manual `/goal` command confirmations.
+
+Unexpected budget exhaustion or a genuine terminal error gets a normal assistant reply, saved with the conversation—not a status toast—even when automatic notices are off. The reply explains progress, remaining work, the actual stopping cause, and the next need. Explicit user stops, live waits, and compression recovery retain their existing behavior; empty text alone is not a failure.
+
+A single tool-free auxiliary check preserves an already-complete explanation or adds only missing information. On timeout or invalid output, a factual fallback distinguishes unverified progress from completed work. Semantic duplicate avoidance is best-effort during an auxiliary outage; explaining the stop takes priority over silence. This output-only step cannot resume work, call tools, or start another agent turn.
 
 ### Choosing the judge model
 

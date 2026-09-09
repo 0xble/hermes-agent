@@ -19,9 +19,9 @@ def _preview(payload: str) -> str:
 
 
 def _print_decision_message(decision: dict) -> bool:
-    """Print a manager decision's ``message`` (if any) via _cprint; True when one was printed."""
+    """Print a manager decision's grounded stop explanation or status message once."""
     from cli import _cprint
-    msg = decision.get("message") or ""
+    msg = decision.get("stop_explanation") or decision.get("message") or ""
     if msg:
         _cprint(f"  {msg}")
     return bool(msg)
@@ -523,8 +523,10 @@ class CLILoopsMixin:
         "continue" and would re-queue exactly what was cancelled; pausing is recoverable
         via ``/goal resume``. Empty-response skip mirrors ``gateway/run.py``."""
         from cli import _DIM, _RST, _cprint, _looks_like_slash_command
+        from hermes_cli.goal_outcomes import consume_goal_decision, automatic_goal_notices_enabled
+        decision = consume_goal_decision(getattr(self, "_last_agent_result", None))
         mgr = self._get_goal_manager()
-        if mgr is None or not mgr.is_active():
+        if mgr is None or (decision is None and not mgr.is_active()):
             return
 
         # Slash commands don't count as "real user messages": they're dispatched via
@@ -573,9 +575,12 @@ class CLILoopsMixin:
             _tool_evidence = collect_tool_evidence(getattr(self, "_last_agent_result", None))
         except Exception:
             _tool_evidence = []
-        decision = mgr.evaluate_after_turn(
-            last_response, user_initiated=True, background_processes=_bg_procs, active_delegations=_active_deleg, tool_evidence=_tool_evidence)
-        if mgr.claim_transition_notice(decision):
+        if decision is None:
+            decision = mgr.evaluate_after_turn(
+                last_response, user_initiated=True, background_processes=_bg_procs,
+                active_delegations=_active_deleg, tool_evidence=_tool_evidence)
+        if (automatic_goal_notices_enabled() and not decision.get("stop_explanation")
+                and mgr.claim_transition_notice(decision)):
             _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

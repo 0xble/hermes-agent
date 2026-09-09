@@ -293,6 +293,8 @@ class CLIChatTurnMixin:
             reset_current_session_key = None  # type: ignore[assignment]
             _approval_session_token = None
         agent_message = turn.voice_prefix + message if turn.voice_prefix else message
+        _history_before = getattr(self.agent, "_session_messages", None)
+        _history_size = len(_history_before) if isinstance(_history_before, list) else 0
         # One-shot /model and /reload-skills notes; _prepend_note_to_message also handles
         # multimodal content-part lists (string concat raised TypeError with an image).
         for _note_attr in ("_pending_model_switch_note", "_pending_skills_reload_note"):
@@ -350,8 +352,16 @@ class CLIChatTurnMixin:
         except Exception as exc:
             logging.error("run_conversation raised: %s", exc, exc_info=True)
             _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
+            _current_history = getattr(self.agent, "_session_messages", None)
+            _failed_history = self.conversation_history
+            if isinstance(_current_history, list) and _current_history and (
+                _current_history is not _history_before or len(_current_history) != _history_size
+            ):
+                _failed_history = _current_history
             turn.result = {
-                "final_response": f"Error: {_summary}", "messages": [], "api_calls": 0,
+                "final_response": f"Error: {_summary}",
+                "messages": list(_failed_history or []),
+                "api_calls": 0, "turn_exit_reason": "exception",
                 "completed": False, "failed": True, "error": _summary,
             }
         finally:
@@ -474,6 +484,8 @@ class CLIChatTurnMixin:
         time.sleep(0.15)
         # Goal evaluation consumes canonical tool-result messages from this turn.
         # Keep the full envelope process-local; only redacted metadata is durable.
+        if isinstance(turn.result, dict) and turn.result.get("failed") and not turn.result.get("messages"):
+            turn.result["messages"] = list(self.conversation_history)
         self._last_agent_result = turn.result
         if turn.result:
             self.conversation_history = turn.result.get("messages", self.conversation_history)
@@ -485,6 +497,11 @@ class CLIChatTurnMixin:
             self.session_id = self.agent.session_id
             self._write_terminal_breadcrumb()
             self._pending_title = None
+        if isinstance(turn.result, dict) and self.agent:
+            from hermes_cli.goal_outcomes import prepare_goal_turn
+            prepare_goal_turn(self._get_goal_manager(), self.agent, turn.result,
+                              is_current=lambda: not self._should_exit)
+            self.conversation_history = turn.result.get("messages", self.conversation_history)
 
     def _chat_render_turn(self, turn, agent_thread, interrupt_msg):
         """Post-turn display: errors, interrupt marker, reasoning/response panels, bell, re-queues.
