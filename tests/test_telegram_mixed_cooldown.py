@@ -106,3 +106,16 @@ async def test_overflow_ambiguous_timeout_never_plain_resends():
     a._bot.send_message.side_effect = TimedOut()
     assert await a._send_overflow_continuation("42", "content", 7, {}, None, {}, True) is None
     a._bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_remains_expendable_behind_pending_final():
+    a = adapter()
+    assert a.deletion_retry_after('42') == 0
+    a._send_final_waiters = {'42': 1}
+    assert a.deletion_retry_after('42') > 0
+    assert not await a.delete_message('42', '7')
+    a._bot.delete_message.assert_not_awaited()
+    a._send_final_waiters['42'] = 0
+    assert await a.delete_message('42', '7')
+    a._bot.delete_message.assert_awaited_once()

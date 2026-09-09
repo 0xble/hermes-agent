@@ -395,7 +395,9 @@ class DelegationCards:
 
     def _defer_delete(self, card, adapter):
         delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
-        key = next(k for k, c in self.cards.items() if c is card)
+        key = next((k for k, c in self.cards.items() if c is card), None)
+        if key is None:
+            return False
         anchor_key = self._anchor(key)
         anchor = self.cards[anchor_key]
         delay = max(delay if isinstance(delay, (int, float)) else 0, anchor.get("delete_retry_at", 0) - time.time())
@@ -434,8 +436,7 @@ class DelegationCards:
                 card["message_deleted"] = True
                 self._save()
             elif self._defer_delete(card, adapter):
-                card["delete_attempts"] -= 1
-                self._save()
+                self._save()  # an actual failed request still spends its bounded attempt
         except Exception:
             logger.exception("Delegation card deletion deferred until reconciliation")
 

@@ -14,12 +14,19 @@ from gateway.session import SessionSource
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['delegation', 'review'])
-async def test_cooldown_defers_cleanup_without_consuming_attempts(kind, tmp_path):
+@pytest.mark.parametrize('persistent_flood', [False, True])
+async def test_cooldown_defers_cleanup_without_consuming_attempts(kind, persistent_flood, tmp_path):
     deadline = [0.0]
     adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True,message_id='one')),
         send_delegation_card=AsyncMock(return_value=SendResult(success=True,message_id='one')),
         edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True),
         deletion_retry_after=lambda _:max(0,deadline[0]-time.monotonic()))
+    async def delete(*args):
+        if persistent_flood:
+            deadline[0] = time.monotonic()+0.01
+            return False
+        return True
+    adapter.delete_message.side_effect = delete
     runner = SimpleNamespace(_adapter_for_source=lambda _:adapter, _thread_metadata_for_source=lambda _: {})
     source = SessionSource(platform=Platform.TELEGRAM,chat_id='42')
     if kind == 'review':
@@ -48,8 +55,12 @@ async def test_cooldown_defers_cleanup_without_consuming_attempts(kind, tmp_path
     adapter.delete_message.assert_not_awaited()
     while pending:
         await asyncio.gather(*list(pending.values()))
-    assert item['message_id'] is None and item['delete_attempts'] == 1
-    adapter.delete_message.assert_awaited_once()
+    if persistent_flood:
+        assert item['message_id'] == 'one' and item['delete_attempts'] == 3
+        assert adapter.delete_message.await_count == 3
+    else:
+        assert item['message_id'] is None and item['delete_attempts'] == 1
+        adapter.delete_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -74,3 +85,16 @@ async def test_legacy_ambiguous_send_does_not_hide_known_aggregate_anchor(tmp_pa
     assert '**A.' in adapter.edit_message.call_args.args[2] and '**B.' in adapter.edit_message.call_args.args[2]
     assert cards.cards['a'*32]['presentation_key'] == 'b'*32
     assert not any(c.get('handled') or c.get('retired') for c in cards.cards.values())
+
+
+@pytest.mark.asyncio
+async def test_missing_deferred_cleanup_record_is_a_noop(tmp_path):
+    runner=SimpleNamespace(_adapter_for_source=lambda _:None)
+    statuses=ReviewStatuses(runner,home=tmp_path)
+    await statuses._retry_delete('missing')
+    assert statuses.delete_pending == {}
+    detached={'source':{'chat_id':'42'}}
+    adapter=SimpleNamespace(deletion_retry_after=lambda _:1)
+    assert statuses._defer_delete(detached,adapter) is False
+    cards=DelegationCards(runner,home=tmp_path)
+    assert cards._defer_delete(detached,adapter) is False

@@ -4672,7 +4672,8 @@ class TelegramAdapter(BasePlatformAdapter):
     def deletion_retry_after(self, chat_id: str) -> float:
         """Known shared deadline, so cleanup owners defer without spending an attempt."""
         key = str(normalize_telegram_chat_id(chat_id))
-        return max(0.0, self._send_cooldown_until.get(key, 0.0) - time.monotonic())
+        priority_wait = 0.05 if getattr(self, "_send_final_waiters", {}).get(key, 0) else 0.0
+        return max(priority_wait, self._send_cooldown_until.get(key, 0.0) - time.monotonic())
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.
@@ -4691,7 +4692,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Cleanup respects published flood waits without assuming send-message quotas.
             await self._run_send_call(chat_id, self._bot.delete_message,
-                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _reserve_gap=False, _expendable=False)
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _reserve_gap=False, _expendable=True)
             self._forget_status_message_id(chat_id, message_id)
             return True
         except Exception as e:

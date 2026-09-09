@@ -200,22 +200,30 @@ class ReviewStatuses:
         delay = max(delay if isinstance(delay, (int, float)) else 0, item.get("delete_retry_at", 0) - time.time())
         if delay <= 0:
             return False
+        key = next((k for k, value in self.items.items() if value is item), None)
+        if key is None:
+            return False
         item["delete_retry_at"] = time.time() + delay
         self._save()
-        key = next(k for k, value in self.items.items() if value is item)
         if key not in self.delete_pending:
             self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
         return True
 
     async def _retry_delete(self, key):
         try:
-            await asyncio.sleep(max(0, self.items[key].get("delete_retry_at", 0) - time.time()))
+            item = self.items.get(key)
+            if item is None:
+                return
+            await asyncio.sleep(max(0, item.get("delete_retry_at", 0) - time.time()))
             async with self.locks.setdefault(key, asyncio.Lock()):
-                self.items[key].pop("delete_retry_at", None)
-                await self._delete(self.items[key])
+                item = self.items.get(key)
+                if item is not None:
+                    item.pop("delete_retry_at", None)
+                    await self._delete(item)
         finally:
             self.delete_pending.pop(key, None)
-            if self.items[key].get("delete_retry_at") and not asyncio.current_task().cancelling():
+            item = self.items.get(key)
+            if item and item.get("delete_retry_at") and not asyncio.current_task().cancelling():
                 self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
 
     async def _delete(self, item):
@@ -232,8 +240,7 @@ class ReviewStatuses:
                     item["message_id"] = None
                     self._save()
                 elif self._defer_delete(item, adapter):
-                    item["delete_attempts"] -= 1
-                    self._save()
+                    self._save()  # an actual failed request still spends its bounded attempt
             except Exception:
                 logger.debug("Native review status deletion deferred", exc_info=True)
 
