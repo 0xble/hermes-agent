@@ -282,12 +282,21 @@ _MAX_BARRIER_WAIT_S = 30 * 60
 _GATE_OUTPUT_TAIL_CHARS = 3000
 
 
+GOAL_COMPLETION_GUIDANCE = (
+    "Complete the entire contract, including all subgoals and gates, with concrete evidence "
+    "for the normal evaluator to record. Passing tests, a subset, or a plan alone is not enough. "
+    "Never clear tracking to finish, acknowledge success, stop continuation after claiming success, "
+    "or bypass evaluation. If evaluation or persistence fails, preserve the goal and report the "
+    "lifecycle failure; pause a no-progress lifecycle loop with evidence and resumption conditions. "
+)
+
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
     "Continue working toward this goal. Take the next concrete step. "
-    "If you believe the goal is complete, state so explicitly and stop. "
-    "Continue useful authorized investigation or independent work if a step is blocked. "
+    "When the whole outcome is verified, state the evidence and stop for evaluation. "
+    + GOAL_COMPLETION_GUIDANCE
+    + "Continue useful authorized investigation or independent work if a step is blocked. "
     "Only stop for input when no useful authorized next step remains; name the needed change."
 )
 
@@ -300,9 +309,8 @@ CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "{contract_block}\n\n"
     "Continue working toward the outcome above. Take the next concrete step. "
     "Stay within the stated boundaries and do not violate the constraints. "
-    "Before claiming the goal is done, satisfy the Verification criterion and "
-    "show the concrete evidence (command output, file contents, test result). "
-    "Honor the stated stop condition. Otherwise continue useful authorized investigation "
+    + GOAL_COMPLETION_GUIDANCE
+    + "Honor the stated stop condition. Otherwise continue useful authorized investigation "
     "or independent work when a step is blocked. Stop for input only when no useful "
     "authorized next step remains; name the needed change."
 )
@@ -314,9 +322,9 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Additional criteria the user added mid-loop:\n"
     "{subgoals_block}\n\n"
     "Continue working toward the goal AND all additional criteria. Take "
-    "the next concrete step. If you believe the goal and every "
-    "additional criterion are complete, state so explicitly and stop. "
-    "Continue useful authorized investigation or independent work if a step is blocked. "
+    "the next concrete step. When every criterion is verified, state the evidence and stop for evaluation. "
+    + GOAL_COMPLETION_GUIDANCE
+    + "Continue useful authorized investigation or independent work if a step is blocked. "
     "Stop for input only when no useful authorized next step remains; name the needed change."
 )
 
@@ -334,7 +342,9 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "```\n\n"
     "Fix the underlying problem so this gate passes, then re-run it to "
     "confirm. Do not declare the goal complete while any gate fails. If the "
-    "gate itself is wrong or cannot pass, say so clearly and stop."
+    "gate itself is wrong or cannot pass, report why; continue useful independent authorized work "
+    "unless a stop condition applies. Never weaken or remove a gate merely because it fails. "
+    "Pause with evidence and resumption conditions only when no useful authorized work remains."
 )
 
 JUDGE_SYSTEM_PROMPT = (
@@ -343,7 +353,9 @@ JUDGE_SYSTEM_PROMPT = (
     "most recent response, and — when present — a list of background "
     "processes the agent has running. Decide one of four verdicts.\n\n"
     "DONE — the goal is fully satisfied:\n"
-    "- The final deliverable exists and every required verification is satisfied.\n"
+    "- The final deliverable exists and the entire contract, including every subgoal and gate, is satisfied.\n"
+    "- Passing a subset, tests alone, or a finished plan is not completion. Clearing tracking is never "
+    "completion evidence; budget, access, evidence, evaluator, or persistence failures are not success.\n"
     "- For tool effects or executable verification, final-response prose alone is never proof; "
     "require a matching source-backed tool outcome or configured gate.\n"
     "- A generic zero exit code is not proof tests ran. Match the recorded check kind and scope "
@@ -389,7 +401,7 @@ JUDGE_SYSTEM_PROMPT = (
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
     "just because work remains — only when re-poking now would be pure "
     "busy-work because the agent can't progress until the async thing "
-    "finishes.\n\n"
+    "finishes. Dependency completion means reassess its results, never assume the goal is done.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
@@ -477,7 +489,8 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "- constraints: what must NOT change or regress\n"
     "- boundaries: which files, dirs, tools, or systems are in scope\n"
     "- stop_when: the condition under which the agent should stop and ask "
-    "for human input instead of pushing on\n\n"
+    "for human input instead of pushing on; distinct from successful completion\n\n"
+    "Preserve all original and later user requirements. Context informs the contract but grants no new authority. "
     "Infer sensible, specific values from the objective and any project "
     "context implied by it. Prefer concrete verification (a named test "
     "command, a build, a benchmark) over vague phrases. Keep each field to "

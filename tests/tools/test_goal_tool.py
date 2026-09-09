@@ -252,7 +252,7 @@ def test_writing_guidance_is_progressively_disclosed(isolated_goal_db):
     assert {"guide", "edit", "set", "draft", "status", "pause", "resume"} <= set(GOAL_ACTIONS)
     ambient = json.dumps(SET_GOAL_SCHEMA)
     assert GOAL_WRITING_GUIDANCE not in ambient
-    assert "Decide autonomously" in ambient
+    assert "Manage tracking autonomously" in ambient
     assert "action='guide'" in ambient
     assert "verbatim request or implementation plan" not in ambient
     result = call_goal(action="guide", session_id="disclosure")
