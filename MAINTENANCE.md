@@ -59,6 +59,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
 | HERMES-135 | Active | `fix(telegram): preserve nested and multiline legacy emphasis` | Resolve valid asterisk emphasis without stripping unmatched literals. |
+| HERMES-132 | Active | `fix(browser): return Camofox navigation titles` | Return the title from the same owned Camofox tab after navigation when its mutation response omits title metadata. |
 | HERMES-131 | Active | `fix(backup): retain verified quick-snapshot recovery generations` | Bound partial snapshot retention while preserving complete and verified per-database recovery coverage. |
 | HERMES-127 | Active | `fix(telegram): preserve literal hash references in rich messages` | Escape non-heading block prefixes before rich parsing without disabling rich delivery. |
 | HERMES-130 | Active | `feat(gateway): queue MoA requests during active turns` | Accept MoA requests immediately for a separate queued one-shot turn. |
@@ -310,6 +311,15 @@ These subjects are retained as provenance notes only. They are not validation in
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-132 — Return Camofox navigation titles
+
+- **Cause and contract:** The live Camofox REST server at `127.0.0.1:9377` returns `{tabId, url}` for `POST /tabs` and `{ok, refsAvailable, tabId, url}` for `POST /tabs/<tabId>/navigate`, while `GET /tabs?userId=<owned-user>` carries the tab's `title`. The adapter shaped `title` solely from the mutation response, so `browser_navigate` reported `"title":""` despite the page title existing. After a successful navigation, return the non-empty response title when supplied; otherwise list only the task's existing Camofox user and select the exact owned `tabId`. A lookup failure remains non-fatal and preserves the historical empty title. No Camofox runtime/engine change, Chrome/manual routing, or configured identity alias behavior is changed.
+- **Upstream tracking:** All-state issue/PR searches for `camofox title`, `browser_navigate title camofox`, and `empty title camofox` on 2026-09-09 found no exact Hermes match. Camofox issue [#8380](https://github.com/jo-inc/camofox-browser/issues/8380) is an open console-capture capability request, not a title defect; this patch intentionally adds neither a second console implementation nor console capture.
+- **Upstream PR:** Pending submission from `0xble/hermes-agent-upstream:fix/camofox-navigate-title-upstream` to `NousResearch/hermes-agent`.
+- **Regression:** `tests/tools/test_browser_camofox.py::TestCamofoxNavigate::test_reads_title_from_owned_tab_when_navigation_response_omits_it` drives the real adapter handler with a synthetic API response that omits a mutation title and exposes the title on the owned tab listing. Focused Camofox, ensure-tab, and named-identity suites passed (35 tests); `uv run ruff check tools/browser_camofox.py tests/tools/test_browser_camofox.py` and `git diff --check` passed. A disposable `127.0.0.1` fixture exercised the candidate against the live Camofox service and returned `Hermes Camofox Title Fixture`; its owned session was closed.
+- **Rollback:** Revert only `fix(browser): return Camofox navigation titles`, including its focused regression and this record. There is no state, configuration, credential, identity, or Camofox-service migration.
+- **Retirement:** Once released upstream contains this contract and the focused regression passes against it, remove the fork delta and mark this entry Retired with the removal subject. Fork publication/runtime promotion are separate.
 
 ### HERMES-130 — Accept MoA requests during active replies
 
