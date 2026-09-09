@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform
+from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
@@ -60,6 +61,56 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     adapter.delete_message.assert_awaited_once_with("42", "1")
     await cards.observe(source, "route", "session", 1, "subagent.start", None, data)
     assert not cards.pending
+
+
+@pytest.mark.asyncio
+async def test_persisted_telegram_card_resolves_live_adapter_and_cleans_up(tmp_path):
+    """Persisted JSON must return to the enum-keyed gateway adapter resolver."""
+    class Runner(GatewayAuthorizationMixin):
+        adapters: dict
+        _primary_profile_name: str
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
+    adapter = SimpleNamespace(
+        send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="card")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)),
+        delete_message=AsyncMock(return_value=True),
+    )
+    runner = Runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._primary_profile_name = "default"
+    owner = dict(profile="default", session_id="session", session_key="route", chat_id="42", thread_id="8")
+    data = dict(parent_task_id="e" * 32, thread_ref="A", owner=owner, background=True)
+
+    cards = DelegationCards(runner, home=tmp_path, interval=0)
+    await cards.observe(source, "route", "session", 1, "subagent.start", None, data)
+    await asyncio.gather(*list(cards.pending.values()))
+
+    restored = DelegationCards(runner, home=tmp_path, interval=0)
+    assert restored.cards["e" * 32]["source"]["platform"] == "telegram"
+    await restored.reconcile()
+    await asyncio.gather(*list(restored.pending.values()))
+    assert restored._source(restored.cards["e" * 32]).platform is Platform.TELEGRAM
+    assert runner._adapter_for_source(restored._source(restored.cards["e" * 32])) is adapter
+    adapter.send_delegation_card.assert_awaited_once()
+    assert adapter.send_delegation_card.call_args.args[0].platform is Platform.TELEGRAM
+
+    event = MessageEvent(text="Returned", source=source, internal=True, metadata={
+        "delegation_parent_task_id": "e" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
+    await restored.delivered(restored.receipt(event, "route", 2))
+    adapter.delete_message.assert_awaited_once_with("42", "card")
+
+
+def test_invalid_persisted_card_source_fails_closed_with_one_safe_diagnostic(tmp_path, caplog):
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: pytest.fail("must not resolve")), home=tmp_path)
+    card = {"source": {"platform": "not-a-platform", "chat_id": "private-chat-id"}}
+
+    assert cards._adapter(card) is None
+    assert cards._adapter(card) is None
+
+    messages = [record.getMessage() for record in caplog.records if "Delegation card" in record.getMessage()]
+    assert messages == ["Delegation card source platform is invalid; skipping delivery"]
+    assert "private-chat-id" not in caplog.text
 
 
 @pytest.mark.asyncio

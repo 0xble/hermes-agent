@@ -62,6 +62,7 @@ class DelegationCards:
         self.locks = {}
         self.last_edit = {}
         self.turn_tasks = {}
+        self._diagnostics = set()
         if self.path.exists():
             try:
                 self.cards = json.loads(self.path.read_text(encoding="utf-8"))
@@ -79,11 +80,42 @@ class DelegationCards:
         temporary.write_text(json.dumps(self.cards, ensure_ascii=False), encoding="utf-8")
         temporary.replace(self.path)
 
-    def _source(self, card):
-        return SessionSource(**card["source"])
+    def _warn_once(self, card, reason):
+        key = (id(card), reason)
+        if key not in self._diagnostics:
+            self._diagnostics.add(key)
+            logger.warning(reason)
 
-    def _adapter(self, card):
-        return self.runner._adapter_for_source(self._source(card))
+    def _source(self, card):
+        source_data = card.get("source")
+        if not isinstance(source_data, dict):
+            self._warn_once(card, "Delegation card source is invalid; skipping delivery")
+            return None
+        source_data = dict(source_data)
+        platform = source_data.get("platform")
+        if isinstance(platform, str):
+            try:
+                source_data["platform"] = Platform(platform)
+            except ValueError:
+                self._warn_once(card, "Delegation card source platform is invalid; skipping delivery")
+                return None
+        elif not isinstance(platform, Platform):
+            self._warn_once(card, "Delegation card source platform is invalid; skipping delivery")
+            return None
+        try:
+            return SessionSource(**source_data)
+        except (TypeError, ValueError):
+            self._warn_once(card, "Delegation card source is invalid; skipping delivery")
+            return None
+
+    def _adapter(self, card, source=None):
+        source = source if source is not None else self._source(card)
+        if source is None:
+            return None
+        adapter = self.runner._adapter_for_source(source)
+        if adapter is None:
+            self._warn_once(card, "Delegation card adapter unavailable; skipping delivery")
+        return adapter
 
     async def reconcile(self):
         for key, card in list(self.cards.items()):
@@ -151,7 +183,8 @@ class DelegationCards:
                 text = render_card(card)
                 if text == card["rendered"]:
                     return
-                adapter = self._adapter(card)
+                source = self._source(card)
+                adapter = self._adapter(card, source)
                 if adapter is None:
                     return
                 revision = card.get("revision", 0)
@@ -169,7 +202,7 @@ class DelegationCards:
                 if result is None and card["send_attempts"] < 1:
                     card["send_attempts"] += 1  # ambiguous sends must not spam retries
                     self._save()  # persist the attempt BEFORE an ambiguous transport await
-                    result = await adapter.send_delegation_card(self._source(card), text)
+                    result = await adapter.send_delegation_card(source, text)
                     if getattr(result, "success", False):
                         card["message_id"] = str(result.message_id)
                     elif (getattr(result, "raw_response", None) or {}).get("definite_rejection") and card.get("rejections", 0) < 1:
