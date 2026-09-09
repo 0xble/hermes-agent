@@ -1028,16 +1028,25 @@ def browser_navigate(url: str, task_id: Optional[str] = None, identity: Optional
     from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
 
     try:
-        resolved_identity = resolve_browser_identity(identity)
+        # Follow-up Camofox navigations deliberately omit identity: the durable
+        # Camofox binding is the authority after the first navigation.
+        resolved_identity = None if (_is_camofox_mode() and identity is None) else resolve_browser_identity(identity)
     except BrowserIdentityError as exc:
         return _dumps(_err(str(exc)))
-    if resolved_identity is not None:
+    if resolved_identity is not None and not _is_camofox_mode():
         if not _use_real_profile():
             _cleanup_real_profile_state()
             return _dumps(_err("named browser identities require browser.use_real_profile: true; "
                                "Hermes will not fall back to a signed-out browser"))
-        if _is_camofox_mode():
-            return _dumps(_err("named browser identities are incompatible with the Camofox backend"))
+    if not _is_camofox_mode():
+        # A durable Camofox binding must also prevent a later Chrome/CDP path from
+        # silently taking ownership of the same task.
+        try:
+            from tools.browser_camofox_state import read_camofox_binding
+            if read_camofox_binding(task_id or "default") is not None:
+                return _dumps(_err("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars"))
+        except Exception as exc:
+            return _dumps(_err(str(exc)))
 
     url, safety_error = _secret_url_error_normalized(url)
     if safety_error is not None:
@@ -1052,7 +1061,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None, identity: Optional
         return json.dumps(safety_error)
 
     if _is_camofox_mode():
-        return _camofox("camofox_navigate", url, task_id)
+        return _camofox("camofox_navigate", url, task_id, identity)
 
     if auto_local_this_nav:
         logger.info("browser_navigate: auto-routing %s to local Chromium sidecar (cloud provider %s stays on "
@@ -1167,6 +1176,14 @@ def _camofox(func_name: str, *args):
     """Call ``tools.browser_camofox.<func_name>(*args)`` (Camofox mode delegation)."""
     import importlib
     return getattr(importlib.import_module("tools.browser_camofox"), func_name)(*args)
+
+
+def _camofox_bound_task_error(task_id: Optional[str]) -> Optional[str]:
+    """Native Camofox follow-ups may only use a durable named task binding."""
+    from tools.browser_camofox_state import read_camofox_binding
+    if read_camofox_binding(task_id) is None:
+        return _dumps(_err("Camofox requires an explicit configured browser identity"))
+    return None
 
 
 def _guarded_action(task_id: Optional[str], action: str, command: str, args: list, ok: Dict[str, Any], err: str) -> str:
@@ -1650,13 +1667,21 @@ def _browser_navigate_schema_overrides() -> dict:
                         "browser session and cannot be changed by follow-up calls."),
     }
     required = list(base.get("required") or [])
-    if cfg.get("require_identity") is True and "identity" not in required:
+    if (_is_camofox_mode() or cfg.get("require_identity") is True) and "identity" not in required:
         required.append("identity")
     return {"parameters": {**base, "properties": properties, "required": required}}
 
 
 def _browser_navigate_handler(args: dict, kw: dict):
     """Keep named real-profile identities off the extension/cloud routing lanes."""
+    if _is_camofox_mode():
+        if not args.get("identity"):
+            from tools.browser_camofox_state import read_camofox_binding
+            if read_camofox_binding(kw.get("task_id")) is not None:
+                return browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"))
+            return _dumps(_err("Camofox requires an explicit configured browser identity"))
+        return browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"),
+                                identity=args.get("identity"))
     from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
 
     try:
@@ -1682,6 +1707,10 @@ def _routed_check_fn(name: str):
 
 def _routed_handler(name: str, fallback):
     def handler(args, **kw):
+        if _is_camofox_mode():
+            binding_error = _camofox_bound_task_error(kw.get("task_id"))
+            if binding_error is not None:
+                return binding_error
         return routed_browser_handler(name, args, fallback=lambda: fallback(args, kw),
                                       task_id=kw.get("task_id"), session_id=kw.get("session_id"))
     return handler

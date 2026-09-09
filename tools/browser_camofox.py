@@ -25,7 +25,15 @@ import requests
 
 from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
-from tools.browser_camofox_state import get_camofox_identity
+from tools.browser_camofox_state import (
+    CamofoxIdentityError,
+    claim_camofox_binding,
+    get_camofox_identity,
+    get_camofox_state_dir,
+    reject_non_camofox_binding,
+    read_camofox_binding,
+    resolve_camofox_identity,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -211,8 +219,13 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 
 
 # ---- Session management ----
-_sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
+_sessions: Dict[tuple[str, str], Dict[str, Any]] = {}  # (Hermes-home, task_id) -> Camofox session
 _sessions_lock = threading.Lock()
+
+
+def _session_cache_key(task_id: Optional[str]) -> tuple[str, str]:
+    """Keep process-local tabs isolated when tests or profile switches change HERMES_HOME."""
+    return str(get_camofox_state_dir()), task_id or "default"
 
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -226,7 +239,11 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("Camofox tab adoption failed for %s: %s", session.get("user_id"), exc)
         return session
     dict_tabs = [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
-    candidates = [tab for tab in dict_tabs if tab.get("listItemId") == session.get("session_key")] or dict_tabs
+    candidates = [tab for tab in dict_tabs if tab.get("listItemId") == session.get("session_key")]
+    # Named identities must never bootstrap onto another task's tab, even under the
+    # same persistent userId. Legacy externally-managed sessions retain their old fallback.
+    if not candidates and not session.get("named"):
+        candidates = dict_tabs
     tab_id = candidates[-1].get("tabId") if candidates else None
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
@@ -234,32 +251,87 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     return session
 
 
-def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
-    """Get or create the task's session. Identity precedence: external override
-    (CAMOFOX_USER_ID / config) → profile-scoped identity when managed persistence
-    is on → random ephemeral userId."""
+def _global_user_id_override(camofox_cfg: Dict[str, Any]) -> bool:
+    """Whether a legacy global Camofox userId would defeat named isolation."""
+    return bool(_env_or_cfg("CAMOFOX_USER_ID", camofox_cfg, "user_id", secret=True))
+
+
+def _named_session_from_binding(task_id: str, binding: Dict[str, str], camofox_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Rehydrate and validate a durable named binding on every command.
+
+    This deliberately does not trust the process cache: configuration/global
+    overrides can change while a gateway remains warm, and restart follow-ups
+    have no identity argument to repeat.
+    """
+    if _global_user_id_override(camofox_cfg):
+        raise CamofoxIdentityError("named Camofox identities conflict with CAMOFOX_USER_ID or browser.camofox.user_id")
+    resolved = resolve_camofox_identity(binding["alias"], task_id)
+    expected = {key: resolved[key] for key in ("alias", "identity_key", "user_id", "session_key")}
+    actual = {key: binding[key] for key in expected}
+    if actual != expected:
+        raise CamofoxIdentityError("Camofox task binding no longer matches configured identity; start a new task")
+    return {"user_id": binding["user_id"], "tab_id": None, "session_key": binding["session_key"],
+            "managed": True, "adopt_existing_tab": True, "named": True, "alias": binding["alias"]}
+
+
+def _get_session(task_id: Optional[str], identity: Optional[str] = None,
+                 adopt_existing_tab: bool = False) -> Dict[str, Any]:
+    """Get or create an identity-bound Camofox session.
+
+    Native Camofox requires a configured identity. A durable backend+identity claim
+    prevents a task from being silently reattached to another cookie jar after restart.
+    """
     task_id = task_id or "default"
+    cache_key = _session_cache_key(task_id)
     with _sessions_lock:
-        if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
         camofox_cfg = _get_camofox_config()
-        identity = _camofox_identity_override(task_id, camofox_cfg)
-        if identity is None and _managed_persistence_enabled(camofox_cfg):
-            identity = get_camofox_identity(task_id)
-        if identity is None:
-            identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
+        binding = read_camofox_binding(task_id)
+        if cache_key in _sessions:
+            existing = _sessions[cache_key]
+            if identity and existing.get("alias") != identity:
+                raise CamofoxIdentityError("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars")
+            if existing.get("named"):
+                if binding is None:
+                    raise CamofoxIdentityError("Camofox task binding is missing; start a new task")
+                validated = _named_session_from_binding(task_id, binding, camofox_cfg)
+                # Keep the live tab but refresh all durable identity values.
+                validated["tab_id"] = existing.get("tab_id")
+                _sessions[cache_key] = existing = validated
+            return _adopt_existing_tab(existing)
+        if identity is not None:
+            if _global_user_id_override(camofox_cfg):
+                raise CamofoxIdentityError("named Camofox identities conflict with CAMOFOX_USER_ID or browser.camofox.user_id")
+            reject_non_camofox_binding(task_id)
+            resolved = resolve_camofox_identity(identity, task_id)
+            bound = claim_camofox_binding(task_id, resolved)
+            session = {"user_id": bound["user_id"], "tab_id": None, "session_key": bound["session_key"],
+                       "managed": True, "adopt_existing_tab": adopt_existing_tab,
+                       "named": True, "alias": bound["alias"]}
+            _sessions[cache_key] = session
+            return _adopt_existing_tab(session)
+        if binding is not None:
+            session = _named_session_from_binding(task_id, binding, camofox_cfg)
+            _sessions[cache_key] = session
+            return _adopt_existing_tab(session)
+        # Compatibility callers keep the old unmanaged behavior; the registered Camofox
+        # tool path always passes identity and therefore never reaches this branch.
+        legacy_identity = _camofox_identity_override(task_id, camofox_cfg)
+        if legacy_identity is None and _managed_persistence_enabled(camofox_cfg):
+            legacy_identity = get_camofox_identity(task_id)
+        if legacy_identity is None:
+            legacy_identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
             managed, adopt = False, False
         else:
             managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
-        session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
-                   "managed": managed, "adopt_existing_tab": adopt}
-        _sessions[task_id] = session
+        session = {"user_id": legacy_identity["user_id"], "tab_id": None, "session_key": legacy_identity["session_key"],
+                   "managed": managed, "adopt_existing_tab": adopt, "named": False}
+        _sessions[cache_key] = session
         return _adopt_existing_tab(session)
 
 
-def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
+def _ensure_tab(task_id: Optional[str], url: str = "about:blank", identity: Optional[str] = None) -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
-    session = _get_session(task_id)
+    session = _get_session(task_id, identity=identity)
     if not session["tab_id"]:
         data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
         session["tab_id"] = data.get("tabId")
@@ -269,7 +341,7 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
     with _sessions_lock:
-        return _sessions.pop(task_id or "default", None)
+        return _sessions.pop(_session_cache_key(task_id), None)
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
@@ -353,29 +425,29 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     return snapshot, data.get("refsCount", 0)
 
 
-def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
+def _navigate_tab(task_id: Optional[str], browser_url: str, identity: Optional[str]) -> tuple[Dict[str, Any], dict]:
     """Open ``browser_url`` in the task's tab (creating it if missing) and return
     ``(session, navigate_response)``. A 404 on the existing tab means the server
     garbage-collected it — recreate instead of failing."""
-    session = _get_session(task_id)
+    session = _get_session(task_id, identity=identity)
     if session["tab_id"]:
         try:
             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
             return session, data
         except requests.HTTPError as e:
-            if e.response is None or e.response.status_code != 404:
+            if e.response is None or e.response.status_code not in {404, 410}:
                 raise
-            logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
-                           session["tab_id"])
+            logger.warning("Camofox tab %s returned %s — tab was garbage collected. Creating a fresh tab.",
+                           session["tab_id"], e.response.status_code)
             session["tab_id"] = None
-    return _ensure_tab(task_id, browser_url), {"ok": True, "url": browser_url}
+    return _ensure_tab(task_id, browser_url, identity=identity), {"ok": True, "url": browser_url}
 
 
-def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
-    """Navigate to a URL via Camofox."""
+def camofox_navigate(url: str, task_id: Optional[str] = None, identity: Optional[str] = None) -> str:
+    """Navigate to a URL via Camofox; native registry calls pass an explicit identity."""
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
-        session, data = _navigate_tab(task_id, browser_url)
+        session, data = _navigate_tab(task_id, browser_url, identity)
         result = {"success": True, "url": data.get("url", browser_url), "title": data.get("title", "")}
         if rewrite_info:
             result["requested_url"], result["url_rewrite"] = url, rewrite_info
@@ -501,14 +573,27 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 
 
 def camofox_close(task_id: Optional[str] = None) -> str:
-    """Close the browser session via Camofox."""
+    """Checkpoint a named profile and close only this task's tab.
+
+    A named identity's userId is shared by sibling tasks.  Deleting its session
+    would tear down their tabs and cookie jar, so export storage (which queues the
+    persistence checkpoint) then delete only our tab.
+    """
     try:
         session = _drop_session(task_id)
-        if session:
+        if session is None and read_camofox_binding(task_id) is not None:
+            # A gateway restart loses the in-memory tab map; recover the task's
+            # tagged tab before cleanup rather than silently leaking it.
+            session = _get_session(task_id)
+        if session and session.get("named"):
+            _get(f"/sessions/{session['user_id']}/storage_state", timeout=30)
+            if session.get("tab_id"):
+                _delete(f"/tabs/{session['tab_id']}", {"userId": session["user_id"]})
+        elif session:
             _delete(f"/sessions/{session['user_id']}")
         return json.dumps({"success": True, "closed": True})
     except Exception as e:
-        return json.dumps({"success": True, "closed": True, "warning": str(e)})
+        return tool_error(f"Camofox task cleanup refused before a safe storage checkpoint: {e}", success=False)
 
 
 def camofox_get_images(task_id: Optional[str] = None) -> str:
