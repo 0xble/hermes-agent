@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
@@ -25,8 +26,8 @@ def test_render_card_is_plain_rich_text_with_task_first_rows():
 
     lines = rendered.splitlines()
     assert lines[0] == "🧵 **Delegating · 0 min**"
-    assert lines[1] == "**A. Repair restart receipt** · Lead"
-    assert lines[2].startswith("↳ Last tool: ")
+    assert lines[1] == "A. Repair restart receipt · Lead"
+    assert lines[2] == f"↳ {get_tool_emoji('read_file')} read_file"
     assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
     assert not any(line.startswith(">") for line in lines)
 
@@ -43,7 +44,7 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    content = "🧵 **Delegating · 0 min**\n**A. Repair receipt** · Worker\n↳ Started · awaiting activity"
+    content = "🧵 **Delegating · 0 min**\nA. Repair receipt · Worker\n↳ Started · awaiting activity"
 
     sent = await adapter.send_delegation_card(source, content)
     edited = await adapter.edit_message("42", "7", content, finalize=True)
@@ -52,9 +53,12 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     send_kwargs = adapter._bot.send_message.call_args.kwargs
     edit_kwargs = adapter._bot.edit_message_text.call_args.kwargs
     assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
-    assert send_kwargs["text"].startswith("🧵 *Delegating · 0 min*")
-    assert "*A\\. Repair receipt* · Worker" in send_kwargs["text"]
-    assert not any(line.startswith(">") for line in send_kwargs["text"].splitlines())
+    sent_lines = send_kwargs["text"].splitlines()
+    assert sent_lines[0].startswith("🧵 *Delegating · 0 min*")
+    assert sent_lines[1] == "A\\. Repair receipt · Worker"
+    assert "*" not in sent_lines[1]
+    assert "*" not in sent_lines[2]
+    assert not any(line.startswith(">") for line in sent_lines)
     assert edit_kwargs["text"] == send_kwargs["text"]
 
 
@@ -89,6 +93,48 @@ async def test_observed_canonical_tool_name_reaches_telegram_send_and_edit(tmp_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", [
+    "mcp__figma__get_context_for_code_connect_suggestions_and_details",
+    "mcp__" + "測試_🧪" * 300,
+], ids=["namespaced", "long-unicode"])
+async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, tool):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token", extra={"rich_messages": False}))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.send_chat_action = AsyncMock()
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    data = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check display", owner=dict(
+        profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""),
+        preview="PRIVATE_PREVIEW", args={"token": "PRIVATE_ARGUMENT"}, goal="PRIVATE_GOAL")
+    await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
+    await cards.observe(source, "r", "s", 1, "subagent.tool", tool, data)
+    await drain_cards(cards)
+    expected = tool[:60]
+    plain = render_card(cards.cards["a" * 32], now=0)
+    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected}"
+    sent = adapter._bot.send_message.call_args.kwargs["text"]
+    assert expected.replace("_", "\\_") in sent
+    # A distinct update must exercise edit formatting, not unchanged suppression.
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "next_" + tool, data)
+    await drain_cards(cards)
+    edited = adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert ("next_" + tool)[:60].replace("_", "\\_") in edited
+    for text in (plain, sent, edited, cards.path.read_text(encoding="utf-8")):
+        assert "PRIVATE_" not in text
+    for text in (sent, edited):
+        assert "Last tool" not in text
+        assert len(text.encode("utf-16-le")) // 2 < 4096
+    row = cards.cards["a" * 32]["rows"]["A"]
+    many = dict(started_at=0, rows={str(i): {**row, "thread_ref": str(i)} for i in range(100)})
+    assert len(render_card(many, now=0)) <= 3500
+
+
+@pytest.mark.asyncio
 async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
@@ -112,7 +158,7 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    assert "Last tool:" in adapter.edit_message.call_args.args[2]
+    assert f"↳ {get_tool_emoji('terminal')} terminal" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
@@ -436,7 +482,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     await drain_cards(cards)
     text = adapter.edit_message.call_args.args[2]
     assert "A. Check receipt" not in text and "B. Check display" in text and "C. Check race" in text
-    assert "**C. Check race**\n" in text  # no fabricated default role
+    assert "C. Check race\n" in text  # no fabricated default role
     adapter.delete_message.assert_not_awaited()
     restored = DelegationCards(runner, home=tmp_path, interval=0)
     await restored.reconcile()
@@ -511,7 +557,7 @@ async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference
     await restored.reconcile()
     await drain_cards(restored)
     text = adapter.edit_message.call_args.args[2]
-    assert "**A." in text and "**A·2." in text
+    assert "A. Task A" in text and "A·2. Task A·2" in text
     assert "Worker" not in text and "Leaf" not in text
     assert adapter.edit_message.call_args.args[1] == "old-a"
     adapter.delete_message.assert_awaited_once_with("42", "old-b")

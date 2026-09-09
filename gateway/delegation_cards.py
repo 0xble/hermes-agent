@@ -44,7 +44,7 @@ def render_card(card, now=None):
     for row in card["rows"].values():
         named_type = _label(row.get("subagent_type"), "", 24)
         role_suffix = f" · {named_type.capitalize()}" if named_type else ""
-        lines.append(f"**{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}**{role_suffix}")
+        lines.append(f"{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}{role_suffix}")
         state = row.get("state")
         if state == "completed":
             activity = "Returned · awaiting parent"
@@ -54,7 +54,8 @@ def render_card(card, now=None):
             activity = "Interrupted / unknown · gateway restarted"
         elif row.get("last_tool"):
             tool = row["last_tool"]
-            activity = f"Last tool: {get_tool_emoji(tool)} {_tool_label(tool, 'tool', 40)}"
+            # Show the full stored name excerpt; never ingest previews or args.
+            activity = f"{get_tool_emoji(tool)} {_tool_label(tool, 'tool', 60)}"
         else:
             activity = "Started · awaiting activity"
         lines.append(f"↳ {activity}")
