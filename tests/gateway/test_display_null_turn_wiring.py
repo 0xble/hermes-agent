@@ -49,6 +49,9 @@ def _wire(user_config):
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
         _clarify_callback_sync=lambda *a, **k: None,
         _notice_callback_sync=lambda *a, **k: None,
+        # Fork-added by the native review status lifecycle (#117); wired strictly like
+        # _notice_callback_sync above, so the fake has to supply it.
+        _review_status_callback_sync=lambda *a, **k: None,
         _attach_session_title_callback=lambda agent, ctx: None,
     )
     TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, None, None, None, False)

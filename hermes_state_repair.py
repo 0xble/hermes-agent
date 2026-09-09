@@ -715,6 +715,32 @@ def _schema_not_built(exc: BaseException) -> bool:
     return any(m in str(exc).lower() for m in ("no such table", "no such column"))
 
 
+def _integrity_check_is_affordable(db_path: Path) -> bool:
+    """False once the store is large enough that ``PRAGMA integrity_check`` blocks startup.
+
+    Shares hermes_cli.backup's ceiling so both paths agree on what "too big to walk" means.
+    Override with ``HERMES_INTEGRITY_CHECK_MAX_BYTES`` (0 disables the cap, restoring the
+    unconditional check).
+    """
+    import os
+    try:
+        from hermes_cli.backup import DEFAULT_INTEGRITY_CHECK_MAX_BYTES as _cap
+    except Exception:
+        _cap = 2 << 30
+    raw = os.environ.get("HERMES_INTEGRITY_CHECK_MAX_BYTES")
+    if raw:
+        try:
+            _cap = int(raw)
+        except ValueError:
+            pass
+    if _cap <= 0:
+        return True
+    try:
+        return db_path.stat().st_size <= _cap
+    except OSError:
+        return True
+
+
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
@@ -737,10 +763,20 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # tokenizer absence must never classify as corruption.
             load_fts5_cjk_extension(conn)
             conn.execute("PRAGMA journal_mode").fetchone()
-            rows = conn.execute("PRAGMA integrity_check").fetchall()
-            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-            if problems:
-                return "; ".join(problems[:3])
+            # ``integrity_check`` walks EVERY b-tree page. hermes_cli/backup.py already learned this
+            # (#70553) and caps it at DEFAULT_INTEGRITY_CHECK_MAX_BYTES because on a multi-GB store it is
+            # "minutes of pegged CPU ... reading as a hung `hermes update`". This probe had no such cap, so
+            # on a 30 GB state.db the startup `state_db_data_migrations` phase sat in checkTreePage for
+            # minutes with the gateway unable to reach Telegram (observed 2026-09-03, 09-07 and 09-09).
+            # Skipping it above the cap costs little here: the corruption class this function exists to
+            # catch (#66724 partial FTS5 shadow damage) is precisely the one where "reads and
+            # integrity_check pass" — the FTS5 MATCH probes below are what detect it. The malformed-schema
+            # parse above and the sessions/FTS probes below still run at every size.
+            if _integrity_check_is_affordable(db_path):
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+                problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+                if problems:
+                    return "; ".join(problems[:3])
             conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
             # FTS5 read probe: partial shadow-table corruption makes MATCH/snippet/rank raise while integrity_check
             # reports healthy. MATCH '""' (empty phrase) parses, scans zero rows and exercises the shadow tables;

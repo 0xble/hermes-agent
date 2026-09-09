@@ -668,6 +668,10 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     underlying_name, underlying_args, err = ts.resolve_underlying_call(args)
     if err or not underlying_name:
         return tool_error(err or "tool_call could not be resolved"), None
+    if underlying_name == ts.CONNECTOR_BATCH_SENTINEL:
+        if not ts.connections_in_scope(current_defs):
+            return tool_error("Connectors are not available in this session."), None
+        return None, (underlying_name, underlying_args)
     # Defense in depth: resolve_underlying_call only checks the global
     # registry; also require membership in the session-scoped catalog.
     if underlying_name not in ts.scoped_deferrable_names(current_defs):
@@ -767,6 +771,10 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["goal_control_revision"] = goal_control_revision
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
+        from tools.tool_gateway.names import is_connector_name
+        if is_connector_name(function_name):
+            from model_tools_connectors import dispatch_connector_call
+            return dispatch_connector_call(function_name, next_args, ids.tool_call_id)
         return registry.dispatch(function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
@@ -840,6 +848,14 @@ def handle_function_call(
         result, underlying = bridged
         if underlying is None:
             return _emit(result, duration_ms=_elapsed_ms(start))
+        from tools.tool_gateway.names import CONNECTOR_BATCH_SENTINEL
+        if underlying[0] == CONNECTOR_BATCH_SENTINEL:
+            from model_tools_connectors import dispatch_connector_batch
+            return _emit(dispatch_connector_batch(
+                underlying[1]["calls"], ids, user_task=user_task,
+                enabled_tools=enabled_tools, middleware_trace=trace,
+                enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            ), duration_ms=_elapsed_ms(start))
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, goal_control_revision=goal_control_revision,
             enabled_tools=enabled_tools,
@@ -847,6 +863,13 @@ def handle_function_call(
             skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         )
+
+    from tools.tool_gateway.names import is_connector_name, parse_connector_name
+    if function_name == "manage_connections" or is_connector_name(function_name):
+        if "manage_connections" not in _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True):
+            return _emit(tool_error("Connectors are not available in this session."))
+        if is_connector_name(function_name) and parse_connector_name(function_name) is None:
+            return _emit(tool_error("Malformed connector tool name; expected connectors__<connector>__<tool>."))
 
     original_args = dict(function_args)
     if not skip_tool_request_middleware:
