@@ -185,7 +185,7 @@ def run_tool_round(
         # in the work phase that requested the review.
         agent._review_yield_requested = False
         _turn_exit_reason = "review_dispatched"
-        final_response = "" if getattr(agent, "_review_status_delivered", False) else "Review dispatched."
+        final_response = "[SILENT]" if getattr(agent, "_review_status_delivered", False) else "Review dispatched."
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.

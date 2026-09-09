@@ -206,7 +206,7 @@ class DelegationCards:
     async def reconcile(self):
         # Bind legacy task cards before any transport work, persisting replacement
         # links before removing redundant messages. No task outcomes are inferred.
-        for key, card in self.cards.items():
+        for key, card in sorted(self.cards.items(), key=lambda item: not bool(item[1].get("message_id"))):
             if not card.get("retired"):
                 self._bind(key)
         self._save()
@@ -283,9 +283,11 @@ class DelegationCards:
         revision = None
         try:
             await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0)),
-                                    self.cards[key].get("retry_at", 0) - time.time()))
+                                    self.cards[key].get("retry_at", 0) - time.time(),
+                                    self.cards[key].get("delete_retry_at", 0) - time.time()))
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 card = self.cards[key]
+                card.pop("delete_retry_at", None)
                 projection = self._projection(key)
                 if not projection["rows"]:
                     await self._delete(card)
@@ -338,6 +340,8 @@ class DelegationCards:
             logger.exception("Delegation card update failed")
         finally:
             self.pending.pop(key, None)
+            if self.cards[key].get("delete_retry_at") and not asyncio.current_task().cancelling():
+                self._queue(key)
         # Events arriving during transport awaits are coalesced, not dropped.
         card = self.cards[key]
         if revision is not None and self._projection(key)["rows"] and (revision != card.get("revision", 0) or card.get("retry_at")):
@@ -389,19 +393,38 @@ class DelegationCards:
                     await self._delete_obsolete(anchor_key)
                     await self._delete(anchor)
 
+    def _defer_delete(self, card, adapter):
+        delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
+        key = next(k for k, c in self.cards.items() if c is card)
+        anchor_key = self._anchor(key)
+        anchor = self.cards[anchor_key]
+        delay = max(delay if isinstance(delay, (int, float)) else 0, anchor.get("delete_retry_at", 0) - time.time())
+        if delay <= 0:
+            return False
+        anchor["delete_retry_at"] = max(anchor.get("delete_retry_at", 0), time.time() + delay)
+        self._save()
+        self._queue(anchor_key)
+        return True
+
     async def _delete_obsolete(self, key):
         for _, card in self._members(key):
             message_id = card.get("obsolete_message_id")
             adapter = self._adapter(card)
             if message_id and adapter:
+                if self._defer_delete(card, adapter):
+                    continue
                 if await adapter.delete_message(card["source"]["chat_id"], message_id):
                     card["obsolete_message_id"] = None
                     self._save()
+                else:
+                    self._defer_delete(card, adapter)
 
     async def _delete(self, card):
         """Keep the tombstone; bounded restart retries may finish failed deletion."""
         adapter = self._adapter(card)
         if not adapter or not card.get("message_id") or card.get("delete_attempts", 0) >= 3:
+            return
+        if self._defer_delete(card, adapter):
             return
         card["delete_attempts"] = card.get("delete_attempts", 0) + 1
         self._save()
@@ -409,6 +432,9 @@ class DelegationCards:
             if await adapter.delete_message(card["source"]["chat_id"], card["message_id"]):
                 card["message_id"] = None
                 card["message_deleted"] = True
+                self._save()
+            elif self._defer_delete(card, adapter):
+                card["delete_attempts"] -= 1
                 self._save()
         except Exception:
             logger.exception("Delegation card deletion deferred until reconciliation")

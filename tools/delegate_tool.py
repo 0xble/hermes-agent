@@ -1465,7 +1465,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Required for new calls: safe, short imperative display label. Never use the goal as a display label."),
+                        "task_label": _p("string", "Use a short, imperative display label of at most 24 characters, including spaces. Keep it privacy-safe; never use the goal as a display label."),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1497,7 +1497,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Legacy single-task display label. New calls use tasks[].task_label; omitted legacy labels are assigned by metadata."),
+            "task_label": _p("string", "Use a short, imperative display label of at most 24 characters, including spaces. Keep it privacy-safe; never use the goal as a display label. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

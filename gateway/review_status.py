@@ -43,6 +43,7 @@ class ReviewStatuses:
         self.path = Path(home or get_hermes_home()) / "cache" / "review-statuses.json"
         self.items = {}
         self.locks = {}
+        self.delete_pending = {}
         self._load()
 
     def _load(self):
@@ -194,16 +195,44 @@ class ReviewStatuses:
                 self._save()
                 await self._delete(item)
 
+    def _defer_delete(self, item, adapter):
+        delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(item["source"]["chat_id"])
+        delay = max(delay if isinstance(delay, (int, float)) else 0, item.get("delete_retry_at", 0) - time.time())
+        if delay <= 0:
+            return False
+        item["delete_retry_at"] = time.time() + delay
+        self._save()
+        key = next(k for k, value in self.items.items() if value is item)
+        if key not in self.delete_pending:
+            self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
+        return True
+
+    async def _retry_delete(self, key):
+        try:
+            await asyncio.sleep(max(0, self.items[key].get("delete_retry_at", 0) - time.time()))
+            async with self.locks.setdefault(key, asyncio.Lock()):
+                self.items[key].pop("delete_retry_at", None)
+                await self._delete(self.items[key])
+        finally:
+            self.delete_pending.pop(key, None)
+            if self.items[key].get("delete_retry_at") and not asyncio.current_task().cancelling():
+                self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
+
     async def _delete(self, item):
         if not item.get("message_id") or item.get("delete_attempts", 0) >= 3:
             return
         adapter = self._adapter(SessionSource(**{**item["source"], "platform": Platform(item["source"]["platform"])}))
         if adapter:
+            if self._defer_delete(item, adapter):
+                return
             item["delete_attempts"] = item.get("delete_attempts", 0) + 1
             self._save()
             try:
                 if await adapter.delete_message(item["source"]["chat_id"], item["message_id"]):
                     item["message_id"] = None
+                    self._save()
+                elif self._defer_delete(item, adapter):
+                    item["delete_attempts"] -= 1
                     self._save()
             except Exception:
                 logger.debug("Native review status deletion deferred", exc_info=True)
