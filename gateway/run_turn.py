@@ -3763,10 +3763,12 @@ class GatewayTurnMixin:
         Failed runs keep them as breadcrumbs. Only on adapters with ``delete_message``; failures swallowed."""
         from gateway.run import safe_schedule_threadsafe
         _cleanup_msg_ids, session_key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
+        delivery = getattr(turn_ctx, "_status_delivery", None)
+        if delivery is not None:
+            delivery.closed = True
         if not (
             turn_ctx._cleanup_progress
             and _cleanup_adapter is not None
-            and _cleanup_msg_ids
             and session_key
             and isinstance(response, dict)
             and not response.get("failed")
@@ -3788,6 +3790,8 @@ class GatewayTurnMixin:
             a fire-and-forget future would race the next turn's own bubbles."""
             # Snapshot at INVOCATION, not registration: a heartbeat/status send that lands while
             # final delivery is in flight still belongs to this turn's cleanup set.
+            if delivery is not None:
+                delivery.cleaned = True
             _ids_snapshot = list(dict.fromkeys(_cleanup_msg_ids))
             _deleted_count = 0
             _failed_details: list[str] = []
@@ -3795,7 +3799,8 @@ class GatewayTurnMixin:
                 try:
                     # Re-resolve per id: a mid-turn reconnect replaces the adapter, and the
                     # captured one can no longer reach the chat.
-                    _delete_adapter = self._adapter_for_source(source) or _adapter_snapshot
+                    _delete_adapter = (delivery.owners.get(_mid) if delivery is not None else None)
+                    _delete_adapter = _delete_adapter or self._adapter_for_source(source) or _adapter_snapshot
                     _deleted = await _delete_adapter.delete_message(_chat_id_snapshot, _mid)
                 except asyncio.CancelledError:
                     _completed = _deleted_count + len(_failed_details)

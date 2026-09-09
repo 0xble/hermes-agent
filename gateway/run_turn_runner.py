@@ -43,6 +43,10 @@ logger = logging.getLogger("gateway.run")
 
 # Minimum seconds between progress edits, enforced per CHAT (see _edit_gate_elapsed).
 _PROGRESS_EDIT_INTERVAL = 1.5
+# A cancelled progress consumer must not keep turn finalization waiting for a
+# transport receipt.  The receipt task itself remains shielded so an accepted
+# send can still be tracked for cleanup when it arrives.
+_PROGRESS_RECEIPT_CANCEL_WAIT_SECONDS = 0.25
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -61,6 +65,9 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        from gateway.status_delivery import StatusDelivery
+        self._status_delivery = StatusDelivery(ctx, lambda: runner._adapter_for_source(ctx.source))
+        ctx._status_delivery = self._status_delivery
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -89,11 +96,11 @@ class TurnRunner:
             while not q.empty():
                 q.get_nowait()
 
-    def _track_progress_result(self, result) -> None:
-        """Remember a delivered progress/status message id for end-of-turn cleanup."""
-        ctx = self._ctx
-        if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+    def _track_progress_result(self, result, adapter=None) -> None:
+        """Remember the receipt and its transport, including after final cleanup."""
+        self._status_delivery.track(result, adapter or self._ctx._status_adapter
+                                    or self._runner._adapter_for_source(self._ctx.source),
+                                    record_owner=False)
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -498,6 +505,12 @@ class TurnRunner:
         seen_content_boundary_events: set = dataclasses.field(default_factory=set)
         deferred_progress_events: Any = dataclasses.field(default_factory=collections.deque)
         replay_progress_events: Any = dataclasses.field(default_factory=collections.deque)
+        # A send can be accepted by the transport before its receipt reaches us.  Keep that
+        # receipt alive across consumer cancellation; an absent anchor is not evidence that no
+        # message was accepted.
+        pending_send_receipt: Any = None
+        retained_send_receipt: Any = None
+        cancel_saw_ambiguous_send: bool = False
         # Anchors already replaced once. A second failure on the same id is not a stale
         # anchor, so it falls through to disabling edits instead of looping on sends.
         recovered_stale_anchor_ids: set = dataclasses.field(default_factory=set)
@@ -656,11 +669,70 @@ class TurnRunner:
 
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
-        result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
-        )
-        self._track_progress_result(result)
+        receipt = asyncio.create_task(st.adapter.send(
+            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
+            metadata=ctx._progress_metadata,
+        ))
+        st.pending_send_receipt = receipt
+        try:
+            # Do not propagate cancellation into a transport that may already have accepted the
+            # send.  The cancellation path retains the receipt and never infers "not sent" from
+            # a missing message id.
+            result = await asyncio.shield(receipt)
+        except asyncio.CancelledError:
+            self._retain_progress_send_receipt(st, receipt)
+            raise
+        except Exception:
+            if st.pending_send_receipt is receipt:
+                st.pending_send_receipt = None
+            raise
+        else:
+            if st.pending_send_receipt is receipt:
+                st.pending_send_receipt = None
+        self._track_progress_result(result, st.adapter)
         return result
+
+    def _retain_progress_send_receipt(self, st, receipt) -> None:
+        """Track a receipt that outlives the cancelled progress consumer exactly once."""
+        if st.retained_send_receipt is receipt:
+            return
+        st.retained_send_receipt = receipt
+        expiry = asyncio.get_running_loop().call_later(30, receipt.cancel)
+
+        def received(fut):
+            expiry.cancel()
+            st.retained_send_receipt = None
+            if st.pending_send_receipt is fut:
+                st.pending_send_receipt = None
+            try:
+                result = fut.result()
+            except (asyncio.CancelledError, Exception):
+                return
+            self._track_progress_result(result, st.adapter)
+            # This state is no longer used to send after cancellation, but retaining the anchor
+            # makes a just-in-time receipt truthful and preserves the typed-boundary lifecycle.
+            if getattr(result, "success", False) and getattr(result, "message_id", None):
+                st.progress_msg_id = str(result.message_id)
+
+        receipt.add_done_callback(received)
+
+    async def _settle_progress_receipt_on_cancel(self, st) -> None:
+        """Give an in-flight receipt a short chance to arrive without delaying the final reply."""
+        receipt = st.pending_send_receipt
+        if receipt is None:
+            return
+        st.cancel_saw_ambiguous_send = True
+        self._retain_progress_send_receipt(st, receipt)
+        if receipt.done():
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(receipt), timeout=_PROGRESS_RECEIPT_CANCEL_WAIT_SECONDS,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            # The retained callback consumes a later success/error.  Crucially, neither outcome
+            # authorizes a replacement send for this ambiguous attempt.
+            return
 
     async def _roll_progress_overflow_if_needed(self, st) -> bool:
         """Start fresh editable progress bubbles before a bubble exceeds limit.
@@ -782,6 +854,10 @@ class TurnRunner:
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        await self._settle_progress_receipt_on_cancel(st)
+        if st.cancel_saw_ambiguous_send:
+            # Never replay/overflow lines from an attempt whose acceptance is unknown.
+            return
         with suppress(Exception):
             while True:
                 if st.replay_progress_events:
@@ -805,7 +881,7 @@ class TurnRunner:
                 await self._roll_progress_overflow_if_needed(st)
         # Lines with no anchor: a boundary sealed the previous bubble and the replayed tool
         # output has nowhere to land yet. Without this the drained lines are silently lost.
-        if st.progress_lines and st.progress_msg_id is None:
+        if st.progress_lines and st.progress_msg_id is None and not st.cancel_saw_ambiguous_send:
             with suppress(Exception):
                 if st.can_edit:
                     result = await self._send_progress_text(
@@ -1078,7 +1154,7 @@ class TurnRunner:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
         ctx = self._ctx
         if not self._status_live():
             return
@@ -1090,12 +1166,10 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
-        fut = self._schedule(
-            _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
+        self._schedule(
+            self._status_delivery.send(ctx._status_adapter, ctx._status_chat_id, event_type, prepared, ctx._status_thread_metadata),
             f"status_callback ({event_type}) scheduling error",
         )
-        if fut is not None and ctx._cleanup_progress:
-            fut.add_done_callback(self._track_future_cleanup_id)
 
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
