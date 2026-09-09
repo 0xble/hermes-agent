@@ -451,6 +451,14 @@ If step 5 logs you out, the Camofox server isn't honoring the stable `userId`. D
 
 Hermes derives the stable `userId` from the profile-scoped directory `~/.hermes/browser_auth/camofox/` (or the equivalent under `$HERMES_HOME` for non-default profiles). The actual browser profile data lives on the Camofox server side, keyed by that `userId`. To fully reset a persistent profile, clear it on the Camofox server and remove the corresponding Hermes profile's state directory.
 
+#### Named Camofox identities
+
+With the native Camofox backend, `browser_navigate` requires an explicit configured browser `identity` (for example, `personal`, `lpg`, or `meridian`). Hermes resolves that alias through the same browser identity registry used for local Chrome profiles, but sends Camofox an opaque stable `userId` derived from the alias runtime key and active `$HERMES_HOME`; alias and source-profile names never leave Hermes.
+
+First navigation durably binds the task to `backend=camofox` and that identity. Changing it, omitting it, or combining it with `CAMOFOX_USER_ID` / `browser.camofox.user_id` fails closed. Named sessions neither adopt another task's tab nor issue `DELETE /sessions` at cleanup, preventing cross-identity bootstrap sharing and destructive cleanup.
+
+Camofox supplies persistence by `userId`, so Hermes has no separate checkpoint endpoint. The tested contract covers cookies and localStorage where the server persists them. IndexedDB, downloads/uploads, extensions, and server-side retention remain deployment limits. `browser_exec` stays unsupported on Camofox because it requires CDP; Hermes does not emulate it through REST.
+
 #### Externally managed Camofox sessions
 
 When another app drives the visible Camofox browser (a desktop assistant, a custom integration, another agent), configure Hermes to operate inside that same identity instead of spawning its own isolated profile.
