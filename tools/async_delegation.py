@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -125,9 +126,54 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # origin_session_id: raw api_server session id of the ORIGINATING request
     # (wake target); without it restart-recovered completions are unroutable there.
     for name, sql_type in (("owner_pid", "INTEGER"), ("owner_started_at", "INTEGER"), ("task_json", "TEXT"),
-                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT")):
+                           ("delivery_claim", "TEXT"), ("delivery_claimed_at", "REAL"), ("origin_session_id", "TEXT"),
+                           ("parent_task_id", "TEXT"), ("thread_number", "INTEGER"), ("task_label", "TEXT"),
+                           ("owner_json", "TEXT")):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    conn.execute("CREATE TABLE IF NOT EXISTS delegation_thread_counters (owner_json TEXT PRIMARY KEY, next_thread_number INTEGER NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS delegation_parent_tasks (parent_task_id TEXT PRIMARY KEY, owner_json TEXT NOT NULL)")
+
+
+def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str]) -> Dict[str, Any]:
+    """Reserve never-reused display refs and validate an opaque id against exact owner.
+
+    ``parent_task_id`` is intentionally an opaque correlation token, never an
+    inferred identity.  Omitting it starts a fresh related-work batch.  The
+    counter is internal; callers receive spreadsheet-style refs (A..Z, AA..).
+    """
+    supplied_parent_task_id = parent_task_id is not None
+    if supplied_parent_task_id and (not isinstance(parent_task_id, str) or not re.fullmatch(r"[a-f0-9]{32}", parent_task_id)):
+        raise ValueError("parent_task_id must be an existing lowercase 32-character hexadecimal reference")
+    parent_task_id = parent_task_id if supplied_parent_task_id else uuid.uuid4().hex
+    owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+    labels = [str(x or "").strip()[:120] or "Run delegated task" for x in task_labels]
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute("SELECT owner_json FROM delegation_parent_tasks WHERE parent_task_id=?", (parent_task_id,)).fetchone()
+        if supplied_parent_task_id:
+            if row is None:
+                raise ValueError("parent_task_id is not a known reference for this conversation owner")
+            if row[0] != owner_json:
+                raise ValueError("parent_task_id belongs to another immutable conversation owner")
+        else:
+            conn.execute("INSERT INTO delegation_parent_tasks VALUES (?, ?)", (parent_task_id, owner_json))
+        row = conn.execute("SELECT next_thread_number FROM delegation_thread_counters WHERE owner_json=?", (owner_json,)).fetchone()
+        start = int(row[0]) if row else 1
+        conn.execute("INSERT INTO delegation_thread_counters VALUES (?, ?) ON CONFLICT(owner_json) DO UPDATE SET next_thread_number=excluded.next_thread_number", (owner_json, start + len(labels)))
+    thread_numbers = list(range(start, start + len(labels)))
+    return {"parent_task_id": parent_task_id, "owner": owner, "owner_json": owner_json,
+            "thread_refs": [_thread_ref(n) for n in thread_numbers], "task_labels": labels}
+
+
+def _thread_ref(number: int) -> str:
+    """One-based monotonic counter -> stable alphabetic display reference."""
+    if number < 1:
+        raise ValueError("thread number must be positive")
+    chars = []
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        chars.append(chr(ord("A") + remainder))
+    return "".join(reversed(chars))
 
 
 @contextmanager
@@ -191,7 +237,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            "task_indexes", "completion_contract", *_ROUTING_KEYS,
+            "task_indexes", "completion_contract", "delegation_metadata", *_ROUTING_KEYS,
         )
         if key in record}
     with _DB_LOCK, _transaction() as conn:
@@ -268,6 +314,7 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
+                **_completion_metadata_fields(task.get("delegation_metadata")),
                 **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
             if task.get("completion_contract") is not None:
                 event["completion_contract"] = task["completion_contract"]
@@ -429,14 +476,65 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("""SELECT origin_session, origin_ui_session_id, parent_session_id,
                       state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id, event_json
+                      origin_session_id, event_json, task_json
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,)).fetchone()
     return None if row is None else {
         "delegation_id": delegation_id, "origin_session": row[0], "origin_ui_session_id": row[1] or "",
         "parent_session_id": row[2] or "", "state": row[3], "dispatched_at": row[4],
         "completed_at": row[5], "result": json.loads(row[6]) if row[6] else None,
         "delivery_state": row[7], "delivery_attempts": row[8], "origin_session_id": row[9] or "",
-        "event": json.loads(row[10]) if row[10] else None}
+        "event": json.loads(row[10]) if row[10] else None,
+        "delegation_metadata": (json.loads(row[11] or "{}").get("delegation_metadata"))}
+
+
+def _owned_durable_row(delegation_id: str, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return one ledger row only after exact immutable-owner verification."""
+    item = get_durable_delegation(delegation_id)
+    metadata = item and item.get("delegation_metadata")
+    if not item or not isinstance(metadata, dict):
+        return None
+    expected = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+    if metadata.get("owner_json") != expected:
+        return None
+    return item
+
+
+def get_delegation_status(delegation_id: str, *, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Owner-scoped durable status; works after in-memory cleanup or restart."""
+    item = _owned_durable_row(delegation_id, owner)
+    if item is None:
+        return None
+    return {key: item.get(key) for key in ("delegation_id", "state", "dispatched_at", "completed_at", "delivery_state", "delegation_metadata")}
+
+
+def get_delegation_result(delegation_id: str, *, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Owner-scoped terminal result; live records deliberately expose no result."""
+    item = _owned_durable_row(delegation_id, owner)
+    if item is None:
+        return None
+    return {key: item.get(key) for key in ("delegation_id", "state", "result", "event", "completed_at", "delegation_metadata")}
+
+
+def list_durable_delegations(*, owner: Dict[str, Any], parent_task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List only durable work for one exact owner, optionally one opaque parent token."""
+    expected = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute("""SELECT delegation_id, state, dispatched_at, completed_at, delivery_state,
+                    task_json FROM async_delegations ORDER BY dispatched_at DESC""").fetchall()
+    entries = []
+    for delegation_id, state, dispatched_at, completed_at, delivery_state, task_json in rows:
+        try:
+            metadata = json.loads(task_json or "{}").get("delegation_metadata")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(metadata, dict) or metadata.get("owner_json") != expected:
+            continue
+        if parent_task_id is not None and metadata.get("parent_task_id") != parent_task_id:
+            continue
+        entries.append({"delegation_id": delegation_id, "state": state, "dispatched_at": dispatched_at,
+                        "completed_at": completed_at, "delivery_state": delivery_state,
+                        "delegation_metadata": metadata})
+    return entries
 
 
 def get_native_review_reuse(candidate, *, focus: str = "") -> Optional[Dict[str, Any]]:
@@ -590,6 +688,7 @@ def _dispatch(
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None, completion_contract: Optional[Dict[str, Any]] = None,
+    delegation_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -612,6 +711,7 @@ def _dispatch(
         # Which of the call's ``goals`` this unit runs (None = all of them).
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         **({"completion_contract": completion_contract} if completion_contract is not None else {}),
+        **({"delegation_metadata": delegation_metadata} if delegation_metadata is not None else {}),
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None}
     with _records_lock:
@@ -653,6 +753,7 @@ def dispatch_async_delegation(
     session_key: str, parent_session_id: Optional[str] = None, runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "", origin_session_id: str = "", interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, progress_fn: Optional[Callable[[], tuple]] = None,
+    delegation_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
     ``session_key``/``parent_session_id`` are captured on the parent thread (the worker carries
@@ -666,6 +767,7 @@ def dispatch_async_delegation(
         parent_session_id=parent_session_id, runner=runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
+        delegation_metadata=delegation_metadata,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or run this task synchronously (background=false). "
@@ -683,6 +785,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[List[int]] = None, completion_contract: Optional[Dict[str, Any]] = None,
+    delegation_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit: ``runner`` runs the
     entire batch and returns the combined ``{"results": [...], "total_duration_seconds": N}``
@@ -698,6 +801,7 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn,
         slot_key=slot_key, task_indexes=task_indexes, completion_contract=completion_contract,
+        delegation_metadata=delegation_metadata,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -729,6 +833,21 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         if delegation_id in _records:
             _records[delegation_id]["status"] = status
         _prune_completed_locked()
+
+
+def _completion_metadata_fields(metadata: Any) -> Dict[str, Any]:
+    """Expose safe correlation fields on completion events without goal text."""
+    if not isinstance(metadata, dict):
+        return {}
+    fields: Dict[str, Any] = {"delegation_metadata": metadata}
+    for key in ("parent_task_id", "owner", "background"):
+        if metadata.get(key) is not None:
+            fields[key] = metadata[key]
+    threads = metadata.get("threads")
+    if isinstance(threads, list):
+        fields["thread_refs"] = [t.get("thread_ref") for t in threads if isinstance(t, dict)]
+        fields["task_labels"] = [t.get("task_label") for t in threads if isinstance(t, dict)]
+    return fields
 
 
 def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], status: str) -> None:
@@ -767,6 +886,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
+        **_completion_metadata_fields(record.get("delegation_metadata")),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     contract = record.get("completion_contract")

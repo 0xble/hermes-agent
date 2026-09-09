@@ -952,6 +952,7 @@ def delegate_task(
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
     child_tool_policy: Optional[str] = None,
     completion_contract: Optional[Dict[str, Any]] = None,
+    parent_task_id: Optional[str] = None, task_label: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -1023,6 +1024,34 @@ def delegate_task(
     if err:
         return tool_error(err)
 
+    # Capture immutable conversation ownership before child construction changes context.
+    try:
+        from gateway.session_context import get_session_env, session_context_engaged, session_is_messaging_surface
+        _session_env = lambda key: get_session_env(key, "")
+        _session_bound = session_context_engaged()
+        _messaging_session = session_is_messaging_surface()
+    except Exception:
+        _session_env = lambda key: ""
+        _session_bound = False
+        _messaging_session = False
+    from hermes_constants import get_hermes_home
+    # Gateway multiplexing binds this explicitly; never derive a profile from
+    # the ambient process home when a session-scoped profile is available.
+    _profile = _session_env("HERMES_SESSION_PROFILE")
+    if _session_bound and _messaging_session and not _profile:
+        return tool_error("Delegation metadata requires the bound session profile; refusing ambient profile ownership.")
+    _profile = _profile or str(get_hermes_home())
+    _thread_id = _session_env("HERMES_SESSION_THREAD_ID")
+    _owner = {"profile": _profile, "session_id": str(getattr(parent_agent, "session_id", "") or ""),
+              "session_key": _session_env("HERMES_SESSION_KEY"), "chat_id": _session_env("HERMES_SESSION_CHAT_ID"),
+              "thread_id": _thread_id, "topic_id": _thread_id}
+    try:
+        from tools.async_delegation import reserve_delegation_metadata
+        _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
+            task_labels=[t.get("task_label") or task_label or "Run delegated task" for t in (task_list or [])])
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     # HERMES-108: resolve every task's named definition BEFORE constructing ANY child. A batch with
     # one bad subagent_type must not leave a valid sibling already spawned and running.
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
@@ -1047,10 +1076,23 @@ def delegate_task(
     )
     if err:
         return tool_error(err)
+    for _i, (_, _, _child) in enumerate(children):
+        _ref = getattr(_child, "_progress_identity_ref", None)
+        if isinstance(_ref, dict):
+            _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
+                        task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
+                        owner=_owner, background=bool(background))
+    _metadata["threads"] = [
+        {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
+         "role": getattr(child, "_delegate_role", None)}
+        for i, (_, _, child) in enumerate(children)
+    ]
+    _metadata["background"] = bool(background)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
         completion_contract=completion_contract,
+        delegation_metadata=_metadata,
     )
     return _run_batch(batch, background)
 
@@ -1343,6 +1385,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
+                        "task_label": _p("string", "Optional safe, short imperative display label; never use the goal as a display label."),
                         "resume_session_id": _p(
                             "string",
                             "Stable child_session_id from a completed or budget-exhausted delegation. Continues that exact "
@@ -1365,6 +1408,8 @@ DELEGATE_TASK_SCHEMA = {
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
+            "task_label": _p("string", "Optional safe short imperative label for a legacy single task; defaults to 'Run delegated task'."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -1418,6 +1463,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        parent_task_id=args.get("parent_task_id"), task_label=args.get("task_label"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

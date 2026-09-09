@@ -4237,6 +4237,25 @@ class TelegramAdapter(BasePlatformAdapter):
         with contextlib.suppress(Exception):
             await self.send_typing(chat_id, metadata=metadata)
 
+    async def send_delegation_card(self, source, content: str) -> SendResult:
+        """One thread-strict, non-notifying card. Never retry an ambiguous send."""
+        from telegram.error import BadRequest, RetryAfter, Forbidden
+        metadata = {"thread_id": source.thread_id, "notify": False}
+        thread_kwargs = self._thread_kwargs_for_send(
+            source.chat_id, source.thread_id, metadata, reply_to_message_id=None,
+            reply_to_mode="off")
+        try:
+            message = await self._send_chunk_markdown_or_plain(
+                source.chat_id, self.format_message(content), {
+                    "chat_id": normalize_telegram_chat_id(source.chat_id),
+                    **thread_kwargs, **self._notification_kwargs(metadata),
+                    **self._link_preview_kwargs(),
+                })
+            return SendResult(success=True, message_id=str(message.message_id))
+        except Exception as exc:
+            return SendResult(success=False, error=_redact_telegram_error_text(exc),
+                raw_response={"definite_rejection": isinstance(exc, (BadRequest, RetryAfter, Forbidden))})
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""

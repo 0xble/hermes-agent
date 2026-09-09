@@ -9,7 +9,7 @@ import json
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, wait as _cf_wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 from tools.delegate_tool_child_run import _detach_child, _fabricated_entry, _signal_child_stop
@@ -43,6 +43,8 @@ class _Batch:
     origin_owner_session_record: Any
     overall_start: float
     completion_contract: Optional[Dict[str, Any]] = None
+    # Reserved before child construction; copied to dispatches and completions.
+    delegation_metadata: Optional[Dict[str, Any]] = None
     # Set on per-group units carved out by ``_dispatch_background``; None for the whole batch / ungrouped units.
     group: Optional[str] = None
     unit_id: Optional[str] = None  # the async registry id this unit runs under (``<call_id>-k`` for split calls)
@@ -276,7 +278,8 @@ _BACKGROUND_NOTES = {
     ),
 }
 
-def _dispatched_payload(dispatch: dict, goals: List[str], child_agents: List[Any], live_paths: List[str]) -> dict:
+def _dispatched_payload(dispatch: dict, goals: List[str], child_agents: List[Any], live_paths: List[str],
+                        delegation_metadata: Optional[Dict[str, Any]] = None) -> dict:
     """Model-facing handle for an accepted background batch."""
     n = len(goals)
     payload = {
@@ -290,6 +293,8 @@ def _dispatched_payload(dispatch: dict, goals: List[str], child_agents: List[Any
     if live_paths:
         payload["live_transcripts"] = list(live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
+    if delegation_metadata:
+        payload["delegation_metadata"] = delegation_metadata
     return payload
 
 def _units_of(batch: _Batch) -> List[_Batch]:
@@ -328,6 +333,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_indexes=[i for (i, _, _) in unit.children] if len(unit.children) < len(unit.task_list) else None,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
         completion_contract=unit.completion_contract,
+        delegation_metadata=unit.delegation_metadata,
     )
 
 def _dispatch_background(batch: _Batch) -> str:
@@ -368,9 +374,11 @@ def _dispatch_background(batch: _Batch) -> str:
         # cache/delegation/live/<id>/.
         delegation_id=batch.live_deleg_id,
         progress_fn=lambda: _batch_progress_token(child_agents),
+        delegation_metadata=batch.delegation_metadata,
     )
     if dispatch.get("status") == "dispatched":
-        return json.dumps(_dispatched_payload(dispatch, goals, child_agents, batch.live_paths), ensure_ascii=False)
+        return json.dumps(_dispatched_payload(
+            dispatch, goals, child_agents, batch.live_paths, batch.delegation_metadata), ensure_ascii=False)
     # Pool at capacity / schedule failure: the async unit was never accepted, so just run inline (re-attaching to the
     # parent list is not needed).
     logger.info(

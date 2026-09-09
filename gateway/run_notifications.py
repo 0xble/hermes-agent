@@ -41,7 +41,7 @@ class GatewayNotificationsMixin:
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
     _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
-    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", *_COMPLETION_BATCH_KEY_FIELDS[1:])
+    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "parent_task_id", *_COMPLETION_BATCH_KEY_FIELDS[1:])
 
     @dataclasses.dataclass
     class _UpdatePaths:
@@ -918,7 +918,18 @@ class GatewayNotificationsMixin:
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = self._resolve_injection_adapter(platform_name)
+        owner = evt.get("owner") if evt.get("type") == "async_delegation" else None
+        if owner and platform_name == "telegram":
+            # Explicit ownership outranks session-store refreshes and adapter replacement.
+            if (str(source.chat_id) != str(owner.get("chat_id"))
+                    or str(source.thread_id or "") != str(owner.get("thread_id") or "")
+                    or str(evt.get("session_key") or "") != str(owner.get("session_key") or "")
+                    or (source.profile and source.profile != owner.get("profile"))):
+                return False
+            source = dataclasses.replace(source, profile=owner.get("profile"))
+            adapter = self._adapter_for_source(source)
+        else:
+            adapter = self._resolve_injection_adapter(platform_name)
         if not adapter:
             return None
         if not adapter_supports_push(adapter):
@@ -931,6 +942,10 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") == "async_delegation" and evt.get("parent_task_id"):
+                metadata["delegation_parent_task_id"] = evt["parent_task_id"]
+                metadata["delegation_owner"] = evt.get("owner")
+                metadata["delegation_thread_refs"] = evt.get("thread_refs", [])
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
@@ -1331,6 +1346,11 @@ class GatewayNotificationsMixin:
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
+        primary_evt = dict(primary_evt)
+        primary_evt["thread_refs"] = list(dict.fromkeys([
+            *primary_evt.get("thread_refs", []),
+            *(ref for evt, _ in siblings for ref in evt.get("thread_refs", [])),
+        ]))
         delivered: Optional[bool] = False
         try:
             delivered = await self._deliver_completion_notification(consolidated, primary_evt)
@@ -1356,6 +1376,8 @@ class GatewayNotificationsMixin:
         completions would otherwise only be seen by the post-turn drain. Ignores non-async events.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from gateway.delegation_cards import cards_for
+        await cards_for(self).reconcile()
         from tools.process_registry import process_registry as _pr
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):

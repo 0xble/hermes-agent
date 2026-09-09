@@ -97,6 +97,14 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if (event_type in {"subagent.start", "subagent.tool", "subagent.complete"}
+                and kwargs.get("parent_task_id") and ctx.source.platform == Platform.TELEGRAM
+                and ctx.tool_progress_enabled and ctx.progress_mode not in {"off", "log"}):
+            from gateway.delegation_cards import cards_for
+            self._schedule(cards_for(self._runner).observe(
+                ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
+                event_type, tool_name, kwargs), "delegation card scheduling error")
+            return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
