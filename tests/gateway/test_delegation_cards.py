@@ -1,7 +1,7 @@
 """Real gateway projection/transport boundaries, without live Telegram traffic."""
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -12,6 +12,48 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
+
+
+def test_render_card_is_one_native_markdown_blockquote_with_task_first_rows():
+    card = {
+        "started_at": 0,
+        "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "Orchestrator",
+                         "state": "running", "last_tool": "read_file"}},
+    }
+
+    rendered = render_card(card, now=0)
+
+    lines = rendered.splitlines()
+    assert lines[0] == "> 🧵 **Delegating · 0 min**"
+    assert lines[1] == "> **A. Repair restart receipt** · Orchestrator"
+    assert lines[2].startswith("> ↳ Last tool: ")
+    assert all(line.startswith("> ") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_telegram_card_send_and_edit_keep_blockquote_and_bold_entities():
+    """Cards use the normal MarkdownV2 formatter on both transport operations."""
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token", extra={"rich_messages": False}))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.send_chat_action = AsyncMock()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    content = "> 🧵 **Delegating · 0 min**\n> **A. Repair receipt** · Worker\n> ↳ Started · awaiting activity"
+
+    sent = await adapter.send_delegation_card(source, content)
+    edited = await adapter.edit_message("42", "7", content, finalize=True)
+
+    assert sent.success and edited.success
+    send_kwargs = adapter._bot.send_message.call_args.kwargs
+    edit_kwargs = adapter._bot.edit_message_text.call_args.kwargs
+    assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
+    assert send_kwargs["text"].startswith("> 🧵 *Delegating · 0 min*")
+    assert "> *A\. Repair receipt* · Worker" in send_kwargs["text"]
+    assert edit_kwargs["text"] == send_kwargs["text"]
 
 
 @pytest.mark.asyncio
@@ -32,12 +74,15 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert adapter.send_delegation_card.await_count == 1
+    assert adapter.send_delegation_card.call_args.args[1].startswith("> 🧵 **Delegating · ")
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert "Last tool:" in adapter.edit_message.call_args.args[2]
+    assert all(line.startswith("> ") for line in adapter.edit_message.call_args.args[2].splitlines())
+    assert adapter.edit_message.call_args.kwargs == {"finalize": True}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
     relay.progress_callback("subagent.complete", status="completed", **data)
     await asyncio.gather(*tasks)
@@ -217,6 +262,40 @@ async def test_restart_never_retries_ambiguous_send_and_recovers_delete(tmp_path
     adapter.delete_message.return_value = True
     await restored.reconcile()
     assert card["message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_restart_retires_exact_parent_receipt_before_card_replay(tmp_path):
+    """A receipt persisted before a crash fences startup replay.
+
+    This is intentionally not an age/terminal-state inference: a terminal card with
+    no exact handled ref remains recoverable for its parent.
+    """
+    import json
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="card")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    owner = dict(profile="default", session_id="session", session_key="route", chat_id="42", thread_id="8")
+    key = "f" * 32
+    cards_path = tmp_path / "cache" / "delegation" / "cards.json"
+    cards_path.parent.mkdir(parents=True)
+    cards_path.write_text(json.dumps({key: {
+        "owner": owner, "source": {"platform": "telegram", "chat_id": "42", "thread_id": "8"},
+        "started_at": 1, "generation": 0, "rows": {"A": {"thread_ref": "A", "state": "interrupted"}},
+        "message_id": None, "rendered": "", "recoveries": 0, "send_attempts": 0, "retired": False,
+        "handled": ["A"],
+    }}))
+
+    restored = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    await restored.reconcile()
+
+    assert restored.cards[key]["retired"] is True
+    adapter.send_delegation_card.assert_not_awaited()
+    # A late completion cannot resurrect a terminal record that has been explicitly retired.
+    await restored.observe(source, "route", "session", 1, "subagent.complete", None, {
+        "parent_task_id": key, "thread_ref": "A", "status": "completed", "owner": owner,
+    })
+    assert not restored.pending
 
 
 @pytest.mark.asyncio

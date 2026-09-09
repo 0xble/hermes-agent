@@ -24,6 +24,7 @@ _MANAGER_LOCK = threading.Lock()
 _TERMINAL = {"completed", "failed", "error", "timeout", "cancelled", "interrupted", "budget_exhausted"}
 
 
+
 def _label(value, default, limit=60):
     # Labels are explicit display data, never goals, tool args or child text.
     text = re.sub(r"[\x00-\x1f\x7f*_`\[\]<>]", "", str(value or ""))
@@ -32,9 +33,11 @@ def _label(value, default, limit=60):
 
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
-    lines = [f"🧵 **Delegating · {elapsed} min**"]
+    # Every physical line is a Markdown blockquote line. Telegram's formatter
+    # keeps this as one native card instead of rendering a fake text border.
+    lines = [f"> 🧵 **Delegating · {elapsed} min**"]
     for row in card["rows"].values():
-        lines.append(f"\n**{row['thread_ref']}. {_label(row.get('task_label'), 'Run delegated task')}** · {_label(row.get('role'), 'Worker', 24)}")
+        lines.append(f"> **{row['thread_ref']}. {_label(row.get('task_label'), 'Run delegated task')}** · {_label(row.get('role'), 'Worker', 24)}")
         state = row.get("state")
         if state == "completed":
             activity = "Returned · awaiting parent"
@@ -47,9 +50,16 @@ def render_card(card, now=None):
             activity = f"Last tool: {get_tool_emoji(tool)} {_label(tool, 'tool', 40)}"
         else:
             activity = "Started · awaiting activity"
-        lines.append(activity)
+        lines.append(f"> ↳ {activity}")
     # Keep a single Telegram message, never split into a second card.
     return "\n".join(lines)[:3500]
+
+
+def _handled_terminal(card):
+    """True only for the exact refs a parent final-delivery receipt handled."""
+    rows = card.get("rows") or {}
+    return bool(rows) and set(rows) <= set(card.get("handled") or ()) and all(
+        row.get("state") in _TERMINAL | {"unknown"} for row in rows.values())
 
 
 class DelegationCards:
@@ -66,11 +76,21 @@ class DelegationCards:
         if self.path.exists():
             try:
                 self.cards = json.loads(self.path.read_text(encoding="utf-8"))
+                changed = False
                 for card in self.cards.values():
                     for row in card["rows"].values():
                         if row["state"] not in _TERMINAL:
                             row["state"] = "unknown"
                     card["generation"] += 1
+                    # A crash can happen after the successful parent-final receipt is
+                    # saved and before delivered() writes the retirement fence.  Recover
+                    # only that exact receipt; an unhandled terminal/failed-send card
+                    # remains visible and retryable.
+                    if not card.get("retired") and _handled_terminal(card):
+                        card["retired"] = True
+                        changed = True
+                if changed:
+                    self._save()
             except (OSError, ValueError, KeyError):
                 logger.exception("Cannot recover delegation cards")
 
@@ -190,7 +210,7 @@ class DelegationCards:
                 revision = card.get("revision", 0)
                 message_id = card["message_id"]
                 if message_id:
-                    result = await adapter.edit_message(card["source"]["chat_id"], message_id, text)
+                    result = await adapter.edit_message(card["source"]["chat_id"], message_id, text, finalize=True)
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
                     if missing and card["recoveries"] < 1:
                         card["recoveries"] += 1
@@ -251,8 +271,7 @@ class DelegationCards:
                 handled = set(card.get("handled", [])) | set(proof["refs"])
                 card["handled"] = sorted(handled)
                 self._save()
-                if not (set(card["rows"]) <= handled and all(
-                        row["state"] in _TERMINAL | {"unknown"} for row in card["rows"].values())):
+                if not _handled_terminal(card):
                     continue
                 # Fence first, including outstanding coalesced updates and late child events.
                 card["retired"] = True
