@@ -1135,10 +1135,12 @@ def delegate_task(
         if isinstance(_ref, dict):
             _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
                         task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
+                        subagent_type=vars(_child).get("_delegation_named_type"),
                         owner=_owner, background=bool(background))
     _metadata["threads"] = [
         {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
-         "role": getattr(child, "_delegate_role", None)}
+         "role": getattr(child, "_delegate_role", None),
+         "subagent_type": vars(child).get("_delegation_named_type")}
         for i, (_, _, child) in enumerate(children)
     ]
     _metadata["background"] = bool(background)

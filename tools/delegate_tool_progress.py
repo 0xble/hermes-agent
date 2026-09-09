@@ -293,6 +293,7 @@ class _ChildProgressRelay:
         for src, dst in (("session_id", "child_session_id"), ("delegation_id", "delegation_id"),
                          ("parent_task_id", "parent_task_id"), ("thread_ref", "thread_ref"),
                          ("task_label", "task_label"), ("role", "role"), ("owner", "owner"),
+                         ("subagent_type", "subagent_type"),
                          ("background", "background")):
             if self.session_ref.get(src) is not None:
                 kw[dst] = self.session_ref[src]

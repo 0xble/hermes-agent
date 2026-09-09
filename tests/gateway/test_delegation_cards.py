@@ -17,7 +17,7 @@ from gateway.turn_context import TurnContext
 def test_render_card_is_plain_rich_text_with_task_first_rows():
     card = {
         "started_at": 0,
-        "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "Orchestrator",
+        "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "orchestrator", "subagent_type": "lead",
                          "state": "running", "last_tool": "read_file"}},
     }
 
@@ -25,7 +25,7 @@ def test_render_card_is_plain_rich_text_with_task_first_rows():
 
     lines = rendered.splitlines()
     assert lines[0] == "🧵 **Delegating · 0 min**"
-    assert lines[1] == "**A. Repair restart receipt** · Orchestrator"
+    assert lines[1] == "**A. Repair restart receipt** · Lead"
     assert lines[2].startswith("↳ Last tool: ")
     assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
     assert not any(line.startswith(">") for line in lines)
@@ -56,6 +56,36 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     assert "*A\\. Repair receipt* · Worker" in send_kwargs["text"]
     assert not any(line.startswith(">") for line in send_kwargs["text"].splitlines())
     assert edit_kwargs["text"] == send_kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_observed_canonical_tool_name_reaches_telegram_send_and_edit(tmp_path):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token", extra={"rich_messages": False}))
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
+    adapter._bot.send_chat_action = AsyncMock()
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    data = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check display", subagent_type="lead", role="orchestrator", owner=dict(
+        profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""))
+    await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "computer_use", data)
+    await asyncio.gather(*list(cards.pending.values()))
+    assert "computer\\_use" in adapter._bot.send_message.call_args.kwargs["text"]
+    await cards.observe(source, "r", "s", 1, "subagent.tool", "computer_use_multi_step", data)
+    await asyncio.gather(*list(cards.pending.values()))
+    assert "computer\\_use\\_multi\\_step" in adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert " · Lead" in adapter._bot.send_message.call_args.kwargs["text"]
+    assert " · Lead" in adapter._bot.edit_message_text.call_args.kwargs["text"]
+    restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain_cards(restored)
+    assert " · Lead" in adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert "orchestrator" not in adapter._bot.edit_message_text.call_args.kwargs["text"]
 
 
 @pytest.mark.asyncio
@@ -367,3 +397,130 @@ async def test_sync_batch_receipt_does_not_handle_related_background_rows(tmp_pa
     assert combined["c" * 32]["refs"] == ["A", "B"]
     await cards.delivered(combined)
     adapter.delete_message.assert_awaited_once()
+
+
+async def drain_cards(cards):
+    while cards.pending:
+        await asyncio.gather(*list(cards.pending.values()))
+
+
+@pytest.mark.asyncio
+async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp_path):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="one")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    runner = SimpleNamespace(_adapter_for_source=lambda _: adapter)
+    cards = DelegationCards(runner, home=tmp_path, interval=0)
+    owner = dict(profile="default", session_id="s", session_key="r", chat_id="42", thread_id="8")
+    a = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check receipt", subagent_type="lead", owner=owner)
+    b = dict(parent_task_id="b" * 32, thread_ref="B", task_label="Check display", subagent_type="explorer", owner=owner)
+    await cards.observe(source, "r", "s", 1, "subagent.start", None, a)
+    await drain_cards(cards)
+    await cards.observe(source, "r", "s", 2, "subagent.start", None, b)
+    await drain_cards(cards)
+    adapter.send_delegation_card.assert_awaited_once()
+    text = adapter.edit_message.call_args.args[2]
+    assert "A. Check receipt" in text and "B. Check display" in text
+    assert "Lead" in text and "Explorer" in text
+    assert adapter.edit_message.call_args.args[1] == "one"
+    await cards.observe(source, "r", "s", 1, "subagent.complete", None, a)
+    event = MessageEvent(source=source, text="handled A", internal=True, metadata={
+        "delegation_parent_task_id": a["parent_task_id"], "delegation_owner": owner, "delegation_thread_refs": ["A"]})
+    proof = cards.receipt(event, "r", 3)
+    # A new row must not invalidate the exact earlier receipt, nor be handled by it.
+    c = {**a, "thread_ref": "C", "task_label": "Check race", "subagent_type": None}
+    await cards.observe(source, "r", "s", 3, "subagent.start", None, c)
+    await cards.delivered(proof)
+    await drain_cards(cards)
+    text = adapter.edit_message.call_args.args[2]
+    assert "A. Check receipt" not in text and "B. Check display" in text and "C. Check race" in text
+    assert "**C. Check race**\n" in text  # no fabricated default role
+    adapter.delete_message.assert_not_awaited()
+    restored = DelegationCards(runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain_cards(restored)
+    assert "Explorer" in adapter.edit_message.call_args.args[2]
+    assert "A. Check receipt" not in adapter.edit_message.call_args.args[2]
+    adapter.send_delegation_card.assert_awaited_once()
+    for data in (b, c):
+        event.metadata = {"delegation_parent_task_id": data["parent_task_id"], "delegation_owner": owner,
+                          "delegation_thread_refs": [data["thread_ref"]]}
+        await restored.delivered(restored.receipt(event, "r", 4))
+    await drain_cards(restored)
+    adapter.delete_message.assert_awaited_once_with("42", "one")
+    restarted = DelegationCards(runner, home=tmp_path, interval=0)
+    await restarted.reconcile()
+    await drain_cards(restarted)
+    adapter.send_delegation_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sends_share_message_and_keep_topic_isolation(tmp_path):
+    started, release = asyncio.Event(), asyncio.Event()
+    async def send(*args):
+        started.set()
+        await release.wait()
+        return SendResult(success=True, message_id="one")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(side_effect=send),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
+    owner = dict(profile="default", session_id="s", session_key="r", chat_id="42", thread_id="8")
+    a = dict(parent_task_id="a" * 32, thread_ref="A", owner=owner)
+    await cards.observe(source, "r", "s", 1, "subagent.start", None, a)
+    await started.wait()
+    b = {**a, "parent_task_id": "b" * 32, "thread_ref": "B"}
+    other = asyncio.create_task(cards.observe(source, "r", "s", 2, "subagent.start", None, b))
+    release.set()
+    await other
+    await drain_cards(cards)
+    adapter.send_delegation_card.assert_awaited_once()
+    assert "A." in adapter.edit_message.call_args.args[2] and "B." in adapter.edit_message.call_args.args[2]
+    assert adapter.edit_message.call_args.args[1] == "one"
+    source.thread_id = "9"
+    await cards.observe(source, "r", "s", 3, "subagent.start", None,
+                        {**a, "parent_task_id": "c" * 32, "owner": {**owner, "thread_id": "9"}})
+    await drain_cards(cards)
+    assert adapter.send_delegation_card.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference(tmp_path):
+    import json
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(side_effect=[
+        SendResult(success=True, message_id="old-a"), SendResult(success=True, message_id="old-b")]),
+        edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=False))
+    runner = SimpleNamespace(_adapter_for_source=lambda _: adapter)
+    legacy = {}
+    for index, key in enumerate(("a" * 32, "b" * 32)):
+        manager = DelegationCards(runner, home=tmp_path / str(index), interval=0)
+        owner = dict(profile="default", session_id=f"s{index}", session_key="r", chat_id="42", thread_id="")
+        await manager.observe(source, "r", f"s{index}", 1, "subagent.start", None,
+                              dict(parent_task_id=key, thread_ref="A", owner=owner, role="leaf"))
+        await drain_cards(manager)
+        legacy[key] = manager.cards[key]
+        legacy[key].pop("presentation_key")
+        legacy[key]["rows"]["A"].pop("display_ref")
+    path = tmp_path / "cache" / "delegation" / "cards.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    restored = DelegationCards(runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain_cards(restored)
+    text = adapter.edit_message.call_args.args[2]
+    assert "**A." in text and "**A·2." in text
+    assert "Worker" not in text and "Leaf" not in text
+    assert adapter.edit_message.call_args.args[1] == "old-a"
+    adapter.delete_message.assert_awaited_once_with("42", "old-b")
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["b" * 32]["presentation_key"] == "a" * 32
+    assert persisted["b" * 32]["obsolete_message_id"] == "old-b"
+    assert all(not c.get("handled") and not c.get("retired") for c in persisted.values())
+    # Failed deletion retries even when the aggregate render is unchanged.
+    adapter.delete_message.return_value = True
+    again = DelegationCards(runner, home=tmp_path, interval=0)
+    await again.reconcile()
+    await drain_cards(again)
+    assert adapter.send_delegation_card.await_count == 2
+    assert again.cards["b" * 32]["obsolete_message_id"] is None
