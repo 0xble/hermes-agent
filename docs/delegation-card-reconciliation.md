@@ -25,12 +25,21 @@ attestations, not authenticated signatures or content interpreted by the tool.
 Treat manifests as privileged administrative input; do not generate approval from
 transcript text or accept model/child text as authorization.
 
-On later authorized installation, the existing `DelegationCards` startup path
-suppresses send/edit replay and rejects late events for retired cards. It also
-attempts deletion of their stored platform messages using the existing bounded
-retry policy. **Installing this candidate therefore authorizes those deletions.**
-A failed deletion leaves the message visible but keeps the replay fence and audit.
-This is not proof of successful Telegram deletion or task completion.
+On later authorized installation, the `DelegationCards` startup path suppresses
+selected task rows and rejects late events for retired tasks. Task ownership and
+receipts remain separate from presentation: one aggregate message belongs to the
+conversation/topic, and handled or dismissed rows are removed in place. The
+aggregate message is deleted only when no outstanding rows remain. Legacy visible
+messages are linked explicitly to the surviving aggregate before redundant
+presentation deletion; their task outcomes and unhandled obligations are retained.
+A known message is preferred over an ambiguous legacy send as the aggregate anchor.
+**Installing this candidate therefore authorizes the applicable exact-target
+presentation updates/deletions.**
+
+Cleanup honors the adapter's known shared cooldown, persists a deferred retry, and
+does not consume deletion attempts for a wait that issued no request. A failed
+delete leaves the retirement fence and audit intact; it is not proof of successful
+Telegram deletion or task completion.
 
 ## Preparation (no live writes or external effects)
 

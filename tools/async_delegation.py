@@ -422,13 +422,13 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, delivery_recovery_attempts
                FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        for delegation_id, payload, completed_at, dispatched_at in rows:
+        for delegation_id, payload, completed_at, dispatched_at, recovery_attempts in rows:
             age_basis = completed_at or dispatched_at
-            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+            if not recovery_attempts and age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
                 # This state is *only* ordinary pending. Retry-exhausted rows use
                 # pending_recovery and are never selected or erased by this cap.
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',

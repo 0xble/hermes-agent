@@ -77,6 +77,8 @@ def test_child_tree_lines_and_relayed_events_carry_batch_tag():
     # Stamped by delegate_task AFTER the callback is built — must be picked up lazily.
     ref["delegation_id"] = "deleg_6a664903"
     ref["session_id"] = "child-sess"
+    ref["subagent_type"] = "explorer"
+    ref["role"] = "leaf"
 
     cb("subagent.start")
     cb("tool.started", "terminal", "ls")
@@ -86,6 +88,8 @@ def test_child_tree_lines_and_relayed_events_carry_batch_tag():
     assert tree[1].startswith(" [set 1 · 3/9] ├─ ")
     assert all(kw.get("delegation_id") == "deleg_6a664903" for _, kw in relayed)
     assert all(kw.get("child_session_id") == "child-sess" for _, kw in relayed)
+    assert all(kw.get("subagent_type") == "explorer" for _, kw in relayed)
+    assert all(kw.get("role") == "leaf" for _, kw in relayed)
 
 
 def test_child_tree_prefix_without_batch_id_is_unchanged():

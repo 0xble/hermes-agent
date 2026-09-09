@@ -31,12 +31,20 @@ def _label(value, default, limit=60):
     return " ".join(text.split())[:limit] or default
 
 
+def _tool_label(value, default="tool", limit=40):
+    """Bound visible tool names without rewriting their canonical identifier."""
+    text = str(value or default).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] or default
+
+
 def render_card(card, now=None):
     elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
     # Plain rich text: cards must never render as a native quote or fake border.
     lines = [f"🧵 **Delegating · {elapsed} min**"]
     for row in card["rows"].values():
-        lines.append(f"**{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}** · {_label(row.get('role'), 'Worker', 24)}")
+        named_type = _label(row.get("subagent_type"), "", 24)
+        role_suffix = f" · {named_type.capitalize()}" if named_type else ""
+        lines.append(f"**{row['thread_ref']}. {_label(row.get('task_label'), 'Task ' + row['thread_ref'])}**{role_suffix}")
         state = row.get("state")
         if state == "completed":
             activity = "Returned · awaiting parent"
@@ -46,7 +54,7 @@ def render_card(card, now=None):
             activity = "Interrupted / unknown · gateway restarted"
         elif row.get("last_tool"):
             tool = row["last_tool"]
-            activity = f"Last tool: {get_tool_emoji(tool)} {_label(tool, 'tool', 40)}"
+            activity = f"Last tool: {get_tool_emoji(tool)} {_tool_label(tool, 'tool', 40)}"
         else:
             activity = "Started · awaiting activity"
         lines.append(f"↳ {activity}")
@@ -81,6 +89,7 @@ class DelegationCards:
                         if row["state"] not in _TERMINAL:
                             row["state"] = "unknown"
                     card["generation"] += 1
+                    card["receipt_epoch"] = card.get("receipt_epoch", 0) + 1
                     # A crash can happen after the successful parent-final receipt is
                     # saved and before delivered() writes the retirement fence.  Recover
                     # only that exact receipt; an unhandled terminal/failed-send card
@@ -136,19 +145,93 @@ class DelegationCards:
             self._warn_once(card, "Delegation card adapter unavailable; skipping delivery")
         return adapter
 
-    async def reconcile(self):
-        for key, card in list(self.cards.items()):
+    @staticmethod
+    def _scope(card):
+        source = card["source"]
+        return (card["owner"].get("profile", ""), source.get("profile"),
+                source.get("platform"), str(source.get("chat_id")), str(source.get("thread_id") or ""))
+
+    def _anchor(self, key):
+        return self.cards[key].get("presentation_key", key)
+
+    def _members(self, key):
+        return [(k, c) for k, c in self.cards.items() if self._anchor(k) == key]
+
+    def _projection(self, key):
+        anchor = self.cards[key]
+        rows = {}
+        for task_key, card in self._members(key):
             if card.get("retired"):
-                await self._delete(card)
+                continue
+            for ref, row in card["rows"].items():
+                if ref in (card.get("handled") or ()) and row["state"] in _TERMINAL | {"unknown"}:
+                    continue
+                rows[task_key + ref] = {**row, "thread_ref": row.get("display_ref", ref)}
+        return {"started_at": anchor["started_at"], "rows": rows}
+
+    def _bind(self, key):
+        card = self.cards[key]
+        if "presentation_key" in card:
+            self._assign_refs(key)
+            return
+        # Presentation identity deliberately excludes execution session/task identity.
+        # Owners and receipts remain on the original task records.
+        anchor = next((self._anchor(k) for k, c in self.cards.items()
+                       if k != key and "presentation_key" in c
+                       and (not c.get("retired") or c.get("message_id")
+                            or (c.get("send_attempts") and not c.get("message_deleted")))
+                       and self._scope(c) == self._scope(card)), key)
+        card["presentation_key"] = anchor
+        self.cards[anchor]["delete_attempts"] = 0
+        if anchor != key and card.get("message_id"):
+            # Exact linkage, not age-based dismissal or an invented handled receipt.
+            card["obsolete_message_id"] = card.pop("message_id")
+            card["message_id"] = None
+        self._assign_refs(key)
+
+    def _assign_refs(self, key):
+        card = self.cards[key]
+        anchor = self._anchor(key)
+        used = {r.get("display_ref", ref) for k, c in self._members(anchor) if k != key
+                for ref, r in c["rows"].items()}
+        for ref, row in card["rows"].items():
+            display = ref
+            suffix = 2
+            while display in used:
+                display = f"{ref}·{suffix}"
+                suffix += 1
+            row.setdefault("display_ref", display)
+            used.add(row["display_ref"])
+
+    async def reconcile(self):
+        # Bind legacy task cards before any transport work, persisting replacement
+        # links before removing redundant messages. No task outcomes are inferred.
+        for key, card in sorted(self.cards.items(), key=lambda item: not bool(item[1].get("message_id"))):
+            if not card.get("retired"):
+                self._bind(key)
+        self._save()
+        for key, card in list(self.cards.items()):
+            if self._anchor(key) != key:
+                continue
+            if not self._projection(key)["rows"]:
+                async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
+                    await self._delete_obsolete(key)
+                    await self._delete(card)
             else:
                 self._queue(key)
-        self._save()
 
     def _queue(self, key):
+        key = self._anchor(key)
         if key not in self.pending:
             self.pending[key] = asyncio.create_task(self._flush(key))
 
     async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data):
+        scope = ((data.get("owner") or {}).get("profile", ""), getattr(source, "profile", None),
+                 source.platform.value, str(source.chat_id), str(source.thread_id or ""))
+        async with self.locks.setdefault(scope, asyncio.Lock()):
+            await self._observe(source, session_key, session_id, generation, event_type, tool_name, data)
+
+    async def _observe(self, source, session_key, session_id, generation, event_type, tool_name, data):
         key, ref = data.get("parent_task_id"), data.get("thread_ref")
         owner = data.get("owner") or {}
         if (source.platform != Platform.TELEGRAM or not isinstance(key, str)
@@ -177,30 +260,42 @@ class DelegationCards:
             if row:
                 return
             row = card["rows"][ref] = {"thread_ref": ref, "task_label": data.get("task_label"),
-                "role": data.get("role"), "state": "running", "last_tool": None}
+                "role": data.get("role"), "subagent_type": data.get("subagent_type"),
+                "state": "running", "last_tool": None}
             card["generation"] += 1
             if data.get("background") is False:
                 self.turn_tasks.setdefault((session_key, generation), {}).setdefault(key, set()).add(ref)
         elif row and event_type == "subagent.complete":
             row["state"] = data.get("status") if data.get("status") in _TERMINAL else "completed"
         elif row and event_type == "subagent.tool" and tool_name:
-            row["last_tool"] = _label(tool_name, "tool", 60)
+            row["last_tool"] = _tool_label(tool_name, "tool", 60)
         else:
             return
-        card["revision"] = card.get("revision", 0) + 1
+        self._bind(key)
+        if _handled_terminal(card):
+            card["retired"] = True
+        anchor = self.cards[self._anchor(key)]
+        anchor["revision"] = anchor.get("revision", 0) + 1
         self._save()
         self._queue(key)
 
     async def _flush(self, key):
         revision = None
         try:
-            await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0))))
-            async with self.locks.setdefault(key, asyncio.Lock()):
+            await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0)),
+                                    self.cards[key].get("retry_at", 0) - time.time(),
+                                    self.cards[key].get("delete_retry_at", 0) - time.time()))
+            async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 card = self.cards[key]
-                if card.get("retired"):
+                card.pop("delete_retry_at", None)
+                projection = self._projection(key)
+                if not projection["rows"]:
+                    await self._delete(card)
+                    await self._delete_obsolete(key)
                     return
-                text = render_card(card)
+                text = render_card(projection)
                 if text == card["rendered"]:
+                    await self._delete_obsolete(key)
                     return
                 source = self._source(card)
                 adapter = self._adapter(card, source)
@@ -209,7 +304,8 @@ class DelegationCards:
                 revision = card.get("revision", 0)
                 message_id = card["message_id"]
                 if message_id:
-                    result = await adapter.edit_message(card["source"]["chat_id"], message_id, text, finalize=True)
+                    result = await adapter.edit_message(source.chat_id, card["message_id"], text, finalize=True,
+                                                        metadata={"hermes_status": True})
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
                     if missing and card["recoveries"] < 1:
                         card["recoveries"] += 1
@@ -228,7 +324,15 @@ class DelegationCards:
                         card["rejections"] = card.get("rejections", 0) + 1
                         card["send_attempts"] = 0  # one retry, on a subsequent observed event only
                 if getattr(result, "success", False):
+                    card.pop("retry_at", None)
                     card["rendered"] = text
+                    await self._delete_obsolete(key)
+                elif getattr(result, "retryable", False) and getattr(result, "retry_after", None) is not None:
+                    # Only explicit flood/cooldown rejection may reset an initial
+                    # send attempt. Ambiguous network sends never enter this path.
+                    if not card.get("message_id"):
+                        card["send_attempts"] = 0
+                    card["retry_at"] = time.time() + max(0.05, float(result.retry_after))
                 self.last_edit[key] = time.monotonic()
                 self._save()
 
@@ -236,9 +340,11 @@ class DelegationCards:
             logger.exception("Delegation card update failed")
         finally:
             self.pending.pop(key, None)
+            if self.cards[key].get("delete_retry_at") and not asyncio.current_task().cancelling():
+                self._queue(key)
         # Events arriving during transport awaits are coalesced, not dropped.
         card = self.cards[key]
-        if not card.get("retired") and revision is not None and revision != card.get("revision", 0):
+        if revision is not None and self._projection(key)["rows"] and (revision != card.get("revision", 0) or card.get("retry_at")):
             self._queue(key)
 
     def receipt(self, event, session_key, generation):
@@ -258,36 +364,88 @@ class DelegationCards:
                     refs.update(metadata.get("delegation_thread_refs", []))
                 if not refs:
                     continue
-                receipt[key] = {"generation": card["generation"], "refs": sorted(refs)}
+                receipt[key] = {"generation": card["generation"], "epoch": card.get("receipt_epoch", 0),
+                                "refs": sorted(refs & set(card["rows"]))}
         return receipt
 
     async def delivered(self, receipt):
         for key, proof in receipt.items():
-            async with self.locks.setdefault(key, asyncio.Lock()):
+            anchor_key = self._anchor(key) if key in self.cards else key
+            if key not in self.cards:
+                continue
+            async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 card = self.cards.get(key)
-                if not card or card["generation"] != proof["generation"] or card.get("retired"):
+                if (not card or card.get("retired")
+                        or proof.get("epoch", 0) != card.get("receipt_epoch", 0)
+                        or proof["generation"] > card["generation"]):
                     continue
-                handled = set(card.get("handled", [])) | set(proof["refs"])
+                handled = set(card.get("handled") or []) | (set(proof["refs"]) & set(card["rows"]))
                 card["handled"] = sorted(handled)
                 self._save()
-                if not _handled_terminal(card):
-                    continue
-                # Fence first, including outstanding coalesced updates and late child events.
-                card["retired"] = True
+                if _handled_terminal(card):
+                    card["retired"] = True
+                anchor = self.cards[anchor_key]
+                anchor["revision"] = anchor.get("revision", 0) + 1
                 self._save()
-                await self._delete(card)
+                if self._projection(anchor_key)["rows"]:
+                    self._queue(anchor_key)
+                else:
+                    await self._delete_obsolete(anchor_key)
+                    await self._delete(anchor)
+
+    def _defer_delete(self, card, adapter, minimum_delay=0):
+        delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
+        key = next((k for k, c in self.cards.items() if c is card), None)
+        if key is None:
+            return False
+        anchor_key = self._anchor(key)
+        anchor = self.cards[anchor_key]
+        delay = max(minimum_delay, delay if isinstance(delay, (int, float)) else 0, anchor.get("delete_retry_at", 0) - time.time())
+        if delay <= 0:
+            return False
+        anchor["delete_retry_at"] = max(anchor.get("delete_retry_at", 0), time.time() + delay)
+        self._save()
+        self._queue(anchor_key)
+        return True
+
+    async def _delete_obsolete(self, key):
+        for _, card in self._members(key):
+            message_id = card.get("obsolete_message_id")
+            adapter = self._adapter(card)
+            if message_id and adapter:
+                if self._defer_delete(card, adapter):
+                    continue
+                if await adapter.delete_message(card["source"]["chat_id"], message_id):
+                    card["obsolete_message_id"] = None
+                    self._save()
+                else:
+                    self._defer_delete(card, adapter)
 
     async def _delete(self, card):
         """Keep the tombstone; bounded restart retries may finish failed deletion."""
         adapter = self._adapter(card)
         if not adapter or not card.get("message_id") or card.get("delete_attempts", 0) >= 3:
             return
+        if self._defer_delete(card, adapter):
+            return
         card["delete_attempts"] = card.get("delete_attempts", 0) + 1
         self._save()
         try:
-            if await adapter.delete_message(card["source"]["chat_id"], card["message_id"]):
+            status_delete = getattr(type(adapter), "_delete_status_message", None)
+            if status_delete is not None:
+                deleted = await status_delete(adapter, card["source"]["chat_id"], card["message_id"])
+            else:
+                deleted = await adapter.delete_message(card["source"]["chat_id"], card["message_id"])
+            if deleted is None and status_delete is not None:
+                # Explicit proof the local gate issued no request, not an API failure.
+                card["delete_attempts"] -= 1
+                self._defer_delete(card, adapter, minimum_delay=1.0)
+            elif deleted:
                 card["message_id"] = None
+                card["message_deleted"] = True
                 self._save()
+            elif self._defer_delete(card, adapter):
+                self._save()  # an actual failed request still spends its bounded attempt
         except Exception:
             logger.exception("Delegation card deletion deferred until reconciliation")
 

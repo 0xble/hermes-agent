@@ -24,12 +24,13 @@ def tool_name_from_definition(definition: Any) -> str:
 def remove_parent_only_review_tools(agent: Any) -> None:
     """Install the persistent parent-only contract on a delegated child."""
     agent._tool_contract_excluded_names = PARENT_ONLY_REVIEW_TOOLS
-    tools, names = filter_child_tool_snapshot(agent, getattr(agent, "tools", None) or [])
+    tools, names = filter_child_tool_snapshot(agent, getattr(agent, "tools", None) or [],
+                                               getattr(agent, "valid_tool_names", None))
     agent.tools = tools
     agent.valid_tool_names = names
 
 
-def filter_child_tool_snapshot(agent: Any, definitions: Any) -> tuple[list, set]:
+def filter_child_tool_snapshot(agent: Any, definitions: Any, names: Any = None) -> tuple[list, set]:
     """Apply a child's durable tool exclusions to a staged snapshot.
 
     MCP refreshes and eviction restores construct a new list, so removing a
@@ -44,7 +45,9 @@ def filter_child_tool_snapshot(agent: Any, definitions: Any) -> tuple[list, set]
         definition for definition in (definitions or [])
         if tool_name_from_definition(definition) not in excluded
     ]
-    return tools, {tool_name_from_definition(definition) for definition in tools if tool_name_from_definition(definition)}
+    if not isinstance(names, (set, frozenset)):
+        names = {tool_name_from_definition(definition) for definition in tools if tool_name_from_definition(definition)}
+    return tools, set(names) - excluded
 
 
 def apply_review_tool_policy(agent: Any, policy: str) -> None:

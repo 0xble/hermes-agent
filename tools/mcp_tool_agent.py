@@ -116,7 +116,7 @@ def refresh_agent_mcp_tools(
     staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
     _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
     from agent.review_policy import filter_child_tool_snapshot
-    new_defs, new_names = filter_child_tool_snapshot(agent, new_defs)
+    new_defs, new_names = filter_child_tool_snapshot(agent, new_defs, new_names)
     # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
     # under the tools lock would be the first nesting of the two.
     prefix_registered: Optional[set] = None
@@ -178,7 +178,7 @@ def restore_agent_tool_prefix(agent, saved_names: list) -> bool:
     merged, merged_names = _merge_preserving_prefix(saved_defs, fresh_defs, registered_names)
     _reinject_authorized_dynamic_tools(agent, merged, merged_names)
     from agent.review_policy import filter_child_tool_snapshot
-    merged, merged_names = filter_child_tool_snapshot(agent, merged)
+    merged, merged_names = filter_child_tool_snapshot(agent, merged, merged_names)
     with _agent_tools_lock:
         if merged == fresh_defs:
             return False

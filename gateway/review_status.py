@@ -43,6 +43,7 @@ class ReviewStatuses:
         self.path = Path(home or get_hermes_home()) / "cache" / "review-statuses.json"
         self.items = {}
         self.locks = {}
+        self.delete_pending = {}
         self._load()
 
     def _load(self):
@@ -115,7 +116,7 @@ class ReviewStatuses:
             self._save()
             try:
                 result = await adapter.send(source.chat_id, render("dispatched"),
-                                            metadata=self.runner._thread_metadata_for_source(source))
+                                            metadata={**(self.runner._thread_metadata_for_source(source) or {}), "hermes_status": True})
             except Exception:
                 logger.debug("Native review status send failed", exc_info=True)
                 return False
@@ -131,6 +132,11 @@ class ReviewStatuses:
             item, source, session_key, session_id, generation,
         ))
 
+    async def lifecycle(self, source, session_key, session_id, generation, delegation_id, event_type):
+        # Typed native-review progress may beat the parent dispatch callback.
+        await self.dispatch(source, session_key, session_id, generation, delegation_id)
+        return await self.observe(source, session_key, session_id, generation, delegation_id, event_type)
+
     async def observe(self, source, session_key, session_id, generation, delegation_id, event_type):
         item = self.items.get(delegation_id)
         if (not item or item.get("retired") or not self._matches(item, source, session_key, session_id, generation)
@@ -145,7 +151,7 @@ class ReviewStatuses:
                 if item.get("state") != "dispatched":
                     return False
                 item["state"], item["started_at"] = "reviewing", time.time()
-            elif item.get("state") not in _TERMINAL:
+            elif item.get("state") != "returned":
                 item["state"] = "returned"
             else:
                 return False
@@ -156,7 +162,7 @@ class ReviewStatuses:
             try:
                 result = await adapter.edit_message(source.chat_id, item["message_id"],
                     render(item["state"], item.get("started_at")), finalize=True,
-                    metadata=self.runner._thread_metadata_for_source(source))
+                    metadata={**(self.runner._thread_metadata_for_source(source) or {}), "hermes_status": True})
             except Exception:
                 logger.debug("Native review status edit failed", exc_info=True)
                 return False
@@ -167,7 +173,7 @@ class ReviewStatuses:
         metadata = event.metadata or {}
         delegation_id = metadata.get("delegation_id") if getattr(event, "internal", False) else None
         item = self.items.get(delegation_id)
-        if not item or item.get("retired") or item.get("state") != "returned":
+        if not item or item.get("retired") or item.get("state") not in {"returned", "unknown"}:
             return {}
         # The parent continuation is necessarily a later turn, so its run
         # generation must not be confused with the review-dispatch generation.
@@ -180,21 +186,78 @@ class ReviewStatuses:
             lock = self.locks.setdefault(delegation_id, asyncio.Lock())
             async with lock:
                 item = self.items.get(delegation_id)
-                if (not item or item.get("retired") or item.get("state") != "returned"
+                if (not item or item.get("retired") or item.get("state") not in {"returned", "unknown"}
                         or item.get("generation") != proof.get("generation")
                         or item.get("owner") != proof.get("owner")):
                     continue
                 # Fence first: late lifecycle events cannot overwrite or recreate it.
                 item["retired"] = True
                 self._save()
-                adapter = self._adapter(SessionSource(**{**item["source"], "platform": Platform(item["source"]["platform"])}))
-                if adapter and item.get("message_id"):
-                    try:
-                        if await adapter.delete_message(item["source"]["chat_id"], item["message_id"]):
-                            item["message_id"] = None
-                            self._save()
-                    except Exception:
-                        logger.debug("Native review status deletion deferred", exc_info=True)
+                await self._delete(item)
+
+    def _defer_delete(self, item, adapter, minimum_delay=0):
+        delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(item["source"]["chat_id"])
+        delay = max(minimum_delay, delay if isinstance(delay, (int, float)) else 0, item.get("delete_retry_at", 0) - time.time())
+        if delay <= 0:
+            return False
+        key = next((k for k, value in self.items.items() if value is item), None)
+        if key is None:
+            return False
+        item["delete_retry_at"] = time.time() + delay
+        self._save()
+        if key not in self.delete_pending:
+            self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
+        return True
+
+    async def _retry_delete(self, key):
+        try:
+            item = self.items.get(key)
+            if item is None:
+                return
+            await asyncio.sleep(max(0, item.get("delete_retry_at", 0) - time.time()))
+            async with self.locks.setdefault(key, asyncio.Lock()):
+                item = self.items.get(key)
+                if item is not None:
+                    item.pop("delete_retry_at", None)
+                    await self._delete(item)
+        finally:
+            self.delete_pending.pop(key, None)
+            item = self.items.get(key)
+            if item and item.get("delete_retry_at") and not asyncio.current_task().cancelling():
+                self.delete_pending[key] = asyncio.create_task(self._retry_delete(key))
+
+    async def _delete(self, item):
+        if not item.get("message_id") or item.get("delete_attempts", 0) >= 3:
+            return
+        adapter = self._adapter(SessionSource(**{**item["source"], "platform": Platform(item["source"]["platform"])}))
+        if adapter:
+            if self._defer_delete(item, adapter):
+                return
+            item["delete_attempts"] = item.get("delete_attempts", 0) + 1
+            self._save()
+            try:
+                status_delete = getattr(type(adapter), "_delete_status_message", None)
+                if status_delete is not None:
+                    deleted = await status_delete(adapter, item["source"]["chat_id"], item["message_id"])
+                else:
+                    deleted = await adapter.delete_message(item["source"]["chat_id"], item["message_id"])
+                if deleted is None and status_delete is not None:
+                    # Explicit proof the local gate issued no request, not an API failure.
+                    item["delete_attempts"] -= 1
+                    self._defer_delete(item, adapter, minimum_delay=1.0)
+                elif deleted:
+                    item["message_id"] = None
+                    self._save()
+                elif self._defer_delete(item, adapter):
+                    self._save()  # an actual failed request still spends its bounded attempt
+            except Exception:
+                logger.debug("Native review status deletion deferred", exc_info=True)
+
+    async def reconcile(self):
+        for key, item in self.items.items():
+            async with self.locks.setdefault(key, asyncio.Lock()):
+                if item.get("retired"):
+                    await self._delete(item)
 
 
 def statuses_for(runner):
