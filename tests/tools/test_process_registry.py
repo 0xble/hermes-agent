@@ -2527,6 +2527,78 @@ class TestSystemdCgroupIsolation:
         assert "DBUS_SESSION_BUS_ADDRESS" not in os.environ
 
     @pytest.mark.linux_only
+    def test_probe_succeeds_without_bin_true(self, monkeypatch):
+        """An absent ``/bin/true`` must not make a usable scope fail its probe."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_PROBED_AT", 0.0)
+        real_run = subprocess.run
+        executed = []
+
+        def systemd_run_on_nixos_shaped_root(argv, **kwargs):
+            # Simulate NixOS's missing executable, but run the selected replacement.
+            payload = argv[argv.index("--") + 1 :]
+            if payload[0] == "/bin/true":
+                return subprocess.CompletedProcess(payload, 127, stderr=b"No such file or directory")
+            executed.append(payload)
+            return real_run(payload, **kwargs)
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr("subprocess.run", systemd_run_on_nixos_shaped_root)
+
+        assert pr._systemd_run_user_scope_available() is True
+        assert len(executed) == 1, "payload must really run (exit 0) on the host, not just be spelled right"
+
+    @pytest.mark.linux_only
+    def test_systemd_scope_first_probe_is_serialized(self, monkeypatch):
+        """Concurrent first-use callers must wait for one definitive probe.
+
+        A temporary cached ``False`` would let a racing worker spawn inside the
+        gateway cgroup, defeating the OOM isolation guarantee.
+        """
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", None)
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        probe_calls = []
+        results = []
+
+        def fake_run(*args, **kwargs):
+            probe_calls.append(args)
+            probe_started.set()
+            assert release_probe.wait(timeout=2)
+            return subprocess.CompletedProcess(args=args[0], returncode=0)
+
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        first = threading.Thread(
+            target=lambda: results.append(pr._systemd_run_user_scope_available())
+        )
+        second = threading.Thread(
+            target=lambda: results.append(pr._systemd_run_user_scope_available())
+        )
+        first.start()
+        assert probe_started.wait(timeout=2)
+        second.start()
+
+        # The racing caller must be blocked behind the probe, not observe a
+        # temporary False cache value.
+        second.join(timeout=0.05)
+        assert second.is_alive()
+
+        release_probe.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert results == [True, True]
+        assert len(probe_calls) == 1
+
+    @pytest.mark.linux_only
     def test_failed_systemd_probe_retries_after_cache_ttl(self, monkeypatch):
         import tools.process_registry as pr
 
