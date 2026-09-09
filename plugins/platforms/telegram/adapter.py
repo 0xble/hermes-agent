@@ -4672,11 +4672,20 @@ class TelegramAdapter(BasePlatformAdapter):
     def deletion_retry_after(self, chat_id: str) -> float:
         """Known shared deadline, so cleanup owners defer without spending an attempt."""
         key = str(normalize_telegram_chat_id(chat_id))
-        priority_wait = 0.05 if getattr(self, "_send_final_waiters", {}).get(key, 0) else 0.0
+        priority_wait = 1.0 if getattr(self, "_send_final_waiters", {}).get(key, 0) else 0.0
         return max(priority_wait, self._send_cooldown_until.get(key, 0.0) - time.monotonic())
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
-        """Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.
+        """Keep the general cleanup API boolean and non-fatal."""
+        return bool(await self._delete_status_message(chat_id, message_id))
+
+    async def _delete_status_message(self, chat_id: str, message_id: str) -> Optional[bool]:
+        """Internal durable cleanup: None means the scheduler issued no request.
+
+        Other callers retain the boolean delete_message API. Durable status owners
+        use this distinction to preserve attempts when a queued call is deferred.
+
+        Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.
 
         Used by the stream consumer's fresh-final cleanup path (ported from openclaw/openclaw#72038) to
         remove long-lived preview messages after sending the completed reply as a fresh message. Telegram's
@@ -4695,6 +4704,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _reserve_gap=False, _expendable=True)
             self._forget_status_message_id(chat_id, message_id)
             return True
+        except _TelegramSendCooldownExceeded:
+            return None  # local gate refused before invoking the Bot API
         except Exception as e:
             if "message to delete not found" in str(e).lower() or "message_id_invalid" in str(e).lower():
                 self._forget_status_message_id(chat_id, message_id)

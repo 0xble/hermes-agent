@@ -393,14 +393,14 @@ class DelegationCards:
                     await self._delete_obsolete(anchor_key)
                     await self._delete(anchor)
 
-    def _defer_delete(self, card, adapter):
+    def _defer_delete(self, card, adapter, minimum_delay=0):
         delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
         key = next((k for k, c in self.cards.items() if c is card), None)
         if key is None:
             return False
         anchor_key = self._anchor(key)
         anchor = self.cards[anchor_key]
-        delay = max(delay if isinstance(delay, (int, float)) else 0, anchor.get("delete_retry_at", 0) - time.time())
+        delay = max(minimum_delay, delay if isinstance(delay, (int, float)) else 0, anchor.get("delete_retry_at", 0) - time.time())
         if delay <= 0:
             return False
         anchor["delete_retry_at"] = max(anchor.get("delete_retry_at", 0), time.time() + delay)
@@ -431,7 +431,16 @@ class DelegationCards:
         card["delete_attempts"] = card.get("delete_attempts", 0) + 1
         self._save()
         try:
-            if await adapter.delete_message(card["source"]["chat_id"], card["message_id"]):
+            status_delete = getattr(type(adapter), "_delete_status_message", None)
+            if status_delete is not None:
+                deleted = await status_delete(adapter, card["source"]["chat_id"], card["message_id"])
+            else:
+                deleted = await adapter.delete_message(card["source"]["chat_id"], card["message_id"])
+            if deleted is None and status_delete is not None:
+                # Explicit proof the local gate issued no request, not an API failure.
+                card["delete_attempts"] -= 1
+                self._defer_delete(card, adapter, minimum_delay=1.0)
+            elif deleted:
                 card["message_id"] = None
                 card["message_deleted"] = True
                 self._save()

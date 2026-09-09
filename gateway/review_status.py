@@ -195,9 +195,9 @@ class ReviewStatuses:
                 self._save()
                 await self._delete(item)
 
-    def _defer_delete(self, item, adapter):
+    def _defer_delete(self, item, adapter, minimum_delay=0):
         delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(item["source"]["chat_id"])
-        delay = max(delay if isinstance(delay, (int, float)) else 0, item.get("delete_retry_at", 0) - time.time())
+        delay = max(minimum_delay, delay if isinstance(delay, (int, float)) else 0, item.get("delete_retry_at", 0) - time.time())
         if delay <= 0:
             return False
         key = next((k for k, value in self.items.items() if value is item), None)
@@ -236,7 +236,16 @@ class ReviewStatuses:
             item["delete_attempts"] = item.get("delete_attempts", 0) + 1
             self._save()
             try:
-                if await adapter.delete_message(item["source"]["chat_id"], item["message_id"]):
+                status_delete = getattr(type(adapter), "_delete_status_message", None)
+                if status_delete is not None:
+                    deleted = await status_delete(adapter, item["source"]["chat_id"], item["message_id"])
+                else:
+                    deleted = await adapter.delete_message(item["source"]["chat_id"], item["message_id"])
+                if deleted is None and status_delete is not None:
+                    # Explicit proof the local gate issued no request, not an API failure.
+                    item["delete_attempts"] -= 1
+                    self._defer_delete(item, adapter, minimum_delay=1.0)
+                elif deleted:
                     item["message_id"] = None
                     self._save()
                 elif self._defer_delete(item, adapter):
