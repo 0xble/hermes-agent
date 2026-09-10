@@ -683,7 +683,12 @@ class ClientLifecycleMixin:
             env_url = get_env_prefer_dotenv(url_var).strip().rstrip("/") if url_var else ""
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
             base_url = env_url or default_base
-            if self.provider in ("kimi-coding", "zai"):
+            if self.provider == "actual":
+                from hermes_cli.auth import normalize_actual_base_url
+                from hermes_cli.runtime_provider import _config_base_url_for_provider, _get_model_config
+                configured_base = _config_base_url_for_provider(_get_model_config(), "actual")
+                base_url = normalize_actual_base_url(configured_base or base_url)
+            elif self.provider in ("kimi-coding", "zai"):
                 from hermes_cli import auth as _auth
                 resolver = _auth._resolve_kimi_base_url if self.provider == "kimi-coding" else _auth._resolve_zai_base_url
                 base_url = resolver(api_key, pconfig.inference_base_url, env_url).rstrip("/")
@@ -918,7 +923,10 @@ class ClientLifecycleMixin:
         if merged:
             self._client_kwargs["default_headers"] = merged
 
-    def _swap_credential(self, entry) -> None:
+    def _swap_credential(self, entry) -> bool:
+        """Adopt *entry* as the live credential. Returns False, changing nothing, when the entry's
+        route cannot serve this conversation's model (a conversation's model is never rewritten by a
+        rotation; the caller treats a refused swap as "no entry")."""
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         pin = getattr(self, "_delegation_runtime_pin", None)
@@ -927,10 +935,25 @@ class ClientLifecycleMixin:
             # Preserve the exact launch spelling, not only normalized endpoint identity.
             assert next_pin is not None
             runtime_base = next_pin.pinned_base_url_for(self)
+        from hermes_cli.providers import is_actual_route
+        actual_route = is_actual_route(getattr(self, "provider", ""), runtime_base)
+        if actual_route and pin is None:
+            # A frozen delegation route keeps its launch spelling; only unpinned routes are normalized.
+            from hermes_cli.auth import normalize_actual_base_url
+            runtime_base = normalize_actual_base_url(runtime_base)
+        stripped_base = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+        # Refuse BEFORE any state changes below: a refused swap must leave the agent exactly as it was.
+        from hermes_cli.anon_auth import route_can_serve_model
+        if not route_can_serve_model(getattr(self, "provider", None), stripped_base, getattr(self, "model", None)):
+            logger.info("Credential %s skipped: its route cannot serve model %s", getattr(entry, "id", "?"), self.model)
+            return False
+        if actual_route:
+            self.api_mode = "chat_completions"
+            if hasattr(self, "_transport_cache"):
+                self._transport_cache.clear()
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
-        stripped_base = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         # Rotation invalidates the per-request wire client too, not only the shared one rebuilt below.
         # Kept at the common boundary so every OpenAI-compatible provider gets the same treatment; the
         # helper no-ops for test doubles and transports with no request-client cache.
@@ -946,7 +969,7 @@ class ClientLifecycleMixin:
             self.api_key, self.base_url = runtime_key, runtime_base if pin is not None else stripped_base
             if next_pin is not None:
                 self._delegation_runtime_pin = next_pin
-            return
+            return True
         self.api_key, self.base_url = runtime_key, runtime_base if pin is not None else stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
@@ -955,6 +978,7 @@ class ClientLifecycleMixin:
         self._replace_primary_openai_client(reason="credential_rotation")
         if next_pin is not None:
             self._delegation_runtime_pin = next_pin
+        return True
 
     def _reapply_route_client_config(self, *, route_changed: bool) -> None:
         """Recompute route-derived client kwargs (TLS material, default headers) for ``self.base_url``.
