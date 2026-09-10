@@ -144,6 +144,33 @@ def _slot_problem(slot: Any) -> str | None:
     return None
 
 
+MAX_MOA_FALLBACKS = 4
+
+
+def _clean_fallback_models(raw: Any, primary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Strict, flat, ordered physical routes; never silently drop authority."""
+    if not isinstance(raw, list) or len(raw) > MAX_MOA_FALLBACKS:
+        raise ValueError("fallback_models must be a list of at most 4 model slots")
+    slots = []
+    seen = {(primary.get("provider"), primary.get("model"))}
+    for item in raw:
+        if not isinstance(item, dict) or set(item) - {"provider", "model", "reasoning_effort"}:
+            raise ValueError("fallback_models entries allow only provider, model, reasoning_effort")
+        if any(not isinstance(item.get(k), str) or not item[k].strip() for k in ("provider", "model")):
+            raise ValueError("fallback_models entries require provider and model strings")
+        if item["provider"].strip().lower() in {"auto", "moa"}:
+            raise ValueError("fallback_models require explicit physical providers")
+        if "reasoning_effort" in item and _clean_reasoning_effort(item["reasoning_effort"]) is None:
+            raise ValueError("fallback_models has invalid reasoning_effort")
+        slot = _clean_slot(item)
+        identity = (slot["provider"], slot["model"])
+        if identity in seen:
+            raise ValueError("fallback_models cannot repeat a provider/model route")
+        seen.add(identity)
+        slots.append(slot)
+    return slots
+
+
 def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] | None:
     # Any slot ``_slot_problem`` rejects is dropped, falling back to the preset's defaults.
     if _slot_problem(slot) is not None:
@@ -155,6 +182,8 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
 
     if include_enabled:
         clean["enabled"] = _coerce_bool(slot.get("enabled"), True)
+    if "fallback_models" in slot:
+        clean["fallback_models"] = _clean_fallback_models(slot["fallback_models"], clean)
     return clean
 
 
@@ -203,6 +232,12 @@ def validate_moa_payload(raw: Any) -> list[str]:
         if all(issue for _, issue in issues):
             problems.append(f"preset '{label}': needs at least one complete reference model")
 
+        for slot in [*refs, preset.get("aggregator")]:
+            if isinstance(slot, dict) and "fallback_models" in slot:
+                try:
+                    _clean_fallback_models(slot["fallback_models"], slot)
+                except ValueError as exc:
+                    problems.append(f"preset '{label}': {exc}")
         agg_issue = _slot_problem(preset.get("aggregator"))
         if agg_issue:
             problems.append(f"preset '{label}' aggregator: {agg_issue}")

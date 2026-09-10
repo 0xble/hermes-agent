@@ -142,6 +142,9 @@ def _resolve_preset_cached(preset_name: str) -> tuple[dict[str, Any], Any]:
     return preset, moa_raw
 
 
+from agent.moa_fallback import physical_slots, prefetched_stream, run_slot_chain
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenMoaPreset:
     """One launch's validated composite route plus runtime-only credentials."""
@@ -152,7 +155,7 @@ class FrozenMoaPreset:
 
     def metadata(self) -> dict[str, Any]:
         public = copy.deepcopy(self.preset)
-        for slot in [*(public.get("reference_models") or []), public.get("aggregator") or {}]:
+        for slot in physical_slots(public):
             slot.pop("_frozen_runtime", None)
         public = _nonsecret_moa_value(public)
         return {
@@ -186,7 +189,7 @@ def _moa_runtime_identity(runtime: dict[str, Any]) -> dict[str, Any]:
 
 def _freeze_moa_slot_runtime(slot: dict[str, Any], runtime: dict[str, Any]) -> None:
     """Attach the complete in-memory route and its persisted public identity."""
-    provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
+    provider, model = str(runtime.get("provider") or slot.get("provider") or ""), str(slot.get("model") or "")
     frozen = {key: copy.deepcopy(runtime[key]) for key in (
         "base_url", "api_key", "api_mode", "request_overrides"
     ) if runtime.get(key) is not None}
@@ -209,14 +212,15 @@ def restore_moa_preset(metadata: dict[str, Any]) -> FrozenMoaPreset:
     ).encode()).hexdigest()[:16]
     if public_fingerprint != metadata.get("preset_fingerprint"):
         raise ValueError("delegated MoA session snapshot fingerprint is invalid")
-    for index, slot in enumerate([*(preset.get("reference_models") or []), preset.get("aggregator") or {}]):
+    for index, slot in enumerate(physical_slots(preset)):
         if not isinstance(slot, dict):
             raise ValueError(f"delegated MoA session slot {index} is invalid")
         provider, model = str(slot.get("provider") or ""), str(slot.get("model") or "")
         runtime = resolve_runtime_provider(requested=provider, target_model=model)
-        if (runtime.get("provider"), runtime.get("model") or model) != (provider, model):
+        physical_provider = "custom" if provider.startswith("custom:") else provider
+        if (runtime.get("provider"), runtime.get("model") or model) != (physical_provider, model):
             raise ValueError(f"delegated MoA session slot {index} no longer resolves to its frozen route")
-        runtime = {**runtime, "provider": provider, "model": model}
+        runtime = {**runtime, "model": model}
         stored_identity = slot.get("runtime_identity")
         current_identity = _moa_runtime_identity(runtime)
         from tools.custom_subagents import _authority_mapping_matches
@@ -242,7 +246,7 @@ def snapshot_moa_preset(preset_name: str) -> FrozenMoaPreset:
 
     preset, raw = _resolve_preset_cached(preset_name)
     snapshot = copy.deepcopy(preset)
-    slots = [*(snapshot.get("reference_models") or []), snapshot.get("aggregator") or {}]
+    slots = physical_slots(snapshot)
     for index, slot in enumerate(slots):
         provider = str(slot.get("provider") or "").strip()
         model = str(slot.get("model") or "").strip()
@@ -250,7 +254,8 @@ def snapshot_moa_preset(preset_name: str) -> FrozenMoaPreset:
             raise ValueError(f"MoA preset {preset_name!r} has invalid physical slot {index}")
         runtime = resolve_runtime_provider(requested=provider, target_model=model)
         actual = (str(runtime.get("provider") or ""), str(runtime.get("model") or model))
-        if actual != (provider, model):
+        physical_provider = "custom" if provider.startswith("custom:") else provider
+        if actual != (physical_provider, model):
             raise ValueError(
                 f"MoA preset {preset_name!r} slot {index} resolved to a different route: {actual!r}"
             )
@@ -261,11 +266,11 @@ def snapshot_moa_preset(preset_name: str) -> FrozenMoaPreset:
         # the in-memory frozen launch; runtime_identity is the durable,
         # credential-free proof used to re-authorize a resumed council.
         _freeze_moa_slot_runtime(
-            slot, {**runtime, "provider": provider, "model": model}
+            slot, {**runtime, "model": model}
         )
     options = {"privacy_filter": (raw or {}).get("privacy_filter")}
     public = copy.deepcopy(snapshot)
-    for slot in [*(public.get("reference_models") or []), public.get("aggregator") or {}]:
+    for slot in physical_slots(public):
         slot.pop("_frozen_runtime", None)
     public = _nonsecret_moa_value(public)
     fingerprint = hashlib.sha256(json.dumps(
@@ -304,6 +309,7 @@ class _RefAccounting:
     model: str | None = None
     provider: str | None = None
     temperature: Any = None
+    rerouted: bool = False
 
 
 # Per-tool-result char budget for the advisory view: tool CALLS are kept in full,
@@ -386,7 +392,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     model = str(slot.get("model") or "").strip()
     frozen = slot.get("_frozen_runtime")
     if isinstance(frozen, dict):
-        if (frozen.get("provider"), frozen.get("model")) != (provider, model):
+        physical_provider = "custom" if provider.startswith("custom:") else provider
+        if (frozen.get("provider"), frozen.get("model")) != (physical_provider, model):
             raise RuntimeError("frozen MoA physical route identity changed")
         if any(not frozen.get(key) for key in ("base_url", "api_key", "api_mode")):
             raise RuntimeError("frozen MoA physical route is incomplete")
@@ -427,7 +434,7 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         rt = resolve_runtime_provider(requested=provider, target_model=model)
-        out.update({k: rt[k] for k in ("base_url", "api_key", "api_mode") if rt.get(k)})
+        out.update({k: rt[k] for k in ("provider", "base_url", "api_key", "api_mode") if rt.get(k)})
         overrides = rt.get("request_overrides")
         extra_body = overrides.get("extra_body") if isinstance(overrides, dict) else None
         if isinstance(extra_body, dict) and extra_body:
@@ -523,7 +530,20 @@ def _price_reference_response(
         return usage, None, None, None
 
 
-def _run_reference(
+def _run_reference(slot: dict[str, Any], ref_messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, str, Any]:
+    requested = _slot_label(slot)
+    try:
+        label, text, acct = run_slot_chain(slot, lambda candidate: _run_reference_candidate(candidate, ref_messages, **kwargs))
+        served = _slot_label({"provider": acct.provider, "model": acct.model})
+        acct.rerouted = (acct.provider, acct.model) != (slot.get("provider"), slot.get("model"))
+        return (f"{requested} -> {served}" if acct.rerouted else requested), text, acct
+    except Exception as exc:
+        note = f"[failed: {type(exc).__name__}]"
+        logger.warning("MoA reference %s failed (%s)", requested, type(exc).__name__)
+        return requested, note, _RefAccounting(CanonicalUsage(), output=note, model=slot.get("model"), provider=slot.get("provider"))
+
+
+def _run_reference_candidate(
     slot: dict[str, Any], ref_messages: list[dict[str, Any]], *, temperature: float | None = None,
     max_tokens: int | None = None, reference_timeout: float | None = None, context_length_cache: Any = None,
     cache_disabled: bool | None = None, cache_ttl: str | None = None,
@@ -531,8 +551,8 @@ def _run_reference(
     """Call one reference model; return ``(label, text, accounting)``. Never raises:
     a failed reference becomes a labelled ``[failed: …]`` note. Runs in a thread pool."""
     label = _slot_label(slot)
-    strict_route = isinstance(slot.get("_frozen_runtime"), dict)
-    runtime = _slot_runtime(slot)
+    strict_route = True
+    runtime = dict(_slot_runtime(slot))
     slot_max_tokens = slot.get("max_tokens")
     runtime_max_tokens = runtime.pop("max_tokens", None)
     # An explicit internal caller budget wins over a per-slot user setting: the caller
@@ -548,41 +568,40 @@ def _run_reference(
     trace_fields = {"model": slot.get("model"), "provider": runtime.get("provider") or slot.get("provider"), "temperature": temperature}
     # The advisory view already stripped the agent's system prompt; this is the only one.
     messages = [{"role": "system", "content": _REFERENCE_SYSTEM_PROMPT}, *ref_messages]
-    try:
-        # Trim to THIS model's window (advisors may be smaller than the aggregator); the
-        # advisory view is append-only across iterations, so cache_control lets
-        # iteration N+1 replay N's cached prefix.
-        # Reference models may have a smaller window than the aggregator (e.g. kimi-k2.7-code @ 262K
-        # advising a glm-5.2 @ 1M conversation); without this trim the provider returns a hard HTTP 400
-        # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
-        # advisory system prompt is prepended so its tokens count against the budget too.
-        trimmed = _trim_messages_for_reference(
-            messages, slot, runtime, reserve_output_tokens=effective_max_tokens, context_length_cache=context_length_cache,
-        )
-        trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
+    # Trim to THIS model's window (advisors may be smaller than the aggregator); the
+    # advisory view is append-only across iterations, so cache_control lets
+    # iteration N+1 replay N's cached prefix.
+    # Reference models may have a smaller window than the aggregator (e.g. kimi-k2.7-code @ 262K
+    # advising a glm-5.2 @ 1M conversation); without this trim the provider returns a hard HTTP 400
+    # which the except below silently converts to a [failed: …] note (issue #60345). Estimated AFTER the
+    # advisory system prompt is prepended so its tokens count against the budget too.
+    trimmed = _trim_messages_for_reference(
+        messages, slot, runtime, reserve_output_tokens=effective_max_tokens, context_length_cache=context_length_cache,
+    )
+    trimmed = _maybe_apply_moa_cache_control(trimmed, _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl)
 
-        # Copilot gates premium models on request attribution; MoA fan-out serves the
-        # user's current turn, so mirror the main agent's x-initiator header.
-        from agent.auxiliary_client import _normalize_aux_provider
-        is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
-        frozen_extra_body = runtime.pop("extra_body", None)
-        frozen_headers = runtime.pop("extra_headers", None)
-        response = call_llm(
-            task="moa_reference", messages=trimmed, temperature=temperature,
-            max_tokens=effective_max_tokens,
-            timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
-            extra_headers=_merge_slot_extra_body(
-                frozen_headers, {"x-initiator": "user"} if is_copilot else None
-            ),
-            extra_body=frozen_extra_body, strict_route=strict_route, **runtime,
-        )
-        output_text = _extract_text(response) or "(empty response)"
-        acct = _RefAccounting(*_price_reference_response(response, slot, runtime), messages=trimmed, output=output_text, **trace_fields)
-        return label, output_text, acct
-    except Exception as exc:
-        logger.warning("MoA reference model %s failed: %s", label, exc)
-        note = f"[failed: {exc}]"
-        return label, note, _RefAccounting(CanonicalUsage(), messages=messages, output=note, **trace_fields)
+    # Copilot gates premium models on request attribution; MoA fan-out serves the
+    # user's current turn, so mirror the main agent's x-initiator header.
+    from agent.auxiliary_client import _normalize_aux_provider
+    is_copilot = _normalize_aux_provider(str(runtime.get("provider") or "")) in ("copilot", "copilot-acp")
+    frozen_extra_body = runtime.pop("extra_body", None)
+    frozen_headers = runtime.pop("extra_headers", None)
+    route_info: dict[str, str] = {}
+    response = call_llm(
+        task="moa_reference", messages=trimmed, temperature=temperature,
+        max_tokens=effective_max_tokens,
+        timeout=reference_timeout, reasoning_config=_slot_reasoning_config(slot),
+        extra_headers=_merge_slot_extra_body(
+            frozen_headers, {"x-initiator": "user"} if is_copilot else None
+        ),
+        extra_body=frozen_extra_body, strict_route=strict_route, route_info=route_info, **runtime,
+    )
+    actual = {**slot, "provider": route_info.get("provider") or runtime.get("provider"),
+              "model": route_info.get("model") or runtime.get("model")}
+    trace_fields.update(provider=actual["provider"], model=actual["model"])
+    output_text = _extract_text(response) or "(empty response)"
+    acct = _RefAccounting(*_price_reference_response(response, actual, runtime), messages=trimmed, output=output_text, **trace_fields)
+    return label, output_text, acct
 
 
 # Output headroom reserved in the reference window when reference_max_tokens is unset.
@@ -958,7 +977,11 @@ def _guidance_inputs(
     successful = [o for o in reference_outputs if not _is_failed_reference(o[1])]
     failed_labels = [label for label, text, _acct in reference_outputs if _is_failed_reference(text)]
     agg_refs = _redact_reference_outputs(successful) if privacy_full else successful
-    return agg_refs, _degraded_notice(failed_labels, policy), bool(reference_outputs) and not successful
+    notice = _degraded_notice(failed_labels, policy)
+    rerouted = [label for label, _, acct in reference_outputs if isinstance(acct, _RefAccounting) and acct.rerouted]
+    if rerouted and policy != "silent":
+        notice += f"[Reference models rerouted: {', '.join(rerouted)}]"
+    return agg_refs, notice, bool(reference_outputs) and not successful
 
 
 def aggregate_moa_context(
@@ -1012,30 +1035,28 @@ def aggregate_moa_context(
         f"Reference responses:\n{joined}"
     )
 
-    agg_label = _slot_label(aggregator)
-    agg_runtime = _slot_runtime(aggregator)
     cache_disabled, cache_ttl = _agent_cache_opts(agent)
-    try:
-        # Same cache_control decoration as the advisor calls; this synthesis call is
-        # a third independent MoA call path that otherwise re-bills its full input.
-        agg_messages = _maybe_apply_moa_cache_control(
-            [{"role": "user", "content": synth_prompt}], _with_cache_disabled(agg_runtime, cache_disabled), cache_ttl=cache_ttl,
+    def synthesize(candidate):
+        runtime = dict(_slot_runtime(candidate))
+        messages = _maybe_apply_moa_cache_control(
+            [{"role": "user", "content": synth_prompt}], _with_cache_disabled(runtime, cache_disabled), cache_ttl=cache_ttl,
         )
-        synthesis = _extract_text(call_llm(
-            task="moa_aggregator", messages=agg_messages, temperature=aggregator_temperature,
-            reasoning_config=_aggregator_reasoning_config(aggregator), **agg_runtime,
-        ))
-    except Exception as exc:
-        logger.warning("MoA aggregator model %s failed: %s", agg_label, exc)
-        synthesis = ""
+        route_info: dict[str, str] = {}
+        response = call_llm(
+            task="moa_aggregator", messages=messages, temperature=aggregator_temperature,
+            reasoning_config=_aggregator_reasoning_config(candidate), strict_route=True,
+            route_info=route_info, **runtime,
+        )
+        return _slot_label({**candidate, **route_info}), _extract_text(response)
+    agg_label, synthesis = run_slot_chain(aggregator, synthesize)
 
     return (
         "[Mixture of Agents context — use this as private guidance for the "
         "normal Hermes agent loop. You may call tools, continue reasoning, or "
         "finish normally.]\n"
         f"Aggregator: {agg_label}\n"
-        f"References: {_slot_labels(reference_models)}\n\n"
-        f"{(synthesis or joined).strip()}"
+        f"References: {', '.join(label for label, _, _ in reference_outputs)}\n\n"
+        f"{synthesis.strip()}"
     )
 
 
@@ -1262,12 +1283,25 @@ class MoAChatCompletions:
         return agg_messages, tools
 
     def _call_prepared_aggregator(self, prepared: dict[str, Any], api_kwargs: dict[str, Any]) -> Any:
-        """Send an already prepared MoA aggregator request exactly once."""
+        """Retry only aggregation over the already-frozen reference guidance."""
+        requested = prepared["aggregator"]
+        self.requested_aggregator_slot = {key: requested.get(key) for key in ("provider", "model")}
+        response = run_slot_chain(requested, lambda candidate: self._call_aggregator_candidate(
+            {**prepared, "aggregator": candidate, "has_fallbacks": bool(requested.get("fallback_models"))}, api_kwargs,
+        ))
+        if self._pending_trace is not None:
+            self._pending_trace["requested_aggregator_slot"] = self.requested_aggregator_slot
+        if self.last_aggregator_slot and any(self.last_aggregator_slot.get(key) != requested.get(key) for key in ("provider", "model")):
+            self._emit("moa.aggregating", aggregator=f"{_slot_label(requested)} -> {_slot_label(self.last_aggregator_slot)}", ref_count=len(self._ref_cache_outputs))
+        return response
+
+    def _call_aggregator_candidate(self, prepared: dict[str, Any], api_kwargs: dict[str, Any]) -> Any:
+        """Send one physical aggregator request without implicit model substitution."""
         aggregator = prepared["aggregator"]
         if aggregator.get("provider") == "moa":
             raise RuntimeError("MoA aggregator cannot be another MoA preset")
-        strict_route = isinstance(aggregator.get("_frozen_runtime"), dict)
-        agg_runtime = _slot_runtime(aggregator)
+        strict_route = True
+        agg_runtime = dict(_slot_runtime(aggregator))
         agg_messages, tools = self._plan_aggregator_cache(
             prepared["messages"], api_kwargs.get("tools"), prepared.get("guidance"), agg_runtime
         )
@@ -1298,14 +1332,33 @@ class MoAChatCompletions:
             if api_kwargs.get("max_tokens") is not None
             else runtime_max_tokens
         )
+        route_info: dict[str, str] = {}
         agg_response = call_llm(
             task="moa_aggregator", messages=agg_messages, temperature=prepared["aggregator_temperature"],
             max_tokens=effective_max_tokens, tools=tools, extra_body=agg_extra_body,
             extra_headers=agg_extra_headers,
             reasoning_config=_aggregator_reasoning_config(aggregator),  # same policy as direct create()
-            strict_route=strict_route, **stream_kwargs, **agg_runtime,
+            strict_route=strict_route, route_info=route_info, **stream_kwargs, **agg_runtime,
         )
+        if stream and prepared.get("has_fallbacks") and not hasattr(agg_response, "choices"):
+            # Lazy transports can raise on the first read, not create(). Advance
+            # inside the candidate boundary, but never replay after emitted output.
+            iterator = iter(agg_response)
+            try:
+                first = next(iterator)
+            except StopIteration:
+                raise RuntimeError("MoA aggregator returned an empty stream") from None
+            except Exception:
+                close = getattr(agg_response, "close", None)
+                if close is not None:
+                    close()
+                raise
+            agg_response = prefetched_stream(first, iterator, agg_response)
+        self.last_aggregator_slot = {**aggregator, "provider": route_info.get("provider") or aggregator.get("provider"),
+                                     "model": route_info.get("model") or aggregator.get("model")}
         if trace is not None:
+            trace["aggregator_slot"] = self.last_aggregator_slot
+            trace["aggregator_label"] = _slot_label(self.last_aggregator_slot)
             # Streaming output lands as the turn's assistant message; the trace marks it.
             trace["aggregator_streamed"] = stream
             output = None

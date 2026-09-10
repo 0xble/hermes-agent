@@ -86,7 +86,8 @@ def test_run_reference_passes_slot_extra_body(monkeypatch):
         [{"role": "user", "content": "hello"}],
     )
 
-    assert label == "dashscope:qwen3.7-max"
+    assert label == "dashscope:qwen3.7-max -> custom:qwen3.7-max"
+    assert _usage.provider == "custom"
     assert text == "advisor"
     assert captured["extra_body"] == {"enable_thinking": False}
 
