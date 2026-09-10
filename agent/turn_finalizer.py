@@ -582,7 +582,8 @@ def _apply_output_hooks(
     except Exception as exc:
         logger.warning("transform_llm_output hook failed: %s", exc)
 
-    if not interrupted:
+    # Detached forks are internal work and must not publish turns under the parent's session ID.
+    if not interrupted and not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
             "post_llm_call", logger,
             session_id=agent.session_id,
@@ -867,18 +868,19 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    _invoke_hook_safely(
-        "on_session_end", logger,
-        session_id=agent.session_id,
-        task_id=effective_task_id,
-        turn_id=turn_id,
-        completed=completed,
-        failed=failed,
-        interrupted=interrupted,
-        turn_exit_reason=_turn_exit_reason,
-        model=agent.model,
-        platform=_platform,
-    )
+    if not getattr(agent, "_persist_disabled", False):
+        _invoke_hook_safely(
+            "on_session_end", logger,
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            model=agent.model,
+            platform=_platform,
+        )
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

@@ -1424,10 +1424,10 @@ _DESCRIPTION_HEAD = (
     "(limit in the tasks description).\n\n"
     # Kept compact deliberately: the fork's HERMES-108 role guidance lives in _DESCRIPTION_TAIL and the
     # whole description is capped (tests/tools/test_delegate.py).
-    "Runs in the background: dispatch returns transcript paths at once; results re-enter as a message when "
-    "subagents finish ({delivery}), only BETWEEN your turns — do unrelated work, give a one-line status, "
-    "END YOUR TURN. Never wait or poll on transcripts, files, or CI. `action` (list/steer/stop) controls "
-    "running children — steer when a transcript shows one drifting.\n\n"
+    "Runs in the background (one-shot CLI/cron return results inline): dispatch returns transcript "
+    "paths at once; results re-enter as a message when subagents finish ({delivery}), only BETWEEN "
+    "your turns — do unrelated work, give a one-line status, END YOUR TURN. Never wait or poll on "
+    "transcripts, files, or CI. `action` (list/steer/stop) steers or stops a drifter.\n\n"
     "USE FOR: reasoning-heavy subtasks, work that would flood your context with intermediate data, or independent "
     "parallel workstreams.\n"
     "DO NOT USE FOR (use these instead):\n"
