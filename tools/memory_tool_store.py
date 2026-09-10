@@ -231,7 +231,37 @@ class MemoryStore:
         return self._consolidation_failure(
             _error(message + " No operations were applied (batch is all-or-nothing).", usage=self._usage(target)))
 
-    def _mutate(self, target: str, mutate, *, skip_drift: bool = False) -> Dict[str, Any]:
+    def _archive_evicted(self, target: str, evicted: List[Tuple[str, str]]) -> Tuple[
+            List[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Archive evicted entries before the main memory rewrite, fail-closed."""
+        from tools import memory_tool as _mt
+        if not evicted or not _mt._should_archive_target(target):
+            return [], None, None
+        records, error = _mt.archive_entries(target, evicted)
+        if error is None:
+            return [{"file": _mt.ARCHIVE_FILENAME, **record} for record in records], None, None
+        return [], "abort", error
+
+    def _preservation_failure(self, target: str, error: str,
+                              proposal: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Refuse an unpreserved mutation and stage it for explicit approval."""
+        message = (f"Archive write failed ({error}); the mutation was refused so the original "
+                   "store remains unchanged. Nothing was changed; retry or approve the staged proposal.")
+        try:
+            from tools import write_approval as wa
+            record = wa.stage_write(
+                wa.MEMORY, proposal or {},
+                summary=f"preservation failure for {proposal.get('action', 'memory') if proposal else 'memory'} on {target}",
+                origin=wa.current_origin())
+            return self._consolidation_failure(_error(
+                message + " A proposal was staged for approval.", proposal_staged=True,
+                pending_id=record["id"], current_entries=self._entries_for(target), usage=self._usage(target)))
+        except Exception:
+            logger.warning("Failed to stage preservation-failure proposal; refusing mutation", exc_info=True)
+            return self._failure_with_entries(target, message + " Proposal staging also failed; retry later.")
+
+    def _mutate(self, target: str, mutate, *, skip_drift: bool = False,
+                proposal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Lock, re-read from disk, run ``mutate(entries, limit)`` -> ``(new_entries, message)``
         or an error dict, then persist and return the success response. The reload aborts
         on an existing-but-unreadable file (even append-only ``add`` rewrites the whole
@@ -252,13 +282,20 @@ class MemoryStore:
             result = mutate(self._entries_for(target), self._char_limit(target))
             if isinstance(result, dict):
                 return result
-            self._set_entries(target, result[0])
+            new_entries, message, *rest = result
+            extra_fields = dict(rest[0]) if rest and isinstance(rest[0], dict) else {}
+            evicted = extra_fields.pop("_evicted", [])
+            archived, archive_status, archive_error = self._archive_evicted(target, evicted)
+            if archive_status == "abort":
+                return self._preservation_failure(target, archive_error or "unknown error", proposal)
+            self._set_entries(target, new_entries)
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
-            self._write_file(path, result[0])
-            extra_fields = result[2] if len(result) > 2 else {}
-            return self._success_response(target, result[1], **extra_fields)
+            self._write_file(path, new_entries)
+            if archived:
+                extra_fields["archived"] = archived
+            return self._success_response(target, message, **extra_fields)
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
@@ -312,21 +349,24 @@ class MemoryStore:
                 return self._consolidation_failure(_error(
                     f"No entry matched '{old_text}'. Check current_entries below and retry with the exact text "
                     f"of the entry you want to {'replace' if new_content else 'remove'}.", current_entries=entries))
+            evicted = [("removed" if new_content is None else "superseded", entries[idx])]
             replaced = entries[:idx] + ([] if new_content is None else [new_content]) + entries[idx + 1:]
             if new_content is None:
-                return replaced, "Entry removed.", {"removed_entry": entries[idx]}
+                return replaced, "Entry removed.", {"removed_entry": entries[idx], "_evicted": evicted}
             new_total = len(ENTRY_DELIMITER.join(replaced))
             if new_total > limit:
                 return self._failure_with_entries(target, (
                     f"Replacement would put memory at {new_total:,}/{limit:,} chars. Shorten the new content, "
                     f"or 'remove' other stale or less important entries to make room (see current_entries "
                     f"below), then retry — all in this turn."))
-            return replaced, "Entry replaced.", {"replaced_entry": entries[idx]}
-        return self._mutate(target, _apply)
+            return replaced, "Entry replaced.", {"replaced_entry": entries[idx], "_evicted": evicted}
+        return self._mutate(target, _apply, proposal={
+            "action": "replace" if new_content is not None else "remove",
+            "target": target, "content": new_content, "old_text": old_text})
 
     @staticmethod
     def _apply_batch_op(working: List[str], act: str, content: str, old_text: str,
-                        pos: str) -> Tuple[Optional[str], Optional[str]]:
+                        pos: str, evicted: List[Tuple[str, str]]) -> Tuple[Optional[str], Optional[str]]:
         """Apply one batch op to *working*; return ``(error message, previous content)``.
         Previous content is captured before each replace/remove, under the store lock.
         It is published only after the entire batch has been validated and persisted.
@@ -349,6 +389,7 @@ class MemoryStore:
         if idx is None:
             return f"{pos}: no entry matched '{old_text}'.", None
         previous_content = working[idx]
+        evicted.append(("superseded" if act == "replace" else "removed", previous_content))
         working[idx:idx + 1] = [content] if act == "replace" else []
         return None, previous_content
 
@@ -368,13 +409,14 @@ class MemoryStore:
 
         def _apply(entries, limit):
             working = list(entries)  # only committed if the whole batch validates
+            evicted: List[Tuple[str, str]] = []
             replaced = {}  # op index -> full entry text its replace overwrote (#117952)
             removed = {}
             for i, op in enumerate(ops):
                 act = op.get("action")
                 msg, previous_content = self._apply_batch_op(
                     working, act, (op.get("content") or op.get("new_text") or "").strip(),
-                    (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})")
+                    (op.get("old_text") or "").strip(), f"Operation {i + 1} ({act or 'unknown'})", evicted)
                 if msg:
                     return self._batch_failure(target, msg)
                 if previous_content is not None:
@@ -400,8 +442,10 @@ class MemoryStore:
             replaced_fields = {"replaced_entries": replaced} if replaced else {}
             if removed:
                 replaced_fields["removed_entries"] = removed
+            replaced_fields["_evicted"] = evicted
             return working, f"Applied {len(operations)} operation(s).", replaced_fields
-        return self._mutate(target, _apply)
+        return self._mutate(target, _apply, proposal={"action": "batch", "target": target,
+                                                       "operations": operations})
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """Frozen load-time snapshot (NOT live state — mid-session writes don't touch
