@@ -38,7 +38,7 @@ class SubagentDefinition:
     reasoning_effort: str | None = None
     inherit_parent: bool = False
     moa_presets: tuple[str, ...] | None = None
-    fallbacks: tuple[FallbackDefinition, ...] = ()
+    fallbacks: tuple[FallbackDefinition, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,9 +395,12 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
 
 
 def freeze_fallback_routes(
-    definition: SubagentDefinition, *, primary_provider: str, primary_model: str,
+    definition: SubagentDefinition, *, primary_provider: str, primary_model: str, parent=None,
 ) -> tuple[ResolvedRoute, ...]:
     """Authorize and freeze every optional route before a child can spawn."""
+    if definition.inherit_parent and definition.fallbacks is None and parent is not None:
+        from tools.custom_subagent_fallbacks import freeze_parent_fallback_routes
+        return freeze_parent_fallback_routes(parent, primary_provider, primary_model)
     if not definition.fallbacks:
         return ()
     from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -413,39 +416,50 @@ def freeze_fallback_routes(
             raise ValueError(
                 f"subagent_type {definition.name!r}: fallback {index} cannot be authorized: {exc}"
             ) from exc
-        provider = str(runtime.get("provider") or route.provider).strip()
-        model = str(runtime.get("model") or route.model).strip()
-        base_url = str(runtime.get("base_url") or "").rstrip("/")
-        api_mode = str(runtime.get("api_mode") or "").strip()
-        api_key = runtime.get("api_key")
-        if not provider or not model or not base_url or not api_mode or not api_key:
-            raise ValueError(
-                f"subagent_type {definition.name!r}: fallback {index} resolved an incomplete runtime route"
-            )
-        unsupported = pinning_support_error(provider, api_mode)
-        if unsupported:
-            raise ValueError(f"subagent_type {definition.name!r}: fallback {index}: {unsupported}")
-        if route.reasoning_effort is not None:
-            from agent.reasoning_effort import transport_supported_reasoning_efforts
-            supported = transport_supported_reasoning_efforts(provider, model, api_mode)
-            if not supported or route.reasoning_effort not in supported:
-                raise ValueError(
-                    f"subagent_type {definition.name!r}: fallback {index} reasoning_effort "
-                    f"{route.reasoning_effort!r} unsupported by {provider}/{model}"
-                )
-        pool = runtime.get("credential_pool")
-        credential_id = None
-        if pool is not None and callable(getattr(pool, "entry_id_for_api_key", None)):
-            credential_id = pool.entry_id_for_api_key(str(api_key))
-        frozen.append(ResolvedRoute(
-            provider, model, base_url, api_mode, route.reasoning_effort,
-            str(api_key), hashlib.sha256(str(api_key).encode()).hexdigest(),
-            json.dumps(runtime.get("request_overrides") or {}, sort_keys=True,
-                       separators=(",", ":"), default=str),
-            pool, credential_id,
+        frozen.append(_freeze_fallback_runtime(
+            runtime, route, f"subagent_type {definition.name!r}: fallback {index}"
         ))
         seen.add((route.provider, route.model))
     return tuple(frozen)
+
+
+def _freeze_fallback_runtime(runtime, route, label):
+    provider = str(runtime.get("provider") or route.provider).strip()
+    model = str(runtime.get("model") or route.model).strip()
+    base_url = str(runtime.get("base_url") or "").rstrip("/")
+    api_mode = str(runtime.get("api_mode") or "").strip()
+    api_key = runtime.get("api_key")
+    if not provider or not model or not base_url or not api_mode or not api_key:
+        raise ValueError(
+            f"{label} resolved an incomplete runtime route"
+        )
+    unsupported = pinning_support_error(provider, api_mode)
+    if unsupported:
+        raise ValueError(f"{label}: {unsupported}")
+    if route.reasoning_effort is not None:
+        from agent.reasoning_effort import transport_supported_reasoning_efforts
+        supported = transport_supported_reasoning_efforts(provider, model, api_mode)
+        if not supported or route.reasoning_effort not in supported:
+            raise ValueError(
+                f"{label} reasoning_effort "
+                f"{route.reasoning_effort!r} unsupported by {provider}/{model}"
+            )
+    from agent.auxiliary_client import _endpoint_default_headers
+    from tools.delegate_tool_config import _merge_request_overrides
+    headers = _endpoint_default_headers(base_url, provider, xai=True) or {}
+    overrides = _merge_request_overrides(
+        {"extra_headers": headers} if headers else {}, runtime.get("request_overrides"))
+    pool = runtime.get("credential_pool")
+    credential_id = None
+    if pool is not None and callable(getattr(pool, "entry_id_for_api_key", None)):
+        credential_id = pool.entry_id_for_api_key(str(api_key))
+    return ResolvedRoute(
+        provider, model, base_url, api_mode, route.reasoning_effort,
+        str(api_key), hashlib.sha256(str(api_key).encode()).hexdigest(),
+        json.dumps(overrides or {}, sort_keys=True,
+                   separators=(",", ":"), default=str),
+        pool, credential_id,
+    )
 
 
 def inherited_credential_pool(child, parent, defaults):

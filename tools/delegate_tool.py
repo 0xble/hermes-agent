@@ -877,7 +877,7 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
             task_creds, reasoning = resolve_named_credentials(definition, cfg, parent_agent)
             snapshot = task_creds.pop("moa_snapshot", None)
             fallback_routes = freeze_fallback_routes(
-                definition,
+                definition, parent=parent_agent,
                 primary_provider=str(task_creds.get("provider") or getattr(parent_agent, "provider", "")),
                 primary_model=str(task_creds.get("model") or getattr(parent_agent, "model", "")),
             ) if definition.provider != "moa" else ()

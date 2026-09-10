@@ -371,11 +371,18 @@ def _text_to_speech_single(
     except FileNotFoundError as e:
         return _tool_failure("TTS dependency missing", provider, e)
     except Exception as e:
-        return _tool_failure("TTS generation failed", provider, e)
+        from tools.tts_tool_fallback import is_availability_failure
+        result = json.loads(_tool_failure("TTS generation failed", provider, e))
+        result["fallback_eligible"] = is_availability_failure(e)
+        return json.dumps(result)
 
 
 class _ChunkFailed(Exception):
-    """One chunk's synthesis returned an error envelope; message is the final tool error text."""
+    """One chunk failed; preserve typed routing eligibility, never parse error prose."""
+
+    def __init__(self, message, *, fallback_eligible=False):
+        super().__init__(message)
+        self.fallback_eligible = fallback_eligible
 
 
 def _synthesize_chunks(chunks: List[str], base_path: Path, generated_artifacts: set, **single_kwargs) -> tuple:
@@ -398,7 +405,8 @@ def _synthesize_chunks(chunks: List[str], base_path: Path, generated_artifacts: 
             raise RuntimeError(f"TTS chunk {index} returned invalid JSON: {str(raw_result)[:200]}")
         if not chunk_result.get("success"):
             error_msg = chunk_result.get("error", "unknown error")
-            raise _ChunkFailed(f"TTS chunk {index} failed ({provider}): {error_msg}")
+            raise _ChunkFailed(f"TTS chunk {index} failed ({provider}): {error_msg}",
+                               fallback_eligible=chunk_result.get("fallback_eligible") is True)
         actual_path = str(chunk_result.get("file_path") or chunk_path)
         if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
             raise RuntimeError(f"TTS chunk {index} produced no final audio: {actual_path}")
@@ -425,7 +433,38 @@ def text_to_speech_tool(
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
+    explicit_override = provider is not None
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
+    from tools.tts_tool_fallback import provider_chain
+    try:
+        chain = provider_chain(tts_config, provider, explicit_override=explicit_override)
+    except ValueError as exc:
+        return _tool_failure("TTS configuration error", provider, exc)
+    attempted = []
+    for selected in chain:
+        attempted.append(selected)
+        try:
+            # Only an opted-in chain needs preflight. Legacy single-provider
+            # behavior, including its detailed dependency diagnostics, is unchanged.
+            if len(chain) > 1 and not _check_provider_requirements(selected, tts_config):
+                result = {"success": False, "error": f"TTS provider unavailable: {selected}",
+                          "fallback_eligible": True}
+            else:
+                result = json.loads(_synthesize_with_provider(
+                    text, output_path, instructions, tts_config, selected))
+        except ValueError as exc:
+            return _tool_failure("TTS configuration error", selected, exc)
+        if result.get("success") or not result.get("fallback_eligible"):
+            break
+    if len(attempted) > 1:
+        result["attempted_providers"] = attempted
+        if result.get("success"):
+            result["fallback_from"] = provider
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _synthesize_with_provider(text, output_path, instructions, tts_config, provider):
+    """One entire utterance; failed attempt artifacts are swept before fallback."""
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
     chunks = _split_text_for_tts(text, max_len)
@@ -464,7 +503,7 @@ def text_to_speech_tool(
                 "target_file_bytes": delivery_profile.target_file_bytes},
         }, ensure_ascii=False)
     except _ChunkFailed as exc:
-        return tool_error(str(exc), success=False)
+        return tool_error(str(exc), success=False, fallback_eligible=exc.fallback_eligible)
     except ValueError as exc:
         return _tool_failure("TTS delivery error", provider, exc)
     except Exception as exc:
@@ -509,14 +548,22 @@ _BUILTIN_REQUIREMENTS: Dict[str, Callable[[], bool]] = {
     "piper": lambda: _check_piper_available()}
 
 
-def check_tts_requirements() -> bool:
-    """Return whether the explicitly resolved TTS provider can run."""
-    tts_config = _load_tts_config()
-    provider = _get_provider(tts_config)
+def _check_provider_requirements(provider, tts_config) -> bool:
     if _resolve_command_provider_config(provider, tts_config) is not None:
         return True
     check = _BUILTIN_REQUIREMENTS.get(provider)
     return check() if check is not None else _plugin_provider_is_available(provider)
+
+
+def check_tts_requirements() -> bool:
+    """Advertise the tool when an authorized provider in its chain can run."""
+    from tools.tts_tool_fallback import provider_chain
+    config = _load_tts_config()
+    try:
+        chain = provider_chain(config, _get_provider(config))
+        return any(_check_provider_requirements(provider, config) for provider in chain)
+    except ValueError:
+        return False
 
 
 # --- Registry ---

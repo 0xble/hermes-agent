@@ -68,18 +68,17 @@ def test_named_codex_fallback_activates_and_builds_pinned_request(make_child):
 def test_named_fallback_rejects_changed_authority(make_child, monkeypatch, field, value):
     child, route = advisor(make_child)
     if field == "client_base_url":
-        from agent import auxiliary_client
-        resolve = auxiliary_client.resolve_provider_client
+        from tools import custom_subagent_fallbacks
+        resolve = custom_subagent_fallbacks.frozen_fallback_client
 
         def changed_client(*args, **kwargs):
-            client, model = resolve(*args, **kwargs)
-            assert client is not None
+            client = resolve(*args, **kwargs)
             client.base_url = value
-            return client, model
+            return client
 
-        monkeypatch.setattr(auxiliary_client, "resolve_provider_client", changed_client)
+        monkeypatch.setattr(custom_subagent_fallbacks, "frozen_fallback_client", changed_client)
     elif field == "api_key":
-        monkeypatch.setattr("agent.auxiliary_client._read_codex_access_token", lambda: value)
+        child._fallback_chain[0][field] = value
     else:
         child._fallback_chain[0][field] = value
     assert not child._try_activate_fallback()

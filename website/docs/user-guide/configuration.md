@@ -1913,6 +1913,17 @@ Legitimately slow work is not penalized: streaming responses, tool heartbeats (e
 
 ## TTS Configuration
 
+`tts.fallback_providers` is an opt-in ordered list (default `[]`). For example,
+with `tts.provider: elevenlabs`, set `tts.fallback_providers: [edge]` after choosing
+the desired voices. Missing credentials/dependencies, network timeouts, HTTP 408,
+429, and 5xx can try the next provider. Invalid input, authentication rejection,
+configuration errors, and local delivery failures do not change providers.
+The entire normalized utterance is retried; partial audio is discarded, never
+mixed across voices. A successful fallback reports `provider`, `fallback_from`,
+and `attempted_providers`. An explicit per-call provider override is single-route.
+Each fallback uses its own voice and chunk limit; configuring a fallback does not
+select or authorize a different primary voice.
+
 ```yaml
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "neutts" | "kittentts" | "piper" | "deepinfra"

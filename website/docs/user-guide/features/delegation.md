@@ -126,8 +126,11 @@ with the correct name suggested.
 
 `description` and `instructions` are required. `provider`, `model`, and
 `reasoning_effort` are optional. Set `inherit_parent: true` to make the primary
-route exactly the parent's resolved route; it may still declare an ordered
-`fallbacks` list. An explicit provider requires an explicit model. Names use
+route exactly the parent's resolved route. If `fallbacks` is omitted, it also
+inherits the parent's remaining authorized fallback chain, frozen at launch
+(including credentials, endpoint, request headers, and reasoning effort). A named
+parent passes its already-frozen authority without re-resolving current config.
+An explicit `fallbacks: []` disables inheritance; a nonempty list replaces it. An explicit provider requires an explicit model. Names use
 lowercase letters, digits, underscores, and hyphens, starting with a letter.
 Unknown names, malformed definitions, unknown fields, and unsupported explicit
 efforts fail before any member of the batch starts, naming the specific invalid
