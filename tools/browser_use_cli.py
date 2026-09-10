@@ -915,6 +915,23 @@ def _resolve_real_profile_cdp(
     return None
 
 
+def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
+    """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault_fill`` has
+    a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
+    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
+    cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    if not cdp:
+        return
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        from tools.browser_tool_cdp import _get_dialog_policy_config, _resolve_cdp_override
+        policy, timeout_s = _get_dialog_policy_config()
+        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=_resolve_cdp_override(cdp),
+                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
+    except Exception as exc:
+        logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+
+
 def _route_backend(
     env: dict,
     session: str,
@@ -1139,6 +1156,10 @@ def _browser_exec(
     )
     if backend_err:
         return tool_error(backend_err)
+    # The vault supervisor needs a secret-capable WebSocket into the SAME browser
+    # this exec drives, so it attaches AFTER routing has published BU_CDP_*. The fork inlines
+    # what upstream factored into _route_backend, so the call lands here rather than inside it.
+    _attach_vault_supervisor(env, task_id)
 
     # Bind only after routing succeeds. A failed cloud/CDP/consent preflight
     # must not poison the user-visible session name for a later valid retry.
@@ -1275,8 +1296,8 @@ _HELPERS_DIGEST = (
     "capture_screenshot() saves and prints a screenshot path, cdp('Domain.method', **kwargs) is raw CDP — "
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's role/name/backendDOMNodeId (filter "
     "in Python before printing; it is thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) "
-    "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: stop and "
-    "ask the user; never guess credentials."
+    "gives click coordinates. ensure_real_tab() recovers from a stale/internal tab. Login walls: never guess "
+    "credentials; see the vault note below if present, otherwise stop and ask the user."
 )
 
 
