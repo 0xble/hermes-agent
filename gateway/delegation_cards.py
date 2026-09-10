@@ -45,9 +45,9 @@ def _row_identity(task_key, ref):
 
 def _row_prefix(depth):
     # Telegram's MarkdownV2 client collapses leading ASCII spaces in ordinary
-    # rich-text paragraphs.  NBSP stays plain text while retaining one visible
-    # indentation unit per displayed delegation layer.
-    return "\u00a0" * min(max(0, depth), 2)
+    # rich-text paragraphs. NBSP stays plain text; four per rendered depth
+    # makes the existing maximum of three visible layers scannable.
+    return "\u00a0" * (4 * min(max(0, depth), 2))
 
 
 def render_card(card, now=None):
