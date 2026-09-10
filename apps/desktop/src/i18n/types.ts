@@ -2083,6 +2083,7 @@ export interface Translations {
     noSessions: string
     noFilterMatches: string
     projects: {
+      showAllSessions: string
       sectionLabel: string
       home: string
       autoDiscovered: string
