@@ -51,9 +51,8 @@ def _row_prefix(depth):
 
 
 def render_card(card, now=None):
-    elapsed = max(0, int(((time.time() if now is None else now) - card["started_at"]) / 60))
     # Plain rich text: cards must never render as a native quote or fake border.
-    lines = [f"🧵 **Delegating · {elapsed} min**"]
+    lines = ["🧵 **Delegating tasks**"]
     rows = card["rows"]
     identities = set(rows)
     children = {}

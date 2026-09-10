@@ -25,7 +25,8 @@ def test_render_card_is_plain_rich_text_with_task_first_rows():
     rendered = render_card(card, now=0)
 
     lines = rendered.splitlines()
-    assert lines[0] == "🧵 **Delegating · 0 min**"
+    assert lines[0] == "🧵 **Delegating tasks**"
+    assert render_card(card, now=3600).splitlines()[0] == "🧵 **Delegating tasks**"
     assert lines[1] == "A. Repair restart receipt · Lead"
     assert lines[2] == f"↳ {get_tool_emoji('read_file')} read_file"
     assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
@@ -44,7 +45,7 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    content = ("🧵 **Delegating · 0 min**\nA. Repair receipt · Worker\n↳ Started · awaiting activity\n"
+    content = ("🧵 **Delegating tasks**\nA. Repair receipt · Worker\n↳ Started · awaiting activity\n"
                "\u00a0A.1. Verify card edit · Explorer\n\u00a0↳ ⚡ terminal")
 
     sent = await adapter.send_delegation_card(source, content)
@@ -55,7 +56,7 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     edit_kwargs = adapter._bot.edit_message_text.call_args.kwargs
     assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
     sent_lines = send_kwargs["text"].splitlines()
-    assert sent_lines[0].startswith("🧵 *Delegating · 0 min*")
+    assert sent_lines[0] == "🧵 *Delegating tasks*"
     assert sent_lines[1] == "A\\. Repair receipt · Worker"
     assert sent_lines[3] == "\u00a0A\\.1\\. Verify card edit · Explorer"
     assert sent_lines[4] == "\u00a0↳ ⚡ terminal"
@@ -168,7 +169,7 @@ async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layou
 
     rendered = adapter.send_delegation_card.call_args.args[1]
     lines = rendered.splitlines()
-    assert lines[0] == "🧵 **Delegating · 0 min**"
+    assert lines[0] == "🧵 **Delegating tasks**"
     assert "A. Check Telegram edits · Worker" in lines
     assert "\u00a0A.1. Verify card edit · Worker" in lines
     assert "\u00a0\u00a0A.1.1. Check Telegram edits · Worker" in lines
@@ -292,7 +293,7 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert adapter.send_delegation_card.await_count == 1
-    assert adapter.send_delegation_card.call_args.args[1].startswith("🧵 **Delegating · ")
+    assert adapter.send_delegation_card.call_args.args[1].startswith("🧵 **Delegating tasks**")
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
