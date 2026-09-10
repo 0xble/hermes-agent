@@ -1,6 +1,7 @@
 """Event-driven replacement of one delegation presentation, never a heartbeat."""
 from __future__ import annotations
 
+import asyncio
 import time
 
 from gateway import delegation_card_presentation as presentation
@@ -46,40 +47,122 @@ def eligible(manager, key):
             and any(r.get("state") == "running" for r in manager._projection(key)["rows"].values()))
 
 
+def pending(card):
+    return (card.get("reanchor") or {}).get("order") == "delete_first"
+
+
 def adopt_receipt(manager, card):
     receipt = card.get("reanchor") or {}
     if (receipt.get("state") != "sent" or card.get("message_deleted")
             or card.get("consolidated_message_id")
             or card.get("message_id") == receipt.get("new_message_id")):
         return
-    # The new transport receipt was persisted before changing the active anchor.
-    card["obsolete_message_id"] = receipt["old_message_id"]
+    # Legacy send-first receipts still need exact-old cleanup. Never reinterpret
+    # their attempting state as proof that either transport is absent.
+    if receipt.get("order") != "delete_first":
+        card["obsolete_message_id"] = receipt["old_message_id"]
     card["message_id"] = receipt["new_message_id"]
     card["rendered"] = receipt["rendered"]
     card["anchored_at"] = receipt["sent_at"]
     card["delete_attempts"] = 0
     card.pop("message_deleted", None)
+    if pending(card):
+        card["last_reanchor"] = card.pop("reanchor")
     manager._save()
 
 
-async def replace(manager, key, adapter, source, text):
+async def replace(manager, key):
+    """Delete confirmed absent → fresh send; a gap is preferable to two cards.
+
+    Do not hold the lifecycle lock over transport waits: completion/handling must
+    remain observable while the shared outbound gate gives final replies priority.
+    The manager owns one flush per anchor, and bind preserves an in-flight anchor.
+    """
+    from gateway.delegation_cards import render_card
+
     card = manager.cards[key]
-    card["reanchor"] = {"state": "attempting", "old_message_id": card["message_id"]}
-    manager._save()  # An ambiguous send/crash must fence every subsequent replacement.
-    result = await adapter.send_delegation_card(source, text)
-    if getattr(result, "success", False) and getattr(result, "message_id", None):
-        card["reanchor"].update(state="sent", new_message_id=str(result.message_id),
-                                rendered=text, sent_at=time.time())
+    lock = manager.locks.setdefault(manager._scope(card), asyncio.Lock())
+    async with lock:
+        source = manager._source(card)
+        adapter = manager._adapter(card, source)
+        if adapter is None:
+            return
+        if not pending(card):
+            if not eligible(manager, key):
+                return
+            card["reanchor"] = dict(order="delete_first", state="delete_pending",
+                                    old_message_id=card["message_id"], delete_attempts=0, send_attempts=0)
+            manager._save()
+        receipt = card["reanchor"]
+        if receipt["state"] in {"delete_pending", "deleting"}:
+            if receipt["delete_attempts"] >= 3 or manager._defer_delete(card, adapter):
+                return
+            receipt["state"] = "deleting"
+            receipt["delete_attempts"] += 1
+            manager._save()  # write-ahead, including cancellation/crash uncertainty
+        elif receipt["state"] != "deleted":
+            return  # sending is ambiguous, including after restart: never resend
+
+    if receipt["state"] == "deleting":
+        status_delete = getattr(type(adapter), "_delete_status_message", None)
+        if status_delete is not None:
+            deleted = await status_delete(adapter, source.chat_id, receipt["old_message_id"])
+        else:
+            deleted = await adapter.delete_message(source.chat_id, receipt["old_message_id"])
+        async with lock:
+            if deleted is not True:
+                if deleted is None and status_delete is not None:
+                    receipt["delete_attempts"] -= 1
+                    receipt["state"] = "delete_pending"
+                    manager._defer_delete(card, adapter, minimum_delay=1.0)
+                elif receipt["delete_attempts"] < 3:
+                    manager._defer_delete(card, adapter)
+                manager._save()
+                return
+            receipt["state"] = "deleted"
+            card.update(message_id=None, message_deleted=True, rendered="", send_attempts=1)
+            manager.displacement.pop(key, None)
+            manager._save()
+
+    async with lock:
+        if receipt["send_attempts"] >= 3:
+            return
+        projection = manager._projection(key)
+        if not any(r.get("state") == "running" for r in projection["rows"].values()):
+            return  # terminal-only/handled during the gap must not resurrect a card
+        receipt["state"] = "sending"
+        receipt["send_attempts"] += 1
         manager._save()
-        adopt_receipt(manager, card)
-        manager.displacement.pop(key, None)
-    elif getattr(result, "retryable", False) and getattr(result, "retry_after", None) is not None:
-        card.pop("reanchor", None)  # Explicit scheduler/429 rejection, not ambiguity.
-        card["retry_at"] = time.time() + max(0.05, float(result.retry_after))
+
+    def latest():
+        # Called synchronously after the adapter's scheduler awaits, immediately
+        # before the Bot API. No lifecycle mutation can interleave with this check.
+        projection = manager._projection(key)
+        if not any(r.get("state") == "running" for r in projection["rows"].values()):
+            return None
+        receipt["rendered"] = render_card(projection)
         manager._save()
-    elif (getattr(result, "raw_response", None) or {}).get("definite_rejection"):
-        card.pop("reanchor", None)
-        manager.displacement.pop(key, None)  # A new displacement window may try again.
-        card["anchored_at"] = time.time()
-        manager._save()
-    return result
+        return receipt["rendered"]
+
+    result = await adapter.send_delegation_card(source, latest)
+    async with lock:
+        if getattr(result, "success", False) and getattr(result, "message_id", None):
+            receipt.update(state="sent", new_message_id=str(result.message_id), sent_at=time.time())
+            card.pop("message_deleted", None)
+            manager._save()
+            adopt_receipt(manager, card)
+            # A terminal/handled event may have arrived during the actual request.
+            # Reconcile that fresh state rather than overwrite it with sent text.
+            manager.cards[key]["revision"] = card.get("revision", 0) + 1
+        else:
+            raw = getattr(result, "raw_response", None) or {}
+            retry_after = getattr(result, "retry_after", None)
+            if raw.get("cancelled_before_send"):
+                receipt["state"] = "deleted"
+                receipt["send_attempts"] -= 1
+            elif raw.get("definite_rejection") or (getattr(result, "retryable", False) and retry_after is not None):
+                receipt["state"] = "deleted"
+                if receipt["send_attempts"] < 3:
+                    card["retry_at"] = time.time() + max(manager.interval, 1.0, float(retry_after or 0))
+            # Every other failure retains sending: a lost receipt fences resends.
+            manager._save()

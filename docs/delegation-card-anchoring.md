@@ -25,24 +25,32 @@ move for an idle or terminal-only card.
 
 ## Replace and recover
 
-Persist an `attempting` fence before the send. A successful returned new-message
-receipt is persisted as `sent` **before** adopting its ID. Only then does the old
-ID become `obsolete_message_id` for bounded cleanup. There is no second replacement
-while any member has outstanding old-message cleanup, or while send acceptance is
-ambiguous. Failed replacement never deletes the original.
+Delete the exact old ID **before** sending a replacement. Persist
+`delete_pending` → `deleting` before the delete request, `deleted` only after
+confirmed success or known absence, then `sending` before the send request.
+A short no-card gap is intentional; this is not atomic Telegram replacement.
+Failed or ambiguous deletion never authorizes a send. Idempotent exact-ID deletion
+may resume after restart, bounded to three issued attempts; scheduler deferrals
+do not consume an attempt and all retries honor the shared flood deadline.
 
-A definite scheduler/429 rejection may retry at the existing shared deadline.
-Ambiguous send/timeout/cancellation remains fenced across restart and needs exact
-operator reconciliation; Telegram supplies no idempotency key or read-history
-API, so no automatic retry can safely prove the absence of an unreturned message.
-A crash with a persisted successful receipt adopts that receipt without resending.
-Already-deleted current anchors are not resurrected on restart.
+Render from fresh task state after deletion and again synchronously after the
+send scheduler's waits, immediately before the Bot API request. The lifecycle
+lock is not held over replacement transport waits. If no row remains running,
+do not send. Completion/handling during the actual request is coalesced into a
+follow-up edit or cleanup without changing task states, refs or handling receipts.
 
-Old cleanup uses the same three-attempt budget and scheduler deferral distinction
-as normal cleanup. Exhaustion leaves the exact old ID visible in persisted state
-and blocks further moves, rather than accumulating copies. Final parent delivery
-continues to retire logical rows using exact receipt epochs/refs, then cleans both
-anchors. Late tool activity cannot revive a recovered unknown or retired row.
+After confirmed deletion, a definite scheduler/429/API rejection may retry at the
+shared deadline, up to three attempts. Ambiguous send, timeout or cancellation
+retains `sending` across restart and later tasks in the same topic: no blind
+resend. Telegram supplies neither an idempotency key nor a read-history API, so
+an unreturned message needs exact operator reconciliation. A durable successful
+`sent` receipt is adopted without resending. Existing send-first `attempting`
+records remain fenced; existing send-first `sent` records retain exact-old cleanup.
+The new phases must be reconciled before rolling back to a reader that lacks them.
+
+Restart marks unproven execution unknown; recovering a deleted phase alone does
+not infer active execution or resurrect a terminal-only card. A later genuinely
+running task may reuse a confirmed-empty topic anchor, but never an uncertain send.
 
 ## Audited legacy dismissal while the gateway is running
 
@@ -83,14 +91,8 @@ late callbacks and final cleanup. Reconciliation tests cover exact-target mismat
 concurrent unrelated work and replay. These tests are not a live Telegram receipt;
 report live initial/replacement IDs, old absence and final cleanup separately.
 
-### Coalescing follow-up review
+### Coalescing
 
-The first source review of `3bef972de81345467982fd129b42e209fa9afb9d` identified
-an early replacement return bypassing post-transport coalescing. The fix uses the
-same success/cleanup/coalescing tail as normal sends and edits, including an empty
-projection needing final cleanup. Regression callbacks arrive during both send
-and old-anchor delete, with and without parent final delivery; no later external
-event is supplied. Public lifecycle calls retain the shared lock, and a reentrant
-accepted-mutation probe independently verifies the coalescing invariant. Review
-confirmation is limited to this finding, the fix delta and its regressions; the
-unchanged anchoring/administrative boundary retains the preceding review evidence.
+Replacement yields the lifecycle lock while transport is pending. Tests use the
+public lifecycle methods during deletion, send acceptance and a final-priority
+scheduler wait, then assert the resulting card without a later external event.

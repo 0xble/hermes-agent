@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
 from gateway import delegation_card_anchor as anchor
 from gateway.config import Platform, PlatformConfig
@@ -158,53 +158,84 @@ async def test_displacement_is_real_topic_activity_with_live_rows_and_original_i
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["ambiguous", "cancel", "delete", "429", "receipt_restart"])
+@pytest.mark.parametrize("failure", ["normal", "ambiguous", "cancel", "delete", "delete_cancel",
+                                     "429", "delete_429", "not_found", "reject", "repeated_429"])
 async def test_replace_failure_restart_and_cleanup_cannot_accumulate_anchors(tmp_path, failure):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial = card["message_id"]
     original_send = adapter._bot.send_message.side_effect
     original_delete = adapter._bot.delete_message.side_effect
-    attempts = 0
-    entered, release = asyncio.Event(), asyncio.Event()
+    attempts = deletes = 0
+    entered = asyncio.Event()
+
+    def persisted():
+        return json.loads(manager.path.read_text(encoding="utf-8"))[data["parent_task_id"]]
 
     async def send(**kw):
         nonlocal attempts
         attempts += 1
-        if attempts == 1 and failure == "ambiguous":
+        assert initial not in live
+        assert persisted()["reanchor"]["state"] == "sending"
+        if failure == "ambiguous":
+            await original_send(**kw)  # accepted remotely, receipt lost
             raise TimedOut("ambiguous")
-        if attempts == 1 and failure == "429":
+        if failure == "repeated_429" or (attempts == 1 and failure == "429"):
             raise RetryAfter(0.01)
-        if attempts == 1 and failure == "cancel":
+        if attempts == 1 and failure == "reject":
+            raise Forbidden("definitely rejected")
+        if failure == "cancel":
+            await original_send(**kw)  # cancellation after acceptance also fences
             entered.set()
-            await release.wait()
-        return await original_send(**kw)
+            await asyncio.Event().wait()
+        result = await original_send(**kw)
+        assert len(live) <= 1
+        return result
+
+    async def delete(**kw):
+        nonlocal deletes
+        deletes += 1
+        assert persisted()["reanchor"]["state"] == "deleting"
+        if failure == "delete":
+            raise TimedOut("deletion unknown")
+        if failure == "delete_cancel":
+            await original_delete(**kw)
+            entered.set()
+            await asyncio.Event().wait()
+        if deletes == 1 and failure == "delete_429":
+            raise RetryAfter(0.01)
+        if failure == "not_found":
+            live.pop(initial, None)
+            raise BadRequest("Message to delete not found")
+        result = await original_delete(**kw)
+        assert len(live) <= 1
+        return result
 
     adapter._bot.send_message.side_effect = send
-    if failure in {"delete", "receipt_restart"}:
-        adapter._bot.delete_message.side_effect = RuntimeError("delete unavailable")
+    adapter._bot.delete_message.side_effect = delete
     for mid in range(anchor.DISPLACEMENT):
         await inbound(adapter, 1000 + mid)
-    if failure == "cancel":
+    if failure in {"cancel", "delete_cancel"}:
         await asyncio.wait_for(entered.wait(), 2)
-        for task in list(manager.pending.values()):
+        tasks = list(manager.pending.values())
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*list(manager.pending.values()), return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
     else:
         await drain(manager)
+    assert len(live) <= 1
     if failure in {"ambiguous", "cancel"}:
-        assert card["message_id"] == initial and initial in live
-        assert card["reanchor"]["state"] == "attempting"
-    elif failure in {"delete", "receipt_restart"}:
-        assert card["message_id"] != initial and initial in live
-        assert card["obsolete_message_id"] == initial
-        if failure == "receipt_restart":
-            # Simulate crash after durable new receipt, before active-ID switch.
-            card["message_id"] = initial
-            card.pop("obsolete_message_id")
-            manager._save()
+        assert card["message_id"] is None and initial not in live
+        assert card["reanchor"]["state"] == "sending"
+    elif failure in {"delete", "delete_cancel"}:
+        assert attempts == 0
+        assert card["reanchor"]["state"] == "deleting"
+    elif failure == "repeated_429":
+        assert attempts == 3 and not live
     else:
-        assert attempts == 2 and card["message_id"] != initial and initial not in live
+        assert card["message_id"] != initial and initial not in live
+        assert calls[1][0] == "delete" or failure == "not_found"
     sends = adapter._bot.send_message.await_count
+    adapter._bot.delete_message.side_effect = original_delete
     restored = DelegationCards(manager.runner, home=tmp_path, interval=0)
     await restored.reconcile()
     await drain(restored)
@@ -214,13 +245,7 @@ async def test_replace_failure_restart_and_cleanup_cannot_accumulate_anchors(tmp
     await drain(restored)
     assert adapter._bot.send_message.await_count == sends
     assert recovered["rows"]["A"]["state"] == "unknown"
-    if failure in {"delete", "receipt_restart"}:
-        adapter._bot.delete_message.side_effect = original_delete
-        await restored.reconcile()
-        await drain(restored)
-        assert initial not in live and not recovered.get("obsolete_message_id")
-        assert not recovered.get("reanchor")
-    # Late tool callbacks cannot revive a post-restart unknown execution.
+    assert len(live) <= 1
     await restored.observe(source, "r", "s", 1, "subagent.tool", "terminal", data)
     assert recovered["rows"]["A"]["state"] == "unknown"
     await handled_delivery(restored, data["parent_task_id"])
@@ -292,11 +317,8 @@ async def test_event_during_replace_drains_without_another_external_event(tmp_pa
         if event_once:
             return
         event_once = True
-        # Exercise the accepted lifecycle mutation while a flush is pending,
-        # as a reentrant transport callback. The public observe wrapper's lock
-        # ordinarily serializes independent callbacks; this also verifies the
-        # existing coalescing invariant itself, not only that lock's protection.
-        await manager._observe(source, "r", "s", 1, "subagent.complete", None,
+        # Real lifecycle calls must not block behind the transport gap.
+        await manager.observe(source, "r", "s", 1, "subagent.complete", None,
                                {**data, "status": "completed"})
         if final_delivery:
             final_tasks.append(asyncio.create_task(handled_delivery(manager, data["parent_task_id"])))
@@ -321,7 +343,98 @@ async def test_event_during_replace_drains_without_another_external_event(tmp_pa
     assert initial not in live
     if final_delivery:
         assert not card["message_id"] and card["retired"]
-    else:
+    elif during == "send":
         assert "Returned · awaiting parent" in card["rendered"]
         assert adapter._bot.edit_message_text.await_count >= 1
+    else:
+        assert card["message_id"] is None
+        assert adapter._bot.send_message.await_count == 1
     assert not manager.pending
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["tool", "terminal", "handled"])
+async def test_replacement_renders_after_final_priority_wait(tmp_path, event):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    original_send = adapter._bot.send_message.side_effect
+    original_delete = adapter._bot.delete_message.side_effect
+    final_entered, release = asyncio.Event(), asyncio.Event()
+    finals = []
+    adapter._retrigger_typing = AsyncMock()
+
+    async def send(**kw):
+        if kw["text"] == "Final":
+            final_entered.set()
+            await release.wait()
+        return await original_send(**kw)
+
+    async def delete(**kw):
+        result = await original_delete(**kw)
+        finals.append(asyncio.create_task(adapter.send("42", "Final", metadata={"thread_id": "8"})))
+        await asyncio.sleep(0)  # register final waiter while deletion owns the gate
+        return result
+
+    adapter._bot.send_message.side_effect = send
+    adapter._bot.delete_message.side_effect = delete
+    for mid in range(1000, 1006):
+        await inbound(adapter, mid)
+    await asyncio.wait_for(final_entered.wait(), 2)
+    assert not live  # old card gone; final and replacement not accepted yet
+    if event == "tool":
+        await manager.observe(source, "r", "s", 1, "subagent.tool", "read_file", data)
+    else:
+        await manager.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
+        if event == "handled":
+            await handled_delivery(manager, data["parent_task_id"])
+    release.set()
+    await asyncio.gather(*finals)
+    await drain(manager)
+    cards = [kw for kw in live.values() if kw["text"] != "Final"]
+    assert len(cards) <= 1
+    if event == "tool":
+        assert "read_file" in card["rendered"]
+        assert len(cards) == 1
+    else:
+        assert not cards and card["message_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["delete_pending", "deleting", "deleted", "sending", "sent", "legacy_attempting", "legacy_sent"])
+async def test_restart_phase_receipts_preserve_transport_and_later_topic_owner(tmp_path, phase):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    old = card["message_id"]
+    if phase.startswith("legacy"):
+        receipt = dict(state=phase.removeprefix("legacy_"), old_message_id=old)
+    else:
+        receipt = dict(order="delete_first", state=phase, old_message_id=old,
+                       delete_attempts=1, send_attempts=1)
+    if phase in {"deleted", "sending", "sent"}:
+        live.pop(old)
+        card.update(message_id=None, message_deleted=True, send_attempts=1, rendered="")
+    if phase in {"sent", "legacy_sent"}:
+        live["999"] = {"text": "receipt"}
+        receipt.update(new_message_id="999", rendered="receipt", sent_at=1)
+        card.pop("message_deleted", None)
+    if phase == "sending":
+        live["998"] = {"text": "unacknowledged remote acceptance"}
+    card["reanchor"] = receipt
+    manager._save()
+    restored = DelegationCards(manager.runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain(restored)
+    assert adapter._bot.send_message.await_count == 1
+    recovered = restored.cards[data["parent_task_id"]]
+    await handled_delivery(restored, data["parent_task_id"])
+    await drain(restored)
+    # A distinct live task cannot sidestep an uncertain old send, even after
+    # final delivery retires that task's row. Definite deletion may resume.
+    await restored.observe(source, "r", "s", 1, "subagent.start", None,
+                           {**data, "parent_task_id": "b" * 32, "task_label": "Next task"})
+    await drain(restored)
+    if phase in {"sending", "legacy_attempting"}:
+        assert adapter._bot.send_message.await_count == 1
+        assert recovered["reanchor"]["state"] in {"sending", "attempting"}
+    else:
+        assert adapter._bot.send_message.await_count == 2
+    assert len(live) <= 1

@@ -397,6 +397,15 @@ class DelegationCards:
             await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0)),
                                     self.cards[key].get("retry_at", 0) - time.time(),
                                     self.cards[key].get("delete_retry_at", 0) - time.time()))
+            # Replacement releases the lifecycle lock across transport, unlike
+            # ordinary edits. Its durable phases fence parallel/restarted sends.
+            if anchoring.pending(self.cards[key]) or anchoring.eligible(self, key):
+                revision = self.cards[key].get("revision", 0)
+                self.cards[key].pop("retry_at", None)
+                self.cards[key].pop("delete_retry_at", None)
+                await anchoring.replace(self, key)
+                self.last_edit[key] = time.monotonic()
+                return
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 # A queued legacy anchor may have been rebound while waiting.
                 if not self.cards[key].get("retired"):
@@ -413,8 +422,7 @@ class DelegationCards:
                     await self._delete_obsolete(key)
                     return
                 text = render_card(projection)
-                reanchor = anchoring.eligible(self, key)
-                if (text == card["rendered"] and not reanchor
+                if (text == card["rendered"]
                         and not any(e["state"] == "pending" for e in presentation.pending(self, key))):
                     await self._delete_obsolete(key)
                     return
@@ -424,9 +432,7 @@ class DelegationCards:
                     return
                 revision = card.get("revision", 0)
                 message_id = card["message_id"]
-                if reanchor:
-                    result = await anchoring.replace(self, key, adapter, source, text)
-                elif message_id:
+                if message_id:
                     result = await adapter.edit_message(source.chat_id, card["message_id"], text, finalize=True,
                                                         metadata={"hermes_status": True})
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
@@ -468,7 +474,8 @@ class DelegationCards:
             logger.exception("Delegation card update failed")
         finally:
             self.pending.pop(key, None)
-            if (self.cards[key].get("delete_retry_at") or self.cards[key].get("retry_at")) and not asyncio.current_task().cancelling():
+            if (self.cards[key].get("delete_retry_at") or self.cards[key].get("retry_at")
+                    or (revision is not None and revision != self.cards[key].get("revision", 0))) and not asyncio.current_task().cancelling():
                 self._queue(key)
         # Events arriving during transport awaits are coalesced, not dropped.
         card = self.cards[key]

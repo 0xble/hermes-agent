@@ -4230,14 +4230,20 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Every attempt reserves its own slot on the chat's shared gate: even a rejected Bot API request
         consumes the chat's budget."""
+        async def send_chunk(*, plain=False):
+            current = chunk() if callable(chunk) else chunk
+            if current is None:
+                return None  # lifecycle retired while waiting for the shared gate
+            return await self._bot.send_message(
+                text=_strip_mdv2(current) if plain else current,
+                parse_mode=None if plain else ParseMode.MARKDOWN_V2, **send_kwargs)
+
         try:
-            return await self._run_send_call(
-                chat_id, self._bot.send_message, text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs)
+            return await self._run_send_call(chat_id, send_chunk)
         except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+            if self._is_bad_request_error(md_error) and ("parse" in str(md_error).lower() or "markdown" in str(md_error).lower()):
                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await self._run_send_call(
-                    chat_id, self._bot.send_message, text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs)
+                return await self._run_send_call(chat_id, send_chunk, plain=True)
             raise
 
     @staticmethod
@@ -4378,13 +4384,19 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_kwargs = self._thread_kwargs_for_send(
             source.chat_id, source.thread_id, metadata, reply_to_message_id=None,
             reply_to_mode="off")
+        def formatted():
+            latest = content() if callable(content) else content
+            return self.format_message(latest) if latest is not None else None
+
         try:
             message = await self._send_chunk_markdown_or_plain(
-                source.chat_id, self.format_message(content), {
+                source.chat_id, formatted, {
                     "chat_id": normalize_telegram_chat_id(source.chat_id),
                     **thread_kwargs, **self._notification_kwargs(metadata),
                     **self._link_preview_kwargs(),
                 })
+            if message is None:
+                return SendResult(success=False, raw_response={"cancelled_before_send": True})
             return SendResult(success=True, message_id=str(message.message_id))
         except _TelegramSendCooldownExceeded as exc:
             return self._send_cooldown_failure(exc)

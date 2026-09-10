@@ -53,10 +53,10 @@ def pending(manager, key):
 
 def fenced(manager, key):
     # A lost receipt remains a fence even after its task is linked to a survivor.
-    return any((c.get("reanchor") or {}).get("state") == "attempting"
-               or (not c.get("message_id") and c.get("send_attempts", 0)
+    return any((c.get("reanchor") or {}).get("state") in {"attempting", "sending", "deleting", "delete_pending", "deleted"}
+               or (not c.get("retired") and not c.get("message_id") and c.get("send_attempts", 0)
                    and not c.get("consolidated_message_id") and not c.get("message_deleted"))
-               for _, c in manager._members(key) if not c.get("retired"))
+               for _, c in manager._members(key))
 
 
 def bind(manager, key):
@@ -69,13 +69,20 @@ def bind(manager, key):
     # Otherwise prefer a real transport receipt, then the oldest task. Never
     # compare message numbers as chronology or merge execution/receipt owners.
     roots = {manager._anchor(k) for k, _ in active}
+    # A gap/lost receipt is still owned even if its execution retired. A later
+    # task in the topic must not create a second transport around that fence.
+    roots.update(k for k, c in manager.cards.items()
+                 if manager._scope(c) == manager._scope(card)
+                 and ((c.get("reanchor") or {}).get("order") == "delete_first"
+                      or (c.get("reanchor") or {}).get("state") == "attempting"))
     # A retired execution can still hold the transport for live siblings. Keep
     # that receipt, but never reuse a deleted/ambiguous historical anchor.
     candidates = active + [(k, manager.cards[k]) for k in roots
                            if k in manager.cards and manager.cards[k].get("retired")
-                           and manager.cards[k].get("message_id")
+                           and (manager.cards[k].get("message_id") or manager.cards[k].get("reanchor"))
                            and manager._scope(manager.cards[k]) == manager._scope(card)]
     anchor, target = min(candidates, key=lambda item: (
+        (item[1].get("reanchor") or {}).get("order") != "delete_first",
         not bool(item[1].get("presentation_cleanup")),
         not bool(item[1].get("message_id")), item[1]["started_at"], item[0]))
     members = [(k, c) for k, c in manager.cards.items()
