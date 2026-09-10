@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent.display import get_tool_emoji
 from gateway.config import Platform
+from gateway import delegation_card_anchor as anchoring
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 
@@ -130,12 +131,21 @@ class DelegationCards:
         self.locks = {}
         self.last_edit = {}
         self.turn_tasks = {}
+        self.displacement = {}
+        self.observed_messages = {}
+        self.tracking_started = time.time()
         self._diagnostics = set()
         if self.path.exists():
             try:
                 self.cards = json.loads(self.path.read_text(encoding="utf-8"))
+                from gateway.delegation_card_reconciliation import apply_pending
+                try:
+                    apply_pending(self)
+                except Exception:
+                    logger.exception("Delegation presentation dismissal request reconciliation failed")
                 changed = False
                 for card in self.cards.values():
+                    anchoring.adopt_receipt(self, card)
                     for row in card["rows"].values():
                         if row["state"] not in _TERMINAL:
                             row["state"] = "unknown"
@@ -194,6 +204,9 @@ class DelegationCards:
         adapter = self.runner._adapter_for_source(source)
         if adapter is None:
             self._warn_once(card, "Delegation card adapter unavailable; skipping delivery")
+        if adapter is not None:
+            adapter._delegation_conversation_observer = (
+                lambda chat, thread, message: anchoring.observe_conversation(self, adapter, chat, thread, message))
         return adapter
 
     @staticmethod
@@ -373,13 +386,15 @@ class DelegationCards:
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 card = self.cards[key]
                 card.pop("delete_retry_at", None)
+                card.pop("retry_at", None)
                 projection = self._projection(key)
                 if not projection["rows"]:
                     await self._delete(card)
                     await self._delete_obsolete(key)
                     return
                 text = render_card(projection)
-                if text == card["rendered"]:
+                reanchor = anchoring.eligible(self, key)
+                if text == card["rendered"] and not reanchor:
                     await self._delete_obsolete(key)
                     return
                 source = self._source(card)
@@ -388,11 +403,13 @@ class DelegationCards:
                     return
                 revision = card.get("revision", 0)
                 message_id = card["message_id"]
-                if message_id:
+                if reanchor:
+                    result = await anchoring.replace(self, key, adapter, source, text)
+                elif message_id:
                     result = await adapter.edit_message(source.chat_id, card["message_id"], text, finalize=True,
                                                         metadata={"hermes_status": True})
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
-                    if missing and card["recoveries"] < 1:
+                    if missing and card["recoveries"] < 1 and not card.get("reanchor"):
                         card["recoveries"] += 1
                         card["message_id"] = None
                         card["send_attempts"] = 0
@@ -405,6 +422,8 @@ class DelegationCards:
                     result = await adapter.send_delegation_card(source, text)
                     if getattr(result, "success", False):
                         card["message_id"] = str(result.message_id)
+                        card["anchored_at"] = time.time()
+                        self.displacement.pop(key, None)
                     elif (getattr(result, "raw_response", None) or {}).get("definite_rejection") and card.get("rejections", 0) < 1:
                         card["rejections"] = card.get("rejections", 0) + 1
                         card["send_attempts"] = 0  # one retry, on a subsequent observed event only
@@ -425,11 +444,11 @@ class DelegationCards:
             logger.exception("Delegation card update failed")
         finally:
             self.pending.pop(key, None)
-            if self.cards[key].get("delete_retry_at") and not asyncio.current_task().cancelling():
+            if (self.cards[key].get("delete_retry_at") or self.cards[key].get("retry_at")) and not asyncio.current_task().cancelling():
                 self._queue(key)
         # Events arriving during transport awaits are coalesced, not dropped.
         card = self.cards[key]
-        if revision is not None and self._projection(key)["rows"] and (revision != card.get("revision", 0) or card.get("retry_at")):
+        if revision is not None and (revision != card.get("revision", 0) or card.get("retry_at")):
             self._queue(key)
 
     def receipt(self, event, session_key, generation):
@@ -528,8 +547,23 @@ class DelegationCards:
             if message_id and adapter:
                 if self._defer_delete(card, adapter):
                     continue
-                if await adapter.delete_message(card["source"]["chat_id"], message_id):
+                if card.get("obsolete_delete_attempts", 0) >= 3:
+                    continue
+                card["obsolete_delete_attempts"] = card.get("obsolete_delete_attempts", 0) + 1
+                self._save()
+                status_delete = getattr(type(adapter), "_delete_status_message", None)
+                if status_delete is not None:
+                    deleted = await status_delete(adapter, card["source"]["chat_id"], message_id)
+                else:
+                    deleted = await adapter.delete_message(card["source"]["chat_id"], message_id)
+                if deleted is None and status_delete is not None:
+                    card["obsolete_delete_attempts"] -= 1
+                    self._defer_delete(card, adapter, minimum_delay=1.0)
+                elif deleted:
                     card["obsolete_message_id"] = None
+                    card.pop("obsolete_delete_attempts", None)
+                    if (card.get("reanchor") or {}).get("state") == "sent":
+                        card["last_reanchor"] = card.pop("reanchor")
                     self._save()
                 else:
                     self._defer_delete(card, adapter)

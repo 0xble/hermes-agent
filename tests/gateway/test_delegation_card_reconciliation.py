@@ -114,3 +114,37 @@ def test_dismissal_rejects_drift_partial_identity_active_rows_and_output_overwri
     manifest.write_text(json.dumps(plan), encoding="utf-8")
     assert main(args) == 2
     assert not output.exists()
+
+
+@pytest.mark.parametrize("change", [None, "rows", "message_id", "owner", "handled"])
+def test_startup_request_preserves_live_anchor_and_unrelated_work(tmp_path, change):
+    source, manifest, plan, original = fixture(tmp_path)
+    home = tmp_path / "profile"
+    directory = home / "cache" / "delegation"
+    directory.mkdir(parents=True)
+    request = {"snapshot_json": source.read_text(), "manifest": plan}
+    (directory / "dismissal-request.json").write_text(json.dumps(request))
+    live = copy.deepcopy(original)
+    # A terminal row's physical message hosts unrelated newer work. Its visual
+    # revision changing is not a different task/outcome/transport identity.
+    live["b" * 32].update(rendered="new active sibling", revision=90)
+    live["d" * 32]["rows"]["D"]["last_tool"] = "terminal"
+    if change == "rows":
+        live["b" * 32]["rows"]["B"]["state"] = "failed"
+    elif change:
+        live["b" * 32][change] = {"changed": True} if change == "owner" else "different"
+    (directory / "cards.json").write_text(json.dumps(live))
+    manager = DelegationCards(SimpleNamespace(), home=home)
+    for key in ("b" * 32, "c" * 32):
+        assert manager.cards[key]["retired"] is (change is None)
+        assert manager.cards[key]["handled"] == live[key]["handled"]
+        assert manager.cards[key]["rows"] == live[key]["rows"]
+    assert manager.cards["d" * 32]["rows"] == live["d" * 32]["rows"]
+    assert manager.cards["b" * 32]["rendered"] == "new active sibling"
+    if not change:
+        assert not (directory / "dismissal-request.json").exists()
+        # A replay after persistence but before archival is idempotent.
+        (directory / "dismissal-request.json").write_text(json.dumps(request))
+        again = DelegationCards(SimpleNamespace(), home=home)
+        assert again.cards["b" * 32]["presentation_dismissal"] == manager.cards["b" * 32]["presentation_dismissal"]
+        assert not (directory / "dismissal-request.json").exists()

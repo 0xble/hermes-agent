@@ -1,5 +1,8 @@
 # Exact-target legacy delegation-card reconciliation
 
+For the authorized startup request route that preserves concurrent unrelated work,
+see [activity-driven anchoring](delegation-card-anchoring.md#audited-legacy-dismissal-while-the-gateway-is-running).
+
 A terminal child is not proof its parent handled it. Older card records can remain
 visible after work was superseded, with no exact delivery receipt. Do not invent a
 `handled` receipt from age, shared inbound message IDs, or prose such as “no action

@@ -12,6 +12,14 @@ Record the removal commit's stable subject on the `Retired` row so fork-only cod
 
 Stable commit subjects survive rebases and are the manifest keys. Resolve the current SHA from the fetched fork history instead of persisting a value that the next upstream rebase will invalidate.
 
+## Delegation presentation reanchoring — source candidate
+
+- **Stable subject:** `fix(telegram): reanchor active delegation cards after conversation displacement`.
+- **Contract:** [activity-driven anchoring](docs/delegation-card-anchoring.md): eight observed same-topic ordinary messages plus five-minute cooldown, genuinely running rows only, no timer or Bot API polling. One logical card with receipt-before-switch replacement, bounded old-ID cleanup and persistent ambiguity fence. Uses existing shared expendable scheduling/final-reply priority. Preserves original starts/refs and current NBSP three-layer, heading-only bold, inline role, tool-only renderer; no label truncation or separate review card.
+- **Lifecycle:** explicit audited startup dismissal uses the existing exact-target validator; changed targets reject atomically and unrelated live rows survive. Does not forge `handled`, change durable task outcomes or infer success from age/prose.
+- **Verification:** real manager/persistence/Telegram adapter with fake Bot API covers interleaving, coalescing, 429, cancellation/ambiguity, restart, old cleanup and final priority. Live activation/transport evidence belongs to the delivery receipt, not source-test assertions.
+- **Rollback/retirement:** revert the scoped commit only after reconciling any persisted replacement receipt/obsolete ID; older readers do not understand an in-flight replacement. Preserve task/dismissal history. Retire when adopted upstream passes the complete anchoring and exact-retirement contract.
+
 ## Telegram tool excerpt — source candidate, activation deferred
 
 - **Recovery finding:** The interrupted name-only commit removed `Last tool:` but did not satisfy the requested tool-usage detail. The existing `tool.started` → child relay → `subagent.tool` callback supplies a display preview separately from raw arguments; the card route discarded it.

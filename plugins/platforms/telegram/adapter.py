@@ -3485,6 +3485,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _on_platform_update(self, update, context) -> None:
         """Catch-all PTB handler (group 99) firing ``gateway_platform_event`` per inbound update with a
         stable envelope (no raw SDK objects) and an internal auth source. Never raises into PTB."""
+        from plugins.platforms.telegram.conversation_activity import inbound
+        inbound(self, update)
         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = getattr(self, "_platform_event_handler", None)
         if handler is None:
             return
@@ -4304,7 +4306,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         token = _EXPENDABLE_TRAFFIC.set(bool((metadata or {}).get("hermes_status")))
         try:
-            return await self._send_impl(chat_id, content, reply_to=reply_to, metadata=metadata)
+            result = await self._send_impl(chat_id, content, reply_to=reply_to, metadata=metadata)
+            from plugins.platforms.telegram.conversation_activity import outbound
+            outbound(self, chat_id, result, metadata)
+            return result
         finally:
             _EXPENDABLE_TRAFFIC.reset(token)
 
