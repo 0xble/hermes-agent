@@ -618,10 +618,10 @@ class SessionDB(
         self._init_schema()
 
     def _connect_and_init_with_lock_patience(self) -> None:
-        """Open + init, waiting out a sibling's write lock with jittered patience:
+        """Open + init, waiting out transient lock or schema invalidation errors:
         _init_schema's DDL runs on a 1s-timeout connection, so a sibling's VACUUM
         or checkpoint used to fail the ENTIRE open and callers disabled
-        persistence for the whole run. Non-lock errors propagate immediately."""
+        persistence for the whole run. Non-transient errors propagate immediately."""
         # Lock contention during open: _init_schema's DDL/reconcile statements run on a 1s-timeout
         # connection with no retry, so a sibling process holding the write lock (VACUUM, TRUNCATE checkpoint
         # at close, a long FTS pass from an older still-running install) used to fail the ENTIRE open —
@@ -635,7 +635,11 @@ class SessionDB(
                 return
             except sqlite3.OperationalError as exc:
                 err = str(exc).lower()
-                if "locked" not in err and "busy" not in err:
+                # FTS xConnect can report only "vtable constructor failed" when
+                # a sibling's DDL invalidates its schema. Retry the authoritative
+                # SQLITE_SCHEMA code, not the wording (which also hides corruption).
+                schema_changed = getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_SCHEMA
+                if not schema_changed and "locked" not in err and "busy" not in err:
                     raise
                 self._close_connection_quietly(self._conn)
                 now = time.monotonic()

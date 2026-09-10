@@ -411,6 +411,11 @@ async def test_cleanup_uses_replacement_after_mid_turn_adapter_swap(
     monkeypatch, tmp_path,
 ):
     """The turn-retained adapter must edit and clean up through its replacement."""
+    from gateway import run_turn_runner
+
+    # Adapter replacement, not pacing: the production edit floor equals the 3s
+    # handshake bound below, so scheduler overhead alone could fail this test.
+    monkeypatch.setattr(run_turn_runner, "_PROGRESS_EDIT_INTERVAL", 0.0)
     config = PlatformConfig(enabled=True, token="test-token")
     retired = TelegramAdapter(config)
     live = TelegramAdapter(config)

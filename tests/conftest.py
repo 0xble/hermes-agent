@@ -645,6 +645,39 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     return None
 
 
+# ── Gateway runtime-state guard ─────────────────────────────────────────────
+# Capture outside fixtures: clear=True removes HERMES_HOME (and HOME), while
+# adapter connect/disconnect calls still persist process identity and health.
+from hermes_constants import _get_platform_default_hermes_home
+
+_GATEWAY_RUNTIME_DENY_ROOTS = (_get_platform_default_hermes_home().resolve(),)
+if _PRE_SANDBOX_HERMES_HOME:
+    _GATEWAY_RUNTIME_DENY_ROOTS += (Path(_PRE_SANDBOX_HERMES_HOME).expanduser().resolve(),)
+
+
+@pytest.fixture(autouse=True)
+def _gateway_runtime_write_guard(monkeypatch):
+    from gateway import status
+
+    original_path = status._get_runtime_status_path
+
+    def isolated_path():
+        path = original_path()
+        resolved = path.expanduser().resolve()
+        if any(resolved.is_relative_to(root) for root in _GATEWAY_RUNTIME_DENY_ROOTS):
+            # Adapter health reporting catches Exception. A pytest outcome must
+            # escape that handler, otherwise an unsafe test would pass silently.
+            pytest.fail(
+                f"gateway runtime isolation: refusing operator state at {resolved}; "
+                "isolate Path.home() when clearing HERMES_HOME"
+            )
+        return path
+
+    # Guard the resolver rather than write_runtime_status: aliases imported by
+    # adapters still use this seam, and refusal occurs before reading live state.
+    monkeypatch.setattr(status, "_get_runtime_status_path", isolated_path)
+
+
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
 # When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
 # invocation), kanban writes silently pollute the real ~/.hermes. This autouse

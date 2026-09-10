@@ -111,6 +111,9 @@ class TestCommandTimeoutRecovery:
         supervisor_events = []
 
         monkeypatch.setattr(bt_install, "_find_agent_browser", lambda: "agent-browser")
+        # This test supplies the browser process; host Chromium availability
+        # must not short-circuit the timeout/recovery path before it is spawned.
+        monkeypatch.setattr(bt_install, "_chromium_installed", lambda: True)
         monkeypatch.setattr("tools.browser_tool_install._requires_real_termux_browser_install", lambda _cmd: False)
         monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr("tools.browser_tool_cdp._ensure_cdp_supervisor", lambda _: supervisor_events.append("ensure"))
@@ -122,8 +125,11 @@ class TestCommandTimeoutRecovery:
         monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: process)
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
 
-        bt_session._run_browser_command(task_id, "click", ["@e1"], timeout=1)
+        result = bt_session._run_browser_command(task_id, "click", ["@e1"], timeout=1)
 
+        assert result["success"] is False
+        assert "timed out" in result["error"]
+        process.kill.assert_called_once_with()
         assert task_id not in bt._last_active_session_key
         assert not (tmp_path / "agent-browser-stuck-session").exists()
         if not cloud:

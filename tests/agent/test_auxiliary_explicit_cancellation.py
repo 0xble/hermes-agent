@@ -191,15 +191,49 @@ def test_codex_silent_stream_is_isolated_without_closing_shared_client() -> None
     stream.close()
 
 
-def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None:
+def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client(monkeypatch) -> None:
     """A cancelled Codex worker's delayed timer owns only its event stream."""
     owner_started = threading.Event()
+    provider_threads = []
+    timers = []
+    clock = [time.monotonic()]
+
+    class _ControlledTimer:
+        def __init__(self, interval, function):
+            self.deadline = clock[0] + interval
+            self.function = function
+            self.cancelled = False
+
+        def start(self):
+            timers.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            assert not self.cancelled
+            clock[0] = self.deadline
+            # Run the real watchdog callback on a stranger thread, just like Timer.
+            callback = threading.Thread(target=self.function, daemon=True)
+            callback.start()
+            callback.join(timeout=1)
+            assert not callback.is_alive()
+
+    # Control only this adapter's clock and timer, not cancellation or cleanup.
+    # Wall-clock descheduling must not expire the orphan before the concurrent use.
+    monkeypatch.setattr(aux, "time", SimpleNamespace(
+        **{**vars(time), "monotonic": lambda: clock[0]}
+    ))
+    monkeypatch.setattr(aux, "threading", SimpleNamespace(
+        **{**vars(threading), "Timer": _ControlledTimer}
+    ))
 
     class _SilentOwnerStream:
         def __init__(self) -> None:
             self.closed = threading.Event()
 
         def __iter__(self):
+            provider_threads.append(threading.current_thread())
             owner_started.set()
             self.closed.wait(timeout=5)
             raise RuntimeError("owner stream closed")
@@ -275,6 +309,7 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
     try:
         owner.start()
         assert owner_started.wait(timeout=1)
+        orphan_timer = timers[0]
         cancel_event.set()
         owner.join(timeout=1)
         assert not owner.is_alive()
@@ -292,10 +327,13 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         )
         assert concurrent.choices[0].message.content == "ok"
 
-        # Let the orphan's real adapter timer fire. It may close the attempt's
+        # Fire the orphan's real watchdog callback at its controlled deadline.
+        # It may close the attempt's
         # event stream to wake that worker, but never the process-shared client.
+        orphan_timer.fire()
         assert owner_stream.closed.wait(timeout=1)
-        time.sleep(0.03)
+        provider_threads[0].join(timeout=1)
+        assert not provider_threads[0].is_alive()
         assert not real_client.closed.is_set()
         with aux._client_cache_lock:
             assert aux._client_cache[cache_key][0] is wrapper
@@ -307,6 +345,9 @@ def test_cancelled_codex_orphan_timeout_preserves_cached_shared_client() -> None
         assert successive.choices[0].message.content == "ok"
     finally:
         owner_stream.close()
+        owner.join(timeout=1)
+        for worker in provider_threads:
+            worker.join(timeout=1)
         with aux._client_cache_lock:
             aux._client_cache.clear()
 

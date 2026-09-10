@@ -13,7 +13,16 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.event import ProcessingOutcome
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_home(tmp_path, monkeypatch):
+    # clear=True scopes remove HERMES_HOME and HOME. Keep the real fallback
+    # resolver and runtime writes, but direct them to this test's account home.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
 if TYPE_CHECKING:
     from plugins.platforms.feishu.adapter import FeishuAdapter

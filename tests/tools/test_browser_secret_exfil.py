@@ -1,6 +1,7 @@
 """Tests for secret exfiltration prevention in browser and web tools."""
 
 import json
+import socket
 from unittest.mock import patch, MagicMock
 import pytest
 
@@ -28,7 +29,11 @@ class TestBrowserSecretExfil:
         parsed = json.loads(result)
         assert parsed["success"] is False
 
-    def test_cloud_browser_allows_credential_named_query_param(self):
+    @pytest.mark.parametrize("resolved_ip, expected_success", [
+        ("93.184.216.34", True),
+        ("198.18.33.64", False),
+    ])
+    def test_cloud_browser_allows_credential_named_query_param(self, resolved_ip, expected_success):
         """Magic links / OAuth callbacks / signed assets carry ``?token=``-style params and must
         reach a cloud browser too: the browser is where the agent signs in, and it already sees the
         session's cookies and typed passwords. Only Hermes-secret-shaped values stay blocked."""
@@ -36,14 +41,21 @@ class TestBrowserSecretExfil:
 
         url = "https://example.com/callback?token=opaque-oauth-code&signature=abc123"
         mock_result = {"success": True, "data": {"title": "ok", "url": url}}
-        with patch("tools.browser_tool_cloud._is_local_backend", return_value=False), \
+        dns_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (resolved_ip, 443))]
+        with patch("tools.url_safety._getaddrinfo", return_value=dns_answer) as resolver, \
+             patch("tools.browser_tool_cloud._is_local_backend", return_value=False), \
              patch("tools.browser_tool._navigation_session_key", return_value="default"), \
              patch("tools.browser_tool_session._get_session_info", return_value={"_first_nav": False}), \
              patch("tools.browser_tool_session._run_browser_command", return_value=mock_result) as mock_run:
             allowed = json.loads(browser_navigate(url))
             blocked = json.loads(browser_navigate("https://example.com/callback?token=" + "sk-or-v1-" + "b" * 30))
 
-        assert allowed["success"] is True
+        assert allowed["success"] is expected_success
+        resolver.assert_called()
+        assert all(call.args[0] == "example.com" for call in resolver.call_args_list)
+        if not expected_success:
+            assert "Blocked" in allowed["error"]
+            mock_run.assert_not_called()
         assert blocked["success"] is False and "Blocked" in blocked["error"]
         assert all(call.args[1] != "open" or "sk-or-v1-" not in call.args[2][0] for call in mock_run.call_args_list)
 
