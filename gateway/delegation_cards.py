@@ -123,7 +123,10 @@ def _handled_terminal(card):
 
 
 class DelegationCards:
-    def __init__(self, runner, *, home=None, interval=1.5):
+    # 3.0s matches the transport's per-chat edit floor (Telegram: _edit_min_interval_seconds).
+    # Editing faster does not surface state sooner: the extra edits queue behind that floor inside
+    # the chat's send lock, and every one of them still counts against the chat's flood budget.
+    def __init__(self, runner, *, home=None, interval=3.0):
         self.runner = runner
         self.path = Path(home or get_hermes_home()) / "cache" / "delegation" / "cards.json"
         self.interval = interval

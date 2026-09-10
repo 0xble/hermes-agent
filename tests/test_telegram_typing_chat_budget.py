@@ -180,19 +180,19 @@ async def test_send_typing_unaffected_for_other_chats():
 
 
 @pytest.mark.asyncio
-async def test_a_lone_session_is_never_shed_by_the_chat_floor():
-    """The floor must not override an explicitly configured faster cadence.
+async def test_a_faster_cadence_is_held_to_the_chat_floor():
+    """A caller asking to refresh faster than the floor is shed down to it.
 
-    A fixed constant coarser than the caller's interval would shed a LONE
-    session's ticks and kill the indicator for a single user who deliberately
-    asked for a fast refresh. The floor is min(constant, interval).
+    The floor used to be min(constant, interval), which honoured any caller's
+    cadence over the chat's ceiling. The chat ceiling wins: a chat action is a
+    full Bot API call, and the budget it spends is the chat's, not the
+    session's.
     """
     adapter = _make_adapter(gap=1.0)
 
-    # One session refreshing every 0.05s must get every tick.
-    for _ in range(3):
-        assert adapter._claim_typing_chat_budget("chat-1", 0.05) is True
-        await asyncio.sleep(0.06)
+    assert adapter._claim_typing_chat_budget("chat-1", 0.05) is True
+    await asyncio.sleep(0.06)
+    assert adapter._claim_typing_chat_budget("chat-1", 0.05) is False
 
 
 @pytest.mark.asyncio
@@ -215,14 +215,43 @@ async def test_concurrent_sessions_never_exceed_the_single_session_rate():
 
 
 @pytest.mark.asyncio
-async def test_production_interval_keeps_the_constant_floor():
-    """min() must not weaken the bound at the real 4.0s cadence."""
+async def test_concurrent_sessions_cannot_stack_at_the_production_cadence():
+    """The regression that took the 2026-09-10 flood ban.
+
+    With min(), the production 4.0s interval collapsed to the 1.0s constant
+    and four concurrent sessions in one chat issued 60 chat actions/min — a
+    whole private-chat budget spent on an indicator, unlogged above debug.
+    The gap must be max(floor, interval), so the second session is shed for
+    the WHOLE interval, not merely for the constant.
+    """
     adapter = _make_adapter(gap=1.0)
 
     assert adapter._claim_typing_chat_budget("chat-1", 4.0) is True
-    # Second session 0.1s later is still inside the 1.0s floor.
-    await asyncio.sleep(0.1)
+    # A second session past the old 1.0s constant must still be shed: the
+    # binding gap is the 4.0s interval.
+    await asyncio.sleep(1.1)
     assert adapter._claim_typing_chat_budget("chat-1", 4.0) is False
+
+
+def test_default_chat_floor_is_a_fraction_of_the_private_chat_ceiling():
+    """The class default is sized against Telegram's ~60 calls/min private-chat
+    envelope, not against the typing lease. Pinned so a future retune cannot
+    quietly hand the indicator most of a chat's flood budget again."""
+    calls_per_minute = 60.0 / BasePlatformAdapter._TYPING_CHAT_MIN_GAP_S
+    assert calls_per_minute <= 20.0, calls_per_minute
+
+
+def test_group_chats_get_a_stricter_typing_floor_than_private_chats():
+    """A group's ceiling is ~20 calls/min against a private chat's ~60, so the
+    indicator has to cost proportionally less there. Telegram gives groups,
+    supergroups and channels negative ids."""
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+
+    private = adapter._typing_chat_min_gap("2027045491")
+    group = adapter._typing_chat_min_gap("-1002027045491")
+
+    assert group > private, (group, private)
+    assert 60.0 / group <= 20.0 / 3.0, 60.0 / group
 
 
 @pytest.mark.asyncio

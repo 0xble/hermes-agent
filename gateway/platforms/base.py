@@ -3057,21 +3057,30 @@ class BasePlatformAdapter(ABC):
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
     # Minimum seconds between ANY two typing refreshes in one chat, across every session sharing it.
-    # Platform typing status expires after ~5s, so a 4.0s per-thread cadence with a 1.0s chat floor
-    # keeps ~4 concurrent threads visibly typing and sheds ticks beyond that.
-    _TYPING_CHAT_MIN_GAP_S = 1.0
+    # Sized against the platform's PER-CHAT ceiling, not against the typing loop's own cadence: a
+    # chat action is a full Bot API call and draws on the same per-chat budget as every send, edit
+    # and delete. 4.0s == 15 calls/min, a quarter of Telegram's ~60/min private-chat envelope.
+    _TYPING_CHAT_MIN_GAP_S = 4.0
+
+    def _typing_chat_min_gap(self, chat_id: str) -> float:
+        """This chat's typing floor in seconds. Overridden where the ceiling depends on chat class
+        (a Telegram group's is ~3x stricter than a private chat's)."""
+        return float(self._TYPING_CHAT_MIN_GAP_S)
 
     def _claim_typing_chat_budget(self, chat_id: str, interval: float | None = None) -> bool:
         """Reserve this chat's next typing slot, or shed the tick (False = DROP it, never wait for it,
         so a busy chat degrades to fewer live bubbles instead of an escalating penalty that silences
         it entirely).
 
-        The floor is ``min(_TYPING_CHAT_MIN_GAP_S, interval)``, never the bare constant: the invariant
-        is that a chat's aggregate typing rate never exceeds what ONE session at the configured cadence
-        produces alone. A constant coarser than the interval would shed a lone session's ticks and kill
-        the indicator for a single user who deliberately configured a fast refresh; a finer one would
-        let concurrent sessions stack above the single-session rate. Production (1.0s floor under the
-        4.0s interval) is unchanged."""
+        The gap is ``max(floor, interval)``, so the chat's aggregate typing rate never exceeds what ONE
+        session at the configured cadence produces alone: N concurrent sessions get one slot between
+        them, and a caller asking for a cadence FASTER than the floor is held to the floor.
+
+        It used to be ``min(...)``, which inverted the second half: at the production 4.0s interval the
+        gap collapsed to the 1.0s constant and let ~4 sessions stack to 60 chat actions/min in one chat,
+        a full private-chat budget spent on an indicator. That hidden traffic — unlogged above debug and
+        exempt from the send cooldown's gap — is what took the 2026-09-10 flood ban while the visible
+        send+edit rate was only 8-12/min. The indicator is worth degrading; the chat is not."""
         budget = getattr(self, "_typing_chat_next_allowed", None)
         if budget is None:
             return True  # bare/legacy adapters built without __init__ keep typing, unthrottled
@@ -3082,9 +3091,9 @@ class BasePlatformAdapter(ABC):
         key = str(chat_id)
         if now < budget.get(key, 0.0):
             return False
-        gap = float(self._TYPING_CHAT_MIN_GAP_S)
+        gap = float(self._typing_chat_min_gap(key))
         if interval is not None:
-            gap = min(gap, max(0.0, float(interval)))
+            gap = max(gap, max(0.0, float(interval)))
         budget[key] = now + gap
         if len(budget) > self._typing_chat_state_max:  # opportunistic trim, bounded, no background task
             cutoff = now - 300.0

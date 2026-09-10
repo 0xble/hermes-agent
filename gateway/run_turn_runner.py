@@ -42,7 +42,10 @@ logger = logging.getLogger("gateway.run")
 
 
 # Minimum seconds between progress edits, enforced per CHAT (see _edit_gate_elapsed).
-_PROGRESS_EDIT_INTERVAL = 1.5
+# Kept at or above the transport's own per-chat edit floor (Telegram: _edit_min_interval_seconds,
+# 3.0s). A producer faster than the transport does not deliver more updates, it just parks each
+# edit inside the chat's send lock, delaying real messages queued behind it.
+_PROGRESS_EDIT_INTERVAL = 3.0
 # A cancelled progress consumer must not keep turn finalization waiting for a
 # transport receipt.  The receipt task itself remains shielded so an accepted
 # send can still be tracked for cleanup when it arrives.

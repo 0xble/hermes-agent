@@ -658,8 +658,36 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_cooldown_locks: Dict[str, asyncio.Lock] = {}
         self._send_cooldown_users: Dict[str, int] = {}
         self._send_cooldown_state_max = 4096
+        # Per-chat outbound budget, sized from Telegram's per-chat ceilings rather than from the
+        # single-request limit. Community-established figures (grammY "Flood limits";
+        # python-telegram-bot AIORateLimiter defaults): ~1 request/s to one private chat (~60/min)
+        # and ~20/min to one group or channel, with EVERY Bot API call counting — edits, chat
+        # actions and deletes included, not just sendMessage.
+        #
+        # 2026-09-10 incident: a DM took a 2h09m flood ban while the visible send+edit rate was only
+        # 8-12/min. The old flat 1.1s gap allowed 54/min on its own, and the typing loop ran a
+        # SECOND, independent budget (1.0s floor => 60/min) whose ticks set _reserve_gap=False, so
+        # the two together permitted ~114/min into one chat — 1.9x the DM ceiling, 5.7x a group's.
+        # Sizing each limiter near the whole ceiling is the bug; these values leave real headroom
+        # because the limits are adaptive and the penalties escalate.
         self._send_cooldown_seconds: float = self._coerce_float_extra(
-            "send_cooldown_seconds", 1.1, min_value=0.0, max_value=10.0)
+            "send_cooldown_seconds", 2.0, min_value=0.0, max_value=30.0)
+        # A group/channel's ceiling is ~3x stricter than a DM's, so it needs its own gap.
+        self._send_cooldown_group_seconds: float = self._coerce_float_extra(
+            "send_cooldown_group_seconds", 6.0, min_value=0.0, max_value=60.0)
+        # Edits to a live message (progress, delegation cards) carry only their LATEST state, so
+        # spacing them costs nothing a reader can perceive. Guidance is "no more than one edit per
+        # second to the same message, ideally further apart"; 3s is that, with margin.
+        self._edit_min_interval_seconds: float = self._coerce_float_extra(
+            "edit_min_interval_seconds", 3.0, min_value=0.0, max_value=60.0)
+        # Adaptive brake: any server-published retry_after is evidence this chat is already near its
+        # limit, so widen its gap for a window instead of walking straight back into the penalty.
+        # On 2026-09-10 two cooldowns (0.6s at 01:26, 0.7s at 10:49) preceded the 2h ban unused.
+        self._send_penalty_until: Dict[str, float] = {}
+        self._send_penalty_factor: float = self._coerce_float_extra(
+            "send_penalty_factor", 2.0, min_value=1.0, max_value=10.0)
+        self._send_penalty_window_seconds: float = self._coerce_float_extra(
+            "send_penalty_window_seconds", 600.0, min_value=0.0, max_value=3600.0)
         # Hard cap on inline blocking: a 7000s flood penalty must not stall the chat path for two hours.
         # The caller observes the wait as a retryable flood_control error and owns the long back-off.
         self._send_cooldown_max_wait: float = self._coerce_float_extra(
@@ -1596,7 +1624,58 @@ class TelegramAdapter(BasePlatformAdapter):
                 cooldowns.pop(chat_key, None)
                 users.pop(chat_key, None)
 
-    async def _run_send_call(self, cooldown_chat_id: Any, send_fn: Any, *args: Any, _reserve_gap: bool = True, _expendable: Optional[bool] = None, **kwargs: Any):
+    @staticmethod
+    def _chat_is_group(chat_key: str) -> bool:
+        """True for a group/supergroup/channel. Telegram gives those negative ids and private chats
+        positive ones, so the id alone classifies the chat without an extra getChat round-trip."""
+        try:
+            return int(str(chat_key).strip()) < 0
+        except (TypeError, ValueError):
+            return False  # unparseable (test doubles, usernames): treat as the looser private case
+
+    # A group/supergroup/channel's per-chat ceiling is ~20 calls/min against a private chat's ~60,
+    # so the indicator has to cost proportionally less there: 12.0s == 5 calls/min, a quarter of it.
+    _TYPING_GROUP_MIN_GAP_S = 12.0
+
+    def _typing_chat_min_gap(self, chat_id: str) -> float:
+        if self._chat_is_group(chat_id):
+            return float(self._TYPING_GROUP_MIN_GAP_S)
+        return float(self._TYPING_CHAT_MIN_GAP_S)
+
+    def _chat_send_gap(self, chat_key: str, *, edit: bool = False, penalized: bool = True) -> float:
+        """Seconds this chat must leave between outbound Bot API calls.
+
+        Group/channel ceilings are ~3x stricter than a DM's. Edits take the wider of the chat gap
+        and the edit floor. A chat that recently published a retry_after stays widened for
+        ``send_penalty_window_seconds``.
+        """
+        if self._chat_is_group(chat_key):
+            gap = float(getattr(self, "_send_cooldown_group_seconds", 6.0))
+        else:
+            gap = float(getattr(self, "_send_cooldown_seconds", 2.0))
+        if edit:
+            gap = max(gap, float(getattr(self, "_edit_min_interval_seconds", 3.0)))
+        penalties = getattr(self, "_send_penalty_until", None) if penalized else None
+        if penalties and penalties.get(str(chat_key), 0.0) > time.monotonic():
+            gap *= float(getattr(self, "_send_penalty_factor", 2.0))
+        return max(0.0, gap)
+
+    def _record_send_penalty(self, chat_key: str) -> None:
+        """Remember that this chat published a retry_after, so its gap widens for a window."""
+        penalties = getattr(self, "_send_penalty_until", None)
+        if penalties is None:
+            return
+        window = float(getattr(self, "_send_penalty_window_seconds", 600.0))
+        if window <= 0:
+            return
+        penalties[str(chat_key)] = time.monotonic() + window
+        if len(penalties) > 4096:  # bounded, opportunistic trim; no background task
+            now = time.monotonic()
+            for stale in [k for k, v in penalties.items() if v < now]:
+                penalties.pop(stale, None)
+
+    async def _run_send_call(self, cooldown_chat_id: Any, send_fn: Any, *args: Any, _reserve_gap: bool = True,
+                             _expendable: Optional[bool] = None, _edit: bool = False, **kwargs: Any):
         """Run one outbound Bot API call under the chat's atomic gate.
 
         The lock stays held through the API call so a concurrent sender cannot commit to a stale wake-up
@@ -1611,7 +1690,12 @@ class TelegramAdapter(BasePlatformAdapter):
         users = getattr(self, "_send_cooldown_users", None)
         if users is not None:
             users[chat_key] = users.get(chat_key, 0) + 1
-        max_wait = float(getattr(self, "_send_cooldown_max_wait", 5.0))
+        # The cap exists so a 7000s server penalty cannot stall the chat path for two hours. It must
+        # never reject this chat's OWN routine spacing, though: a group gap wider than the cap would
+        # turn every second ordinary send into a retryable flood error. Penalty widening is excluded
+        # on purpose, so a chat under penalty still hands the long back-off to the caller.
+        max_wait = max(float(getattr(self, "_send_cooldown_max_wait", 5.0)),
+                       self._chat_send_gap(chat_key, edit=bool(_edit), penalized=False) + 0.5)
         deadline = time.monotonic() + max_wait
         expendable = _EXPENDABLE_TRAFFIC.get() if _expendable is None else _expendable
         finals = getattr(self, "_send_final_waiters", None)
@@ -1651,12 +1735,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 retry_after = self._telegram_retry_after(error)
                 if retry_after is not None:
                     cooldowns[chat_key] = max(float(cooldowns.get(chat_key, 0.0) or 0.0), time.monotonic() + retry_after)
+                    # The server just told us this chat is at its limit. Widen its gap for a window
+                    # so the next burst does not walk straight back into an escalating penalty.
+                    self._record_send_penalty(chat_key)
                 elif self._looks_like_connect_timeout(error) or self._looks_like_pool_timeout(error):
                     stamp_gap = False
                 raise
             finally:
                 if stamp_gap:
-                    gap = max(0.0, float(getattr(self, "_send_cooldown_seconds", 1.1)))
+                    gap = self._chat_send_gap(chat_key, edit=bool(_edit))
                     cooldowns[chat_key] = max(float(cooldowns.get(chat_key, 0.0) or 0.0), started_at + gap)
         finally:
             if not expendable:
@@ -1744,7 +1831,7 @@ class TelegramAdapter(BasePlatformAdapter):
         bot = self._bot
         if bot is None:
             raise RuntimeError("Telegram bot is not initialized")
-        return await self._run_send_call(str(chat_id), bot.edit_message_text, chat_id=chat_id, **kwargs)
+        return await self._run_send_call(str(chat_id), bot.edit_message_text, chat_id=chat_id, _edit=True, **kwargs)
 
     @staticmethod
     def _business_connection_kwargs(metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
@@ -2168,7 +2255,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # No topic routing on edits: message_thread_id/direct_messages_topic_id make Telegram reject it.
         payload = {**self._rich_payload_base(chat_id, content), "message_id": int(message_id)}
         try:
-            await self._run_send_call(chat_id, self._bot.do_api_request, "editMessageText", api_kwargs=payload)
+            await self._run_send_call(chat_id, self._bot.do_api_request, "editMessageText", api_kwargs=payload, _edit=True)
         except Exception as exc:
             # "Message is not modified" = successful no-op; skip the redundant legacy edit.
             if "not modified" in str(exc).lower():
