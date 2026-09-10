@@ -58,6 +58,7 @@ If upstream covers only part of the plugin contract, keep the plugin only for th
 
 | ID | Status | Stable commit subject | Purpose |
 | --- | --- | --- | --- |
+| HERMES-136 | Active | `fix(telegram): preserve nested delegation card indentation` | Keep nested delegation task and tool rows visibly indented in Telegram MarkdownV2 cards. |
 | HERMES-135 | Active | `fix(telegram): preserve nested and multiline legacy emphasis` | Resolve valid asterisk emphasis without stripping unmatched literals. |
 | HERMES-132 | Active | `fix(browser): return Camofox navigation titles` | Return the title from the same owned Camofox tab after navigation when its mutation response omits title metadata. |
 | HERMES-131 | Active | `fix(backup): retain verified quick-snapshot recovery generations` | Bound partial snapshot retention while preserving complete and verified per-database recovery coverage. |
@@ -311,6 +312,15 @@ These subjects are retained as provenance notes only. They are not validation in
 The umbrella commit contains independently retireable fixes. Never revert it wholesale to retire one of HERMES-001 through HERMES-010.
 
 ## Patch records
+
+### HERMES-136 — Preserve nested delegation card indentation
+
+- **Cause and contract:** Telegram's MarkdownV2 client collapses leading ASCII spaces in ordinary rich-text paragraphs, so rows rendered with `"  " * depth` visually flatten despite retaining distinct `A`, `A.1`, and `A.1.1` references. Use one U+00A0 no-break space per rendered depth (capped at the existing two display levels) for task and tool rows. Keep hierarchy references, inline roles, the heading-only bold treatment, tool-only rows, and the existing no-preview/no-`Last tool:` contract unchanged. The no-break space remains ordinary plain text: no code block, quote, border, wrap-policy, or execution-limit change.
+- **Model-facing authoring:** The task-card-row target is 24 characters total, including indentation/layer depth, hierarchy reference, separators/spaces, inline named role, and label. It remains guidance only: authored labels are neither truncated nor rejected; the tool-name 40-character bound is unchanged.
+- **Upstream tracking:** All-state GitHub issue/PR searches for `Telegram delegation indentation` on 2026-09-09 found no exact relevant Hermes issue or pull request. The local visual reproduction and fork-only card renderer establish this targeted correction; no upstream contribution is authorized.
+- **Regression:** `scripts/run_tests.sh tests/gateway/test_delegation_cards.py tests/tools/test_delegation_label_guidance.py`. Covers actual Telegram formatter payload construction for initial send and edit, visible depth-one/depth-two prefixes, third-level hierarchy references, tool-only activity rows, preserved full overlong labels, and the model-facing 24-character guidance on both task-label schemas.
+- **Rollback:** Revert only `fix(telegram): preserve nested delegation card indentation`, restoring ASCII prefixes and the former 32-character guidance; no schema, configuration, state, or migration is involved.
+- **Retirement:** Retire when released upstream preserves visible nested Telegram delegation indentation using an ordinary text-safe representation and retains equivalent formatter/send/edit coverage; remove this fork delta rather than retain duplicate behavior.
 
 ### HERMES-132 — Return Camofox navigation titles
 

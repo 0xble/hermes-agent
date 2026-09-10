@@ -1482,7 +1482,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 32-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit."),
+                        "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit."),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1514,7 +1514,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 32-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
+            "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

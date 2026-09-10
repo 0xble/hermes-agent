@@ -44,7 +44,8 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    content = "🧵 **Delegating · 0 min**\nA. Repair receipt · Worker\n↳ Started · awaiting activity"
+    content = ("🧵 **Delegating · 0 min**\nA. Repair receipt · Worker\n↳ Started · awaiting activity\n"
+               "\u00a0A.1. Verify card edit · Explorer\n\u00a0↳ ⚡ terminal")
 
     sent = await adapter.send_delegation_card(source, content)
     edited = await adapter.edit_message("42", "7", content, finalize=True)
@@ -56,6 +57,8 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     sent_lines = send_kwargs["text"].splitlines()
     assert sent_lines[0].startswith("🧵 *Delegating · 0 min*")
     assert sent_lines[1] == "A\\. Repair receipt · Worker"
+    assert sent_lines[3] == "\u00a0A\\.1\\. Verify card edit · Explorer"
+    assert sent_lines[4] == "\u00a0↳ ⚡ terminal"
     assert "*" not in sent_lines[1]
     assert "*" not in sent_lines[2]
     assert not any(line.startswith(">") for line in sent_lines)
@@ -167,10 +170,10 @@ async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layou
     lines = rendered.splitlines()
     assert lines[0] == "🧵 **Delegating · 0 min**"
     assert "A. Check Telegram edits · Worker" in lines
-    assert "  A.1. Verify card edit · Worker" in lines
-    assert "    A.1.1. Check Telegram edits · Worker" in lines
-    assert "    ↳ ⚡ computer_use" in lines
-    assert "    A.1.1.1. Bound deep descendant · Worker · ↑A.1.1" in lines
+    assert "\u00a0A.1. Verify card edit · Worker" in lines
+    assert "\u00a0\u00a0A.1.1. Check Telegram edits · Worker" in lines
+    assert "\u00a0\u00a0↳ ⚡ computer_use" in lines
+    assert "\u00a0\u00a0A.1.1.1. Bound deep descendant · Worker · ↑A.1.1" in lines
     assert any(len(line) > 32 for line in lines[1::2])  # guidance never truncates authored labels
     assert all("Last tool:" not in line and "PRIVATE_" not in line for line in lines)
     assert not any(line.startswith(">") for line in lines)
@@ -224,9 +227,9 @@ async def test_nested_relays_reach_root_card_with_root_display_owner(tmp_path):
     assert cards.cards["c" * 32]["delegation_owner"]["session_id"] == "child-2"
     rendered = adapter.send_delegation_card.call_args.args[1]
     assert "A. root" in rendered
-    assert "  A.1. child" in rendered
-    assert "    A.1.1. grandchild" in rendered
-    assert "    ↳ ⚡ read_file" in rendered
+    assert "\u00a0A.1. child" in rendered
+    assert "\u00a0\u00a0A.1.1. grandchild" in rendered
+    assert "\u00a0\u00a0↳ ⚡ read_file" in rendered
 
 
 @pytest.mark.asyncio

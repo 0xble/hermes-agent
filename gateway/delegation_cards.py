@@ -42,7 +42,10 @@ def _row_identity(task_key, ref):
 
 
 def _row_prefix(depth):
-    return "  " * min(max(0, depth), 2)
+    # Telegram's MarkdownV2 client collapses leading ASCII spaces in ordinary
+    # rich-text paragraphs.  NBSP stays plain text while retaining one visible
+    # indentation unit per displayed delegation layer.
+    return "\u00a0" * min(max(0, depth), 2)
 
 
 def render_card(card, now=None):
@@ -86,7 +89,7 @@ def render_card(card, now=None):
         named_type = _label(row.get("subagent_type"), "", 10_000)
         role_suffix = f" · {named_type.capitalize()}" if named_type else ""
         parent_marker = row.get("_parent_marker", "")
-        # The model receives a 32-character row-budget guideline, but authored
+        # The model receives a 24-character row-budget guideline, but authored
         # labels are never truncated or rejected here. Telegram's proportional
         # fonts likewise cannot guarantee physical width.
         label = _label(row.get("task_label"), "Task " + row["thread_ref"], 10_000)
