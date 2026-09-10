@@ -4203,7 +4203,7 @@ class BasePlatformAdapter(ABC):
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event,
-                                           generation: Optional[int] = None) -> None:
+                                           generation: Optional[int] = None, *, delivery_succeeded: bool = True) -> None:
         """Run the one-shot post-delivery callback (bounded, errors swallowed). ``generation`` is the
         caller's snapshot from right after the handler returned; the shared interrupt event is only a
         fallback, because a queued follow-up rebinds its generation before this runs and reading it
@@ -4212,10 +4212,15 @@ class BasePlatformAdapter(ABC):
             generation = getattr(interrupt_event, "_hermes_run_generation", None)
         _post_cb = self.pop_post_delivery_callback(session_key, generation=generation)
         if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+            from gateway.status_delivery import final_delivery_succeeded
+            outcome_token = final_delivery_succeeded.set(delivery_succeeded)
+            try:
+                with contextlib.suppress(asyncio.TimeoutError, Exception):
+                    _post_result = _post_cb()
+                    if inspect.isawaitable(_post_result):
+                        await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+            finally:
+                final_delivery_succeeded.reset(outcome_token)
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -4244,6 +4249,7 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        processing_ok = False  # cancellation/exception must not erase undelivered progress
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -4338,7 +4344,8 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event, callback_generation)
+            await self._fire_post_delivery_callback(
+                session_key, interrupt_event, callback_generation, delivery_succeeded=processing_ok)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)

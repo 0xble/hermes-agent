@@ -3832,6 +3832,11 @@ class GatewayTurnMixin:
         async def _cleanup_temp_bubbles() -> None:
             """Awaited by the caller, so deletion completes BEFORE a queued follow-up starts —
             a fire-and-forget future would race the next turn's own bubbles."""
+            from gateway.status_delivery import final_delivery_succeeded
+            if not final_delivery_succeeded.get():
+                logger.info("Keeping temporary bubbles after failed delivery for session %s generation %s",
+                            session_key, turn_ctx.run_generation)
+                return
             # Snapshot at INVOCATION, not registration: a heartbeat/status send that lands while
             # final delivery is in flight still belongs to this turn's cleanup set.
             if delivery is not None:
@@ -3845,7 +3850,8 @@ class GatewayTurnMixin:
                     # captured one can no longer reach the chat.
                     _delete_adapter = (delivery.owners.get(_mid) if delivery is not None else None)
                     _delete_adapter = _delete_adapter or self._adapter_for_source(source) or _adapter_snapshot
-                    _deleted = await _delete_adapter.delete_message(_chat_id_snapshot, _mid)
+                    _deleted = (await delivery.delete(_delete_adapter, _mid) if delivery is not None
+                                else await _delete_adapter.delete_message(_chat_id_snapshot, _mid))
                 except asyncio.CancelledError:
                     _completed = _deleted_count + len(_failed_details)
                     logger.warning(
@@ -3931,9 +3937,19 @@ class GatewayTurnMixin:
         if not _notify_adapter:
             return
         _heartbeat_msg_id: Optional[str] = None
+        _send_attempted = False
+        _replacement_used = False
+        _edit_retry_at = 0.0
+        # Reuse the turn's shielded receipt/cleanup path, including late receipts
+        # and the exact transport that accepted them. Never send a rich final as
+        # a mutable heartbeat (rich_messages=always also applies to short text).
+        delivery = turn_ctx._status_delivery
+        heartbeat_metadata = _interim_metadata(_non_conversational_metadata(
+            _status_thread_metadata, platform=source.platform))
+        heartbeat_metadata["expect_edits"] = True
         while True:
             await asyncio.sleep(_NOTIFY_INTERVAL)
-            if not self._should_emit_long_running_notification(
+            if not turn_ctx._run_still_current() or not self._should_emit_long_running_notification(
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
@@ -3960,22 +3976,34 @@ class GatewayTurnMixin:
                 else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
             )
             try:
-                _notify_res = None
+                if time.monotonic() < _edit_retry_at:
+                    continue
                 if _heartbeat_msg_id:
-                    try:
-                        _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
-                    except Exception as _ee:
-                        logger.debug("Heartbeat edit failed: %s", _ee)
-                        _notify_res = None
-                if not (_notify_res and getattr(_notify_res, "success", False)):
-                    _notify_res = await _notify_adapter.send(
-                        source.chat_id, _heartbeat_text,
-                        metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
-                    )
-                    if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
-                        _heartbeat_msg_id = str(_notify_res.message_id)
-                        if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                    _notify_res = await _notify_adapter.edit_message(
+                        source.chat_id, _heartbeat_msg_id, _heartbeat_text)
+                    if getattr(_notify_res, "success", False):
+                        continue
+                    retry_after = getattr(_notify_res, "retry_after", None)
+                    if isinstance(retry_after, (int, float)) and retry_after > 0:
+                        _edit_retry_at = time.monotonic() + retry_after
+                        continue
+                    # Only confirmed absence permits one replacement per turn.
+                    # 429/network/permissions/unknown outcomes keep the anchor.
+                    error = str(getattr(_notify_res, "error", "") or "").lower()
+                    missing = not getattr(_notify_res, "retryable", False) and any(
+                        marker in error for marker in ("message to edit not found", "message_id_invalid"))
+                    if not missing or _replacement_used:
+                        continue
+                    _replacement_used = True
+                    _heartbeat_msg_id = None
+                    _send_attempted = False
+                if _send_attempted:
+                    continue  # an ambiguous send must never produce another bubble
+                _send_attempted = True  # claim BEFORE awaiting transport acceptance
+                _notify_res = await delivery.progress_send(
+                    _notify_adapter, _heartbeat_text, metadata=heartbeat_metadata)
+                if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
+                    _heartbeat_msg_id = str(_notify_res.message_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
