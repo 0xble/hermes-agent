@@ -2878,7 +2878,10 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
     try:
         from hermes_cli.config_effective import load_user_config_effective
         return load_user_config_effective(config_path)
-    except Exception:
+    except Exception as exc:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(exc, ModelPresetError):
+            raise
         logger.debug("Could not load gateway config from %s", config_path, exc_info=True)
         return {}
 
