@@ -29,8 +29,14 @@ from tests.gateway.test_run_progress_interrupt import (  # noqa: E402
 )
 
 
-_PROGRESS_EDIT_INTERVAL = 1.5  # must match gateway/run.py
-_RUN_SECONDS = 4.0
+from gateway.run_turn_runner import _PROGRESS_EDIT_INTERVAL  # noqa: E402
+
+# Read the real constant rather than restating it: a copy here silently stops testing the
+# production rate the moment the interval is retuned against a platform's flood budget.
+# Long enough that the shared-clock budget stays BELOW the unshared ceiling at the production
+# interval (the self-guard at the end of the test enforces this): the run must exceed
+# _PROGRESS_EDIT_INTERVAL * (_SESSIONS + 2) / (_SESSIONS - 1) seconds.
+_RUN_SECONDS = 12.0
 _SESSIONS = 4
 
 
