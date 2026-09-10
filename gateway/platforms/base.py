@@ -3917,7 +3917,8 @@ class BasePlatformAdapter(ABC):
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 obligation_kind="agent_final",
-                turn_token=getattr(event, "_gateway_active_turn_token", None))
+                turn_token=getattr(event, "_gateway_active_turn_token", None),
+                delegation_receipt=getattr(event, "_delegation_card_receipt", None))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
@@ -3939,6 +3940,9 @@ class BasePlatformAdapter(ABC):
                 flood_wait_seconds, is_flood_error, mark_delivered, mark_failed)
             if getattr(result, "success", False):
                 await asyncio.to_thread(mark_delivered, obligation_id)
+                cards = getattr(self.gateway_runner, "_delegation_cards", None)
+                if cards is not None:
+                    await cards.delivered(getattr(event, "_delegation_card_receipt", None))
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)

@@ -1724,7 +1724,15 @@ class GatewayTurnMixin:
         if cards is not None and not agent_result.get("failed"):
             receipt = cards.receipt(event, session_key, run_generation)
             event._delegation_card_receipt = receipt
-            if _intentional_silence or agent_result.get("already_sent"):
+            if _intentional_silence:
+                # An explicit incorporation may be silent; a blocker report cannot.
+                silent = {}
+                for key, proof in receipt.items():
+                    refs = [ref for ref in proof["refs"] if cards.cards[key]["handling"][ref]["reason"] == "incorporated"]
+                    if refs:
+                        silent[key] = {**proof, "refs": refs}
+                await cards.delivered(silent)
+            elif agent_result.get("already_sent"):
                 await cards.delivered(receipt)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:

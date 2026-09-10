@@ -13,6 +13,7 @@ best-effort: ledger failures must never block a send; callers wrap every call in
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -206,7 +207,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
     for column, ddl in (("adapter_profile", "adapter_profile TEXT"),
                         ("obligation_kind", "obligation_kind TEXT NOT NULL DEFAULT 'legacy'"),
-                        ("turn_token", "turn_token TEXT")):
+                        ("turn_token", "turn_token TEXT"),
+                        ("delegation_receipt", "delegation_receipt TEXT")):
         if column in columns:
             continue
         try:
@@ -294,7 +296,8 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
-                      obligation_kind: str = "agent_final", turn_token: Optional[str] = None) -> None:
+                      obligation_kind: str = "agent_final", turn_token: Optional[str] = None,
+                      delegation_receipt: Optional[dict] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -303,12 +306,20 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile,
-                obligation_kind, turn_token)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?)""",
+                obligation_kind, turn_token, delegation_receipt)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
-             obligation_kind, turn_token))
+             obligation_kind, turn_token, json.dumps(delegation_receipt) if delegation_receipt else None))
     _prune()
+
+
+def delivered_delegation_receipts() -> list[dict]:
+    """Exact final-send dependencies for card reconciliation, never transcript inference."""
+    with _DB_LOCK, _transaction() as conn:
+        return [json.loads(row[0]) for row in conn.execute(
+            "SELECT delegation_receipt FROM delivery_obligations "
+            "WHERE state='delivered' AND delegation_receipt IS NOT NULL")]
 
 
 def mark_attempting(obligation_id: str) -> None:

@@ -12,6 +12,7 @@ import logging
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from agent.display import get_tool_emoji
@@ -222,19 +223,27 @@ class DelegationCards:
     def _projection(self, key):
         anchor = self.cards[key]
         rows = {}
+        hidden = set()
         for task_key, card in self._members(key):
-            if card.get("retired"):
-                continue
             for ref, row in card["rows"].items():
-                if ref in (card.get("handled") or ()) and row["state"] in _TERMINAL | {"unknown"}:
-                    continue
-                rows[_row_identity(task_key, ref)] = {
+                identity = _row_identity(task_key, ref)
+                if card.get("retired") or (ref in (card.get("handled") or ()) and row["state"] in _TERMINAL | {"unknown"}):
+                    hidden.add(identity)
+                rows[identity] = {
                     **row,
                     "thread_ref": row.get("display_ref", ref),
                     "card_parent_identity": _row_identity(row["card_parent_task_id"], row["card_parent_thread_ref"])
                     if row.get("card_parent_task_id") and row.get("card_parent_thread_ref") else None,
                 }
-        return {"started_at": anchor["started_at"], "rows": rows}
+        visible = set(rows) - hidden
+        for identity in list(visible):
+            parent = rows[identity].get("card_parent_identity")
+            seen = {identity}
+            while parent in rows and parent not in seen:
+                visible.add(parent)
+                seen.add(parent)
+                parent = rows[parent].get("card_parent_identity")
+        return {"started_at": anchor["started_at"], "rows": {k: v for k, v in rows.items() if k in visible}}
 
     def _bind(self, key):
         presentation.bind(self, key)
@@ -269,6 +278,12 @@ class DelegationCards:
             used.add(row["display_ref"])
 
     async def reconcile(self):
+        from gateway.delivery_ledger import delivered_delegation_receipts
+        try:
+            for receipt in await asyncio.to_thread(delivered_delegation_receipts):
+                await self.delivered(receipt)
+        except Exception:
+            logger.warning("Delegation delivery receipt reconciliation failed", exc_info=True)
         # Recovery uses the same normalized scope lock as dispatch and transport.
         for scope in dict.fromkeys(self._scope(c) for c in self.cards.values()):
             async with self.locks.setdefault(scope, asyncio.Lock()):
@@ -341,6 +356,18 @@ class DelegationCards:
                 "card_parent_task_id": data.get("card_parent_task_id"),
                 "card_parent_thread_ref": data.get("card_parent_thread_ref"),
                 "state": "running", "last_tool": None}
+            replacement = data.get("replaces")
+            old = self.cards.get(replacement.get("parent_task_id")) if isinstance(replacement, dict) else None
+            old_ref = replacement.get("thread_ref") if isinstance(replacement, dict) else None
+            if (old and old.get("delegation_owner", old["owner"]) == owner
+                    and old["owner"] == card_owner and self._scope(old) == self._scope(card)
+                    and old_ref in old["rows"] and old["rows"][old_ref]["state"] in _TERMINAL | {"unknown"}):
+                row["replaces"] = copy.deepcopy(replacement)
+                old.setdefault("handling", {})[old_ref] = {"reason": "replacement",
+                    "replacement": {"parent_task_id": key, "thread_ref": ref}, "actor_session_id": owner.get("session_id")}
+                old["handled"] = sorted({*old.get("handled", ()), old_ref})
+                # Bind the replacement to the existing anchor before retiring
+                # the old task, otherwise presentation.bind chooses a new bubble.
             card["generation"] += 1
             if data.get("background") is False:
                 self.turn_tasks.setdefault((session_key, generation), {}).setdefault(key, set()).add(ref)
@@ -351,6 +378,9 @@ class DelegationCards:
         else:
             return
         self._bind(key)
+        for _, member in self._members(key):
+            if _handled_terminal(member):
+                member["retired"] = True
         if _handled_terminal(card):
             card["retired"] = True
         anchor = self.cards[self._anchor(key)]
@@ -442,67 +472,85 @@ class DelegationCards:
         if revision is not None and (revision != card.get("revision", 0) or card.get("retry_at")):
             self._queue(key)
 
+    async def handling(self, source, session_key, session_id, generation, *,
+                       actor_session_id, parent_task_id, refs, reason):
+        """Explicit parent attestation, not result arrival or prose classification.
+
+        Root attestations await their final delivery. Nested incorporation has
+        no user-facing send dependency; its own parent may consume it silently.
+        """
+        card = self.cards.get(parent_task_id)
+        if (not card or not isinstance(refs, list) or not refs
+                or not all(isinstance(ref, str) for ref in refs)
+                or len(set(refs)) != len(refs)
+                or reason not in {"incorporated", "blocker_report", "validate_replacement"}):
+            raise ValueError("Expected exact task identity, refs and handling reason")
+        async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
+            owner = card.get("delegation_owner", card["owner"])
+            if (owner.get("session_id") != actor_session_id
+                    or card["owner"].get("session_id") != session_id
+                    or card["owner"].get("session_key") != session_key
+                    or str(card["source"]["chat_id"]) != str(source.chat_id)
+                    or str(card["source"].get("thread_id") or "") != str(source.thread_id or "")
+                    or any(ref not in card["rows"] or card["rows"][ref]["state"] not in _TERMINAL | {"unknown"} for ref in refs)):
+                raise ValueError("Handling requires this exact parent owner's terminal rows")
+            if reason == "validate_replacement":
+                return {"validated": True}
+            if actor_session_id != session_id and reason == "blocker_report":
+                raise ValueError("A nested parent cannot attest a root user-facing delivery; incorporate its result instead")
+            for ref in refs:
+                prior = card.get("handling", {}).get(ref, {})
+                card.setdefault("handling", {})[ref] = dict(
+                    # A queued outbound obligation already owns this exact ID.
+                    # Re-attesting the same immutable terminal ref must not revoke it.
+                    id=prior.get("id") or uuid.uuid4().hex, reason=reason, actor_session_id=actor_session_id,
+                    session_key=session_key, generation=generation,
+                    epoch=card.get("receipt_epoch", 0))
+            self._save()
+            proof = {parent_task_id: self._proof(card, refs)}
+        if actor_session_id != session_id and reason == "incorporated":
+            await self.delivered(proof)
+        return {"recorded": True, "parent_task_id": parent_task_id, "refs": refs,
+                "awaiting_delivery": actor_session_id == session_id or reason == "blocker_report"}
+
+    @staticmethod
+    def _proof(card, refs):
+        return {"generation": card["generation"], "epoch": card.get("receipt_epoch", 0),
+                "refs": sorted(refs), "owner": copy.deepcopy(card.get("delegation_owner", card["owner"])),
+                "handling_ids": {ref: card["handling"][ref]["id"] for ref in refs}}
+
     def receipt(self, event, session_key, generation):
-        metadata = event.metadata or {}
         receipt = {}
-        turn_refs = self.turn_tasks.get((session_key, generation), {})
-
-        def add_terminal(key, refs):
-            card = self.cards.get(key)
-            if not (card and not card.get("retired") and card["rows"]
+        for key, card in self.cards.items():
+            refs = [ref for ref, intent in card.get("handling", {}).items()
+                    if ref not in card.get("handled", ())
+                    and intent.get("session_key") == session_key
+                    and intent.get("generation") == generation
+                    and intent.get("epoch") == card.get("receipt_epoch", 0)
                     and str(event.source.chat_id) == str(card["source"]["chat_id"])
-                    and str(event.source.thread_id or "") == str(card["source"].get("thread_id") or "")):
-                return
-            refs = {ref for ref in refs if ref in card["rows"]
-                    and card["rows"][ref].get("state") in _TERMINAL | {"unknown"}}
+                    and str(event.source.thread_id or "") == str(card["source"].get("thread_id") or "")]
             if refs:
-                existing = receipt.get(key, {}).get("refs", [])
-                receipt[key] = {"generation": card["generation"], "epoch": card.get("receipt_epoch", 0),
-                                "refs": sorted(set(existing) | refs)}
-
-        for key, refs in turn_refs.items():
-            add_terminal(key, refs)
-
-        root_key = metadata.get("delegation_parent_task_id") if event.internal else None
-        root_owner = metadata.get("delegation_owner") if event.internal else None
-        root_refs = set(metadata.get("delegation_thread_refs", [])) if root_key else set()
-        root = self.cards.get(root_key)
-        if not (root and root_owner == root["owner"]):
-            return receipt
-
-        # A background root's eventual receipt owns only terminal nodes linked
-        # to its exact card rows.  This consumes completed synchronous children
-        # without sweeping up still-running descendants or other root cards.
-        pending = [(root_key, ref) for ref in root_refs if ref in root["rows"]]
-        seen = set(pending)
-        while pending:
-            parent_key, parent_ref = pending.pop()
-            for key, card in self.cards.items():
-                if card.get("retired") or card.get("owner") != root_owner:
-                    continue
-                for ref, row in card.get("rows", {}).items():
-                    if (row.get("card_parent_task_id"), row.get("card_parent_thread_ref")) != (parent_key, parent_ref):
-                        continue
-                    node = (key, ref)
-                    if node not in seen:
-                        seen.add(node)
-                        pending.append(node)
-        for key, ref in seen:
-            add_terminal(key, {ref})
+                receipt[key] = self._proof(card, refs)
         return receipt
 
     async def delivered(self, receipt):
-        for key, proof in receipt.items():
+        for key, proof in (receipt or {}).items():
             if key not in self.cards:
                 continue
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
                 anchor_key = self._anchor(key)
                 card = self.cards.get(key)
-                if (not card or card.get("retired")
-                        or proof.get("epoch", 0) != card.get("receipt_epoch", 0)
-                        or proof["generation"] > card["generation"]):
+                if not card or card.get("retired"):
                     continue
-                handled = set(card.get("handled") or []) | (set(proof["refs"]) & set(card["rows"]))
+                if proof.get("owner") != card.get("delegation_owner", card["owner"]):
+                    continue
+                refs = {ref for ref in proof.get("refs", ()) if ref in card["rows"]
+                        and card["rows"][ref]["state"] in _TERMINAL | {"unknown"}
+                        and proof.get("handling_ids", {}).get(ref)
+                        and proof["handling_ids"][ref] == card.get("handling", {}).get(ref, {}).get("id")}
+                if not refs:
+                    continue
+                handled = set(card.get("handled") or []) | refs
                 card["handled"] = sorted(handled)
                 self._save()
                 if _handled_terminal(card):

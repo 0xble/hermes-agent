@@ -1,5 +1,13 @@
 """Real manager, persistence, adapter and shared gate; only the Bot API is fake."""
 import asyncio
+
+
+async def handled_delivery(manager, key):
+    card = manager.cards[key]
+    await manager.handling(manager._source(card), "r", "s", 1, actor_session_id="s",
+                           parent_task_id=key, refs=["A"], reason="incorporated")
+    await manager.delivered({key: manager._proof(card, ["A"])})
+
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -138,7 +146,7 @@ async def test_displacement_is_real_topic_activity_with_live_rows_and_original_i
     await inbound(adapter, 900)
     await drain(manager)
     assert card["message_id"] == replacement  # terminal-only never reanchors
-    await manager.delivered({data["parent_task_id"]: {"generation": card["generation"], "refs": ["A"]}})
+    await handled_delivery(manager, data["parent_task_id"])
     await drain(manager)
     assert replacement not in live and card["retired"]
 
@@ -211,8 +219,7 @@ async def test_replace_failure_restart_and_cleanup_cannot_accumulate_anchors(tmp
     # Late tool callbacks cannot revive a post-restart unknown execution.
     await restored.observe(source, "r", "s", 1, "subagent.tool", "terminal", data)
     assert recovered["rows"]["A"]["state"] == "unknown"
-    await restored.delivered({data["parent_task_id"]: {"generation": recovered["generation"],
-                             "epoch": recovered["receipt_epoch"], "refs": ["A"]}})
+    await handled_delivery(restored, data["parent_task_id"])
     await drain(restored)
     assert not recovered.get("message_id")
 
@@ -250,7 +257,7 @@ async def test_reanchor_coalesces_with_final_priority_and_terminal_callback(tmp_
     # Late completion and final delivery operate on the logical task, not old ID.
     await manager.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
     await drain(manager)
-    await manager.delivered({data["parent_task_id"]: {"generation": card["generation"], "refs": ["A"]}})
+    await handled_delivery(manager, data["parent_task_id"])
     await drain(manager)
     assert not card["message_id"]
 
@@ -292,8 +299,7 @@ async def test_event_during_replace_drains_without_another_external_event(tmp_pa
         await manager._observe(source, "r", "s", 1, "subagent.complete", None,
                                {**data, "status": "completed"})
         if final_delivery:
-            final_tasks.append(asyncio.create_task(manager.delivered({data["parent_task_id"]: {
-                "generation": card["generation"], "refs": ["A"]}})))
+            final_tasks.append(asyncio.create_task(handled_delivery(manager, data["parent_task_id"])))
 
     async def send(**kw):
         if during == "send":

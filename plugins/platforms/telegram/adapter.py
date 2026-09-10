@@ -4369,6 +4369,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if isinstance(outcome, SendResult):
                     return self._partial_text_delivery_failure(outcome, message_ids, chunks) if message_ids else outcome
                 msg, used_thread_fallback = outcome
+                # Count acknowledged physical chunks even if a later chunk fails.
+                # The outer send receipt can repeat these IDs; the manager deduplicates.
+                from plugins.platforms.telegram.conversation_activity import physical_outbound
+                physical_outbound(self, chat_id, msg, metadata, None if used_thread_fallback else thread_id)
                 message_ids.append(str(msg.message_id))
             await self._retrigger_typing(chat_id, metadata)
             return SendResult(
@@ -4601,9 +4605,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
                     text = _strip_mdv2(chunk) if finalize else chunk
-                return await self._run_send_call(chat_id, self._bot.send_message,
+                sent = await self._run_send_call(chat_id, self._bot.send_message,
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base)
+                from plugins.platforms.telegram.conversation_activity import physical_outbound
+                physical_outbound(self, chat_id, sent, metadata, thread_kwargs.get("message_thread_id"))
+                return sent
             except Exception as send_err:
                 if "reply message not found" in str(send_err).lower():
                     # Private DM topic fallback needs anchor + topic id together; forum topics keep thread id.
@@ -4611,9 +4618,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         {} if self._dm_topic_fallback(metadata)
                         else self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=None))
                     try:
-                        return await self._run_send_call(chat_id, self._bot.send_message,
+                        sent = await self._run_send_call(chat_id, self._bot.send_message,
                             chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
                             **retry_thread_kwargs, **base)
+                        from plugins.platforms.telegram.conversation_activity import physical_outbound
+                        physical_outbound(self, chat_id, sent, metadata, retry_thread_kwargs.get("message_thread_id"))
+                        return sent
                     except Exception as _retry_err:
                         logger.warning(
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
@@ -5666,8 +5676,11 @@ class TelegramAdapter(BasePlatformAdapter):
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
         """Send one native media payload with thread routing + DM-topic anchor retry."""
         reply_to_id, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
-        return await self._send_with_dm_topic_reply_anchor_retry(
+        sent = await self._send_with_dm_topic_reply_anchor_retry(
             send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media)
+        from plugins.platforms.telegram.conversation_activity import physical_outbound
+        physical_outbound(self, chat_id, sent, metadata, kwargs.get("message_thread_id"))
+        return sent
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:

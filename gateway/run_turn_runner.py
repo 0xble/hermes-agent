@@ -114,6 +114,14 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if event_type == "subagent.handling":
+            from gateway.delegation_cards import cards_for
+            if ctx.source.platform != Platform.TELEGRAM:
+                raise ValueError("Delegation card handling is unavailable on this surface")
+            future = self._schedule(cards_for(self._runner).handling(
+                ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, **kwargs),
+                "delegation handling failed")
+            return future.result(timeout=30)
         if (event_type in {"subagent.start", "subagent.tool", "subagent.complete"}
                 and kwargs.get("parent_task_id") and ctx.source.platform == Platform.TELEGRAM
                 and ctx.tool_progress_enabled and ctx.progress_mode not in {"off", "log"}):

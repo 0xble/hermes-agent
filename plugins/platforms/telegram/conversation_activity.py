@@ -22,6 +22,16 @@ def inbound(adapter, update):
                getattr(message, "message_thread_id", None), getattr(message, "message_id", None))
 
 
+def physical_outbound(adapter, chat_id, message, metadata, thread_id=None):
+    """One acknowledged new message, never an edit/draft/card/status update."""
+    if (metadata or {}).get("hermes_status"):
+        return
+    messages = message if isinstance(message, (tuple, list)) else [message]
+    for sent in messages:
+        record(adapter, chat_id, getattr(sent, "message_thread_id", thread_id),
+               getattr(sent, "message_id", None))
+
+
 def outbound(adapter, chat_id, result, metadata):
     if not result.success or (metadata or {}).get("hermes_status"):
         return

@@ -1064,6 +1064,17 @@ def _effective_task_labels(
     return labels, None
 
 
+def _card_handling(parent_agent, parent_task_id, refs, reason):
+    callback = getattr(parent_agent, "tool_progress_callback", None)
+    if not callable(callback):
+        raise ValueError("Delegation handling requires a gateway card owner")
+    result = callback("subagent.handling", actor_session_id=str(parent_agent.session_id),
+                      parent_task_id=parent_task_id, refs=refs, reason=reason)
+    if not isinstance(result, dict):
+        raise ValueError("Delegation handling was not acknowledged")
+    return result
+
+
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
@@ -1072,6 +1083,7 @@ def delegate_task(
     child_tool_policy: Optional[str] = None,
     completion_contract: Optional[Dict[str, Any]] = None,
     parent_task_id: Optional[str] = None, task_label: Optional[str] = None,
+    handled_refs: Optional[List[str]] = None, handling: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -1081,6 +1093,11 @@ def delegate_task(
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
+    if normalized_action == "handle":
+        try:
+            return json.dumps(_card_handling(parent_agent, parent_task_id, handled_refs, handling))
+        except (ValueError, TimeoutError) as exc:
+            return tool_error(str(exc))
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
@@ -1190,6 +1207,15 @@ def delegate_task(
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
+    for task in task_list:
+        replacement = task.get("replaces")
+        if replacement is not None:
+            if not isinstance(replacement, dict) or set(replacement) != {"parent_task_id", "thread_ref"}:
+                return tool_error("replaces must name an exact parent_task_id and thread_ref")
+            try:
+                _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]], "validate_replacement")
+            except (ValueError, TimeoutError) as exc:
+                return tool_error(str(exc))
     creds = dict(task_runtime[0].credentials)
 
     overall_start = time.monotonic()
@@ -1218,7 +1244,8 @@ def delegate_task(
                         task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
                         subagent_type=vars(_child).get("_delegation_named_type"),
                         native_review=(completion_contract or {}).get("kind") == "native_review",
-                        owner=_owner, card_owner=_card_owner, background=bool(background))
+                        owner=_owner, card_owner=_card_owner, background=bool(background),
+                        replaces=task_list[_i].get("replaces"))
     _metadata["threads"] = [
         {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
          "role": getattr(child, "_delegate_role", None),
@@ -1546,7 +1573,8 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Required for a new delegation: use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+                        "replaces": {"type": "object", "properties": {"parent_task_id": {"type": "string"}, "thread_ref": {"type": "string"}}, "required": ["parent_task_id", "thread_ref"], "additionalProperties": False, "description": "Explicit recovery of this parent-owned terminal thread; retire it only after this replacement actually starts. Failed spawn leaves it visible."},
+                        "task_label": _p("string", "Required for a new delegation: use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1585,7 +1613,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. Use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. Use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -1595,9 +1623,12 @@ DELEGATE_TASK_SCHEMA = {
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
+                "'handle' attests exact owned results actually incorporated, or a composed blocker report, using parent_task_id + handled_refs + handling. Arrival alone never handles a row. Nested parents can incorporate only their own children; they cannot attest root user-facing delivery. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop"],
+                enum=["spawn", "list", "steer", "stop", "handle"],
             ),
+            "handled_refs": {"type": "array", "items": {"type": "string"}, "description": "For action=handle: exact terminal thread_refs under parent_task_id, after incorporating their results or preparing their blocker report. Arrival alone is not handling; never infer task success."},
+            "handling": _p("string", "For action=handle: incorporated or blocker_report. Root rows retire only after successful final delivery; blocker_report requires a delivered user-facing report.", enum=["incorporated", "blocker_report"]),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(
                 "string",
@@ -1640,6 +1671,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_task_id=args.get("parent_task_id"), task_label=args.get("task_label"),
+        handled_refs=args.get("handled_refs"), handling=args.get("handling"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

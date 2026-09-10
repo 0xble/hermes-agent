@@ -15,6 +15,16 @@ from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 
 
+async def handling_receipt(cards, key, refs, generation):
+    card = cards.cards[key]
+    await cards.handling(cards._source(card), card["owner"]["session_key"], card["owner"]["session_id"], generation,
+                         actor_session_id=card.get("delegation_owner", card["owner"])["session_id"],
+                         parent_task_id=key, refs=refs, reason="incorporated"
+                         if card.get("delegation_owner", card["owner"])["session_id"] != card["owner"]["session_id"]
+                         else "blocker_report")
+    return {key: cards._proof(card, refs)}
+
+
 def test_render_card_is_plain_rich_text_with_task_first_rows():
     card = {
         "started_at": 0,
@@ -185,8 +195,9 @@ async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layou
 
     for data in (root_data, child_data, grandchild_data, deeper_data):
         await cards.observe(source, "***", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
-    receipt = {key: {"generation": cards.cards[key]["generation"], "epoch": cards.cards[key].get("receipt_epoch", 0), "refs": ["A"]}
-               for key in (root, child, grandchild, deeper)}
+    receipt = {}
+    for key in (root, child, grandchild, deeper):
+        receipt.update(await handling_receipt(cards, key, ["A"], 1))
     await cards.delivered(receipt)
     assert all(card["retired"] for card in cards.cards.values())
     await cards.observe(source, "***", "s", 1, "subagent.tool", "terminal", root_data)
@@ -238,7 +249,7 @@ async def test_nested_relays_reach_root_card_with_root_display_owner(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_root_receipt_consumes_only_terminal_nested_descendants(tmp_path):
+async def test_root_receipt_never_infers_nested_handling(tmp_path):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
         edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
@@ -262,7 +273,7 @@ async def test_root_receipt_consumes_only_terminal_nested_descendants(tmp_path):
         "delegation_parent_task_id": "a" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
 
     receipt = cards.receipt(event, "route", 2)
-    assert set(receipt) == {"a" * 32, "b" * 32, "c" * 32}
+    assert receipt == {}
     await cards.delivered(receipt)
 
     assert cards.cards["d" * 32].get("handled", []) == []
@@ -280,7 +291,8 @@ def test_render_card_preserves_full_explicit_label_without_card_truncation():
 
 
 @pytest.mark.asyncio
-async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
+@pytest.mark.parametrize("state, display", [("completed", "Returned"), ("failed", "Failed"), ("interrupted", "Interrupted")])
+async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, display):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
         edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True))
@@ -307,14 +319,14 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path):
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
-    relay.progress_callback("subagent.complete", status="completed", **data)
+    relay.progress_callback("subagent.complete", status=state, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    assert "Returned · awaiting parent" in render_card(cards.cards["a" * 32])
+    assert f"{display} · awaiting parent" in render_card(cards.cards["a" * 32])
     adapter.delete_message.assert_not_awaited()
     final_event = MessageEvent(text="Returned", source=source, internal=True, metadata={
         "delegation_parent_task_id": "a" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
-    final_event._delegation_card_receipt = cards.receipt(final_event, "route", 2)
+    final_event._delegation_card_receipt = await handling_receipt(cards, "a" * 32, ["A"], 2)
     transport = SimpleNamespace(name="test")
     transport._send_final_text = BasePlatformAdapter._send_final_text.__get__(transport)
     # Upstream moved the ledger bracket out of _send_final_text into send_final_ledgered; bind the
@@ -369,7 +381,7 @@ async def test_persisted_telegram_card_resolves_live_adapter_and_cleans_up(tmp_p
 
     event = MessageEvent(text="Returned", source=source, internal=True, metadata={
         "delegation_parent_task_id": "e" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
-    await restored.delivered(restored.receipt(event, "route", 2))
+    await restored.delivered(await handling_receipt(restored, "e" * 32, ["A"], 2))
     adapter.delete_message.assert_awaited_once_with("42", "card")
 
 
@@ -456,6 +468,8 @@ async def test_silent_terminal_delivery_and_unchanged_suppression(tmp_path):
     await asyncio.gather(*list(cards.pending.values()))
     assert "Failed · awaiting parent" in render_card(cards.cards["c" * 32])
     event = MessageEvent(source=source, text="")
+    await cards.handling(source, "r", "s", 1, actor_session_id="s", parent_task_id="c" * 32,
+                         refs=["A"], reason="incorporated")
     await GatewayTurnMixin._hmwa_deliver_turn_response(runner, event, source,
         SimpleNamespace(session_id="s"), "r", 1, {}, [], "[SILENT]", "", True)
     adapter.delete_message.assert_awaited_once()
@@ -623,14 +637,16 @@ async def test_sync_batch_receipt_does_not_handle_related_background_rows(tmp_pa
         await cards.observe(source, "route", "session", 1, "subagent.complete", None, data)
     await asyncio.gather(*list(cards.pending.values()))
     event = MessageEvent(text="Synchronous B handled; A completion is still queued", source=source)
-    receipt = cards.receipt(event, "route", 1)
+    assert cards.receipt(event, "route", 1) == {}
+    receipt = await handling_receipt(cards, "c" * 32, ["B"], 1)
     assert receipt["c" * 32]["refs"] == ["B"]
     await cards.delivered(receipt)
     adapter.delete_message.assert_not_awaited()
     completion = MessageEvent(text="Handle A and synchronous B", source=source, internal=True, metadata={
         "delegation_parent_task_id": "c" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
+    await handling_receipt(cards, "c" * 32, ["A"], 1)
     combined = cards.receipt(completion, "route", 1)
-    assert combined["c" * 32]["refs"] == ["A", "B"]
+    assert combined["c" * 32]["refs"] == ["A"]
     await cards.delivered(combined)
     adapter.delete_message.assert_awaited_once()
 
@@ -662,7 +678,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     await cards.observe(source, "r", "s", 1, "subagent.complete", None, a)
     event = MessageEvent(source=source, text="handled A", internal=True, metadata={
         "delegation_parent_task_id": a["parent_task_id"], "delegation_owner": owner, "delegation_thread_refs": ["A"]})
-    proof = cards.receipt(event, "r", 3)
+    proof = await handling_receipt(cards, a["parent_task_id"], ["A"], 3)
     # A new row must not invalidate the exact earlier receipt, nor be handled by it.
     c = {**a, "thread_ref": "C", "task_label": "Check race", "subagent_type": None}
     await cards.observe(source, "r", "s", 3, "subagent.start", None, c)
@@ -681,7 +697,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     for data in (b, c):
         event.metadata = {"delegation_parent_task_id": data["parent_task_id"], "delegation_owner": owner,
                           "delegation_thread_refs": [data["thread_ref"]]}
-        await restored.delivered(restored.receipt(event, "r", 4))
+        await restored.delivered(await handling_receipt(restored, data["parent_task_id"], [data["thread_ref"]], 4))
     await drain_cards(restored)
     adapter.delete_message.assert_awaited_once_with("42", "one")
     restarted = DelegationCards(runner, home=tmp_path, interval=0)
