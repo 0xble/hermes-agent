@@ -8,6 +8,14 @@ import yaml
 from hermes_cli.model_presets import ModelPresetError, expand_model_presets
 
 
+def test_documented_preset_example_expands():
+    from pathlib import Path
+    doc = Path(__file__).resolve().parents[2] / "website/docs/user-guide/configuring-models.md"
+    block = doc.read_text().split("## Reusing a named route", 1)[1].split("```yaml", 1)[1].split("```", 1)[0]
+    expanded = expand_model_presets(yaml.safe_load(block))
+    assert expanded["delegation"]["fallback_providers"][0]["provider"] == "openai"
+
+
 def routes():
     return {"model_presets": {
         "primary": {"provider": "provider-a", "model": "model-a", "reasoning_effort": "high", "fallbacks": [{"provider": "provider-b", "model": "model-b", "reasoning_effort": "low"}]},

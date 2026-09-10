@@ -43,7 +43,7 @@ model_presets:
     model: google/gemini-3-flash-preview
 
 model:
-  model_preset: coding
+  model_preset: quick
 delegation:
   model_preset: coding
 auxiliary:
@@ -63,10 +63,15 @@ moa:
 A preset definition is flat: `provider`, `model`, optional `reasoning_effort`, and optional
 ordered `fallbacks` only. Fallback entries are themselves inline flat routes; presets cannot
 reference other presets or inherit from one another. At a reference site, do not combine
-`model_preset` with inline route fields (including an empty fallback override). Hermes rejects
-unknown names, malformed definitions, route conflicts, and preset fallbacks in a fallback or
-MoA slot with the affected config path. Config writes preserve an unchanged named reference
-instead of flattening it.
+`model_preset` with inline route fields. The exception is `fallbacks: []`, which explicitly
+turns off a preset's fallback chain for main, delegation, and auxiliary consumers. A main preset
+that declares fallbacks cannot also be combined with a top-level fallback chain. Hermes rejects
+unknown names, malformed definitions, route conflicts, and recursive fallback routes with the
+affected config path. Config writes preserve unchanged references; deliberate route edits stay
+inline instead of restoring a conflicting reference.
+
+MoA slots cannot reference presets declaring fallbacks: this upstream configuration does not
+support per-slot fallback chains. Use a preset without fallbacks for those slots.
 
 ## The Models page
 
