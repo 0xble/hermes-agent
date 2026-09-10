@@ -56,10 +56,19 @@ def test_persist_disabled_fork_skips_session_and_turn_lifecycle_hooks():
 
     def invoke_output_hook(name, _logger, **_kwargs):
         output_calls.append(name)
-        return ["transformed"] if name == "transform_llm_output" else []
+        return []
 
-    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke_output_hook):
-        response, transformed, _original = _apply_hooks(agent)
+    # The fork routes transform_llm_output through the lifecycle helper, which owns
+    # sequential composition; _invoke_hook_safely is only the compat fallback.
+    def transform(response, **_kwargs):
+        output_calls.append("transform_llm_output")
+        return "transformed", True
+
+    with (
+        patch("hermes_cli.lifecycle.transform_llm_output", side_effect=transform),
+        patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke_output_hook),
+    ):
+        response, transformed, _original, _output_hook_transformed = _apply_hooks(agent)
 
     lifecycle_hook.assert_not_called()
     assert context == ""
@@ -94,7 +103,14 @@ def test_persisted_agent_still_fires_session_and_turn_lifecycle_hooks():
         output_calls.append(name)
         return []
 
-    with patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke_output_hook):
+    def transform(response, **_kwargs):
+        output_calls.append("transform_llm_output")
+        return response, False
+
+    with (
+        patch("hermes_cli.lifecycle.transform_llm_output", side_effect=transform),
+        patch("agent.turn_finalizer._invoke_hook_safely", side_effect=invoke_output_hook),
+    ):
         _apply_hooks(agent)
 
     assert [call.args[0] for call in lifecycle_hook.call_args_list] == [
