@@ -25,6 +25,24 @@ def isolated_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
+class _CLIStub(SimpleNamespace):
+    """A CLI stand-in that tolerates prompt callbacks this test does not model.
+
+    ``_chat_run_agent`` registers a growing set of thread-local callbacks: sudo, approval,
+    secret capture, and three vault prompts as of upstream 872bafd (unlock, save-login,
+    2FA code). Modelling them one at a time means this file breaks on every upstream
+    addition, and it breaks badly: the AttributeError is raised inside the worker thread,
+    so it surfaces here only as a later ``KeyError: 'result'``. ``None`` is the right value
+    for all of them, since this test drives goal continuation authority rather than
+    prompting. The pattern is deliberately narrow so a genuine typo still raises.
+    """
+
+    def __getattr__(self, name):
+        if name.startswith("_") and name.endswith("_callback"):
+            return None
+        raise AttributeError(name)
+
+
 def _invoke(session_id, action, *, user_requested=False, user_task="", **args):
     return json.loads(registry.dispatch(
         "set_goal", {"action": action, "user_requested": user_requested, **args}, session_id=session_id,
@@ -66,13 +84,12 @@ def _run_queued_turn(session_id, queued, action, *, user_requested, user_task, *
             )
             return {"final_response": "done"}
 
-    cli = SimpleNamespace(
+    cli = _CLIStub(
         agent=Agent(), session_id=session_id,
         conversation_history=[{"role": "user", "content": str(message)}],
         _sudo_password_callback=None, _approval_callback=None,
         _secret_capture_callback=None, _pending_turn_reasoning_config=None,
         _pending_moa_config=None, _pending_one_turn_model_restore=None,
-        _vault_unlock_callback=None, _vault_save_login_callback=None,
         _flush_credit_notices=lambda: None,
     )
     turn = SimpleNamespace(voice_prefix="", stream_callback=None, result=None)
