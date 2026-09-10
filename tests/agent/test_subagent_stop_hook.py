@@ -99,7 +99,7 @@ class TestSingleTask:
                 "duration_seconds": 5.0,
                 "_child_role": "analyst",
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            delegate_task(goal="do X", task_label="Do X", parent_agent=_make_parent())
 
         assert len(captured) == 1
         payload = captured[0]
@@ -127,7 +127,7 @@ class TestSingleTask:
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": None,
             }
-            delegate_task(goal="go", parent_agent=_make_parent())
+            delegate_task(goal="go", task_label="Go", parent_agent=_make_parent())
 
         assert dispatch_threads and all(t is main_thread for t in dispatch_threads)
         cb_thread = captured[0]["_thread"]
@@ -144,6 +144,7 @@ class TestSingleTask:
             }
             delegate_task(
                 goal="go",
+                task_label="Go",
                 parent_agent=_make_parent(session_id="sess-xyz"),
             )
 
@@ -171,9 +172,9 @@ class TestBatchMode:
             ]
             delegate_task(
                 tasks=[
-                    {"goal": "Investigate module A"},
-                    {"goal": "Investigate module B"},
-                    {"goal": "Investigate module C"},
+                    {"goal": "Investigate module A", "task_label": "Check module A"},
+                    {"goal": "Investigate module B", "task_label": "Check module B"},
+                    {"goal": "Investigate module C", "task_label": "Check module C"},
                 ],
                 parent_agent=_make_parent(),
             )
@@ -206,8 +207,8 @@ class TestBatchMode:
             ]
             delegate_task(
                 tasks=[
-                    {"goal": "Investigate module A"},
-                    {"goal": "Investigate module B"},
+                    {"goal": "Investigate module A", "task_label": "Check module A"},
+                    {"goal": "Investigate module B", "task_label": "Check module B"},
                 ],
                 parent_agent=_make_parent(),
             )
@@ -247,7 +248,7 @@ class TestPayloadShape:
                     "result": "secret output",
                 }],
             }
-            delegate_task(goal="do X", parent_agent=_make_parent())
+            delegate_task(goal="do X", task_label="Do X", parent_agent=_make_parent())
 
         assert captured[0]["tool_call_history"] == [{
             "tool_name": "write_file",
@@ -277,7 +278,7 @@ class TestPayloadShape:
                 "summary": "x", "api_calls": 1, "duration_seconds": 0.1,
                 "_child_role": "leaf",
             }
-            raw = delegate_task(goal="do X", parent_agent=_make_parent())
+            raw = delegate_task(goal="do X", task_label="Do X", parent_agent=_make_parent())
 
         parsed = json.loads(raw)
         assert "results" in parsed
