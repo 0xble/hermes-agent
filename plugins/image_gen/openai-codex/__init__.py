@@ -303,6 +303,27 @@ def _collect_image_b64(
     import httpx
     from agent.codex_headers import codex_cloudflare_headers
 
+    if gateway and load_image_gen_config().get("api_mode") == "images":
+        payload = {"model": API_MODEL, "prompt": prompt, "size": size,
+                   "quality": quality, "n": 1}
+        with httpx.Client(timeout=300.0) as http:
+            headers = {"Authorization": f"Bearer {token}"}
+            if input_images:
+                from plugins.image_gen.openai import _load_image_bytes
+                files = []
+                for part in input_images:
+                    data, filename = _load_image_bytes(part["image_url"])
+                    files.append(("image[]", (filename, data)))
+                response = http.post(f"{base_url}/images/edits", headers=headers,
+                                     data={k: str(v) for k, v in payload.items()}, files=files)
+            else:
+                response = http.post(f"{base_url}/images/generations", headers=headers, json=payload)
+            response.raise_for_status()
+            items = response.json().get("data", [])
+            if items and items[0].get("b64_json"):
+                return {"b64": items[0]["b64_json"], "source": "final"}
+            return None
+
     headers = {} if gateway else codex_cloudflare_headers(token)
     headers.update({
         "Accept": "text/event-stream",
