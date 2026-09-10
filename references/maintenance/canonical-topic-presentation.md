@@ -44,6 +44,19 @@ four sends instead of three isolated conversation sends. Source changes then
 passed the focused suite. Publication, promotion, activation and exact live
 Telegram acceptance are separate receipts, not implied by these tests.
 
+For an authorization-limited rollout, create
+`cache/delegation/presentation-cleanup-policy.json` in the active Hermes home
+before activation, with `{"version": 1, "allow": [{"profile": "default",
+"platform": "telegram", "chat_id": "<exact chat>", "thread_id": "<exact topic>",
+"message_id": "<exact redundant message>"}]}`. This optional guard narrows only
+consolidation-ledger cleanup. Unlisted IDs remain pending, and therefore suppress
+further displacement replacements. An empty list or invalid/unreadable file
+allows no consolidation deletes. Absence retains ordinary automatic lifecycle
+behavior. Do not remove the file until broader cleanup is authorized. This does
+not authorize arbitrary IDs, change handled/outcome state, or override normal
+final-delivery retirement. Tests cover scoped and malformed policies through
+restart and transport deletion traces.
+
 Rollback requires preserving the cards file and its cleanup ledger: reverting
 code alone must not discard pending exact-message cleanup. Do not replay the
 pre-consolidation cards file into a running gateway or guess Telegram message ID

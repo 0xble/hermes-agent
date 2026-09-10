@@ -545,6 +545,7 @@ class DelegationCards:
                              survivor_message_id=anchor.get("message_id"))
                 self._save()
             if (entry["state"] != "ready" or entry["attempts"] >= 3 or not adapter
+                    or not presentation.cleanup_allowed(self, key, entry["message_id"])
                     or entry.get("survivor_message_id") != anchor.get("message_id")):
                 continue
             if self._defer_delete(anchor, adapter):

@@ -182,3 +182,40 @@ async def test_ambiguous_send_blocks_concurrent_new_execution_and_restart(tmp_pa
     await drain(restored)
     assert adapter.send_delegation_card.await_count == 1
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["scoped", "invalid", "boolean", "float", "dangling"])
+async def test_exact_cleanup_policy_preserves_unapproved_messages(tmp_path, policy):
+    state = legacy()
+    for key, card in list(state.items()):
+        other = copy.deepcopy(card)
+        other["source"]["thread_id"] = "other"
+        other["presentation_key"] += "-other"
+        if other["message_id"]:
+            other["message_id"] += "-other"
+        state[key + "-other"] = other
+    seed(tmp_path, state)
+    path = tmp_path / "cache/delegation/presentation-cleanup-policy.json"
+    path.write_text(json.dumps({"version": 1, "allow": [dict(profile="default", platform="telegram",
+        chat_id=state[E]["source"]["chat_id"], thread_id="173511", message_id="85393")]}))
+    if policy in ("boolean", "float", "invalid"):
+        malformed = json.loads(path.read_text())
+        malformed["version"] = {"boolean": True, "float": 1.0, "invalid": "*"}[policy]
+        path.write_text(json.dumps(malformed))
+    elif policy == "dangling":
+        path.unlink()
+        path.symlink_to(tmp_path / "missing-policy")
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(),
+        edit_message=AsyncMock(return_value=SendResult(success=True)),
+        delete_message=AsyncMock(return_value=True))
+    runner = SimpleNamespace(_adapter_for_source=lambda _: adapter)
+    for _ in range(2):
+        manager = DelegationCards(runner, home=tmp_path, interval=0)
+        await manager.reconcile()
+        await drain(manager)
+    if policy == "scoped":
+        adapter.delete_message.assert_awaited_once_with(state[E]["source"]["chat_id"], "85393")
+    else:
+        adapter.delete_message.assert_not_awaited()
+    assert not adapter.send_delegation_card.called
+

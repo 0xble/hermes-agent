@@ -5,6 +5,39 @@ write-ahead: link original records, publish the union, then delete exact receipt
 """
 
 
+import json
+
+
+def cleanup_allowed(manager, key, message_id):
+    """Optional operator scope guard; malformed/unreadable policy denies cleanup.
+
+    The policy only narrows exact IDs already present in the write-ahead ledger;
+    it cannot authorize arbitrary deletion, retirement or send replacement.
+    Read at the deletion boundary so removing an approval takes effect promptly.
+    """
+    path = manager.path.with_name("presentation-cleanup-policy.json")
+    try:
+        if path.is_symlink():
+            return False
+        policy = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return True  # Ordinary automatic lifecycle; no scoped rollout requested.
+    except (OSError, ValueError):
+        return False
+    fields = ("profile", "platform", "chat_id", "thread_id", "message_id")
+    if (not isinstance(policy, dict) or type(policy.get("version")) is not int
+            or policy["version"] != 1
+            or not isinstance(policy.get("allow"), list)
+            or any(not isinstance(entry, dict) or set(entry) != set(fields)
+                   or any(not isinstance(entry[f], str) for f in fields)
+                   for entry in policy["allow"])):
+        return False
+    owner_profile, *route = manager._scope(manager.cards[key])
+    target = (*route, str(message_id))
+    return owner_profile == route[0] and any(
+        tuple(entry[f] for f in fields) == target for entry in policy["allow"])
+
+
 def scope(owner, source):
     # SessionSource.profile=None means the event's owning profile, not a second
     # presentation namespace. Keep explicit conflicting routes isolated.
