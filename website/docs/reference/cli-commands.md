@@ -251,6 +251,7 @@ Subcommands:
 | `list` | List **all profiles** and whether each profile's gateway is currently running (with PID where available). Handy when you run multiple profiles side-by-side and want a single overview. |
 | `install` | Install as a systemd (Linux) or launchd (macOS) background service. |
 | `uninstall` | Remove the installed service. |
+| `update --reason "…"` | Agent-session handoff to the running local gateway's native updater. It records the direct or delegated messaging route and prints a turn-ending handoff; it does not restart or promote the gateway itself. |
 | `setup` | Interactive messaging-platform setup. |
 | `migrate-legacy` | Remove legacy `hermes.service` units left over from pre-rename installs. Profile units (`hermes-gateway-<profile>.service`) and unrelated services are never touched. Flags: `--dry-run`, `-y`/`--yes`. |
 | `enroll` | Experimental: enroll this gateway with a relay connector and save relay credentials for connector-backed platforms. See [Hermes Relay](/user-guide/messaging/relay). |
@@ -272,6 +273,8 @@ unsuccessful exits. Without that policy, a requested restart leaves the gateway
 stopped.
 
 `hermes gateway enroll` accepts `--token`, `--connector-url`, `--gateway-id`, and `--wake-url`. It exchanges the enrollment token with the connector and writes the resulting `GATEWAY_RELAY_ID`, `GATEWAY_RELAY_SECRET`, `GATEWAY_RELAY_DELIVERY_KEY`, optional `GATEWAY_RELAY_URL`, and (when `--wake-url` is given) `GATEWAY_RELAY_WAKE_URL` values to the active profile's `.env`.
+
+`hermes gateway update --reason "…"` is available only from a session with a persisted messaging origin. The reason must be one nonblank paragraph of at most 240 characters. It refuses managed or non-git installs, unavailable gateways, and origins that do not permit messaging updates. The native updater retains its normal profile/fleet behavior and owns any subsequent restart and completion notification. After the accepted handoff, end the initiating turn immediately rather than waiting on the updater: native draining includes background delegations. The supplied reason is preserved in separate Updating, Restarting, and completion/failure notices alongside native progress. Completion requires a finalized native receipt and matching runtime evidence; it does not promise all interrupted work resumed.
 
 :::tip WSL users
 Use `hermes gateway run` instead of `hermes gateway start` — WSL's systemd support is unreliable. Wrap it in tmux for persistence: `tmux new -s hermes 'hermes gateway run'`. See [WSL FAQ](/reference/faq#wsl-gateway-keeps-disconnecting-or-hermes-gateway-start-fails) for details.

@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
+from tests.gateway.update_fixtures import finalize_update as _finalized
+
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
@@ -171,11 +173,11 @@ class TestHandleUpdateCommand:
         call_args = mock_popen.call_args[0][0]
         assert call_args[0] == "bash"
         assert "nohup" not in call_args[2]
-        assert ".update_exit_code" in call_args[2]
+        assert ".update_process_exit_code" in call_args[2]
         # start_new_session=True should be in kwargs
         call_kwargs = mock_popen.call_args[1]
         assert call_kwargs.get("start_new_session") is True
-        assert "Starting Hermes update" in result
+        assert result == ""  # The native watcher owns the initial notice.
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +304,7 @@ class TestSendUpdateNotification:
         }))
         (hermes_home / ".update_output.txt").write_text("done")
         (hermes_home / ".update_exit_code").write_text("0")
+        _finalized(hermes_home)
 
         mock_adapter = AsyncMock()
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
@@ -310,7 +313,7 @@ class TestSendUpdateNotification:
             result = await runner._send_update_notification()
 
         assert result is True
-        mock_adapter.send.assert_called_once()
+        assert sum(c.args[1].startswith("✅ Update Complete") for c in mock_adapter.send.call_args_list) == 1
         assert not claimed_path.exists()
 
     @pytest.mark.asyncio
@@ -332,6 +335,7 @@ class TestSendUpdateNotification:
             "→ Found 3 new commit(s)\n✓ Code updated!\n✓ Update complete!"
         )
         (hermes_home / ".update_exit_code").write_text("0")
+        _finalized(hermes_home)
 
         # Mock the adapter
         mock_adapter = AsyncMock()
@@ -341,15 +345,15 @@ class TestSendUpdateNotification:
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._send_update_notification()
 
-        mock_adapter.send.assert_called_once()
+        assert sum(c.args[1].startswith("✅ Update Complete") for c in mock_adapter.send.call_args_list) == 1
         call_args = mock_adapter.send.call_args
         assert call_args[0][0] == "67890"  # chat_id
-        assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
+        assert "Update complete" in call_args[0][1] or "update complete" in call_args[0][1].lower()
 
 
     @pytest.mark.asyncio
-    async def test_cleans_up_on_error(self, tmp_path):
-        """Files are cleaned up even if notification fails."""
+    async def test_preserves_markers_on_error(self, tmp_path):
+        """Failed delivery retains the evidence for retry."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -362,6 +366,7 @@ class TestSendUpdateNotification:
         }))
         output_path.write_text("✓ Done")
         exit_code_path.write_text("0")
+        _finalized(hermes_home)
 
         # Adapter send raises
         mock_adapter = AsyncMock()
@@ -371,11 +376,9 @@ class TestSendUpdateNotification:
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._send_update_notification()
 
-        # Files should still be cleaned up (finally block)
-        assert not pending_path.exists()
-        assert not output_path.exists()
-        assert not exit_code_path.exists()
-
+        assert pending_path.exists()
+        assert output_path.exists()
+        assert exit_code_path.exists()
 
     @pytest.mark.asyncio
     async def test_no_adapter_for_platform_preserves_markers(self, tmp_path):
@@ -397,6 +400,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps(pending))
         output_path.write_text("Done")
         exit_code_path.write_text("0")
+        _finalized(hermes_home)
 
         # Only telegram adapter available, but pending says discord
         mock_adapter = AsyncMock()
@@ -435,6 +439,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps(pending))
         output_path.write_text("✓ Update complete!")
         exit_code_path.write_text("0")
+        _finalized(hermes_home)
 
         # First pass: target platform (discord) is still offline → defer.
         with patch("gateway.run._hermes_home", hermes_home):
@@ -451,8 +456,8 @@ class TestSendUpdateNotification:
             second = await runner._send_update_notification()
 
         assert second is True
-        mock_adapter.send.assert_called_once()
-        sent_text = mock_adapter.send.call_args[0][1]
+        assert sum(c.args[1].startswith("✅ Update Complete") for c in mock_adapter.send.call_args_list) == 1
+        sent_text = "\n".join(c.args[1] for c in mock_adapter.send.call_args_list)
         assert "Update complete" in sent_text
         # Now everything is cleaned up — no duplicate deliveries possible.
         assert not pending_path.exists()
@@ -474,6 +479,7 @@ class TestSendUpdateNotification:
         pending_path.write_text(json.dumps(pending))
         output_path.write_bytes(b"ok before\ninvalid byte: \x96\ncontinued after\n")
         exit_code_path.write_text("0")
+        _finalized(hermes_home)
 
         mock_adapter = AsyncMock()
         runner.adapters = {Platform.DISCORD: mock_adapter}
@@ -482,12 +488,12 @@ class TestSendUpdateNotification:
             delivered = await runner._send_update_notification()
 
         assert delivered is True
-        mock_adapter.send.assert_called_once()
-        sent_text = mock_adapter.send.call_args[0][1]
+        assert sum(c.args[1].startswith("✅ Update Complete") for c in mock_adapter.send.call_args_list) == 1
+        sent_text = "\n".join(c.args[1] for c in mock_adapter.send.call_args_list)
         assert "ok before" in sent_text
         assert "invalid byte" in sent_text
         assert "continued after" in sent_text
-        assert "Hermes update finished" in sent_text
+        assert "Update Complete" in sent_text
         assert not pending_path.exists()
         assert not output_path.exists()
         assert not exit_code_path.exists()
@@ -532,6 +538,7 @@ class TestWatchUpdateProgress:
             b"ok before\n\xe2\x9c invalid-continuation: \x96\ncontinued after\n"
         )
         (hermes_home / ".update_exit_code").write_text("0")
+        _finalized(hermes_home)
 
         mock_adapter = AsyncMock()
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
@@ -542,5 +549,5 @@ class TestWatchUpdateProgress:
         sent = "\n".join(call.args[1] for call in mock_adapter.send.call_args_list)
         assert "ok before" in sent
         assert "continued after" in sent
-        assert "Hermes update finished" in sent
+        assert "Update Complete" in sent
         assert not (hermes_home / ".update_pending.json").exists()

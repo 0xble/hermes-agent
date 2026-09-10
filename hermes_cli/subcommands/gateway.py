@@ -107,6 +107,11 @@ def build_gateway_parser(
 
     gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
 
+    gateway_update = gateway_subparsers.add_parser(
+        "update", help="Request a native update from a delegated agent session")
+    gateway_update.add_argument("--reason", required=True,
+        help="Short single-paragraph reason for the parent-session update handoff")
+
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_migrate_legacy = gateway_subparsers.add_parser(

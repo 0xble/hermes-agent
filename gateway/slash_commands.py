@@ -114,19 +114,69 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     return data
 
 
+def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
+    """Wrap *argv* in a transient ``systemd-run --user --scope`` unit when this gateway
+    itself runs under systemd; otherwise return (*argv*, None) unchanged. Never raises.
+
+    ``setsid``/``start_new_session`` only leave the POSIX session, not the systemd
+    cgroup: when the updater's own restart phase restarts ``hermes-gateway.service``,
+    ``KillMode=mixed`` SIGKILLs the updater mid-run, before it can write the receipt,
+    clear the pending marker, or refresh the dashboard (#107427). A transient user
+    scope lives outside the service cgroup and survives that restart. Mirrors the
+    recovery spawn in ``hermes_cli.update_abort_recovery`` (plain ``--quiet --collect``,
+    deliberately no ``MemoryMax``: an updater syncing dependencies must not inherit a
+    worker-sized memory cap). Unusable scope (no binary, no reachable user bus,
+    probe failed) degrades to the plain spawn — today's behavior — instead of
+    blocking the update.
+    """
+    try:
+        if sys.platform == "win32":
+            return argv, None
+        supervised = bool(os.environ.get("INVOCATION_ID"))
+        if not supervised:
+            try:
+                from tools.process_registry import _is_supervised_gateway_process
+                supervised = bool(_is_supervised_gateway_process())
+            except Exception:
+                supervised = False
+        if not supervised:
+            return argv, None
+        from tools.process_registry import (
+            _systemd_run_user_scope_available,
+            systemd_user_bus_env,
+        )
+        if not _systemd_run_user_scope_available():
+            return argv, None
+        import shutil
+        binary = shutil.which("systemd-run")
+        if not binary:
+            return argv, None
+        wrapped = [
+            binary, "--user", "--scope", "--quiet", "--collect",
+            "--unit", "hermes-gateway-update.scope",
+            "--", *argv,
+        ]
+        return wrapped, systemd_user_bus_env()
+    except Exception:
+        return argv, None
+
+
 def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
-    setsid is portable (works where ``systemd-run --user`` lacks a D-Bus session); ``--gateway``
-    enables file-based IPC so interactive prompts are forwarded; PYTHONUNBUFFERED lets the gateway
-    stream output live.  Windows has no setsid: an inline helper runs the updater as a module under
-    this interpreter (not venv\\Scripts\\hermes.exe — that shim holds its own file open, and the
-    update must replace it), redirects both outputs to one file and writes the exit code."""
+    Under systemd the spawn is first placed in a transient user scope (see
+    :func:`_systemd_scope_wrap_if_supervised`): ``setsid`` alone is portable (works where
+    ``systemd-run --user`` lacks a D-Bus session) but cannot escape the service cgroup.
+    ``--gateway`` enables file-based IPC so interactive prompts are forwarded;
+    PYTHONUNBUFFERED lets the gateway stream output live.  Windows has no setsid: an
+    inline helper runs the updater as a module under this interpreter (not
+    venv\\Scripts\\hermes.exe — that shim holds its own file open, and the update must
+    replace it), redirects both outputs to one file and writes the exit code."""
     import shutil
     import subprocess
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
-            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
+            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
              sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
@@ -136,12 +186,22 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
-        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}")
+        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path.parent / '.update_process_exit_code'))}")
     # Preferred: setsid creates a new session, fully detached; fallback start_new_session=True
     # calls os.setsid() in the child.
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
+    if scoped_env is not None:
+        subprocess.Popen(
+            scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=scoped_env,
+        )
+    else:
+        subprocess.Popen(
+            scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def _home_thread_from_source(source) -> Optional[str]:
@@ -1249,8 +1309,8 @@ class GatewaySlashCommandsMixin(
     async def _handle_update_command(self, event: MessageEvent) -> str:
         """Handle /update — spawn ``hermes update`` detached (``setsid``) so it survives the gateway
         restart it may trigger; marker files let this or the next gateway process notify the user."""
-        import json
         from gateway.run import _hermes_home, _resolve_hermes_bin
+        from gateway.update_launcher import launch_native_update
         from hermes_cli.config import is_managed, format_managed_message
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
         # allow_update_command=True are also allowed.
@@ -1270,26 +1330,20 @@ class GatewaySlashCommandsMixin(
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             return t("gateway.update.hermes_cmd_not_found")
-        pending_path = _hermes_home / ".update_pending.json"
-        output_path = _hermes_home / ".update_output.txt"
-        exit_code_path = _hermes_home / ".update_exit_code"
         pending = {
             "platform": src.platform.value, "chat_id": src.chat_id, "chat_type": src.chat_type,
             "user_id": src.user_id, "session_key": self._session_key_for_source(src),
             "timestamp": datetime.now().isoformat()}
         pending.update({k: v for k, v in (("thread_id", src.thread_id), ("message_id", event.message_id)) if v})
-        _tmp_pending = pending_path.with_suffix(".tmp")
-        _tmp_pending.write_text(json.dumps(pending), encoding="utf-8")
-        _tmp_pending.replace(pending_path)
-        exit_code_path.unlink(missing_ok=True)
         try:
-            _spawn_detached_update(hermes_cmd, output_path, exit_code_path)
+            launch = launch_native_update(
+                home=_hermes_home, hermes_cmd=hermes_cmd, pending=pending, spawn=_spawn_detached_update)
         except Exception as e:
-            pending_path.unlink(missing_ok=True)
-            exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
+        if launch["pending"]:
+            return t("gateway.update.starting")
         self._schedule_update_notification_watch()
-        return t("gateway.update.starting")
+        return ""
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

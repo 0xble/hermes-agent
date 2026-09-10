@@ -465,17 +465,12 @@ class GatewayNotificationsMixin:
         )
 
     async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float) -> None:
-        """Fallback when no adapter/chat can be resolved: wait for the exit code, then notify."""
-        logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
-        # Poll until _send_update_notification delivers (it returns False while the platform reconnects).
         loop = asyncio.get_running_loop()
         while paths.any_pending() and loop.time() < deadline:
-            if paths.exit_code.exists() and await self._send_update_notification():
+            if await self._send_update_notification():
                 return
             await asyncio.sleep(poll_interval)
-        if paths.any_pending() and not paths.exit_code.exists():
-            paths.exit_code.write_text("124", encoding="utf-8")
-            await self._send_update_notification()
+        await self._send_update_notification(timed_out=True)
 
     @staticmethod
     def _update_exit_code(paths: "_UpdatePaths") -> int:
@@ -492,16 +487,18 @@ class GatewayNotificationsMixin:
             return "", len(data)
         return data[offset:].decode("utf-8", errors="replace"), len(data)
 
-    async def _send_update_output(self, target: "_UpdateTarget", text: str) -> None:
-        """Send buffered update output as fenced chunks that fit message limits (Telegram: 4096)."""
+    async def _send_update_output(self, target: "_UpdateTarget", text: str) -> bool:
         from tools.ansi_strip import strip_ansi
         clean = strip_ansi(text).strip()
-        if not clean:
-            return
-        max_chunk = 3500
-        for i in range(0, len(clean), max_chunk):
-            with _log_suppressed(logging.DEBUG, "Update stream send failed: %s"):
-                await target.send(f"```\n{clean[i:i + max_chunk]}\n```")
+        for i in range(0, len(clean), 3500):
+            try:
+                result = await target.send(f"```\n{clean[i:i + 3500]}\n```")
+                if _send_failed(result):
+                    return False
+            except Exception:
+                logger.debug("Update stream send failed", exc_info=True)
+                return False
+        return True
 
     async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
@@ -547,16 +544,22 @@ class GatewayNotificationsMixin:
             await self._watch_update_completion_only(paths, deadline, poll_interval)
             return
         session_key = target.session_key
-        bytes_sent = 0
+        from gateway.update_notifications import final_outcome, read_pending, save_pending
+        record = read_pending(paths.pending.parent)
+        bytes_sent = int(record[1].get("output_offset", 0)) if record else 0
         last_stream_time = loop.time()
         buffer = ""
 
         async def _flush_buffer() -> None:
             nonlocal buffer, last_stream_time
-            text, buffer = buffer, ""
-            if text.strip():
+            if buffer.strip() and await self._send_update_output(target, buffer):
+                buffer = ""
                 last_stream_time = loop.time()
-                await self._send_update_output(target, text)
+                current = read_pending(paths.pending.parent)
+                if current:
+                    marker, pending = current
+                    pending["output_offset"] = bytes_sent
+                    save_pending(marker, pending)
 
         def _read_new_output() -> None:
             nonlocal buffer, bytes_sent
@@ -566,18 +569,17 @@ class GatewayNotificationsMixin:
                     buffer += chunk
 
         while loop.time() < deadline:
-            if paths.exit_code.exists():
+            if not paths.any_pending():
+                return
+            if not await self._send_update_phase("updating"):
+                await asyncio.sleep(poll_interval)
+                continue
+            current = read_pending(paths.pending.parent)
+            if current and final_outcome(paths.pending.parent, current[1]) is not None:
                 _read_new_output()
                 await _flush_buffer()
-                with _log_suppressed(logging.WARNING, "Update final notification failed: %s"):
-                    exit_code = self._update_exit_code(paths)
-                    await target.send(
-                        "✅ Hermes update finished." if exit_code == 0
-                        else "❌ Hermes update failed (exit code {}).".format(exit_code)
-                    )
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
-                self._clear_update_markers(paths, session_key)
-                return
+                if not buffer and await self._send_update_notification():
+                    return
             _read_new_output()
             if buffer.strip() and (loop.time() - last_stream_time) >= stream_interval:
                 await _flush_buffer()
@@ -595,79 +597,95 @@ class GatewayNotificationsMixin:
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
             await asyncio.sleep(poll_interval)
-        if not paths.exit_code.exists():
-            logger.warning("Update watcher timed out after %.0fs", timeout)
-            paths.exit_code.write_text("124", encoding="utf-8")
-            await _flush_buffer()
-            with suppress(Exception):
-                await target.send("❌ Hermes update timed out after 30 minutes.")
-            self._clear_update_markers(paths, session_key)
+        await _flush_buffer()
+        await self._send_update_notification(timed_out=True)
 
-    async def _send_update_notification(self) -> bool:
-        """If an update finished, notify the user.
+    async def _send_update_phase(self, phase: str) -> bool:
+        lock = getattr(self, "_update_phase_send_lock", None)
+        if lock is None:
+            lock = self._update_phase_send_lock = asyncio.Lock()
+        async with lock:
+            return await self._send_update_phase_inner(phase)
 
-        False while the update is still running (caller may retry); True after a definitive send/skip.
-        """
-        from gateway.run import _non_conversational_metadata
+    async def _send_update_phase_inner(self, phase: str) -> bool:
+        from gateway.update_notifications import notice, read_pending, save_pending
         paths = self._update_paths()
-        if not paths.any_pending():
+        current = read_pending(paths.pending.parent)
+        target = self._resolve_update_target(paths)
+        if not current or target is None:
             return False
-        cleanup = True
-        active_pending_path = paths.claimed
-
-        def _defer(reason: str, *args) -> bool:
-            nonlocal cleanup, active_pending_path
-            logger.info(reason, *args)
-            cleanup = False
-            active_pending_path = paths.pending
-            paths.claimed.replace(paths.pending)
-            return False
-
+        marker, pending = current
+        flag = phase + "_notified"
+        if pending.get(flag):
+            return True
+        if phase == "restarting":
+            heading = "🔄 Restarting"
+            detail = "The gateway is restarting. If work is interrupted, recovery will be attempted where supported; it is not guaranteed."
+        else:
+            heading = "⬆️ Updating"
+            detail = "The native update was started. Progress follows here."
         try:
-            if paths.pending.exists():
-                try:
-                    paths.pending.replace(paths.claimed)
-                except FileNotFoundError:
-                    if not paths.claimed.exists():
-                        return True
-            elif not paths.claimed.exists():
-                return True
-            pending = json.loads(paths.claimed.read_text(encoding="utf-8"))
-            platform_str = pending.get("platform")
-            chat_id = pending.get("chat_id")
-            if not paths.exit_code.exists():
-                return _defer("Update notification deferred: update still running")
-            exit_code = self._update_exit_code(paths)
-            output = paths.output.read_bytes().decode("utf-8", errors="replace") if paths.output.exists() else ""
-            platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
-            if chat_id and not adapter:
-                # Target platform not reconnected yet (common right after the update's restart): keep the
-                # markers for a later retry instead of silently losing the notification.
-                return _defer("Update notification deferred: %s adapter not connected yet", platform_str)
-            if chat_id:
-                metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
-                from tools.ansi_strip import strip_ansi
-                output = strip_ansi(output).strip()
-                if output:
-                    if len(output) > 3500:
-                        output = "…" + output[-3500:]
-                    status = "✅ Hermes update finished." if exit_code == 0 else "❌ Hermes update failed."
-                    msg = f"{status}\n\n```\n{output}\n```"
-                else:
-                    msg = (
-                        "✅ Hermes update finished successfully." if exit_code == 0 else
-                        "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                    )
-                await adapter.send(chat_id, msg, metadata=_non_conversational_metadata(metadata, platform=platform))
-                logger.info("Sent post-update notification to %s:%s (exit=%s)", platform_str, chat_id, exit_code)
-        except Exception as e:
-            logger.warning("Post-update notification failed: %s", e)
+            if _send_failed(await target.send(notice(heading, pending, detail))):
+                return False
+            current = read_pending(paths.pending.parent)
+            if current:
+                marker, pending = current
+                pending[flag] = True
+                save_pending(marker, pending)
+            return True
+        except Exception:
+            logger.warning("Update phase notification failed", exc_info=True)
+            return False
+
+    async def _send_update_notification(self, *, timed_out: bool = False) -> bool:
+        """One final send path for live watchers and startup; retain state on send failure."""
+        from gateway.update_notifications import final_outcome, notice, read_pending, save_pending
+        if getattr(self, "_update_final_send_active", False):
+            return False
+        self._update_final_send_active = True
+        try:
+            paths = self._update_paths()
+            current = read_pending(paths.pending.parent)
+            target = self._resolve_update_target(paths)
+            if not current or target is None:
+                return False
+            _, pending = current
+            outcome = final_outcome(paths.pending.parent, pending)
+            if outcome is None:
+                if not timed_out:
+                    return False
+                outcome = (False, "Update finalization could not be verified before the notification deadline. Runtime state is unknown. Inspect the update output before retrying.")
+            success, detail = outcome
+            if pending.get("notification_version") == 2 and not pending.get("updating_notified"):
+                if not await self._send_update_phase("updating"):
+                    return False
+                current = read_pending(paths.pending.parent)
+                if not current:
+                    return False
+                _, pending = current
+            # Startup can reach here without a live watcher; preserve unsent native output.
+            offset = int(pending.get("output_offset", 0))
+            output, end_offset = self._read_update_output_since(paths.output, offset)
+            if output.strip():
+                if not await self._send_update_output(target, output):
+                    return False
+                current = read_pending(paths.pending.parent)
+                if current:
+                    marker, pending = current
+                    pending["output_offset"] = end_offset
+                    save_pending(marker, pending)
+            heading = "✅ Update Complete" if success else "❌ Update Failed"
+            result = await target.send(notice(heading, pending, detail))
+            if _send_failed(result):
+                return False
+            self._clear_update_markers(paths, target.session_key)
+            (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)
+            return True
+        except Exception:
+            logger.warning("Update final notification failed", exc_info=True)
+            return False
         finally:
-            if cleanup:
-                for p in (active_pending_path, paths.claimed, paths.output, paths.exit_code):
-                    p.unlink(missing_ok=True)
-        return True
+            self._update_final_send_active = False
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""

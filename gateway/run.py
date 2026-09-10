@@ -5140,8 +5140,18 @@ async def _start_gateway_start_control_socket(runner):
                 "pausing": accepted, "already_stopping": not accepted,
                 "pid": os.getpid(), "drain_timeout": _drain}
 
+        from gateway.slash_commands import _spawn_detached_update
+        from gateway.update_launcher import make_agent_update_handler
+        from hermes_cli.config import is_managed
+
+        _agent_update_handler = make_agent_update_handler(
+            runner=runner, home=_hermes_home, main_loop=_main_loop,
+            resolve_hermes_bin=_resolve_hermes_bin, spawn=_spawn_detached_update, is_managed=is_managed,
+        )
+
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler})
+            home=_hermes_home,
+            verb_handlers={"pause-for-update": _pause_for_update_handler, "agent-update": _agent_update_handler})
         if not await _control_server.start():
             _control_server = None
         else:

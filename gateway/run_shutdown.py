@@ -180,6 +180,7 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            + self._active_async_delegation_count()
         )
 
     @staticmethod
@@ -239,6 +240,25 @@ class GatewayShutdownMixin:
         if not isinstance(workers, dict):
             return 0
         return sum(1 for future in list(workers) if not future.done())
+
+    @staticmethod
+    def _active_async_delegation_count() -> int:
+        """Live detached delegation units, including queued/finalizing work but never terminal history."""
+        try:
+            from tools.async_delegation import active_count
+            return max(0, int(active_count()))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _interrupt_async_delegations(reason: str) -> int:
+        """Cooperatively interrupt live detached delegations during forced shutdown."""
+        try:
+            from tools.async_delegation import interrupt_all
+            return max(0, int(interrupt_all(reason=reason)))
+        except Exception as exc:
+            logger.debug("Failed interrupting async delegations during shutdown: %s", exc)
+            return 0
 
     def _track_deferred_agent_worker(self, future: asyncio.Future, agent: Any) -> None:
         """Expose an executor worker to drain/interrupt until it really exits."""
@@ -721,10 +741,11 @@ class GatewayShutdownMixin:
 
     # Drain / interrupt
     def _drain_work_counts(self) -> tuple:
-        """``(agents, cron, api, deferred)`` — the four sources the drain waits on."""
+        """``(agents, cron, api, deferred, delegations)`` — every source the drain waits on."""
         return (
             self._running_agent_count(), self._active_cron_job_count(),
             self._active_api_run_count(), self._active_deferred_agent_worker_count(),
+            self._active_async_delegation_count(),
         )
 
     async def _drain_active_agents(
@@ -743,10 +764,10 @@ class GatewayShutdownMixin:
                 self._update_runtime_status("draining")
                 last_counts, last_status_at = counts, now
 
-        # Cron/API/deferred work lives outside ``_running_agents``; fold it in or it is killed unwarned.
-        _cron0, _api0, _deferred0 = last_counts[1:]
+        # Cron/API/deferred/delegated work lives outside ``_running_agents``; fold it in or it is killed unwarned.
+        _cron0, _api0, _deferred0, _delegations0 = last_counts[1:]
         _maybe_update_status(force=True)
-        if not self._running_agents and not (_cron0 or _api0 or _deferred0):
+        if not self._running_agents and not (_cron0 or _api0 or _deferred0 or _delegations0):
             return snapshot, False
         # Cron has its own deadline: a chat turn is announced+resumable; a killed cron run is a permanent failure.
         # ``timeout`` (``restart_drain_timeout``) defaults to 0 because interrupting a chat turn is
@@ -760,8 +781,8 @@ class GatewayShutdownMixin:
 
         def _still_draining() -> bool:
             now = loop.time()
-            agents, cron, api, deferred = self._drain_work_counts()
-            return bool(((agents or api or deferred) and now < deadline) or (cron and now < cron_deadline))
+            agents, cron, api, deferred, delegations = self._drain_work_counts()
+            return bool(((agents or api or deferred or delegations) and now < deadline) or (cron and now < cron_deadline))
 
         # Both budgets at 0 = an expired deadline (loop unentered), so timed_out still comes from real state.
         while _still_draining():
@@ -784,6 +805,7 @@ class GatewayShutdownMixin:
         for count, what in (
             (self._interrupt_api_server_runs(reason), "api_server run(s)"),
             (self._interrupt_deferred_agent_workers(reason), "deferred agent worker(s)"),
+            (self._interrupt_async_delegations(reason), "async delegation(s)"),
         ):
             if count:
                 logger.debug("Interrupted %d %s during shutdown", count, what)
@@ -944,6 +966,12 @@ class GatewayShutdownMixin:
         # session was notified — a loop-body import would leave the name unbound on that path.
         from gateway.run import _interim_metadata
 
+        from gateway.update_notifications import notice, read_pending
+        update_record = read_pending(self._update_paths().pending.parent) if self._restart_requested else None
+        update_notified = False
+        if update_record:
+            await self._send_update_phase("updating")
+            update_notified = await self._send_update_phase("restarting")
         restart_source = self._restart_command_source if self._restart_requested else None
         def _notification_message(adapter) -> str:
             if not self._restart_requested:
@@ -953,6 +981,10 @@ class GatewayShutdownMixin:
                 hint = "I'll try to resume it automatically after restart."
             else:
                 hint = "Send any message after restart and I'll try to resume where you left off."
+            if update_record:
+                # The reason belongs to its exact originating conversation only.
+                # That route is notified above; other active/home chats get no private context.
+                return notice("🔄 Restarting", {}, f"Your current task may be interrupted. {hint}")
             return f"⚠️ Gateway restarting — Your current task will be interrupted. {hint}"
         restart_key = None
         if restart_source is not None:
@@ -961,6 +993,9 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        if update_notified and update_record:
+            data = update_record[1]
+            notified.add(_notice_target_key(data.get("platform"), data.get("chat_id"), data.get("thread_id")))
         notified_dm_topic_parents: set[tuple[str, str]] = set()
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
@@ -1616,6 +1651,7 @@ class GatewayShutdownMixin:
         _cron_at_start = self._active_cron_job_count()
         _api_at_start = self._active_api_run_count()
         _deferred_at_start = ctx.deferred_count()
+        _delegations_at_start = self._active_async_delegation_count()
         # Cron floor clamped to the watchdog leash; getattr-guard for bare shutdown-path doubles.
         _cron_drain_cfg = getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT)
         _cron_timeout = resolve_cron_drain_budget(
@@ -1634,10 +1670,10 @@ class GatewayShutdownMixin:
         logger.info(
             "Shutdown phase: drain done at +%.2fs (drain took %.2fs, timed_out=%s, active_at_start=%d, "
             "active_now=%d, cron_at_start=%d, cron_now=%d, api_at_start=%d, api_now=%d, "
-            "deferred_at_start=%d, deferred_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
+            "deferred_at_start=%d, deferred_now=%d, delegations_at_start=%d, delegations_now=%d)", ctx.elapsed(), ctx.drain_elapsed,
             ctx.timed_out, len(ctx.active_agents), self._running_agent_count(), _cron_at_start,
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
-            _deferred_at_start, ctx.deferred_count(),
+            _deferred_at_start, ctx.deferred_count(), _delegations_at_start, self._active_async_delegation_count(),
         )
         if ctx.timed_out:
             return
@@ -1655,9 +1691,10 @@ class GatewayShutdownMixin:
         from gateway.run import GatewayRunner
         logger.warning(
             "Gateway drain timed out after %.1fs with %d active agent(s), "
-            "%d in-flight cron job(s), %d api_server run(s), and %d deferred agent worker(s); "
+            "%d in-flight cron job(s), %d api_server run(s), %d deferred agent worker(s), and %d async delegation(s); "
             "interrupting remaining work.", ctx.drain_elapsed, self._running_agent_count(),
             self._active_cron_job_count(), self._active_api_run_count(), ctx.deferred_count(),
+            self._active_async_delegation_count(),
         )
         # Mark resume_pending BEFORE interrupting so the next message auto-resumes (stuck sessions
         # still escalate via .restart_failure_counts). CURRENT _running_agents, not the drain snapshot.
@@ -1670,7 +1707,12 @@ class GatewayShutdownMixin:
         logger.info("Shutdown phase: allowing %.1fs for interrupted agents to unwind", interrupt_grace_timeout)
 
         def _work_live() -> bool:
-            return bool(self._running_agents or self._active_api_run_count() or ctx.deferred_count())
+            return bool(
+                self._running_agents
+                or self._active_api_run_count()
+                or ctx.deferred_count()
+                or self._active_async_delegation_count()
+            )
 
         # Wait on API-server work too, or an API turn's tool subprocesses are killed before it unwinds.
         while _work_live() and loop.time() < interrupt_deadline:
@@ -1893,6 +1935,7 @@ class GatewayShutdownMixin:
             "active_cron_jobs": self._active_cron_job_count(),
             "active_api_runs": self._active_api_run_count(),
             "active_deferred_agent_workers": ctx.deferred_count(),
+            "active_async_delegations": self._active_async_delegation_count(),
             "restart_drain_timeout": self._restart_drain_timeout,
             "watchdog_delay_s": resolve_shutdown_watchdog_delay(self._restart_drain_timeout),
             "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,

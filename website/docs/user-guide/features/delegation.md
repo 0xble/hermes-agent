@@ -472,7 +472,7 @@ What happens:
 
 The canonical flow: your main agent opens a PR, you type `/review`, and a second pair of eyes investigates it while you keep working; the review lands back in the chat addressed to the agent that created the PR.
 
-Dispatch prints only a one-liner naming the model the review is starting on — “⚖ Review dispatched starting on <model>. Results will return here.” — because configured fallback routes may move it. The live subagent viewer identifies the worker as **Review: your focus** (or **Review recent work** for bare `/review`), with a shortened single-line label; the reviewer still receives your full instructions. In the classic CLI, the dock above the composer shows elapsed time and latest activity; **Ctrl+T** (or **F6**) opens the roster with its model, transcript, steering, and stop controls. The same review label appears in the TUI and Desktop subagent viewers.
+Dispatch prints only a one-liner naming the model the review is starting on — “⚖ Review dispatched starting on `<model>`. Results will return here.” — because configured fallback routes may move it. The live subagent viewer identifies the worker as **Review: your focus** (or **Review recent work** for bare `/review`), with a shortened single-line label; the reviewer still receives your full instructions. In the classic CLI, the dock above the composer shows elapsed time and latest activity; **Ctrl+T** (or **F6**) opens the roster with its model, transcript, steering, and stop controls. The same review label appears in the TUI and Desktop subagent viewers.
 
 ### Review model
 

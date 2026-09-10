@@ -14,6 +14,8 @@ import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
+from tests.gateway.update_fixtures import finalize_update as _finalized_stream
+
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
@@ -158,7 +160,7 @@ class TestUpdateCommandGatewayFlag:
         assert "PYTHONUNBUFFERED" in cmd_string
         assert "rc=$?" in cmd_string
         assert "status=$?" not in cmd_string
-        assert "stream progress" in result
+        assert result == ""  # The durable watcher owns the initial notice.
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +194,7 @@ class TestWatchUpdateProgress:
                 "→ Fetching updates...\n✓ Code updated!\n"
             , encoding="utf-8")
             (hermes_home / ".update_exit_code").write_text("0")
+            _finalized_stream(hermes_home)
 
         with patch("gateway.run._hermes_home", hermes_home):
             task = asyncio.create_task(write_exit_code())
@@ -205,7 +208,7 @@ class TestWatchUpdateProgress:
         # Should have sent at least the output and a success message
         assert mock_adapter.send.call_count >= 1
         all_sent = " ".join(str(c) for c in mock_adapter.send.call_args_list)
-        assert "update finished" in all_sent.lower()
+        assert "update complete" in all_sent.lower()
 
     @pytest.mark.asyncio
     async def test_detects_and_forwards_prompt(self, tmp_path):
@@ -233,6 +236,7 @@ class TestWatchUpdateProgress:
             (hermes_home / ".update_prompt.json").unlink(missing_ok=True)
             await asyncio.sleep(0.2)
             (hermes_home / ".update_exit_code").write_text("0")
+            _finalized_stream(hermes_home)
 
         with patch("gateway.run._hermes_home", hermes_home):
             task = asyncio.create_task(simulate_prompt_cycle())
@@ -248,7 +252,7 @@ class TestWatchUpdateProgress:
         prompt_found = any("Restore local changes" in s for s in all_sent)
         assert prompt_found, f"Prompt not forwarded. Sent: {all_sent}"
         # Check session was marked as having pending prompt
-        # (may be cleared by the time we check since update finished)
+        # (may be cleared by the time we check since update complete)
 
 
     @pytest.mark.asyncio
@@ -289,7 +293,7 @@ class TestWatchUpdateProgress:
                     break
                 await asyncio.sleep(0.05)
 
-            assert adapter1.send.call_count == 1
+            assert sum("Restore local changes?" in c.args[1] for c in adapter1.send.call_args_list) == 1
             assert (hermes_home / ".update_prompt.json").exists()
 
             watch1.cancel()
@@ -305,6 +309,7 @@ class TestWatchUpdateProgress:
                 (hermes_home / ".update_response").write_text("y")
                 await asyncio.sleep(0.2)
                 (hermes_home / ".update_exit_code").write_text("0")
+                _finalized_stream(hermes_home)
 
             finisher = asyncio.create_task(respond_and_finish())
             await runner2._watch_update_progress(
@@ -397,4 +402,3 @@ class TestCmdUpdateGatewayMode:
 
         assert len(calls) == 1
         assert "Restore" in calls[0]
-

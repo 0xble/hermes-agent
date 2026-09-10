@@ -12,6 +12,14 @@ When useful, record the removal commit subject or resolved SHA on the `Retired` 
 
 Commit subjects and resolved SHAs are optional, human-readable provenance, not manifest keys or publication requirements. Resolve a current SHA from fetched fork history only when it materially helps attribution or review; do not reconstruct or rewrite history to complete this inventory.
 
+## Agent-requested native update lifecycle — source candidate
+
+- **Contract:** [agent update lifecycle](docs/agent-update-lifecycle.md): required short reason, durable direct/nested parent-topic resolution, shared native `/update` launch and progress, separate Updating/Restarting/final notices, honest recovery attempts and receipt-plus-runtime completion evidence. No synthetic chat events, inferred reasons, second restart, or extra scheduler.
+- **Drain:** native active-work accounting includes background delegations; the initiating turn hands off immediately rather than waiting on its own drain.
+- **Upstream:** adopts open PR [107445](https://github.com/NousResearch/hermes-agent/pull/107445), issue [107427](https://github.com/NousResearch/hermes-agent/issues/107427), preserving its author. The remaining local delta adds agent routing, durable reason/progress and stricter finalization evidence. Retire adopted/private portions when released upstream satisfies the complete contract.
+- **Verification:** real Unix socket and SQLite lineage; native receipt persistence, restart simulation, send failures, legacy/no-reason records, duplicate admission and drain regressions. Source tests are not live rollout evidence.
+- **Activation boundary:** authorized rollout is default local only, coordinated after checking other work. Product keeps native profile/fleet semantics. No remote or other-profile deployment is authorized by this entry.
+
 ## Delegation presentation reanchoring — source candidate
 
 - **Stable subject:** `fix(telegram): reanchor active delegation cards after conversation displacement`.

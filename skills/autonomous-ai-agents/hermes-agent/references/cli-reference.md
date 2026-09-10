@@ -76,7 +76,13 @@ Details (transport, tool discovery, catalog): `references/native-mcp.md`.
 
 ```
 hermes gateway run|install|start|stop|restart|status|setup
+
+# Delegated child only: request the running local gateway's native updater.
+# Use a short factual reason and end the turn immediately after acceptance.
+hermes gateway update --reason "Fix requires the current Hermes release"
 ```
+
+`gateway update` is not a general service command: it requires the caller's session to resolve to a durable messaging route (direct or through delegated ancestry). It validates the reason before IPC, sends no synthetic user event, and returns a handoff instruction. Once accepted, **end the current turn**; do not restart the gateway, wait for the updater, or write update marker files. The native updater performs the update and owns the eventual parent-session notification.
 
 20+ platforms: Telegram, Discord, Slack, WhatsApp (Baileys + Business Cloud API), iMessage (Photon — `hermes photon setup`), Signal, Email, SMS, Matrix, Mattermost, Teams, LINE, SimpleX, ntfy, Google Chat, Home Assistant, DingTalk, Feishu, WeCom, Weixin, API Server, Webhooks. Open WebUI connects via the API Server adapter. Most adapters ship under `plugins/platforms/`.
 Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/
