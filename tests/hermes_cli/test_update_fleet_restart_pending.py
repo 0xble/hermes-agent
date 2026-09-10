@@ -77,6 +77,14 @@ def _make_up_to_date_side_effect(sha="abc123"):
 
 def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     """Patch ``_cmd_update_impl`` helpers. Mirrors test_update_head_moved_gate."""
+    # These tests exercise marker/receipt lifecycle, not elapsed wall time.
+    import time
+    clock = SimpleNamespace(now=0.0)
+    def sleep(seconds):
+        clock.now += seconds
+    monkeypatch.setattr(update_cmd_fleet, "_time", SimpleNamespace(
+        monotonic=lambda: clock.now, sleep=sleep, time=time.time,
+    ))
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     (tmp_path / ".git").mkdir()

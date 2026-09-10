@@ -1261,23 +1261,40 @@ def _print_legacy_units_warning() -> None:
     print("  (add `sudo` if any are in system scope)")
 
 
-def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
-    """Fleet version rows, polled over a bounded settle window when runtimes are expected.
+def _coerce_pid_set(pids) -> set[int]:
+    """Normalize PID snapshots and socket rows, including numeric strings (#102733)."""
+    result: set[int] = set()
+    for pid in pids or []:
+        try:
+            result.add(int(pid))
+        except (TypeError, ValueError):
+            continue
+    return result
 
-    Gateways need time to rewrite gateway_state.json; Windows resumes DETACHED (~10s boot),
-    so a single 2s sleep reported "no rows" on healthy resumes. A "down" row may be a
-    detached replacement still booting: poll until none remain or the deadline passes.
-    Pre-restart PIDs make a gateway stopped WITHOUT verified replacement a DOWN row (exit 1)
-    instead of no row at all.
+
+def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
+    """Wait for an outgoing gateway's drain and replacement code identity.
+
+    A stale pre-restart PID is still draining, not a failed replacement (#102733).
+    Reuse the gateway's full after-turn/drain/headroom budget: the short startup
+    settle window cannot cover an asynchronous self-restart with active work.
+    New-PID stale rows remain terminal failures; DOWN/empty probes keep polling.
     """
     from hermes_cli.update_receipt import collect_fleet_versions
     if not rows_expected:
         return collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
-    _fleet_deadline = _time.monotonic() + 30.0
+    from hermes_cli.gateway import _get_restart_exit_wait_budget
+    _fleet_deadline = _time.monotonic() + _get_restart_exit_wait_budget()
+    _pre_restart_pid_set = _coerce_pid_set(restart.pre_restart_gateway_pids)
     while True:
         _time.sleep(2.0)
         snapshot = collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
-        if snapshot and not any(row.get("state") == "down" for row in snapshot):
+        settling_stale = any(
+            row.get("state") == "stale"
+            and _coerce_pid_set([row.get("pid")]) & _pre_restart_pid_set
+            for row in snapshot
+        )
+        if snapshot and not settling_stale and not any(row.get("state") == "down" for row in snapshot):
             return snapshot
         if _time.monotonic() >= _fleet_deadline:
             return snapshot
