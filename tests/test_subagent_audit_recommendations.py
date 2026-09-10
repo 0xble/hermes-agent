@@ -356,6 +356,13 @@ def test_pin_rejects_a_replaced_client_at_the_boundary():
     # A trailing slash is spelling, not a route change.
     enforce_delegation_pin(child, kwargs, client=SimpleNamespace(
         api_key="fixture", base_url="https://openrouter.ai/api/v1/"))
+    child.base_url = "https://openrouter.ai/api/v1/"
+    enforce_delegation_pin(child, kwargs, client=child.client)
+    assert child._delegation_runtime_pin.pinned_base_url_for(child) == "https://openrouter.ai/api/v1"
+    child.base_url = "https://openrouter.ai/api/v1?tenant=other"
+    with pytest.raises(ValueError, match="pinned route changed"):
+        enforce_delegation_pin(child, kwargs, client=child.client)
+    child.base_url = "https://openrouter.ai/api/v1"
     other = SimpleNamespace(api_key="someone-elses-key",
                             base_url="https://openrouter.ai/api/v1")
     with pytest.raises(ValueError, match="credential changed"):

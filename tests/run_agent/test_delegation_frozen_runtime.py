@@ -110,6 +110,27 @@ def test_frozen_fallback_allows_authorized_same_route_pool_rotation():
         pin.for_pool_swap(child, rotated_entry, rotated_key, route.base_url)
 
 
+def test_primary_pool_rotation_tolerates_trailing_slash_base_url():
+    from tools.custom_subagents import RuntimePin
+
+    old_key, rotated_key = "primary-account-a", "primary-account-b"
+    rotated_entry = SimpleNamespace(provider="primary-provider", runtime_api_key=rotated_key,
+                                    runtime_base_url="https://primary.fixture/v1")
+    primary_pool: Any = SimpleNamespace(provider="primary-provider")
+    primary_pool.entries = lambda: [rotated_entry]
+    pin = RuntimePin("fixture", "primary-provider", "primary-model", "https://primary.fixture/v1",
+        "chat_completions", None, hashlib.sha256(old_key.encode()).hexdigest(), True,
+        primary_pool, (), "{}")
+    child = SimpleNamespace(provider=pin.provider, model=pin.model,
+        base_url="https://primary.fixture/v1/", api_mode=pin.api_mode, api_key=old_key,
+        request_overrides={}, _credential_pool=primary_pool)
+    rotated = pin.for_pool_swap(child, rotated_entry, rotated_key, rotated_entry.runtime_base_url)
+    child.api_key = rotated_key
+    rotated.validate_request(child, {"model": pin.model},
+                             client=SimpleNamespace(api_key=rotated_key, base_url=child.base_url))
+    assert rotated.pinned_base_url_for(child) == "https://primary.fixture/v1"
+
+
 def _resume_fixture(monkeypatch):
     from tools.custom_subagents import parse_definitions
     from hermes_cli import runtime_provider

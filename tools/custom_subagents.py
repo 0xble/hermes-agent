@@ -179,6 +179,21 @@ def _route_host(base_url: str) -> tuple[str, str]:
     return (parts.scheme.lower(), parts.netloc.lower())
 
 
+def _same_pinned_base_url(left: str, right: str) -> bool:
+    """Compare frozen base URLs with the shared route normalizer, not raw spelling."""
+    from hermes_cli.route_identity import normalize_route_base_url
+    return normalize_route_base_url(left) == normalize_route_base_url(right)
+
+
+def _same_pinned_route(current: tuple, provider: str, model: str, base_url: str, api_mode: str) -> bool:
+    return (
+        current[0] == provider
+        and current[1] == model
+        and current[3] == api_mode
+        and _same_pinned_base_url(current[2], base_url)
+    )
+
+
 def parse_definitions(config: Mapping) -> dict[str, SubagentDefinition]:
     """Validate the entire registry before any child can be constructed."""
     if config.get("subagents") is None:
@@ -587,10 +602,10 @@ class RuntimePin:
 
         current = (child.provider, child.model, child.base_url, child.api_mode)
         primary = (self.provider, self.model, self.base_url, self.api_mode)
-        fallback = next((route for route in self.fallback_routes if current == (
-            route.provider, route.model, route.base_url, route.api_mode
+        fallback = next((route for route in self.fallback_routes if _same_pinned_route(
+            current, route.provider, route.model, route.base_url, route.api_mode
         )), None)
-        pool = self._credential_pool if current == primary else (
+        pool = self._credential_pool if _same_pinned_route(current, *primary) else (
             fallback._credential_pool if fallback is not None else None
         )
         expected_provider = self.provider if fallback is None else fallback.provider
@@ -603,7 +618,7 @@ class RuntimePin:
             or entry.provider != pool.provider
             or not any(candidate is entry for candidate in pool.entries())
             or normalize_route_base_url(base_url) != normalize_route_base_url(expected_base_url)
-            or (current != primary and fallback is None)
+            or (not _same_pinned_route(current, *primary) and fallback is None)
         ):
             raise ValueError(f"subagent_type {self.subagent_type!r}: unauthorized credential rotation")
         digest = hashlib.sha256(api_key.encode()).hexdigest()
@@ -620,10 +635,10 @@ class RuntimePin:
     def pinned_base_url_for(self, child) -> str:
         """Return the exact frozen spelling for the child's active route."""
         current = (child.provider, child.model, child.base_url, child.api_mode)
-        if current == (self.provider, self.model, self.base_url, self.api_mode):
+        if _same_pinned_route(current, self.provider, self.model, self.base_url, self.api_mode):
             return self.base_url
-        fallback = next((route for route in self.fallback_routes if current == (
-            route.provider, route.model, route.base_url, route.api_mode
+        fallback = next((route for route in self.fallback_routes if _same_pinned_route(
+            current, route.provider, route.model, route.base_url, route.api_mode
         )), None)
         if fallback is None:
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
@@ -642,8 +657,10 @@ class RuntimePin:
         digest = hashlib.sha256(str(child.api_key or "").encode()).hexdigest()
         fallback = next((route for route in self.fallback_routes
                          if (route.provider, route.model) == current[:2]), None)
-        if current != expected and (
-            fallback is None or current[2:] != (fallback.base_url, fallback.api_mode)
+        if not _same_pinned_route(current, *expected) and (
+            fallback is None or not _same_pinned_route(
+                current, fallback.provider, fallback.model, fallback.base_url, fallback.api_mode
+            )
         ):
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
         expected_digest = self._credential_digest if fallback is None else fallback.credential_digest

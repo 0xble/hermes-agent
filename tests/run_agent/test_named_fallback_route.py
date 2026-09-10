@@ -47,6 +47,9 @@ def test_named_codex_fallback_activates_and_builds_pinned_request(make_child):
     assert kwargs["model"] == route.model
     assert kwargs["reasoning"]["effort"] == "high"
     assert child._delegation_runtime_pin.pinned_base_url_for(child) == route.base_url
+    child.base_url = route.base_url + "/"
+    child._delegation_runtime_pin.validate_request(child, kwargs, client=child.client)
+    assert child._delegation_runtime_pin.pinned_base_url_for(child) == route.base_url
     assert child._delegation_route_transitions[-1]["to"] == {
         "provider": route.provider, "model": route.model,
     }
