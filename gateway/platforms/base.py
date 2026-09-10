@@ -4090,11 +4090,6 @@ class BasePlatformAdapter(ABC):
             cards = getattr(self.gateway_runner, "_delegation_cards", None)
             if cards is not None:
                 await cards.delivered(_card_receipt)
-        _review_status_receipt = getattr(event, "_review_status_receipt", None)
-        if _review_status_receipt and getattr(result, "success", False):
-            statuses = getattr(self.gateway_runner, "_review_statuses", None)
-            if statuses is not None:
-                await statuses.delivered(_review_status_receipt)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 

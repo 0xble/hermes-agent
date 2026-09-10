@@ -1726,12 +1726,6 @@ class GatewayTurnMixin:
             event._delegation_card_receipt = receipt
             if _intentional_silence or agent_result.get("already_sent"):
                 await cards.delivered(receipt)
-        statuses = getattr(self, "_review_statuses", None)
-        if statuses is not None and not agent_result.get("failed"):
-            receipt = statuses.receipt(event, session_key, run_generation)
-            event._review_status_receipt = receipt
-            if _intentional_silence or agent_result.get("already_sent"):
-                await statuses.delivered(receipt)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)

@@ -12,14 +12,14 @@ def test_child_exclusion_preserves_staged_name_only_tools():
     assert names == {'read_file','engine_tool'}
 
 
-def test_delivered_native_status_uses_canonical_intentional_silence_boundary():
+def test_review_dispatch_uses_canonical_intentional_silence_boundary():
     from agent.turn_tool_round import run_tool_round
     from gateway.response_filters import is_intentional_silence_agent_result
     agent = SimpleNamespace(quiet_mode=True, verbose_logging=False,
         _deduplicate_tool_calls=lambda x:x, _cap_delegate_task_calls=lambda x:x,
         _flush_messages_to_session_db=lambda *a: True, _emit_interim_assistant_message=Mock(),
         stream_delta_callback=None, _execute_tool_calls=Mock(), _incremental_persistence_failed=False,
-        _tool_guardrail_halt_decision=None, _review_yield_requested=True, _review_status_delivered=True)
+        _tool_guardrail_halt_decision=None, _review_yield_requested=True)
     with patch('agent.turn_tool_round.validate_tool_calls', return_value=SimpleNamespace(action='run',mixed_invalid_batch=False)), patch(
         'agent.turn_tool_round.stage_tool_call_message', return_value=({'role':'assistant','content':None},True)):
         verdict = run_tool_round(agent, assistant_message=SimpleNamespace(tool_calls=[]), finish_reason='tool_calls',

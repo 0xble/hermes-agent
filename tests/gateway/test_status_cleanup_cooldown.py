@@ -7,15 +7,14 @@ from unittest.mock import AsyncMock
 import pytest
 from gateway.config import Platform
 from gateway.delegation_cards import DelegationCards
-from gateway.review_status import ReviewStatuses
+
 from gateway.platforms.base import SendResult, MessageEvent
 from gateway.session import SessionSource
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['delegation', 'review'])
 @pytest.mark.parametrize('persistent_flood', [False, True])
-async def test_cooldown_defers_cleanup_without_consuming_attempts(kind, persistent_flood, tmp_path):
+async def test_cooldown_defers_delegation_cleanup_without_consuming_attempts(persistent_flood, tmp_path):
     deadline = [0.0]
     adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True,message_id='one')),
         send_delegation_card=AsyncMock(return_value=SendResult(success=True,message_id='one')),
@@ -29,26 +28,17 @@ async def test_cooldown_defers_cleanup_without_consuming_attempts(kind, persiste
     adapter.delete_message.side_effect = delete
     runner = SimpleNamespace(_adapter_for_source=lambda _:adapter, _thread_metadata_for_source=lambda _: {})
     source = SessionSource(platform=Platform.TELEGRAM,chat_id='42')
-    if kind == 'review':
-        manager = ReviewStatuses(runner,home=tmp_path)
-        await manager.dispatch(source,'r','s',1,'review')
-        await manager.observe(source,'r','s',1,'review','subagent.complete')
-        event = MessageEvent(source=source,text='handled',internal=True,metadata={'delegation_id':'review','gateway_session_id':'s'})
-        receipt = manager.receipt(event,'r',2)
-        item = manager.items['review']
-        pending = manager.delete_pending
-    else:
-        manager = DelegationCards(runner,home=tmp_path,interval=0)
-        owner = dict(profile='default',session_id='s',session_key='r',chat_id='42',thread_id='')
-        data = dict(parent_task_id='a'*32,thread_ref='A',owner=owner)
-        await manager.observe(source,'r','s',1,'subagent.start',None,data)
-        await asyncio.gather(*list(manager.pending.values()))
-        await manager.observe(source,'r','s',1,'subagent.complete',None,data)
-        event = MessageEvent(source=source,text='handled',internal=True,metadata={
-            'delegation_parent_task_id':'a'*32,'delegation_owner':owner,'delegation_thread_refs':['A']})
-        receipt = manager.receipt(event,'r',2)
-        item = manager.cards['a'*32]
-        pending = manager.pending
+    manager = DelegationCards(runner,home=tmp_path,interval=0)
+    owner = dict(profile='default',session_id='s',session_key='r',chat_id='42',thread_id='')
+    data = dict(parent_task_id='a'*32,thread_ref='A',owner=owner)
+    await manager.observe(source,'r','s',1,'subagent.start',None,data)
+    await asyncio.gather(*list(manager.pending.values()))
+    await manager.observe(source,'r','s',1,'subagent.complete',None,data)
+    event = MessageEvent(source=source,text='handled',internal=True,metadata={
+        'delegation_parent_task_id':'a'*32,'delegation_owner':owner,'delegation_thread_refs':['A']})
+    receipt = manager.receipt(event,'r',2)
+    item = manager.cards['a'*32]
+    pending = manager.pending
     deadline[0] = time.monotonic()+0.05
     await manager.delivered(receipt)
     assert item['retired'] and item.get('delete_attempts',0) == 0
@@ -93,11 +83,7 @@ async def test_legacy_ambiguous_send_does_not_hide_known_aggregate_anchor(tmp_pa
 @pytest.mark.asyncio
 async def test_missing_deferred_cleanup_record_is_a_noop(tmp_path):
     runner=SimpleNamespace(_adapter_for_source=lambda _:None)
-    statuses=ReviewStatuses(runner,home=tmp_path)
-    await statuses._retry_delete('missing')
-    assert statuses.delete_pending == {}
+    cards=DelegationCards(runner,home=tmp_path)
     detached={'source':{'chat_id':'42'}}
     adapter=SimpleNamespace(deletion_retry_after=lambda _:1)
-    assert statuses._defer_delete(detached,adapter) is False
-    cards=DelegationCards(runner,home=tmp_path)
     assert cards._defer_delete(detached,adapter) is False

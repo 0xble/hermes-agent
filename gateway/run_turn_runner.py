@@ -114,19 +114,6 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
-        # Native review is a compact, exclusive Telegram status—not a delegation
-        # card and not generic tool progress. The child lifecycle is observed,
-        # never inferred from dispatch or a timer.
-        if (kwargs.get("delegation_id") and event_type in {"subagent.start", "subagent.complete"}
-                and ctx.source.platform == Platform.TELEGRAM):
-            from gateway.review_status import statuses_for
-            statuses = statuses_for(self._runner)
-            if kwargs.get("native_review") or statuses.owns(ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, kwargs["delegation_id"]):
-                self._schedule(statuses.lifecycle(
-                    ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
-                    kwargs["delegation_id"], event_type,
-                ), "review status update scheduling error")
-                return
         if (event_type in {"subagent.start", "subagent.tool", "subagent.complete"}
                 and kwargs.get("parent_task_id") and ctx.source.platform == Platform.TELEGRAM
                 and ctx.tool_progress_enabled and ctx.progress_mode not in {"off", "log"}):
@@ -1167,21 +1154,6 @@ class TurnRunner:
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
-    def _review_status_callback_sync(self, delegation_id: str) -> bool:
-        """Deliver the initial native review notice before suppressing text fallback."""
-        ctx = self._ctx
-        if ctx.source.platform != Platform.TELEGRAM or not self._status_live() or not delegation_id:
-            return False
-        from gateway.review_status import statuses_for
-        future = self._schedule(statuses_for(self._runner).dispatch(
-            ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, delegation_id,
-        ), "review status dispatch scheduling error")
-        try:
-            # The adapter owns bounded network deadlines. An arbitrary shorter
-            # wait must not race a still-pending send against a textual fallback.
-            return bool(future.result())
-        except Exception:
-            return False
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
         from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets
@@ -1591,7 +1563,6 @@ class TurnRunner:
         # OFF case, where a clarify decision brief must still precede its prompt.
         agent.clarify_context_callback = None if want_interim_messages else clarify_context_cb
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, self._notice_callback_sync
-        agent.review_status_callback = self._review_status_callback_sync
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier

@@ -188,14 +188,6 @@ def _review_current_work(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
         user_prompt=args.get("focus", ""), candidate=candidate,
     )
     if isinstance(result, dict) and result.get("status") == "dispatched":
-        # Telegram's native status callback waits for a real transport receipt;
-        # unsupported/failed surfaces retain the short textual fallback.
-        callback = getattr(agent, "review_status_callback", None)
-        if callable(callback):
-            try:
-                agent._review_status_delivered = bool(callback(str(result.get("delegation_id") or "")))
-            except Exception:
-                agent._review_status_delivered = False
         # The normal durable completion rail owns the next useful turn. Stop
         # this work phase so the parent cannot continue past its own review gate.
         agent._review_yield_requested = True

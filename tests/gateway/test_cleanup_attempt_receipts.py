@@ -7,13 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from gateway.config import PlatformConfig
 from gateway.delegation_cards import DelegationCards
-from gateway.review_status import ReviewStatuses
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['delegation', 'review'])
-async def test_queued_cleanup_keeps_attempt_after_final_takes_priority(kind, tmp_path):
+async def test_queued_delegation_cleanup_keeps_attempt_after_final_takes_priority(tmp_path):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token='fake'))
     adapter._bot = MagicMock()
     adapter._bot.delete_message = AsyncMock(return_value=True)
@@ -22,14 +20,9 @@ async def test_queued_cleanup_keeps_attempt_after_final_takes_priority(kind, tmp
     item = {'source': {'platform': 'telegram', 'chat_id': '42'},
             'message_id': '7', 'retired': True, 'rows': {}, 'generation': 1,
             'owner': {'profile': 'default'}, 'started_at': time.time()}
-    if kind == 'review':
-        manager = ReviewStatuses(runner, home=tmp_path)
-        manager.items['record'] = item
-        pending = manager.delete_pending
-    else:
-        manager = DelegationCards(runner, home=tmp_path, interval=0)
-        manager.cards['record'] = item
-        pending = manager.pending
+    manager = DelegationCards(runner, home=tmp_path, interval=0)
+    manager.cards['record'] = item
+    pending = manager.pending
     lock = adapter._send_cooldown_lock('42')
     await lock.acquire()
     deleting = asyncio.create_task(manager._delete(item))

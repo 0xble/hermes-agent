@@ -1563,8 +1563,8 @@ class GatewayNotificationsMixin:
         await asyncio.sleep(3)  # let platforms finish connecting
         from gateway.delegation_cards import cards_for
         await cards_for(self).reconcile()
-        from gateway.review_status import statuses_for
-        await statuses_for(self).reconcile()
+        from gateway.review_status_migration import retire_legacy_review_statuses
+        await retire_legacy_review_statuses(self)
         from tools.process_registry import process_registry as _pr
         # ProcessRegistry restores ordinary pending rows before adapters connect. Do this separate,
         # one-time pass only after connection so retry-exhausted rows cannot spin on unavailable
