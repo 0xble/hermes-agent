@@ -240,7 +240,7 @@ def start_review(
 
     from tools.delegate_tool import delegate_task
     raw = delegate_task(
-        goal=goal, context=context, background=True, parent_agent=parent_agent,
+        goal=goal, context=context, task_label="Review candidate", background=True, parent_agent=parent_agent,
         credentials_cfg=credentials_cfg, output_schema=output_schema,
         child_tool_policy=tool_policy, completion_contract=completion_contract,
     )

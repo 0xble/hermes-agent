@@ -43,6 +43,10 @@ def _make_mock_parent(depth=0):
 
 
 def _call(tasks):
+    # These tests exercise goal-quality validation; delegation display labels
+    # are validated separately and are now required for every new spawn.
+    tasks = [{**task, "task_label": task.get("task_label", f"Check task {i + 1}")}
+             for i, task in enumerate(tasks)]
     return json.loads(delegate_task(tasks=tasks, parent_agent=_make_mock_parent()))
 
 
@@ -178,7 +182,7 @@ class TestValidBatchStillRuns(unittest.TestCase):
                 "task_index": 0, "status": "completed", "summary": "ok",
                 "api_calls": 1, "duration_seconds": 1.0, "_child_role": None,
             }
-            result = json.loads(delegate_task(goal="test", parent_agent=parent))
+            result = json.loads(delegate_task(goal="test", task_label="Check test", parent_agent=parent))
         self.assertNotIn("error", result)
 
 
