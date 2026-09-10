@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import time
 
+from gateway import delegation_card_presentation as presentation
+
 # Eight distinct ordinary messages in this topic, and at most one move per five
 # minutes. IDs are deduplication tokens, never a measure of topic displacement.
 DISPLACEMENT = 8
@@ -39,6 +41,7 @@ def eligible(manager, key):
     card = manager.cards[key]
     return (bool(card.get("message_id")) and not card.get("reanchor")
             and not any(c.get("obsolete_message_id") for _, c in manager._members(key))
+            and not presentation.pending(manager, key) and not presentation.fenced(manager, key)
             and len(manager.displacement.get(key, ())) >= DISPLACEMENT
             and time.time() - max(card.get("anchored_at", 0), manager.tracking_started) >= COOLDOWN
             and any(r.get("state") == "running" for r in manager._projection(key)["rows"].values()))
@@ -47,6 +50,7 @@ def eligible(manager, key):
 def adopt_receipt(manager, card):
     receipt = card.get("reanchor") or {}
     if (receipt.get("state") != "sent" or card.get("message_deleted")
+            or card.get("consolidated_message_id")
             or card.get("message_id") == receipt.get("new_message_id")):
         return
     # The new transport receipt was persisted before changing the active anchor.

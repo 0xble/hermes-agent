@@ -746,7 +746,9 @@ async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference
     adapter.delete_message.assert_awaited_once_with("42", "old-b")
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["b" * 32]["presentation_key"] == "a" * 32
-    assert persisted["b" * 32]["obsolete_message_id"] == "old-b"
+    assert persisted["b" * 32]["consolidated_message_id"] == "old-b"
+    assert persisted["a" * 32]["presentation_cleanup"][0]["message_id"] == "old-b"
+    assert persisted["a" * 32]["presentation_cleanup"][0]["state"] == "ready"
     assert all(not c.get("handled") and not c.get("retired") for c in persisted.values())
     # Failed deletion retries even when the aggregate render is unchanged.
     adapter.delete_message.return_value = True
@@ -754,7 +756,7 @@ async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference
     await again.reconcile()
     await drain_cards(again)
     assert adapter.send_delegation_card.await_count == 2
-    assert again.cards["b" * 32]["obsolete_message_id"] is None
+    assert again.cards["a" * 32]["presentation_cleanup"][0]["state"] == "deleted"
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from pathlib import Path
 from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway import delegation_card_anchor as anchoring
+from gateway import delegation_card_presentation as presentation
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 
@@ -211,9 +212,7 @@ class DelegationCards:
 
     @staticmethod
     def _scope(card):
-        source = card["source"]
-        return (card["owner"].get("profile", ""), source.get("profile"),
-                source.get("platform"), str(source.get("chat_id")), str(source.get("thread_id") or ""))
+        return presentation.scope(card["owner"], card["source"])
 
     def _anchor(self, key):
         return self.cards[key].get("presentation_key", key)
@@ -239,27 +238,7 @@ class DelegationCards:
         return {"started_at": anchor["started_at"], "rows": rows}
 
     def _bind(self, key):
-        card = self.cards[key]
-        current_anchor = self._anchor(key)
-        if ("presentation_key" in card and current_anchor in self.cards
-                and not self.cards[current_anchor].get("retired")):
-            self._assign_refs(key)
-            return
-        # Presentation identity deliberately excludes execution session/task identity.
-        # Owners and receipts remain on the original task records. A retired card,
-        # including one retaining an ambiguous-send fence, cannot own a new active
-        # presentation: its fence remains on its historical record instead.
-        anchor = next((self._anchor(k) for k, c in self.cards.items()
-                       if (k != key and "presentation_key" in c and not c.get("retired")
-                           and not self.cards.get(self._anchor(k), {}).get("retired")
-                           and self._scope(c) == self._scope(card))), key)
-        card["presentation_key"] = anchor
-        self.cards[anchor]["delete_attempts"] = 0
-        if anchor != key and card.get("message_id"):
-            # Exact linkage, not age-based dismissal or an invented handled receipt.
-            card["obsolete_message_id"] = card.pop("message_id")
-            card["message_id"] = None
-        self._assign_refs(key)
+        presentation.bind(self, key)
 
     def _assign_refs(self, key):
         card = self.cards[key]
@@ -291,21 +270,20 @@ class DelegationCards:
             used.add(row["display_ref"])
 
     async def reconcile(self):
-        # Bind legacy task cards before any transport work, persisting replacement
-        # links before removing redundant messages. No task outcomes are inferred.
-        for key, card in sorted(self.cards.items(), key=lambda item: not bool(item[1].get("message_id"))):
-            if not card.get("retired"):
-                self._bind(key)
-        self._save()
-        for key, card in list(self.cards.items()):
-            if self._anchor(key) != key:
-                continue
-            if not self._projection(key)["rows"]:
-                async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
-                    await self._delete_obsolete(key)
-                    await self._delete(card)
-            else:
-                self._queue(key)
+        # Recovery uses the same normalized scope lock as dispatch and transport.
+        for scope in dict.fromkeys(self._scope(c) for c in self.cards.values()):
+            async with self.locks.setdefault(scope, asyncio.Lock()):
+                for key, card in list(self.cards.items()):
+                    if self._scope(card) == scope and not card.get("retired"):
+                        self._bind(key)
+                self._save()
+                for key, card in list(self.cards.items()):
+                    if self._scope(card) == scope and self._anchor(key) == key:
+                        if not self._projection(key)["rows"]:
+                            await self._delete_obsolete(key)
+                            await self._delete(card)
+                        else:
+                            self._queue(key)
 
     def _queue(self, key):
         key = self._anchor(key)
@@ -315,8 +293,9 @@ class DelegationCards:
     async def observe(self, source, session_key, session_id, generation, event_type, tool_name, data, preview=None):
         # Kept for the runner's lifecycle callback compatibility; cards intentionally
         # project canonical tool names only and never persist/render preview detail.
-        scope = ((data.get("owner") or {}).get("profile", ""), getattr(source, "profile", None),
-                 source.platform.value, str(source.chat_id), str(source.thread_id or ""))
+        scope = presentation.scope(data.get("owner") or {}, dict(
+            profile=getattr(source, "profile", None), platform=source.platform.value,
+            chat_id=source.chat_id, thread_id=source.thread_id))
         async with self.locks.setdefault(scope, asyncio.Lock()):
             await self._observe(source, session_key, session_id, generation, event_type, tool_name, data)
 
@@ -387,6 +366,12 @@ class DelegationCards:
                                     self.cards[key].get("retry_at", 0) - time.time(),
                                     self.cards[key].get("delete_retry_at", 0) - time.time()))
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
+                # A queued legacy anchor may have been rebound while waiting.
+                if not self.cards[key].get("retired"):
+                    self._bind(key)
+                if self._anchor(key) != key:
+                    self._queue(key)
+                    return
                 card = self.cards[key]
                 card.pop("delete_retry_at", None)
                 card.pop("retry_at", None)
@@ -397,7 +382,8 @@ class DelegationCards:
                     return
                 text = render_card(projection)
                 reanchor = anchoring.eligible(self, key)
-                if text == card["rendered"] and not reanchor:
+                if (text == card["rendered"] and not reanchor
+                        and not any(e["state"] == "pending" for e in presentation.pending(self, key))):
                     await self._delete_obsolete(key)
                     return
                 source = self._source(card)
@@ -412,14 +398,16 @@ class DelegationCards:
                     result = await adapter.edit_message(source.chat_id, card["message_id"], text, finalize=True,
                                                         metadata={"hermes_status": True})
                     missing = "message to edit not found" in str(getattr(result, "error", "")).lower()
-                    if missing and card["recoveries"] < 1 and not card.get("reanchor"):
+                    if (missing and card["recoveries"] < 1 and not card.get("reanchor")
+                            and not presentation.fenced(self, key)):
                         card["recoveries"] += 1
                         card["message_id"] = None
                         card["send_attempts"] = 0
                         result = None
                 else:
                     result = None
-                if result is None and card["send_attempts"] < 1:
+                if (result is None and card["send_attempts"] < 1
+                        and not presentation.fenced(self, key)):
                     card["send_attempts"] += 1  # ambiguous sends must not spam retries
                     self._save()  # persist the attempt BEFORE an ambiguous transport await
                     result = await adapter.send_delegation_card(source, text)
@@ -433,6 +421,7 @@ class DelegationCards:
                 if getattr(result, "success", False):
                     card.pop("retry_at", None)
                     card["rendered"] = text
+                    presentation.published(self, key)
                     await self._delete_obsolete(key)
                 elif getattr(result, "retryable", False) and getattr(result, "retry_after", None) is not None:
                     # Only explicit flood/cooldown rejection may reset an initial
@@ -505,10 +494,10 @@ class DelegationCards:
 
     async def delivered(self, receipt):
         for key, proof in receipt.items():
-            anchor_key = self._anchor(key) if key in self.cards else key
             if key not in self.cards:
                 continue
             async with self.locks.setdefault(self._scope(self.cards[key]), asyncio.Lock()):
+                anchor_key = self._anchor(key)
                 card = self.cards.get(key)
                 if (not card or card.get("retired")
                         or proof.get("epoch", 0) != card.get("receipt_epoch", 0)
@@ -528,7 +517,7 @@ class DelegationCards:
                     await self._delete_obsolete(anchor_key)
                     await self._delete(anchor)
 
-    def _defer_delete(self, card, adapter, minimum_delay=0):
+    def _defer_delete(self, card, adapter, minimum_delay=0.0):
         delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
         key = next((k for k, c in self.cards.items() if c is card), None)
         if key is None:
@@ -544,6 +533,37 @@ class DelegationCards:
         return True
 
     async def _delete_obsolete(self, key):
+        anchor = self.cards[key]
+        adapter = self._adapter(anchor)
+        empty = not self._projection(key)["rows"]
+        for entry in presentation.pending(self, key):
+            # Exact final-delivery receipts can retire every row before the first
+            # union edit, or between a failed delete and restart. Then there is
+            # no survivor to preserve; retain that distinct retirement evidence.
+            if empty:
+                entry.update(state="ready", projection_retired=True,
+                             survivor_message_id=anchor.get("message_id"))
+                self._save()
+            if (entry["state"] != "ready" or entry["attempts"] >= 3 or not adapter
+                    or entry.get("survivor_message_id") != anchor.get("message_id")):
+                continue
+            if self._defer_delete(anchor, adapter):
+                continue
+            entry["attempts"] += 1
+            self._save()
+            status_delete = getattr(type(adapter), "_delete_status_message", None)
+            if status_delete is not None:
+                deleted = await status_delete(adapter, anchor["source"]["chat_id"], entry["message_id"])
+            else:
+                deleted = await adapter.delete_message(anchor["source"]["chat_id"], entry["message_id"])
+            if deleted is None and status_delete is not None:
+                entry["attempts"] -= 1
+                self._defer_delete(anchor, adapter, minimum_delay=1.0)
+            elif deleted:
+                entry["state"] = "deleted"
+            else:
+                self._defer_delete(anchor, adapter)
+            self._save()
         for _, card in self._members(key):
             message_id = card.get("obsolete_message_id")
             adapter = self._adapter(card)
