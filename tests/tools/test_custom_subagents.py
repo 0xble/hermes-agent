@@ -161,8 +161,8 @@ def test_invalid_batch_never_constructs_valid_sibling(monkeypatch):
         pytest.fail("Preflight-invalid batch constructed a child")
     monkeypatch.setattr(delegate_tool, "_build_child_preserving_parent_tools", unexpected)
     result = json.loads(delegate_tool.delegate_task(tasks=[
-        {"goal": "Implement a scoped fixture", "subagent_type": "worker"},
-        {"goal": "Investigate a scoped fixture", "subagent_type": "unknown"},
+        {"goal": "Implement a scoped fixture", "subagent_type": "worker", "task_label": "Implement a scoped"},
+        {"goal": "Investigate a scoped fixture", "subagent_type": "unknown", "task_label": "Investigate a scoped"},
     ], parent_agent=parent))
     assert "Task 1" in result["error"]
     assert "Unknown subagent_type" in result["error"]
@@ -261,7 +261,7 @@ def test_empty_internal_credentials_retains_legacy_config(monkeypatch):
         seen.append(config)
         raise ValueError("fixture stops before child construction")
     monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", observe)
-    result = json.loads(delegate_tool.delegate_task(tasks=[{"goal": "Fixture"}],
+    result = json.loads(delegate_tool.delegate_task(tasks=[{"goal": "Fixture", "task_label": "Fixture"}],
         parent_agent=SimpleNamespace(), credentials_cfg={}))
     assert "fixture stops" in result["error"]
     assert seen == [cfg]

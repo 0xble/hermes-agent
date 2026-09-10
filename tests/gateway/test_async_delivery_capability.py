@@ -135,7 +135,7 @@ class TestStatelessChannelForcesSyncDelegation:
         try:
             declare_stateless_channel()
             out = dt.delegate_task(
-                goal="review the spec", background=True, parent_agent=_Parent()
+                goal="review the spec", task_label="Review the spec", background=True, parent_agent=_Parent()
             )
         finally:
             reset_session_vars()

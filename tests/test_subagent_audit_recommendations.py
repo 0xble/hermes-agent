@@ -162,7 +162,7 @@ def test_loader_failure_is_recorded_and_refuses_to_spawn(monkeypatch):
         lambda **kw: pytest.fail("spawned on an unreadable configuration"),
     )
     result = json.loads(delegate_tool.delegate_task(
-        tasks=[{"goal": "Do some scoped fixture work"}], parent_agent=parent,
+        tasks=[{"goal": "Do some scoped fixture work", "task_label": "Do some scoped"}], parent_agent=parent,
     ))
     assert "could not be loaded" in result["error"]
 
@@ -252,7 +252,7 @@ def test_spawn_reports_the_invalid_definition(monkeypatch):
         lambda **kw: pytest.fail("spawned on an invalid registry"),
     )
     result = json.loads(delegate_tool.delegate_task(
-        tasks=[{"goal": "Investigate the fixture", "subagent_type": "explorer"}],
+        tasks=[{"goal": "Investigate the fixture", "subagent_type": "explorer", "task_label": "Investigate the fixture"}],
         parent_agent=parent,
     ))
     assert "Invalid delegation.subagents configuration" in result["error"]

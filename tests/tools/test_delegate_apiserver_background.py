@@ -130,7 +130,7 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     )
 
     out = dt.delegate_task(
-        goal="bg on api_server", context="ctx",
+        goal="bg on api_server", task_label="Bg on api_server", context="ctx",
         background=True, parent_agent=_fake_parent(),
     )
     parsed = json.loads(out)
@@ -166,7 +166,7 @@ def test_apiserver_session_without_id_stays_synchronous(monkeypatch):
     )
 
     out = dt.delegate_task(
-        goal="one-shot", context="ctx",
+        goal="one-shot", task_label="One shot", context="ctx",
         background=True, parent_agent=_fake_parent(),
     )
     parsed = json.loads(out)

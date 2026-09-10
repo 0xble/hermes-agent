@@ -141,7 +141,7 @@ def test_cron_sync_fallback_returns_and_spawns_no_review_fork(monkeypatch):
             ),
         ):
             done["out"] = dt.delegate_task(
-                goal="do trivial work and finish",
+                goal="do trivial work and finish", task_label="Do trivial work",
                 context="cron regression #86632",
                 background=True,
                 parent_agent=parent,

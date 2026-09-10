@@ -72,6 +72,7 @@ def _run_queued_turn(session_id, queued, action, *, user_requested, user_task, *
         _sudo_password_callback=None, _approval_callback=None,
         _secret_capture_callback=None, _pending_turn_reasoning_config=None,
         _pending_moa_config=None, _pending_one_turn_model_restore=None,
+        _vault_unlock_callback=None, _vault_save_login_callback=None,
         _flush_credit_notices=lambda: None,
     )
     turn = SimpleNamespace(voice_prefix="", stream_callback=None, result=None)

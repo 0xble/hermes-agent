@@ -35,6 +35,13 @@ from gateway.platforms.base import (
 
 
 class _StubAdapter(BasePlatformAdapter):
+    # These tests drive sub-second intervals to keep the assertions fast. The per-chat typing
+    # floor is a rate limit sized against a real platform's per-chat ceiling (HERMES-137), and
+    # holding a caller to it is the production contract, so shed it here rather than stretching
+    # every test to a 4-second cadence. The budget itself is covered by
+    # tests/test_telegram_typing_chat_budget.py.
+    _TYPING_CHAT_MIN_GAP_S = 0.0
+
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
 

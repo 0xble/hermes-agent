@@ -125,7 +125,8 @@ def test_batch_completion_lines_are_attributable_across_two_batches(monkeypatch,
 
     for n in (3, 9):
         res = dt.delegate_task(
-            tasks=[{"goal": f"batch of {n}: worker task number {i}"} for i in range(n)],
+            tasks=[{"goal": f"batch of {n}: worker task number {i}", "task_label": f"Worker {i}"}
+                   for i in range(n)],
             parent_agent=parent,
         )
         assert "error" not in str(res)[:20], res

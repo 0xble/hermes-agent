@@ -78,6 +78,11 @@ class _FakeGateway:
     def _active_cron_job_count(self):
         return 0
 
+    def _active_async_delegation_count(self):
+        # stop() counts detached delegation units alongside agents, cron and API work when it
+        # decides whether the drain is complete. This fake dispatches none, so it is always idle.
+        return 0
+
     def _active_api_run_count(self):
         return 0
 

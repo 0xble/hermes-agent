@@ -36,6 +36,10 @@ async def test_cooldown_defers_delegation_cleanup_without_consuming_attempts(per
     await manager.observe(source,'r','s',1,'subagent.complete',None,data)
     event = MessageEvent(source=source,text='handled',internal=True,metadata={
         'delegation_parent_task_id':'a'*32,'delegation_owner':owner,'delegation_thread_refs':['A']})
+    # A terminal row is not a handled row: since #148 a card retires only on an explicit parent
+    # attestation, so receipt() sees nothing to deliver until handling() has recorded one.
+    await manager.handling(source,'r','s',2,actor_session_id='s',parent_task_id='a'*32,
+                           refs=['A'],reason='blocker_report')
     receipt = manager.receipt(event,'r',2)
     item = manager.cards['a'*32]
     pending = manager.pending

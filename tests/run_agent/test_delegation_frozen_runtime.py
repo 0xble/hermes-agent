@@ -445,7 +445,20 @@ def test_frozen_moa_token_limit_reaches_real_auxiliary_dispatch(monkeypatch):
     assert all("max_output_tokens" not in call for call in physical_calls)
 
 
-def test_ordinary_moa_keeps_native_auxiliary_recovery_ladder(monkeypatch):
+def test_every_moa_slot_routes_strictly_frozen_or_not(monkeypatch):
+    """Superseded contract (#147, 2026-09-10).
+
+    ``strict_route`` used to be ``isinstance(slot["_frozen_runtime"], dict)``: a FROZEN slot
+    routed strictly, while an ordinary preset fell back to the native auxiliary recovery
+    ladder's implicit model substitution. #147 made routing explicit for every slot and gave
+    reference slots and the aggregator their own declared ``fallback_models`` chains instead.
+
+    The user-visible consequence is that an ordinary preset declaring no ``fallback_models``
+    now has NO recovery: a failed route fails the slot rather than silently substituting a
+    model. That is the point of the change (a MoA answer must come from the models the preset
+    named), but it is a behaviour change, not a refactor, so pin it rather than leaving the
+    old ladder's assertion behind.
+    """
     from agent import moa_loop
 
     preset = {"reference_models": [{"provider": "p1", "model": "r1"}],
@@ -465,7 +478,7 @@ def test_ordinary_moa_keeps_native_auxiliary_recovery_ladder(monkeypatch):
     monkeypatch.setattr(moa_loop, "call_llm", fake_call_llm)
     moa_loop.MoAChatCompletions("ordinary", agent=SimpleNamespace(_interrupt_requested=False)).create(
         messages=[{"role": "user", "content": "review"}], tools=[])
-    assert calls and all(call["strict_route"] is False for call in calls)
+    assert calls and all(call["strict_route"] is True for call in calls)
 
 
 def test_moa_resume_rejects_credential_authority_rotation(monkeypatch):

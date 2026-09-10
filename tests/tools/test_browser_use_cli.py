@@ -268,7 +268,8 @@ class TestToolSurfaceSwap:
 
 
 class TestVaultSupervisorAttach:
-    def test_exec_attaches_supervisor_to_the_browser_it_drives(self, tmp_path, monkeypatch, _fake_supervisor_registry):
+    def test_exec_attaches_supervisor_to_the_browser_it_drives(self, tmp_path, monkeypatch,
+                                                               _fake_supervisor_registry, _fake_managed_chromium):
         """browser_vault_fill injects secrets only over the supervisor's CDP WebSocket. Without this attach the
         default (Browser Use) backend had no supervisor at all and every fill failed with supervisor_required."""
         monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
@@ -279,7 +280,13 @@ class TestVaultSupervisorAttach:
         result = json.loads(bu_cli.browser_exec("print(1)", task_id="t-vault"))
 
         assert result["success"] is True
-        assert _fake_supervisor_registry == [("t-vault", "ws://127.0.0.1:47000/devtools/browser/t-vault")]
+        # The endpoint is read back from the browser this exec actually resolved rather than
+        # restated: the fork keys a backend browser by named session (bu-named-<session>, #86894),
+        # so hardcoding the task_id would pin upstream's un-namespaced scheme instead of the
+        # invariant, which is that the supervisor drives the SAME browser as the exec.
+        resolved_key = _fake_managed_chromium[-1][0]
+        assert _fake_supervisor_registry == [
+            ("t-vault", f"ws://127.0.0.1:47000/devtools/browser/{resolved_key}")]
 
 
 class TestFindCli:

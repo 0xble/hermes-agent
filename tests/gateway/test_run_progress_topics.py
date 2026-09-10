@@ -1307,6 +1307,15 @@ async def _run_with_agent(
     fake_run_agent.AIAgent = agent_cls
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    # These tests are about progress ROUTING — anchors, overflow, replacement, send-only
+    # fallback — and their agents emit callbacks on sub-second sleeps tuned to a fast gate.
+    # Pin a test-scale interval so the production value, which is sized against the platform's
+    # per-chat flood budget (HERMES-137), can be retuned without silently changing what these
+    # assertions count. The production rate itself is pinned by
+    # tests/gateway/test_progress_edit_shared_clock_integration.py.
+    import gateway.run_turn_runner as _run_turn_runner
+    monkeypatch.setattr(_run_turn_runner, "_PROGRESS_EDIT_INTERVAL", 1.5)
+
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
     gateway_run = importlib.import_module("gateway.run")

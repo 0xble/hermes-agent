@@ -1729,6 +1729,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise _TelegramSendCooldownExceeded(0.05)
             started_at = time.monotonic()
             stamp_gap = _reserve_gap
+            published_retry_after = False
             try:
                 return await send_fn(*args, **kwargs)
             except Exception as error:
@@ -1737,13 +1738,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     cooldowns[chat_key] = max(float(cooldowns.get(chat_key, 0.0) or 0.0), time.monotonic() + retry_after)
                     # The server just told us this chat is at its limit. Widen its gap for a window
                     # so the next burst does not walk straight back into an escalating penalty.
+                    published_retry_after = True
                     self._record_send_penalty(chat_key)
                 elif self._looks_like_connect_timeout(error) or self._looks_like_pool_timeout(error):
                     stamp_gap = False
                 raise
             finally:
                 if stamp_gap:
-                    gap = self._chat_send_gap(chat_key, edit=bool(_edit))
+                    # On a call that published its own retry_after, the server's number governs and the
+                    # widening starts with the NEXT call: stacking the multiplier on top of the deadline
+                    # the server just named would inflate the inline retry past what it asked for.
+                    gap = self._chat_send_gap(chat_key, edit=bool(_edit), penalized=not published_retry_after)
                     cooldowns[chat_key] = max(float(cooldowns.get(chat_key, 0.0) or 0.0), started_at + gap)
         finally:
             if not expendable:
