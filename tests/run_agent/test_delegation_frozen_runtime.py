@@ -718,6 +718,90 @@ def test_moa_resume_rejects_authentication_header_rotation(monkeypatch):
         moa_loop.restore_moa_preset(metadata)
 
 
+def test_named_role_preset_freezes_moa_snapshot_and_resume_ignores_later_config_edit(tmp_path, monkeypatch):
+    """Named aliases normalize before the launch snapshot; resume trusts that snapshot, not config."""
+    from agent import moa_loop
+    from hermes_cli import config as config_mod
+    from tools import delegate_tool
+    from tools.custom_subagents import parse_definitions
+
+    home = tmp_path / "hermes-home"; home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    raw = {
+        "model_presets": {"council-route": {"provider": "moa", "model": "review"}},
+        "delegation": {"subagents": {"council": {
+            "description": "Review", "instructions": "Review carefully", "model_preset": "council-route",
+        }}},
+    }
+    (home / "config.yaml").write_text(json.dumps(raw), encoding="utf-8")
+    config_mod._LOAD_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    delegation = delegate_tool.load_delegation_config()
+    definitions = parse_definitions(delegation)
+    assert definitions["council"].provider == "moa" and definitions["council"].model == "review"
+
+    frozen = SimpleNamespace(metadata=lambda: {"preset": "review", "preset_snapshot": {}})
+    monkeypatch.setattr(moa_loop, "snapshot_moa_preset", lambda name: frozen if name == "review" else pytest.fail(name))
+    parent = SimpleNamespace(provider="parent", model="parent-model", api_key="parent-secret")
+    launches, error = delegate_tool._preflight_task_runtime(
+        [{"goal": "review", "subagent_type": "council"}], delegation, None, parent, {},
+    )
+    assert error is None and launches[0].moa_snapshot is frozen
+
+    raw["model_presets"]["council-route"]["model"] = "edited-review"
+    (home / "config.yaml").write_text(json.dumps(raw), encoding="utf-8")
+    config_mod._LOAD_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    edited_definitions = parse_definitions(delegate_tool.load_delegation_config())
+    assert edited_definitions["council"].model == "edited-review"
+
+    metadata = {
+        "version": 1, "subagent_type": "council", "description": "Review", "instructions": "Review carefully",
+        "parent_session_root": "root", "provider": "moa", "model": "review", "base_url": "moa://local",
+        "api_mode": "chat_completions", "reasoning_effort": None, "fallbacks": [], "enabled_toolsets": [],
+        "moa": frozen.metadata(),
+    }
+    class DB:
+        def resolve_resume_session_id(self, _sid): return "tip"
+        def get_session(self, _sid): return {"profile_name": "default", "model_config": json.dumps({
+            "_delegation_launch": metadata, "_delegation_completed": True, "_delegate_from": "root",
+        })}
+        def get_compression_lineage(self, sid): return ["root"] if sid == "root" else ["root", sid]
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(moa_loop, "restore_moa_preset", lambda stored: frozen if stored == metadata["moa"] else pytest.fail(stored))
+    resumed = delegate_tool._resolve_resume_launch(
+        {"resume_session_id": "child"}, edited_definitions,
+        SimpleNamespace(session_id="parent", _session_db=DB()),
+    )
+    assert resumed.credentials["model"] == "review" and resumed.moa_snapshot is frozen
+
+
+def test_named_role_preset_uses_named_provider_credentials_not_parent_credentials(tmp_path, monkeypatch):
+    from hermes_cli import config as config_mod
+    from tools import delegate_tool
+
+    home = tmp_path / "hermes-home"; home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    raw = {"model_presets": {"worker-route": {"provider": "named", "model": "fixed"}},
+           "delegation": {"subagents": {"worker": {
+               "description": "Work", "instructions": "Do work", "model_preset": "worker-route",
+           }}}}
+    (home / "config.yaml").write_text(json.dumps(raw), encoding="utf-8")
+    config_mod._LOAD_CONFIG_CACHE.clear(); config_mod._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    delegation = delegate_tool.load_delegation_config()
+    monkeypatch.setattr("tools.custom_subagents.resolve_named_credentials", lambda definition, _cfg, _parent: ({
+        "provider": definition.provider, "model": definition.model, "base_url": "https://named.fixture/v1",
+        "api_key": "named-provider-secret", "api_mode": "chat_completions", "request_overrides": {},
+    }, None))
+    parent = SimpleNamespace(provider="parent", model="parent-model", api_key="parent-secret")
+    launches, error = delegate_tool._preflight_task_runtime(
+        [{"goal": "work", "subagent_type": "worker"}], delegation, None, parent, {},
+    )
+    assert error is None
+    assert launches[0].credentials["provider"] == "named"
+    assert launches[0].credentials["api_key"] == "named-provider-secret"
+    assert launches[0].credentials["api_key"] != parent.api_key
+
+
 def test_resumable_metadata_records_active_fallback_pool_rotation():
     from tools.delegate_tool import _refresh_resumable_launch_metadata
 

@@ -2427,8 +2427,10 @@ def _try_resolve_fallback_provider() -> dict | None:
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(exc, ModelPresetError):
+            raise
     return None
 
 
@@ -2896,7 +2898,10 @@ def _load_gateway_runtime_config() -> dict:
         return {}
     from hermes_cli.config import _expand_env_vars
     expanded = _expand_env_vars(cfg)
-    return expanded if isinstance(expanded, dict) else {}
+    if not isinstance(expanded, dict):
+        return {}
+    from hermes_cli.model_presets import expand_model_presets
+    return expand_model_presets(expanded)
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
