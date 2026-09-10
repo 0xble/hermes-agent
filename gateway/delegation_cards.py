@@ -240,16 +240,19 @@ class DelegationCards:
 
     def _bind(self, key):
         card = self.cards[key]
-        if "presentation_key" in card:
+        current_anchor = self._anchor(key)
+        if ("presentation_key" in card and current_anchor in self.cards
+                and not self.cards[current_anchor].get("retired")):
             self._assign_refs(key)
             return
         # Presentation identity deliberately excludes execution session/task identity.
-        # Owners and receipts remain on the original task records.
+        # Owners and receipts remain on the original task records. A retired card,
+        # including one retaining an ambiguous-send fence, cannot own a new active
+        # presentation: its fence remains on its historical record instead.
         anchor = next((self._anchor(k) for k, c in self.cards.items()
-                       if k != key and "presentation_key" in c
-                       and (not c.get("retired") or c.get("message_id")
-                            or (c.get("send_attempts") and not c.get("message_deleted")))
-                       and self._scope(c) == self._scope(card)), key)
+                       if (k != key and "presentation_key" in c and not c.get("retired")
+                           and not self.cards.get(self._anchor(k), {}).get("retired")
+                           and self._scope(c) == self._scope(card))), key)
         card["presentation_key"] = anchor
         self.cards[anchor]["delete_attempts"] = 0
         if anchor != key and card.get("message_id"):

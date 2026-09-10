@@ -483,6 +483,49 @@ async def test_restart_never_retries_ambiguous_send_and_recovers_delete(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_audited_dismissal_does_not_bind_new_row_to_deleted_historical_sibling_anchor(tmp_path):
+    """A retired ambiguous sibling fences its own send; it cannot own a new presentation."""
+    adapter = SimpleNamespace(
+        send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="fresh")),
+        edit_message=AsyncMock(return_value=SendResult(success=True)),
+        delete_message=AsyncMock(return_value=True),
+    )
+    cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    owner = dict(profile="default", session_id="s", session_key="r", chat_id="42", thread_id="8")
+    dismissed, historical, active, other_topic = ("x" * 32, "a" * 32, "t" * 32, "o" * 32)
+
+    def card(*, rows, retired, thread_id="8", **extra):
+        return dict(owner={**owner, "thread_id": thread_id}, source={"platform": "telegram", "chat_id": "42", "thread_id": thread_id},
+                    started_at=1, generation=0, rows=rows, message_id=None, rendered="", recoveries=0,
+                    retired=retired) | {"send_attempts": 0} | extra
+
+    cards.cards = {
+        dismissed: card(retired=True, message_deleted=True, send_attempts=1,
+                        dismissal_request_sha256="audited", rows={"X": {"thread_ref": "X", "state": "completed"}}),
+        historical: card(retired=True, presentation_key=dismissed, send_attempts=1,
+                         rows={"AA": {"thread_ref": "AA", "state": "completed"}}),
+        active: card(retired=False, presentation_key=dismissed,
+                     rows={"AT": {"thread_ref": "AT", "state": "running"}}),
+        other_topic: card(retired=False, thread_id="9", message_id="other", presentation_key=other_topic,
+                          rows={"B": {"thread_ref": "B", "state": "running"}}),
+    }
+
+    cards._save()
+    restarted = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+    restarted._bind(active)
+    await restarted._flush(restarted._anchor(active))
+
+    assert restarted._anchor(active) == active
+    assert restarted.cards[active]["message_id"] == "fresh"
+    assert restarted.cards[historical]["send_attempts"] == 1  # Preserve its ambiguous-send fence.
+    assert restarted.cards[dismissed]["send_attempts"] == 1
+    assert restarted.cards[dismissed]["message_deleted"] is True
+    assert restarted._anchor(other_topic) == other_topic
+    assert restarted.cards[other_topic]["message_id"] == "other"
+    adapter.send_delegation_card.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_restart_retires_exact_parent_receipt_before_card_replay(tmp_path):
     """A receipt persisted before a crash fences startup replay.
 
