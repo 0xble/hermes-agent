@@ -403,6 +403,7 @@ class TestDelegateTaskDispatch:
         ):
             out = delegate_task(
                 goal="produce the address",
+                task_label="Produce address",
                 context="base context",
                 output_schema=ADDRESS_SCHEMA,
                 parent_agent=_make_mock_parent(),

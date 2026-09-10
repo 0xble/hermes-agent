@@ -209,6 +209,7 @@ def _build_child_agent(
     resume_claim_id=None,
     resume_credential_pool=None,
     resume_credential_id=None,
+    task_label: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -397,6 +398,10 @@ def _build_child_agent(
                 ))),
                 "fallbacks": [route.metadata() for route in resolved_fallback_routes],
                 "enabled_toolsets": list(child_toolsets or []),
+                # Display metadata is deliberately caller-authored, never derived
+                # from the private child goal.  It lets a later named resume keep
+                # the same card label without asking the model to repeat it.
+                "task_label": task_label,
             }
             if moa_snapshot is not None:
                 launch["moa"] = moa_snapshot.metadata()
@@ -942,6 +947,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
     task_runtime: Optional[List[Any]] = None,
+    task_labels: Optional[List[str]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
     child_tool_policy: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
@@ -979,6 +985,7 @@ def _build_children(
                 resume_claim_id=_launch.resume_claim_id if _launch else None,
                 resume_credential_pool=_launch._credential_pool if _launch else None,
                 resume_credential_id=_launch.resume_credential_id if _launch else None,
+                task_label=(task_labels[i] if task_labels and i < len(task_labels) else None),
                 routing_cfg=routing_cfg,
                 child_tool_policy=child_tool_policy,
                 **_task_overrides,
@@ -1005,6 +1012,56 @@ def _build_children(
                 _ident_ref["delegation_id"] = live_deleg_id
         children.append((i, t, child))
     return children, None
+
+
+def _historical_resume_task_label(task: Dict[str, Any], parent_agent) -> Optional[str]:
+    """Return a persisted, caller-authored resume label without mutating state.
+
+    Old resumable rows predate labels.  They remain readable, but cannot invent a
+    display label from their goal; callers must provide one when resuming them.
+    """
+    requested = task.get("resume_session_id")
+    if not isinstance(requested, str) or not requested.strip():
+        return None
+    db = getattr(parent_agent, "_session_db", None)
+    if db is None:
+        return None
+    try:
+        tip = db.resolve_resume_session_id(requested.strip())
+        row = db.get_session(tip) if tip else None
+        config = _parse_model_config((row or {}).get("model_config"))
+        launch = config.get("_delegation_launch")
+        label = launch.get("task_label") if isinstance(launch, dict) else None
+        return label.strip() if isinstance(label, str) and label.strip() else None
+    except Exception:
+        # Resume authorization remains the authoritative later preflight.  This
+        # read-only convenience must not conceal its specific error.
+        return None
+
+
+def _effective_task_labels(
+    task_list: List[Dict[str, Any]], task_label: Optional[str], parent_agent,
+) -> tuple[Optional[List[str]], Optional[str]]:
+    """Validate every new card label before metadata reservation or child setup.
+
+    A per-task key wins over the documented top-level fallback, including an
+    explicit blank value (which is an error rather than an accidental fallback).
+    A valid named resume may reuse its own preserved historical label.
+    """
+    fallback_supplied = task_label is not None
+    labels: List[str] = []
+    for index, task in enumerate(task_list):
+        supplied = task.get("task_label") if "task_label" in task else task_label
+        if supplied is None and task.get("resume_session_id") is not None:
+            supplied = _historical_resume_task_label(task, parent_agent)
+        if not isinstance(supplied, str) or not supplied.strip():
+            path = f"tasks[{index}].task_label" if "task_label" in task or not fallback_supplied else "task_label"
+            return None, (
+                f"Task {index} requires a nonempty {path}. Provide a short verb-first, privacy-safe "
+                "task_label (for example, 'Check receipt'); labels are display guidance, not truncated."
+            )
+        labels.append(supplied.strip())
+    return labels, None
 
 
 def delegate_task(
@@ -1071,6 +1128,18 @@ def delegate_task(
             "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
+    max_children = _get_max_concurrent_children()
+    task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
+    if not err:
+        task_schemas, err = _coerce_task_schemas(task_list or [], output_schema)
+    if err:
+        return tool_error(err)
+    # This is intentionally before metadata reservation, resume claims, live
+    # transcript creation, child construction, and any external child route.
+    # Validate the whole batch first so one bad label cannot partially spawn it.
+    effective_labels, err = _effective_task_labels(task_list or [], task_label, parent_agent)
+    if err:
+        return tool_error(err)
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
@@ -1083,12 +1152,6 @@ def delegate_task(
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
         return tool_error(str(exc))
-    max_children = _get_max_concurrent_children()
-    task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
-    if not err:
-        task_schemas, err = _coerce_task_schemas(task_list, output_schema)
-    if err:
-        return tool_error(err)
 
     # Capture immutable conversation ownership before child construction changes context.
     try:
@@ -1118,7 +1181,7 @@ def delegate_task(
     try:
         from tools.async_delegation import reserve_delegation_metadata
         _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
-            task_labels=[t.get("task_label") or task_label or "" for t in (task_list or [])])
+            task_labels=effective_labels or [])
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -1143,6 +1206,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
+        task_labels=effective_labels or [],
         routing_cfg=routing_cfg, child_tool_policy=child_tool_policy,
     )
     if err:
@@ -1482,7 +1546,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
-                        "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit."),
+                        "task_label": _p("string", "Required for a new delegation: use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1510,11 +1574,18 @@ DELEGATE_TASK_SCHEMA = {
                         ),
                     },
                     "required": ["goal"],
+                    # A new task needs a visible label.  The only exception is
+                    # a named resume, whose already-persisted caller-authored
+                    # label is recovered by the no-side-effect preflight.
+                    "anyOf": [
+                        {"required": ["task_label"]},
+                        {"required": ["resume_session_id"]},
+                    ],
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Use a concise, imperative, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is display guidance, not a hard limit. Legacy single-task path; new calls use tasks[].task_label. Omitted legacy labels are assigned by metadata."),
+            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. Use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting nesting indentation, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

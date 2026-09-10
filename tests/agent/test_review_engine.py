@@ -293,6 +293,7 @@ def test_delegate_task_credentials_cfg_overrides_delegation_config(monkeypatch):
     }
     out = dt.delegate_task(
         goal="review this",
+        task_label="Review candidate",
         background=True,
         parent_agent=_fake_parent(),
         credentials_cfg=override,
