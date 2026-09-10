@@ -4806,9 +4806,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if outcome is not None:
                 return bool(outcome)
         try:
-            # Cleanup respects published flood waits without assuming send-message quotas.
+            # Cleanup spends the shared budget too: activity-driven reanchoring
+            # must not create an unmetered delete lane beside sends and typing.
             await self._run_send_call(chat_id, self._bot.delete_message,
-                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _reserve_gap=False, _expendable=True)
+                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _expendable=True)
             self._forget_status_message_id(chat_id, message_id)
             return True
         except _TelegramSendCooldownExceeded:

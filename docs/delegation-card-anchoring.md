@@ -7,15 +7,16 @@ Task IDs, display references and original task start times do not change.
 ## Eligibility and transport
 
 **Single rule:** while a visible row is `running`, move an active card only after
-**three distinct ordinary messages in its exact adapter/chat/topic** and at least
-**one minute since the last anchor and this process's tracking start**. Ordinary
-messages are received new messages and successfully sent ordinary text replies;
-IDs only deduplicate them. Status messages, card edits/replacements, edits,
-reactions, drafts, failed sends, media-only sends and other topics do not count.
+**six distinct ordinary messages in its exact adapter/chat/topic**, with no separate
+elapsed-time eligibility condition. Shared API spacing and flood cooldowns remain
+mandatory. Ordinary messages include received new messages and successfully sent
+assistant replies, physical continuations and media. IDs only deduplicate them.
+Status messages, card edits/replacements, edits, reactions, drafts, failed sends
+and other topics do not count.
 This is event-driven: there is no cooldown-expiry heartbeat, history polling, or
 move for an idle or terminal-only card.
 
-- Three pending observations saturate; recent ingress/reply IDs have a bounded
+- Six pending observations saturate; recent ingress/reply IDs have a bounded
   1,024-entry deduplication window. Restart discards displacement, marks unproven
   execution unknown, and requires fresh activity. No inferred continued execution.
 - Existing per-presentation lock/coalescing owns replacement. Telegram's existing

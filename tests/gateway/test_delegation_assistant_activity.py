@@ -14,14 +14,12 @@ from tests.gateway.test_delegation_card_anchor import fixture, drain, inbound
 async def test_assistant_only_and_mixed_traffic_reanchor_once(tmp_path, lane):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial = card["message_id"]
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     adapter._retrigger_typing = AsyncMock()
     metadata = {"thread_id": "8", "notify": True}
     if lane == "rich":
         adapter._should_attempt_rich = lambda *a, **kw: True
-        adapter._try_send_rich = AsyncMock(side_effect=[SendResult(success=True, message_id=str(i)) for i in range(200, 203)])
-    for i in range(3):
+        adapter._try_send_rich = AsyncMock(side_effect=[SendResult(success=True, message_id=str(i)) for i in range(200, 200 + anchor.DISPLACEMENT)])
+    for i in range(anchor.DISPLACEMENT):
         if lane == "overflow":
             await adapter._send_overflow_continuation("42", "New physical continuation", None,
                 {"message_thread_id": 8}, "8", metadata, True)
@@ -34,7 +32,7 @@ async def test_assistant_only_and_mixed_traffic_reanchor_once(tmp_path, lane):
         # A duplicate update of an already observed physical outbound ID is inert.
         if lane == "rich":
             await inbound(adapter, 200 + i)
-        if i < 2:
+        if i < anchor.DISPLACEMENT - 1:
             await drain(manager)
             assert card["message_id"] == initial
     await drain(manager)

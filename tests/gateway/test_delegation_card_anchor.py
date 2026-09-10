@@ -31,6 +31,24 @@ async def drain(manager):
     raise AssertionError("unbounded scheduling")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat", ["42", "-42"])
+async def test_anchor_cleanup_reserves_shared_budget_and_preserves_server_cooldown(tmp_path, chat):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    calls.clear()
+    adapter._send_cooldown_seconds = 2.0
+    adapter._send_cooldown_group_seconds = 6.0
+    live["100"] = {}
+    before = anchor.time.monotonic()
+    assert await adapter.delete_message(chat, "100")
+    assert adapter._send_cooldown_until[chat] >= before + adapter._chat_send_gap(chat)
+    adapter._send_cooldown_until[chat] = anchor.time.monotonic() + 3600
+    live["101"] = {}
+    assert await adapter._delete_status_message(chat, "101") is None
+    assert "101" in live
+    assert calls == [("delete", "100")]
+
+
 async def fixture(tmp_path):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake", extra={"rich_messages": False}))
     adapter._send_cooldown_seconds = 0
@@ -68,51 +86,42 @@ async def inbound(adapter, mid, topic="8"):
 
 
 @pytest.mark.asyncio
-async def test_three_same_topic_messages_and_one_minute_fake_clock_trigger_one_move(tmp_path, monkeypatch):
+async def test_six_same_topic_messages_count_both_directions_without_time_gate(tmp_path, monkeypatch):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
-    now = [1_000.0]
-    monkeypatch.setattr(anchor.time, "time", lambda: now[0])
-    card["anchored_at"] = 941.0
-    manager.tracking_started = 900.0
-
+    now = 1_000.0
+    monkeypatch.setattr(anchor.time, "time", lambda: now)
+    card["anchored_at"] = manager.tracking_started = now
+    initial = card["message_id"]
+    adapter._retrigger_typing = AsyncMock()
     await inbound(adapter, 1, "other")
     await inbound(adapter, 2)
     await inbound(adapter, 2)  # Duplicate ingress never advances the ledger.
-    await inbound(adapter, 3)
+    await adapter._on_platform_update(SimpleNamespace(message=None, edited_message=object()), None)
+    for mid in (3, 4, 5):
+        await inbound(adapter, mid)
+    await adapter.send("42", "Ordinary reply", metadata={"thread_id": "8"})
     await drain(manager)
-    assert card["message_id"] in live
-    assert len(manager.displacement[data["parent_task_id"]]) == 2
-
-    # The third event is retained while the 60-second boundary is still closed.
-    now[0] += 1
-    await inbound(adapter, 4)
+    assert len(manager.displacement[data["parent_task_id"]]) == 5
+    assert card["message_id"] == initial
+    await inbound(adapter, 6)
     await drain(manager)
     replacement = card["message_id"]
-    assert replacement != "100"
-    assert len([call for call in calls if call[0] == "send"]) == 2
-
-    # Three new observations inside the following cooldown are not a timer or
-    # a bypass: a later real event is required after the full provider-safe wait.
-    for mid in (5, 6, 7):
+    assert replacement != initial and initial not in live
+    assert data["parent_task_id"] not in manager.displacement  # Card self-send excluded.
+    # A second six-message window can move immediately; no clock advancement.
+    for mid in range(10, 15):
         await inbound(adapter, mid)
     await drain(manager)
     assert card["message_id"] == replacement
-    now[0] += anchor.COOLDOWN - 1
-    await inbound(adapter, 8)
+    await inbound(adapter, 15)
     await drain(manager)
-    assert card["message_id"] == replacement
-    now[0] += 1
-    await inbound(adapter, 9)
-    await drain(manager)
-    assert card["message_id"] != replacement
+    assert card["message_id"] != replacement and replacement not in live
 
 
 @pytest.mark.asyncio
 async def test_displacement_is_real_topic_activity_with_live_rows_and_original_identity(tmp_path):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial, started = card["message_id"], card["started_at"]
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     # Huge interleaved IDs in other topics, duplicate deliveries, status sends and
     # edited messages cannot constitute displacement in topic 8.
     for mid in range(900000, 900030):
@@ -134,15 +143,12 @@ async def test_displacement_is_real_topic_activity_with_live_rows_and_original_i
     assert card["last_reanchor"]["new_message_id"] == replacement
     assert card["started_at"] == started and card["rows"]["A"]["display_ref"] == "A"
     assert not card.get("obsolete_message_id")
-    assert json.loads(manager.path.read_text())[data["parent_task_id"]]["message_id"] == replacement
-    # Cooldown is a predicate, not a timer that emits traffic on its own.
+    assert json.loads(manager.path.read_text(encoding="utf-8"))[data["parent_task_id"]]["message_id"] == replacement
+    await manager.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
     for mid in range(800, 820):
         await inbound(adapter, mid)
     await drain(manager)
     assert card["message_id"] == replacement
-    await manager.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     await inbound(adapter, 900)
     await drain(manager)
     assert card["message_id"] == replacement  # terminal-only never reanchors
@@ -156,8 +162,6 @@ async def test_displacement_is_real_topic_activity_with_live_rows_and_original_i
 async def test_replace_failure_restart_and_cleanup_cannot_accumulate_anchors(tmp_path, failure):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial = card["message_id"]
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     original_send = adapter._bot.send_message.side_effect
     original_delete = adapter._bot.delete_message.side_effect
     attempts = 0
@@ -228,8 +232,6 @@ async def test_replace_failure_restart_and_cleanup_cannot_accumulate_anchors(tmp
 async def test_reanchor_coalesces_with_final_priority_and_terminal_callback(tmp_path):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     original = card["message_id"]
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     real_send = adapter._bot.send_message.side_effect
     final_entered, release = asyncio.Event(), asyncio.Event()
 
@@ -280,8 +282,6 @@ def test_restart_does_not_resurrect_deleted_new_anchor(tmp_path):
 async def test_event_during_replace_drains_without_another_external_event(tmp_path, during, final_delivery):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial = card["message_id"]
-    card["anchored_at"] -= anchor.COOLDOWN
-    manager.tracking_started -= anchor.COOLDOWN
     sent = adapter._bot.send_message.side_effect
     deleted = adapter._bot.delete_message.side_effect
     event_once = False

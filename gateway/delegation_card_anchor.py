@@ -5,10 +5,10 @@ import time
 
 from gateway import delegation_card_presentation as presentation
 
-# Three distinct ordinary messages in this topic, and at most one move per
-# minute. IDs are deduplication tokens, never a measure of topic displacement.
-DISPLACEMENT = 3
-COOLDOWN = 60.0
+# Six distinct ordinary messages in this topic; no elapsed-time eligibility gate.
+# Transport spacing and server flood cooldowns remain owned by the shared gate.
+# IDs are deduplication tokens, never a measure of topic displacement.
+DISPLACEMENT = 6
 
 
 def observe_conversation(manager, adapter, chat_id, thread_id, message_id):
@@ -43,7 +43,6 @@ def eligible(manager, key):
             and not any(c.get("obsolete_message_id") for _, c in manager._members(key))
             and not presentation.pending(manager, key) and not presentation.fenced(manager, key)
             and len(manager.displacement.get(key, ())) >= DISPLACEMENT
-            and time.time() - max(card.get("anchored_at", 0), manager.tracking_started) >= COOLDOWN
             and any(r.get("state") == "running" for r in manager._projection(key)["rows"].values()))
 
 
