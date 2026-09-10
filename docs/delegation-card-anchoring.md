@@ -6,19 +6,16 @@ Task IDs, display references and original task start times do not change.
 
 ## Eligibility and transport
 
-- At least one visible row must be `running` from actual lifecycle activity.
-  Dispatched-only, returned, interrupted, unknown and handled rows do not qualify.
-- Observe **eight distinct ordinary messages in that exact adapter/chat/topic**
-  after its anchor. Count received new messages and successfully sent ordinary
-  text replies. Do not subtract Telegram message IDs: IDs are only deduplication
-  tokens. Status messages, edits, reactions, drafts, failed sends and other topics
-  do not advance displacement. Media-only outbound sends conservatively do not
-  advance it. This is an observed lower bound, not a complete Telegram history.
-- At least **five minutes** since the last anchor and this process's tracking
-  start. These small conservative defaults avoid treating every exchange as an
-  invitation to move. There is no cooldown-expiry heartbeat or history polling:
-  another actual conversation/lifecycle event must cause an eligible flush.
-- Eight pending observations saturate; recent ingress/reply IDs have a bounded
+**Single rule:** while a visible row is `running`, move an active card only after
+**three distinct ordinary messages in its exact adapter/chat/topic** and at least
+**one minute since the last anchor and this process's tracking start**. Ordinary
+messages are received new messages and successfully sent ordinary text replies;
+IDs only deduplicate them. Status messages, card edits/replacements, edits,
+reactions, drafts, failed sends, media-only sends and other topics do not count.
+This is event-driven: there is no cooldown-expiry heartbeat, history polling, or
+move for an idle or terminal-only card.
+
+- Three pending observations saturate; recent ingress/reply IDs have a bounded
   1,024-entry deduplication window. Restart discards displacement, marks unproven
   execution unknown, and requires fresh activity. No inferred continued execution.
 - Existing per-presentation lock/coalescing owns replacement. Telegram's existing

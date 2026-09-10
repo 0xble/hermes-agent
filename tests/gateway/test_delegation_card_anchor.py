@@ -60,6 +60,46 @@ async def inbound(adapter, mid, topic="8"):
 
 
 @pytest.mark.asyncio
+async def test_three_same_topic_messages_and_one_minute_fake_clock_trigger_one_move(tmp_path, monkeypatch):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    now = [1_000.0]
+    monkeypatch.setattr(anchor.time, "time", lambda: now[0])
+    card["anchored_at"] = 941.0
+    manager.tracking_started = 900.0
+
+    await inbound(adapter, 1, "other")
+    await inbound(adapter, 2)
+    await inbound(adapter, 2)  # Duplicate ingress never advances the ledger.
+    await inbound(adapter, 3)
+    await drain(manager)
+    assert card["message_id"] in live
+    assert len(manager.displacement[data["parent_task_id"]]) == 2
+
+    # The third event is retained while the 60-second boundary is still closed.
+    now[0] += 1
+    await inbound(adapter, 4)
+    await drain(manager)
+    replacement = card["message_id"]
+    assert replacement != "100"
+    assert len([call for call in calls if call[0] == "send"]) == 2
+
+    # Three new observations inside the following cooldown are not a timer or
+    # a bypass: a later real event is required after the full provider-safe wait.
+    for mid in (5, 6, 7):
+        await inbound(adapter, mid)
+    await drain(manager)
+    assert card["message_id"] == replacement
+    now[0] += anchor.COOLDOWN - 1
+    await inbound(adapter, 8)
+    await drain(manager)
+    assert card["message_id"] == replacement
+    now[0] += 1
+    await inbound(adapter, 9)
+    await drain(manager)
+    assert card["message_id"] != replacement
+
+
+@pytest.mark.asyncio
 async def test_displacement_is_real_topic_activity_with_live_rows_and_original_identity(tmp_path):
     manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
     initial, started = card["message_id"], card["started_at"]

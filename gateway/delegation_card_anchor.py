@@ -5,10 +5,10 @@ import time
 
 from gateway import delegation_card_presentation as presentation
 
-# Eight distinct ordinary messages in this topic, and at most one move per five
-# minutes. IDs are deduplication tokens, never a measure of topic displacement.
-DISPLACEMENT = 8
-COOLDOWN = 300.0
+# Three distinct ordinary messages in this topic, and at most one move per
+# minute. IDs are deduplication tokens, never a measure of topic displacement.
+DISPLACEMENT = 3
+COOLDOWN = 60.0
 
 
 def observe_conversation(manager, adapter, chat_id, thread_id, message_id):
