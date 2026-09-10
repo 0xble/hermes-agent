@@ -23,7 +23,7 @@ from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio,
 from plugins.image_gen._common import (
     GPT_IMAGE_2_API_MODEL as API_MODEL, GPT_IMAGE_2_DEFAULT as DEFAULT_MODEL, GPT_IMAGE_2_TIERS,
     StaticImageGenProvider, collect_source_images, error_factory, prompt_required_error,
-    resolve_static_model, size_for)
+    resolve_static_model, size_for, load_image_gen_config)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,22 @@ def _read_codex_access_token() -> Optional[str]:
     except Exception as exc:
         logger.debug("Could not resolve Codex access token: %s", exc)
         return None
+
+
+def _resolve_transport() -> Tuple[str, Optional[str], bool]:
+    """An explicit gateway never reads or refreshes direct Codex credentials."""
+    config = load_image_gen_config()
+    base_url = str(config.get("base_url") or "").strip().rstrip("/")
+    if base_url:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("image_gen.base_url must be an HTTP(S) endpoint without credentials")
+        key = str(config.get("api_key") or "").strip()
+        if not key or key.startswith("${"):
+            raise ValueError("image_gen.api_key must resolve when image_gen.base_url is configured")
+        return base_url, key, True
+    return _CODEX_BASE_URL, _read_codex_access_token(), False
 
 
 def _httpx_available() -> bool:
@@ -279,14 +295,15 @@ def _iter_sse_json(response: Any):
 
 
 def _collect_image_b64(
-    token: str, *, prompt: str, size: str, quality: str, input_images: Optional[List[Dict[str, str]]] = None
+    token: str, *, prompt: str, size: str, quality: str, input_images: Optional[List[Dict[str, str]]] = None,
+    base_url: str = _CODEX_BASE_URL, gateway: bool = False
 ) -> Optional[Dict[str, str]]:
     """Stream a Codex Responses image_generation call → ``{"b64", "source": "final"|"partial"}`` or
     ``None``. A partial is kept only when no final arrives; callers must not treat it as success."""
     import httpx
     from agent.codex_headers import codex_cloudflare_headers
 
-    headers = codex_cloudflare_headers(token)
+    headers = {} if gateway else codex_cloudflare_headers(token)
     headers.update({
         "Accept": "text/event-stream",
         "Authorization": f"Bearer {token}",
@@ -299,7 +316,7 @@ def _collect_image_b64(
     final_b64: Optional[str] = None
     partial_b64: Optional[str] = None
     with httpx.Client(timeout=timeout, headers=headers) as http:
-        with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
+        with http.stream("POST", f"{base_url}/responses", json=payload) as response:
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -327,7 +344,10 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
     price = "varies"
 
     def is_available(self) -> bool:
-        return bool(_read_codex_access_token()) and _httpx_available()
+        try:
+            return bool(_resolve_transport()[1]) and _httpx_available()
+        except ValueError:
+            return False
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
@@ -352,7 +372,10 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
         aspect = resolve_aspect_ratio(aspect_ratio)
         if not prompt:
             return prompt_required_error("openai-codex", aspect)
-        token = _read_codex_access_token()
+        try:
+            base_url, token, gateway = _resolve_transport()
+        except ValueError as exc:
+            return error_factory("openai-codex", aspect)(str(exc), "invalid_config")
         if not token:
             return error_factory("openai-codex", aspect)(_NO_AUTH, "auth_required")
         if not _httpx_available():
@@ -373,7 +396,8 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
             for attempt in range(attempts):
                 collected = _collect_image_b64(
                     token, prompt=prompt, size=size, quality=meta["quality"],
-                    input_images=input_images or None)
+                    input_images=input_images or None,
+                    **({"base_url": base_url, "gateway": True} if gateway else {}))
                 if collected and collected.get("source") == "final" and collected.get("b64"):
                     break
                 if attempt < _NONFINAL_RETRIES:
