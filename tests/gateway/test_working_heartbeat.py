@@ -324,6 +324,7 @@ async def test_cleanup_retries_scheduler_deferral_without_bypassing_final_priori
             return getattr(asyncio, name)
     monkeypatch.setattr(delivery_module, "asyncio", RetryClock())
     await finish(p)
+    await asyncio.gather(*adapter._background_tasks)
     assert not wire.messages and len(wire.deletes) == 1
 
 
@@ -379,3 +380,99 @@ async def test_final_cleanup_snapshots_late_id_but_never_new_generation(monkeypa
     await adapter._fire_post_delivery_callback(ctx.session_key, asyncio.Event(), 7, delivery_succeeded=True)
     assert set(wire.messages) == {3}
     assert adapter.pop_post_delivery_callback(ctx.session_key, generation=8) is not None
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["deleted", "absent", "rejected", "cancelled", "expired"])
+async def test_deferred_cleanup_keeps_owned_receipt_until_shared_gate_allows(monkeypatch, outcome):
+    p = setup(monkeypatch)
+    _, ctx, _, adapter, wire, _, heartbeat, _ = p
+    task = await start(p)
+    await heartbeat.step()
+    await stop(task)
+    import gateway.status_delivery as delivery_module
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    class GateClock:
+        now = 100.0
+        waiting = asyncio.Queue()
+        release = asyncio.Queue()
+        def monotonic(self):
+            return self.now
+        async def sleep(self, seconds):
+            await self.waiting.put(seconds)
+            await self.release.get()
+            self.now += seconds
+    clock = GateClock()
+    monkeypatch.setattr(adapter_module, "time", clock)
+    monkeypatch.setattr(delivery_module, "time", clock, raising=False)
+    monkeypatch.setattr(delivery_module, "asyncio", _AsyncioClock(clock))
+    adapter._send_cooldown_until["123"] = 112.0
+    # Final completion must not wait for this deadline, and a different topic's
+    # unowned message must survive every retry.
+    wire.messages[99] = {"text": "other topic"}
+    await asyncio.wait_for(finish(p), 2)
+    assert not wire.deletes
+    assert ctx._status_delivery.cleanup_failures == {}
+    assert await asyncio.wait_for(clock.waiting.get(), 2) == 12.0
+    # Repeated post-final callbacks/late duplicate receipts coalesce one delete.
+    await ctx._status_delivery.delete(adapter, "1")
+    pending = list(adapter._background_tasks)
+    assert len(pending) == 1
+    if outcome == "cancelled":
+        await adapter.cancel_background_tasks()
+        assert not wire.deletes and not adapter._background_tasks
+        assert not ctx._status_delivery.pending_deletes
+        return
+    if outcome == "expired":
+        clock.now += 48 * 3600
+        clock.release.put_nowait(None)
+        await asyncio.wait_for(asyncio.gather(*pending), 2)
+        assert not wire.deletes and not adapter._background_tasks
+        assert ctx._status_delivery.cleanup_failures == {"1": "deferred_expired"}
+        return
+    adapter._send_final_waiters["123"] = 1
+    clock.release.put_nowait(None)
+    assert await asyncio.wait_for(clock.waiting.get(), 2) == 1.0
+    clock.release.put_nowait(None)
+    assert await asyncio.wait_for(clock.waiting.get(), 2) == 1.0
+    assert not wire.deletes
+    adapter._send_final_waiters.clear()
+    if outcome == "absent":
+        wire.messages.pop(1)
+    elif outcome == "rejected":
+        wire.delete_error = BadRequest("not enough rights")
+    clock.release.put_nowait(None)
+    await asyncio.wait_for(asyncio.gather(*pending), 2)
+    assert wire.deletes == [{"chat_id": 123, "message_id": 1}]
+    assert wire.messages[99] == {"text": "other topic"}
+    assert (1 in wire.messages) is (outcome == "rejected")
+    assert not adapter._background_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["before_final", "cleanup_off", "capacity", "concurrent", "ambiguous"])
+async def test_cleanup_authority_and_bounded_admission(monkeypatch, guard):
+    p = setup(monkeypatch, cleanup=guard != "cleanup_off")
+    _, ctx, _, adapter, wire, _, heartbeat, _ = p
+    task = await start(p)
+    await heartbeat.step()
+    await stop(task)
+    delivery = ctx._status_delivery
+    if guard in {"before_final", "cleanup_off"}:
+        assert await delivery.delete(adapter, "1") is False
+        assert not wire.deletes and not adapter._background_tasks
+        return
+    delivery.cleaned = True
+    if guard == "capacity":
+        adapter._send_final_waiters["123"] = 1
+        adapter._pending_status_delete_count = 256
+        assert await delivery.delete(adapter, "1") is False
+        assert delivery.cleanup_failures == {"1": "pending_capacity"}
+        assert not wire.deletes and not adapter._background_tasks
+    elif guard == "ambiguous":
+        wire.delete_error = TimedOut("unknown remote outcome")
+        assert await delivery.delete(adapter, "1") is False
+        assert len(wire.deletes) == 1 and not adapter._background_tasks
+    else:
+        assert await asyncio.gather(*(delivery.delete(adapter, "1") for _ in range(3))) == [True] * 3
+        assert len(wire.deletes) == 1
