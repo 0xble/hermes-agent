@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -1896,12 +1896,17 @@ test.skipIf(process.platform === 'win32')(
       })
       const argv = (await readFile(argvFile, 'utf8')).split('\0')
 
-      // argv: ['-c', <mutex script>, <mutex path>, <payload>]
-      assert.equal(
-        argv[2],
-        `${fakeHome}/.hermes/.hermes-update-in-progress.mutex`,
-        'mutex path must reach python fully expanded, with no quote characters'
+      // argv: ['-c', <mutex script>, <mutex path>, <payload>]. The mutex
+      // wrapper expands home in Python, not sh. Exercise that real wrapper
+      // with an inert payload; never execute its backend-spawning payload.
+      const { stdout: mutexOutput } = await promisify(execFileCallback)(
+        'python3',
+        [argv[0], argv[1], argv[2], 'printf mutex-ok'],
+        { cwd: root, env: { ...process.env, HOME: fakeHome }, timeout: 5000 }
       )
+
+      assert.equal(mutexOutput, 'mutex-ok')
+      assert.equal(await readFile(`${fakeHome}/.hermes/.hermes-update-in-progress.mutex`, 'utf8'), '')
 
       // The payload assigns reservation/lock/owner_file before its mkdir loop.
       // Evaluate only that prefix the way the remote sh does; never the loop itself.
