@@ -2368,11 +2368,13 @@ def _resolve_gateway_model_context(
     resolved_model = model or _resolve_gateway_model()
     config_context_length = provider = base_url = api_key = custom_providers = None
     configured_model = configured_provider = configured_base_url = None
+    requested_provider = None
+    # Invalid authored routes must fail before optional metadata/auth best-effort reads.
+    data = _load_gateway_runtime_config()
 
     def _read_config() -> None:
         nonlocal config_context_length, provider, base_url, custom_providers
         nonlocal configured_model, configured_provider, configured_base_url
-        data = _load_gateway_config()
         if not data:
             return
         model_cfg = data.get("model", {})
@@ -2391,16 +2393,18 @@ def _resolve_gateway_model_context(
             custom_providers = data.get("custom_providers")
 
     def _read_runtime() -> None:
-        nonlocal provider, base_url, api_key
+        nonlocal provider, base_url, api_key, requested_provider
         if route and route.get("base_url"):
             # A session route with its own endpoint (a /model switch) replaces the default runtime
             # read; a route without one (persisted / SessionDB / plain config) still resolves the
             # default runtime credentials so a custom endpoint and its context_length pin survive.
+            requested_provider = route.get("requested_provider") or route.get("provider")
             provider = route.get("provider") or provider
             base_url = route["base_url"]
             api_key = route.get("api_key")
             return
         runtime = _resolve_runtime_agent_kwargs()
+        requested_provider = runtime.get("requested_provider")
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
@@ -2409,7 +2413,8 @@ def _resolve_gateway_model_context(
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
         return not should_clear_context_pin(
-            configured_model, resolved_model, configured_base_url, base_url, configured_provider, provider)
+            configured_model, resolved_model, configured_base_url, base_url,
+            configured_provider, requested_provider or provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
@@ -2889,12 +2894,21 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
 from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpoint_agent_kwargs
 
 
+def _load_gateway_runtime_config(config: dict | None = None) -> dict:
+    """Expand an explicitly supplied route; disk reads use the effective user-config seam."""
+    if config is None:
+        return _load_gateway_config()
+    from hermes_cli.config import _expand_env_vars
+    from hermes_cli.model_presets import expand_model_presets
+    return expand_model_presets(_expand_env_vars(config))
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """The profile's model when nothing else names one: config.yaml (single source of truth), else the
     claimed welcome trial's. Temporary AIAgents (e.g. /compress) otherwise use the hardcoded default,
     which fails under openai-codex."""
     from hermes_cli.anon_auth import trial_model
-    model_cfg = (config if config is not None else _load_gateway_config()).get("model", {})
+    model_cfg = _load_gateway_runtime_config(config).get("model", {})
     if isinstance(model_cfg, dict):
         model_cfg = model_cfg.get("default") or model_cfg.get("model")
     return (model_cfg if isinstance(model_cfg, str) else "") or trial_model()
