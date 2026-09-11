@@ -2,13 +2,26 @@
 
 This repository tracks `NousResearch/hermes-agent` while carrying a small set of Brian-owned patches. Official upstream remains authoritative for all unmodified Hermes code. Fork `main` is the last candidate that passed fork verification; runtime promotion is a separate operation.
 
-## Frozen upstream reconciliation, September 11, 2026
+## Background
+
+### Frozen upstream reconciliation, September 11, 2026
 
 - Frozen upstream: `939e45c91d751fadd94dcd1b873ac3cb44846213`. Source verification and publication are separate from the separately authorized default-local runtime activation.
 - Preserve private-fork update discovery through authenticated noninteractive `ls-remote`, adopting upstream's no-fetch passive checks and HEAD-aware cache while retaining source invalidation. A private API 404 must not redirect checks to public upstream or fabricate a count.
 - Use upstream's canonical `SCHEMA_SQL` reconciliation for async delegations, including the fork's recovery and presentation metadata and counter tables. Retain stable display references and exact ownership.
 - Restore the existing blank-slate tool overlap filter removed incidentally by upstream's Collective Wisdom revert `0dcadf6f41c`. Disabling another bundle must not strip file, terminal, vision, or skill tools retained by setup. Existing behavioral tests cover this contract.
 - Keep MoA frozen physical routes, Telegram Business routing, update reason isolation, and the HERMES-137 flood budget across upstream profile-aware interfaces. Test stubs follow the new profile argument/return shapes without weakening their assertions.
+
+### Reconciliation boundaries
+
+The September 11 review repairs preserve the frozen integration while correcting independent fork defects. These are local adaptations, not claims of upstream acceptance. Retire them only when released upstream satisfies the affected contracts.
+
+- Restart inbox ownership is linked to the exact normalized event and its canonical input owner. Reconciliation chooses original replay or transcript continuation before either consumer runs. A required input must be durably present before native or Codex model dispatch. Unknown ingestion and previously attempted controls without proof remain parked. Routing JSON fallback is insufficient admission evidence. This does not promise exactly-once arbitrary external effects.
+- Goal evaluation works on an isolated draft and commits against the original stored state and revision. User controls arriving during evaluation or classification retain authority. Profile identity is part of the revision/lock scope.
+- Named-profile update requests already retain profile identity in their session key. Both CLI socket discovery and gateway database resolution must use the actual owning profile, including the default multiplexer. Missing, unreadable or ambiguous ownership rejects rather than guessing a payload-supplied path.
+- Native turn-start titling includes the current user row. The opening turn may create a derived title and one auxiliary worker. A later native turn has two user rows, so neither the historical `> 1` guard nor the present guard provides a second-exchange retry. Explicit derived-title upgrades remain available through the dedicated title API.
+- The browser immutable-SQLite fallback is retired: an immutable reader can expose uncommitted pages in a hot-journal database. An inability to obtain a trustworthy snapshot must not be reported as a safe read. Browser lifecycle recovery still requires exact daemon/process ownership.
+- Preserve exact per-child credentials and reasoning, task-relative knowledge boundaries, verified Hindsight writes, and full redaction before display clipping. Manual supply-chain scans require real immutable endpoints and must fail on unavailable comparison evidence.
 
 ## Non-negotiable patch lifecycle
 

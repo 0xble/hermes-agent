@@ -1535,16 +1535,12 @@ def maybe_auto_title(
     if not session_db or not session_id or not request_text:
         return
 
-    # Count the real questions behind us to detect the opening turn.
-    # ``conversation_history`` is the state BEFORE this turn's message is
-    # appended when called from the turn prologue, and after it when called
-    # post-response, so accept both.
-    #
-    # Two things have to be true to skip: we are past the opening turn AND the
-    # session already has a name. Either alone gets it wrong. The count alone
-    # left a session that opened with machinery permanently nameless, because
-    # nothing reconsidered it. The title alone would never title at all on a
-    # store too old to report one.
+    # The native turn-start caller includes the current user message. An untitled
+    # opening turn therefore has one user row and may start its initial worker.
+    # Once named, a nonempty real-user history suppresses another worker, even
+    # when the initial auxiliary request left only the derived title. A later
+    # native turn has two user rows, so the historical > 1 guard also skipped it.
+    # Explicit derived-title upgrades belong to auto_title_session itself.
     user_msg_count = sum(1 for m in (conversation_history or []) if _is_real_user_turn(m))
     if user_msg_count >= 1 and not _session_is_untitled(session_db, session_id):
         return

@@ -573,3 +573,35 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_native_title_turn_keeps_derived_title_without_second_worker(tmp_path):
+    """Native history already includes each current user, including the opener."""
+    from agent import turn_context
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / "titles.db")
+    try:
+        db.create_session(session_id="sess-1", source="cli")
+        agent = _TitlingAgent("cli")
+        agent._session_db = db
+        history = [{"role": "user", "content": "Fix the login button"}]
+        # Leave the auxiliary worker unexecuted, as after an initial failure.
+        with patch("agent.title_generator.threading.Thread") as worker:
+            turn_context._maybe_title_session_at_turn_start(agent, history)
+            first_title = db.get_session_title("sess-1")
+            assert first_title
+            assert db.get_session_title_source("sess-1") == "derived"
+            assert worker.call_count == 1
+            worker.return_value.start.assert_called_once()
+
+            history.extend([
+                {"role": "assistant", "content": "The button is fixed."},
+                {"role": "user", "content": "Now check the logout button"},
+            ])
+            turn_context._maybe_title_session_at_turn_start(agent, history)
+            assert worker.call_count == 1
+            assert db.get_session_title("sess-1") == first_title
+            assert db.get_session_title_source("sess-1") == "derived"
+    finally:
+        db.close()
