@@ -527,14 +527,15 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
             pass
         def offline_file_access(_path, **_kw):
             return contextlib.nullcontext()
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
-    for seq in itertools.count(1):  # same-second collision must not overwrite the earlier forensic copy
-        if not backup_path.exists():
-            break
-        backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}_{seq}")
     try:
         with offline_file_access(db_path, what="raw-copy for forensic backup"):
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
+            # Allocate while serialized with publication, including same-second callers.
+            for seq in itertools.count(1):
+                if not backup_path.exists():
+                    break
+                backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}_{seq}")
             # Sweep staging debris from an interrupted pass BEFORE the dedupe (it is byte-identical to the damaged
             # DB, so dedupe would hand it back as a backup). Also the old ``.incomplete`` spelling, which
             # prefix-matches as a backup, sorts NEWEST and would otherwise survive prune forever.

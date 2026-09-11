@@ -79,6 +79,16 @@ def test_isolated_runner_cannot_escape_job_scope(tmp_path: Path) -> None:
     assert any("runs-on" in error for error in validate(root, ROOT))
 
 
+@pytest.mark.parametrize("axis", [["self-hosted"], ["ubuntu-latest"], "${{ inputs.runners }}"])
+def test_runner_axis_cannot_hide_behind_hosted_include(tmp_path: Path, axis) -> None:
+    root = candidate(tmp_path)
+    path = root / ".github/workflows/tests-os.yml"
+    data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    data["jobs"]["os-tests"]["strategy"]["matrix"]["runner"] = axis
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    assert any("runs-on" in error for error in validate(root, ROOT))
+
+
 def test_untrusted_external_actions_are_rejected(tmp_path: Path) -> None:
     root = candidate(tmp_path)
     replace(

@@ -30,6 +30,47 @@ from hermes_cli import sqlite_safe_read
 from hermes_cli.sqlite_safe_read import connect_tracked
 
 
+def test_same_second_backups_keep_both_serialized_generations(tmp_path, monkeypatch):
+    import contextlib
+    import datetime
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    import hermes_state_repair as repair
+
+    source = tmp_path / "state.db"
+    source.write_bytes(b"first damaged generation")
+    class FixedDatetime(datetime.datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 9, 11, 12, 0, 0)
+    monkeypatch.setattr(repair, "datetime", SimpleNamespace(datetime=FixedDatetime))
+    barrier = threading.Barrier(2)
+    real_access = sqlite_safe_read.offline_file_access
+    @contextlib.contextmanager
+    def simultaneous_access(path, **kwargs):
+        if kwargs.get("what") == "raw-copy for forensic backup":
+            barrier.wait(timeout=5)
+        with real_access(path, **kwargs):
+            yield
+    monkeypatch.setattr(sqlite_safe_read, "offline_file_access", simultaneous_access)
+    real_publish = repair._publish_backup_bundle
+    published = []
+    def publish(src, staging, destination):
+        real_publish(src, staging, destination)
+        published.append(destination)
+        if len(published) == 1:
+            source.write_bytes(b"second damaged generation")
+    monkeypatch.setattr(repair, "_publish_backup_bundle", publish)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(repair._backup_db_file, [source, source]))
+    assert all(path is not None and error is None for path, error in results)
+    paths = {path for path, _error in results}
+    assert len(paths) == 2
+    assert {path.read_bytes() for path in paths} == {
+        b"first damaged generation", b"second damaged generation",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Each test starts and ends with an empty live-connection registry.

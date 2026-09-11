@@ -130,16 +130,18 @@ def rollback(record_id: str, store) -> Dict[str, Any]:
     record = _read_record(record_id)
     if not record:
         return {"success": False, "error": f"Unknown memory history id '{record_id}'."}
-    record = _recover(record)
-    if record.get("status") == "not_applied":
-        return {"success": True, "done": True, "id": record_id, "message": "Write was never applied."}
-    if record.get("status") == "rolled_back":
-        return {"success": True, "done": True, "id": record_id, "message": "Already rolled back."}
-    if record.get("status") != "applied":
-        return {"success": False, "error": "History record cannot be rolled back safely.", "status": record.get("status")}
-
     target, path = record["target"], store._path_for(record["target"])
     with store._file_lock(path):
+        record = _read_record(record_id)
+        if not record or record.get("target") != target:
+            return {"success": False, "error": "History record changed before rollback acquired its target."}
+        record = _recover_locked(record)
+        if record.get("status") == "not_applied":
+            return {"success": True, "done": True, "id": record_id, "message": "Write was never applied."}
+        if record.get("status") == "rolled_back":
+            return {"success": True, "done": True, "id": record_id, "message": "Already rolled back."}
+        if record.get("status") != "applied":
+            return {"success": False, "error": "History record cannot be rolled back safely.", "status": record.get("status")}
         current, readable = store._read_raw_checked(path)
         if not readable:
             return {"success": False, "error": "Memory file could not be read; rollback was not applied."}

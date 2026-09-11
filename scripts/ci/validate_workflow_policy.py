@@ -220,7 +220,10 @@ def _validate_job(
         matrix = ((job.get("strategy") or {}).get("matrix") or {}) if isinstance(job.get("strategy"), dict) else {}
         include = matrix.get("include") if isinstance(matrix, dict) else None
         runners = [item.get("runner") for item in include] if isinstance(include, list) and all(isinstance(item, dict) for item in include) else []
-        if not runners or any(runner not in STANDARD_RUNNERS for runner in runners):
+        # Axes create jobs independently of include rows. Only the enumerated
+        # include-only form has complete, statically validated runner selection.
+        include_only = isinstance(matrix, dict) and set(matrix) <= {"include", "exclude"}
+        if not include_only or not runners or any(runner not in STANDARD_RUNNERS for runner in runners):
             errors.append(f"{location}.runs-on: only GitHub-hosted standard runners are allowed")
     elif runner is not None and str(runner) not in STANDARD_RUNNERS:
         errors.append(f"{location}.runs-on: only GitHub-hosted standard runners are allowed")

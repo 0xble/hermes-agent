@@ -15,9 +15,9 @@ def _git(args, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True)
 
 
-def _git_run(_git_cmd, args, cwd, *, network=False):
+def _git_run(_git_cmd, args, cwd, *, network=False, check=False):
     del network
-    return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True)
+    return subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=check)
 
 
 def _repo(tmp_path: Path) -> tuple[Path, Path, str]:
@@ -136,7 +136,37 @@ def test_unexpected_head_is_refused_and_same_target_skips_apply(monkeypatch, tmp
         gateway_mode=False, desktop_dir=tmp_path, had_desktop_app_before_update=False,
         pre_update_snapshot_id=None, _windows_gateway_resume=None,
     )
-    assert calls == ["verify", "repair", "runtime"]
+    assert calls == ["verify", "repair", "verify", "runtime"]
+
+
+def test_already_pinned_update_rejects_checkout_movement_during_catchup(monkeypatch, tmp_path):
+    import hermes_cli.update_cmd as update_cmd
+    seed, checkout, first = _repo(tmp_path)
+    later = _advance(seed)
+    _git(["fetch", "origin", "main"], checkout)
+    outcomes = []
+    monkeypatch.setattr(update_cmd, "_git_run", _git_run)
+    monkeypatch.setattr(update_cmd, "_current_branch_name", lambda *_args, **_kwargs: "main")
+    monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(
+        PROJECT_ROOT=checkout,
+        _resume_windows_gateways_after_update=lambda *_args: None,
+    ))
+    monkeypatch.setattr(update_cmd, "_finalize_receipt", lambda status, *_args: outcomes.append(status))
+    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda _sha: None)
+    def catchup(*args, **kwargs):
+        _git(["checkout", "--detach", later], checkout)
+        kwargs["final_head_guard"]()
+    monkeypatch.setattr(update_cmd, "_finish_already_up_to_date", catchup)
+    opts = SimpleNamespace(assume_yes=True, gw_input_fn=None, active_lazy_features=None, active_tool_dependencies=None)
+    with pytest.raises(SystemExit) as error:
+        update_cmd._run_pinned_revision_update(
+            ["git"], update_revision.RevisionTarget(first, "tree"), opts, None,
+            gateway_mode=False, desktop_dir=tmp_path, had_desktop_app_before_update=False,
+            pre_update_snapshot_id=None, _windows_gateway_resume=None,
+        )
+    assert error.value.code == 1
+    assert outcomes == ["failed"]
+    assert _git(["rev-parse", "HEAD"], checkout).stdout.strip() == later
 
 
 def test_public_cmd_update_preserves_revision_flag_to_native_pipeline(monkeypatch):

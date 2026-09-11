@@ -85,6 +85,33 @@ def test_automatic_single_remove_keeps_explicit_delete_semantics(tmp_path, monke
     assert store.memory_entries == ["old fact"]
 
 
+def test_rollback_rechecks_journal_after_waiting_for_target_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from tools.memory_history import rollback
+    store = _configure(tmp_path, monkeypatch, "automatic")
+    token = _review()
+    try:
+        result = json.loads(mt.memory_tool("replace", content="new fact", old_text="old fact", store=store))
+    finally:
+        reset_current_write_origin(token)
+    record_id = result["history_id"]
+    other = mt.MemoryStore()
+    other.load_from_disk()
+    real_lock = store._file_lock
+    @contextmanager
+    def waited_lock(path):
+        # Another rollback wins while this caller waits, then a legitimate
+        # writer recreates the after-image before this caller acquires the lock.
+        assert rollback(record_id, other)["success"]
+        assert other.replace("memory", "old fact", "new fact")["success"]
+        with real_lock(path):
+            yield
+    monkeypatch.setattr(store, "_file_lock", waited_lock)
+    assert rollback(record_id, store)["success"]
+    raw, readable = store._read_raw_checked(store._path_for("memory"))
+    assert readable and store._parse_entries(raw) == ["new fact"]
+
+
 def test_general_write_approval_overrides_automatic(tmp_path, monkeypatch):
     from tools import write_approval as wa
     store = _configure(tmp_path, monkeypatch, "automatic", approval=True)

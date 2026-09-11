@@ -1337,7 +1337,7 @@ def _run_pinned_revision_update(
                 active_lazy_features=opts.active_lazy_features,
                 active_tool_dependencies=opts.active_tool_dependencies,
                 _windows_gateway_resume=_windows_gateway_resume,
-                final_head_guard=lambda: _verify_pinned_runtime_readback(target.sha))
+                final_head_guard=lambda: _verify_pinned_completion(git_cmd, target.sha))
             return
         rollback = retain_precheckout_rollback(_git_run, git_cmd, _m().PROJECT_ROOT, target)
         record_revision_receipt(target, rollback)
