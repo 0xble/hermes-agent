@@ -8,10 +8,20 @@ import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.session import SessionSource
+from gateway.session import SessionSource, SessionStore
 from gateway import restart_inbox as inbox
 from gateway.run import GatewayRunner
-from tests.gateway.restart_test_helpers import make_restart_runner
+from tests.gateway.restart_test_helpers import make_restart_runner as _make_restart_runner
+
+
+def make_restart_runner():
+    from hermes_state import SessionDB
+    runner, adapter = _make_restart_runner()
+    home = inbox._db_path().parent
+    runner.session_store = SessionStore(sessions_dir=home / "sessions", config=runner.config)
+    runner.session_store._routing_home = home
+    runner.session_store._db = SessionDB(db_path=inbox._db_path())
+    return runner, adapter
 
 
 @pytest.fixture(autouse=True)

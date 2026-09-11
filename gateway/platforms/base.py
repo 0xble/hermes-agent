@@ -3747,6 +3747,9 @@ class BasePlatformAdapter(ABC):
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
+        restart_claim = getattr(event, "_restart_inbox_claim", None)
+        if restart_claim:
+            expected_session_key = restart_claim["session_key"]
         # Explicitly routed events already name their destination; recovering a
         # different topic would redirect them and yield before the session claim.
         if (not expected_session_key and getattr(self, "_topic_recovery_fn", None) is not None
@@ -3754,6 +3757,9 @@ class BasePlatformAdapter(ABC):
             await asyncio.to_thread(self._apply_topic_recovery, event)
         session_key = self._event_session_key(event)
         if expected_session_key and session_key != expected_session_key:
+            if restart_claim:
+                event._restart_input_admission_failed = True
+                raise RuntimeError("Restart inbox route no longer matches its queued session")
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
@@ -3761,6 +3767,9 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
+            if restart_claim:
+                from gateway.restart_inbox import RestartInboxBusy
+                raise RestartInboxBusy(self._session_tasks.get(session_key))
             await self._handle_message_while_active(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
@@ -4280,6 +4289,14 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             response = await self._message_handler(event)
+            claim = getattr(event, "_restart_inbox_claim", None)
+            if (claim and not getattr(event, "_restart_inbox_agent_started", False)
+                    and not getattr(event, "_restart_input_admission_failed", False)):
+                # A control handler can finish without an agent marker. Its successful return
+                # settles the queue, while a crash before this receipt remains ambiguous.
+                from gateway.restart_inbox import transition_link
+                if not await asyncio.to_thread(transition_link, claim, "delivered"):
+                    raise RuntimeError("Could not settle restart inbox control completion")
             # Snapshot ownership the moment the handler returns: the queued follow-up spawned later
             # in this method reuses the active-session event and binds its newer generation there.
             callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)

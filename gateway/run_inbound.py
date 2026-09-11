@@ -1766,7 +1766,11 @@ class GatewayInboundMixin:
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
         """Persist the exact resolved routing key for this running turn."""
         try:
-            token = await self.async_session_store.mark_turn_active(session_key)
+            claim = getattr(event, "_restart_inbox_claim", None)
+            if claim:
+                token = await self.async_session_store.mark_turn_active(session_key, restart_claim=claim)
+            else:
+                token = await self.async_session_store.mark_turn_active(session_key)
         except Exception as exc:
             logger.warning("Could not persist active-turn marker for %s: %s", session_key, exc)
             return False
@@ -1776,21 +1780,14 @@ class GatewayInboundMixin:
         # metadata, transcripts, and platform payloads.
         event._gateway_active_turn_session_key = session_key
         event._gateway_active_turn_token = token
-        queue_id = getattr(event, "_restart_inbox_queue_id", None)
-        if queue_id:
-            # Fence the replayed row against a second replay: active-turn recovery owns it now.
-            try:
-                from gateway.restart_inbox import mark_handed_off
-
-                await asyncio.to_thread(mark_handed_off, queue_id)
-            except Exception:
-                logger.exception(
-                    "Could not hand restart inbox row %s to active-turn recovery", queue_id)
+        event._restart_inbox_agent_started = bool(claim)
         return True
 
     async def _clear_durable_active_turn(self, event: "MessageEvent") -> bool:
         """Best-effort CAS clear of the marker owned by *event* (3 attempts; never blocks agent/lease
         release — a stale marker is bounded by the agent timeout and clean-start discard)."""
+        if getattr(event, "_restart_input_admission_failed", False):
+            return False
         session_key = getattr(event, "_gateway_active_turn_session_key", None)
         token = getattr(event, "_gateway_active_turn_token", None)
         try:

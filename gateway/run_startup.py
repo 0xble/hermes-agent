@@ -69,12 +69,44 @@ class GatewayStartupMixin:
                 source.chat_id if source else "unknown",
             )
 
+    def _reconcile_restart_recovery(self) -> bool:
+        """One arbitration gate shared by clean/unclean startup and adapter reconnect."""
+        from pathlib import Path
+        from gateway.run import _multiplex_profile_homes
+        try:
+            root = Path(self.session_store._routing_home)
+            paths = {root / "state.db"}
+            if self.config.multiplex_profiles:
+                paths.update(Path(home) / "state.db" for _profile, home in _multiplex_profile_homes(self.config))
+            with self.session_store._lock:
+                self.session_store._ensure_loaded_locked()
+                running = {key for key in self.session_store._entries if self._is_session_running(key)}
+            self._restart_inbox_blocked = self.session_store.reconcile_restart_inbox(paths, running_keys=running)
+            return True
+        except Exception:
+            logger.exception("Restart inbox arbitration unavailable; deferring both recovery consumers")
+            return False
+
     async def _drain_restart_inbox(self) -> int:
+        lock = getattr(self, "_restart_inbox_drain_lock", None)
+        if lock is None:
+            lock = self._restart_inbox_drain_lock = asyncio.Lock()
+        async with lock:
+            return await self._drain_restart_inbox_serial()
+
+    def _schedule_restart_inbox_drain(self):
+        if getattr(self, "_running", False) and not getattr(self, "_draining", False):
+            self._retain_background_task(asyncio.create_task(self._drain_restart_inbox()))
+
+    async def _drain_restart_inbox_serial(self) -> int:
         """Replay messages the PREVIOUS draining process durably accepted. Rows are claimed
         under this boot's live adapter identities; a claim we cannot dispatch is released
         rather than spent, so the next boot can still deliver it."""
         try:
-            from gateway.restart_inbox import claim_recoverable, mark_delivered, release_claim
+            from gateway.restart_inbox import claim_recoverable, transition_link, linked_row, RestartInboxBusy
+
+            if not await asyncio.to_thread(self._reconcile_restart_recovery):
+                return 0
 
             targets = {
                 (getattr(platform, "value", str(platform)), "default")
@@ -84,7 +116,24 @@ class GatewayStartupMixin:
                 targets.update(
                     (getattr(platform, "value", str(platform)), str(profile))
                     for platform in adapters)
-            claimed = await asyncio.to_thread(claim_recoverable, deliverable_targets=targets)
+            claimed = []
+            busy_keys = set(getattr(self, "_restart_inbox_inflight_keys", ()))
+            with self.session_store._lock:
+                busy_keys.update(key for key in self.session_store._entries if self._is_session_running(key))
+            all_adapters = list(self.adapters.values())
+            all_adapters.extend(adapter for group in (getattr(self, "_profile_adapters", None) or {}).values()
+                                for adapter in group.values())
+            for adapter in all_adapters:
+                tasks = getattr(adapter, "_session_tasks", None)
+                if isinstance(tasks, dict):
+                    busy_keys.update(key for key, task in tasks.items() if task and not task.done())
+            for path, excluded in self._restart_inbox_blocked.items():
+                batch = await asyncio.to_thread(
+                    claim_recoverable, deliverable_targets=targets, db_path=path,
+                    excluded_queue_ids=excluded, excluded_session_keys=busy_keys,
+                )
+                claimed.extend(batch)
+                busy_keys.update(row["session_key"] for row in batch)
         except Exception:
             logger.exception("Could not claim restart-drain inbox")
             return 0
@@ -97,7 +146,7 @@ class GatewayStartupMixin:
                 logger.warning(
                     "Restart inbox claim %s has no live adapter; leaving for retry", row["queue_id"])
                 try:
-                    await asyncio.to_thread(release_claim, row["queue_id"])
+                    await asyncio.to_thread(transition_link, event._restart_inbox_claim, "pending")
                 except Exception:
                     logger.exception(
                         "Could not release restart inbox claim %s", row["queue_id"])
@@ -105,22 +154,44 @@ class GatewayStartupMixin:
             setattr(event, "_hermes_startup_restore_replay", True)
             try:
                 await adapter.handle_message(event)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Restart inbox dispatch failed for claim %s; releasing for retry",
                     row["queue_id"])
                 try:
-                    await asyncio.to_thread(release_claim, row["queue_id"])
+                    await asyncio.to_thread(transition_link, event._restart_inbox_claim, "pending",
+                                            refund_attempt=isinstance(exc, RestartInboxBusy))
+                    if isinstance(exc, RestartInboxBusy) and isinstance(exc.task, asyncio.Task):
+                        exc.task.add_done_callback(lambda _task: self._schedule_restart_inbox_drain())
                 except Exception:
                     logger.exception(
                         "Could not release failed restart inbox claim %s", row["queue_id"])
                 continue
             session_tasks = getattr(adapter, "_session_tasks", None)
-            if not isinstance(session_tasks, dict) or not session_tasks.get(row["session_key"]):
+            task = session_tasks.get(row["session_key"]) if isinstance(session_tasks, dict) else None
+            if isinstance(task, asyncio.Task) and not task.done():
+                inflight = getattr(self, "_restart_inbox_inflight_keys", None)
+                if inflight is None:
+                    inflight = self._restart_inbox_inflight_keys = set()
+                inflight.add(row["session_key"])
+                def completed(_task, *, key=row["session_key"], accepted=event):
+                    inflight.discard(key)
+                    if not getattr(accepted, "_restart_input_admission_failed", False):
+                        self._schedule_restart_inbox_drain()
+                task.add_done_callback(completed)
+            elif (getattr(event, "_restart_inbox_agent_started", False)
+                  and not getattr(event, "_restart_input_admission_failed", False)):
+                if (await asyncio.to_thread(linked_row, event._restart_inbox_claim))["state"] == "delivered":
+                    self._schedule_restart_inbox_drain()
+            if (not getattr(event, "_restart_input_admission_failed", False)
+                    and not getattr(event, "_restart_inbox_agent_started", False)
+                    and (not isinstance(session_tasks, dict) or not session_tasks.get(row["session_key"]))):
                 # Commands and other control messages finish entirely inside handle_message
                 # without acquiring an agent turn, so they never reach the turn finalizer.
                 try:
-                    await asyncio.to_thread(mark_delivered, row["queue_id"])
+                    settled = await asyncio.to_thread(transition_link, event._restart_inbox_claim, "delivered")
+                    if settled:
+                        self._schedule_restart_inbox_drain()
                 except Exception:
                     logger.exception(
                         "Could not finalize handled restart inbox claim %s", row["queue_id"])
@@ -608,6 +679,7 @@ class GatewayStartupMixin:
                 candidates = [
                     entry for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
+                    and (not entry.restart_inbox_link or entry.restart_inbox_link.get("mode") == "continuation")
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
@@ -649,6 +721,8 @@ class GatewayStartupMixin:
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
+        if not self._reconcile_restart_recovery():
+            return 0
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
         if candidates is None:
@@ -1055,6 +1129,8 @@ class GatewayStartupMixin:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
         # Recover sessions active at last exit (exact turn markers + 120s recency fallback for
         # marker-less older turns). SKIP after a clean exit — the previous process already drained.
+        if not await asyncio.to_thread(self._reconcile_restart_recovery):
+            raise RuntimeError("restart inbox reconciliation failed")
         _clean_marker = _hermes_home / ".clean_shutdown"
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")

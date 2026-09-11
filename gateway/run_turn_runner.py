@@ -2148,6 +2148,9 @@ class TurnRunner:
         try:
             return self._run_sync()
         except Exception as exc:
+            from agent.turn_context import RequiredInputPersistenceError
+            if isinstance(exc, RequiredInputPersistenceError):
+                raise
             from hermes_cli.goals import GoalManager
             sid = str(getattr(self._ctx.agent_holder[0], "session_id", None) or self._ctx.session_id or "")
             if not GoalManager(sid).is_active():
@@ -2230,6 +2233,9 @@ class TurnRunner:
         try:
             result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)
         except Exception as exc:
+            from agent.turn_context import RequiredInputPersistenceError
+            if isinstance(exc, RequiredInputPersistenceError):
+                raise
             from hermes_cli.goals import GoalManager
             goal_session_id = str(getattr(agent, "session_id", None) or ctx.session_id or "")
             if not GoalManager(goal_session_id).is_active():

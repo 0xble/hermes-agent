@@ -525,6 +525,8 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
+    restart_inbox_link: Optional[Dict[str, Any]] = None
+    restart_inbox_settled_at: Optional[str] = None
     # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
     # sanitize_model_override). Persisted so a restart keeps the chosen model.
     model_override: Optional[Dict[str, str]] = None
@@ -534,7 +536,8 @@ class SessionEntry:
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
-        "expiry_finalized", "suspended", "resume_pending", "resume_reason",
+        "expiry_finalized", "suspended", "resume_pending", "resume_reason", "restart_inbox_link",
+        "restart_inbox_settled_at",
     )
     _RESET_FIELDS = (
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
@@ -976,6 +979,11 @@ class SessionStore(
                     session_key, entry.session_id,
                 )
             if stale_hit or reset_reason:
+                if entry.restart_inbox_link and not reset_reason:
+                    # Keep recovery evidence even when transcript lifecycle reports an ended row.
+                    decision.entry = entry
+                    return decision
+                self._settle_restart_reset(entry)
                 # Honour an explicit suspension/reset decision instead of silently reopening via recovery.
                 if reset_reason:
                     decision.schedule_reset(reset_reason, entry, entry.last_prompt_tokens > 0)
@@ -1019,6 +1027,8 @@ class SessionStore(
         with self._lock:
             current = self._entries.get(session_key)
             if current is None or (force_new and current is observed):
+                if current is not None:
+                    self._settle_restart_reset(current)
                 self._entries[session_key] = current = candidate
         decision.entry = current
         decision.needs_save = True
@@ -1115,6 +1125,7 @@ class SessionStore(
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
         """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+        self._settle_restart_reset(old_entry)
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,

@@ -900,6 +900,45 @@ def _persist_turn_start(
     )
 
 
+class RequiredInputPersistenceError(RuntimeError):
+    """A recovery input was not durably admitted. No runtime may execute it."""
+
+
+def _require_durable_input(agent, metadata, messages, conversation_history, pending_cli_message):
+    """Replay-only admission, outside the best-effort persistence exception boundary."""
+    if not isinstance(metadata, dict) or metadata.get("gateway_input_required") is not True:
+        return
+    owner = metadata.get("gateway_input_owner")
+    if not isinstance(owner, str) or not owner:
+        raise RequiredInputPersistenceError("Required input has no stable owner")
+
+    def proven():
+        db = getattr(agent, "_session_db", None)
+        if db is None or not agent.session_id:
+            return False
+        current = db.get_compression_tip(agent.session_id) or agent.session_id
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            if db.has_gateway_input_owner(current, owner):
+                return True
+            row = db.get_session(current)
+            if not row or not db._is_compression_child_row(row):
+                break
+            current = row["parent_session_id"]
+        return False
+
+    try:
+        if proven():
+            return
+        _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+        if proven():
+            return
+    except Exception as exc:
+        raise RequiredInputPersistenceError("Required input durability is unknown") from exc
+    raise RequiredInputPersistenceError("Required input was not durably persisted")
+
+
 def build_turn_context(
     agent, user_message: Any, system_message: Optional[str],
     conversation_history: Optional[List[Dict[str, Any]]], task_id: Optional[str], stream_callback,
@@ -1013,6 +1052,10 @@ def build_turn_context(
 
     _ensure_session_row(agent, pending_cli_message)
 
+    _require_durable_input(
+        agent, persist_user_display_metadata, messages, conversation_history, pending_cli_message,
+    )
+
     compaction = run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
@@ -1046,6 +1089,10 @@ def build_turn_context(
     )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+
+    _require_durable_input(
+        agent, persist_user_display_metadata, messages, conversation_history, pending_cli_message,
+    )
 
     # Title the session now: the row exists and titling depends only on the user's ask,
     # so it runs concurrently with the turn. Daemon thread, no-op once titled.

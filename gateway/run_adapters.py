@@ -794,6 +794,7 @@ class GatewayAdapterLifecycleMixin:
         # A platform offline at startup skipped its restart-interrupted sessions; resume them now.
         try:
             self._schedule_resume_pending_sessions(platform=platform)
+            await self._drain_restart_inbox()
         except Exception:
             logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
 
@@ -1147,6 +1148,8 @@ class GatewayAdapterLifecycleMixin:
                             await self._redeliver_failed_obligations_for_platform(
                                 platform, profile=profile_name
                             )
+                            self._schedule_resume_pending_sessions(platform=platform)
+                            await self._drain_restart_inbox()
                             return
                     # Not installed (newer reconnect won the slot, shutdown began, or connect failed):
                     # release partial resources; stop only for a non-retryable fatal.

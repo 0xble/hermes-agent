@@ -1786,6 +1786,10 @@ class GatewayTurnMixin:
     async def _hmwa_agent_error_reply(self, e, event, source, session_entry, session_key, prepared):
         """``except Exception`` body of the agent turn: stop typing, log, persist the inbound user
         turn once, and build the sanitized user-facing error reply."""
+        from agent.turn_context import RequiredInputPersistenceError
+        if isinstance(e, RequiredInputPersistenceError):
+            event._restart_input_admission_failed = True
+            raise e
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
@@ -1890,7 +1894,13 @@ class GatewayTurnMixin:
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
+        from agent.turn_context import RequiredInputPersistenceError
+        claim = getattr(event, "_restart_inbox_claim", None)
+        marked = await self._mark_durable_active_turn(event, session_entry.session_key)
+        if not marked and (claim or session_entry.restart_inbox_link):
+            event._restart_input_admission_failed = True
+            self._clear_session_env(_session_env_tokens)
+            raise RequiredInputPersistenceError("Could not durably link restart input")
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
@@ -1901,6 +1911,9 @@ class GatewayTurnMixin:
             )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
+            if claim or session_entry.restart_inbox_link:
+                event._restart_input_admission_failed = True
+                raise RequiredInputPersistenceError("Restart input transcript is unavailable")
             return (
                 "⚠️ This session's history is temporarily unavailable, so this message was not "
                 "processed. Ask the operator to inspect state.db, then resend after it is healthy. "
@@ -1939,7 +1952,7 @@ class GatewayTurnMixin:
         import uuid
         namespace = [source.platform.value, source.profile, source.scope_id,
                      source.chat_id, source.thread_id, str(event.message_id)]
-        owner = (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
+        owner = claim["input_owner"] if claim else (str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(namespace)))
                  if event.message_id else str(uuid.uuid4()))
         return self._PreparedTurn(
             history, context_prompt, message_text, persist_user_message, persist_user_timestamp,
@@ -2003,7 +2016,10 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
-                persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
+                persist_user_display_metadata={
+                    "gateway_input_owner": prepared.persistence_owner,
+                    **({"gateway_input_required": True} if getattr(event, "_restart_inbox_claim", None) else {}),
+                },
                 message_type=event.message_type,
                 turn_reasoning_config=getattr(event, "turn_reasoning_config", None),
                 goal_session_entry=session_entry,

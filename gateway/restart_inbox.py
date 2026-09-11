@@ -1,9 +1,9 @@
 """Durable inbox for inbound messages accepted during gateway restart drain.
 
 A restart acknowledgement is truthful only after the normalized event is committed.
-Rows remain replayable while ``pending``/``attempting``. Once an agent turn owns a
-durable active-turn marker, the row becomes ``handed_off`` and restart recovery owns
-continuation, preventing both message replay and turn auto-resume from running it.
+Versioned claims require a linked routing marker and durable canonical input before
+runtime dispatch. Recovery partitions original-event replay from transcript continuation
+using exact ingestion proof. Legacy attempts and attempted controls remain ambiguous.
 """
 
 from __future__ import annotations
@@ -14,7 +14,9 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
@@ -23,6 +25,14 @@ _LOCK = threading.Lock()
 _MAX_ATTEMPTS = 5
 _STALE_SECONDS = 24 * 60 * 60
 _TERMINAL_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+class RestartInboxBusy(RuntimeError):
+    """Adapter rejected a replay before dispatch because its exact session is busy."""
+
+    def __init__(self, task):
+        super().__init__("Restart inbox session is busy")
+        self.task = task
 
 
 def _db_path():
@@ -54,8 +64,8 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         return False
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _connect(db_path=None) -> sqlite3.Connection:
+    path = Path(db_path) if db_path is not None else _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     from hermes_state import apply_wal_with_fallback
@@ -77,6 +87,10 @@ def _connect() -> sqlite3.Connection:
         )"""
     )
     conn.row_factory = sqlite3.Row
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(restart_inbox)")}
+    for name, declaration in (("protocol", "INTEGER NOT NULL DEFAULT 0"), ("input_owner", "TEXT")):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE restart_inbox ADD COLUMN {name} {declaration}")
     return conn
 
 
@@ -185,7 +199,7 @@ def record_event(session_key: str, event: Any, adapter_profile: Optional[str] = 
                 )
                 conn.execute(
                     """DELETE FROM restart_inbox
-                       WHERE state IN ('handed_off', 'delivered', 'abandoned')
+                       WHERE state IN ('delivered', 'abandoned')
                          AND updated_at < ?""",
                     (now - _TERMINAL_RETENTION_SECONDS,),
                 )
@@ -194,39 +208,51 @@ def record_event(session_key: str, event: Any, adapter_profile: Optional[str] = 
     return queue_id
 
 
-def claim_recoverable(*, deliverable_targets: set[tuple[str, str]]) -> list[dict[str, Any]]:
+def claim_recoverable(*, deliverable_targets: set[tuple[str, str]], db_path=None,
+                      excluded_queue_ids=(), excluded_session_keys=()) -> list[dict[str, Any]]:
     now = time.time()
     pid, started = _owner_stamp()
     claimed: list[dict[str, Any]] = []
+    busy_keys = set(excluded_session_keys)
     with _LOCK:
-        conn = _connect()
+        path = Path(db_path or _db_path()).resolve()
+        conn = _connect(path)
         try:
             with conn:
                 rows = conn.execute(
                     """SELECT * FROM restart_inbox
-                       WHERE state IN ('pending', 'attempting')"""
+                       WHERE state IN ('pending', 'attempting') ORDER BY created_at, queue_id"""
                 ).fetchall()
                 for row in rows:
+                    if row["queue_id"] in excluded_queue_ids or row["session_key"] in busy_keys:
+                        continue
+                    # Older attempting/released rows may have executed before their input write.
+                    if ambiguous_unlinked_attempt(dict(row)):
+                        continue
                     if _owner_alive(row["owner_pid"], row["owner_started_at"]):
                         continue
                     if (row["platform"], row["adapter_profile"]) not in deliverable_targets:
                         continue
-                    if row["attempts"] >= _MAX_ATTEMPTS or now - row["created_at"] > _STALE_SECONDS:
+                    if not row["protocol"] and (
+                        row["attempts"] >= _MAX_ATTEMPTS or now - row["created_at"] > _STALE_SECONDS
+                    ):
                         conn.execute(
                             "UPDATE restart_inbox SET state='abandoned', updated_at=? WHERE queue_id=?",
                             (now, row["queue_id"]),
                         )
                         continue
+                    input_owner = row["input_owner"] or str(uuid.uuid4())
                     cursor = conn.execute(
                         """UPDATE restart_inbox
                            SET state='attempting', attempts=attempts+1,
-                               owner_pid=?, owner_started_at=?, updated_at=?
+                               owner_pid=?, owner_started_at=?, updated_at=?, protocol=1, input_owner=?
                            WHERE queue_id=? AND state=? AND attempts=?
                              AND owner_pid IS ? AND owner_started_at IS ?""",
                         (
                             pid,
                             started,
                             now,
+                            input_owner,
                             row["queue_id"],
                             row["state"],
                             row["attempts"],
@@ -235,8 +261,17 @@ def claim_recoverable(*, deliverable_targets: set[tuple[str, str]]) -> list[dict
                         ),
                     )
                     if cursor.rowcount:
+                        busy_keys.add(row["session_key"])
                         event = deserialize_event(row["event_json"])
                         setattr(event, "_restart_inbox_queue_id", row["queue_id"])
+                        event._restart_inbox_claim = {
+                            "queue_id": row["queue_id"], "db_path": str(path),
+                            "session_key": row["session_key"], "platform": row["platform"],
+                            "profile": row["adapter_profile"], "owner_pid": pid,
+                            "owner_started_at": started, "input_owner": input_owner,
+                            "payload_sha256": hashlib.sha256(row["event_json"].encode()).hexdigest(),
+                            "protocol": 1,
+                        }
                         claimed.append({
                             "queue_id": row["queue_id"],
                             "session_key": row["session_key"],
@@ -287,3 +322,99 @@ def release_claim(queue_id: str) -> bool:
 
 def mark_delivered(queue_id: str) -> bool:
     return _mark(queue_id, "delivered")
+
+
+def read_rows(db_path):
+    """Read an existing authoritative inbox without creating a missing database."""
+    path = Path(db_path).resolve()
+    conn = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='restart_inbox'").fetchone():
+            return []
+        return [dict(row) for row in conn.execute("SELECT * FROM restart_inbox")]
+    finally:
+        conn.close()
+
+
+def ambiguous_unlinked_attempt(row):
+    """Commands can mutate before an agent marker, so an attempted command needs intervention."""
+    attempted = row["state"] in ("attempting", "handed_off") or row["attempts"] > 0
+    if not attempted or row["state"] not in ("pending", "attempting", "handed_off"):
+        return False
+    if not row.get("protocol"):
+        return True
+    from gateway.platforms.base import coerce_plaintext_gateway_command
+    try:
+        event = deserialize_event(row["event_json"])
+    except Exception:
+        return True
+    coerce_plaintext_gateway_command(event)
+    return bool(event.allow_gateway_control and event.is_command())
+
+
+def linked_row(link):
+    """Exact immutable payload identity. Claim ownership is separately CAS checked on writes."""
+    row = next((r for r in read_rows(link["db_path"]) if r["queue_id"] == link["queue_id"]), None)
+    if row is None or any((
+        row["session_key"] != link["session_key"], row["platform"] != link["platform"],
+        row["adapter_profile"] != link["profile"], row.get("protocol") != 1,
+        row.get("input_owner") != link["input_owner"],
+        hashlib.sha256(row["event_json"].encode()).hexdigest() != link["payload_sha256"],
+    )):
+        raise ValueError("Restart inbox linkage does not match its durable payload")
+    return row
+
+
+def transition_link(link, state, *, recovery=False, refund_attempt=False):
+    """CAS an exact claim, or a dead owner's recovery row, without ambient profile lookup."""
+    with _LOCK:
+        row = linked_row(link)
+        if row["state"] == "delivered":
+            return state == "delivered"
+        if row["state"] not in ("pending", "attempting", "handed_off"):
+            return False
+        if recovery:
+            if _owner_alive(row["owner_pid"], row["owner_started_at"]):
+                return False
+        elif (row["owner_pid"], row["owner_started_at"]) != (
+            link["owner_pid"], link["owner_started_at"],
+        ):
+            return False
+        conn = sqlite3.connect(Path(link["db_path"]).as_uri() + "?mode=rw", uri=True, timeout=10)
+        try:
+            with conn:
+                cursor = conn.execute(
+                    """UPDATE restart_inbox SET state=?, updated_at=?,
+                       owner_pid=?, owner_started_at=?, attempts=MAX(0, attempts-?)
+                       WHERE queue_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?
+                         AND event_json=? AND input_owner=? AND protocol=1""",
+                    (state, time.time(), None if recovery or state == "pending" else row["owner_pid"],
+                     None if recovery or state == "pending" else row["owner_started_at"],
+                     int(refund_attempt and state == "pending"), row["queue_id"], row["state"],
+                     row["owner_pid"], row["owner_started_at"], row["event_json"], row["input_owner"]),
+                )
+            return bool(cursor.rowcount)
+        finally:
+            conn.close()
+
+
+def adopt_continuation(link):
+    """Acquire the already-ingested half of recovery before its new active marker."""
+    with _LOCK:
+        row = linked_row(link)
+        if row["state"] != "handed_off" or _owner_alive(row["owner_pid"], row["owner_started_at"]):
+            return None
+        pid, started = _owner_stamp()
+        conn = sqlite3.connect(Path(link["db_path"]).as_uri() + "?mode=rw", uri=True, timeout=10)
+        try:
+            with conn:
+                cursor = conn.execute(
+                    """UPDATE restart_inbox SET owner_pid=?, owner_started_at=?, updated_at=?
+                       WHERE queue_id=? AND state='handed_off'
+                       AND owner_pid IS ? AND owner_started_at IS ?""",
+                    (pid, started, time.time(), row["queue_id"], row["owner_pid"], row["owner_started_at"]),
+                )
+            return dict(link, owner_pid=pid, owner_started_at=started) if cursor.rowcount else None
+        finally:
+            conn.close()

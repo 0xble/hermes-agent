@@ -317,6 +317,8 @@ class SessionPersistenceMixin:
         recovered_keys = 0
         try:
             for key, entry in self._entries.items():
+                if entry.restart_inbox_link:
+                    continue  # Reconciliation must see the exact queue/transcript relation first.
                 # Ask the store that owns the key, not the ambient handle, or a live
                 # secondary-profile session gets pruned on the root copy.
                 db = self._db_for_key(key)
@@ -491,7 +493,7 @@ class SessionPersistenceMixin:
 
     def _save_entry(
         self, session_key: str, *, entry_data: Optional[Dict[str, Any]] = None,
-        lock_held: bool = False) -> None:
+        lock_held: bool = False, require_primary: bool = False) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path (a full rewrite fsyncs a
         multi-MB sessions.json). The key -> session_id mapping never changes here: structural
         transitions use the full rewrite (which also refreshes the sessions.json mirror; it may lag
@@ -499,11 +501,15 @@ class SessionPersistenceMixin:
         ``_save_lock`` the upsert is skipped if a full snapshot or a newer fast save of this key
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is
-        published to the live entry (failure-atomic transitions); the fallback carries it too."""
+        published to the live entry (failure-atomic transitions); the fallback carries it too.
+        ``require_primary`` refuses skipped/failed DB writes and never falls back to a JSON
+        mirror, which cannot establish recovery ownership when an older DB row still exists."""
         guard = contextlib.nullcontext() if lock_held else self._lock
         with guard:
             entry = self._entries.get(session_key)
             if entry is None:
+                if require_primary:
+                    raise RuntimeError("Required routing entry disappeared")
                 return
             serialized = dict(entry_data) if entry_data is not None else entry.to_dict()
             # The O(n) full snapshot is deferred to the fallback branch.
@@ -513,18 +519,26 @@ class SessionPersistenceMixin:
             try:
                 with self._lazy("_save_lock", threading.Lock):
                     if getattr(self, "_persisted_routing_generation", 0) >= revision:
+                        if require_primary:
+                            raise RuntimeError("Required routing write was superseded")
                         return
                     fast_persisted = self._lazy("_fast_persisted_entries", dict)
                     persisted = fast_persisted.get(session_key)
                     if persisted is not None and persisted[0] >= revision:
+                        if require_primary:
+                            raise RuntimeError("Required routing write was superseded")
                         return
                     saver(session_key, entry_json, scope=self._routing_scope())
                     fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
+                if require_primary:
+                    raise
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
                     "to full index rewrite", session_key, exc)
+        if require_primary:
+            raise RuntimeError("Primary routing database unavailable")
         if entry_data is not None:
             # Full-snapshot fallback carrying the candidate transition.
             with guard:
