@@ -301,7 +301,7 @@ class DelegationCards:
                     if self._scope(card) == scope and self._anchor(key) == key:
                         if not self._projection(key)["rows"]:
                             await self._delete_obsolete(key)
-                            await self._delete(card)
+                            await self._delete(key, card)
                         else:
                             self._queue(key)
 
@@ -421,7 +421,7 @@ class DelegationCards:
                 card.pop("retry_at", None)
                 projection = self._projection(key)
                 if not projection["rows"]:
-                    await self._delete(card)
+                    await self._delete(key, card)
                     await self._delete_obsolete(key)
                     return
                 text = render_card(projection)
@@ -575,7 +575,7 @@ class DelegationCards:
                     self._queue(anchor_key)
                 else:
                     await self._delete_obsolete(anchor_key)
-                    await self._delete(anchor)
+                    await self._delete(anchor_key, anchor)
 
     def _defer_delete(self, card, adapter, minimum_delay=0.0):
         delay = getattr(adapter, "deletion_retry_after", lambda _: 0)(card["source"]["chat_id"])
@@ -625,10 +625,12 @@ class DelegationCards:
             else:
                 self._defer_delete(anchor, adapter)
             self._save()
-        for _, card in self._members(key):
+        for member_key, card in self._members(key):
             message_id = card.get("obsolete_message_id")
             adapter = self._adapter(card)
             if message_id and adapter:
+                if not presentation.cleanup_allowed(self, member_key, message_id):
+                    continue
                 if self._defer_delete(card, adapter):
                     continue
                 if card.get("obsolete_delete_attempts", 0) >= 3:
@@ -652,10 +654,12 @@ class DelegationCards:
                 else:
                     self._defer_delete(card, adapter)
 
-    async def _delete(self, card):
+    async def _delete(self, key, card):
         """Keep the tombstone; bounded restart retries may finish failed deletion."""
         adapter = self._adapter(card)
         if not adapter or not card.get("message_id") or card.get("delete_attempts", 0) >= 3:
+            return
+        if not presentation.cleanup_allowed(self, key, card["message_id"]):
             return
         if self._defer_delete(card, adapter):
             return

@@ -209,9 +209,13 @@ def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkey
     assert name not in manager._plugin_platform_names
 
 
-def test_fresh_process_real_plugin_fixture_covers_host_send_and_cron(tmp_path):
+@pytest.mark.parametrize("profile", ["", "default", "work"])
+@pytest.mark.parametrize("handler_kind", ["sync", "async"])
+def test_fresh_process_real_plugin_fixture_covers_host_send_and_cron(tmp_path, profile, handler_kind):
     """A standalone directory plugin is visible to host-driven send paths."""
     home = tmp_path / "home"
+    if profile == "work":
+        home = home / "profiles" / "work"
     plugin = home / "plugins" / "fmsg-fixture"
     plugin.mkdir(parents=True)
     (plugin / "plugin.yaml").write_text(
@@ -219,8 +223,10 @@ def test_fresh_process_real_plugin_fixture_covers_host_send_and_cron(tmp_path):
     )
     (home / "config.yaml").write_text("plugins:\n  enabled:\n    - fmsg-fixture\n")
     (plugin / "__init__.py").write_text(
-        "async def _send(args, chat_id, platform_name, pconfig):\n"
-        "    return {'success': True, 'platform': platform_name, 'chat_id': chat_id}\n"
+        "calls = []\n"
+        + ("async " if handler_kind == "async" else "") + "def _send(args, chat_id, platform_name, pconfig):\n"
+        "    calls.append(args)\n"
+        "    return {'success': True, 'platform': platform_name, 'chat_id': chat_id, 'args': args, 'calls': len(calls)}\n"
         "def _parse(ref):\n"
         "    ref = ref.strip().lower()\n"
         "    return (ref, None) if ref.startswith('@') and '@' in ref[1:] else None\n"
@@ -231,14 +237,20 @@ def test_fresh_process_real_plugin_fixture_covers_host_send_and_cron(tmp_path):
     )
     script = r'''
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 from hermes_cli.plugins import discover_plugins
 from gateway.config import Platform
 from tools.registry import registry
 from tools.send_message_tool import send_message_tool
+from gateway.session_context import set_session_vars
+from gateway.platform_registry import platform_registry
 
 discover_plugins()
+entry = platform_registry.get("fmsg")
+assert platform_registry.snapshot_registration("fmsg", scope=platform_registry.current_scope_key())[0] is entry
+set_session_vars(profile=os.environ["TEST_SEND_PROFILE"])
 platform = Platform("fmsg")
 pconfig = SimpleNamespace(enabled=True, token=None, extra={})
 config = SimpleNamespace(platforms={platform: pconfig}, get_home_channel=lambda p: None)
@@ -246,7 +258,8 @@ with patch("gateway.config.load_gateway_config", return_value=config), \
      patch("tools.interrupt.is_interrupted", return_value=False), \
      patch("gateway.mirror.mirror_to_session", return_value=True):
     host_send = json.loads(send_message_tool({"target": "fmsg:@Alice@Example.COM",
-                                              "message": "hello", "subject": "hi"}))
+                                              "message": "hello" * 1000, "subject": "hi",
+                                              "typed": {"priority": 3, "tags": ["one", "two"]}}))
 from cron.scheduler_delivery import _resolve_single_delivery_target
 cron = _resolve_single_delivery_target({}, "fmsg:@Alice@Example.COM")
 print(json.dumps({"host_send": host_send, "cron": cron,
@@ -257,6 +270,7 @@ print(json.dumps({"host_send": host_send, "cron": cron,
         "HERMES_HOME": str(home),
         "HERMES_KANBAN_TASK": "fixture",
         "PYTHONPATH": os.getcwd(),
+        "TEST_SEND_PROFILE": profile,
     })
     completed = subprocess.run(
         [sys.executable, "-c", script],
@@ -270,3 +284,38 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
     assert payload["model_registered"] is True
+    assert payload["host_send"]["calls"] == 1
+    assert payload["host_send"]["args"]["typed"] == {"priority": 3, "tags": ["one", "two"]}
+    assert payload["host_send"]["args"]["message"] == "hello" * 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["global", "wrong_home", "lookup_error", "other_scope_only"])
+async def test_trusted_custom_handler_refuses_unproven_scope(plugin_platform, tmp_path, monkeypatch, case):
+    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
+    from tools.send_message_tool import _send_to_platform
+    name, entry, seen = plugin_platform
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token = set_hermes_home_override(tmp_path)
+    scope = hermes_home_key()
+    platform = Platform(name)
+    try:
+        if case == "wrong_home":
+            platform_registry.register(entry, scope=scope)
+        if case == "other_scope_only":
+            platform_registry.unregister(name)
+            platform_registry.register(entry, scope=str(tmp_path / "profiles" / "other"))
+        if case == "lookup_error":
+            monkeypatch.setattr(platform_registry, "snapshot_registration", lambda *a, **kw: (_ for _ in ()).throw(OSError("no scope")))
+        with patch("tools.send_message_tool._via_adapter_route", new_callable=AsyncMock) as generic:
+            result = await _send_to_platform(platform, SimpleNamespace(), "chat", "body",
+                                             args={"subject": "typed"}, profile="work" if case == "wrong_home" else "default")
+        assert "error" in result
+        assert seen == []
+        generic.assert_not_awaited()
+    finally:
+        if case == "wrong_home":
+            platform_registry.unregister(name, scope=scope)
+        if case == "other_scope_only":
+            platform_registry.unregister(name, scope=str(tmp_path / "profiles" / "other"))
+        reset_hermes_home_override(token)

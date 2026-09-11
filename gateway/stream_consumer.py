@@ -196,6 +196,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
 
     def _reset_message_state(self) -> None:
         """Per-message (segment) state: fresh at construction and after each segment break."""
+        # Unlike turn-wide _already_sent, this proves transport ACK in this segment.
+        self._segment_has_persistent_receipt = False
         self._message_id: Optional[str] = None
         self._message_created_ts: Optional[float] = None  # fresh-final age
         # ``_stream_ledger`` mirrors ``_accumulated`` but is NOT truncated when
@@ -462,13 +464,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._pending_preview_boundary = event
         self._publish_content_boundary(event)
 
-    def _record_pending_preview_message_id(self, message_id: str) -> None:
+    def _record_pending_preview_message_id(self, message_id: Optional[str]) -> None:
         """Attach the platform id after a provisional send succeeds."""
         pending = self._pending_preview_boundary
         if pending is None:
             return
         self._pending_preview_boundary = ProvisionalContentBoundary(
-            boundary_id=pending.boundary_id, message_id=str(message_id))
+            boundary_id=pending.boundary_id,
+            message_id=str(message_id) if message_id is not None else None)
 
     def _confirm_pending_preview_boundary(
         self, *, source: DurableContentSource = DurableContentSource.STREAM_FINALIZED,
@@ -500,6 +503,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._publish_content_boundary(
             RetractedContentBoundary(boundary_id=pending.boundary_id))
 
+    def _settle_pending_preview_boundary(self) -> None:
+        """Settle from a persistent receipt, never draft text or optimistic final flags."""
+        pending = self._pending_preview_boundary
+        if pending is None:
+            return
+        if pending.message_id is not None or self._segment_has_persistent_receipt:
+            self._confirm_pending_preview_boundary()
+        else:
+            self._retract_pending_preview_boundary()
+
     @staticmethod
     def _signal_flush(flush_event) -> None:
         """Wake a thread blocked in flush_pending_sync(), swallowing errors.  Every loop path
@@ -512,17 +525,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
-        had_persistent_preview = (
-            self._message_id is not None or self._already_sent or bool(self._last_sent_text))
         # Retain the segment's visible text so has_delivered_text still matches.
         finalized = self._clean_for_display(self._last_sent_text).strip()
-        if finalized:
+        if finalized and self._segment_has_persistent_receipt:
             self._delivered_segment_texts.append(finalized)
-        if self._pending_preview_boundary is not None:
-            if had_persistent_preview:
-                self._confirm_pending_preview_boundary()
-            else:
-                self._retract_pending_preview_boundary()
+        self._settle_pending_preview_boundary()
         # Also clears the final flags: what we delivered was an interim preamble.  Safe:
         # got_done returns before any reset; run.py reads flags after the task exits.
         self._reset_message_state()
@@ -899,17 +906,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         tick.update_visible = await self._send_or_edit(
             display_text, finalize=tick.got_done or tick.got_segment_break,
             is_turn_final=tick.got_done)
-        if tick.got_done or tick.got_segment_break:
-            # Sealed into the timeline (or a failed finalize left the sent preview
-            # visible) — only now may it split tool-progress chronology.
-            self._confirm_pending_preview_boundary()
         self._last_edit_time = time.monotonic()
         # Lines stay in _tool_progress_lines for the next compose.
         self._tool_progress_active = False
 
     async def _finalize_turn(self, tick: "_Tick") -> None:
         """got_done: final edit without cursor, or one continuation send if edits failed."""
-        self._confirm_pending_preview_boundary()
         if self._accumulated or self._message_id is not None or self._already_sent:
             await self._notify_before_finalize()
         if self._reopen_seed_pending() and not self._accumulated:
@@ -933,6 +935,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 self._mark_final_delivered()
         elif self._accumulated:
             await self._finalize_edit_path(tick)
+        # Native final flags may be optimistic while the ACK is outstanding.
+        # Settle only after transport returns, retaining a failed edit's real preview.
+        self._settle_pending_preview_boundary()
 
     async def _finalize_edit_path(self, tick: "_Tick") -> None:
         """Edit-transport finalize (the non-native got_done branches, in priority order)."""

@@ -95,6 +95,9 @@ async def replace(manager, key):
             manager._save()
         receipt = card["reanchor"]
         if receipt["state"] in {"delete_pending", "deleting"}:
+            from gateway.delegation_card_presentation import cleanup_allowed
+            if not cleanup_allowed(manager, key, receipt["old_message_id"]):
+                return
             if receipt["delete_attempts"] >= 3 or manager._defer_delete(card, adapter):
                 return
             receipt["state"] = "deleting"

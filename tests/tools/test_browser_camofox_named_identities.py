@@ -3,9 +3,45 @@
 from __future__ import annotations
 
 import json
+import errno
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.mark.parametrize("winner", ["same", "different", "corrupt", "absent"])
+def test_camofox_competing_claim_verifies_winner_and_cleans_only_own_temp(tmp_path, monkeypatch, winner):
+    from tools import browser_camofox_state as state
+    monkeypatch.setattr(state, "get_hermes_home", lambda: tmp_path)
+    identity = dict(alias="personal", identity_key="key", user_id="user", session_key="session")
+    expected = dict(backend="camofox", **identity)
+    claim = state._binding_dir("race")
+    before = {}
+
+    def competing_rename(temporary, destination):
+        assert destination == claim
+        if winner != "absent":
+            claim.mkdir()
+            values = dict(expected)
+            if winner == "different":
+                values["identity_key"] = "other"
+            if winner == "corrupt":
+                values.pop("user_id")
+            for name, value in values.items():
+                (claim / name).write_text(value + "\n")
+            before.update({p.name: p.read_bytes() for p in claim.iterdir()})
+        raise OSError(errno.EACCES if winner == "absent" else errno.ENOTEMPTY, "race")
+
+    monkeypatch.setattr(Path, "rename", competing_rename)
+    if winner == "same":
+        assert state.claim_camofox_binding("race", identity) == expected
+    else:
+        with pytest.raises(OSError if winner == "absent" else state.CamofoxIdentityError):
+            state.claim_camofox_binding("race", identity)
+    assert not list(claim.parent.glob(".*.tmp"))
+    if winner != "absent":
+        assert {p.name: p.read_bytes() for p in claim.iterdir()} == before
 
 
 @pytest.fixture(autouse=True)

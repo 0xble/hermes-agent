@@ -91,6 +91,55 @@ def _make_native_streaming_adapter(
 # === RESOLVER ===
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acked", [False, True])
+@pytest.mark.parametrize("prior_segment", [False, True])
+@pytest.mark.parametrize("interim_native", [False, True])
+async def test_preview_boundary_waits_for_real_native_final_ack(acked, prior_segment, interim_native):
+    from gateway.progress_events import DurableContentBoundary, ProvisionalContentBoundary, RetractedContentBoundary
+    adapter = _make_native_streaming_adapter()
+    entered, release = asyncio.Event(), asyncio.Event()
+    preview_acked = asyncio.Event()
+
+    async def frame(text, *, finalize=False, **kwargs):
+        if finalize:
+            entered.set()
+            await release.wait()
+            return acked
+        if text:
+            preview_acked.set()
+        return True
+
+    adapter.send_stream_frame = frame
+    events = []
+    consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(cursor=""), on_content_boundary=events.append)
+    if prior_segment:
+        assert await consumer._first_send("earlier content", finalize=True)
+        consumer._reset_segment_state()
+        events.clear()
+    adapter.send.return_value = SimpleNamespace(success=False)
+    consumer.on_delta("final response")
+    if not interim_native:
+        consumer.finish()
+    task = asyncio.create_task(consumer.run())
+    if interim_native:
+        await asyncio.wait_for(preview_acked.wait(), 2)
+        assert not consumer._segment_has_persistent_receipt
+        consumer.finish()
+    await asyncio.wait_for(entered.wait(), 2)
+    assert isinstance(events[0], ProvisionalContentBoundary)
+    assert not any(isinstance(event, DurableContentBoundary) for event in events)
+    release.set()
+    await asyncio.wait_for(task, 2)
+    if acked:
+        assert len(events) == 2
+        assert isinstance(events[1], DurableContentBoundary)
+        assert events[1].boundary_id == events[0].boundary_id
+    else:
+        assert not any(isinstance(event, DurableContentBoundary) for event in events)
+        assert any(isinstance(event, RetractedContentBoundary) for event in events)
+
+
 class TestNativeStreamingResolver:
     """``_resolve_native_streaming`` gating logic."""
 

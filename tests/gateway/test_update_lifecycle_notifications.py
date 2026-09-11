@@ -45,6 +45,70 @@ def pending(home, *, reason=True):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content", [" \n\t\n", "visible progress\n\n"])
+async def test_finalized_output_acknowledges_whitespace_without_timeout(tmp_path, content):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text(content)
+    finalize_update(tmp_path)
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())}
+    runner._send_update_output = AsyncMock(return_value=True)
+    offsets = []
+
+    async def notify(*, timed_out=False):
+        assert not timed_out
+        offsets.append(read_pending(tmp_path)[1]["output_offset"])
+        return True
+
+    runner._send_update_notification = notify
+    with patch("gateway.run._hermes_home", tmp_path):
+        await asyncio.wait_for(runner._watch_update_progress(poll_interval=.01, stream_interval=.01), 2)
+    assert offsets == [len(content.encode())]
+    assert runner._send_update_output.await_count == int(bool(content.strip()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivered", [False, True])
+async def test_output_offsets_require_visible_delivery_but_consume_later_blank_tail(tmp_path, delivered):
+    pending(tmp_path)
+    output = tmp_path / ".update_output.txt"
+    output.write_text("first visible progress\n")
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())}
+    runner._send_update_output = AsyncMock(return_value=delivered)
+    notified = []
+
+    async def notify(*, timed_out=False):
+        assert not timed_out
+        notified.append(read_pending(tmp_path)[1].get("output_offset", 0))
+        return True
+
+    runner._send_update_notification = notify
+    with patch("gateway.run._hermes_home", tmp_path):
+        task = asyncio.create_task(runner._watch_update_progress(poll_interval=.01, stream_interval=.01))
+        for _ in range(100):
+            if runner._send_update_output.await_count:
+                break
+            await asyncio.sleep(.01)
+        assert runner._send_update_output.await_count
+        if delivered:
+            assert read_pending(tmp_path)[1]["output_offset"] == output.stat().st_size
+            with output.open("a") as stream:
+                stream.write(" \n\t")
+            finalize_update(tmp_path)
+            await asyncio.wait_for(task, 2)
+            assert notified == [output.stat().st_size]
+            assert runner._send_update_output.await_count == 1
+        else:
+            assert read_pending(tmp_path)[1].get("output_offset", 0) == 0
+            assert not notified
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
 async def test_shutdown_reason_does_not_cross_conversation_boundaries(tmp_path):
     from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
     data = pending(tmp_path)

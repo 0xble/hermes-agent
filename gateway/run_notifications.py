@@ -442,6 +442,7 @@ class GatewayNotificationsMixin:
         profile = str(data.get("profile") or "").strip()
         if profile:
             return profile
+        # Agent-launched updates retain this validated profile lane in session_key.
         parts = str(data.get("session_key") or "").split(":")
         if len(parts) >= 5 and parts[0] == "agent" and parts[1] not in ("main", ""):
             return parts[1]
@@ -567,7 +568,8 @@ class GatewayNotificationsMixin:
 
         async def _flush_buffer() -> None:
             nonlocal buffer, last_stream_time
-            if buffer.strip() and await self._send_update_output(target, buffer):
+            # Whitespace consumes output bytes too, but never needs a chat send.
+            if buffer and (not buffer.strip() or await self._send_update_output(target, buffer)):
                 buffer = ""
                 last_stream_time = loop.time()
                 current = read_pending(paths.pending.parent)

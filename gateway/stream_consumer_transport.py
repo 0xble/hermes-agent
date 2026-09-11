@@ -296,6 +296,8 @@ class StreamTransportMixin:
         self._preview_message_ids = set()
         self._adopt_message_id(new_message_id)
         self._already_sent = True
+        self._segment_has_persistent_receipt = True
+        self._record_pending_preview_message_id(new_message_id)
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
@@ -330,6 +332,7 @@ class StreamTransportMixin:
             if (finalize and self._use_native_streaming and self._native_stream_opened
                     and await self._try_frame(self._send_frame("✅", finalize=True),
                                               "Finalize empty stream failed: %s")):
+                self._segment_has_persistent_receipt = True
                 self._mark_final_delivered()
             return True  # cursor-only / whitespace-only update
         # Don't open a new message for 1-2 tokens + cursor (rapid tool-calling): if
@@ -392,6 +395,9 @@ class StreamTransportMixin:
             self._last_sent_text = text
             self._native_last_pushed_len = len(text)
             if finalize:
+                # Native preview frames can be transient. Only the final ACK
+                # seals them into persistent content for progress chronology.
+                self._segment_has_persistent_receipt = True
                 self._mark_final_delivered()
             return True
 
@@ -463,6 +469,7 @@ class StreamTransportMixin:
             self._edit_supported = False
             return False
         self._already_sent = True
+        self._segment_has_persistent_receipt = True
         self._last_sent_text = text
         if result.message_id:
             self._record_pending_preview_message_id(str(result.message_id))
@@ -508,6 +515,7 @@ class StreamTransportMixin:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)
         self._already_sent = True
+        self._segment_has_persistent_receipt = True
         self._track_preview_ids_from_result(result)
         # Oversized edit split across continuations: message_id is now the LAST
         # continuation, which holds only the final chunk — retarget edits and reset

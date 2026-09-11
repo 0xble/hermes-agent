@@ -1042,6 +1042,16 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
+async def _send_custom_request(entry, args, chat_id, platform_name, pconfig):
+    """Custom handlers consume the original typed request once, never per chunk."""
+    try:
+        import inspect
+        result = entry.send_message_handler(args or {}, chat_id, platform_name, pconfig)
+        return await result if inspect.isawaitable(result) else result
+    except Exception as exc:
+        return {"error": f"Plugin send_message handler failed: {exc}"}
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None, profile=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
@@ -1050,9 +1060,24 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
 
-    # Explicit profile routes are trust boundaries: use only that profile's live
-    # gateway adapter, never a process-global credential or standalone sender.
+    # A custom handler may own typed fields that generic adapter.send cannot carry.
+    # Registry lookup alone is insufficient: it also falls back to global entries.
     if str(profile or "").strip():
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.profiles import profile_matches_home
+        try:
+            entry = platform_registry.get(platform_name)
+            if args is not None and (entry is None or entry.send_message_handler is None):
+                return {"error": f"No scoped custom handler for profile '{profile}' and platform '{platform_name}'"}
+            if entry is not None and entry.send_message_handler is not None:
+                scoped, _ = platform_registry.snapshot_registration(
+                    platform_name, scope=platform_registry.current_scope_key())
+                if not profile_matches_home(str(profile).strip()) or scoped is not entry:
+                    return {"error": f"Cannot verify custom handler ownership for profile '{profile}' and platform '{platform_name}'"}
+                return await _send_custom_request(entry, args, chat_id, platform_name, pconfig)
+        except Exception as exc:
+            return {"error": f"Custom handler profile resolution failed: {type(exc).__name__}"}
+        # Ordinary profile sends retain the live adapter trust boundary.
         from gateway.platforms.base import BasePlatformAdapter
         max_len = _platform_max_length(platform)
         chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
@@ -1104,13 +1129,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         from gateway.platform_registry import platform_registry
         entry = platform_registry.get(platform_name)
         if entry is not None and entry.send_message_handler is not None:
-            # Custom handler receives the full typed request once (not per chunk).
-            try:
-                import inspect
-                result = entry.send_message_handler(args or {}, chat_id, platform_name, pconfig)
-                return await result if inspect.isawaitable(result) else result
-            except Exception as e:
-                return {"error": f"Plugin send_message handler failed: {e}"}
+            return await _send_custom_request(entry, args, chat_id, platform_name, pconfig)
         # Plugin platform: live gateway adapter if available, else standalone_sender_fn.
         send_one = lambda chunk, is_last: _via_adapter_route(  # noqa: E731
             platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id, force_document, profile)

@@ -113,6 +113,11 @@ def claim_camofox_binding(task_id: Optional[str], identity: Dict[str, str]) -> D
             temporary.rename(claim)
         except FileExistsError:
             pass
+        except OSError:
+            # A populated competing claim can produce ENOTEMPTY, not EEXIST.
+            # Its existence permits only the strict winner verification below.
+            if not claim.exists():
+                raise
     finally:
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)

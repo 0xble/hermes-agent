@@ -1122,6 +1122,68 @@ class TestContentBoundaryCallback:
         assert events[0].boundary_id.endswith(":message:same-message")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("next_segment", ["filtered", "draft"])
+    async def test_prior_segment_receipt_cannot_confirm_empty_or_draft_segment(self, next_segment):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="earlier"))
+        adapter.send_draft = AsyncMock(return_value=SimpleNamespace(success=True))
+        events = []
+        consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(), on_content_boundary=events.append)
+        assert await consumer._first_send("earlier content", finalize=True)
+        consumer._reset_segment_state()
+        assert consumer._already_sent  # Turn-wide flag intentionally survives.
+        assert not consumer._segment_has_persistent_receipt
+        events.clear()
+        if next_segment == "filtered":
+            consumer.on_delta("<think>hidden</think>")
+            consumer.finish()
+            await consumer.run()
+        else:
+            consumer._open_preview_boundary()
+            consumer._draft_id = 1
+            consumer._use_draft_streaming = True
+            assert await consumer._send_draft_frame("ephemeral next segment")
+            consumer._reset_segment_state()
+            assert "ephemeral next segment" not in consumer._delivered_segment_texts
+        assert len(events) == 2
+        assert isinstance(events[0], ProvisionalContentBoundary)
+        assert isinstance(events[1], RetractedContentBoundary)
+        adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("receipt", ["preview", "draft", "suppressed", "failed"])
+    async def test_final_boundary_requires_persistent_receipt(self, receipt):
+        from gateway.stream_consumer import _Tick
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=receipt == "preview", message_id="preview"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False))
+        events = []
+        consumer = GatewayStreamConsumer(adapter, "chat", StreamConsumerConfig(), on_content_boundary=events.append)
+        consumer.on_delta("visible text")
+        if receipt in {"preview", "failed"}:
+            await consumer._first_send("visible text", finalize=False)
+        elif receipt == "draft":
+            adapter.send_draft = AsyncMock(return_value=SimpleNamespace(success=True))
+            # The real draft transport updates dedupe text but creates no persistent receipt.
+            consumer._use_draft_streaming = True
+            consumer._draft_id = 1
+            assert await consumer._send_draft_frame("visible text")
+        else:
+            assert await consumer._send_or_edit(" \n")
+        if receipt == "preview":
+            consumer._accumulated = "visible text final"
+        await consumer._finalize_turn(_Tick(got_done=True))
+        durable = [event for event in events if isinstance(event, DurableContentBoundary)]
+        assert bool(durable) == (receipt == "preview")
+        if durable:
+            assert durable[0].message_id == "preview"
+            adapter.edit_message.assert_awaited()
+        else:
+            assert any(isinstance(event, RetractedContentBoundary) for event in events)
+
+    @pytest.mark.asyncio
     async def test_stream_preview_is_provisional_until_segment_seals(self):
         """A preview opens a pause point but cannot reset progress yet."""
         adapter = MagicMock()
@@ -1164,7 +1226,8 @@ class TestContentBoundaryCallback:
         await task
 
     @pytest.mark.asyncio
-    async def test_filtered_segment_retracts_provisional_boundary(self):
+    @pytest.mark.parametrize("segment_break", [False, True])
+    async def test_filtered_segment_retracts_provisional_boundary(self, segment_break):
         """Hidden-only deltas cannot commit a durable content split."""
         adapter = MagicMock()
         adapter.send = AsyncMock()
@@ -1179,7 +1242,8 @@ class TestContentBoundaryCallback:
         )
 
         consumer.on_delta("<think>hidden</think>")
-        consumer.on_segment_break()
+        if segment_break:
+            consumer.on_segment_break()
         consumer.finish()
         await consumer.run()
 
@@ -1508,12 +1572,13 @@ class TestHasDeliveredTextAfterSegmentBreak:
     """has_delivered_text must find a delivered segment after a segment break,
     but must not claim text from a failed delivery. (#65919 review)"""
 
-    def test_finds_delivered_segment_after_segment_break(self):
+    @pytest.mark.asyncio
+    async def test_finds_delivered_segment_after_segment_break(self):
         """A successfully delivered segment must still be found by
         has_delivered_text after _reset_segment_state runs."""
         c = _make_consumer()
-        # Simulate a successfully delivered segment
-        c._last_sent_text = "Here is the first segment"
+        c.adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="segment"))
+        assert await c._first_send("Here is the first segment", finalize=False)
         c._reset_segment_state()
         # After the reset, has_delivered_text must still find it
         assert c.has_delivered_text("Here is the first segment") is True
@@ -1614,4 +1679,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

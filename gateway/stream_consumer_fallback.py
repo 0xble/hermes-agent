@@ -34,6 +34,7 @@ class StreamFallbackMixin:
             self._message_id = str(result.message_id)
             self._track_preview_ids_from_result(result)
             self._already_sent = True
+            self._segment_has_persistent_receipt = True
             self._last_sent_text = text
             self._confirm_or_notify_content_boundary(
                 DurableContentSource.OVERFLOW, message_id=str(result.message_id))
@@ -123,9 +124,10 @@ class StreamFallbackMixin:
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
+            self._segment_has_persistent_receipt = True
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
-            self._notify_content_boundary(
+            self._confirm_or_notify_content_boundary(
                 DurableContentSource.FALLBACK,
                 message_id=(str(result.message_id) if result.message_id else None))
 
@@ -250,6 +252,7 @@ class StreamFallbackMixin:
         self._segment_preview_message_ids = set()
         self._message_id = new_message_id or "__no_edit__"
         self._already_sent = True
+        self._segment_has_persistent_receipt = True
         self._mark_final_delivered()
         # Record VERBATIM, not via _record_turn_final_payload: the sealed previews
         # were just deleted, so the ledger (still holding sealed heads) would claim
@@ -310,6 +313,7 @@ class StreamFallbackMixin:
             result = await self.adapter.send(chat_id=self.chat_id, content=tail, metadata=_md)
             if result.success:
                 self._already_sent = True
+                self._segment_has_persistent_receipt = True
         except Exception as e:
             logger.error("Segment-break tail flush error: %s", e)
 
@@ -395,6 +399,7 @@ class StreamFallbackMixin:
             cleanup_succeeded = False
         self._preview_message_ids = set()
         if cleanup_succeeded:
+            self._segment_has_persistent_receipt = False
             self._retract_pending_preview_boundary()
         else:
             # The preview survived on screen, so it stays a persistent timeline entry.

@@ -80,6 +80,56 @@ async def fixture(tmp_path):
     return manager, adapter, source, data, card, live, calls
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["reanchor", "current", "obsolete"])
+@pytest.mark.parametrize("policy", ["exclude", "malformed", "symlink"])
+async def test_cleanup_policy_guards_every_physical_boundary_and_survives_reload(tmp_path, boundary, policy):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    key = data["parent_task_id"]
+    original = card["message_id"]
+    path = manager.path.with_name("presentation-cleanup-policy.json")
+    path.write_text('{"version": 1, "allow": []}' if policy == "exclude" else "{")
+    if policy == "symlink":
+        path.unlink()
+        path.symlink_to(tmp_path / "absent")
+    if boundary == "reanchor":
+        for mid in range(1, 7):
+            await inbound(adapter, mid)
+        await drain(manager)
+    elif boundary == "current":
+        card["rows"]["A"]["state"] = "completed"
+        await handled_delivery(manager, key)
+    else:
+        card["obsolete_message_id"] = "999"
+        live["999"] = {}
+        manager._save()
+        await manager._delete_obsolete(key)
+    await drain(manager)
+    assert not [call for call in calls if call[0] == "delete"]
+    assert len([call for call in calls if call[0] == "send"]) == 1
+    assert card.get("delete_attempts", 0) == 0
+    assert card.get("obsolete_delete_attempts", 0) == 0
+    assert (card.get("reanchor") or {}).get("delete_attempts", 0) == 0
+
+    restored = DelegationCards(manager.runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain(restored)
+    assert not [call for call in calls if call[0] == "delete"]
+    if path.is_symlink():
+        path.unlink()
+    approved = "999" if boundary == "obsolete" else original
+    path.write_text(json.dumps({"version": 1, "allow": [dict(profile="default", platform="telegram",
+        chat_id="42", thread_id="8", message_id=approved)]}))
+    if boundary == "reanchor":
+        await anchor.replace(restored, key)
+    elif boundary == "obsolete":
+        await restored._delete_obsolete(key)
+    else:
+        await restored.reconcile()
+    await drain(restored)
+    assert [call for call in calls if call[0] == "delete"] == [("delete", approved)]
+
+
 async def inbound(adapter, mid, topic="8"):
     await adapter._on_platform_update(SimpleNamespace(message=SimpleNamespace(
         chat_id=42, message_id=mid, message_thread_id=topic)), None)

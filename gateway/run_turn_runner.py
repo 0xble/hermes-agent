@@ -915,7 +915,7 @@ class TurnRunner:
         if ctx._run_still_current():
             await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
-    async def _progress_send_or_edit(self, st, msg) -> bool:
+    async def _progress_send_or_edit(self, st, msg, *, fallback_lines=None) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
 
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
@@ -946,7 +946,12 @@ class TurnRunner:
             st.can_edit = False
             # Unknown permanent failures (permission revoked, unsupported edits) keep the
             # legacy send-only fallback; a verified stale anchor was replaced above.
-            await self._send_progress_text(st, msg)
+            for line in fallback_lines if fallback_lines is not None else [msg]:
+                await self._send_progress_text(st, line)
+            return True
+        if not st.can_edit and fallback_lines is not None:
+            for line in fallback_lines:
+                await self._send_progress_text(st, line)
             return True
         # First tool: send all accumulated text as a new message; editing unsupported: just this line.
         result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
@@ -1005,21 +1010,38 @@ class TurnRunner:
                     # replay these into the SAME bubble instead of fragmenting it.
                     st.deferred_progress_events.append(raw)
                     continue
+                batch_start = len(st.progress_lines)
+                if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    batch_start = max(0, batch_start - 1)
                 msg = self._progress_absorb(st, raw)
+                fallback_lines = None
+                if st.can_edit and st.progress_msg_id is not None:
+                    # Fold queued ordinary updates into this edit, but replay the
+                    # first content boundary before consuming anything beyond it.
+                    while True:
+                        try:
+                            queued = self._next_progress_item(st)
+                        except queue.Empty:
+                            break
+                        if self._is_content_boundary(queued):
+                            st.replay_progress_events.appendleft(queued)
+                            break
+                        msg = self._progress_absorb(st, queued)
+                    # A permanent edit failure can switch transport after batching.
+                    # Preserve each newly absorbed line for that send-only fallback.
+                    fallback_lines = st.progress_lines[batch_start:]
                 if not await self._roll_progress_overflow_if_needed(st):
                     if not ctx._run_still_current():
                         return
-                    # No loop-level throttle: the chat-wide gate lives inside
-                    # _edit_progress_message, which AWAITS the shared slot so rapid tool updates
-                    # batch into fewer API calls. Gating here would also throttle the SEND-only
-                    # path (editing disabled), where every tool line owes its own bubble.
+                    # The shared gate still controls transport timing. Send-only
+                    # progress retains one bubble per item instead of coalescing.
                     if st.can_edit and st.progress_msg_id is not None:
                         deadlines = self._edit_retry_deadlines()
                         if deadlines is not None and deadlines.get(
                             st.edit_clock_key, 0.0
                         ) > time.monotonic():
                             continue  # chat parked by a server-named flood wait
-                    if not await self._progress_send_or_edit(st, msg):
+                    if not await self._progress_send_or_edit(st, msg, fallback_lines=fallback_lines):
                         continue
                 st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
                 await self._progress_restore_typing(st)
