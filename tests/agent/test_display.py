@@ -314,3 +314,18 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
+
+
+@pytest.mark.parametrize("action,key", [
+    ("set", "goal"), ("draft", "goal"), ("edit", "goal"),
+    ("subgoal_add", "text"), ("gate_add", "command"),
+])
+@pytest.mark.parametrize("max_len", [0, 65, None])
+def test_goal_label_redacts_full_argument_before_clipping(monkeypatch, action, key, max_len):
+    monkeypatch.setattr(display_module, "_friendly_tool_labels", True)
+    secret = "opaque-secret-token-123456789"
+    args = {"action": action, key: f"Inspect https://example.test/?api_key={secret}"}
+    label = display_module.build_tool_label("set_goal", args, max_len=max_len)
+    assert "opaque-secret" not in label
+    assert "Inspect" in label
+    assert args[key].endswith(secret)

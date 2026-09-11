@@ -267,6 +267,24 @@ def _assistant_calls(messages: Iterable[dict[str, Any]]) -> Iterable[tuple[str, 
             yield name, _json_args(function.get("arguments")), results.get(call_id, "")
 
 
+def _verified_file_write(result: str, content: str) -> bool:
+    """Require the native write acknowledgment, bound to the proposed bytes."""
+    try:
+        acknowledgment = json.loads(result)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(acknowledgment, dict):
+        return False
+    size = acknowledgment.get("bytes_written")
+    return (
+        acknowledgment.get("verified") is True
+        and not acknowledgment.get("error")
+        and acknowledgment.get("success") is not False
+        and type(size) is int
+        and size == len(content.encode("utf-8"))
+    )
+
+
 @dataclass(frozen=True)
 class SourceCandidate:
     """A source eligible for automatic Hindsight retention."""
@@ -512,7 +530,7 @@ def discover_source_candidates(
         if name in {"write_file", "file_write"}:
             path = _path_value(args)
             content = _as_text(args.get("content"))
-            if _is_durable_artifact_path(path):
+            if _verified_file_write(result, content) and _is_durable_artifact_path(path):
                 candidate = _candidate_text(
                     source_type="artifact",
                     source_id=f"artifact-{_sha256_text(str(Path(path).expanduser().resolve()))[:32]}",

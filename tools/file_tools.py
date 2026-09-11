@@ -668,6 +668,17 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
         return None
 
 
+def _resolve_write_targets(paths: list[str], task_id: str) -> tuple[dict[str, str | None], str | None]:
+    """Bind the knowledge check and the operation to the same task paths."""
+    from agent.delegation_context import is_read_only_knowledge_context
+    from tools.knowledge_boundary import _UNEVALUATED
+
+    resolved = {path: _resolve_or_none(path, task_id) for path in paths}
+    if is_read_only_knowledge_context() and any(value is None for value in resolved.values()):
+        return resolved, _UNEVALUATED
+    return resolved, _check_shared_knowledge_write(list(resolved.values()), how="a write")
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
                           cross_profile: bool) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
@@ -681,9 +692,6 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
             None if cross_profile else _check_cross_profile_path(p, task_id))
         if err:
             return err
-    knowledge_err = _check_shared_knowledge_write(paths, how="a patch")
-    if knowledge_err:
-        return knowledge_err
     for p in content_paths:
         err = _check_binary_document_write(p, task_id)
         if err:
@@ -772,9 +780,10 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
     """
+    path_to_resolved, knowledge_err = _resolve_write_targets([path], task_id)
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
-           or _check_shared_knowledge_write([path], how="a write")
+           or knowledge_err
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
@@ -786,10 +795,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     if err:
         return tool_error(err)
     try:
-        # Resolution failure falls back to the legacy unlocked path (the write
-        # still proceeds; the per-task staleness check still runs).
-        _resolved = _resolve_or_none(path, task_id)
-        path_to_resolved = {path: _resolved}
+        # Parent writes preserve the legacy unresolved fallback. Named children
+        # have already refused any unresolved target before this point.
+        _resolved = path_to_resolved[path]
         with ExitStack() as _lock:
             if _resolved:
                 # Per-path lock serializes read→modify→write across concurrent
@@ -866,6 +874,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
+    _path_to_resolved, knowledge_err = _resolve_write_targets(_paths_to_check, task_id)
+    if knowledge_err:
+        return tool_error(knowledge_err)
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
     if precheck_err:
         return tool_error(precheck_err)
@@ -873,7 +884,6 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # Lock paths in sorted, deduplicated order so concurrent callers with
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
-        _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))

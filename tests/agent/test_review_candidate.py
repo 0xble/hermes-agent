@@ -378,3 +378,25 @@ def test_candidate_identity_preserves_distinct_non_utf8_tracked_patch_bytes(cand
     assert first.tracked_patch == second.tracked_patch
     assert first.candidate_id != second.candidate_id
     assert first.tracked_patch_sha256 != second.tracked_patch_sha256
+
+
+def test_capture_and_freshness_never_execute_textconv(candidate_repo, tmp_path):
+    import shlex
+    import sys
+
+    marker = tmp_path / "converter-ran"
+    converter = tmp_path / "converter.py"
+    converter.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('executed')\n"
+        "print('converted evidence')\n"
+    )
+    (candidate_repo / ".gitattributes").write_text("tracked.py diff=probe\n")
+    _git(candidate_repo, "config", "diff.probe.textconv",
+         f"{shlex.quote(sys.executable)} {shlex.quote(str(converter))}")
+    candidate = _capture_changed_candidate(candidate_repo, "HEAD")
+    assert not marker.exists()
+    assert "+value = 2" in candidate.tracked_patch
+    assert "converted evidence" not in candidate.tracked_patch
+    require_fresh_candidate(candidate)
+    assert not marker.exists()

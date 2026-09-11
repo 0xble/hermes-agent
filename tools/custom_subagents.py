@@ -364,7 +364,7 @@ def resolve_named_credentials(definition: SubagentDefinition, defaults: Mapping,
     else:
         from tools.delegate_tool import _resolve_delegation_credentials
 
-        config = dict(defaults)
+        config = {} if definition.inherit_parent else dict(defaults)
         config.update({"model": model})
         if definition.provider:
             # An explicit provider/model replaces an unrelated default route.

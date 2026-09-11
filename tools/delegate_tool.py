@@ -294,6 +294,8 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    if subagent_definition is not None:
+        rt["reasoning_config"] = deepcopy(resolved_reasoning)
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -958,7 +960,6 @@ def _build_children(
     preflight, so a named child is built on ITS route rather than the batch's first one."""
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = _creds_overrides(creds)
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -969,7 +970,7 @@ def _build_children(
         _definition = _launch.definition if _launch else None
         _task_creds = _launch.credentials if _launch else creds
         _reasoning = _launch.reasoning if _launch else None
-        _task_overrides = overrides if _definition is None else _creds_overrides(_task_creds)
+        _task_overrides = _creds_overrides(_task_creds)
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
@@ -1202,11 +1203,6 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
-    # HERMES-108: resolve every task's named definition BEFORE constructing ANY child. A batch with
-    # one bad subagent_type must not leave a valid sibling already spawned and running.
-    task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
-    if err:
-        return tool_error(err)
     for task in task_list:
         replacement = task.get("replaces")
         if replacement is not None:
@@ -1216,49 +1212,58 @@ def delegate_task(
                 _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]], "validate_replacement")
             except (ValueError, TimeoutError) as exc:
                 return tool_error(str(exc))
-    creds = dict(task_runtime[0].credentials)
-
-    overall_start = time.monotonic()
-    # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
-    # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
-    from tools.delegation_live_log import create_live_transcripts
-    live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        routing=_task_routing_metadata(task_runtime, parent_agent),
-    )
-    _announce_batch(parent_agent, len(task_list), live_deleg_id)
-    origin = _capture_origin()
-
-    children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
-        task_labels=effective_labels or [],
-        routing_cfg=routing_cfg, child_tool_policy=child_tool_policy,
-    )
+    # HERMES-108: resolve every task's named definition BEFORE constructing ANY child. A batch with
+    # one bad subagent_type must not leave a valid sibling already spawned and running.
+    task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
-    for _i, (_, _, _child) in enumerate(children):
-        _ref = getattr(_child, "_progress_identity_ref", None)
-        if isinstance(_ref, dict):
-            _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
-                        task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
-                        subagent_type=vars(_child).get("_delegation_named_type"),
-                        native_review=(completion_contract or {}).get("kind") == "native_review",
-                        owner=_owner, card_owner=_card_owner, background=bool(background),
-                        replaces=task_list[_i].get("replaces"))
-    _metadata["threads"] = [
-        {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
-         "role": getattr(child, "_delegate_role", None),
-         "subagent_type": vars(child).get("_delegation_named_type")}
-        for i, (_, _, child) in enumerate(children)
-    ]
-    _metadata["background"] = bool(background)
-    batch = _Batch(
-        task_list, children, parent_agent, creds, context, top_role, max_children,
-        live_deleg_id, live_writers, live_paths, *origin, overall_start,
-        completion_contract=completion_contract,
-        delegation_metadata=_metadata,
-    )
+    try:
+        creds = dict(task_runtime[0].credentials)
+
+        overall_start = time.monotonic()
+        # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
+        # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
+        from tools.delegation_live_log import create_live_transcripts
+        live_deleg_id, live_writers, live_paths = create_live_transcripts(
+            task_list, context, model=creds.get("model"), provider=creds.get("provider"),
+            routing=_task_routing_metadata(task_runtime, parent_agent),
+        )
+        _announce_batch(parent_agent, len(task_list), live_deleg_id)
+        origin = _capture_origin()
+
+        children, err = _build_children(
+            task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
+            live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
+            task_labels=effective_labels or [],
+            routing_cfg=routing_cfg, child_tool_policy=child_tool_policy,
+        )
+        if err:
+            return tool_error(err)
+        for _i, (_, _, _child) in enumerate(children):
+            _ref = getattr(_child, "_progress_identity_ref", None)
+            if isinstance(_ref, dict):
+                _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
+                            task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
+                            subagent_type=vars(_child).get("_delegation_named_type"),
+                            native_review=(completion_contract or {}).get("kind") == "native_review_result_v1",
+                            owner=_owner, card_owner=_card_owner, background=bool(background),
+                            replaces=task_list[_i].get("replaces"))
+        _metadata["threads"] = [
+            {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
+             "role": getattr(child, "_delegate_role", None),
+             "subagent_type": vars(child).get("_delegation_named_type")}
+            for i, (_, _, child) in enumerate(children)
+        ]
+        _metadata["background"] = bool(background)
+        batch = _Batch(
+            task_list, children, parent_agent, creds, context, top_role, max_children,
+            live_deleg_id, live_writers, live_paths, *origin, overall_start,
+            completion_contract=completion_contract,
+            delegation_metadata=_metadata,
+        )
+    except BaseException:
+        _release_resume_launches(parent_agent, task_runtime)
+        raise
     return _run_batch(batch, background)
 
 

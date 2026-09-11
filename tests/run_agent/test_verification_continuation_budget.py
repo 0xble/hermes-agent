@@ -433,8 +433,15 @@ def test_receipt_only_verification_response_keeps_pending_answer(agent, monkeypa
     agent._handle_max_iterations.assert_not_called()
 
 
+@pytest.mark.parametrize("first_receipt,last_receipt", [
+    ("I cannot provide fresh verification evidence for that edit.",
+     "I cannot provide fresh verification evidence for that edit."),
+    ("I cannot provide fresh verification evidence for that edit.", "Fresh verification passes: tests passed."),
+    ("Fresh verification passes: tests passed.", "I cannot provide fresh verification evidence for that edit."),
+    ("Fresh verification passes: lint passed.", "Fresh verification passes: tests passed."),
+])
 def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
-    agent, monkeypatch, tmp_path
+    agent, monkeypatch, tmp_path, first_receipt, last_receipt
 ):
     from hermes_state import SessionDB
 
@@ -443,12 +450,12 @@ def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
     agent._session_db = db
     agent.max_iterations = 3
     agent.iteration_budget.max_total = 3
-    blocker = "I cannot provide fresh verification evidence for that edit."
+    blocker = last_receipt
     answers = iter(
         [
             _response("The code edit is complete."),
-            _response(blocker),
-            _response(blocker),
+            _response(first_receipt),
+            _response(last_receipt),
         ]
     )
     agent._interruptible_api_call = lambda _kwargs: next(answers)
@@ -467,7 +474,7 @@ def test_repeated_verification_blockers_preserve_and_persist_substantive_answer(
     expected = (
         "The code edit is complete.\n\n"
         "## Verification\n\n"
-        "I cannot provide fresh verification evidence for that edit."
+        + last_receipt
     )
     assert result["final_response"] == expected
     assert result["response_transformed"] is True
@@ -636,3 +643,10 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
+
+
+def test_receipt_replacement_preserves_authored_verification_section():
+    answer = "Changed the code.\n\n## Verification\n\nManual testing remains necessary."
+    previous = _compose_verification_receipt_with_answer(answer, "Fresh verification passes: lint.")
+    final = _compose_verification_receipt_with_answer(previous, "Fresh verification passes: tests.")
+    assert final == answer + "\n\n## Verification\n\nFresh verification passes: tests."

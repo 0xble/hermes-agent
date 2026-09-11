@@ -292,7 +292,7 @@ def capture_review_candidate(
     base_commit = _git(root, "rev-parse", "--verify", f"{base_revision}^{{commit}}").decode().strip()
     head_commit = _git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
     pathspecs = _literal_pathspecs(scope)
-    patch_bytes = _git(root, "diff", "--binary", "--no-ext-diff", base_commit, "--", *pathspecs)
+    patch_bytes = _git(root, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", *pathspecs)
     untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
     untracked_paths = sorted(
         item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item

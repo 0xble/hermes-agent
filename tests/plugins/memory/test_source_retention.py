@@ -2,6 +2,8 @@
 
 import json
 import threading
+
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -147,7 +149,7 @@ def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
         _tool_turn(
             "write_file",
             {"path": "/Users/brianle/Vault/Reports/review.md", "content": content},
-            "written",
+            json.dumps({"bytes_written": len(content.encode("utf-8")), "verified": True}),
         ),
         retain_tool_sources=True,
     )
@@ -158,7 +160,7 @@ def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
         _tool_turn(
             "write_file",
             {"path": "/tmp/scratch.md", "content": content},
-            "written",
+            json.dumps({"bytes_written": len(content.encode("utf-8")), "verified": True}),
         ),
         retain_tool_sources=True,
     ) == []
@@ -166,7 +168,7 @@ def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
         _tool_turn(
             "write_file",
             {"path": "/Users/brianle/Workspaces/project/main.py", "content": content},
-            "written",
+            json.dumps({"bytes_written": len(content.encode("utf-8")), "verified": True}),
         ),
         retain_tool_sources=True,
     ) == []
@@ -331,3 +333,87 @@ def test_read_file_extraction_requires_explicit_opt_in_and_secret_paths_stay_blo
         retain_file_extractions=True,
     )
     assert skipped == []
+
+
+@pytest.mark.parametrize("readback", [
+    None, {}, SimpleNamespace(id="attachment:file-1"),
+    SimpleNamespace(document_metadata={"content_hash": "hash-1"}),
+    SimpleNamespace(id="wrong", document_metadata={"content_hash": "hash-1"}),
+    SimpleNamespace(id="attachment:file-1", document_metadata={"content_hash": "wrong"}),
+])
+def test_source_completion_requires_matching_identity_and_hash(tmp_path, readback):
+    provider = _provider_for_source_tests()
+    candidate = _source_candidate(tmp_path)
+    provider._run_hindsight_operation = lambda operation: readback
+    assert provider._verify_source_candidate("bank", candidate) is False
+    assert candidate.automatic_key not in provider._source_retain_verified
+    assert candidate.automatic_key not in provider._source_ledger
+    provider._run_hindsight_operation = lambda operation: SimpleNamespace(
+        id=candidate.source_id, document_metadata={"content_hash": candidate.content_hash},
+    )
+    assert provider._verify_source_candidate("bank", candidate) is True
+    assert provider._source_ledger[candidate.automatic_key]["status"] == "completed"
+
+
+@pytest.mark.parametrize("status", ["completed", "gone"])
+def test_missing_readback_keeps_source_operation_pending(tmp_path, status):
+    from hindsight_client_api.exceptions import NotFoundException
+
+    provider = _provider_for_source_tests()
+    candidate = _source_candidate(tmp_path)
+    provider._source_retain_ops["op"] = candidate
+    outcomes = iter([NotFoundException() if status == "gone" else SimpleNamespace(status=status), None])
+
+    def respond(operation):
+        result = next(outcomes)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    provider._run_hindsight_operation = respond
+    assert provider._is_retain_op_complete("bank", "op") is False
+    assert provider._source_retain_ops["op"] is candidate
+    assert candidate.automatic_key not in provider._source_retain_verified
+
+
+@pytest.mark.parametrize("result", [
+    None, "", "written", "{}", "[]", '{"error":"Permission denied"}',
+    '{"success":false}', '{"verified":true,"bytes_written":true}',
+    '{"verified":true,"bytes_written":1}',
+])
+def test_unverified_or_unanswered_write_is_not_artifact(result):
+    content = "Report evidence. " * 60
+    messages = _tool_turn("write_file", {"path": "/Users/probe/Documents/report.md", "content": content}, result)
+    if result is None:
+        messages = [message for message in messages if message["role"] != "tool"]
+    assert discover_source_candidates(messages, retain_tool_sources=True) == []
+
+
+@pytest.mark.parametrize("changes", [{}, {"verified": None}, {"error": "write failed"}, {"success": False}])
+def test_artifact_requires_native_verified_write_acknowledgment(changes):
+    from tools.file_operations_common import WriteResult
+
+    content = "Unicode report evidence é. " * 60
+    acknowledgment = WriteResult(bytes_written=len(content.encode("utf-8")), verified=True).to_dict()
+    acknowledgment.update(changes)
+    messages = _tool_turn("write_file", {"path": "/Users/probe/Documents/report.md", "content": content}, json.dumps(acknowledgment))
+    # An unrelated result cannot certify this write.
+    messages.insert(2, {"role": "tool", "tool_call_id": "unrelated", "content": json.dumps(WriteResult(bytes_written=len(content.encode("utf-8")), verified=True).to_dict())})
+    candidates = discover_source_candidates(messages, retain_tool_sources=True)
+    assert bool(candidates) is (not changes)
+    if candidates:
+        assert candidates[0].content == content.strip()
+
+
+def test_valid_sdk_document_without_source_hash_cannot_verify(tmp_path):
+    from hindsight_client_api.models.document_response import DocumentResponse
+
+    provider = _provider_for_source_tests()
+    candidate = _source_candidate(tmp_path)
+    document = DocumentResponse(
+        id=candidate.source_id, bank_id="bank", original_text="wrong content", content_hash="wrong hash",
+        created_at="2026-09-11", updated_at="2026-09-11", memory_unit_count=0,
+    )
+    provider._run_hindsight_operation = lambda operation: document
+    assert provider._verify_source_candidate("bank", candidate) is False
+    assert candidate.automatic_key not in provider._source_retain_verified

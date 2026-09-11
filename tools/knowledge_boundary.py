@@ -48,19 +48,15 @@ _ROOT_RESOLVERS: tuple[str, ...] = (
 _ENV_HOME_SPELLINGS: tuple[str, ...] = ("$HERMES_HOME", "${HERMES_HOME}")
 
 
-def _resolve(dotted: str) -> Path | None:
+def _resolve(dotted: str) -> Path:
     module_name, _, attr = dotted.partition(":")
-    try:
-        module = __import__(module_name, fromlist=[attr])
-        return Path(getattr(module, attr)())
-    except Exception:
-        return None
+    module = __import__(module_name, fromlist=[attr])
+    return Path(getattr(module, attr)())
 
 
 def protected_roots() -> tuple[Path, ...]:
-    """Return the shared-knowledge roots for the active Hermes home."""
-    resolved = (_resolve(dotted) for dotted in _ROOT_RESOLVERS)
-    return tuple(path for path in resolved if path is not None)
+    """Resolve every protected root, or fail rather than weaken the boundary."""
+    return tuple(_resolve(dotted) for dotted in _ROOT_RESOLVERS)
 
 
 def _real(path: Path | str) -> str:

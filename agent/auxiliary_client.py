@@ -3419,6 +3419,8 @@ def _select_transient_aux_alternate(
     if not pool or not pool.has_credentials():
         return None
     failed_id = pool.entry_id_for_api_key(failed_api_key)
+    if failed_id is None:
+        return None
     alternate = pool.select_alternate(
         exclude_id=failed_id, exclude_runtime_key=failed_api_key,
     )

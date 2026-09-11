@@ -586,7 +586,8 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
         preview_key = "goal" if action in {"set", "draft", "edit"} else (
             "text" if action == "subgoal_add" else "command" if action == "gate_add" else None
         )
-        preview = _oneline(str(args.get(preview_key) or "")) if preview_key else ""
+        preview = sanitize_tool_preview(str(args.get(preview_key) or ""), 0) if preview_key else ""
+        preview = preview or ""
         label = f"{verb} {preview}".strip()
         return _truncate_preview(label, max_len) if max_len else label
 

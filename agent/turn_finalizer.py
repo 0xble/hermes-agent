@@ -64,6 +64,9 @@ def _compose_verification_receipt_with_answer(
     receipt_suffix = f"{_VERIFICATION_SECTION}{final}"
     if pending.endswith(receipt_suffix):
         return pending_response
+    answer, separator, prior_receipt = pending.rpartition(_VERIFICATION_SECTION)
+    if separator and _is_verification_receipt_only(prior_receipt):
+        return f"{answer.rstrip()}{receipt_suffix}"
     return f"{pending_response.rstrip()}{receipt_suffix}"
 
 

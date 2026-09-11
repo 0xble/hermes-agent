@@ -713,13 +713,13 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight source readback failed for %s: %s", candidate.source_id, exc)
             return False
         document_id = str(getattr(document, "id", "") or "")
-        if document_id and document_id != candidate.source_id:
+        if not document_id or document_id != candidate.source_id:
             logger.warning("Hindsight source readback returned unexpected document %s for %s",
                            document_id, candidate.source_id)
             return False
         metadata = getattr(document, "document_metadata", None) or {}
         stored_hash = str(metadata.get("content_hash") or "") if isinstance(metadata, dict) else ""
-        if stored_hash and stored_hash != candidate.content_hash:
+        if not stored_hash or stored_hash != candidate.content_hash:
             logger.warning("Hindsight source readback hash mismatch for %s", candidate.source_id)
             return False
         self._source_retain_verified.add(candidate.automatic_key)

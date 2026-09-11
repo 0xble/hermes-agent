@@ -5454,3 +5454,24 @@ class TestFastModelTier:
             _FAST_MODEL_TASKS
         )
         assert not overlap
+
+
+@pytest.mark.parametrize("failed_key,keys", [
+    ("unknown", ["known"]), ("ambiguous", ["ambiguous", "ambiguous", "alternate"]),
+])
+def test_transient_alternate_requires_unambiguous_pool_membership(monkeypatch, failed_key, keys):
+    from agent.credential_pool import CredentialPool, PooledCredential
+    from agent import auxiliary_client
+
+    pool = CredentialPool("openrouter", [PooledCredential(
+        provider="openrouter", id=str(i), label=str(i), auth_type="api_key",
+        priority=i, source="manual", access_token=key,
+    ) for i, key in enumerate(keys)])
+    monkeypatch.setattr(auxiliary_client, "load_pool", lambda _provider: pool)
+    with patch.object(pool, "select_alternate", wraps=pool.select_alternate) as alternate:
+        assert auxiliary_client._select_transient_aux_alternate(
+            "openrouter", failed_api_key=failed_key, reason="overloaded",
+        ) is None
+    alternate.assert_not_called()
+    assert pool.current() is None
+    assert not pool.soft_cooldown_ids()
