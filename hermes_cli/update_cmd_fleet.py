@@ -1210,6 +1210,18 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
         # and never came back", not "nothing was running"; None fails closed.
         try:
             out.pre_restart_gateway_pids = list(find_gateway_pids(all_profiles=True))
+            # The cleanup scan excludes ancestors of an agent-launched updater,
+            # and launchd may report a wrapper rather than the gateway PID.
+            # Keep the pre-update inventory's socket/state identities too: the
+            # settling check must recognize the outgoing process, not its wrapper.
+            # This only supplies verification evidence; it never expands kill targets.
+            if _pre_update_plan is not None:
+                planned_pids = _coerce_pid_set(
+                    rt.pid for rt in _pre_update_plan.runtimes if rt.kind == "gateway"
+                )
+                out.pre_restart_gateway_pids = sorted(
+                    _coerce_pid_set(out.pre_restart_gateway_pids) | planned_pids
+                )
         except Exception:
             out.pre_restart_gateway_pids = None
 

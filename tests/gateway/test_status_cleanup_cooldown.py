@@ -78,8 +78,11 @@ async def test_legacy_ambiguous_send_does_not_hide_known_aggregate_anchor(tmp_pa
     assert adapter.edit_message.call_args.args[1] == 'known'
     rendered = adapter.edit_message.call_args.args[2]
     # Both cards share the known aggregate anchor; only the heading uses bold.
-    assert '\nA. ' in rendered and '\nB. ' in rendered
-    assert '**A.' not in rendered and '**B.' not in rendered
+    assert rendered.count('\n✓ Task\n') == 2
+    assert '\nA. ' not in rendered and '\nB. ' not in rendered
+    assert all('**' not in line for line in rendered.splitlines()[1:])
+    assert set(cards.cards['a'*32]['rows']) == {'A'}
+    assert set(cards.cards['b'*32]['rows']) == {'B'}
     assert cards.cards['a'*32]['presentation_key'] == 'b'*32
     assert not any(c.get('handled') or c.get('retired') for c in cards.cards.values())
 

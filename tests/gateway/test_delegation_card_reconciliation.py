@@ -55,7 +55,9 @@ async def test_explicit_dismissal_fences_startup_without_marking_results_handled
     await asyncio.gather(*list(baseline.pending.values()))
     assert {call.args[1] for call in adapter.edit_message.await_args_list} == {"14"}
     text = adapter.edit_message.call_args.args[2]
-    assert all(ref in text for ref in ("B.", "C.", "D.", "D·2."))
+    assert text.count("Ⅱ Task") == 3 and text.count("! Task") == 1
+    assert all(ref not in text for ref in ("B.", "C.", "D.", "D·2."))
+    assert set(baseline.cards["b" * 32]["rows"]) == {"B"}
     for mock in (adapter.send_delegation_card, adapter.edit_message, adapter.delete_message):
         mock.reset_mock()
     output = tmp_path / "reconciled.json"
@@ -80,7 +82,8 @@ async def test_explicit_dismissal_fences_startup_without_marking_results_handled
     assert [call.args[1] for call in adapter.edit_message.await_args_list] == ["16"]
     assert {call.args[1] for call in adapter.delete_message.await_args_list} == {"14", "15"}
     adapter.send_delegation_card.assert_not_awaited()  # failed-send sibling joins existing message
-    assert "D·2." in adapter.edit_message.call_args.args[2]
+    assert "! Task" in adapter.edit_message.call_args.args[2]
+    assert set(restored.cards["e" * 32]["rows"]) == {"D"}
     persisted = json.loads(path.read_bytes())
     assert persisted["b" * 32]["presentation_dismissal"] == result["b" * 32]["presentation_dismissal"]
     assert not persisted["d" * 32]["retired"]

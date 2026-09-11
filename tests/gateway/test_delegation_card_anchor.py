@@ -344,7 +344,7 @@ async def test_event_during_replace_drains_without_another_external_event(tmp_pa
     if final_delivery:
         assert not card["message_id"] and card["retired"]
     elif during == "send":
-        assert "Returned · awaiting parent" in card["rendered"]
+        assert "Awaiting parent" in card["rendered"]
         assert adapter._bot.edit_message_text.await_count >= 1
     else:
         assert card["message_id"] is None

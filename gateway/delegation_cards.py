@@ -70,10 +70,7 @@ def render_card(card, now=None):
         visited.add(identity)
         row = rows[identity]
         actual_depth = depth
-        row = {**row, "_display_depth": min(actual_depth, 2), "_actual_depth": actual_depth}
-        if actual_depth > 2:
-            parent_ref = _label(rows.get(row.get("card_parent_identity"), {}).get("thread_ref"), "parent", 24)
-            row["_parent_marker"] = f" · ↑{parent_ref}"
+        row = {**row, "_display_depth": min(actual_depth, 2)}
         ordered.append(row)
         for child in children.get(identity, ()):
             if child not in ancestry:
@@ -90,26 +87,32 @@ def render_card(card, now=None):
         prefix = _row_prefix(depth)
         named_type = _label(row.get("subagent_type"), "", 10_000)
         role_suffix = f" · {named_type.capitalize()}" if named_type else ""
-        parent_marker = row.get("_parent_marker", "")
         # The model receives a 24-character row-budget guideline, but authored
         # labels are never truncated or rejected here. Telegram's proportional
         # fonts likewise cannot guarantee physical width.
-        label = _label(row.get("task_label"), "Task " + row["thread_ref"], 10_000)
-        lines.append(f"{prefix}{row['thread_ref']}. {label}{role_suffix}{parent_marker}")
+        # Refs remain stable in the lifecycle/tool API, never in visible text.
+        label = _label(row.get("task_label"), "Task", 10_000)
         state = row.get("state")
-        if state == "completed":
-            activity = "Returned · awaiting parent"
-        elif state in _TERMINAL:
-            activity = f"{state.replace('_', ' ').capitalize()} · awaiting parent"
-        elif state == "unknown":
-            activity = "Interrupted / unknown · gateway restarted"
-        elif row.get("last_tool"):
-            tool = row["last_tool"]
-            # Only canonical tool identifiers are visible: no previews, args or usage summaries.
-            activity = f"{get_tool_emoji(tool)} {_tool_label(tool, 'tool', 40)}"
-        else:
-            activity = "Started · awaiting activity"
-        lines.append(f"{prefix}↳ {activity}")
+        symbol, activity = {
+            "running": ("○", None),
+            "queued": ("◌", "Queued"),
+            "completed": ("✓", "Awaiting parent"),
+            "failed": ("!", "Failed · awaiting parent"),
+            "error": ("!", "Error · awaiting parent"),
+            "timeout": ("!", "Timeout · awaiting parent"),
+            "cancelled": ("Ⅱ", "Cancelled · awaiting parent"),
+            "interrupted": ("Ⅱ", "Interrupted · awaiting parent"),
+            "budget_exhausted": ("Ⅱ", "Budget exhausted · awaiting parent"),
+            "unknown": ("Ⅱ", "Interrupted · awaiting parent"),
+        }.get(state, ("Ⅱ", "Status unknown · awaiting parent"))
+        lines.append(f"{prefix}{symbol} {label}{role_suffix}")
+        if activity is None:
+            # Tool rows retain the compact icon plus canonical identifier only:
+            # no previews, arguments, usage summaries, or stale terminal tool.
+            tool = row.get("last_tool")
+            activity = (f"{get_tool_emoji(tool)} {_tool_label(tool)}" if tool
+                        else "Started · awaiting activity")
+        lines.append(f"{prefix}\u00a0\u00a0↳ {activity}")
     # Do not invent a row/card truncation policy. The platform adapter reports
     # an over-limit send honestly rather than silently hiding authored labels.
     return "\n".join(lines)
