@@ -2,7 +2,27 @@
 
 A conversation owns one **logical** delegation presentation; its physical Telegram
 message may change. This supersedes the earlier strict same-physical-message rule.
-Task IDs, display references and original task start times do not change.
+Task IDs, internal display references and original task start times do not change.
+
+## Symbol-first presentation
+
+Only the heading text is bold: 🧵 **Delegating tasks** (the emoji is plain text).
+Rows show `● Task label · Role` for running, `○` for queued, `✓` for returned,
+`!` for failed/error/timeout and `Ⅱ` for interrupted/cancelled/budget exhaustion
+or unproven recovered execution. Returned activity is `Awaiting parent`; failed
+and interrupted activity remains explicit and awaiting parent, never success.
+Unknown future states have an explicit unknown-status fallback, not a running dot.
+
+Task labels stay authored and untruncated under the existing plain-text sanitizer;
+roles remain inline. A second line, indented two nonbreaking spaces beyond its
+row, shows `↳` and the bounded canonical tool identifier only while running—no
+tool emoji, args, preview, or “Last tool”. Four nonbreaking spaces per actual
+parent layer preserve Telegram indentation, capped at three visible layers.
+There are no visible numbering/ref prefixes or deep-parent ref markers, including
+unlabeled legacy rows. Stable internal refs, parent identities and exact handling,
+replacement, recovery and final-delivery receipts remain unchanged. Identical
+labels never identify or merge tasks. Do not restore visible refs when maintaining
+the lifecycle/tool API; they are separate concerns.
 
 ## Eligibility and transport
 

@@ -20,6 +20,13 @@ Commit subjects and resolved SHAs are optional, human-readable provenance, not m
 - **Verification:** real Unix socket and SQLite lineage; native receipt persistence, restart simulation, send failures, legacy/no-reason records, duplicate admission and drain regressions. Source tests are not live rollout evidence.
 - **Activation boundary:** authorized rollout is default local only, coordinated after checking other work. Product keeps native profile/fleet semantics. No remote or other-profile deployment is authorized by this entry.
 
+## Symbol-first delegation presentation
+
+- **Contract:** [symbol-first presentation](docs/delegation-card-anchoring.md#symbol-first-presentation). Status symbols, no visible numbering/ref prefixes, inline roles, heading-text-only bold, canonical tool names only, two-space activity inset and actual-parent indentation capped at three layers. Stable internal refs/ownership and exact handling remain unchanged. This supersedes historical tool-preview/display-prefix contracts below, not their lifecycle protections.
+- **Upstream:** inspected upstream `main` at `45a6101f36576367359c171cd5820ee76a3d047b`; `gateway/delegation_cards.py` is absent (contents API 404), and matching delegation-card PR search was empty. Fork-local projection, not an independently applicable upstream change. No model-preset PR changes.
+- **Verification:** symbol/status table, unknown-state fallback, native Telegram MarkdownV2 send/edit boundaries, three-layer actual parentage, duplicate-label independent ownership and exact handling; existing card/reanchor/consolidation/final cleanup regressions. Native client pixels are separate delivery evidence, never implied by mocked Bot API tests.
+- **Rollback:** revert only this presentation change; no migration or lifecycle data edits. PR159 scheduler-deferred cleanup code remains untouched.
+
 ## Delegation presentation reanchoring — source candidate
 
 - **Stable subject:** `fix(telegram): reanchor active delegation cards after conversation displacement`.

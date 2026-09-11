@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
@@ -25,7 +24,29 @@ async def handling_receipt(cards, key, refs, generation):
     return {key: cards._proof(card, refs)}
 
 
-def test_render_card_is_plain_rich_text_with_task_first_rows():
+@pytest.mark.parametrize("state,symbol,activity", [
+    ("running", "●", "read_file"), ("queued", "○", "Queued"),
+    ("completed", "✓", "Awaiting parent"),
+    ("failed", "!", "Failed · awaiting parent"), ("error", "!", "Error · awaiting parent"),
+    ("timeout", "!", "Timeout · awaiting parent"),
+    ("interrupted", "Ⅱ", "Interrupted · awaiting parent"),
+    ("cancelled", "Ⅱ", "Cancelled · awaiting parent"),
+    ("budget_exhausted", "Ⅱ", "Budget exhausted · awaiting parent"),
+    ("unknown", "Ⅱ", "Interrupted · awaiting parent"),
+    ("unrecognized_<status>", "Ⅱ", "Status unknown · awaiting parent"),
+    (None, "Ⅱ", "Status unknown · awaiting parent"),
+])
+def test_symbols_project_observed_state_without_exposing_refs_or_stale_tools(state, symbol, activity):
+    import copy
+    card = {"rows": {"internal:A.1": dict(thread_ref="A.1", task_label="Trace scheduler",
+            subagent_type="explorer", state=state, last_tool="read_file")}}
+    before = copy.deepcopy(card)
+    assert render_card(card).splitlines() == ["🧵 **Delegating tasks**",
+        f"{symbol} Trace scheduler · Explorer", f"\u00a0\u00a0↳ {activity}"]
+    assert card == before  # Presentation cannot rewrite lifecycle identity or state.
+
+
+def test_render_card_is_plain_rich_text_with_symbol_first_rows():
     card = {
         "started_at": 0,
         "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "orchestrator", "subagent_type": "lead",
@@ -37,8 +58,8 @@ def test_render_card_is_plain_rich_text_with_task_first_rows():
     lines = rendered.splitlines()
     assert lines[0] == "🧵 **Delegating tasks**"
     assert render_card(card, now=3600).splitlines()[0] == "🧵 **Delegating tasks**"
-    assert lines[1] == "A. Repair restart receipt · Lead"
-    assert lines[2] == f"↳ {get_tool_emoji('read_file')} read_file"
+    assert lines[1] == "● Repair restart receipt · Lead"
+    assert lines[2] == "\u00a0\u00a0↳ read_file"
     assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
     assert not any(line.startswith(">") for line in lines)
 
@@ -55,10 +76,14 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    content = ("🧵 **Delegating tasks**\nA. Repair receipt · Worker\n↳ Started · awaiting activity\n"
-               "\u00a0\u00a0\u00a0\u00a0A.1. Verify card edit · Explorer\n\u00a0\u00a0\u00a0\u00a0↳ ⚡ terminal\n"
-               "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0A.1.1. Verify edit payload · Worker\n"
-               "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ read_file")
+    content = render_card({"rows": {
+        "root": dict(thread_ref="A", task_label="Repair receipt", subagent_type="worker", state="running"),
+        "child": dict(thread_ref="A.1", card_parent_identity="root", task_label="Verify card edit",
+                      subagent_type="explorer", state="running", last_tool="terminal"),
+        "leaf": dict(thread_ref="A.1.1", card_parent_identity="child", task_label="Verify edit payload",
+                     subagent_type="worker", state="running", last_tool="read_file"),
+        "punctuation": dict(thread_ref="B", task_label="Check (send)! #1 + A.B", state="failed"),
+    }})
 
     sent = await adapter.send_delegation_card(source, content)
     edited = await adapter.edit_message("42", "7", content, finalize=True)
@@ -69,13 +94,14 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
     sent_lines = send_kwargs["text"].splitlines()
     assert sent_lines[0] == "🧵 *Delegating tasks*"
-    assert sent_lines[1] == "A\\. Repair receipt · Worker"
-    assert sent_lines[3] == "\u00a0\u00a0\u00a0\u00a0A\\.1\\. Verify card edit · Explorer"
-    assert sent_lines[4] == "\u00a0\u00a0\u00a0\u00a0↳ ⚡ terminal"
-    assert sent_lines[5] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0A\\.1\\.1\\. Verify edit payload · Worker"
-    assert sent_lines[6] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ read\\_file"
-    assert "*" not in sent_lines[1]
-    assert "*" not in sent_lines[2]
+    assert sent_lines[1] == "● Repair receipt · Worker"
+    assert sent_lines[3] == "\u00a0\u00a0\u00a0\u00a0● Verify card edit · Explorer"
+    assert sent_lines[4] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ terminal"
+    assert sent_lines[5] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0● Verify edit payload · Worker"
+    assert sent_lines[6] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ read\\_file"
+    assert sent_lines[7] == r"\! Check \(send\)\! \#1 \+ A\.B"
+    assert all("*" not in line for line in sent_lines[1:])
+    assert "A.1" not in content
     assert not any(line.startswith(">") for line in sent_lines)
     assert edit_kwargs["text"] == send_kwargs["text"]
 
@@ -134,7 +160,7 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
     await drain_cards(cards)
     expected = tool[:40]
     plain = render_card(cards.cards["a" * 32], now=0)
-    assert plain.splitlines()[-1] == f"↳ {get_tool_emoji(expected)} {expected}"
+    assert plain.splitlines()[-1] == f"\u00a0\u00a0↳ {expected}"
     sent = adapter._bot.send_message.call_args.kwargs["text"]
     assert expected.replace("_", "\\_") in sent
     # A distinct update must exercise edit formatting, not unchanged suppression.
@@ -150,7 +176,7 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
     row = cards.cards["a" * 32]["rows"]["A"]
     many = dict(started_at=0, rows={str(i): {**row, "thread_ref": str(i)} for i in range(100)})
     # Card row guidance is not a renderer hard cap: authored rows are preserved.
-    assert "99. Check display" in render_card(many, now=0)
+    assert render_card(many, now=0).count("● Check display") == len(many["rows"])
 
 
 @pytest.mark.asyncio
@@ -184,19 +210,27 @@ async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layou
     rendered = adapter.send_delegation_card.call_args.args[1]
     lines = rendered.splitlines()
     assert lines[0] == "🧵 **Delegating tasks**"
-    assert "A. Check Telegram edits · Worker" in lines
-    assert "\u00a0\u00a0\u00a0\u00a0A.1. Verify card edit · Worker" in lines
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0A.1.1. Check Telegram edits · Worker" in lines
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ computer_use" in lines
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0A.1.1.1. Bound deep descendant · Worker · ↑A.1.1" in lines
+    assert "● Check Telegram edits · Worker" in lines
+    assert "\u00a0\u00a0\u00a0\u00a0● Verify card edit · Worker" in lines
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0● Check Telegram edits · Worker" in lines
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ computer_use" in lines
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0● Bound deep descendant · Worker" in lines
     assert any(len(line) > 32 for line in lines[1::2])  # guidance never truncates authored labels
     assert all("Last tool:" not in line and "PRIVATE_" not in line for line in lines)
     assert not any(line.startswith(">") for line in lines)
 
     for data in (root_data, child_data, grandchild_data, deeper_data):
         await cards.observe(source, "***", "s", 1, "subagent.complete", None, {**data, "status": "completed"})
+    # Identical labels and local refs do not merge independent owners. Rendering
+    # has no visible ref, but handling still requires the exact task/ref pair.
+    assert cards.cards[root]["rows"]["A"]["thread_ref"] == "A"
+    assert cards.cards[grandchild]["rows"]["A"]["thread_ref"] == "A"
+    assert "A.1" not in rendered and "↑" not in rendered
+    await cards.delivered(await handling_receipt(cards, root, ["A"], 1))
+    assert cards.cards[root]["retired"]
+    assert not cards.cards[grandchild].get("retired")
     receipt = {}
-    for key in (root, child, grandchild, deeper):
+    for key in (child, grandchild, deeper):
         receipt.update(await handling_receipt(cards, key, ["A"], 1))
     await cards.delivered(receipt)
     assert all(card["retired"] for card in cards.cards.values())
@@ -242,10 +276,10 @@ async def test_nested_relays_reach_root_card_with_root_display_owner(tmp_path):
 
     assert cards.cards["c" * 32]["delegation_owner"]["session_id"] == "child-2"
     rendered = adapter.send_delegation_card.call_args.args[1]
-    assert "A. root" in rendered
-    assert "\u00a0\u00a0\u00a0\u00a0A.1. child" in rendered
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0A.1.1. grandchild" in rendered
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ read_file" in rendered
+    assert "● root" in rendered
+    assert "\u00a0\u00a0\u00a0\u00a0● child" in rendered
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0● grandchild" in rendered
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ read_file" in rendered
 
 
 @pytest.mark.asyncio
@@ -291,7 +325,7 @@ def test_render_card_preserves_full_explicit_label_without_card_truncation():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state, display", [("completed", "Returned"), ("failed", "Failed"), ("interrupted", "Interrupted")])
+@pytest.mark.parametrize("state, display", [("completed", "Awaiting parent"), ("failed", "Failed"), ("interrupted", "Interrupted")])
 async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, display):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
@@ -315,14 +349,15 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, 
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    assert f"↳ {get_tool_emoji('terminal')} terminal" in adapter.edit_message.call_args.args[2]
+    assert "\u00a0\u00a0↳ terminal" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]
     relay.progress_callback("subagent.complete", status=state, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    assert f"{display} · awaiting parent" in render_card(cards.cards["a" * 32])
+    expected = display if state == "completed" else f"{display} · awaiting parent"
+    assert expected in render_card(cards.cards["a" * 32])
     adapter.delete_message.assert_not_awaited()
     final_event = MessageEvent(text="Returned", source=source, internal=True, metadata={
         "delegation_parent_task_id": "a" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
@@ -431,7 +466,7 @@ async def test_grouping_isolation_generation_and_recovery(tmp_path):
     await asyncio.gather(*list(cards.pending.values()))
     restarted = DelegationCards(runner, home=tmp_path, interval=0)
     assert all(r["state"] == "unknown" for r in restarted.cards["b" * 32]["rows"].values())
-    assert "gateway restarted" in render_card(restarted.cards["b" * 32])
+    assert "Interrupted · awaiting parent" in render_card(restarted.cards["b" * 32])
 
 
 @pytest.mark.asyncio
@@ -672,7 +707,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     await drain_cards(cards)
     adapter.send_delegation_card.assert_awaited_once()
     text = adapter.edit_message.call_args.args[2]
-    assert "A. Check receipt" in text and "B. Check display" in text
+    assert "Check receipt" in text and "Check display" in text
     assert "Lead" in text and "Explorer" in text
     assert adapter.edit_message.call_args.args[1] == "one"
     await cards.observe(source, "r", "s", 1, "subagent.complete", None, a)
@@ -685,14 +720,14 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     await cards.delivered(proof)
     await drain_cards(cards)
     text = adapter.edit_message.call_args.args[2]
-    assert "A. Check receipt" not in text and "B. Check display" in text and "C. Check race" in text
-    assert "C. Check race\n" in text  # no fabricated default role
+    assert "Check receipt" not in text and "Check display" in text and "● Check race" in text
+    assert "● Check race\n" in text  # no fabricated default role
     adapter.delete_message.assert_not_awaited()
     restored = DelegationCards(runner, home=tmp_path, interval=0)
     await restored.reconcile()
     await drain_cards(restored)
     assert "Explorer" in adapter.edit_message.call_args.args[2]
-    assert "A. Check receipt" not in adapter.edit_message.call_args.args[2]
+    assert "Check receipt" not in adapter.edit_message.call_args.args[2]
     adapter.send_delegation_card.assert_awaited_once()
     for data in (b, c):
         event.metadata = {"delegation_parent_task_id": data["parent_task_id"], "delegation_owner": owner,
@@ -727,7 +762,9 @@ async def test_concurrent_sends_share_message_and_keep_topic_isolation(tmp_path)
     await other
     await drain_cards(cards)
     adapter.send_delegation_card.assert_awaited_once()
-    assert "A." in adapter.edit_message.call_args.args[2] and "B." in adapter.edit_message.call_args.args[2]
+    assert adapter.edit_message.call_args.args[2].count("● Task") == 2
+    assert set(cards.cards[a["parent_task_id"]]["rows"]) == {"A"}
+    assert set(cards.cards[b["parent_task_id"]]["rows"]) == {"B"}
     assert adapter.edit_message.call_args.args[1] == "one"
     source.thread_id = "9"
     await cards.observe(source, "r", "s", 3, "subagent.start", None,
@@ -761,7 +798,8 @@ async def test_legacy_messages_merge_with_explicit_link_and_no_handled_inference
     await restored.reconcile()
     await drain_cards(restored)
     text = adapter.edit_message.call_args.args[2]
-    assert "A. Task A" in text and "A·2. Task A·2" in text
+    assert text.count("Ⅱ Task") == 2
+    assert "A." not in text and "A·2" not in text
     assert "Worker" not in text and "Leaf" not in text
     assert adapter.edit_message.call_args.args[1] == "old-a"
     adapter.delete_message.assert_awaited_once_with("42", "old-b")

@@ -74,9 +74,9 @@ async def test_exact_legacy_split_updates_survivor_before_delete_and_recovers(tm
 
     async def delete(chat, message):
         calls.append(("delete", message))
-        assert "E. Run delegated task" in messages["85392"]
-        assert "\u00a0E.1. Audit identity paths" in messages["85392"]
-        assert "G. Run delegated task" in messages["85392"]
+        assert "Ⅱ Run delegated task" in messages["85392"]
+        assert "\u00a0Ⅱ Audit identity paths" in messages["85392"]
+        assert "! Run delegated task" in messages["85392"]
         if fail_delete:
             return False
         messages.pop(message, None)
