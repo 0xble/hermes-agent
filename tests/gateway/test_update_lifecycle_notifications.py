@@ -52,7 +52,7 @@ async def test_shutdown_reason_does_not_cross_conversation_boundaries(tmp_path):
     runner._restart_requested = True
     runner._snapshot_running_agents = Mock(return_value={"other": object()})
     other = make_restart_source(chat_id="unrelated", thread_id="other-topic")
-    runner._shutdown_notification_target = AsyncMock(return_value=(other, "telegram", "unrelated", "other-topic"))
+    runner._shutdown_notification_target = AsyncMock(return_value=(other, "telegram", "unrelated", "other-topic", None))
     with patch("gateway.run._hermes_home", tmp_path):
         await runner._notify_active_sessions_of_shutdown()
     origin = [text for chat, text, _ in adapter.sent_calls if chat == "42"]

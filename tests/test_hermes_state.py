@@ -2037,15 +2037,16 @@ class TestAsyncDelegationsSchemaAgreement:
 
         from hermes_state_common import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
-            "    delivery_claimed_at REAL,\n",
-            "    delivery_claimed_at REAL\n",
-        )
         conn = sqlite3.connect(db_path)
         try:
-            conn.executescript(legacy_sql)
+            conn.executescript(SCHEMA_SQL)
+            # Build a real legacy shape rather than deleting SQL punctuation:
+            # later fork columns mean origin_session_id is no longer last.
+            for column in (
+                "origin_session_id", "delivery_recovery_attempts", "parent_task_id",
+                "thread_number", "task_label", "owner_json",
+            ):
+                conn.execute(f'ALTER TABLE async_delegations DROP COLUMN "{column}"')
             conn.execute(
                 "INSERT INTO async_delegations (delegation_id, origin_session, origin_ui_session_id, state, dispatched_at, updated_at) VALUES ('legacy-1', 'sess-a', '', 'completed', 1.0, 1.0)"
             )

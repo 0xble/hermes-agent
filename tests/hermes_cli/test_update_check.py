@@ -161,3 +161,26 @@ def test_passive_check_reads_only_configured_fork_origin(tmp_path):
     assert _git(["remote"], checkout).splitlines() == ["origin"]
     assert banner._check_via_local_git(checkout) == banner.UPDATE_AVAILABLE_NO_COUNT
     assert _git(["remote"], checkout).splitlines() == ["origin"]
+
+
+@pytest.mark.parametrize("reachable", [True, False])
+def test_private_fork_uses_authenticated_origin_without_public_fallback(tmp_path, reachable):
+    """Private-fork discovery uses its configured transport, including on failure."""
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args == ["remote", "get-url", "origin"]:
+            return MagicMock(returncode=0, stdout="git@github.com:0xble/hermes-agent.git\n")
+        if args == ["rev-parse", "HEAD"]:
+            return MagicMock(returncode=0, stdout=SHA_A)
+        assert args == ["ls-remote", "origin", "refs/heads/main"]
+        assert kwargs["network"] is True
+        return MagicMock(returncode=0 if reachable else 1,
+                         stdout=f"{SHA_A}\trefs/heads/main\n" if reachable else "")
+
+    with patch.object(banner, "_git_run", side_effect=run), \
+         patch.object(banner, "_github_branch_tip") as public_api:
+        assert banner._check_via_local_git(tmp_path) == (0 if reachable else None)
+    public_api.assert_not_called()
+    assert not any(args[0] == "fetch" for args in calls)

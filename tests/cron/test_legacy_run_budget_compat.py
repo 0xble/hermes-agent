@@ -23,7 +23,7 @@ def _install_run_job_stubs(monkeypatch, tmp_path, agent_type):
     monkeypatch.setattr(scheduler, "_preflight_job_config", lambda *_a, **_kw: None)
     monkeypatch.setattr(scheduler, "_build_job_prompt", lambda *_a, **_kw: "prompt")
     monkeypatch.setattr(env_loader, "load_hermes_dotenv", lambda **_kw: [])
-    monkeypatch.setattr(env_loader, "reset_secret_source_cache", lambda: None)
+    monkeypatch.setattr(env_loader, "reset_secret_source_cache", lambda _home=None: None)
     monkeypatch.setattr(hermes_state, "SessionDB", lambda: fake_db)
     monkeypatch.setattr(
         runtime_provider,

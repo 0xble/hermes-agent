@@ -55,7 +55,10 @@ def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     assert started.exists(), "script did not start"
 
     cancel.set()
-    thread.join(timeout=3)
+    # Cancellation includes process-tree discovery and a bounded pipe drain
+    # (up to five seconds), so a three-second join races valid cleanup under
+    # the parallel suite. Still finish well before the script's 30-second sleep.
+    thread.join(timeout=15)
 
     assert errors == []
     assert not thread.is_alive(), "script ignored cancellation"

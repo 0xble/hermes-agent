@@ -107,7 +107,7 @@ def test_compare_behind_rejects_malformed_payloads(payload):
 
 
 def _upstream_tip(sha):
-    return patch.object(banner, "_github_branch_tip", return_value=sha)
+    return patch.object(banner, "_upstream_main_sha", return_value=sha)
 
 
 def test_check_via_rev_recovers_exact_count():

@@ -321,7 +321,7 @@ def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
 
 
 def _upstream_main_sha() -> Optional[str]:
-    """Tip SHA of upstream main; API first, HTTPS ``ls-remote`` (no auth, no prompts) as fallback."""
+    """Tip SHA of the maintained private fork via authenticated, noninteractive ``ls-remote``."""
     result = _git_run(["ls-remote", _UPSTREAM_REPO_URL, "refs/heads/main"], timeout=10, network=True)
     if result is None or result.returncode != 0 or not result.stdout:
         return None
@@ -375,7 +375,8 @@ def check_for_updates(*, passive: bool = False) -> Optional[int]:
     """Check whether a Hermes update is available.
 
     If ``HERMES_REVISION`` is set (nix builds embed it), compare it to upstream main; otherwise
-    compare the local checkout's HEAD. Both go through the GitHub API, never ``git fetch``.
+    compare the local checkout's HEAD. Public GitHub origins use the API; the private fork
+    uses authenticated ``ls-remote``. Neither path runs ``git fetch``.
     """
     def _read_config_opt_out():
         from hermes_cli.config import load_config

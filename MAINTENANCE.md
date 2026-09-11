@@ -2,6 +2,14 @@
 
 This repository tracks `NousResearch/hermes-agent` while carrying a small set of Brian-owned patches. Official upstream remains authoritative for all unmodified Hermes code. Fork `main` is the last candidate that passed fork verification; runtime promotion is a separate operation.
 
+## Frozen upstream reconciliation, September 11, 2026
+
+- Frozen upstream: `939e45c91d751fadd94dcd1b873ac3cb44846213`. Source verification and publication are separate from the separately authorized default-local runtime activation.
+- Preserve private-fork update discovery through authenticated noninteractive `ls-remote`, adopting upstream's no-fetch passive checks and HEAD-aware cache while retaining source invalidation. A private API 404 must not redirect checks to public upstream or fabricate a count.
+- Use upstream's canonical `SCHEMA_SQL` reconciliation for async delegations, including the fork's recovery and presentation metadata and counter tables. Retain stable display references and exact ownership.
+- Restore the existing blank-slate tool overlap filter removed incidentally by upstream's Collective Wisdom revert `0dcadf6f41c`. Disabling another bundle must not strip file, terminal, vision, or skill tools retained by setup. Existing behavioral tests cover this contract.
+- Keep MoA frozen physical routes, Telegram Business routing, update reason isolation, and the HERMES-137 flood budget across upstream profile-aware interfaces. Test stubs follow the new profile argument/return shapes without weakening their assertions.
+
 ## Non-negotiable patch lifecycle
 
 This file is a useful inventory of Brian-owned patches and retirement evidence. Keep entries current when practical, but it is advisory: publication, PR validation, promotion, and runtime operation never depend on commit subjects, trailers, or per-commit registration. Retired entries remain as historical lifecycle records even though their private code must be gone.
