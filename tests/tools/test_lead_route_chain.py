@@ -67,6 +67,10 @@ def test_inherited_authority(make_child, tmp_path, monkeypatch, named, provider,
         assert child._try_activate_fallback()
         kwargs = child._build_api_kwargs([{"role": "user", "content": "Fixture"}], tools_for_api=[])
         child._delegation_runtime_pin.validate_request(child, kwargs, client=child._anthropic_client if mode == "anthropic_messages" else child.client)
+        frozen_base = child._delegation_runtime_pin.pinned_base_url_for(child)
+        child.base_url = str(frozen_base).rstrip("/") + "/"
+        child._delegation_runtime_pin.validate_request(child, kwargs, client=child._anthropic_client if mode == "anthropic_messages" else child.client)
+        assert child._delegation_runtime_pin.pinned_base_url_for(child) == frozen_base
         if mode == "chat_completions":
             response = child.client.chat.completions.create(**kwargs)
             assert response.choices[0].message.content == "Verified inherited fallback."

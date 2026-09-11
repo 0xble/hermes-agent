@@ -2307,11 +2307,13 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     resolved_model = model or _resolve_gateway_model()
     config_context_length = provider = base_url = api_key = custom_providers = None
     configured_model = configured_provider = configured_base_url = None
+    requested_provider = None
+    # Invalid authored routes must fail before optional metadata/auth best-effort reads.
+    data = _load_gateway_runtime_config()
 
     def _read_config() -> None:
         nonlocal config_context_length, provider, base_url, custom_providers
         nonlocal configured_model, configured_provider, configured_base_url
-        data = _load_gateway_config()
         if not data:
             return
         model_cfg = data.get("model", {})
@@ -2330,8 +2332,9 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
             custom_providers = data.get("custom_providers")
 
     def _read_runtime() -> None:
-        nonlocal provider, base_url, api_key
+        nonlocal provider, base_url, api_key, requested_provider
         runtime = _resolve_runtime_agent_kwargs()
+        requested_provider = runtime.get("requested_provider")
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
@@ -2340,7 +2343,8 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
         from hermes_cli.route_identity import should_clear_context_pin
         return not should_clear_context_pin(
-            configured_model, resolved_model, configured_base_url, base_url, configured_provider, provider)
+            configured_model, resolved_model, configured_base_url, base_url,
+            configured_provider, requested_provider or provider)
 
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
@@ -2889,11 +2893,14 @@ def _checkpoint_agent_kwargs(config: dict | None) -> dict:
         "checkpoint_max_file_size_mb": cp_cfg.get("max_file_size_mb", defaults["max_file_size_mb"])}
 
 
-def _load_gateway_runtime_config() -> dict:
-    """Load gateway config for runtime reads, expanding supported ``${VAR}`` refs.
+def _load_gateway_runtime_config(config: dict | None = None) -> dict:
+    """Load gateway config for runtime reads, expanding supported ``${VAR}`` and model-preset refs.
+
+    ``config`` is the raw per-turn config passed by gateway callers. Expansion stays at this runtime-read
+    boundary so authoring loaders retain named references while every primary-route consumer sees inline fields.
     Expansion failures are deliberately NOT swallowed: an unexpanded dict would mask the bug fixed here.
     """
-    cfg = _load_gateway_config()
+    cfg = _load_gateway_config() if config is None else config
     if not isinstance(cfg, dict) or not cfg:
         return {}
     from hermes_cli.config import _expand_env_vars
@@ -2907,7 +2914,7 @@ def _load_gateway_runtime_config() -> dict:
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
     use the hardcoded default, which fails under openai-codex."""
-    cfg = config if config is not None else _load_gateway_config()
+    cfg = _load_gateway_runtime_config(config)
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg

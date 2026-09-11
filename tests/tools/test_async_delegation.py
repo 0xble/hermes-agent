@@ -5,6 +5,7 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import contextlib
 import json
 import os
 import queue
@@ -1198,6 +1199,91 @@ def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path
             ("deleg_abandoned_review",),
         ).fetchone()[0])
     assert event["native_review_result"]["judgment"] == "unknown"
+
+
+def test_persist_busy_retries_then_commits(tmp_path, monkeypatch):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    monkeypatch.setattr(ad, "_BUSY_RETRY_DELAYS_S", (0.0, 0.0))
+    event = {"type": "async_delegation", "delegation_id": "busy-ok", "status": "completed",
+             "summary": "exact result", "dispatched_at": 1.0, "completed_at": 2.0}
+    ad._persist_dispatch({"delegation_id": "busy-ok", "session_key": "s", "dispatched_at": 1.0})
+    original = ad._transaction
+    attempts = {"n": 0}
+
+    @contextlib.contextmanager
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        with original() as conn:
+            yield conn
+
+    monkeypatch.setattr(ad, "_transaction", flaky)
+    ad._persist_completion(event, {"summary": "exact result"})
+    assert attempts["n"] == 2
+    assert ad.get_durable_delegation("busy-ok")["result"] == {"summary": "exact result"}
+
+
+def test_abandoned_checkpoint_replays_exact_result_instead_of_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    now = time.time()
+    event = {"type": "async_delegation", "delegation_id": "deleg_busy_replay", "status": "completed",
+             "summary": "keep this exact summary", "session_key": "parent", "dispatched_at": now - 1.0,
+             "completed_at": now}
+    result = {"summary": "keep this exact summary"}
+    ad._persist_dispatch({"delegation_id": "deleg_busy_replay", "session_key": "parent", "dispatched_at": now - 1.0})
+    ad._checkpoint_terminal_result(event, result)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    assert ad.recover_abandoned_delegations() == 1
+    item = ad.get_durable_delegation("deleg_busy_replay")
+    assert item is not None
+    assert item["result"] == result
+    assert item["event"]["summary"] == "keep this exact summary"
+    restarted = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted) == 1
+    assert restarted.get_nowait()["summary"] == "keep this exact summary"
+
+
+def test_checkpoint_recovery_does_not_overwrite_terminal_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    now = time.time()
+    winner = {"type": "async_delegation", "delegation_id": "deleg_winner", "status": "failed",
+              "summary": "already terminal", "session_key": "parent", "dispatched_at": now - 1.0,
+              "completed_at": now}
+    ad._persist_dispatch({"delegation_id": "deleg_winner", "session_key": "parent", "dispatched_at": now - 1.0})
+    ad._persist_completion(winner, {"summary": "already terminal"})
+    ad._checkpoint_terminal_result(
+        {**winner, "status": "completed", "summary": "stale checkpoint"},
+        {"summary": "stale checkpoint"},
+    )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    assert ad.recover_abandoned_delegations() == 0
+    item = ad.get_durable_delegation("deleg_winner")
+    assert item is not None
+    assert item["result"] == {"summary": "already terminal"}
+    assert item["event"]["status"] == "failed"
+
+
+def test_persist_failure_after_checkpoint_does_not_enqueue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    now = time.time()
+    record = {"delegation_id": "deleg_no_enqueue", "session_key": "s", "goal": "g",
+              "dispatched_at": now - 1.0, "completed_at": now}
+    ad._persist_dispatch({"delegation_id": "deleg_no_enqueue", "session_key": "s", "dispatched_at": now - 1.0})
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ad, "_BUSY_RETRY_DELAYS_S", ())
+    monkeypatch.setattr(ad, "_persist_completion", boom)
+    ad._push_completion_event(record, {"summary": "exact parked result"}, "completed")
+    assert process_registry.completion_queue.empty()
+    payload = ad._load_terminal_checkpoint("deleg_no_enqueue")
+    assert payload is not None
+    assert payload["result"] == {"summary": "exact parked result"}
 
 
 def test_retry_exhaustion_parks_result_until_one_explicit_bounded_recovery(tmp_path, monkeypatch):

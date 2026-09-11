@@ -20,6 +20,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -54,6 +55,9 @@ _MAX_DELIVERY_RECOVERIES = 1
 # durable obligation awaiting an availability-triggered retry, never an age cap.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_BUSY_RETRY_DELAYS_S = (0.02, 0.04, 0.08, 0.12, 0.15)
+_TERMINAL_CHECKPOINT_SCHEMA = "async_delegation_terminal_v1"
+_CHECKPOINT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # ── Stale-delegation detection (progress-based, on by default) ──────────────
 # A runner wedged before returning never reaches its finalizer, so it would show
@@ -230,6 +234,75 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _run_with_busy_retry(op: Callable[[], Any]) -> Any:
+    """Retry a SQLite write on transient lock/busy without treating a healthy DB as corrupt."""
+    from hermes_state_errors import is_transient_sqlite_error
+    delays = _BUSY_RETRY_DELAYS_S
+    attempt = 0
+    while True:
+        try:
+            return op()
+        except sqlite3.OperationalError as exc:
+            if not is_transient_sqlite_error(exc) or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+            attempt += 1
+
+
+def _terminal_checkpoint_path(delegation_id: str) -> Path:
+    if not isinstance(delegation_id, str) or not _CHECKPOINT_ID.fullmatch(delegation_id):
+        raise ValueError("invalid delegation_id for terminal checkpoint")
+    return get_hermes_home() / "async_delegation_terminals" / f"{delegation_id}.json"
+
+
+def _checkpoint_terminal_result(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Atomically park the exact terminal event/result before the SQLite commit."""
+    from utils import atomic_json_write
+    delegation_id = event["delegation_id"]
+    path = _terminal_checkpoint_path(delegation_id)
+    atomic_json_write(path, {
+        "schema": _TERMINAL_CHECKPOINT_SCHEMA,
+        "delegation_id": delegation_id,
+        "event": event,
+        "result": result,
+    }, indent=2)
+
+
+def _load_terminal_checkpoint(delegation_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        path = _terminal_checkpoint_path(delegation_id)
+    except ValueError:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != _TERMINAL_CHECKPOINT_SCHEMA:
+        return None
+    event, result = payload.get("event"), payload.get("result")
+    if (
+        payload.get("delegation_id") != delegation_id
+        or not isinstance(event, dict)
+        or event.get("delegation_id") != delegation_id
+        or not isinstance(result, dict)
+    ):
+        return None
+    return payload
+
+
+def _clear_terminal_checkpoint(delegation_id: str) -> None:
+    try:
+        path = _terminal_checkpoint_path(delegation_id)
+    except ValueError:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("Async delegation %s: could not remove terminal checkpoint: %s", delegation_id, exc)
+
+
 def _capture_routing_origin() -> Dict[str, Any]:
     """Snapshot scope_id/user_id/user_name on the PARENT thread (the daemon worker
     has no contextvars) so a restart-replayed completion can rebuild a SessionSource.
@@ -311,13 +384,15 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
-    now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]))
+    def _write() -> None:
+        now = time.time()
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 json.dumps(event), json.dumps(result), event["delegation_id"]))
+    _run_with_busy_retry(_write)
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -358,6 +433,7 @@ def recover_abandoned_delegations() -> int:
     except Exception:
         return 0
     now, recovered = time.time(), 0
+    imported: List[str] = []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -366,6 +442,20 @@ def recover_abandoned_delegations() -> int:
         for row in rows:
             delegation_id, session_key, origin_ui, parent_id, dispatched_at, pid, started, task_json, origin_sid, result_json = row
             if pid and _pid_exists(int(pid)) and (started is None or get_process_start_time(int(pid)) == int(started)):
+                continue
+            checkpoint = _load_terminal_checkpoint(delegation_id)
+            if checkpoint is not None:
+                event = checkpoint["event"]
+                result = checkpoint["result"]
+                cur = conn.execute("""UPDATE async_delegations SET state=?, completed_at=?,
+                       updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    (event.get("status", "completed"), event.get("completed_at", now), now,
+                     json.dumps(event), json.dumps(result), delegation_id))
+                if cur.rowcount != 1:
+                    continue
+                imported.append(delegation_id)
+                recovered += 1
                 continue
             task = json.loads(task_json or "{}")
             error = "Delegation owner exited before recording a terminal result; outcome unknown."
@@ -401,6 +491,8 @@ def recover_abandoned_delegations() -> int:
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
             recovered += 1
+    for delegation_id in imported:
+        _clear_terminal_checkpoint(delegation_id)
     return recovered
 
 
@@ -1051,7 +1143,24 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         typed = _native_review_result(contract, entry)
         if typed is not None:
             evt["native_review_result"] = typed
-    _persist_completion(evt, result)
+    checkpointed = False
+    try:
+        _checkpoint_terminal_result(evt, result)
+        checkpointed = True
+    except Exception as exc:  # noqa: BLE001 — SQLite persist is the primary store
+        logger.error("Async delegation%s %s: terminal checkpoint failed: %s",
+                     label, record.get("delegation_id"), exc)
+    try:
+        _persist_completion(evt, result)
+        if checkpointed:
+            _clear_terminal_checkpoint(evt["delegation_id"])
+    except Exception as persist_exc:
+        if not checkpointed:
+            raise
+        logger.error("Async delegation%s %s: persist failed after terminal checkpoint; "
+                     "not enqueueing until recovery replays the exact result: %s",
+                     label, record.get("delegation_id"), persist_exc)
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
