@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 import uuid
 from collections import defaultdict
 from contextvars import ContextVar
@@ -24,6 +25,8 @@ class StatusDelivery:
         self.owners = {}
         self.tasks = set()
         self.cleanup_failures = {}
+        self.pending_deletes = {}
+        self.deleted = set()
         self.locks = defaultdict(asyncio.Lock)
 
     def live(self, adapter):
@@ -49,35 +52,93 @@ class StatusDelivery:
             task.add_done_callback(self.tasks.discard)
 
     async def delete(self, adapter, mid):
-        """Bounded cleanup on the receipt's transport, not a replacement bot.
+        """True=absent, None=owned deferred work, False=terminal failure.
 
-        Telegram's shared gate may defer expendable deletion without issuing a
-        request. Preserve that distinction and give finals priority while retrying
-        briefly; permanent failure remains visible rather than reported as clean.
+        A scheduler refusal issues no request and must not consume the receipt.
+        Deadline retries belong to the adapter's existing shutdown task registry;
+        they never hold the final-delivery callback open or switch transports.
+        Like the existing status receipts, this queue is process-local: shutdown
+        cancels it, and restart must not infer deletion authority from old logs.
         """
-        delete = getattr(adapter, "_delete_status_message", None) or adapter.delete_message
-        reason = "returned_false"
-        try:
-            # Leave room for Telegram's ordinary six-second group send gap.
-            async with asyncio.timeout(10):
-                for attempt in range(3):
-                    result = await delete(self.ctx.source.chat_id, mid)
-                    if result is True:
-                        self.cleanup_failures.pop(mid, None)
-                        logger.info("Temp receipt deleted for session %s generation %s: %s",
-                                    self.ctx.session_key, self.ctx.run_generation, mid)
-                        return True
-                    if result is not None:
-                        break
-                    reason = "scheduler_deferred"
-                    if attempt < 2:
-                        await asyncio.sleep(1)
-        except Exception as exc:
-            reason = type(exc).__name__
+        async with self.locks[("delete", adapter, str(mid))]:
+            return await self._delete_owned(adapter, mid)
+
+    async def _delete_owned(self, adapter, mid):
+        if not self.cleaned or not self.ctx._cleanup_progress:
+            return False
+        key = (adapter, str(mid))
+        if key in self.deleted:
+            return True
+        if key in self.pending_deletes:
+            return None
+        result = await self._delete_once(adapter, mid)
+        if result is not None:
+            return result
+        # Bound retained turn contexts during a prolonged transport outage.
+        count = getattr(adapter, "_pending_status_delete_count", 0)
+        if count >= 256:
+            self._delete_failed(mid, "pending_capacity")
+            return False
+        adapter._pending_status_delete_count = count + 1
+        task = asyncio.create_task(self._retry_delete(adapter, mid))
+        self.pending_deletes[key] = task
+        adapter._background_tasks.add(task)
+
+        def settled(task):
+            self.pending_deletes.pop(key, None)
+            adapter._pending_status_delete_count -= 1
+            adapter._background_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+        task.add_done_callback(settled)
+        logger.info("Temp receipt cleanup deferred for session %s generation %s: %s",
+                    self.ctx.session_key, self.ctx.run_generation, mid)
+        return None
+
+    def _delete_failed(self, mid, reason):
         self.cleanup_failures[mid] = reason
         logger.warning("Temp receipt cleanup failed for session %s generation %s: %s:%s",
                        self.ctx.session_key, self.ctx.run_generation, mid, reason)
+
+    async def _delete_once(self, adapter, mid):
+        delete = getattr(adapter, "_delete_status_message", None) or adapter.delete_message
+        try:
+            async with asyncio.timeout(10):
+                result = await delete(self.ctx.source.chat_id, mid)
+        except Exception as exc:
+            self._delete_failed(mid, type(exc).__name__)
+            return False
+        if result is None:
+            return None
+        if result is True:
+            self.deleted.add((adapter, str(mid)))
+            self.cleanup_failures.pop(mid, None)
+            logger.info("Temp receipt deleted for session %s generation %s: %s",
+                        self.ctx.session_key, self.ctx.run_generation, mid)
+            return True
+        self._delete_failed(mid, "returned_false")
         return False
+
+    async def _retry_delete(self, adapter, mid):
+        # Telegram rejects messages older than 48h. This is a lifetime bound,
+        # not a longer retry sleep: each wake follows the shared gate deadline.
+        expires = time.monotonic() + 48 * 3600
+        try:
+            while True:
+                remaining = expires - time.monotonic()
+                if remaining <= 0:
+                    self._delete_failed(mid, "deferred_expired")
+                    return
+                delay = getattr(adapter, "deletion_retry_after", lambda _: 1)(self.ctx.source.chat_id)
+                await asyncio.sleep(min(remaining, max(1.0, delay)))
+                if time.monotonic() >= expires:
+                    self._delete_failed(mid, "deferred_expired")
+                    return
+                if await self._delete_once(adapter, mid) is not None:
+                    return
+        except asyncio.CancelledError:
+            self._delete_failed(mid, "deferred_cancelled")
+            raise
 
     async def progress_send(self, adapter, content, *, metadata=None):
         """One shielded progress send; keep its exact receipt owner after cancellation.

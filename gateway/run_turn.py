@@ -3830,8 +3830,8 @@ class GatewayTurnMixin:
         source, run_generation = turn_ctx.source, turn_ctx.run_generation
 
         async def _cleanup_temp_bubbles() -> None:
-            """Awaited by the caller, so deletion completes BEFORE a queued follow-up starts —
-            a fire-and-forget future would race the next turn's own bubbles."""
+            """Drain immediate deletes before follow-up; retain gate-deferred receipts
+            on their exact owning adapter without blocking final delivery."""
             from gateway.status_delivery import final_delivery_succeeded
             if not final_delivery_succeeded.get():
                 logger.info("Keeping temporary bubbles after failed delivery for session %s generation %s",
@@ -3843,6 +3843,7 @@ class GatewayTurnMixin:
                 delivery.cleaned = True
             _ids_snapshot = list(dict.fromkeys(_cleanup_msg_ids))
             _deleted_count = 0
+            _deferred_count = 0
             _failed_details: list[str] = []
             for _mid in _ids_snapshot:
                 try:
@@ -3853,7 +3854,7 @@ class GatewayTurnMixin:
                     _deleted = (await delivery.delete(_delete_adapter, _mid) if delivery is not None
                                 else await _delete_adapter.delete_message(_chat_id_snapshot, _mid))
                 except asyncio.CancelledError:
-                    _completed = _deleted_count + len(_failed_details)
+                    _completed = _deleted_count + _deferred_count + len(_failed_details)
                     logger.warning(
                         "Temp bubble cleanup cancelled for session %s generation %s: "
                         "requested=%d completed=%d remaining=%d",
@@ -3864,7 +3865,9 @@ class GatewayTurnMixin:
                 except Exception as _cleanup_error:
                     _failed_details.append(f"{_mid}:{type(_cleanup_error).__name__}")
                 else:
-                    if _deleted:
+                    if _deleted is None:
+                        _deferred_count += 1
+                    elif _deleted:
                         _deleted_count += 1
                     else:
                         _failed_details.append(f"{_mid}:returned_false")
@@ -3878,9 +3881,9 @@ class GatewayTurnMixin:
                 )
             logger.info(
                 "Temp bubble cleanup complete for session %s generation %s: "
-                "requested=%d deleted=%d failed=%d",
+                "requested=%d deleted=%d failed=%d deferred=%d",
                 session_key, run_generation, len(_ids_snapshot), _deleted_count,
-                len(_failed_details),
+                len(_failed_details), _deferred_count,
             )
 
         # Registered on the adapter the turn STARTED with (callers pop from it), while the
