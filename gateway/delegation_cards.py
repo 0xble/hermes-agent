@@ -93,8 +93,8 @@ def render_card(card, now=None):
         label = _label(row.get("task_label"), "Task", 10_000)
         state = row.get("state")
         symbol, activity = {
-            "running": ("●", None),
-            "queued": ("○", "Queued"),
+            "running": ("○", None),
+            "queued": ("◌", "Queued"),
             "completed": ("✓", "Awaiting parent"),
             "failed": ("!", "Failed · awaiting parent"),
             "error": ("!", "Error · awaiting parent"),
