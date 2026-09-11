@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
+from cron.completion import CompletionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -669,6 +670,8 @@ def _action_create(a: Dict[str, Any]) -> str:
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             timezone=a["timezone"],
             allow_messaging=bool(a["allow_messaging"]),
+            **({**a["_completion_config"].fields(), "trusted_completion_config": True}
+               if a.get("_completion_config") is not None else {}),
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -914,9 +917,12 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
         error = step(job, a, updates)
         if error:
             return tool_error(error, success=False)
+    completion_config = a.get("_completion_config")
+    if completion_config is not None:
+        updates.update(completion_config.fields())
     if not updates:
         return tool_error("No updates provided.", success=False)
-    updated = update_job(job["id"], updates)
+    updated = update_job(job["id"], updates, trusted_completion_config=completion_config is not None)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
@@ -984,8 +990,10 @@ def cronjob(
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
-    paused_reason: Optional[str] = None) -> str:
-    """Unified cron job management tool."""
+    paused_reason: Optional[str] = None,
+    *,
+    _completion_config: Optional[CompletionConfig] = None) -> str:
+    """Unified cron job management tool. _completion_config is only supplied by the CLI."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
     try:

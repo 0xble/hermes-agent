@@ -883,3 +883,20 @@ class TestScriptTimeoutTreeKill:
                     psutil.Process(gpid).kill()
                 except psutil.NoSuchProcess:
                     pass
+
+
+def test_captured_python_preserves_script_identity_and_sibling_imports(cron_env, tmp_path):
+    from cron.scheduler_script import _run_job_script
+    script = cron_env / 'scripts' / 'verify.py'
+    (script.parent / 'fixture.txt').write_text('fixture')
+    (script.parent / 'sibling.py').write_text('VALUE = "sibling"\n')
+    snapshot = b'''import json, sys, __main__
+from pathlib import Path
+import sibling
+print(json.dumps([__file__, sys.argv[0], __main__.__file__, Path(__file__).with_name("fixture.txt").read_text(), sibling.VALUE]))
+'''
+    script.write_text('raise RuntimeError("live bytes must not execute")')
+    workdir = tmp_path / 'work'; workdir.mkdir()
+    ok, output = _run_job_script(str(script), workdir=str(workdir), script_snapshot=snapshot)
+    assert ok, output
+    assert json.loads(output) == [str(script.resolve())] * 3 + ['fixture', 'sibling']

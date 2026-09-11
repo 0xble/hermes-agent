@@ -89,31 +89,54 @@ def _write_last_output(job_id: str, output: str) -> None:
 def _fetch_monitor_url(
     url: str, timeout_seconds: Optional[float] = None,
 ) -> tuple[bool, str]:
-    """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
-    import urllib.request
+    """Bound the entire fetch, including DNS, TLS and trickling response headers."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    from cron.scheduler_script import _windows_cron_python_invocation
+    from hermes_cli._subprocess_compat import windows_hide_flags
+    from tools.environments.local import build_subprocess_env
 
     if not str(url).lower().startswith(("http://", "https://")):
         return False, f"monitor_url must be http(s): {url!r}"
+    timeout = float(URL_TIMEOUT_SECONDS)
+    if timeout_seconds is not None:
+        timeout = min(timeout, max(0.0, float(timeout_seconds)))
+    deadline = time.monotonic() + timeout
+    if timeout <= 0:
+        return False, "monitor_url total deadline exceeded"
+    # A stdlib-only isolated child never launches descendants. Kill + communicate reaps it
+    # and closes the network socket, unlike an abandoned thread around urlopen.
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "hermes-cron-monitor"})
-        timeout = float(URL_TIMEOUT_SECONDS)
-        if timeout_seconds is not None:
-            timeout = min(timeout, max(0.0, float(timeout_seconds)))
-        deadline = time.monotonic() + timeout
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — scheme checked above
-            chunks = []
-            total = 0
-            read = getattr(resp, "read1", resp.read)
-            while total <= MAX_URL_BYTES:
-                if time.monotonic() >= deadline:
-                    return False, "monitor_url total deadline exceeded"
-                chunk = read(min(64 * 1024, MAX_URL_BYTES + 1 - total))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-        body = b"".join(chunks)
-        return True, body[:MAX_URL_BYTES].decode("utf-8", errors="replace")
+        python, overlay = _windows_cron_python_invocation(
+            getattr(sys, "_base_executable", None) or sys.executable)
+        env = build_subprocess_env()
+        env.update(overlay)
+        with subprocess.Popen(
+            [python, "-I", str(Path(__file__).with_name("monitor_fetch.py"))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", env=env, creationflags=windows_hide_flags(),
+        ) as proc:
+            try:
+                output, _stderr = proc.communicate(
+                    json.dumps({"url": url, "timeout": timeout, "max_bytes": MAX_URL_BYTES}),
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return False, "monitor_url total deadline exceeded"
+            except BaseException:
+                proc.kill()
+                proc.communicate()
+                raise
+            if time.monotonic() >= deadline:
+                return False, "monitor_url total deadline exceeded"
+            if proc.returncode:
+                return False, "monitor_url fetch worker failed"
+            ok, body = json.loads(output)
+            return bool(ok), str(body)
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 

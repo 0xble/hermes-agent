@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from cron.completion import CompletionConfig
+
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -26,13 +28,9 @@ def _validate_completion_script_path(script: Optional[str]) -> Optional[str]:
     return _validate_cron_script_path(script)
 
 
-def _set_completion_script(job_id: str, script: Optional[str]) -> Dict[str, Any]:
-    """Persist the trusted completion verifier through the storage API.
-
-    The content hash is pinned here, at configuration time, so the scheduler can refuse a verifier
-    whose bytes changed since the operator approved them."""
+def _prepare_completion_script(script: Optional[str]) -> CompletionConfig:
+    """Read and pin the CLI-owned verifier before publishing any job changes."""
     import hashlib
-    from cron.jobs import update_job
     from cron.lifecycle_guard import _resolve_script_path
 
     script_sha256 = None
@@ -41,39 +39,7 @@ def _set_completion_script(job_id: str, script: Optional[str]) -> Dict[str, Any]
         if resolved is None:
             raise ValueError(f"Invalid completion script path: {script!r}")
         script_sha256 = hashlib.sha256(resolved.resolve().read_bytes()).hexdigest()
-    updated = update_job(job_id, {"completion_script": script or None,
-                                  "completion_script_sha256": script_sha256},
-                         trusted_completion_config=True)
-    if updated is None:
-        raise RuntimeError(f"Job not found after update: {job_id}")
-    return updated
-
-
-def _rollback_created_job(job_id: str) -> None:
-    """Undo a create whose verifier could not be pinned — an unpinned job must never survive."""
-    from cron.jobs import get_job, remove_job, update_job
-
-    removed = remove_job(job_id)
-    remaining = get_job(job_id)
-    if not removed and remaining is not None:
-        update_job(job_id, {"enabled": False})
-        remaining = get_job(job_id)
-    if remaining is not None and remaining.get("enabled", True):
-        raise RuntimeError(f"could not remove or disable partially configured job: {job_id}")
-
-
-def _restore_job_snapshot(job_id: str, snapshot: Dict[str, Any]) -> None:
-    """Restore *snapshot* after a failed verifier update, verifying every field landed."""
-    from cron.jobs import get_job, update_job
-
-    expected = {k: v for k, v in snapshot.items() if k not in {"id", "latest_execution"}}
-    restored = update_job(job_id, expected, trusted_completion_config=True)
-    current = get_job(job_id)
-    if restored is None or current is None:
-        raise RuntimeError(f"could not restore job after failed verifier update: {job_id}")
-    for key, value in expected.items():
-        if current.get(key) != value:
-            raise RuntimeError(f"job rollback verification failed for {job_id}: {key}")
+    return CompletionConfig(script or None, script_sha256)
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
@@ -652,10 +618,16 @@ def cron_create(args):
         print(color("Failed to create job: completion_script requires an agent run and "
                     "cannot be combined with --no-agent.", Colors.RED))
         return 1
+    try:
+        completion_config = _prepare_completion_script(completion_script) if completion_script else None
+    except Exception as exc:
+        print(color(f"Failed to create job: {exc}", Colors.RED))
+        return 1
     # The gateway-lifecycle guard lives in cron.jobs.create_job (every creation path); a block
     # surfaces as result["error"].
     result = _cron_api(
         action="create", schedule=args.schedule, prompt=args.prompt,
+        _completion_config=completion_config,
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         no_agent=getattr(args, "no_agent", False) or None,
@@ -665,14 +637,6 @@ def cron_create(args):
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
-    if completion_script:
-        try:
-            _set_completion_script(result["job_id"], completion_script)
-        except Exception as exc:
-            _rollback_created_job(result["job_id"])
-            print(color(f"Failed to create job: {exc}", Colors.RED))
-            return 1
-        result.setdefault("job", {})["completion_script"] = completion_script
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}\n  Schedule: {result['schedule']}")
     if result.get("skills"):
@@ -734,25 +698,21 @@ def cron_edit(args):
     update_kwargs = {"schedule": getattr(args, "schedule", None),
                      "prompt": getattr(args, "prompt", None), "skills": final_skills,
                      "no_agent": requested_no_agent, **_job_api_kwargs(args)}
-    if any(value is not None for value in update_kwargs.values()):
-        result = _cron_api(action="update", job_id=args.job_id, **update_kwargs)
+    try:
+        completion_config = (_prepare_completion_script(completion_script)
+                             if completion_script is not None else None)
+    except Exception as exc:
+        print(color(f"Failed to update completion verifier: {exc}", Colors.RED))
+        return 1
+    if completion_config is not None or any(value is not None for value in update_kwargs.values()):
+        result = _cron_api(action="update", job_id=args.job_id,
+                           _completion_config=completion_config, **update_kwargs)
         if not result.get("success"):
             print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
             return 1
     else:
-        # A verifier-only edit is still a complete update; don't report "No updates provided".
-        from tools.cronjob_tools import _format_job
+        from tools.cronjob_job_args import _format_job
         result = {"success": True, "job": _format_job(job)}
-    if completion_script is not None:
-        try:
-            updated_job = _set_completion_script(job["id"], completion_script)
-        except Exception as exc:
-            if any(value is not None for value in update_kwargs.values()):
-                _restore_job_snapshot(job["id"], job)
-            print(color(f"Failed to update completion verifier: {exc}", Colors.RED))
-            return 1
-        from tools.cronjob_tools import _format_job
-        result["job"] = _format_job(updated_job)
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))
     print(f"  Name: {updated['name']}\n  Schedule: {updated['schedule']}")

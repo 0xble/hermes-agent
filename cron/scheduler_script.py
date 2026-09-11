@@ -255,21 +255,24 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
-def _windows_cron_bootstrap_stdin_argv(
-    python_exe: str,
-    env_overlay: dict[str, str],
-    script_label: str,
+def _captured_python_argv(
+    python_exe: str, env_overlay: dict[str, str], script_label: str,
 ) -> list[str]:
-    """Execute a captured script from stdin while retaining Windows .pth support."""
-    site_packages = _sched.Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
-    if not site_packages.is_dir():
-        return [python_exe, "-"]
+    """Run captured bytes with file-invocation identity without rereading the live script."""
+    site_packages = Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
+    site_setup = (
+        f"import site;site.addsitedir({str(site_packages)!r});"
+        if env_overlay and site_packages.is_dir() else ""
+    )
     bootstrap = (
-        "import site, sys;"
-        f"site.addsitedir({str(site_packages)!r});"
-        "source = sys.stdin.read();"
+        "import os, sys;"
+        + site_setup
+        + "source = sys.stdin.read();"
         "label = sys.argv[1];"
-        "scope = {'__name__': '__main__', '__file__': label, '__package__': None};"
+        "sys.argv = [label] + sys.argv[2:];"
+        "sys.path[0] = os.path.dirname(os.path.abspath(label));"
+        "scope = sys.modules['__main__'].__dict__;"
+        "scope.update(__file__=label, __package__=None, __spec__=None, __cached__=None);"
         "exec(compile(source, label, 'exec'), scope)"
     )
     return [python_exe, "-c", bootstrap, script_label]
@@ -370,10 +373,8 @@ def _run_job_script(
     if script_stdin is not None:
         if path.suffix.lower() in {".sh", ".bash"}:
             argv = [argv[0], "-s"]
-        elif env_overlay:
-            argv = _windows_cron_bootstrap_stdin_argv(argv[0], env_overlay, str(path))
         else:
-            argv = [argv[0], "-"]
+            argv = _captured_python_argv(argv[0], env_overlay, str(path))
 
     try:
         from tools.environments.local import build_subprocess_env

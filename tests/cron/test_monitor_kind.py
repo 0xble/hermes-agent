@@ -450,7 +450,7 @@ def test_cronjob_tool_update_clears_monitor_script(hermes_env):
 
 
 def test_monitor_url_read_enforces_total_deadline(monkeypatch):
-    import cron.monitor as monitor
+    import cron.monitor_fetch as monitor
 
     class TrickleResponse:
         def __enter__(self):
@@ -469,10 +469,87 @@ def test_monitor_url_read_enforces_total_deadline(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: TrickleResponse())
     monkeypatch.setattr(monitor.time, "monotonic", lambda: next(ticks))
 
-    ok, error = monitor._fetch_monitor_url(
-        "https://example.com/monitor",
-        timeout_seconds=0.5,
-    )
+    ok, error = monitor.fetch("https://example.com/monitor", 0.5, 262_144)
 
     assert ok is False
     assert "deadline" in error.lower()
+
+
+def test_monitor_url_bounds_trickling_headers_and_closes_worker(hermes_env):
+    import socket
+    import threading
+    import time
+    from cron.monitor import _fetch_monitor_url
+    server = socket.socket(); server.bind(('127.0.0.1', 0)); server.listen()
+    server.settimeout(5)
+    closed = threading.Event()
+    def serve():
+        try:
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(8192)
+                conn.sendall(b'HTTP/1.1 200 OK\r\n')
+                for _ in range(20):
+                    time.sleep(0.2)
+                    conn.sendall(b'X-Trickle: x\r\n')
+                conn.sendall(b'Content-Length: 1\r\n\r\nx')
+        except OSError:
+            pass
+        finally:
+            closed.set(); server.close()
+    peer = threading.Thread(target=serve, daemon=True); peer.start()
+    started = time.monotonic()
+    ok, error = _fetch_monitor_url(f'http://127.0.0.1:{server.getsockname()[1]}/', timeout_seconds=0.5)
+    elapsed = time.monotonic() - started
+    assert not ok and 'deadline' in error.lower()
+    assert elapsed < 2.5  # Two seconds of scheduling/cleanup tolerance.
+    assert closed.wait(3), 'fetch socket/worker survived the deadline'
+    peer.join(3)
+
+
+@pytest.mark.parametrize('chunk', [b'', b'x' * 11])
+def test_monitor_worker_rejects_late_eof_or_size_cap(monkeypatch, chunk):
+    from cron import monitor_fetch
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self, _size):
+            return chunk
+    ticks = iter([10.0, 10.1, 10.6])
+    monkeypatch.setattr(monitor_fetch.time, 'monotonic', lambda: next(ticks))
+    monkeypatch.setattr(monitor_fetch.urllib.request, 'urlopen', lambda *a, **kw: Response())
+    ok, error = monitor_fetch.fetch('https://example.com', 0.5, 10)
+    assert not ok and 'deadline' in error
+
+
+def test_monitor_subprocess_preserves_redirects_decoding_and_size_cap(hermes_env):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    from cron.monitor import _fetch_monitor_url, MAX_URL_BYTES
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_GET(self):
+            if self.path == '/redirect':
+                self.send_response(302)
+                self.send_header('Location', '/body')
+                self.end_headers()
+                return
+            body = b'\xff' + b'x' * MAX_URL_BYTES
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    server = HTTPServer(('127.0.0.1', 0), Handler)
+    peer = threading.Thread(target=server.serve_forever, daemon=True)
+    peer.start()
+    try:
+        ok, body = _fetch_monitor_url(f'http://127.0.0.1:{server.server_port}/redirect', timeout_seconds=5)
+        assert ok, body
+        assert body == '\ufffd' + 'x' * (MAX_URL_BYTES - 1)
+    finally:
+        server.shutdown()
+        server.server_close()
+        peer.join(3)

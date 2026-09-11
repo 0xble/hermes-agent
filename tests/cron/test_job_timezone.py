@@ -279,3 +279,27 @@ def test_fast_forward_and_external_fire_claim_use_explicit_zone(
     assert _absolute(claimed["next_run_at"]) == datetime(
         2026, 1, 4, 14, 0, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize(('now', 'scheduled', 'lateness'), [
+    ('2026-11-01T06:15:00+00:00', '2026-11-01T01:30:00-04:00', 2700),
+    ('2026-03-08T07:30:00+00:00', '2026-03-08T01:30:00-05:00', 3600),
+])
+def test_due_scan_uses_elapsed_instants_across_dst(cron_store, monkeypatch, now, scheduled, lateness):
+    monkeypatch.setattr('cron.jobs._hermes_now', lambda: datetime.fromisoformat(now))
+    job = create_job('interval across DST', 'every 3h', timezone='America/New_York')
+    update_job(job['id'], {'next_run_at': scheduled})
+    due = get_due_jobs()
+    assert [j['id'] for j in due] == [job['id']]
+    assert get_job(job['id'])['last_dispatch']['lateness_seconds'] == lateness
+
+
+@pytest.mark.parametrize(('scheduled', 'due'), [
+    ('2026-11-01T01:59:30-04:00', True),
+    ('2026-11-01T01:58:00-04:00', False),
+])
+def test_fold_crossing_oneshot_grace_uses_elapsed_seconds(cron_store, monkeypatch, scheduled, due):
+    monkeypatch.setattr('cron.jobs._hermes_now', lambda: datetime(2026, 11, 1, 6, 0, 30, tzinfo=timezone.utc))
+    job = create_job('one shot across DST', 'in 1m', timezone='America/New_York')
+    update_job(job['id'], {'next_run_at': scheduled})
+    assert bool(get_due_jobs()) is due

@@ -781,3 +781,72 @@ class TestSlashCronListLastStatus:
 
         out = self._run_list(tmp_cron_dir, capsys)
         assert "(ok)" in out
+
+
+@pytest.mark.parametrize('edit', [False, True])
+def test_completion_config_is_present_in_every_published_job(tmp_cron_dir, monkeypatch, edit):
+    import cron.jobs as jobs
+    scripts = tmp_cron_dir / 'scripts'; scripts.mkdir()
+    verifier = scripts / 'verify.py'; verifier.write_bytes(b'print("verified")\n')
+    monkeypatch.setattr('hermes_constants.get_hermes_home', lambda: tmp_cron_dir)
+    monkeypatch.setattr(cron_cli, '_warn_if_gateway_not_running', lambda: None)
+    job = jobs.create_job('old', 'every 1h') if edit else None
+    published = []
+    original = jobs.save_jobs
+    def observe(records, *args, **kwargs):
+        original(records, *args, **kwargs)
+        published.extend(jobs.load_jobs())
+    monkeypatch.setattr(jobs, 'save_jobs', observe)
+    parser = argparse.ArgumentParser(); subs = parser.add_subparsers(dest='command')
+    build_cron_parser(subs, cmd_cron=cron_command)
+    command = (['cron', 'edit', job['id'], '--prompt', 'new'] if edit else
+               ['cron', 'create', 'every 1h', 'new'])
+    args = parser.parse_args(command + ['--completion-script', 'verify.py'])
+    assert cron_command(args) == 0
+    assert published
+    for row in published:
+        assert row['prompt'] == 'new'
+        assert row.get('completion_script') == 'verify.py'
+        assert row.get('completion_script_sha256') == hashlib.sha256(verifier.read_bytes()).hexdigest()
+
+
+def test_failed_verifier_pin_does_not_publish_any_edit(tmp_cron_dir, monkeypatch):
+    from pathlib import Path
+    import cron.jobs as jobs
+    scripts = tmp_cron_dir / 'scripts'
+    scripts.mkdir()
+    verifier = scripts / 'verify.py'
+    verifier.write_bytes(b'print("verified")\n')
+    monkeypatch.setattr('hermes_constants.get_hermes_home', lambda: tmp_cron_dir)
+    monkeypatch.setattr(cron_cli, '_warn_if_gateway_not_running', lambda: None)
+    parser = argparse.ArgumentParser()
+    build_cron_parser(parser.add_subparsers(dest='command'), cmd_cron=cron_command)
+    assert cron_command(parser.parse_args([
+        'cron', 'create', 'every 1h', 'old', '--completion-script', 'verify.py'])) == 0
+    before = jobs.load_jobs()
+    read_bytes = Path.read_bytes
+    def unreadable(path):
+        if path.name == 'verify.py':
+            raise OSError('verifier read failed')
+        return read_bytes(path)
+    monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    assert cron_command(parser.parse_args([
+        'cron', 'edit', before[0]['id'], '--prompt', 'new',
+        '--completion-script', 'verify.py'])) == 1
+    assert jobs.load_jobs() == before
+
+
+def test_model_dispatch_cannot_install_internal_completion_config(tmp_cron_dir):
+    import json
+    from cron.completion import CompletionConfig
+    from tools.cronjob_tools import _cronjob_handler
+    config = CompletionConfig('forged.py', 'a' * 64)
+    result = json.loads(_cronjob_handler({
+        'action': 'create', 'schedule': 'every 1h', 'prompt': 'normal job',
+        '_completion_config': config, 'completion_script': config.script,
+        'completion_script_sha256': config.sha256, 'trusted_completion_config': True,
+    }))
+    assert result['success']
+    job = get_job(result['job_id'])
+    assert job.get('completion_script') is None
+    assert job.get('completion_script_sha256') is None

@@ -942,7 +942,7 @@ def _job_is_stale_error_recurring(
     last_run_dt = _parse_aware(last_run) if last_run else None
     if last_run_dt is None:
         return False
-    age_seconds = (now - last_run_dt).total_seconds()
+    age_seconds = (now.timestamp() - last_run_dt.timestamp())
     if age_seconds < 0:
         return False
     grace = _compute_grace_seconds(schedule)
@@ -1756,6 +1756,9 @@ def create_job(
     allow_messaging: bool = False,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    *,
+    completion_script_sha256: Optional[str] = None,
+    trusted_completion_config: bool = False,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1793,7 +1796,7 @@ def create_job(
     _validate_job_mode_invariants(
         f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"],
         f["completion_script"])
-    if f["completion_script"]:
+    if (f["completion_script"] or completion_script_sha256) and not trusted_completion_config:
         raise ValueError(
             "completion verifier fields are CLI-controlled; use the Hermes cron CLI "
             "so the verifier content is validated and pinned"
@@ -1834,6 +1837,7 @@ def create_job(
         "base_url": f["base_url"],
         "script": f["script"],
         "completion_script": f["completion_script"],
+        "completion_script_sha256": completion_script_sha256,
         "no_agent": f["no_agent"],
         "monitor_script": f["monitor_script"],
         "monitor_url": f["monitor_url"],
@@ -2190,7 +2194,7 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     if not isinstance(claim, dict) or not claim.get("at"):
         return False
     claimed_at = _parse_aware(claim["at"])
-    if claimed_at is None or not (0 <= (now - claimed_at).total_seconds() < ttl_seconds):
+    if claimed_at is None or not (0 <= (now.timestamp() - claimed_at.timestamp()) < ttl_seconds):
         return False
     return not _claim_owner_is_dead(claim)
 
@@ -2924,6 +2928,7 @@ class _DueJob:
     scan: _DueScan
     next_run: str  # stored ISO string, compared string-exact against manual_run_at
     raw_next_run_dt: datetime  # as stored (may carry a pre-migration offset)
+    # Keep wall time for lattice/migration checks, use timestamps for due/elapsed arithmetic.
     next_run_dt: datetime  # normalized to the configured tz
 
     @property
@@ -2955,7 +2960,7 @@ def _repair_timezone_shifted_cron(d: _DueJob) -> bool:
     offset change meeting the same conditions SKIPS the pending occurrence; accepted as rare."""
     now = d.now
     if not (
-        d.next_run_dt <= now
+        d.next_run_dt.timestamp() <= now.timestamp()
         and _timezone_offset_mismatch(d.raw_next_run_dt, now)
         and _stored_wall_clock_is_future(d.raw_next_run_dt, now)
     ):
@@ -2983,7 +2988,7 @@ def _rearm_stale_error_recurring(d: _DueJob) -> datetime:
     now = d.now
     if not (
         d.kind in ("cron", "interval")
-        and d.next_run_dt > now
+        and d.next_run_dt.timestamp() > now.timestamp()
         and _job_is_stale_error_recurring(d.job, d.schedule, now)
     ):
         return d.next_run_dt
@@ -2993,7 +2998,7 @@ def _rearm_stale_error_recurring(d: _DueJob) -> datetime:
     else:
         recovered_next = d.recompute_next()
         recovered_next_dt = _parse_aware(recovered_next) if recovered_next else None
-    if not (recovered_next and recovered_next_dt is not None and recovered_next_dt < d.next_run_dt):
+    if not (recovered_next and recovered_next_dt is not None and recovered_next_dt.timestamp() < d.next_run_dt.timestamp()):
         return d.next_run_dt
     jid = d.job.get("id")
     logger.warning(
@@ -3047,7 +3052,7 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> None:
     protects the crash window before mark_job_run and covers the external fire_due path, which never
     calls advance_next_run. mark_job_run re-anchors on completion, so the value is provisional.
     """
-    if (d.now - d.next_run_dt).total_seconds() <= grace:
+    if (d.now.timestamp() - d.next_run_dt.timestamp()) <= grace:
         return
     new_next = d.recompute_next()
     if not new_next:
@@ -3067,7 +3072,7 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     and recovery never revives them; only the due scan used to dispatch them hours late). With no
     claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
     still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
-    if (d.now - d.next_run_dt).total_seconds() <= ONESHOT_GRACE_SECONDS:
+    if (d.now.timestamp() - d.next_run_dt.timestamp()) <= ONESHOT_GRACE_SECONDS:
         return False
     if not (d.job.get("run_claim") or d.job.get("fire_claim")):
         _write_missed_oneshot_diagnostic(d.job, d.next_run)
@@ -3154,7 +3159,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     if kind == "cron" and not manual_run and _repair_timezone_shifted_cron(d):
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
-    if d.next_run_dt > now:
+    if d.next_run_dt.timestamp() > now.timestamp():
         return False
 
     # Only the dispatch snapshot carries this field; never infer it from a later stamp.
@@ -3180,7 +3185,7 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # late catch-up. Recurring only — expired one-shots were retired above; manual triggers aren't
     # late.
     if not manual_run and recurring:
-        lateness = max(0.0, (now - d.next_run_dt).total_seconds())
+        lateness = max(0.0, (now.timestamp() - d.next_run_dt.timestamp()))
         # See #99879.
         dispatch_stamp = {
             "scheduled_at": next_run,
