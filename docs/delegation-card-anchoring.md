@@ -15,8 +15,9 @@ Unknown future states have an explicit unknown-status fallback, not a running do
 
 Task labels stay authored and untruncated under the existing plain-text sanitizer;
 roles remain inline. A second line, indented two nonbreaking spaces beyond its
-row, shows `↳` and the bounded canonical tool identifier only while running—no
-tool emoji, args, preview, or “Last tool”. Four nonbreaking spaces per actual
+row, shows `↳`, the compact tool emoji, and the bounded canonical tool
+identifier only while running—no args, preview, or “Last tool”. Four
+nonbreaking spaces per actual
 parent layer preserve Telegram indentation, capped at three visible layers.
 There are no visible numbering/ref prefixes or deep-parent ref markers, including
 unlabeled legacy rows. Stable internal refs, parent identities and exact handling,

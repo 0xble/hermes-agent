@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.delegation_cards import DelegationCards, render_card
@@ -25,7 +26,7 @@ async def handling_receipt(cards, key, refs, generation):
 
 
 @pytest.mark.parametrize("state,symbol,activity", [
-    ("running", "○", "read_file"), ("queued", "◌", "Queued"),
+    ("running", "○", "⚡ read_file"), ("queued", "◌", "Queued"),
     ("completed", "✓", "Awaiting parent"),
     ("failed", "!", "Failed · awaiting parent"), ("error", "!", "Error · awaiting parent"),
     ("timeout", "!", "Timeout · awaiting parent"),
@@ -46,22 +47,27 @@ def test_symbols_project_observed_state_without_exposing_refs_or_stale_tools(sta
     assert card == before  # Presentation cannot rewrite lifecycle identity or state.
 
 
-def test_render_card_is_plain_rich_text_with_symbol_first_rows():
-    card = {
-        "started_at": 0,
-        "rows": {"A": {"thread_ref": "A", "task_label": "Repair restart receipt", "role": "orchestrator", "subagent_type": "lead",
-                         "state": "running", "last_tool": "read_file"}},
-    }
+def test_render_card_shows_lightning_only_for_observed_tool_activity():
+    card = {"rows": {
+        "root": dict(thread_ref="A", task_label="Run tools", subagent_type="lead",
+                     state="running", last_tool="delegate_task"),
+        "nested": dict(thread_ref="A.1", card_parent_identity="root", task_label="Run code",
+                       state="running", last_tool="execute_code"),
+        "started": dict(thread_ref="B", task_label="Await tool", state="running"),
+        "returned": dict(thread_ref="C", task_label="Await parent", state="completed", last_tool="read_file"),
+    }}
 
-    rendered = render_card(card, now=0)
+    lines = render_card(card, now=0).splitlines()
 
-    lines = rendered.splitlines()
-    assert lines[0] == "🧵 **Delegating tasks**"
-    assert render_card(card, now=3600).splitlines()[0] == "🧵 **Delegating tasks**"
-    assert lines[1] == "○ Repair restart receipt · Lead"
-    assert lines[2] == "\u00a0\u00a0↳ read_file"
-    assert "computer_use" in render_card({**card, "rows": {"A": {**card["rows"]["A"], "last_tool": "computer_use_multi_step"}}}, now=0)
-    assert not any(line.startswith(">") for line in lines)
+    assert lines == [
+        "🧵 **Delegating tasks**",
+        "○ Run tools · Lead", "\u00a0\u00a0↳ ⚡ delegate_task",
+        "\u00a0\u00a0\u00a0\u00a0○ Run code", "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ execute_code",
+        "○ Await tool", "\u00a0\u00a0↳ Started · awaiting activity",
+        "✓ Await parent", "\u00a0\u00a0↳ Awaiting parent",
+    ]
+    assert all("⚡" not in line for line in (lines[6], lines[8]))
+    assert not any("A.1" in line or line.startswith(">") for line in lines)
 
 
 @pytest.mark.asyncio
@@ -97,9 +103,9 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     assert sent_lines[1] == "◌ Repair receipt · Worker"
     assert sent_lines[2] == "\u00a0\u00a0↳ Queued"
     assert sent_lines[3] == "\u00a0\u00a0\u00a0\u00a0○ Verify card edit · Explorer"
-    assert sent_lines[4] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ terminal"
+    assert sent_lines[4] == f"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ {get_tool_emoji('terminal')} terminal"
     assert sent_lines[5] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0○ Verify edit payload · Worker"
-    assert sent_lines[6] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ read\\_file"
+    assert sent_lines[6] == "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ read\\_file"
     assert sent_lines[7] == r"\! Check \(send\)\! \#1 \+ A\.B"
     assert all("*" not in line for line in sent_lines[1:])
     assert "A.1" not in content
@@ -161,7 +167,7 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
     await drain_cards(cards)
     expected = tool[:40]
     plain = render_card(cards.cards["a" * 32], now=0)
-    assert plain.splitlines()[-1] == f"\u00a0\u00a0↳ {expected}"
+    assert plain.splitlines()[-1] == f"\u00a0\u00a0↳ ⚡ {expected}"
     sent = adapter._bot.send_message.call_args.kwargs["text"]
     assert expected.replace("_", "\\_") in sent
     # A distinct update must exercise edit formatting, not unchanged suppression.
@@ -214,7 +220,7 @@ async def test_nested_cards_preserve_actual_parentage_and_third_layer_role_layou
     assert "○ Check Telegram edits · Worker" in lines
     assert "\u00a0\u00a0\u00a0\u00a0○ Verify card edit · Worker" in lines
     assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0○ Check Telegram edits · Worker" in lines
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ computer_use" in lines
+    assert f"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ {get_tool_emoji('computer_use')} computer_use" in lines
     assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0○ Bound deep descendant · Worker" in lines
     assert any(len(line) > 32 for line in lines[1::2])  # guidance never truncates authored labels
     assert all("Last tool:" not in line and "PRIVATE_" not in line for line in lines)
@@ -280,7 +286,7 @@ async def test_nested_relays_reach_root_card_with_root_display_owner(tmp_path):
     assert "○ root" in rendered
     assert "\u00a0\u00a0\u00a0\u00a0○ child" in rendered
     assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0○ grandchild" in rendered
-    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ read_file" in rendered
+    assert "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ read_file" in rendered
 
 
 @pytest.mark.asyncio
@@ -350,7 +356,7 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, 
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    assert "\u00a0\u00a0↳ terminal" in adapter.edit_message.call_args.args[2]
+    assert f"\u00a0\u00a0↳ {get_tool_emoji('terminal')} terminal" in adapter.edit_message.call_args.args[2]
     assert not any(line.startswith(">") for line in adapter.edit_message.call_args.args[2].splitlines())
     assert adapter.edit_message.call_args.kwargs == {"finalize": True, "metadata": {"hermes_status": True}}
     assert "SECRET" not in adapter.edit_message.call_args.args[2]

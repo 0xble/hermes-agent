@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway import delegation_card_anchor as anchoring
 from gateway import delegation_card_presentation as presentation
@@ -106,8 +107,10 @@ def render_card(card, now=None):
         }.get(state, ("Ⅱ", "Status unknown · awaiting parent"))
         lines.append(f"{prefix}{symbol} {label}{role_suffix}")
         if activity is None:
-            # Canonical identifiers only: no tool emoji, previews, args or usage summaries.
-            activity = (_tool_label(row["last_tool"]) if row.get("last_tool")
+            # Tool rows retain the compact icon plus canonical identifier only:
+            # no previews, arguments, usage summaries, or stale terminal tool.
+            tool = row.get("last_tool")
+            activity = (f"{get_tool_emoji(tool)} {_tool_label(tool)}" if tool
                         else "Started · awaiting activity")
         lines.append(f"{prefix}\u00a0\u00a0↳ {activity}")
     # Do not invent a row/card truncation policy. The platform adapter reports
