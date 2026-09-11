@@ -69,24 +69,21 @@ def prepare_goal_turn(manager, agent, result, *, is_current=lambda: True):
         detail = str(result.get("error") or result.get("failure_reason") or "").strip()
         reason = ": ".join(part for part in (exit_reason, detail) if part) or "agent turn failed"
         reason = redact_sensitive_text(reason, force=True)[:1600]
-        decision = manager.unexpected_stop(reason)
+        decision = manager.unexpected_stop(reason, expected_revision=revision, is_current=current)
     elif text.strip():
         decision = manager.evaluate_after_turn(text, user_initiated=True,
             background_processes=gather_background_processes(owner_task_id=manager.session_id),
-            active_delegations=count_active_delegations(manager.session_id), tool_evidence=evidence)
+            active_delegations=count_active_delegations(manager.session_id), tool_evidence=evidence,
+            expected_revision=revision, is_current=current)
     else:
         return  # emptiness alone does not prove failure
-    if not current() or get_goal_control_revision(manager.session_id) != revision:
+    from hermes_cli.goals_evaluation import decision_is_current
+    if not decision or not current() or not decision_is_current(decision):
         return
     # Freeze lifecycle BEFORE the output-only classifier, then recheck authority.
     prepared = manager.prepare_goal_outcome(decision, text, tool_evidence=evidence)
-    if not current() or get_goal_control_revision(manager.session_id) != revision:
+    if not current() or not decision_is_current(decision):
         return
-    decision["_goal_authority"] = {
-        "session_id": manager.session_id,
-        "revision": revision,
-        "updated_at": manager.state.updated_at if manager.state else None,
-    }
     result["_goal_decision"] = decision
     if prepared != text or decision.get("stop_explanation"):
         from agent.turn_finalizer import synchronize_terminal_response
@@ -102,6 +99,10 @@ def prepared_continuation_is_current(decision):
     session_id = authority.get("session_id")
     if not session_id:
         return False
+    if authority.get("state_token"):
+        from hermes_cli.goals_evaluation import decision_is_current
+        if not decision_is_current(decision):
+            return False
     manager = GoalManager(session_id)
     return bool(
         manager.is_active() and manager.state

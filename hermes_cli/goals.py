@@ -9,6 +9,7 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -20,7 +21,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.goals_blockers import normalize_blocker, blocker_summary, blocker_resume_context
@@ -32,8 +33,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 20
 DEFAULT_JUDGE_TIMEOUT = 30.0
-_MODEL_GOAL_CONTROL_REVISIONS: Dict[str, int] = {}
-_MODEL_GOAL_CONTROL_LOCKS: Dict[str, threading.RLock] = {}
+_MODEL_GOAL_CONTROL_REVISIONS: Dict[Tuple[str, str], int] = {}
+_MODEL_GOAL_CONTROL_LOCKS: Dict[Tuple[str, str], threading.RLock] = {}
 _MODEL_GOAL_CONTROL_LOCKS_LOCK = threading.Lock()
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -198,13 +199,18 @@ def _goal_control_revision_key(session_id: str) -> str:
     return f"goal-control-revision:{session_id}"
 
 
+def _goal_control_cache_key(session_id: str) -> Tuple[str, str]:
+    from hermes_constants import get_hermes_home
+    return str(get_hermes_home().resolve()), session_id
+
+
 def _goal_control_lock(session_id: str) -> threading.RLock:
     with _MODEL_GOAL_CONTROL_LOCKS_LOCK:
-        return _MODEL_GOAL_CONTROL_LOCKS.setdefault(session_id, threading.RLock())
+        return _MODEL_GOAL_CONTROL_LOCKS.setdefault(_goal_control_cache_key(session_id), threading.RLock())
 
 
 def _read_goal_control_revision_unlocked(session_id: str) -> int:
-    revision = _MODEL_GOAL_CONTROL_REVISIONS.get(session_id, 0)
+    revision = _MODEL_GOAL_CONTROL_REVISIONS.get(_goal_control_cache_key(session_id), 0)
     db = _get_session_db()
     if db is not None:
         try:
@@ -214,7 +220,7 @@ def _read_goal_control_revision_unlocked(session_id: str) -> int:
             logger.warning("Goal control revision is invalid for %s", session_id)
         except Exception as exc:
             logger.debug("Goal control revision read failed: %s", exc)
-    _MODEL_GOAL_CONTROL_REVISIONS[session_id] = revision
+    _MODEL_GOAL_CONTROL_REVISIONS[_goal_control_cache_key(session_id)] = revision
     return revision
 
 
@@ -234,7 +240,7 @@ def advance_goal_control_revision(session_id: str) -> int:
         return 0
     with _goal_control_lock(sid):
         revision = _read_goal_control_revision_unlocked(sid) + 1
-        _MODEL_GOAL_CONTROL_REVISIONS[sid] = revision
+        _MODEL_GOAL_CONTROL_REVISIONS[_goal_control_cache_key(sid)] = revision
         db = _get_session_db()
         if db is not None:
             try:
@@ -882,25 +888,24 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
+def _load_goal_record(session_id: str) -> Tuple[bool, Optional[str], Optional[GoalState]]:
+    """Decode state and its accepted raw baseline from the same read."""
     if not session_id:
-        return None
+        return False, None, None
     db = _get_session_db()
     if db is None:
-        return None
+        return False, None, None
     try:
         raw = db.get_meta(_meta_key(session_id))
+        return True, raw, GoalState.from_json(raw) if raw else None
     except Exception as exc:
-        logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
-    if not raw:
-        return None
-    try:
-        return GoalState.from_json(raw)
-    except Exception as exc:
-        logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        logger.debug("GoalManager: goal read failed: %s", exc)
+        return False, None, None
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session, or None if unavailable or absent."""
+    return _load_goal_record(session_id)[2]
 
 
 def save_goal(session_id: str, state: GoalState) -> bool:
@@ -1394,7 +1399,10 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        loaded, raw, state = _load_goal_record(session_id)
+        self._state: Optional[GoalState] = state
+        self._stored_goal_raw = raw
+        self._has_stored_baseline = loaded
         self._dirty_since: Optional[float] = None
 
     # --- introspection ------------------------------------------------
@@ -1404,46 +1412,22 @@ class GoalManager:
         return self.refresh()
 
     def refresh(self) -> Optional[GoalState]:
-        """Reload state from SessionDB and return it.
-
-        Live CLI/gateway sessions may keep a ``GoalManager`` cached while a
-        model-callable tool updates the same session's goal through the DB.
-        Refreshing on public reads/mutations keeps those cached managers in
-        sync with externally-written goal state. Cleared audit rows are exposed
-        as ``None`` here so callers keep the long-standing "no active state"
-        semantics while ``load_goal`` still preserves the row for audit.
-        """
-        state = load_goal(self.session_id)
-        if self._dirty_since is not None:
-            if state is not None and self._state is not None and state.to_json() == self._state.to_json():
-                self._dirty_since = None
-            elif state is not None and max(state.created_at, state.last_turn_at, state.updated_at) > self._dirty_since:
-                self._dirty_since = None
-            else:
-                return None if self._state is None or self._state.status == "cleared" else self._state
-        if state is None:
-            return self._state
-        if self._state is not None:
-            if state.to_json() == self._state.to_json():
-                return None if self._state.status == "cleared" else self._state
-            local_revision = max(
-                self._state.created_at,
-                self._state.last_turn_at,
-                self._state.updated_at,
-            )
-            stored_revision = max(state.created_at, state.last_turn_at, state.updated_at)
-            # Public callers historically mutate nested state (for example,
-            # gate retry limits) before the next manager operation. An equal
-            # persisted revision is therefore an older snapshot, not evidence
-            # that the local mutation should be discarded. Model-tool writes
-            # use a fresh updated_at and still win this comparison.
-            if stored_revision <= local_revision:
-                return None if self._state.status == "cleared" else self._state
-        self._state = None if state.status == "cleared" else state
-        return self._state
+        """Preserve unsaved local edits only while their accepted storage baseline holds."""
+        loaded, raw, state = _load_goal_record(self.session_id)
+        if loaded and (not self._has_stored_baseline or raw != self._stored_goal_raw):
+            self._state = state
+            self._stored_goal_raw = raw
+            self._has_stored_baseline = True
+            self._dirty_since = None
+        return None if self._state is None or self._state.status == "cleared" else self._state
 
     def _persist_state(self, state: GoalState) -> bool:
-        saved = save_goal(self.session_id, state)
+        # Keep the baseline tied to the exact accepted snapshot, never a later read or mutation.
+        snapshot = copy.deepcopy(state)
+        saved = save_goal(self.session_id, snapshot)
+        if saved:
+            self._stored_goal_raw = snapshot.to_json()
+            self._has_stored_baseline = True
         self._dirty_since = None if saved else time.time()
         return saved
 
@@ -1544,7 +1528,15 @@ class GoalManager:
         decision["stop_event"] = f"{self.session_id}:{self._state.created_at}:{self._state.updated_at}"
         return decision
 
-    def unexpected_stop(self, reason: str) -> Dict[str, Any]:
+    def unexpected_stop(
+        self, reason: str, *, expected_revision: Optional[int] = None,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> Dict[str, Any]:
+        from hermes_cli.goals_evaluation import evaluate_draft
+        return evaluate_draft(self, lambda draft: draft._unexpected_stop_draft(reason),
+                              expected_revision=expected_revision, is_current=is_current)
+
+    def _unexpected_stop_draft(self, reason: str) -> Dict[str, Any]:
         """Pause an active goal after a failed turn; waiting barriers remain routine and silent."""
         state = self.refresh()
         if state is None or state.status != "active":
@@ -2076,6 +2068,22 @@ class GoalManager:
         return decision
 
     def evaluate_after_turn(
+        self, last_response: str, *, user_initiated: bool = True,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+        active_delegations: int = 0,
+        tool_evidence: Optional[List[Dict[str, Any]]] = None,
+        expected_revision: Optional[int] = None,
+        is_current: Callable[[], bool] = lambda: True,
+    ) -> Dict[str, Any]:
+        from hermes_cli.goals_evaluation import evaluate_draft
+        return evaluate_draft(
+            self, lambda draft: draft._evaluate_after_turn_draft(
+                last_response, user_initiated=user_initiated,
+                background_processes=background_processes, active_delegations=active_delegations,
+                tool_evidence=tool_evidence),
+            expected_revision=expected_revision, is_current=is_current)
+
+    def _evaluate_after_turn_draft(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,

@@ -1442,6 +1442,36 @@ class SessionDB(
             row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
+    def get_meta_values(self, keys: List[str]) -> Dict[str, Optional[str]]:
+        """Read related metadata in one SQLite snapshot, preserving absent keys."""
+        if not keys:
+            return {}
+        placeholders = ",".join("?" for _ in keys)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT key, value FROM state_meta WHERE key IN ({placeholders})", keys,
+            ).fetchall()
+        values = dict(rows)
+        return {key: values.get(key) for key in keys}
+
+    def compare_and_set_meta(
+        self, expected: Dict[str, Optional[str]], replacements: Dict[str, str],
+        *, is_current: Callable[[], bool] = lambda: True,
+    ) -> bool:
+        """Publish a prepared result only if its complete metadata baseline still holds."""
+        def apply(conn):
+            for key, value in expected.items():
+                row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+                if (None if row is None else row[0]) != value:
+                    return False
+            if not is_current():
+                return False
+            cursor = conn.cursor()
+            for key, value in replacements.items():
+                self.set_meta(key, value, cursor=cursor)
+            return True
+        return self._execute_write(apply)
+
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
         """Upsert state_meta[key]; with ``cursor`` the write is inline (the caller already holds a
         transaction — nesting BEGIN IMMEDIATE would deadlock)."""
