@@ -605,7 +605,14 @@ export function closeManualOnboarding() {
   providersRefreshPromise = null
   pendingProviderOAuthId = null
 
-  patch({ targetProfile: undefined, manual: false, requested: false, localEndpoint: false, freeTierReady: false, flow: { status: 'idle' } })
+  patch({
+    targetProfile: undefined,
+    manual: false,
+    requested: false,
+    localEndpoint: false,
+    freeTierReady: false,
+    flow: { status: 'idle' }
+  })
 }
 
 export function completeDesktopOnboarding() {

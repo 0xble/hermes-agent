@@ -776,7 +776,7 @@ class GatewayBusySessionMixin:
     _PLAIN_COMMANDS = (
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "reasoning", "fast",
-        "footer", "help", "commands", "profile", "login", "update", "version", "title",
+        "footer", "help", "commands", "profile", "wisdom", "login", "update", "version", "title",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (

@@ -178,13 +178,12 @@ def _blank_slate_minimal_toolsets(config: dict):
             # here causes model_tools to subtract their tools (terminal, read_file, …) from the minimal
             # Blank Slate surface (#57315).
             all_keys.add(k)
-        # ``disabled_toolsets`` is applied at TOOL granularity and one tool can belong to several
-        # toolsets, so a deny-only singleton may overlap a kept bundle (``skill_management`` vs
-        # ``skills``). Disabling it would silently strip a tool a kept toolset still provides
-        # (#57315, #58281) — filter those out rather than trusting key-level subtraction.
-        kept_tools = {tool for key in keep for tool in resolve_toolset(key)}
-        disabled = sorted(key for key in all_keys - keep
-                          if not kept_tools.intersection(resolve_toolset(key)))
+        # Disabling a bundle subtracts its tools even if another kept bundle owns them.
+        kept_tools = {tool for name in keep for tool in resolve_toolset(name)}
+        disabled = sorted(
+            name for name in all_keys - keep
+            if kept_tools.isdisjoint(resolve_toolset(name))
+        )
         if disabled:
             config.setdefault("agent", {})["disabled_toolsets"] = disabled
     except Exception as exc:
