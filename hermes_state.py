@@ -1447,8 +1447,8 @@ class SessionDB(
         if not keys:
             return {}
         placeholders = ",".join("?" for _ in keys)
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_ctx() as conn:
+            rows = conn.execute(
                 f"SELECT key, value FROM state_meta WHERE key IN ({placeholders})", keys,
             ).fetchall()
         values = dict(rows)

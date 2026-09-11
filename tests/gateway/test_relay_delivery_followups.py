@@ -447,6 +447,8 @@ def test_live_completion_event_carries_scope_id(tmp_path, monkeypatch):
     cache was evicted."""
     import tools.async_delegation as ad
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
     record = {
         "delegation_id": "d-live-1",
         "session_key": "agent:main:discord:group:C123:U9",
@@ -470,6 +472,7 @@ def test_live_completion_event_carries_scope_id(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "tools.process_registry.process_registry", _PR(), raising=False
     )
+    ad._persist_dispatch(record)
     ad._push_completion_event(record, {"summary": "ok"}, "completed")
     assert captured.get("scope_id") == "G777"
     assert captured.get("user_id") == "U9"
