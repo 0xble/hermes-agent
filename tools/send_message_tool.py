@@ -571,13 +571,13 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
                         and os.path.splitext(path)[1].lower() in _IMAGE_EXTS
                         and os.path.exists(path)):
                     images.append((index, path))
-            if len(images) > 1:
-                from urllib.parse import quote
+            if len(images) == total:
+                from pathlib import Path
 
                 try:
                     results = await adapter.send_multiple_images(
                         chat_id=chat_id,
-                        images=[(f"file://{quote(path)}", caption if n == 0 else "")
+                        images=[(Path(path).resolve().as_uri(), caption if n == 0 else "")
                                 for n, (_index, path) in enumerate(images)],
                         metadata=metadata)
                 except asyncio.CancelledError:

@@ -358,6 +358,10 @@ def validate(root: Path, trusted_root: Path | None = None) -> list[str]:
         paths = _workflow_paths(root)
     except ValueError as exc:
         return [str(exc)]
+    present = {path.name for path in paths}
+    for required in ("ci.yaml", "fork-policy.yml"):
+        if required not in present:
+            errors.append(f"{required}: mandatory workflow is missing")
     for path in paths:
         try:
             data = _load(path)

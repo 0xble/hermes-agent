@@ -181,3 +181,17 @@ def test_project_python_prefers_repository_environment(tmp_path: Path) -> None:
     candidate.parent.mkdir(parents=True)
     candidate.write_text("", encoding="utf-8")
     assert MODULE.project_python(tmp_path) == str(candidate)
+
+
+def test_requested_head_must_be_the_tested_checkout(tmp_path, capsys):
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(tmp_path), *args], text=True).strip()
+    git('init', '-q')
+    git('config', 'user.email', 'test@example.invalid')
+    git('config', 'user.name', 'Test')
+    git('commit', '--allow-empty', '-qm', 'first')
+    old = git('rev-parse', 'HEAD')
+    git('commit', '--allow-empty', '-qm', 'second')
+    assert MODULE.main(['--profile', 'smoke', '--repo-root', str(tmp_path),
+                        '--head', old, '--dry-run', '--json']) == 2
+    assert 'differs from the checkout' in json.loads(capsys.readouterr().out)['error']

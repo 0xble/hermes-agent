@@ -141,3 +141,27 @@ def test_anthropic_mandatory_thinking(agent):
     with session_model_scope(agent, Mock()):
         assert request(reasoning="none")["status"] == "rejected"
         assert request(reasoning="high")["status"] == "queued"
+
+
+@pytest.mark.parametrize('completion', ['applied', 'failed', 'cancelled'])
+def test_receipt_matches_durable_terminal_history(agent, tmp_path, completion):
+    from hermes_state import SessionDB
+    db = SessionDB(tmp_path / 'receipt.db')
+    try:
+        db.create_session(agent.session_id, source='cli')
+        messages = [{'role': 'user', 'content': 'Set reasoning high'},
+                    {'role': 'assistant', 'content': 'Queued.'}]
+        db.replace_messages(agent.session_id, messages)
+        agent._session_db = db
+        agent._session_messages = messages
+        apply = Mock(side_effect=ValueError('rejected')) if completion == 'failed' else Mock()
+        with session_model_scope(agent, apply) as control:
+            assert request(reasoning='high')['status'] == 'queued'
+            result = control.finish({'completed': completion != 'cancelled',
+                                     'messages': messages, 'final_response': 'Queued.'})
+        assert result['session_model']['status'] == completion
+        assert result['messages'][-1]['content'] == result['final_response']
+        assert agent._session_messages[-1]['content'] == result['final_response']
+        assert db.get_messages(agent.session_id)[-1]['content'] == result['final_response']
+    finally:
+        db.close()

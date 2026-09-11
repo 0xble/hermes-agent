@@ -30,3 +30,8 @@ def test_parse_reasoning_turn_rejects_global_scope():
 
 def test_parse_reasoning_turn_does_not_claim_unknown_subcommand():
     assert parse_reasoning_turn("turbo answer this") is None
+
+
+@pytest.mark.parametrize("effort", ["high", "none"])
+def test_persistent_global_setting_is_not_a_one_turn_prompt(effort):
+    assert parse_reasoning_turn(f"{effort} --global") is None

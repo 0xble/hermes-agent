@@ -354,7 +354,7 @@ class SessionFtsSetupMixin:
     def _fts_structure_is_corrupt(self):
         """Positively attribute a malformed error to the FTS shadow tables (HERMES-054).
 
-        Runs FTS5's structure-only ``integrity-check`` (rank=1: internal index consistency, no
+        Runs FTS5's structure-only ``integrity-check`` (rank=0: internal index consistency, no
         external-content comparison) against each present FTS table. True when any FTS structure is
         corrupt, False when every present structure verifies clean, and None when the probe itself
         cannot run (older FTS5, probe error) — callers treat None as "attribution unknown" and keep
@@ -379,7 +379,7 @@ class SessionFtsSetupMixin:
                 for table in present:
                     try:
                         self._conn.execute(
-                            f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)")
+                            f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 0)")
                     except sqlite3.DatabaseError as probe_exc:
                         from hermes_state_errors import is_malformed_db_error
                         if is_malformed_db_error(probe_exc) or "corrupt" in str(probe_exc).lower():

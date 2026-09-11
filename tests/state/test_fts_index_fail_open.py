@@ -131,3 +131,18 @@ def test_escaped_fts_only_error_is_index_scoped_not_quarantined(tmp_path, monkey
         assert "refused detach" not in _contents(db_path)
     finally:
         db.close()
+
+
+def test_structure_probe_does_not_classify_content_mismatch_as_shadow_corruption(tmp_path):
+    import threading
+    from hermes_state_fts import SessionFtsSetupMixin
+    conn = sqlite3.connect(tmp_path / 'probe.db')
+    try:
+        conn.executescript("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);"
+            "CREATE VIRTUAL TABLE messages_fts USING fts5(body, content='docs', content_rowid='id');"
+            "INSERT INTO docs VALUES(1,'canonical text');"
+            "INSERT INTO messages_fts(rowid,body) VALUES(1,'stale index text');")
+        probe = SimpleNamespace(_conn=conn, _lock=threading.RLock(), _FTS_PROBE_CACHE_SECONDS=60)
+        assert SessionFtsSetupMixin._fts_structure_is_corrupt(probe) is False
+    finally:
+        conn.close()

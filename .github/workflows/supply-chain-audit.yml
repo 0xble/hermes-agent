@@ -31,13 +31,17 @@ jobs:
       - name: Scan added code
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          diff=$(git diff "$BASE"..."$HEAD" -- . ':!uv.lock' ':!*.lock' ':!package-lock.json' ':!yarn.lock' || true)
+          HEAD=$(git rev-parse --verify "$HEAD^{commit}")
+          # Manual runs inspect the dispatched commit against its first parent.
+          BASE=$(git rev-parse --verify "${BASE:-$HEAD^1}^{commit}")
+          diff=$(git diff --no-textconv --no-ext-diff "$BASE"..."$HEAD" -- . ':!uv.lock' ':!*.lock' ':!package-lock.json' ':!yarn.lock')
           findings=""
 
-          pth_files=$(git diff --diff-filter=d --name-only "$BASE"..."$HEAD" | grep '\.pth$' || true)
+          changed=$(git diff --no-textconv --no-ext-diff --diff-filter=d --name-only "$BASE"..."$HEAD")
+          pth_files=$(printf '%s\n' "$changed" | grep '\.pth$' || true)
           [ -z "$pth_files" ] || findings="${findings}\nPython .pth file changed:\n${pth_files}"
 
           b64_exec=$(printf '%s\n' "$diff" | grep -n '^+' | grep -iE 'base64\.(b64decode|decodebytes|urlsafe_b64decode)' | grep -iE 'exec\(|eval\(' | head -10 || true)
@@ -46,7 +50,7 @@ jobs:
           proc_obfuscation=$(printf '%s\n' "$diff" | grep -n '^+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|\\x[0-9a-f]{2}|chr\(' | head -10 || true)
           [ -z "$proc_obfuscation" ] || findings="${findings}\nobfuscated subprocess command:\n${proc_obfuscation}"
 
-          install_hooks=$(git diff --diff-filter=d --name-only "$BASE"..."$HEAD" | grep -E '^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$' || true)
+          install_hooks=$(printf '%s\n' "$changed" | grep -E '^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$' || true)
           [ -z "$install_hooks" ] || findings="${findings}\ninstall/startup hook changed:\n${install_hooks}"
 
           if [ -n "$findings" ]; then
@@ -67,10 +71,14 @@ jobs:
       - name: Reject newly unbounded dependencies
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          added=$(git diff "$BASE"..."$HEAD" -- pyproject.toml | grep '^+' | grep -v '^+++' || true)
+          HEAD=$(git rev-parse --verify "$HEAD^{commit}")
+          # Manual runs inspect the dispatched commit against its first parent.
+          BASE=$(git rev-parse --verify "${BASE:-$HEAD^1}^{commit}")
+          diff=$(git diff --no-textconv --no-ext-diff "$BASE"..."$HEAD" -- pyproject.toml)
+          added=$(printf '%s\n' "$diff" | grep '^+' | grep -v '^+++' || true)
           unbounded=$(printf '%s\n' "$added" | grep -oE '"[a-zA-Z0-9_-]+(\[[^]]*\])?>=[ 0-9.]+"' | grep -v ',<' || true)
           if [ -n "$unbounded" ]; then
             echo "::error::New PyPI dependencies require an upper bound:"

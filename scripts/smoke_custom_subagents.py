@@ -515,30 +515,17 @@ def _resolve_active_credentials() -> tuple[dict, str]:
     route Hermes does not use. A 429 from it says nothing about whether Hermes's
     credential path works — the mistake the first version of this smoke made.
     """
-    from hermes_cli.auth import resolve_codex_runtime_credentials
     from hermes_cli.config import load_config_readonly
+    from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    resolved = resolve_codex_runtime_credentials()
-    token = (resolved or {}).get("access_token") or (resolved or {}).get("api_key")
-    if not token:
-        raise RuntimeError(
-            "Hermes's Codex credential resolver returned no access token. "
-            "Run `hermes auth` for the Codex subscription and retry."
-        )
     live = load_config_readonly() or {}
-    # ``model`` is a mapping ({default, provider}), not a string.
     model_block = live.get("model")
     model = model_block.get("default") if isinstance(model_block, dict) else model_block
-    return (
-        {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "model": model or "gpt-6-astra",
-            "api_key": token,
-        },
-        "hermes_cli.auth.resolve_codex_runtime_credentials",
-    )
+    if not model:
+        raise RuntimeError("Active Hermes configuration has no default model")
+    requested = model_block.get("provider") if isinstance(model_block, dict) else None
+    runtime = resolve_runtime_provider(requested=requested, target_model=model)
+    return ({**runtime, "model": model}, "hermes_cli.runtime_provider.resolve_runtime_provider")
 
 
 def _child_tool_outputs(home: Path, child_session_id) -> list:

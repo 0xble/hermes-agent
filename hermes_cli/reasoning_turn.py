@@ -43,6 +43,8 @@ def parse_reasoning_turn(raw_args: str) -> ReasoningTurnRequest | None:
     raw_effort, prompt = parts[0].lower(), parts[1].strip()
     if not prompt:
         return None
+    if prompt == "--global":
+        return None  # Existing persistent setting, not a one-turn prompt.
 
     parsed = parse_reasoning_effort(raw_effort)
     if parsed is None:

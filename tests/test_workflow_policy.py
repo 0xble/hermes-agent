@@ -234,3 +234,10 @@ def test_write_secrets_publish_and_privileged_runner_are_rejected(tmp_path: Path
     assert any("secrets and deployment environments" in error for error in errors)
     assert any("secret references" in error for error in errors)
     assert any("deployment or publish" in error for error in errors)
+
+
+@pytest.mark.parametrize("missing", ["ci.yaml", "fork-policy.yml"])
+def test_missing_mandatory_workflow_is_rejected(tmp_path, missing):
+    root = candidate(tmp_path)
+    (root / '.github/workflows' / missing).unlink()
+    assert any(missing in error and 'missing' in error for error in validate(root, ROOT))

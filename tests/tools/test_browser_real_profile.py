@@ -1161,18 +1161,7 @@ class TestWindowsLockedProfileCopy:
             src_con.close()
         elapsed = time.monotonic() - started
         assert elapsed < 2.0
-        # HERMES-077's contract is boundedness, and the fork additionally requires that an
-        # exclusively-locked source still yields its COMMITTED state rather than failing the
-        # launch. immutable=1 bypasses lock negotiation and reads exactly that committed image,
-        # so this returns True with the pre-lock value. Upstream asserts False here; adopting
-        # that breaks real-profile launch outright, because a running Chrome holds Login Data
-        # and Web Data exclusively and _mirror_profile_auth fails the whole snapshot on any
-        # unreadable DB. Measured on macOS with live Chrome: mode=ro burns the full budget and
-        # fails on both, immutable=1 returns complete snapshots in ~0.00 s. See HERMES-133.
-        assert result is True
-        with sqlite3.connect(dst) as check:
-            assert check.execute("select x from cookies").fetchall() == [(1,)]
-        check.close()
+        assert result is False
 
     @pytest.mark.parametrize("locked", ["source", "destination"])
     def test_copy_auth_file_bounds_locks_without_overwriting(self, tmp_path, locked):
@@ -1198,14 +1187,12 @@ class TestWindowsLockedProfileCopy:
                  str(src), str(dst)],
                 capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
             assert result.returncode == 0, result.stderr
-            # A locked DESTINATION must fail closed and leave the existing file untouched.
-            # A locked SOURCE still snapshots its committed image via immutable=1 (HERMES-133):
-            # refusing there would break every real-profile launch while the browser is open.
-            assert result.stdout.strip() == ("False" if locked == "destination" else "True")
+            assert result.stdout.strip() == "False"
+
         finally:
             holder.rollback()
             holder.close()
-        expected_after = [(99,)] if locked == "destination" else [(7,)]
+        expected_after = [(99,)]
         with sqlite3.connect(dst) as conn:
             assert conn.execute("select x from cookies").fetchall() == expected_after
         conn.close()
@@ -1297,3 +1284,25 @@ class TestWindowsLockedProfileCopy:
         dst, err = bc.snapshot_real_profile("chrome", src=str(root))
         assert dst is None
         assert err and "login data" in err.lower() and "close" in err.lower()
+
+
+def test_auth_snapshot_never_reads_spilled_uncommitted_pages(tmp_path, monkeypatch):
+    import sqlite3
+    from hermes_cli import browser_connect as bc
+    source = tmp_path / 'Cookies'
+    destination = tmp_path / 'out' / 'Cookies'
+    writer = sqlite3.connect(source)
+    try:
+        writer.executescript('PRAGMA page_size=512; PRAGMA cache_size=10; CREATE TABLE t(v TEXT);')
+        writer.executemany('INSERT INTO t VALUES(?)', [('old-' + 'x' * 400,)] * 500)
+        writer.commit()
+        writer.execute('BEGIN EXCLUSIVE')
+        writer.execute("UPDATE t SET v='uncommitted-' || substr(v,5)")
+        monkeypatch.setattr(bc, '_AUTH_BACKUP_TIMEOUT_SECONDS', 0.2)
+        assert bc._copy_auth_file(str(source), str(destination)) is False
+    finally:
+        writer.rollback()
+        writer.close()
+    assert bc._copy_auth_file(str(source), str(destination)) is True
+    with sqlite3.connect(destination) as reader:
+        assert reader.execute("SELECT count(*) FROM t WHERE v LIKE 'old-%'").fetchone()[0] == 500

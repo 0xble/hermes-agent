@@ -164,3 +164,14 @@ class ProxyIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_doh_decodes_chunked_response_on_pinned_transport():
+    payload = json.dumps({'Answer': [{'type': 1, 'data': '8.8.8.8'}]}).encode()
+    response = (b'HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\n'
+                b'Transfer-Encoding: chunked\r\n\r\n' +
+                f'{len(payload):x}\r\n'.encode() + payload + b'\r\n0\r\n\r\n')
+    tls = FakeTLS(response)
+    with mock.patch.object(proxy.socket, 'create_connection', return_value=FakeRaw()), \
+         mock.patch.object(proxy.ssl, 'create_default_context', return_value=FakeContext(tls)):
+        assert proxy.resolve_public_a('github.com') == ('8.8.8.8',)

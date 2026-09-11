@@ -352,7 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.profile == "affected" and not args.base:
         parser.error("--profile affected requires --base")
     try:
-        head_sha = _git(root, "rev-parse", args.head)
+        head_sha = _git(root, "rev-parse", "--verify", f"{args.head}^{{commit}}")
+        if _git(root, "rev-parse", "HEAD") != head_sha:
+            raise ValueError("requested head differs from the checkout to be tested")
         base_sha = _git(root, "rev-parse", args.base) if args.base else None
         paths = changed_files(root, args.base, args.head)
         status_before = _git(root, "status", "--porcelain", "--untracked-files=all")
@@ -360,6 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_worktree(args.profile, dirty, args.allow_dirty)
         checks = build_checks(root, args.profile, paths, args.python_test)
         results = run_checks(root, checks, args.dry_run)
+        if _git(root, "rev-parse", "HEAD") != head_sha:
+            raise ValueError("checkout HEAD changed during local checks")
         status_after = _git(root, "status", "--porcelain", "--untracked-files=all")
         if status_after != status_before:
             results.append(

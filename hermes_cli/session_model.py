@@ -159,7 +159,10 @@ class SessionModelControl:
                 status = "failed"
                 message = "Session model change failed: " + redact_sensitive_text(str(exc))
         result["session_model"] = {"status": status, "message": message}
-        result["final_response"] = (result.get("final_response") or "") + "\n\n" + message
+        from agent.turn_finalizer import synchronize_terminal_response
+        synchronize_terminal_response(
+            self.agent, result, (result.get("final_response") or "") + "\n\n" + message,
+        )
         return result
 
 

@@ -16,6 +16,8 @@ query. TLS between guest and destination remains opaque to this proxy.
 
 import argparse
 import ipaddress
+import http.client
+import io
 import json
 import socket
 import socketserver
@@ -154,23 +156,23 @@ def resolve_public_a(hostname, timeout=CONNECT_TIMEOUT):
     except Exception:
         raw.close()
         raise
-    header, marker, body = response.partition(b"\r\n\r\n")
-    if not marker:
-        raise ProxyError("invalid DoH response")
+    # Parse framing only after the wire response has passed the strict size bound.
+    # HTTPResponse handles both Content-Length and chunked encoding over this buffer.
+    class BufferedResponse:
+        def makefile(self, *_args):
+            return io.BytesIO(response)
+
     try:
-        header_text = header.decode("iso-8859-1")
-        status = header_text.split("\r\n", 1)[0].split()
-    except (UnicodeDecodeError, IndexError):
-        raise ProxyError("invalid DoH response")
-    if len(status) < 2 or status[1] != "200":
-        raise ProxyError("DoH lookup failed")
-    fields = {}
-    for line in header_text.split("\r\n")[1:]:
-        if ":" in line:
-            key, val = line.split(":", 1)
-            fields[key.lower()] = val.strip()
-    if not fields.get("content-type", "").lower().split(";", 1)[0] == "application/dns-json":
-        raise ProxyError("unexpected DoH content type")
+        parsed = http.client.HTTPResponse(BufferedResponse())
+        parsed.begin()
+        if parsed.status != 200:
+            raise ProxyError("DoH lookup failed")
+        if parsed.getheader("Content-Type", "").lower().split(";", 1)[0] != "application/dns-json":
+            raise ProxyError("unexpected DoH content type")
+        body = parsed.read(MAX_DOH_BYTES + 1)
+        parsed.close()
+    except (http.client.HTTPException, OSError, ValueError) as exc:
+        raise ProxyError("invalid DoH response") from exc
     if len(body) > MAX_DOH_BYTES:
         raise ProxyError("DoH response too large")
     try:
