@@ -131,6 +131,7 @@ def spawn_background_process(
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
     notify_on_complete: bool, watch_patterns: Optional[List[str]], approval_note: Optional[str],
     pty_disabled_reason: Optional[str], timeout: Optional[int] = None,
+    execution_cwd: Optional[str] = None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
@@ -142,7 +143,7 @@ def spawn_background_process(
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
 
-    effective_cwd = _resolve_command_cwd(
+    effective_cwd = execution_cwd or _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
     try:

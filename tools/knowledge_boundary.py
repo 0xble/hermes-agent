@@ -16,7 +16,7 @@ Enforced (deterministic, tested):
   * ``memory`` / ``skill_manage`` specialized tools
   * ``write_file`` (all modes)
   * ``patch`` (replace + V4A Update/Add/Delete/Move, both endpoints)
-  * ``terminal`` commands that reference a protected root
+  * ``terminal`` commands that reference or execute within a protected root
   * ``execute_code`` source that references a protected root
 
 Not enforced (documented, not silently implied):
@@ -217,7 +217,7 @@ def boundary_report() -> dict:
             "memory", "skill_manage", "write_file", "patch",
             "terminal", "execute_code",
         ],
-        "shell_enforcement": "command_scan",
+        "shell_enforcement": "command_scan_and_execution_cwd",
         "not_enforced": [
             "runtime-computed paths inside a subprocess (no OS sandbox)",
             "writes made outside Hermes's tool surface",

@@ -731,6 +731,21 @@ class TestFailureAttribution:
         }
         assert all(status != "exhausted" for status in self._statuses(pool).values())
 
+    @pytest.mark.parametrize("swap_result, expected", [(False, False), (None, True), (True, True)])
+    def test_transient_rotation_accounts_only_for_accepted_swaps(self, tmp_path, monkeypatch, swap_result, expected):
+        from agent.credential_pool import recover_transient_credential
+        pool = self._make_pool(tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")], provider="openai-codex")
+        agent = self._agent(pool, failing_key="key-a", provider="openai-codex")
+        agent._swap_credential.return_value = swap_result
+        agent._last_credential_rotation = None
+        attempted = set()
+        assert recover_transient_credential(agent, classified_reason="timeout",
+            attempted_credential_identities=attempted) is expected
+        assert (pool.credential_retry_identity("cred-1") in attempted) is expected
+        assert bool(agent._last_credential_rotation) is expected
+        assert "cred-0" in pool.soft_cooldown_ids()
+
     def test_transient_failure_prefers_api_key_over_stale_entry_id(
         self, tmp_path, monkeypatch
     ):

@@ -269,14 +269,21 @@ def _judge(scenario: dict, calls: list, *, turn: dict, error: str | None) -> dic
 def run(only: str | None = None) -> dict:
     repo = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo))
-    from hermes_cli.auth import resolve_codex_runtime_credentials
+    selected = [s for s in scenarios() if only is None or s["name"] == only]
+    if not selected:
+        raise SystemExit(f"Unknown or empty scenario selection: {only!r}")
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_constants import resolve_reasoning_config
 
-    resolved = resolve_codex_runtime_credentials() or {}
-    token = resolved.get("access_token") or resolved.get("api_key")
-    if not token:
-        raise SystemExit(
-            "Hermes's Codex credential resolver returned no token; run `hermes auth`."
-        )
+    live = load_config_readonly() or {}
+    model_block = live.get("model")
+    model = model_block.get("default") if isinstance(model_block, dict) else model_block
+    if not model:
+        raise SystemExit("Active Hermes configuration has no default model")
+    provider = model_block.get("provider") if isinstance(model_block, dict) else None
+    runtime = resolve_runtime_provider(requested=provider, target_model=model)
+    reasoning = resolve_reasoning_config(live, model)
     home = _setup_home()
 
     from hermes_state import SessionDB
@@ -312,16 +319,18 @@ def run(only: str | None = None) -> dict:
     intercepted_total = 0
     verdicts = []
     try:
-        for scenario in scenarios():
-            if only and scenario["name"] != only:
-                continue
+        for scenario in selected:
             calls.clear()
             db = SessionDB()
             parent = AIAgent(
-                session_db=db, model="gpt-6-astra", provider="openai-codex",
-                api_mode="codex_responses",
-                base_url="https://chatgpt.com/backend-api/codex", api_key=token,
-                reasoning_config={"enabled": True, "effort": "high"},
+                session_db=db, model=model, provider=runtime.get("provider"),
+                api_mode=runtime.get("api_mode"),
+                base_url=runtime.get("base_url"), api_key=runtime.get("api_key"),
+                request_overrides=runtime.get("request_overrides"),
+                max_tokens=runtime.get("max_output_tokens"),
+                acp_command=runtime.get("acp_command"), acp_args=runtime.get("acp_args"),
+                command=runtime.get("command"), args=runtime.get("args"),
+                reasoning_config=reasoning,
                 enabled_toolsets=["file", "delegation"], quiet_mode=True,
                 # Generous on purpose: a parent that reads a few files before
                 # deciding must still reach a completed turn, or its decision
@@ -346,7 +355,7 @@ def run(only: str | None = None) -> dict:
 
     if intercepted_total == 0 and any(
         s["expect"].get("delegated") or s["expect"].get("roles_all")
-        for s in scenarios() if not only or s["name"] == only
+        for s in selected
     ):
         raise SystemExit(
             "No delegate_task call was intercepted in any scenario that expects "
@@ -357,7 +366,8 @@ def run(only: str | None = None) -> dict:
 
     receipt = {
         "home": str(home),
-        "credential_source": "hermes_cli.auth.resolve_codex_runtime_credentials",
+        "credential_source": "hermes_cli.runtime_provider.resolve_runtime_provider",
+        "provider": runtime.get("provider"), "model": model, "api_mode": runtime.get("api_mode"),
         "passed": sum(1 for v in verdicts if v["passed"]),
         "inconclusive": sum(1 for v in verdicts if v["inconclusive"]),
         "total": len(verdicts),

@@ -77,3 +77,69 @@ def test_allowed_task_write_uses_same_checked_path(tmp_path, monkeypatch):
     assert not result.get("error")
     assert (workspace / "notes.txt").read_text() == "allowed"
     assert calls == [("notes.txt", "ordinary-child")]
+
+
+@pytest.mark.parametrize("root_name", ["memories", "skills"])
+@pytest.mark.parametrize("source", ["explicit", "relative", "symlink", "recorded", "default"])
+@pytest.mark.parametrize("background", [False, True])
+def test_terminal_protected_execution_directory_is_denied_before_acquisition(
+    tmp_path, monkeypatch, root_name, source, background,
+):
+    from types import SimpleNamespace
+    from tools import terminal_tool as terminal
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    root = home / root_name
+    root.mkdir(parents=True)
+    target = root / "MEMORY.md"
+    target.write_text("original")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    session = f"terminal-{root_name}-{source}-{background}"
+    terminal.record_session_cwd(session, str(root if source == "recorded" else tmp_path))
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda **k: session if source != "default" else "")
+    if source == "default":
+        session = None
+    monkeypatch.setattr(terminal, "_plan_execution", lambda *a, **k: SimpleNamespace(
+        cwd=str(root if source == "default" else tmp_path), env_type="local", effective_task_id="test"))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("acquired environment before denial"))
+    workdir = str(alias if source == "symlink" else root) if source in {"explicit", "symlink"} else None
+    if source == "relative":
+        workdir = f"hermes/{root_name}"
+    with delegated_child_context(read_only_knowledge=True):
+        result = terminal.terminal_tool("printf changed > MEMORY.md", workdir=workdir,
+                                        task_id=session, background=background)
+    assert "Parent-owned shared knowledge" in json.loads(result)["error"]
+    assert target.read_text() == "original"
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_terminal_binds_checked_cwd_even_if_session_record_changes(tmp_path, monkeypatch, background):
+    from types import SimpleNamespace
+    from tools import terminal_tool as terminal
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    root = home / "memories"
+    root.mkdir(parents=True)
+    session = "cwd-bind-test"
+    terminal.record_session_cwd(session, str(tmp_path))
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda **k: session)
+    monkeypatch.setattr(terminal, "_plan_execution", lambda *a, **k: SimpleNamespace(
+        cwd=str(tmp_path), env_type="local", effective_task_id=session, effective_timeout=1,
+        config={}, promoted_from_foreground_timeout=None))
+    def acquire(*args):
+        terminal.record_session_cwd(session, str(root))
+        return SimpleNamespace()
+    monkeypatch.setattr(terminal, "_acquire_env", acquire)
+    monkeypatch.setattr(terminal, "_pre_exec_block", lambda *a, **k: None)
+    monkeypatch.setattr(terminal, "_run_approval_guards", lambda *a, **k: SimpleNamespace(note=None, approved_run=False))
+    captured = []
+    def run(*a, **kwargs):
+        captured.append(kwargs)
+        return json.dumps({"exit_code": 0})
+    monkeypatch.setattr(terminal, "_run_foreground", run)
+    monkeypatch.setattr(terminal, "spawn_background_process", run)
+    with delegated_child_context(read_only_knowledge=True):
+        assert json.loads(terminal.terminal_tool("echo ok", task_id=session, background=background))["exit_code"] == 0
+    assert captured[0]["execution_cwd"] == str(tmp_path.resolve())
+    assert captured[0]["workdir"] is None  # preserve foreground cd bookkeeping

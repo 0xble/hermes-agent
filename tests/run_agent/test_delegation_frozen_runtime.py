@@ -289,8 +289,38 @@ def test_resume_preserves_launch_metadata_and_uses_stable_pool_identity(monkeypa
 
     launch = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
     assert launch.credentials["api_key"] == "refreshed-secret"
+    assert launch._credential_pool is pool
+    assert launch.resume_credential_id == "account-a"
     assert launch.launch_metadata == metadata
     assert "refreshed-secret" not in json.dumps(launch.launch_metadata)
+
+    # The current parent cannot supply the child's provider pool. Exercise the
+    # real construction/pin/lease handoff, not only resume's returned metadata.
+    parent.provider, parent.model, parent.base_url = "other", "parent-model", "https://other/v1"
+    parent.api_key, parent.prefill_messages, parent._delegate_depth = "other-key", None, 0
+    parent._fallback_chain, parent.request_overrides = [], {}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.setattr(delegate_tool, "_resolve_child_runtime", lambda *a, **k: {
+        **launch.credentials, "fallback_model": None})
+    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *a, **k: ([], []))
+    monkeypatch.setattr(delegate_tool, "_open_child_session_db", lambda *a: None)
+    monkeypatch.setattr(delegate_tool, "_attach_child", lambda *a: None)
+    monkeypatch.setattr("run_agent.AIAgent", lambda **kwargs: SimpleNamespace(
+        **kwargs, _session_init_model_config={}))
+    child = delegate_tool._build_child_agent(
+        0, "continue", None, None, "m", 1, 1, parent,
+        subagent_definition=launch.definition, resolved_reasoning=launch.reasoning,
+        resume_session_id=launch.resume_session_id, resume_launch_metadata=launch.launch_metadata,
+        resume_credential_pool=launch._credential_pool, resume_credential_id=launch.resume_credential_id)
+    assert child._credential_pool is pool
+    assert child._delegation_runtime_pin._credential_pool is pool
+    selected = []
+    pool.acquire_lease = lambda credential_id: selected.append(credential_id) or credential_id
+    pool.current = lambda: entry
+    child._swap_credential = lambda value: None
+    from tools.delegate_tool_child_run import _lease_child_credential
+    assert _lease_child_credential(child) == (pool, "account-a")
+    assert selected == ["account-a"]
 
     metadata["credential_pool_entry_id"] = "unknown-account"
     with pytest.raises(ValueError, match="stable credential identity"):
@@ -863,13 +893,65 @@ def test_fallback_resume_restores_persisted_stable_pool_entry():
     )
     expected = [route.metadata()]
     expected[0]["credential_pool_entry_id"] = entry.id
-    expected[0]["authority_fingerprint"] = hashlib.sha256(
-        entry.runtime_api_key.encode()
-    ).hexdigest()
-
-    restored = _restore_fallback_authority((route,), expected, normalize_route_base_url)
+    # Keep the old digest: only the same verified account may refresh it.
+    restored, refreshed = _restore_fallback_authority((route,), expected, normalize_route_base_url)
 
     assert restored[0].api_key == entry.runtime_api_key
     assert restored[0].credential_pool_entry_id == entry.id
-    assert _fallback_metadata_matches(restored, expected)
+    assert not _fallback_metadata_matches(restored, expected)
+    assert _fallback_metadata_matches(restored, expected, refreshed_accounts=refreshed)
     assert entry.runtime_api_key not in json.dumps(expected)
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("mutation", [None, "account", "provider", "base", "model", "mode", "reasoning", "overrides", "legacy"])
+def test_fallback_resume_refresh_requires_same_authorized_account(monkeypatch, mutation, active):
+    from dataclasses import replace
+    from tools import delegate_tool
+    from tools.custom_subagents import ResolvedRoute
+    metadata, definitions, parent = _resume_fixture(monkeypatch)
+    entry = SimpleNamespace(id="fallback-account", provider="fallback", runtime_api_key="new-token",
+                            runtime_base_url="https://fallback.invalid/v1")
+    pool = SimpleNamespace(entries=lambda: [entry])
+    route = ResolvedRoute("fallback", "fm", "https://fallback.invalid/v1", "chat_completions", None,
+        "old-token", hashlib.sha256(b"old-token").hexdigest(), "{}", pool, "fallback-account")
+    metadata["fallbacks"] = [route.metadata()]
+    if active:
+        original_get = parent._session_db.get_session
+        def get_session(sid):
+            row = original_get(sid)
+            config = json.loads(row["model_config"])
+            config["_delegation_active_route"] = {"provider": "fallback", "model": "fm"}
+            return {**row, "model_config": json.dumps(config)}
+        monkeypatch.setattr(parent._session_db, "get_session", get_session)
+    if mutation == "account":
+        entry.id = "other-account"
+    elif mutation == "provider":
+        entry.provider = "other"
+    elif mutation == "base":
+        entry.runtime_base_url = "https://other.invalid/v1"
+    elif mutation == "model":
+        route = replace(route, model="different")
+    elif mutation == "mode":
+        route = replace(route, api_mode="codex_responses")
+    elif mutation == "reasoning":
+        route = replace(route, reasoning_effort="high")
+    elif mutation == "overrides":
+        route = replace(route, request_overrides_json=json.dumps({"extra_headers": {"Authorization": "changed"}}))
+    elif mutation == "legacy":
+        metadata["fallbacks"][0].pop("credential_pool_entry_id")
+        route = replace(route, credential_pool_entry_id=None, api_key="new-token",
+                        credential_digest=hashlib.sha256(b"new-token").hexdigest())
+    monkeypatch.setattr("tools.custom_subagents.freeze_fallback_routes", lambda *a, **k: (route,))
+    if mutation:
+        with pytest.raises(ValueError, match="fallback"):
+            delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
+    else:
+        launch = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
+        if active:
+            assert launch.credentials["api_key"] == "new-token"
+            assert launch._credential_pool is pool
+            assert launch.resume_credential_id == "fallback-account"
+        else:
+            assert launch.fallback_routes[0].api_key == "new-token"
+            assert launch.fallback_routes[0].credential_pool_entry_id == "fallback-account"

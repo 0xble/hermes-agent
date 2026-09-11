@@ -110,3 +110,31 @@ def test_pending_trace_cleared_after_flush(tmp_path, monkeypatch):
     assert len(lines) == 1
 
 
+
+
+def test_frozen_aggregator_credentials_stay_out_of_internal_and_saved_trace(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from agent import moa_loop
+    trace_dir = _enable_traces(tmp_path, monkeypatch)
+    preset = {"reference_models": [{"provider": "ref", "model": "reference"}],
+              "aggregator": {"provider": "agg", "model": "acting",
+                             "fallbacks": [{"provider": "backup", "model": "backup"}]}}
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda name: (preset, {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda *, requested, target_model: {
+        "provider": requested, "model": target_model, "api_mode": "chat_completions",
+        "base_url": "https://fixture.invalid/v1", "api_key": f"sentinel-secret-{requested}"})
+    snapshot = moa_loop.snapshot_moa_preset("trace-fixture")
+    calls = []
+    def call(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="answer", tool_calls=[]), finish_reason="stop")], usage=None)
+    monkeypatch.setattr(moa_loop, "call_llm", call)
+    owner = SimpleNamespace(_moa_preset_snapshot=snapshot, _interrupt_requested=False)
+    mc = MoAChatCompletions("trace-fixture", agent=owner)
+    mc.create(messages=[{"role": "user", "content": "inspect"}], tools=[])
+    assert any(c.get("api_key") == "sentinel-secret-agg" for c in calls)
+    assert "sentinel-secret" not in json.dumps(mc.last_aggregator_slot)
+    assert "sentinel-secret" not in json.dumps(mc._pending_trace, default=str)
+    mc.consume_and_save_trace("frozen-trace")
+    assert "sentinel-secret" not in json.dumps(_read_single_trace(trace_dir, "frozen-trace"))

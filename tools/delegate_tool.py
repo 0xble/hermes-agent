@@ -502,9 +502,10 @@ def _refresh_resumable_launch_metadata(child, launch_metadata: dict) -> dict:
 def _restore_fallback_authority(routes, expected, normalize_route_base_url):
     """Rebind frozen fallbacks to their persisted stable pool account IDs."""
     if not isinstance(expected, list) or len(routes) != len(expected):
-        return routes
+        return routes, frozenset()
     restored = []
-    for route, metadata in zip(routes, expected):
+    refreshed_accounts = set()
+    for index, (route, metadata) in enumerate(zip(routes, expected)):
         credential_id = metadata.get("credential_pool_entry_id") if isinstance(metadata, dict) else None
         if not credential_id:
             restored.append(route)
@@ -520,20 +521,21 @@ def _restore_fallback_authority(routes, expected, normalize_route_base_url):
             or normalize_route_base_url(str(entry_base)) != normalize_route_base_url(route.base_url)
         ):
             raise ValueError("delegated child fallback stable credential can no longer be authorized")
+        refreshed_accounts.add(index)
         restored.append(replace(
             route, api_key=str(api_key),
             credential_digest=__import__("hashlib").sha256(str(api_key).encode()).hexdigest(),
             credential_pool_entry_id=str(credential_id),
         ))
-    return tuple(restored)
+    return tuple(restored), frozenset(refreshed_accounts)
 
 
-def _fallback_metadata_matches(routes, expected) -> bool:
+def _fallback_metadata_matches(routes, expected, *, refreshed_accounts=frozenset()) -> bool:
     """Compare public route data plus complete override authority, including legacy-safe metadata."""
     from tools.custom_subagents import _authority_mapping_matches
     if not isinstance(expected, list) or len(routes) != len(expected):
         return False
-    for route, stored in zip(routes, expected):
+    for index, (route, stored) in enumerate(zip(routes, expected)):
         if not isinstance(stored, dict):
             return False
         overrides = json.loads(route.request_overrides_json)
@@ -543,6 +545,10 @@ def _fallback_metadata_matches(routes, expected) -> bool:
         ):
             return False
         current = route.metadata()
+        if index in refreshed_accounts:
+            # Only restoration's positive stable-account authorization permits
+            # a new token digest. All other route/override/account fields match.
+            current["authority_fingerprint"] = stored.get("authority_fingerprint")
         if "request_overrides_fingerprint" not in stored:
             current.pop("request_overrides_fingerprint", None)
         if "credential_pool_entry_id" not in stored:
@@ -769,6 +775,7 @@ def _resolve_resume_launch(task, definitions, parent_agent):
             if not isinstance(runtime_key, str) or not runtime_key:
                 raise ValueError("delegated child stable credential identity has no usable runtime credential")
             creds = {**creds, "api_key": runtime_key, "base_url": entry_base}
+            resume_credential_pool = pool
         authority_matches = (
             stable_credential_id is not None
             or __import__("hashlib").sha256(str(creds.get("api_key") or "").encode()).hexdigest()
@@ -792,10 +799,10 @@ def _resolve_resume_launch(task, definitions, parent_agent):
             definition, primary_provider=provider, primary_model=model
         )
         expected_fallbacks = launch.get("fallbacks") or []
-        fallbacks = _restore_fallback_authority(fallbacks, expected_fallbacks, normalize_route_base_url)
-        if not _fallback_metadata_matches(fallbacks, expected_fallbacks):
+        fallbacks, refreshed_accounts = _restore_fallback_authority(
+            fallbacks, expected_fallbacks, normalize_route_base_url)
+        if not _fallback_metadata_matches(fallbacks, expected_fallbacks, refreshed_accounts=refreshed_accounts):
             raise ValueError("delegated child fallback routes no longer match their frozen identities")
-        resume_credential_pool = None
         resume_credential_id = stable_credential_id
         active = config.get("_delegation_active_route") or {"provider": provider, "model": model}
         active_id = (active.get("provider"), active.get("model")) if isinstance(active, dict) else (None, None)
@@ -1607,13 +1614,8 @@ DELEGATE_TASK_SCHEMA = {
                         ),
                     },
                     "required": ["goal"],
-                    # A new task needs a visible label.  The only exception is
-                    # a named resume, whose already-persisted caller-authored
-                    # label is recovered by the no-side-effect preflight.
-                    "anyOf": [
-                        {"required": ["task_label"]},
-                        {"required": ["resume_session_id"]},
-                    ],
+                    # Preflight resolves per-item, top-level, or historical
+                    # resume labels and rejects missing/blank values before spawn.
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },

@@ -1064,7 +1064,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    allow_yield: bool = True,
+    allow_yield: bool = True, execution_cwd: Optional[str] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1081,7 +1081,7 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
-            command_cwd = _resolve_command_cwd(
+            command_cwd = execution_cwd or _resolve_command_cwd(
                 workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
             )
             # bounded_capture: model-facing output keeps a head/tail window
@@ -1221,7 +1221,6 @@ def terminal_tool(
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
-        env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
         # Session key for cwd records: the contextvar doesn't cross tool-worker
@@ -1231,6 +1230,26 @@ def terminal_tool(
 
         session_key = get_current_session_key(default="") or (task_id or "")
 
+        from agent.delegation_context import is_read_only_knowledge_context
+        from tools.knowledge_boundary import write_denial_reason
+
+        execution_cwd = None
+        if is_read_only_knowledge_context():
+            execution_cwd = _resolve_command_cwd(
+                workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+            )
+            if env_type == "local":
+                execution_cwd = os.path.expanduser(execution_cwd)
+                if workdir and not os.path.isabs(execution_cwd):
+                    base = _resolve_command_cwd(
+                        workdir=None, default_cwd=cwd, session_key=session_key, env_type=env_type)
+                    execution_cwd = os.path.join(os.path.abspath(os.path.expanduser(base)), execution_cwd)
+                execution_cwd = os.path.realpath(execution_cwd)
+            knowledge_denial = write_denial_reason([execution_cwd], how="terminal execution")
+            if knowledge_denial:
+                return _error_json(knowledge_denial, status="error")
+
+        env = _acquire_env(plan, task_id)
         _pre_exec_block(command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key)
         # Pre-exec security checks (tirith + dangerous command detection);
         # force=True means the user already confirmed.
@@ -1248,7 +1267,7 @@ def terminal_tool(
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
-                timeout=timeout,
+                timeout=timeout, execution_cwd=execution_cwd,
             )
             if plan.promoted_from_foreground_timeout is not None:
                 result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
@@ -1257,7 +1276,7 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-            allow_yield=_allow_yield,
+            allow_yield=_allow_yield, execution_cwd=execution_cwd,
         )
     except _Rejected as r:
         return r.result_json

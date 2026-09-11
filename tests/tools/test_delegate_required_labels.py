@@ -35,9 +35,14 @@ def test_model_schema_requires_per_task_label_and_keeps_guidance_unbounded():
     label = item["properties"]["task_label"]
 
     assert set(item["required"]) == {"goal"}
-    assert {tuple(branch["required"]) for branch in item["anyOf"]} == {
-        ("task_label",), ("resume_session_id",),
-    }
+    import jsonschema
+    for payload in (
+        {"task_label": "Check receipt", "tasks": [{"goal": "Inspect receipt"}]},
+        {"tasks": [{"goal": "Inspect", "task_label": "Check receipt"}]},
+        {"tasks": [{"goal": "Continue", "resume_session_id": "child"}]},
+        {"action": "list"},
+    ):
+        jsonschema.validate(payload, schema)
     assert "AUTHORING GUIDANCE" in label["description"]
     assert "24-character total task-card row" in label["description"]
     assert "maxLength" not in label
@@ -85,10 +90,14 @@ def test_model_dispatch_valid_batch_uses_full_labels_and_top_level_fallback(monk
     assert payload["status"] == "dispatched"
     assert captured["metadata"]["task_labels"] == ["Inspect every fixture thoroughly beyond display guidance"]
 
+    raw = registry.dispatch("delegate_task", {
+        "task_label": "Check receipt", "tasks": [{"goal": "Use legacy fallback"}],
+    }, parent_agent=_Parent())
+    assert json.loads(raw)["status"] == "dispatched"
+    assert captured["metadata"]["task_labels"] == ["Check receipt"]
     labels, error = delegate_tool._effective_task_labels(
-        [{"goal": "Use legacy fallback"}], "Check receipt", _Parent())
-    assert error is None
-    assert labels == ["Check receipt"]
+        [{"goal": "Inspect", "task_label": " "}], "Check receipt", _Parent())
+    assert labels is None and error
 
 
 def test_resume_reuses_only_a_preserved_nonempty_historical_label():

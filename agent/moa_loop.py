@@ -350,6 +350,16 @@ _REFERENCE_SYSTEM_PROMPT = (
 )
 
 
+def _trace_slot(slot: dict[str, Any]) -> dict[str, Any]:
+    """Project runtime slots to the route fields used by trace/display consumers."""
+    from tools.custom_subagents import nonsecret_route_url
+
+    projected = {key: slot[key] for key in ("provider", "model", "reasoning_effort") if key in slot}
+    if slot.get("base_url"):
+        projected["base_url"] = nonsecret_route_url(slot["base_url"])
+    return projected
+
+
 def _slot_label(slot: dict[str, Any]) -> str:
     label = f"{(slot.get('provider') or '').strip()}:{(slot.get('model') or '').strip()}"
     effort = str(slot.get("reasoning_effort") or "").strip()
@@ -1357,8 +1367,8 @@ class MoAChatCompletions:
                     close()
                 raise
             agg_response = prefetched_stream(first, iterator, agg_response)
-        self.last_aggregator_slot = {**aggregator, "provider": route_info.get("provider") or aggregator.get("provider"),
-                                     "model": route_info.get("model") or aggregator.get("model")}
+        self.last_aggregator_slot = _trace_slot({**aggregator, "provider": route_info.get("provider") or aggregator.get("provider"),
+                                     "model": route_info.get("model") or aggregator.get("model")})
         if trace is not None:
             trace["aggregator_slot"] = self.last_aggregator_slot
             trace["aggregator_label"] = _slot_label(self.last_aggregator_slot)
@@ -1469,7 +1479,7 @@ class MoAChatCompletions:
         ] if privacy_mode else list(reference_outputs)
         self._pending_trace = {
             "preset": self.preset_name, "reference_outputs": trace_refs,
-            "aggregator_slot": aggregator, "aggregator_temperature": aggregator_temperature,
+            "aggregator_slot": _trace_slot(aggregator), "aggregator_temperature": aggregator_temperature,
         }
         # Derived from the privacy-redacted trace_refs.
         try:
@@ -1553,7 +1563,7 @@ class MoAChatCompletions:
         ] if preset.get("enabled", True) else []
         aggregator = preset.get("aggregator") or {}
         # The MoA path's virtual model/provider have no pricing entry; expose the real slot.
-        self.last_aggregator_slot = dict(aggregator) if aggregator else None
+        self.last_aggregator_slot = _trace_slot(aggregator) if aggregator else None
         # None = provider default (see _preset_temperature); the acting agent's own
         # temperature applies to the aggregator (the acting model).
         aggregator_temperature = _preset_temperature(preset, "aggregator_temperature")

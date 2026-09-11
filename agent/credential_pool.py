@@ -2932,7 +2932,6 @@ def recover_transient_credential(
     )
     if alternate is None:
         return False
-    attempted.add(pool.credential_retry_identity(alternate.id))
     rotation = {
         "from_entry": current_id,
         "to_entry": alternate.id,
@@ -2943,7 +2942,9 @@ def recover_transient_credential(
         "from_entry=%s to_entry=%s before_provider_fallback=true",
         reason, getattr(agent, "provider", None), current_id or "unknown", alternate.id,
     )
-    agent._swap_credential(alternate)
+    if agent._swap_credential(alternate) is False:
+        return False
+    attempted.add(pool.credential_retry_identity(alternate.id))
     agent._last_credential_rotation = rotation
     return True
 

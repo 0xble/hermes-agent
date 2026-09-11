@@ -128,7 +128,7 @@ def test_boundary_report_never_claims_a_sandbox():
     from tools.knowledge_boundary import boundary_report
 
     report = boundary_report()
-    assert report["shell_enforcement"] == "command_scan"
+    assert report["shell_enforcement"] == "command_scan_and_execution_cwd"
     assert report["not_enforced"], "the honest limits must travel with the claim"
 
 

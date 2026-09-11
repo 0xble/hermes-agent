@@ -19,7 +19,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlsplit, urlunsplit
 
 _MIN_TEXT_CHARS = 512
 _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -106,7 +106,7 @@ def _normalize_url(value: str) -> str:
             hostname = f"[{hostname}]"
         netloc = f"{hostname}:{parsed.port}" if parsed.port is not None else hostname
         # Durable source metadata must never retain URL userinfo or signed/query
-        # credentials. The path is sufficient to identify the external source.
+        # credentials. Private identity below separately distinguishes query documents.
         return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", "", ""))
     except Exception:
         return ""
@@ -126,6 +126,24 @@ def _url_value(args: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return _normalize_url(value)
     return ""
+
+
+_CREDENTIAL_QUERY_KEYS = frozenset({
+    "access_token", "refresh_token", "id_token", "token", "api_key", "apikey",
+    "client_secret", "password", "auth", "authorization", "jwt", "session",
+    "secret", "key", "code", "signature", "sig", "awsaccesskeyid",
+})
+
+
+def _credential_query_key(raw: str) -> bool:
+    name = raw
+    for _ in range(3):
+        decoded = unquote_plus(name)
+        if decoded == name:
+            break
+        name = decoded
+    name = name.casefold().replace("-", "_")
+    return name in _CREDENTIAL_QUERY_KEYS or name.startswith(("x_amz_", "x_goog_"))
 
 
 def _url_identity_value(args: dict[str, Any]) -> str:
@@ -150,6 +168,12 @@ def _url_identity_value(args: dict[str, Any]) -> str:
                 ]
                 if video_ids:
                     return f"{origin}\0youtube-video:{video_ids[0]}"
+            # Preserve exact order, repeats and blank values for unknown URL
+            # semantics. Only the hash uses this input; public origins stay clean.
+            query = "&".join(part for part in parsed.query.split("&")
+                             if part and not _credential_query_key(part.partition("=")[0]))
+            if query:
+                return f"{origin}\0query:{query}"
         except (TypeError, ValueError):
             pass
         return origin

@@ -417,3 +417,17 @@ def test_valid_sdk_document_without_source_hash_cannot_verify(tmp_path):
     provider._run_hindsight_operation = lambda operation: document
     assert provider._verify_source_candidate("bank", candidate) is False
     assert candidate.automatic_key not in provider._source_retain_verified
+
+
+def test_query_addressed_documents_keep_distinct_private_identities():
+    def candidate(query):
+        return discover_source_candidates(_tool_turn("web_extract", {
+            "url": "https://example.com/document?" + query}, "Source paragraph. " * 60),
+            session_id="query-identity", retain_tool_sources=True)[0]
+    first = candidate("id=1&token=secret")
+    assert first.source_id != candidate("id=2&token=secret").source_id
+    assert first.source_id == candidate("id=1&X-Amz-Credential=changed&%74oken=other").source_id
+    assert candidate("id=1&id=2").source_id != candidate("id=2&id=1").source_id
+    assert candidate("id=").source_id != candidate("").source_id
+    assert first.metadata["source_origin"] == "https://example.com/document"
+    assert "secret" not in json.dumps(first.metadata)
