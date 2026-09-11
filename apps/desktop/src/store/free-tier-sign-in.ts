@@ -2,7 +2,7 @@ import { atom } from 'nanostores'
 
 import { cancelOAuthSession, listOAuthProviders, pollOAuthSession, startOAuthLogin } from '@/hermes'
 
-import { type FreeTierRequester, NOUS_PROVIDER_ID, refreshFreeTierStatus } from './free-tier'
+import { freeTierGeneration, type FreeTierRequester, NOUS_PROVIDER_ID, refreshFreeTierStatus } from './free-tier'
 
 const POLL_MS = 2000
 const COPY_FLASH_MS = 1500
@@ -79,6 +79,7 @@ function clearTimers() {
 const set = (state: FreeTierSignInState) => $freeTierSignIn.set(state)
 
 const fail = (kind: FreeTierSignInFailure, message: null | string = null) => {
+  attempt += 1
   clearTimers()
   set({ kind, message: message?.trim() || null, status: 'failed' })
 }
@@ -145,6 +146,7 @@ async function openSignInUrl(url: string) {
 export async function beginFreeTierSignIn(requestGateway: FreeTierRequester) {
   clearTimers()
   const mine = ++attempt
+  const source = freeTierGeneration()
   const stale = () => mine !== attempt
 
   const status = await refreshFreeTierStatus(requestGateway)
@@ -220,11 +222,23 @@ export async function beginFreeTierSignIn(requestGateway: FreeTierRequester) {
     // wins; this is the floor.
     const ttlMs = Math.max(1, Number(start.expires_in) || 0) * 1000
     expiryTimer = window.setTimeout(() => {
-      expiryTimer = null
-      fail('timed_out', null)
+      if (!stale()) {
+        expiryTimer = null
+        fail('timed_out', null)
+      }
     }, ttlMs)
 
-    pollTimer = window.setInterval(() => void pollOnce(start.session_id, requestGateway, mine), POLL_MS)
+    let polling = false
+    pollTimer = window.setInterval(() => {
+      if (stale() || polling) {
+        return
+      }
+
+      polling = true
+      void pollOnce(start.session_id, requestGateway, mine, source).finally(() => {
+        polling = false
+      })
+    }, POLL_MS)
   } catch (error) {
     if (!stale()) {
       fail('error', error instanceof Error ? error.message : String(error))
@@ -232,7 +246,7 @@ export async function beginFreeTierSignIn(requestGateway: FreeTierRequester) {
   }
 }
 
-async function pollOnce(sessionId: string, requestGateway: FreeTierRequester, mine: number) {
+async function pollOnce(sessionId: string, requestGateway: FreeTierRequester, mine: number, source: number) {
   const stale = () => mine !== attempt
 
   try {
@@ -251,13 +265,21 @@ async function pollOnce(sessionId: string, requestGateway: FreeTierRequester, mi
       return
     }
 
+    // Terminal approval owns its continuation; invalidate all poll callbacks
+    // before yielding to reload/refresh. A later close or retry still wins.
+    mine = ++attempt
     set({ status: 'finishing' })
 
     // The tokens are on disk now, so the backend's view of this identity has
     // changed: reload its env and re-read the free-tier verdict before the
     // completed screen claims the user is signed in.
     await requestGateway('reload.env').catch(() => undefined)
-    await refreshFreeTierStatus(requestGateway)
+
+    if (stale()) {
+      return
+    }
+
+    await refreshFreeTierStatus(requestGateway, source)
 
     if (stale()) {
       return

@@ -15,7 +15,13 @@ import { translateNow } from '@/i18n'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { setMainModelAssignment } from '@/store/cron-model-impact'
-import { ackFreeTierNotice, freeTierReadyPending, refreshFreeTierStatus, setFreeTierRoute } from '@/store/free-tier'
+import {
+  ackFreeTierNotice,
+  freeTierGeneration,
+  freeTierReadyPending,
+  refreshFreeTierStatus,
+  setFreeTierRoute
+} from '@/store/free-tier'
 import { notify, notifyError } from '@/store/notifications'
 import type { ModelOptionProvider, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
@@ -646,6 +652,8 @@ export function setOnboardingMode(mode: OnboardingMode) {
 }
 
 export async function refreshOnboarding(ctx: OnboardingContext) {
+  const source = freeTierGeneration()
+
   // Manual mode (user opened the selector from a working app): never
   // auto-dismiss on runtime-ready — the whole point is to let them add /
   // switch a provider while already configured. Just ensure the provider
@@ -660,7 +668,11 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
 
   if (runtime.ready) {
     completeDesktopOnboarding()
-    await applyFreeTierIntro(ctx, runtime)
+
+    if (source === freeTierGeneration()) {
+      await applyFreeTierIntro(ctx, runtime)
+    }
+
     ctx.onCompleted?.()
 
     return true
@@ -711,10 +723,11 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
  * the same notice flag) offers the free models without interrupting.
  */
 async function applyFreeTierIntro(ctx: OnboardingContext, runtime: RuntimeReadinessResult) {
+  const source = freeTierGeneration()
   setFreeTierRoute(runtime.freeTier)
   const status = await refreshFreeTierStatus(ctx.requestGateway)
 
-  if (freeTierReadyPending(status, runtime.freeTier ?? null)) {
+  if (source === freeTierGeneration() && freeTierReadyPending(status, runtime.freeTier ?? null)) {
     patch({ freeTierReady: true })
   }
 }

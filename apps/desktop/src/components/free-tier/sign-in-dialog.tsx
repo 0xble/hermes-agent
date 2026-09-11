@@ -94,16 +94,26 @@ export function FreeTierSignInDialog({ onSelectModel }: FreeTierSignInDialogProp
     }
   }
 
-  const finish = (model: null | string, after?: () => void) => {
-    settle(model)
+  const finish = (after?: () => void) => {
+    // The synchronous store transition is a one-shot gate even when two close
+    // callbacks run before React commits another render.
+    if ($freeTierSignIn.get() !== state) {
+      return
+    }
+
     closeFreeTierSignIn()
+
+    if (state.status === 'completed') {
+      settle(state.model)
+    }
+
     after?.()
   }
 
   const retry = () => void beginFreeTierSignIn(requestGateway)
 
   return (
-    <Dialog onOpenChange={open => !open && closeFreeTierSignIn()} open>
+    <Dialog onOpenChange={open => !open && finish()} open>
       <DialogContent onOpenAutoFocus={preventCloseButtonAutoFocus}>
         {state.status === 'setting_up' && (
           <Screen heading={copy.signInHeading}>
@@ -160,7 +170,7 @@ export function FreeTierSignInDialog({ onSelectModel }: FreeTierSignInDialogProp
                   {state.model}
                 </span>
                 <Button
-                  onClick={() => finish(state.model, () => setModelPickerOpen(true))}
+                  onClick={() => finish(() => setModelPickerOpen(true))}
                   size="inline"
                   type="button"
                   variant="text"
@@ -170,7 +180,7 @@ export function FreeTierSignInDialog({ onSelectModel }: FreeTierSignInDialogProp
               </div>
             )}
             <Actions>
-              <Button onClick={() => finish(state.model)} type="button">
+              <Button onClick={() => finish()} type="button">
                 {copy.done}
               </Button>
             </Actions>

@@ -5,6 +5,7 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway, setApiRequestConnection } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import { resetFreeTierStatus } from '@/store/free-tier'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
 import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
@@ -468,6 +469,7 @@ function setActive(profile: string): void {
 
 function beginGatewayActivation(): number {
   g.activationEpoch = gatewayActivationEpoch() + 1
+  resetFreeTierStatus()
 
   return g.activationEpoch
 }

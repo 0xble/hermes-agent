@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 
 import { getStatus } from '@/hermes'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
-import { refreshFreeTierStatus, setFreeTierRoute } from '@/store/free-tier'
+import { freeTierGeneration, refreshFreeTierStatus, resetFreeTierStatus, setFreeTierRoute } from '@/store/free-tier'
 import { $setupReadyTick } from '@/store/live-sync'
 import type { StatusResponse } from '@/types/hermes'
 
@@ -24,6 +24,8 @@ export function useStatusSnapshot(
   useEffect(() => {
     let cancelled = false
     let timer: number | undefined
+    resetFreeTierStatus()
+    const source = freeTierGeneration()
 
     // Status and inference readiness belong to one backend. A source switch
     // can keep gatewayState="open" throughout, so clear the previous source's
@@ -55,7 +57,7 @@ export function useStatusSnapshot(
     // or that this window crosses (open, return from another app), so they
     // run once per seam instead of every 60s.
     const refreshReadiness = async () => {
-      if (gatewayState !== 'open') {
+      if (gatewayState !== 'open' || cancelled || source !== freeTierGeneration()) {
         return
       }
 
@@ -67,7 +69,7 @@ export function useStatusSnapshot(
         refreshFreeTierStatus(requestGateway)
       ])
 
-      if (cancelled || inferenceResult.status !== 'fulfilled') {
+      if (cancelled || source !== freeTierGeneration() || inferenceResult.status !== 'fulfilled') {
         return
       }
 

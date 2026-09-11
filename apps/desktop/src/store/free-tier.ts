@@ -9,6 +9,21 @@ export const FREE_TIER_MODEL = 'nous/welcome'
 /** The provider slug the free-tier route and a signed-in Nous account share. */
 export const NOUS_PROVIDER_ID = 'nous'
 
+let generation = 0
+let statusRequest = 0
+
+export function freeTierGeneration(): number {
+  return generation
+}
+
+/** A foreground connection/profile activation owns a fresh cache, including its route. */
+export function resetFreeTierStatus() {
+  generation += 1
+  statusRequest += 1
+  $freeTierStatus.set(null)
+  $freeTierRoute.set(null)
+}
+
 export type FreeTierRequester = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 
 /**
@@ -34,9 +49,22 @@ function isFreeTierStatus(value: unknown): value is FreeTierStatus {
  * chrome — an older backend without the method, or a gateway flap, is not
  * evidence that the free tier went away.
  */
-export async function refreshFreeTierStatus(requestGateway: FreeTierRequester): Promise<FreeTierStatus | null> {
+export async function refreshFreeTierStatus(
+  requestGateway: FreeTierRequester,
+  source = generation
+): Promise<FreeTierStatus | null> {
+  if (source !== generation) {
+    return null
+  }
+
+  const requestId = ++statusRequest
+
   try {
     const status = await requestGateway<FreeTierStatus>('free_tier.status')
+
+    if (source !== generation || requestId !== statusRequest) {
+      return null
+    }
 
     if (!isFreeTierStatus(status)) {
       return $freeTierStatus.get()
@@ -46,17 +74,19 @@ export async function refreshFreeTierStatus(requestGateway: FreeTierRequester): 
 
     return status
   } catch {
-    return $freeTierStatus.get()
+    return source === generation ? $freeTierStatus.get() : null
   }
 }
 
 /** Persist the one-time notice acknowledgement, then re-read so every surface
  *  keyed on `notice_pending` drops away together. */
 export async function ackFreeTierNotice(requestGateway: FreeTierRequester): Promise<boolean> {
+  const source = generation
+
   try {
     const result = await requestGateway<{ acked?: boolean }>('free_tier.ack_notice')
 
-    if (result?.acked !== true) {
+    if (source !== generation || result?.acked !== true) {
       return false
     }
   } catch {
@@ -64,9 +94,9 @@ export async function ackFreeTierNotice(requestGateway: FreeTierRequester): Prom
     return false
   }
 
-  await refreshFreeTierStatus(requestGateway)
+  await refreshFreeTierStatus(requestGateway, source)
 
-  return true
+  return source === generation
 }
 
 /**

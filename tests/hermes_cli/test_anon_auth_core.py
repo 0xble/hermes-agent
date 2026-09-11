@@ -112,7 +112,111 @@ def _shared_store(tmp_path) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def test_bootstrap_waiter_does_not_hold_publication_lock(monkeypatch):
+    import threading
+    from hermes_cli import free_tier_bootstrap as fb
+    fb.reset_for_tests()
+    owner_entered, waiter_entered = threading.Event(), threading.Event()
+    completed = threading.Event()
+    lock_states, inventories, broadcasts, results = [], [], [], []
+    class Completion:
+        def wait(self, timeout=None):
+            lock_states.append(fb._lock.locked())
+            waiter_entered.set()
+            return completed.wait(timeout)
+        def set(self):
+            completed.set()
+    def inventory():
+        inventories.append(True)
+        owner_entered.set()
+        assert waiter_entered.wait(3)
+        return True
+    monkeypatch.setattr(fb, "_done", Completion())
+    monkeypatch.setattr(fb, "SETUP_READY_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(fb, "_inventory_other_providers", inventory)
+    monkeypatch.setattr(fb, "_resolve_inference", lambda: "fixture")
+    monkeypatch.setattr(fb, "_broadcast", broadcasts.append)
+    monkeypatch.setattr(anon_auth, "current_nous_state", lambda: None)
+    monkeypatch.setattr(anon_auth, "guest_enabled", lambda: False)
+    one = threading.Thread(target=lambda: results.append(fb.run_bootstrap()), daemon=True)
+    two = threading.Thread(target=lambda: results.append(fb.run_bootstrap()), daemon=True)
+    one.start()
+    assert owner_entered.wait(3)
+    two.start()
+    one.join(3)
+    two.join(3)
+    assert not one.is_alive() and not two.is_alive()
+    assert lock_states == [False]
+    assert len(inventories) == len(broadcasts) == 1
+    assert results[0] is results[1]
+
+
+def test_bootstrap_timeout_keeps_single_owner(monkeypatch):
+    from hermes_cli import free_tier_bootstrap as fb
+    fb.reset_for_tests()
+    monkeypatch.setattr(fb, "_started", True)
+    monkeypatch.setattr(fb, "SETUP_READY_WAIT_SECONDS", 0)
+    def duplicate():
+        pytest.fail("a waiting caller must not become a second owner")
+    monkeypatch.setattr(fb, "_inventory_other_providers", duplicate)
+    assert fb.run_bootstrap() is None
+    assert fb._started
+    fb.reset_for_tests()
+
+
 class TestIdentityLifecycle:
+    def test_runtime_optout_rejects_existing_guest_without_network_or_deletion(self, portal, monkeypatch):
+        from hermes_cli.auth_nous import resolve_nous_runtime_credentials
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        state = anon_auth.ensure_portal_identity(explicit=True)
+        _write_config(monkeypatch, guest=False)
+        before = list(portal.calls)
+        for force in (False, True):
+            with pytest.raises(anon_auth.AuthError):
+                resolve_nous_runtime_credentials(force_refresh=force)
+        with pytest.raises(anon_auth.AuthError):
+            resolve_runtime_provider(requested="nous", target_model="nous/welcome")
+        assert portal.calls == before
+        assert _load_auth_store()["providers"]["nous"]["anon_token"] == state["anon_token"]
+        _write_config(monkeypatch, guest=True)
+        assert resolve_nous_runtime_credentials()["provider"] == "nous"
+
+    @pytest.mark.parametrize("named", [False, True])
+    def test_failed_guest_resolution_cannot_delete_peer_replacement(self, portal, monkeypatch, named):
+        from hermes_cli import auth, auth_nous
+        state = anon_auth.ensure_portal_identity(explicit=True)
+        portal.dead_tokens.add(state["anon_token"])
+        original = auth_nous._resolve_nous_runtime_credentials
+        replaced = False
+        shared_replacement = None
+        replacement = dict(state, anon_token="anon_peer")
+        if named:
+            replacement = {"auth_method": "device_code", "access_token": _jwt(client_id="hermes-cli", account_tier="free"), "refresh_token": "fixture_refresh",
+                           "token_type": "Bearer", "expires_at": "2999-01-01T00:00:00+00:00"}
+        def resolve(**kwargs):
+            nonlocal replaced, shared_replacement
+            try:
+                return original(**kwargs)
+            except anon_auth.AnonCredentialDead:
+                store = auth._load_auth_store()
+                store["providers"]["nous"] = replacement
+                store.setdefault("credential_pool", {})["nous"] = [{"id": "peer"}]
+                auth._save_auth_store(store)
+                auth_nous._write_shared_nous_state(replacement)
+                shared_replacement = auth_nous._read_shared_nous_state()
+                assert shared_replacement is not None
+                replaced = True
+                raise
+        monkeypatch.setattr(auth_nous, "_resolve_nous_runtime_credentials", resolve)
+        def ensure(**kwargs):
+            assert auth._load_auth_store()["providers"]["nous"] == replacement
+            assert auth._load_auth_store()["credential_pool"]["nous"] == [{"id": "peer"}]
+            assert auth_nous._read_shared_nous_state() == shared_replacement
+            return replacement
+        monkeypatch.setattr(anon_auth, "ensure_portal_identity", ensure)
+        assert auth_nous.resolve_nous_runtime_credentials(force_refresh=True)["provider"] == "nous"
+        assert replaced
+
     def test_fresh_install_mints_once_and_is_the_active_provider(self, portal, tmp_path):
         state = anon_auth.ensure_portal_identity(explicit=True)
         assert anon_auth.is_guest_state(state)

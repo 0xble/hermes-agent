@@ -96,22 +96,27 @@ def _resolve_inference() -> str:
         return ""
 
 
-def run_bootstrap(*, announce: bool = True) -> SetupRecord:
+def run_bootstrap(*, announce: bool = True) -> Optional[SetupRecord]:
     """Inventory -> ensure identity (gate permitting) -> resolve inference -> record -> broadcast.
 
     Runs every boot; only the mint is gated. Idempotent per process: a second call returns the
     existing record without touching the portal. Never raises. ``announce=False`` skips the
     ``setup.ready`` event: the plain CLI has no client to tell and its stdout is the user's terminal.
+    A concurrent caller waits outside the lock; on timeout it returns ``None`` (still pending),
+    exactly like ``wait_for_record``, without starting a second bootstrap.
     """
     global _record, _started
     with _lock:
         if _record is not None:
             return _record
-        if _started:
-            _done.wait(SETUP_READY_WAIT_SECONDS)
-            if _record is not None:
-                return _record
-        _started = True
+        waiting = _started
+        if not waiting:
+            _started = True
+
+    if waiting:
+        # The elected owner needs this lock to publish. A timeout is not an
+        # ownership transfer: leave the in-flight bootstrap alone.
+        return wait_for_record(SETUP_READY_WAIT_SECONDS)
 
     from hermes_cli import anon_auth
 

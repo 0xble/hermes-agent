@@ -17,6 +17,7 @@ vi.mock('@/hermes', async importOriginal => ({
 
 const requestGateway = (async <T>(_method: string, _params?: Record<string, unknown>): Promise<T> =>
   ({ available: true, has_guest: true }) as T) satisfies FreeTierRequester
+
 const start = (id: string) => ({
   expires_in: 900,
   flow: 'device_code' as const,
@@ -40,6 +41,36 @@ afterEach(async () => {
 })
 
 describe('free-tier sign-in attempts', () => {
+  it('serializes polls and ignores a poll rejected after local expiry', async () => {
+    const { $freeTierSignIn, beginFreeTierSignIn } = await import('./free-tier-sign-in')
+    let rejectPoll: (reason: Error) => void = () => undefined
+    startOAuthLogin.mockResolvedValue({ ...start('terminal'), expires_in: 8 })
+    pollOAuthSession.mockImplementation(() => new Promise((_resolve, reject) => (rejectPoll = reject)))
+    await beginFreeTierSignIn(requestGateway)
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(pollOAuthSession).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect($freeTierSignIn.get()).toMatchObject({ status: 'failed', kind: 'timed_out' })
+    rejectPoll(new Error('late transport error'))
+    await vi.advanceTimersByTimeAsync(1)
+    expect($freeTierSignIn.get()).toMatchObject({ status: 'failed', kind: 'timed_out' })
+  })
+
+  it('completes once and never polls after approval', async () => {
+    const { $freeTierSignIn, beginFreeTierSignIn } = await import('./free-tier-sign-in')
+    let approve: (value: unknown) => void = () => undefined
+    startOAuthLogin.mockResolvedValue(start('approved'))
+    pollOAuthSession.mockImplementation(() => new Promise(resolve => (approve = resolve)))
+    await beginFreeTierSignIn(requestGateway)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(pollOAuthSession).toHaveBeenCalledTimes(1)
+    approve({ status: 'approved', model: 'account/model' })
+    await vi.advanceTimersByTimeAsync(1)
+    expect($freeTierSignIn.get()).toMatchObject({ status: 'completed', model: 'account/model' })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(pollOAuthSession).toHaveBeenCalledTimes(1)
+  })
+
   it('a poll from a closed attempt never overwrites the attempt now on screen', async () => {
     const { $freeTierSignIn, beginFreeTierSignIn, closeFreeTierSignIn } = await import('./free-tier-sign-in')
     let resolveA: (value: unknown) => void = () => undefined

@@ -205,7 +205,13 @@ def exchange_anon_jwt(client: httpx.Client, portal_base_url: str, anon_token: st
     """
     response = client.post(
         f"{portal_base_url.rstrip('/')}/api/anonymous/token", headers=_anon_headers(), json={"token": anon_token})
-    payload = _raise_for_anon_status(response, action="token exchange")
+    try:
+        payload = _raise_for_anon_status(response, action="token exchange")
+    except AnonCredentialDead as exc:
+        # Carry the exact rejected credential across the transaction unwind. Never
+        # re-read it later: another process may already have installed a replacement.
+        exc.dead_token = anon_token
+        raise
     if not isinstance(payload.get("access_token"), str) or not payload["access_token"]:
         raise _anon_err("Nous free tier token exchange returned no token.", "anon_server_error")
     return payload
@@ -512,7 +518,8 @@ def note_model_switch(agent: Any, headers: Any) -> Optional[str]:
     this install's configuration. Recorded here, applied by :func:`apply_model_switch` between
     calls so a response still streaming is never re-labelled under itself. Returns the backing id.
     """
-    if headers is None:
+    if (headers is None or getattr(agent, "provider", None) != "nous"
+            or getattr(agent, "model", None) != GUEST_MODEL):
         return None
     value = None
     try:
@@ -529,6 +536,7 @@ def note_model_switch(agent: Any, headers: Any) -> Optional[str]:
         return None
     try:
         agent._nous_pending_model_switch = (requested, backing)
+        agent._nous_pending_model_switch_route = getattr(agent, "base_url", None)
     except Exception:
         return None
     return backing
@@ -548,7 +556,9 @@ def apply_model_switch(agent: Any) -> Optional[str]:
         return None
     agent._nous_pending_model_switch = None
     requested, backing = pending
-    if str(getattr(agent, "model", "") or "") != requested:
+    if (requested != GUEST_MODEL or getattr(agent, "provider", None) != "nous"
+            or str(getattr(agent, "model", "") or "") != requested
+            or getattr(agent, "base_url", None) != getattr(agent, "_nous_pending_model_switch_route", None)):
         return None  # the session already moved (a /model, a sign-in sweep)
     agent.model = backing
     # The gateway's cache check compares agent.model with the config default and evicts on a
@@ -560,7 +570,12 @@ def apply_model_switch(agent: Any) -> Optional[str]:
         from hermes_cli.config import load_config_readonly
         raw = load_config_readonly().get("model")
         model_cfg = raw if isinstance(raw, dict) else ({"default": raw} if isinstance(raw, str) else {})
-        if str(model_cfg.get("default") or "").strip() == requested:
+        config_url = str(model_cfg.get("base_url") or "").rstrip("/")
+        agent_url = str(getattr(agent, "base_url", "") or "").rstrip("/")
+        if (str(model_cfg.get("default") or "").strip() == requested
+                and model_cfg.get("provider") in (None, "", "auto", "nous")
+                and not model_cfg.get("api_key")
+                and (not config_url or config_url == agent_url or route_is_welcome_host(config_url))):
             from hermes_cli.auth import _update_config_for_provider
             _update_config_for_provider(
                 "nous", str(getattr(agent, "base_url", "") or ""), default_model=backing)

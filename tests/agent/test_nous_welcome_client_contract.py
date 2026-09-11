@@ -60,6 +60,40 @@ def _agent(model="nous/welcome", base_url=PAID):
 
 
 class TestModelSwitchHeader:
+    @pytest.mark.parametrize("provider,model", [("custom:test", "vendor/pinned"),
+                                                ("custom:test", "nous/welcome"),
+                                                ("nous", "vendor/pinned")])
+    def test_header_cannot_override_an_unrelated_route(self, provider, model, monkeypatch, tmp_path):
+        import yaml
+        from hermes_cli.config import get_config_path
+        from agent.rate_limit_credits import RateLimitCreditsMixin
+        config = {"model": {"provider": provider, "default": model,
+                            "base_url": "https://original.example/v1", "api_key": "fixture"}}
+        path = get_config_path()
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        agent = _agent(model=model)
+        agent.provider = provider
+        RateLimitCreditsMixin._capture_nous_model_switch(
+            agent, SimpleNamespace(headers={"x-nous-model-switch": "backing/model"}))
+        assert anon_auth.apply_model_switch(agent) is None
+        assert agent.model == model
+        assert yaml.safe_load(path.read_text(encoding="utf-8")) == config
+
+    def test_pending_header_rechecks_route_and_preserves_explicit_config(self, monkeypatch):
+        writes = []
+        monkeypatch.setattr("hermes_cli.auth._update_config_for_provider", lambda *a, **k: writes.append(k))
+        agent = _agent()
+        anon_auth.note_model_switch(agent, {"x-nous-model-switch": "backing/model"})
+        agent.provider = "custom:test"
+        assert anon_auth.apply_model_switch(agent) is None
+        assert agent.model == "nous/welcome"
+        agent = _agent()
+        anon_auth.note_model_switch(agent, {"x-nous-model-switch": "backing/model"})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {
+            "model": {"provider": "custom:test", "default": "nous/welcome", "api_key": "fixture"}})
+        assert anon_auth.apply_model_switch(agent) == "backing/model"
+        assert writes == []
+
     def test_header_is_recorded_not_applied_on_the_streaming_response(self):
         agent = _agent()
         assert anon_auth.note_model_switch(agent, {"X-Nous-Model-Switch": "z-ai/glm-5.3-flash"}) == "z-ai/glm-5.3-flash"

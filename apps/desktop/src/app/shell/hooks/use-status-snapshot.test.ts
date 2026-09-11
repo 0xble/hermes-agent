@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getStatus } from '@/hermes'
+import { $freeTierRoute, $freeTierStatus } from '@/store/free-tier'
 import { $setupReadyTick, notifySetupReady } from '@/store/live-sync'
 
 import { deferred } from '../../../test/deferred'
@@ -36,6 +37,44 @@ afterEach(() => {
 })
 
 describe('useStatusSnapshot', () => {
+  it('clears free-tier state for an unsupported source and rejects the old response', async () => {
+    const oldStatus = deferred<unknown>()
+    let source = 'A'
+    let delayOld = false
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (source === 'B') {
+        throw new Error('Method not found')
+      }
+
+      if (method === 'free_tier.status') {
+        return delayOld ? oldStatus.promise : { has_guest: true, notice_pending: true }
+      }
+
+      return method === 'setup.runtime_check' ? { ok: true, free_tier: true } : { provider_configured: true }
+    }) as unknown as GatewayRequester
+
+    const { rerender } = renderHook(({ scope }) => useStatusSnapshot('open', requestGateway, scope), {
+      initialProps: { scope: 'A\0default' }
+    })
+
+    await flushAsync()
+    expect($freeTierStatus.get()?.has_guest).toBe(true)
+    expect($freeTierRoute.get()).toBe(true)
+    delayOld = true
+    window.dispatchEvent(new Event('focus'))
+    await flushAsync()
+    source = 'B'
+    rerender({ scope: 'B\0other-profile' })
+    await flushAsync()
+    expect($freeTierStatus.get()).toBeNull()
+    expect($freeTierRoute.get()).toBeNull()
+    oldStatus.resolve({ has_guest: true, notice_pending: true })
+    await flushAsync()
+    expect($freeTierStatus.get()).toBeNull()
+    expect($freeTierRoute.get()).toBeNull()
+  })
+
   it('pauses status RPCs while visible but unfocused, then catches up on focus', async () => {
     vi.mocked(document.hasFocus).mockReturnValue(false)
     const requestGateway = vi.fn().mockResolvedValue({}) as unknown as GatewayRequester

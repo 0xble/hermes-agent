@@ -977,10 +977,11 @@ def resolve_nous_runtime_credentials(
         return _resolve_nous_runtime_credentials(
             timeout_seconds=timeout_seconds, insecure=insecure, ca_bundle=ca_bundle,
             force_refresh=force_refresh, stale_access_token=stale_access_token)
-    except AnonCredentialDead:
-        from hermes_cli.auth import get_provider_auth_state
-        dead = get_provider_auth_state("nous") or {}
-        clear_dead_guest("anon_credential_dead", dead_token=dead.get("anon_token"))
+    except AnonCredentialDead as exc:
+        dead_token = getattr(exc, "dead_token", None)
+        if not dead_token:
+            raise  # no rejected credential identified; never delete a peer's state
+        clear_dead_guest("anon_credential_dead", dead_token=dead_token)
         if ensure_portal_identity(explicit=True, timeout_seconds=timeout_seconds) is None:
             raise
         return _resolve_nous_runtime_credentials(
@@ -1004,6 +1005,9 @@ def _resolve_nous_runtime_credentials(
     with _provider_state_transaction("nous") as (auth_store, state, state_source_path):
         if not state:
             raise _nous_err("Hermes is not logged into Nous Portal.", relogin=True)
+        from hermes_cli.anon_auth import guest_enabled, is_guest_state
+        if is_guest_state(state) and not guest_enabled():
+            raise _nous_err("Nous free tier is disabled for this profile.", "anon_gate_closed")
         run = _NousRuntimeResolve(
             auth_store, state, state_source_path, force_refresh=force_refresh,
             stale_access_token=stale_access_token, timeout_seconds=timeout_seconds)
