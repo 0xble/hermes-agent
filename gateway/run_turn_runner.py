@@ -602,14 +602,13 @@ class TurnRunner:
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
         deadlines = self._edit_retry_deadlines()
-        now = time.monotonic()
-        deadline = deadlines.get(st.edit_clock_key, 0.0) if deadlines is not None else 0.0
-        if deadline > now:
-            return SendResult(
-                success=False, error="progress_edit_flood_control_deferred",
-                retryable=True, retry_after=deadline - now)
         while True:
             now = time.monotonic()
+            deadline = deadlines.get(st.edit_clock_key, 0.0) if deadlines is not None else 0.0
+            if deadline > now:
+                return SendResult(
+                    success=False, error="progress_edit_flood_control_deferred",
+                    retryable=True, retry_after=deadline - now)
             remaining = _PROGRESS_EDIT_INTERVAL - self._edit_gate_elapsed(st, now)
             if remaining <= 0:
                 # Claim BEFORE the API await so another session in this chat cannot observe a

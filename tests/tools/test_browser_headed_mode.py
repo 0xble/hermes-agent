@@ -143,7 +143,13 @@ class TestEffectiveHeadedPersistence:
             runtime_key="identity-key",
         )
         (tmp_path / ".hermes-browser-mode").write_text("headed", encoding="utf-8")
+        # A different cached headless identity must not hide this recovered one.
+        from hermes_constants import hermes_home_key
+        bt._real_profile_cdp_cache["other-headless"] = "http://headless"
+        bt._real_profile_headed_modes["other-headless"] = False
+        bt._real_profile_session_homes["other-headless"] = hermes_home_key()
         with (
+            patch.object(bt, "_cdp_http_ready", return_value=True),
             patch(
                 "hermes_cli.browser_identity.read_browser_identity_config",
                 return_value={"real_profile_identities": {"personal": {}}},

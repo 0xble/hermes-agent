@@ -2258,7 +2258,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Edit a message in place as rich (``editMessageText`` + ``rich_message``) so a streamed preview
         finalizes without send+delete. Same contract as :meth:`_try_send_rich`."""
         # No topic routing on edits: message_thread_id/direct_messages_topic_id make Telegram reject it.
-        payload = {**self._rich_payload_base(chat_id, content), "message_id": int(message_id)}
+        payload = {**self._rich_payload_base(chat_id, content), "message_id": int(message_id),
+                   **self._business_connection_kwargs(metadata)}
         try:
             await self._run_send_call(chat_id, self._bot.do_api_request, "editMessageText", api_kwargs=payload, _edit=True)
         except Exception as exc:
@@ -4548,25 +4549,28 @@ class TelegramAdapter(BasePlatformAdapter):
             if str(normalize_telegram_chat_id(key[0])) == chat and str(mid) == str(message_id):
                 self._status_message_ids.pop(key, None)
 
-    async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None) -> None:
+    async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None,
+                         *, metadata: Optional[Dict[str, Any]] = None) -> None:
         """``editMessageText`` with normalized ids; ``parse_mode=None`` sends plain text."""
-        kwargs: Dict[str, Any] = {"message_id": int(message_id), "text": text}
+        kwargs: Dict[str, Any] = {"message_id": int(message_id), "text": text,
+                                  **self._business_connection_kwargs(metadata)}
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
         await self._edit_message_text_with_cooldown(normalize_telegram_chat_id(chat_id), **kwargs)
 
-    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
+    async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str,
+                                      *, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
         skip further work); the fallback edit's exceptions propagate."""
         try:
-            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2)
+            await self._edit_text(chat_id, message_id, formatted, ParseMode.MARKDOWN_V2, metadata=metadata)
         except Exception as fmt_err:
             if "not modified" in str(fmt_err).lower():
                 return True
             if isinstance(fmt_err, _TelegramSendCooldownExceeded) or self._telegram_retry_after(fmt_err) is not None:
                 raise
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            await self._edit_text(chat_id, message_id, plain, metadata=metadata)
         return False
 
     async def edit_message(
@@ -4629,13 +4633,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
-                await self._edit_text(chat_id, message_id, content)
+                await self._edit_text(chat_id, message_id, content, metadata=metadata)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
             await self._edit_markdown_or_plain(
                 chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+                "[%s] MarkdownV2 edit failed, falling back to plain text: %s", metadata=metadata)
             return SendResult(success=True, message_id=message_id)
         except _TelegramSendCooldownExceeded as e:
             return self._send_cooldown_failure(e)
@@ -4654,7 +4658,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 truncated = self._truncate_stream_overflow_preview(content)
                 if self._last_overflow_preview.get(_preview_key) == truncated:
                     return SendResult(success=True, message_id=message_id)
-                await self._edit_text(chat_id, message_id, truncated)
+                await self._edit_text(chat_id, message_id, truncated, metadata=metadata)
                 self._last_overflow_preview[_preview_key] = truncated
                 return SendResult(success=True, message_id=message_id)
             # Flood control: short waits retry inline; long waits fail immediately so streaming falls back
@@ -4668,7 +4672,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     return _flood_cap_result(wait, retryable=True)
                 await asyncio.sleep(wait)
                 try:
-                    await self._edit_text(chat_id, message_id, content)
+                    await self._edit_text(chat_id, message_id, content, metadata=metadata)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -4758,9 +4762,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if finalize:
                 await self._edit_markdown_or_plain(
                     chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
-                    "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
+                    "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s", metadata=metadata)
             else:
-                await self._edit_text(chat_id, message_id, first_chunk)
+                await self._edit_text(chat_id, message_id, first_chunk, metadata=metadata)
         except _TelegramSendCooldownExceeded as cooldown_error:
             return self._send_cooldown_failure(cooldown_error)
         except Exception as e:

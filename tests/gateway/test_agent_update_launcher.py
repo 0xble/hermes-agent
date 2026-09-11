@@ -30,15 +30,20 @@ def test_cli_invalid_reason_returns_nonzero_without_ipc(monkeypatch, capsys):
     assert "--reason" in capsys.readouterr().out
 
 
-def _real_store_with_routes(tmp_path):
+def _real_store_with_routes(tmp_path, profile=None):
     """Create a persisted messaging parent and two real delegated descendants."""
     token = set_hermes_home_override(tmp_path)
+    if profile:
+        (tmp_path / "profiles" / profile).mkdir(parents=True)
+    profile_root = patch("hermes_cli.profiles._get_default_hermes_home", return_value=tmp_path)
+    profile_root.start()
     try:
-        store = SessionStore(tmp_path / "sessions", GatewayConfig())
+        store = SessionStore(tmp_path / "sessions", GatewayConfig(multiplex_profiles=bool(profile)))
         direct = store.get_or_create_session(
-            SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="private", user_id="u", thread_id="t")
+            SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="private", user_id="u", thread_id="t", profile=profile)
         )
-        db = store._db
+        db = store._db_for_key(direct.session_key)
+        store._test_route_db = db
         assert db is not None
         db.create_session("delegate-1", "agent", parent_session_id=direct.session_id)
         db.create_session("delegate-2", "agent", parent_session_id="delegate-1")
@@ -46,15 +51,23 @@ def _real_store_with_routes(tmp_path):
         assert db.get_session("delegate-2")["chat_id"] is None
         return store, direct.session_id, "delegate-2"
     finally:
+        profile_root.stop()
         reset_hermes_home_override(token)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="real unix socket transport")
+@pytest.mark.parametrize("profile", (None, "work"))
 @pytest.mark.parametrize("route_kind", ("direct", "nested"))
-def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watcher(tmp_path, route_kind):
+def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watcher(tmp_path, route_kind, profile, monkeypatch):
+    """The real unpinned DB resolver finds named lineage before socket handoff."""
     from gateway.run import _start_gateway_start_control_socket
 
-    store, direct_id, nested_id = _real_store_with_routes(tmp_path)
+    import hermes_state
+    # Restore the production dynamic-home branch disabled by the global test fixture.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path)
+    store, direct_id, nested_id = _real_store_with_routes(tmp_path, profile=profile)
     watched = asyncio.Event()
     watch_threads = []
     main_thread = threading.get_ident()
@@ -63,10 +76,16 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
         watch_threads.append(threading.get_ident())
         watched.set()
 
-    runner = SimpleNamespace(
-        _session_db=AsyncSessionDB(store._db), _schedule_update_notification_watch=watch,
-        request_restart=Mock(),
-    )
+    from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
+    runner = object.__new__(GatewayRunner)
+    runner.config = store.config
+    runner.session_store = store
+    runner._session_db_pinned = _SESSION_DB_UNPINNED
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    runner._schedule_update_notification_watch = watch
+    runner.request_restart = Mock()
+
     spawns = []
 
     def fake_spawn(cmd, output, exit_code):
@@ -88,6 +107,7 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
                         tmp_path, "agent-update", payload={"session_id": session_id, "reason": "Apply security fix"},
                     )
                 )
+                assert result and result.get("accepted"), result
                 await asyncio.wait_for(watched.wait(), timeout=1)
                 duplicate = await loop.run_in_executor(
                     None, lambda: query_gateway_control(
@@ -111,9 +131,20 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
         "source": "telegram", "chat_id": "42", "chat_type": "private", "user_id": "u",
         "session_key": marker["parent_route"]["session_key"], "thread_id": "t",
     }
+    from gateway.run_notifications import GatewayNotificationsMixin
+    default_adapter, named_adapter = object(), object()
+    class TargetRunner(GatewayNotificationsMixin):
+        def _authorization_adapter(self, platform, requested_profile):
+            return named_adapter if requested_profile == "work" else default_adapter
+        def _pending_marker_metadata(self, *args):
+            return None
+    target = TargetRunner()._resolve_update_target(SimpleNamespace(
+        pending=tmp_path / ".update_pending.json", claimed=tmp_path / "missing.json"))
+    assert target.adapter is (named_adapter if profile else default_adapter)
     assert len(spawns) == 1
     assert watch_threads == [main_thread]
     runner.request_restart.assert_not_called()
+    store._test_route_db.close()
     store._db.close()
 
 
@@ -124,7 +155,7 @@ def test_agent_update_invalid_reason_or_route_has_no_side_effects(tmp_path):
     store, _direct_id, _nested_id = _real_store_with_routes(tmp_path)
     spawn = Mock()
     runner = SimpleNamespace(
-        _session_db=AsyncSessionDB(store._db), _schedule_update_notification_watch=Mock(), request_restart=Mock(),
+        _session_db=AsyncSessionDB(store._test_route_db), _schedule_update_notification_watch=Mock(), request_restart=Mock(),
     )
 
     async def scenario():
@@ -173,3 +204,41 @@ def test_claimed_marker_prevents_duplicate_spawn_and_preserves_reason(tmp_path):
     spawn.assert_not_called()
     assert json.loads(claimed.read_text(encoding="utf-8"))["reason"] == "existing precise reason"
     assert not (tmp_path / ".update_pending.json").exists()
+
+
+@pytest.mark.parametrize("standalone,multiplexer,response", [(True, True, None), (False, True, None),
+                                                          (False, True, {"accepted": True, "handoff": "ok"})])
+def test_cli_selects_one_transport_before_update(tmp_path, monkeypatch, standalone, multiplexer, response):
+    import hermes_cli.gateway as cli
+    named = tmp_path / "profiles" / "work"
+    monkeypatch.setattr(cli, "get_hermes_home", lambda: named)
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "get_gateway_runtime_snapshot", lambda: SimpleNamespace(running=standalone))
+    monkeypatch.setattr(cli, "named_profile_served_by_running_multiplexer", lambda: multiplexer)
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda *_: "session")
+    query = Mock(return_value=response)
+    monkeypatch.setattr("gateway.control_socket.query_gateway_control", query)
+    _cmd_update(SimpleNamespace(reason="Fix bug"))
+    query.assert_called_once()
+    assert query.call_args.args[0] == (named if standalone else tmp_path)
+
+
+def test_update_lineage_rejects_duplicate_profile_identity(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner, _SESSION_DB_UNPINNED
+    from gateway.update_launcher import _runner_session_lineage
+    from hermes_constants import get_hermes_home
+    import hermes_state
+    # Restore the production dynamic-home branch disabled by the global test fixture.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path)
+    store, sid, _ = _real_store_with_routes(tmp_path, profile="work")
+    store._db.create_session(sid, "telegram", session_key="agent:main:telegram:dm:42", chat_id="42")
+    runner = object.__new__(GatewayRunner)
+    runner.config = store.config
+    runner.session_store = store
+    runner._session_db_pinned = _SESSION_DB_UNPINNED
+    runner._session_db_handles = {}
+    runner._session_db_handles_lock = threading.Lock()
+    assert _runner_session_lineage(runner, tmp_path, sid) is None
+    assert get_hermes_home() == tmp_path

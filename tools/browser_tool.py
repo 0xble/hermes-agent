@@ -394,9 +394,6 @@ def _preserve_browser_between_turns() -> bool:
         if _real_profile_headed_modes.get(cache_key) is not False:
             return True  # unknown mode is not evidence of headless
         saw_active_headless = True
-    if saw_active_headless:
-        return False
-
     # Browser processes survive a gateway restart while every process-local cache above is lost.
     # Recover only live runtimes whose CDP endpoint owns an active-profile managed snapshot.
     try:
@@ -439,7 +436,7 @@ def _preserve_browser_between_turns() -> bool:
     except Exception as exc:
         logger.debug("real-profile mode recovery failed: %s", exc)
         return True  # fail toward preserving a runtime we could not classify
-    return _is_headed_mode()
+    return False if saw_active_headless else _is_headed_mode()
 
 
 def _browser_identity_binding_dir(task_id: str) -> Path:

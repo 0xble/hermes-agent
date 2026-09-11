@@ -1190,12 +1190,35 @@ def _browser_exec(
 
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
+    execution_deadline = time.monotonic() + timeout
     from tools.browser_handoff import enabled as visibility_handoff_enabled
     track_visibility_activity = resolved_identity is not None and visibility_handoff_enabled()
     owns_activity_marker = False
     if track_visibility_activity:
-        from tools.browser_handoff import mark_executing
+        from tools.browser_handoff import HandoffError, mark_executing, _assert_no_pending
+        try:
+            _assert_no_pending(resolved_identity)
+        except HandoffError as exc:
+            return tool_error(str(exc))
         daemon_identity = _daemon_process_identity(daemon_name, env) if daemon_name else None
+        if daemon_identity is None:
+            # Establish the daemon before recording uncertain USER execution. The
+            # supported harness ensures its daemon before evaluating stdin Python.
+            # This setup script neither runs user code nor invokes browser helpers.
+            try:
+                setup = _run_cli_killing_process_group(cmd, "pass\n", env, timeout)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return tool_error(f"Failed to launch browser-use daemon setup: {type(exc).__name__}")
+            if setup.returncode != 0:
+                return tool_error("Browser-use daemon setup failed; user code was not submitted.")
+            daemon_identity = _daemon_process_identity(daemon_name, env) if daemon_name else None
+        if daemon_identity is None:
+            return tool_error("Cannot verify browser-use daemon identity; user code was not submitted.")
+        if time.monotonic() >= execution_deadline:
+            return tool_error("Browser-use daemon setup exhausted the execution timeout; user code was not submitted.")
+        # Supported harness contract: do not silently spawn a replacement between
+        # identity proof and user execution. Exact reload checks still fence PID reuse.
+        env["BH_REQUIRE_EXISTING_DAEMON"] = "1"
         owns_activity_marker = mark_executing(
             resolved_identity,
             env.get("BU_CDP_URL") or env.get("BU_CDP_WS") or "unknown",
@@ -1203,8 +1226,12 @@ def _browser_exec(
             runtime_owner=_browser_exec_runtime_owner(resolved_identity),
             daemon_identity=daemon_identity,
         )
+        if not owns_activity_marker:
+            return tool_error("Browser execution remains pending; user code was not submitted.")
     try:
-        proc = _run_cli_killing_process_group(cmd, code, env, timeout)
+        proc = _run_cli_killing_process_group(
+            cmd, code, env,
+            max(0.001, execution_deadline - time.monotonic()) if track_visibility_activity else timeout)
     except subprocess.TimeoutExpired:
         return tool_error(f"browser-use exec timed out after {timeout}s. The daemon may still be working; retry "
                           f"with a larger timeout_s (max {_MAX_TIMEOUT_S}), or split the work into several calls that "

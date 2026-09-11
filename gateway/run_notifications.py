@@ -1643,16 +1643,21 @@ class GatewayNotificationsMixin:
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from gateway.delegation_cards import cards_for
-        await cards_for(self).reconcile()
+        with _log_suppressed(logging.WARNING, "Delegation card startup recovery failed: %s"):
+            await cards_for(self).reconcile()
         from gateway.review_status_migration import retire_legacy_review_statuses
-        await retire_legacy_review_statuses(self)
+        with _log_suppressed(logging.WARNING, "Legacy review status recovery failed: %s"):
+            await retire_legacy_review_statuses(self)
         from tools.process_registry import process_registry as _pr
         # ProcessRegistry restores ordinary pending rows before adapters connect. Do this separate,
         # one-time pass only after connection so retry-exhausted rows cannot spin on unavailable
         # destinations and are never reset on each watcher poll.
-        await self._recover_ready_async_delegation_deliveries(_pr.completion_queue)
+        with _log_suppressed(logging.WARNING, "Exhausted delegation recovery failed: %s"):
+            await self._recover_ready_async_delegation_deliveries(_pr.completion_queue)
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                from tools.async_delegation import retry_current_owner_terminal_checkpoints
+                await asyncio.to_thread(retry_current_owner_terminal_checkpoints, _pr.completion_queue)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.

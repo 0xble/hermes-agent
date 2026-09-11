@@ -225,3 +225,39 @@ def test_multiple_windows(cdp):
     with pytest.raises(CdpHandoffError, match="multiple"):
         client.set_visibility("reveal")
     assert all(c.args[0] != "Browser.setWindowBounds" for c in client.call.call_args_list)
+
+
+def test_cold_execution_handshake_and_pending_refusal(identity, monkeypatch):
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli, "_resolve_real_profile_cdp", lambda env, **_: (
+        env.update({"BU_CDP_URL": "http://fake", cli._REAL_PROFILE_SENTINEL: "1"}) or None))
+    monkeypatch.setattr(cli, "_resolve_backend_cdp", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "_attach_vault_supervisor", lambda *_: None)
+    monkeypatch.setattr(cli, "_workspace_dir", lambda _: None)
+    calls = []
+    clock = [0.0]
+    daemon = [None]
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_: daemon[0])
+    def run(cmd, code, env, timeout):
+        calls.append((code, dict(env), timeout))
+        if code == "pass\n":
+            daemon[0] = (41, 1.0)
+            clock[0] += 2
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    monkeypatch.setattr(cli, "_run_cli_killing_process_group", run)
+    result = cli.browser_exec("print('user')", identity="work", session="cold", timeout_s=10)
+    assert "timed out" in result
+    assert len(calls) == 2
+    assert calls[0][0] == "pass\n"
+    assert calls[1][1]["BH_REQUIRE_EXISTING_DAEMON"] == "1"
+    assert calls[1][2] < calls[0][2]
+    pending = life._read_state(identity)
+    assert pending["daemon_pid"] == 41
+    assert pending["daemon_created"] == 1.0
+    result = cli.browser_exec("print('another')", identity="work", session="cold")
+    assert "unfinished or uncertain" in result
+    assert len(calls) == 2
+    assert life._read_state(identity) == pending

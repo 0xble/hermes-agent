@@ -414,3 +414,30 @@ def test_checklist_transport_retryability_never_authorizes_ambiguous_resend():
     assert send_failure.retryable is False
     assert edit_failure.retryable is True
     assert forbidden_edit.retryable is False
+
+
+@pytest.mark.parametrize("finalize,overflow,rich", [(False, False, False), (True, False, False),
+                                                  (True, True, False), (True, False, True)])
+def test_business_edit_retains_connection(finalize, overflow, rich):
+    from plugins.platforms.telegram.adapter import TelegramAdapter as PackageAdapter
+    adapter = PackageAdapter(PlatformConfig(enabled=True, token="test-token", extra={"allow_from": ["*"]}))
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock()
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=80))
+    adapter._bot.do_api_request = AsyncMock(return_value={"message_id": 77})
+    adapter._rich_messages_enabled = rich
+    if rich:
+        adapter._rich_eligible = lambda _: True
+    content = ("paragraph " * 700) if overflow else "updated text"
+    result = asyncio.run(adapter.edit_message("123", "77", content, finalize=finalize,
+        metadata={"telegram_business_connection_id": "biz-A", "thread_id": "9"}))
+    assert result.success
+    if rich:
+        payload = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]
+        assert payload["business_connection_id"] == "biz-A"
+        assert "message_thread_id" not in payload
+    else:
+        for call in adapter._bot.edit_message_text.call_args_list:
+            assert call.kwargs["business_connection_id"] == "biz-A"
+            assert "message_thread_id" not in call.kwargs
+        assert adapter._bot.edit_message_text.call_count

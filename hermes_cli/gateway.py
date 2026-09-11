@@ -6282,7 +6282,13 @@ def _cmd_update(args) -> int:
         print("Error: update requests require a durable messaging session route")
         return 2
     from gateway.control_socket import query_gateway_control
-    result = query_gateway_control(get_hermes_home(), "agent-update", payload={
+    target_home = get_hermes_home()
+    # Select the owning transport BEFORE a mutating request. An absent response
+    # may mean accepted work, so never retry the request on another socket.
+    if not get_gateway_runtime_snapshot().running and named_profile_served_by_running_multiplexer():
+        from hermes_constants import get_default_hermes_root
+        target_home = get_default_hermes_root()
+    result = query_gateway_control(target_home, "agent-update", payload={
         "reason": reason, "session_id": session_id,
     })
     if not result:

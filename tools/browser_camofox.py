@@ -607,6 +607,12 @@ def camofox_close(task_id: Optional[str] = None) -> str:
                 _delete(f"/tabs/{session['tab_id']}", {"userId": session["user_id"]})
         elif session:
             _delete(f"/sessions/{session['user_id']}")
+        # Rehydration above publishes a fresh cache entry. Remove only that exact
+        # entry after successful cleanup, never a concurrently replaced session.
+        with _sessions_lock:
+            key = _session_cache_key(task_id)
+            if _sessions.get(key) is session:
+                _sessions.pop(key, None)
         return json.dumps({"success": True, "closed": True})
     except Exception as e:
         return tool_error(f"Camofox task cleanup refused before a safe storage checkpoint: {e}", success=False)

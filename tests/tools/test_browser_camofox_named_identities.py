@@ -223,3 +223,19 @@ def test_camofox_schema_requires_identity_when_backend_selected(monkeypatch):
 
     assert schema["parameters"]["properties"]["identity"]["enum"] == ["lpg", "meridian", "personal"]
     assert "identity" in schema["parameters"]["required"]
+
+
+def test_close_rehydrated_tab_does_not_cache_deleted_tab(monkeypatch):
+    from tools import browser_camofox as cf
+    tabs = [{"tabId": "old", "listItemId": "task"}]
+    binding = {"alias": "personal", "identity_key": "key", "user_id": "user", "session_key": "task"}
+    monkeypatch.setattr(cf, "read_camofox_binding", lambda _: binding)
+    monkeypatch.setattr(cf, "resolve_camofox_identity", lambda *_: binding)
+    monkeypatch.setattr(cf, "_get_camofox_config", lambda: {})
+    monkeypatch.setattr(cf, "_global_user_id_override", lambda _: False)
+    monkeypatch.setattr(cf, "get_camofox_url", lambda: "http://fake")
+    monkeypatch.setattr(cf, "_get", lambda path, **_: {"tabs": list(tabs)} if path == "/tabs" else {})
+    monkeypatch.setattr(cf, "_delete", lambda *args: tabs.clear())
+    monkeypatch.setattr(cf, "_post", lambda *args: {"tabId": "new"})
+    assert json.loads(cf.camofox_close("task"))["success"]
+    assert cf._ensure_tab("task")["tab_id"] == "new"

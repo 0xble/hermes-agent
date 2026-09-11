@@ -120,8 +120,7 @@ def make_agent_update_handler(
         if not (Path(__file__).parent.parent.resolve() / ".git").exists():
             return {"accepted": False, "error": "update requires a git checkout"}
         try:
-            db = runner._session_db._db
-            resolved = _route_from_session_lineage(db, session_id)
+            resolved = _runner_session_lineage(runner, home, session_id)
         except Exception:
             resolved = None
         if resolved is None:
@@ -155,3 +154,36 @@ def make_agent_update_handler(
         return {"accepted": True, **result, "handoff": _UPDATE_HANDOFF}
 
     return _handler
+
+
+def _runner_session_lineage(runner: Any, home: Path, session_id: str):
+    """Resolve only gateway-owned stores and refuse ambiguous cross-profile IDs."""
+    if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return _route_from_session_lineage(runner._session_db._db, session_id)
+    from gateway.run import _multiplex_profile_homes
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    scopes = [("default", home), *_multiplex_profile_homes(runner.config)]
+    seen = set()
+    matches = []
+    for profile, candidate_home in scopes:
+        candidate_home = Path(candidate_home).resolve()
+        if candidate_home in seen:
+            continue
+        seen.add(candidate_home)
+        token = set_hermes_home_override(candidate_home)
+        try:
+            db = runner._session_db._db
+            if db.get_session(session_id) is None:
+                continue
+            route = _route_from_session_lineage(db, session_id)
+            if route is None:
+                return None
+            parts = str(route[1].get("session_key") or "").split(":")
+            expected = "main" if profile == "default" else profile
+            if len(parts) < 5 or parts[:2] != ["agent", expected]:
+                return None
+            matches.append(route)
+        finally:
+            reset_hermes_home_override(token)
+    return matches[0] if len(matches) == 1 else None

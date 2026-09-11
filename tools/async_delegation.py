@@ -55,6 +55,9 @@ _MAX_DELIVERY_RECOVERIES = 1
 # durable obligation awaiting an availability-triggered retry, never an age cap.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
+_completion_publish_lock = threading.RLock()
+_completion_retry_homes: set[Path] = set()
+_completion_publications: Dict[tuple[Path, str], Dict[str, Any]] = {}
 _BUSY_RETRY_DELAYS_S = (0.02, 0.04, 0.08, 0.12, 0.15)
 _TERMINAL_CHECKPOINT_SCHEMA = "async_delegation_terminal_v1"
 _CHECKPOINT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -359,16 +362,81 @@ def _prune_durable_records() -> None:
                    )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
 
 
-def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
-    def _write() -> None:
+def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
+    """Only the winner of the terminal transition owns queue publication."""
+    from gateway.status import get_process_start_time
+    pid = os.getpid()
+    started = get_process_start_time(pid)
+
+    def _write() -> bool:
         now = time.time()
         with _DB_LOCK, _transaction() as conn:
-            conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+            changed = conn.execute("""UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                    event_json=?, result_json=?, delivery_state='pending'
-                   WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                   WHERE delegation_id=? AND state IN ('running','finalizing')
+                     AND owner_pid=? AND owner_started_at IS ?""",
                 (event.get("status", "completed"), event.get("completed_at", now), now,
-                 json.dumps(event), json.dumps(result), event["delegation_id"]))
-    _run_with_busy_retry(_write)
+                 json.dumps(event), json.dumps(result), event["delegation_id"], pid, started))
+            return changed.rowcount == 1
+    return _run_with_busy_retry(_write)
+
+
+def _publish_completion(event: Dict[str, Any], target_queue) -> None:
+    """Retain publication failures for the live watcher, separate from delivery attempts."""
+    home = get_hermes_home().resolve()
+    key = (home, event["delegation_id"])
+    with _completion_publish_lock:
+        _completion_retry_homes.add(home)
+        _completion_publications[key] = event
+        target_queue.put(event)
+        _completion_publications.pop(key, None)
+        _clear_terminal_checkpoint(event["delegation_id"])
+
+
+def retry_current_owner_terminal_checkpoints(target_queue) -> int:
+    """Import exact terminal results from this process without waiting for its death.
+
+    Only homes registered by a local producer are considered. Dead-owner startup
+    recovery and retry-exhausted delivery budgets retain their separate semantics.
+    """
+    from gateway.status import get_process_start_time
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    pid = os.getpid()
+    started = get_process_start_time(pid)
+    if started is None:
+        return 0
+    published = 0
+    with _completion_publish_lock:
+        for home in tuple(_completion_retry_homes):
+            token = set_hermes_home_override(home)
+            try:
+                with _DB_LOCK, _transaction() as conn:
+                    ids = [r[0] for r in conn.execute(
+                        "SELECT delegation_id FROM async_delegations "
+                        "WHERE state IN ('running','finalizing') AND owner_pid=? AND owner_started_at=?",
+                        (pid, started))]
+                for delegation_id in ids:
+                    checkpoint = _load_terminal_checkpoint(delegation_id)
+                    if checkpoint is None:
+                        continue
+                    event = checkpoint["event"]
+                    if event.get("status") in _ACTIVE_STATES or event.get("status") not in {
+                            "completed", "failed", "error", "cancelled", "stalled", "unknown"}:
+                        continue
+                    if _persist_completion(event, checkpoint["result"]):
+                        _completion_publications[(home, delegation_id)] = event
+                for (pending_home, _), event in tuple(_completion_publications.items()):
+                    if pending_home == home:
+                        _publish_completion(event, target_queue)
+                        published += 1
+                if not any(h == home for h, _ in _completion_publications) and not any(
+                        _load_terminal_checkpoint(oid) is not None for oid in ids):
+                    _completion_retry_homes.discard(home)
+            except Exception:
+                logger.warning("Same-owner delegation completion retry deferred", exc_info=True)
+            finally:
+                reset_hermes_home_override(token)
+    return published
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -1127,18 +1195,20 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         logger.error("Async delegation%s %s: terminal checkpoint failed: %s",
                      label, record.get("delegation_id"), exc)
     try:
-        _persist_completion(evt, result)
-        if checkpointed:
-            _clear_terminal_checkpoint(evt["delegation_id"])
+        won = _persist_completion(evt, result)
     except Exception as persist_exc:
         if not checkpointed:
             raise
         logger.error("Async delegation%s %s: persist failed after terminal checkpoint; "
                      "not enqueueing until recovery replays the exact result: %s",
                      label, record.get("delegation_id"), persist_exc)
+        with _completion_publish_lock:
+            _completion_retry_homes.add(get_hermes_home().resolve())
+        return
+    if not won:
         return
     try:
-        process_registry.completion_queue.put(evt)
+        _publish_completion(evt, process_registry.completion_queue)
     except Exception as exc:  # pragma: no cover
         logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
                      "result lost: %s", record.get("delegation_id"), exc)
