@@ -16,11 +16,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from cron.jobs import _ensure_cron_dir
 from pathlib import Path
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, BinaryIO, Callable, Optional, TYPE_CHECKING
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -360,22 +361,25 @@ def _run_job_script(
     script_timeout = float(_get_script_timeout())
     if timeout_seconds is not None:
         script_timeout = min(script_timeout, max(0.0, float(timeout_seconds)))
-    script_stdin: Optional[str] = None
     if script_snapshot is not None:
         try:
-            script_stdin = script_snapshot.decode("utf-8")
+            script_snapshot.decode("utf-8")
         except UnicodeDecodeError as exc:
             return False, f"Completion script snapshot is not UTF-8: {exc}"
 
     argv, env_overlay, err = _script_argv(path)
     if argv is None:
         return False, err
-    if script_stdin is not None:
+    shell_executable: Optional[str] = None
+    if script_snapshot is not None:
         if path.suffix.lower() in {".sh", ".bash"}:
-            argv = [argv[0], "-s"]
+            # In stdin mode Bash takes $0 from argv[0], not an argument after -s.
+            shell_executable = argv[0]
+            argv = [str(path), "-s", "--"]
         else:
             argv = _captured_python_argv(argv[0], env_overlay, str(path))
 
+    script_input: Optional[BinaryIO] = None
     try:
         from tools.environments.local import build_subprocess_env
         popen_kwargs: dict[str, Any] = {"start_new_session": True}
@@ -389,6 +393,15 @@ def _run_job_script(
                 # reader threads on non-UTF-8 Windows (#45099).
                 "encoding": "utf-8",
                 "errors": "replace"}
+        if shell_executable is not None:
+            popen_kwargs["executable"] = shell_executable
+        if script_snapshot is not None:
+            # A private seekable stdin avoids partial communicate(input=...) writes
+            # being stranded across timeout polls on Python 3.11. Never reopen the
+            # live verifier or put captured source in the command-line arguments.
+            script_input = tempfile.TemporaryFile()
+            script_input.write(script_snapshot)
+            script_input.seek(0)
         env = build_subprocess_env()
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
@@ -396,10 +409,9 @@ def _run_job_script(
         # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
         # gateway sessions (#69396).
         proc = subprocess.Popen(
-            argv, stdin=subprocess.PIPE if script_stdin is not None else None,
+            argv, stdin=script_input,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
-        pending_script_input = script_stdin
         deadline = time.monotonic() + script_timeout
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
@@ -420,15 +432,9 @@ def _run_job_script(
                 # tree-kill (#85147, d6a5cb9725).
                 return False, f"Script timed out after {script_timeout:g}s: {path}"
             try:
-                if pending_script_input is None:
-                    stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
-                else:
-                    stdout_raw, stderr_raw = proc.communicate(
-                        input=pending_script_input, timeout=min(0.1, remaining))
-                pending_script_input = None
+                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
             except subprocess.TimeoutExpired:
-                pending_script_input = None
                 continue
 
         stdout = (stdout_raw or "").strip()
@@ -453,6 +459,9 @@ def _run_job_script(
         return True, stdout
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        if script_input is not None:
+            script_input.close()
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

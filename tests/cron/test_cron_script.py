@@ -885,18 +885,140 @@ class TestScriptTimeoutTreeKill:
                     pass
 
 
-def test_captured_python_preserves_script_identity_and_sibling_imports(cron_env, tmp_path):
+@pytest.mark.parametrize("large", [False, True])
+def test_captured_python_preserves_script_identity_and_sibling_imports(cron_env, tmp_path, large):
     from cron.scheduler_script import _run_job_script
     script = cron_env / 'scripts' / 'verify.py'
     (script.parent / 'fixture.txt').write_text('fixture')
     (script.parent / 'sibling.py').write_text('VALUE = "sibling"\n')
-    snapshot = b'''import json, sys, __main__
+    padding = b"# captured comment\n" * (180 * 1024) if large else b""
+    snapshot = padding + b'''import json, sys, __main__
 from pathlib import Path
 import sibling
 print(json.dumps([__file__, sys.argv[0], __main__.__file__, Path(__file__).with_name("fixture.txt").read_text(), sibling.VALUE]))
 '''
     script.write_text('raise RuntimeError("live bytes must not execute")')
     workdir = tmp_path / 'work'; workdir.mkdir()
-    ok, output = _run_job_script(str(script), workdir=str(workdir), script_snapshot=snapshot)
+    ok, output = _run_job_script(
+        str(script), workdir=str(workdir), script_snapshot=snapshot, timeout_seconds=5,
+    )
     assert ok, output
     assert json.loads(output) == [str(script.resolve())] * 3 + ['fixture', 'sibling']
+
+
+@pytest.mark.parametrize("suffix", [".sh", ".bash"])
+@pytest.mark.parametrize("large", [False, True])
+def test_captured_shell_preserves_identity_and_sibling_lookup(cron_env, tmp_path, monkeypatch, suffix, large):
+    from cron.scheduler_script import _run_job_script
+
+    scripts = cron_env / "scripts" / "space directory"
+    scripts.mkdir()
+    script = scripts / f"verify snapshot{suffix}"
+    (scripts / "fixture.txt").write_text("sibling fixture\n")
+    workdir = tmp_path / "different cwd"
+    workdir.mkdir()
+    # Larger than common command-line limits: source must travel over stdin.
+    padding = b"# captured comment\n" * (180 * 1024) if large else b""
+    snapshot = padding + b'''set -eu
+printf '%s\\n' "$0" "$#" "${1-unset}"
+cat "$(dirname "$0")/fixture.txt"
+pwd
+'''
+    script.write_bytes(snapshot)
+    captured = script.read_bytes()
+    script.write_text("echo live-bytes-must-not-run; exit 91\n")
+    invocations = []
+    input_files = []
+    real_popen = subprocess.Popen
+
+    def observe_popen(argv, **kwargs):
+        invocations.append(list(argv))
+        if kwargs.get("stdin") is not None:
+            input_files.append(kwargs["stdin"])
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", observe_popen)
+    ok, output = _run_job_script(
+        str(script), workdir=str(workdir), script_snapshot=captured, timeout_seconds=5,
+    )
+    assert ok, output
+    assert output.splitlines() == [str(script.resolve()), "0", "unset", "sibling fixture", str(workdir)]
+    assert invocations
+    assert all(sum(len(arg) for arg in argv) < 4096 for argv in invocations)
+    assert input_files and all(stream.closed for stream in input_files)
+
+
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("stop", ["timeout", "cancel"])
+def test_captured_shell_stops_descendants_and_closes_input(cron_env, monkeypatch, stop):
+    import shlex
+    import threading
+    import time
+
+    import psutil
+
+    from cron.scheduler_script import _run_job_script
+
+    script = cron_env / "scripts" / "stopping.sh"
+    pid_file = cron_env / "child.pid"
+    child_source = (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "start_new_session=True, stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"Path({str(pid_file)!r}).write_text(str(p.pid))\n"
+        "time.sleep(30)\n"
+    )
+    snapshot = f"{shlex.quote(sys.executable)} -c {shlex.quote(child_source)}\n".encode()
+    script.write_text("exit 91\n")
+    cancelled = threading.Event()
+    result = []
+    input_files = []
+    real_popen = subprocess.Popen
+
+    def observe_popen(argv, **kwargs):
+        if kwargs.get("stdin") is not None:
+            input_files.append(kwargs["stdin"])
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", observe_popen)
+    worker = threading.Thread(target=lambda: result.append(_run_job_script(
+        str(script), script_snapshot=snapshot, cancel_event=cancelled,
+        timeout_seconds=2 if stop == "timeout" else 15,
+    )))
+    worker.start()
+    child_pid = None
+
+    def child_alive():
+        try:
+            process = psutil.Process(child_pid)
+            return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                child_pid = int(pid_file.read_text())
+                break
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.02)
+        assert child_pid is not None, "captured shell did not launch its descendant"
+        if stop == "cancel":
+            cancelled.set()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert len(result) == 1 and result[0][0] is False
+        assert ("timed out" if stop == "timeout" else "cancelled") in result[0][1]
+        deadline = time.monotonic() + 5
+        while child_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not child_alive()
+        assert input_files and all(stream.closed for stream in input_files)
+    finally:
+        cancelled.set()
+        worker.join(timeout=10)
+        if child_pid is not None and child_alive():
+            psutil.Process(child_pid).kill()

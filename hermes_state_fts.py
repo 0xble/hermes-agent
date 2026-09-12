@@ -352,13 +352,14 @@ class SessionFtsSetupMixin:
     _FTS_PROBE_CACHE_SECONDS = 60.0
 
     def _fts_structure_is_corrupt(self):
-        """Positively attribute a malformed error to the FTS shadow tables (HERMES-054).
+        """Diagnose internal FTS consistency without comparing external content (HERMES-054).
 
         Runs FTS5's structure-only ``integrity-check`` (rank=0: internal index consistency, no
         external-content comparison) against each present FTS table. True when any FTS structure is
         corrupt, False when every present structure verifies clean, and None when the probe itself
-        cannot run (older FTS5, probe error) — callers treat None as "attribution unknown" and keep
-        the historical fail-open behaviour. Cached briefly so repeated failing writes do not re-scan.
+        cannot run (older FTS5, probe error). A clean result does not rule out an FTS write error
+        caused by external-content disagreement, so this diagnostic does not gate fail-open.
+        Cached briefly so repeated diagnostic calls do not re-scan.
 
         Without this probe a malformed page in ANY table read as FTS corruption: the in-place
         rebuild "succeeded" against healthy indexes, the write failed again, and the process looped
@@ -398,15 +399,8 @@ class SessionFtsSetupMixin:
         gap of unknown extent, so nobody may reinstall them without a full rebuild."""
         if not self._fts_enabled or not self._is_fts_write_corruption_error(exc):
             return False
-        # HERMES-054: a VTAB-coded error without an ``fts5:`` message still has to be attributed.
-        # A clean structure probe means the damage is in another table, and detaching triggers
-        # there only hides a canonical failure; an inconclusive probe keeps the fail-open route.
-        if "fts5" not in str(exc).lower() and self._fts_structure_is_corrupt() is False:
-            logger.error(
-                "state.db write failed with a malformed-database error, but the FTS indexes "
-                "verify clean — the corruption is in another table. Skipping the FTS fail-open; "
-                "run PRAGMA quick_check and map damaged pages via dbstat for the offline repair.")
-            return False
+        # Shared provenance is authoritative. A clean rank=0 structure check cannot
+        # rule out external-content disagreement causing an FTS delete/update failure.
         self._raise_if_db_corrupt()
         self._halt_if_db_generation_changed()
         try:

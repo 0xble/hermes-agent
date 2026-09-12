@@ -146,3 +146,62 @@ def test_structure_probe_does_not_classify_content_mismatch_as_shadow_corruption
         assert SessionFtsSetupMixin._fts_structure_is_corrupt(probe) is False
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("operation", ["delete", "update"])
+def test_external_content_gap_detaches_fts_and_commits_canonical_write(tmp_path, operation):
+    from hermes_state_common import FTS_STALE_KEY, _FTS_TRIGGERS
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        _seed(db, rows=1)
+        with sqlite3.connect(db_path) as raw:
+            raw.execute("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')")
+        assert db._fts_structure_is_corrupt() is False
+        sql = (
+            "DELETE FROM messages WHERE session_id='s1'"
+            if operation == "delete"
+            else "UPDATE messages SET content='updated canonical' WHERE session_id='s1'"
+        )
+        # Establish the actual engine failure before application recovery.
+        with sqlite3.connect(db_path) as raw:
+            with pytest.raises(sqlite3.DatabaseError) as caught:
+                raw.execute(sql)
+            raw.rollback()
+        assert caught.value.sqlite_errorcode == sqlite3.SQLITE_CORRUPT_VTAB
+        assert db._fts_structure_is_corrupt() is False
+        db._write_sql(sql)
+        expected = [] if operation == "delete" else ["updated canonical"]
+        assert _contents(db_path) == expected
+        assert db._fts_stale is True
+        assert db._db_corrupt is False
+        with sqlite3.connect(db_path) as raw:
+            assert raw.execute("SELECT value FROM state_meta WHERE key=?", (FTS_STALE_KEY,)).fetchone() == ("1",)
+            triggers = {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            assert not triggers.intersection(_FTS_TRIGGERS)
+        db.append_message("s1", "user", "after recovery")
+        assert _contents(db_path) == expected + ["after recovery"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB])
+def test_unscoped_corruption_refuses_fts_recovery(tmp_path, code):
+    from hermes_state_common import FTS_STALE_KEY, _FTS_TRIGGERS
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        _seed(db, rows=1)
+        exc = sqlite3.DatabaseError("database disk image is malformed")
+        exc.sqlite_errorcode = code
+        assert db._enter_fts_fail_open(exc) is False
+        assert db._is_structural_corruption_error(exc) is True
+        assert db._fts_stale is False
+        with sqlite3.connect(db_path) as raw:
+            assert raw.execute("SELECT value FROM state_meta WHERE key=?", (FTS_STALE_KEY,)).fetchone() is None
+            triggers = {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+            assert set(_FTS_TRIGGERS) <= triggers
+    finally:
+        db.close()
