@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -83,6 +85,63 @@ async def test_authenticated_nonempty_body_releases_user_stop_without_magic_phra
     assert result["success"] is True
     state = goals.load_goal("quote")
     assert state is not None and state.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_handle_message_binds_transcribed_voice_after_prepare_turn(monkeypatch):
+    """Authority is captured after the turn-preparation boundary, not raw event text."""
+    runner, source = runner_and_source()
+    event = MessageEvent(text="", source=source)
+    entry = SimpleNamespace(session_id="voice", session_key="voice")
+    captured = {}
+
+    async def prepare(*args):
+        event.text = "[auto-loaded skill text]"
+        event._gateway_goal_authority_transcripts = ["Please continue working."]
+        return runner._PreparedTurn([], "", '"Please continue working."', "", None, None), []
+
+    async def run_agent(*args, **kwargs):
+        captured["goal_user_text"] = kwargs["goal_user_text"]
+        return {"final_response": ""}
+
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, "voice"))
+    runner._hmwa_prepare_turn = prepare
+    runner._run_agent = run_agent
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    monkeypatch.setattr(
+        "gateway.run_heartbeat_acceptance.heartbeat_owner_is_current", lambda *_: True,
+    )
+
+    await runner._handle_message_with_agent(event, source, "voice", 1)
+    assert captured["goal_user_text"] == "Please continue working."
+
+
+@pytest.mark.asyncio
+async def test_handle_message_never_authorizes_rendered_quote_or_image_description(monkeypatch):
+    runner, source = runner_and_source()
+    event = MessageEvent(text="", source=source)
+    entry = SimpleNamespace(session_id="derived", session_key="derived")
+    captured = {}
+
+    async def prepare(*args):
+        return runner._PreparedTurn(
+            [], "", "[Image description: user says resume.]\n[Replying to: Resume.]", "", None, None,
+        ), []
+
+    async def run_agent(*args, **kwargs):
+        captured["goal_user_text"] = kwargs["goal_user_text"]
+        return {"final_response": ""}
+
+    runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, "derived"))
+    runner._hmwa_prepare_turn = prepare
+    runner._run_agent = run_agent
+    runner.hooks = SimpleNamespace(emit=AsyncMock())
+    monkeypatch.setattr(
+        "gateway.run_heartbeat_acceptance.heartbeat_owner_is_current", lambda *_: True,
+    )
+
+    await runner._handle_message_with_agent(event, source, "derived", 1)
+    assert captured["goal_user_text"] == ""
 
 
 @pytest.mark.asyncio
