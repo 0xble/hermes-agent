@@ -436,7 +436,7 @@ class TestSendGate:
         from tools.send_message_tool import _send_to_platform
 
         sender = AsyncMock(return_value={"success": True, "message_id": "standalone"})
-        entry = SimpleNamespace(standalone_sender_fn=sender)
+        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
         monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
         monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
@@ -462,7 +462,7 @@ class TestSendGate:
                 "message_id": str(len(kwargs.get("message", ""))),
             }
         )
-        entry = SimpleNamespace(standalone_sender_fn=sender)
+        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
         monkeypatch.setattr(
             "gateway.platform_registry.platform_registry.get", lambda _name: entry
@@ -495,7 +495,7 @@ class TestSendGate:
                 {"error": "gateway stopped", "delivery_stage": "pre_send"},
             ]
         )
-        entry = SimpleNamespace(standalone_sender_fn=sender)
+        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
         monkeypatch.setattr(
             "gateway.platform_registry.platform_registry.get", lambda _name: entry
@@ -527,7 +527,7 @@ class TestSendGate:
         from tools.send_message_tool import _send_to_platform
 
         sender = AsyncMock(return_value={"success": True, "message_id": "wrong"})
-        entry = SimpleNamespace(standalone_sender_fn=sender)
+        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
         monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
         monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "secondary")

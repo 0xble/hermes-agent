@@ -58,10 +58,7 @@ def _make_consumer(adapter=None, **overrides):
         MAX_MESSAGE_LENGTH=4096,
         splits_long_messages=True,
     )
-    consumer = GatewayStreamConsumer.__new__(GatewayStreamConsumer)
-    consumer.adapter = adapter
-    consumer.chat_id = "c1"
-    consumer.cfg = StreamConsumerConfig(cursor="▉")
+    consumer = GatewayStreamConsumer(adapter, "c1", StreamConsumerConfig(cursor="▉"))
     consumer._final_response_sent = True
     consumer._final_content_delivered = True
     consumer._delivered_final_text = None

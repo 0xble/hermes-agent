@@ -25,7 +25,7 @@ async def test_queued_delegation_cleanup_keeps_attempt_after_final_takes_priorit
     pending = manager.pending
     lock = adapter._send_cooldown_lock('42')
     await lock.acquire()
-    deleting = asyncio.create_task(manager._delete(item))
+    deleting = asyncio.create_task(manager._delete('record', item))
     try:
         async def queued():
             while not item.get('delete_attempts'):
