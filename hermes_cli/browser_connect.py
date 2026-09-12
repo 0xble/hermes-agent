@@ -834,20 +834,13 @@ def _copy_profile_tree(src: str, dst: str, source_profile: str) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True unless ``pid`` is verifiably gone on this host; unknown fails closed as alive."""
+    """True unless ``pid`` is verifiably gone on this host; unknown fails closed as alive.
+
+    psutil is a pinned core dependency and the only portable probe: ``os.kill(pid, 0)``
+    is not a no-op on Windows (it sends CTRL_C_EVENT), so there is no stdlib fallback.
+    """
     try:
         import psutil
-    except ImportError:  # hard dep; defensive
-        if os.name == "nt":  # os.kill(pid, 0) TERMINATES on Windows; never probe with it
-            return True
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:  # EPERM: exists, owned by another user
-            return True
-        return True
-    try:
         return psutil.pid_exists(pid)
     except Exception:
         return True
