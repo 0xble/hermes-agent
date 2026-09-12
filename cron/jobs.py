@@ -2691,8 +2691,9 @@ def claim_job_for_fire(
     resume: no occurrence stamp, so the still-pending ``next_run_at`` slot is not skipped. Lose if a
     claim younger than ``claim_ttl_seconds`` exists (the live claim is the same-fire idempotency
     fence; mark_job_run clears it). Otherwise stamp a fresh ``fire_claim`` identity and, for
-    recurring jobs, advance
-    ``next_run_at`` so a stale re-delivery cannot re-fire."""
+    scheduled recurring jobs, advance ``next_run_at`` so a stale re-delivery cannot re-fire.
+    Explicit ``force``/``manual`` acquisitions leave the pending schedule alone until normal
+    completion, so an executor setup failure does not consume an occurrence."""
     def apply(jobs, _i, job):
         if is_terminal_job(job) and not _is_recoverable_error_job(job):
             return False
@@ -2736,7 +2737,9 @@ def claim_job_for_fire(
         if keep_paused and kind in {"cron", "interval"}:
             fire_claim["preserve_paused_next_run_at"] = copy.deepcopy(job.get("next_run_at"))
         job["fire_claim"] = fire_claim
-        if kind in {"cron", "interval"} and not keep_paused:
+        # Explicit manual admission is only a reservation. Tick-triggered runs keep
+        # scheduled at-most-once advancement even when their occurrence stamp is omitted.
+        if kind in {"cron", "interval"} and not (force or manual):
             nxt = _compute_next_run_for_job(job, now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
