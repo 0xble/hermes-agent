@@ -205,29 +205,25 @@ def test_nonstream_completion_after_interrupt_is_cancelled(make_child, monkeypat
 
 
 def test_named_child_native_cancellation_keeps_parent_configuration(make_child, monkeypatch):
-    from threading import Event
+    from threading import get_ident
     from tools.delegate_tool import _run_single_child
     parent = make_child("high", "gpt-6-astra")
     del parent._delegation_runtime_pin
     child = make_child()
     before = (parent.model, deepcopy(parent.reasoning_config), parent.provider, parent.api_key)
-    entered, release = Event(), Event()
+    interrupts = []
 
     def stream(api_kwargs, **kwargs):
         assert api_kwargs["reasoning"]["effort"] == "medium"
-        entered.set()
-        assert release.wait(5)
+        # Cancel from the real API worker, after turn setup and before its response.
+        # A timed rendezvous also times unrelated startup and flakes on busy runners.
+        assert get_ident() != child._execution_thread_id
+        interrupts.append(child.interrupt("Test cancellation", hard_cancel=True))
         return _codex_message_response("cancelled response")
 
     monkeypatch.setattr(child, "_run_codex_stream", stream)
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_run_single_child, 0, "Wait until cancelled", child, parent)
-        try:
-            assert entered.wait(5)
-            assert child.interrupt("Test cancellation", hard_cancel=True)
-        finally:
-            release.set()
-        result = future.result(timeout=10)
+    result = _run_single_child(0, "Wait until cancelled", child, parent)
+    assert interrupts == [True]
     assert result["status"] == "interrupted"
     assert before == (parent.model, parent.reasoning_config, parent.provider, parent.api_key)
 
