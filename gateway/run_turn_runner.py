@@ -1302,9 +1302,13 @@ class TurnRunner:
             display_text = transform_outbound_text(text)
             if not str(display_text or "").strip():
                 return
+            from gateway.run import _interim_metadata
             fut = self._schedule(
                 ctx._status_adapter.send(
-                    ctx._status_chat_id, display_text, metadata=ctx._status_thread_metadata),
+                    ctx._status_chat_id, display_text,
+                    # Mid-turn: the clarifying question and its answer still follow, so this
+                    # brief must not be taken for the turn-final send.
+                    metadata=_interim_metadata(ctx._status_thread_metadata)),
                 "clarify context delivery scheduling error")
             if fut is None:
                 return

@@ -661,6 +661,13 @@ class GatewayStartupMixin:
                 # +1s so we wake just OUTSIDE the server's stated window rather than
                 # racing its boundary.
                 await asyncio.sleep(delay + 1.0)
+                # Deregister BEFORE redelivering. While the sweep runs, its own entry is no
+                # longer a cancellable *timer*: a rejection raised inside the sweep would
+                # coalesce onto it, see an elapsed ``_hermes_sweep_at``, and cancel the
+                # redelivery mid-flight — losing the ledger updates and the remaining sends.
+                # A later rejection now schedules a fresh timer instead.
+                if self._deferred_obligation_sweeps.get(key) is task:
+                    self._deferred_obligation_sweeps.pop(key, None)
                 await self._redeliver_failed_obligations_for_platform(platform, profile=profile)
             except asyncio.CancelledError:
                 raise

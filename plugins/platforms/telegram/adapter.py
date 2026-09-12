@@ -4265,6 +4265,14 @@ class TelegramAdapter(BasePlatformAdapter):
             total_chunks=len(chunks),
             delivery_retry_content="".join(chunks[len(message_ids):]),
         )
+        # ``retryable`` stays exactly as the send path set it. On a flood rejection
+        # ``_send_retry_after_outcome`` clears it so that a consumer reading the flag ALONE cannot
+        # re-send the whole payload and duplicate the chunks that already landed. That does not
+        # strand the suffix: neither recovery path gates on this flag. ``_send_with_retry``
+        # classifies on ``retry_after``/rate-limit and then narrows the next attempt through
+        # ``_delivery_retry_suffix``, and the delivery ledger re-claims the row from the
+        # ``flood_control:`` error class via ``is_runtime_retryable``. See
+        # ``test_flood_capped_partial_delivery_retries_suffix_even_when_not_retryable``.
         return SendResult(
             success=False, error=failure.error, message_id=message_ids[0], raw_response=raw_response,
             retryable=failure.retryable, retry_after=failure.retry_after, error_kind=failure.error_kind)

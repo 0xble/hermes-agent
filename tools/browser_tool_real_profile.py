@@ -404,7 +404,7 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
             # this process still using it (a cache hit never runs a daemon command).
             if conflict := mode_conflict():
                 return None, conflict
-            _session._prepare_session_socket_dir(_bt._REAL_PROFILE_SESSION)
+            _session._prepare_session_socket_dir(session_name)
             return cached, None
 
         browser = identity.browser if identity is not None else detect_default_chromium()
@@ -423,6 +423,10 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
             if _bt._cdp_owned_by_data_dir(cached, copy_dir):
                 if conflict := mode_conflict():
                     return None, conflict
+                # Same reclaim as the legacy lane: a cache hit runs no daemon command, so
+                # without this the reaper's idle clock never sees this process using the
+                # socket and can remove an attachment that is still live.
+                _session._prepare_session_socket_dir(session_name)
                 return cached, None
             _bt._agent_browser_close_session(session_name)
             # A failed ownership probe does not prove the launched Chromium exited. Stop the tracked

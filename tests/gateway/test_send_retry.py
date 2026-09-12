@@ -151,6 +151,40 @@ class TestSendWithRetryNetworkRetry:
             ("chat1", "remaining suffix"),
         ]
 
+    @pytest.mark.asyncio
+    async def test_flood_capped_partial_delivery_retries_suffix_even_when_not_retryable(self):
+        """A flood-capped partial send reports ``retryable=False`` on purpose: it forbids a
+        WHOLE-message retry that would duplicate the chunk already on screen. The undelivered
+        suffix must still be recovered, because this path classifies on ``retry_after`` /
+        rate-limit rather than on the flag, then narrows the attempt to the reported suffix."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="flood_control:30",
+                retryable=False,
+                retry_after=30,
+                message_id="101",
+                raw_response={
+                    "telegram_partial_text_delivery": True,
+                    "delivered_chunks": 1,
+                    "total_chunks": 2,
+                    "delivery_retry_content": "remaining suffix",
+                },
+            ),
+            SendResult(success=True, message_id="ok"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "full response", base_delay=0)
+
+        assert result.success
+        # The already-delivered prefix is never resent.
+        assert adapter._send_calls == [
+            ("chat1", "full response"),
+            ("chat1", "remaining suffix"),
+        ]
+
 
 # ---------------------------------------------------------------------------
 # _send_with_retry — all retries exhausted → user notification
