@@ -2264,6 +2264,7 @@ export interface CronJobMutation {
   schedule?: string;
   deliver?: string;
   skills?: string[];
+  model_preset?: string | null;
   provider?: string | null;
   model?: string | null;
   base_url?: string | null;
@@ -2291,6 +2292,7 @@ export interface CronJob {
   enabled: boolean;
   state?: string | null;
   deliver?: string | null;
+  model_preset?: string | null;
   model?: string | null;
   provider?: string | null;
   base_url?: string | null;

@@ -44,6 +44,7 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(

@@ -252,6 +252,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             deliver=_cron_optional_text(body.deliver) or "local",
             skills=skills,
             model=_cron_optional_text(body.model),
+            model_preset=_cron_optional_text(body.model_preset),
             provider=_cron_optional_text(body.provider),
             base_url=_cron_optional_text(body.base_url, strip_trailing_slash=True),
             script=script,

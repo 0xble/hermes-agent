@@ -346,6 +346,8 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    fallbacks: Optional[list] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -778,6 +780,9 @@ def load_gateway_config() -> GatewayConfig:
     try:
         config_loader.load_yaml_layer(_home, gw_data)
     except Exception as e:
+        from hermes_cli.model_presets import ModelPresetError
+        if isinstance(e, ModelPresetError):
+            raise
         logger.warning(
             # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
             # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.

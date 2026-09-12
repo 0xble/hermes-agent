@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+pytest.importorskip("telegram", reason="python-telegram-bot not installed")
 from telegram.error import RetryAfter, TimedOut
 
 from gateway.config import PlatformConfig

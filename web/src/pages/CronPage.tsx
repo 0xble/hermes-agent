@@ -142,6 +142,7 @@ function emptyCronJobForm(): CronJobEditorState {
     skills: [],
     provider: "",
     model: "",
+    model_preset: "",
     base_url: "",
     script: "",
     no_agent: false,
@@ -220,6 +221,16 @@ function CronAdvancedFields({
         Advanced fields
       </summary>
       <div className="mt-3 grid gap-3">
+        <div className="grid gap-1">
+          <Label htmlFor={`${idPrefix}-model-preset`}>Named model preset</Label>
+          <Input
+            id={`${idPrefix}-model-preset`}
+            placeholder="Preset name (leave inline model, provider and base URL empty)"
+            value={form.model_preset}
+            onChange={(e) => update("model_preset", e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">Follows the preset at each run. Clear to return to inline/default routing.</p>
+        </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div className="grid gap-1">
             <Label htmlFor={`${idPrefix}-provider`}>Provider</Label>
@@ -506,6 +517,7 @@ function getJobMode(job: CronJob): string {
 }
 
 function getModelDisplay(job: CronJob): string {
+  if (job.model_preset) return `Preset: ${job.model_preset}`;
   const provider = asText(job.provider);
   const model = asText(job.model);
   if (provider && model) return `${provider}/${model}`;

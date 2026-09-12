@@ -1380,6 +1380,7 @@ class _CronJobConfig:
     model: str
     model_cfg: Any
     cron_default_provider: str
+    effective_job: dict | None = None
 
 
 def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
@@ -1438,6 +1439,26 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
             raise
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
+    from hermes_cli.model_presets import resolve_cron_model_preset
+    route = resolve_cron_model_preset(job, _cfg)
+    effective_job = None
+    if route is not None:
+        # The named route is one atomic selection; stale snapshots and fleet defaults
+        # must not contribute an axis. Never write expanded values into jobs.json.
+        model = route["model"]
+        effective_job = {**job, "model": model, "provider": route["provider"]}
+    else:
+        cron_cfg = _cfg.get("cron") or {}
+        if isinstance(cron_cfg, dict) and not any(job.get(key) for key in ("model", "provider", "base_url")):
+            route = cron_cfg
+    if route is not None:
+        if "reasoning_effort" in route:
+            _cfg["agent"] = {**(_cfg.get("agent") or {}), "reasoning_effort": route["reasoning_effort"]}
+        if "fallbacks" in route or "fallback_providers" in route:
+            _cfg["fallback_providers"] = route.get("fallbacks", route.get("fallback_providers"))
+            # A named chain is authoritative, including []; do not append legacy routes.
+            _cfg.pop("fallback_model", None)
+
     # Fail fast: an empty model otherwise reaches the provider as an opaque 400.
     # See #23979.
     if not (isinstance(model, str) and model.strip()):
@@ -1456,7 +1477,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
         _net_cfg = _cfg.get("network", {})
         if isinstance(_net_cfg, dict) and _net_cfg.get("force_ipv4"):
             apply_ipv4_preference(force=True)
-    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
+    return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider, effective_job)
 
 
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
@@ -1546,6 +1567,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         resolve_runtime_provider, format_runtime_provider_error)
     from hermes_cli.auth import AuthError
 
+    job = jc.effective_job or job
     model = jc.model
     requested = job.get("provider") or jc.cron_default_provider or None
     if not requested:
@@ -2308,6 +2330,7 @@ class _CronAgentSetup:
 def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _CronAgentSetup:
     """Resolve model/runtime/reasoning/pool for the run, in the original gate order: exfil guard ->
     preflight (may block) -> runtime (+ fallback chain) -> credential pool -> MCP."""
+    job = jc.effective_job or job
     _cfg = jc.cfg
     setup = _CronAgentSetup(model=jc.model)
     setup.prefill_messages = _load_prefill_messages(_cfg, job_id)

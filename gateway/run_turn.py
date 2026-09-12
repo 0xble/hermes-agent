@@ -181,7 +181,26 @@ class GatewayTurnMixin:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_channel_route_config(self, source=None, session_key=None) -> dict:
+        """Selected channel bundle after session runtime resolution, separate from constructor kwargs."""
+        from gateway.run import _get_channel_override
+        skey = self._resolve_session_key_or_none(source, session_key)
+        state = self._peek_session_state(skey) if skey else None
+        if state and state.conversation.model_override:
+            return {}
+        cfg = getattr(self, "config", None)
+        if not cfg or source is None:
+            return {}
+        channel = _get_channel_override(
+            cfg, source.platform, str(source.chat_id) if source.chat_id else "",
+            thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+            parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+        )
+        return channel.to_dict() if channel else {}
+
+    def _resolve_turn_agent_config(
+        self, user_message: str, model: str, runtime_kwargs: dict, *, channel_route=None,
+    ) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
         from gateway.run import _deep_merge_request_overrides
@@ -204,6 +223,9 @@ class GatewayTurnMixin:
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
+        channel_route = channel_route or {}
+        if "fallbacks" in channel_route:
+            route["fallback_model"] = channel_route["fallbacks"]
         if getattr(self, "_service_tier", None) != "priority":
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
@@ -509,7 +531,9 @@ class GatewayTurnMixin:
     @staticmethod
     def _hmwa_hygiene_read_config(hs, data):
         """Apply model / compression knobs from the gateway config onto ``hs`` (invalid values keep the defaults)."""
-        # Resolve model name (same logic as run_sync)
+        # Resolve model name (same logic as run_sync), including named routes.
+        from hermes_cli.model_presets import expand_model_presets
+        data = expand_model_presets(data)
         _model_cfg = data.get("model", {})
         if isinstance(_model_cfg, str):
             hs.model = _model_cfg
@@ -2237,10 +2261,13 @@ class GatewayTurnMixin:
             enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
+            channel_route = self._resolve_channel_route_config(source)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source, model=model, route=channel_route,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs, channel_route=channel_route)
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
@@ -2281,7 +2308,7 @@ class GatewayTurnMixin:
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot.
                     # See #60955.
-                    fallback_model=self._refresh_fallback_model(),
+                    fallback_model=self._fallback_chain_for_route(turn_route),
                 )
                 try:
                     return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)

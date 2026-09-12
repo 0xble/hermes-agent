@@ -1173,7 +1173,8 @@ def _load_cfg() -> dict:
     cfg = _apply_managed(_load_cfg_raw())
     with contextlib.suppress(Exception):
         cfg = _expand_cfg(cfg)
-    return cfg
+    from hermes_cli.model_presets import expand_model_presets
+    return expand_model_presets(cfg)
 
 
 def _apply_managed(cfg: dict) -> dict:

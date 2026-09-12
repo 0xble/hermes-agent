@@ -154,7 +154,7 @@ def merge_platform_sections(yaml_cfg: dict, gateway_cfg: Any, gw_data: dict) -> 
     api_plat = platforms_data.get("api_server")
     if isinstance(api_plat, dict):
         api_extra = _dict_slot(api_plat, "extra")
-        for key in ("port", "key", "host", "cors_origins", "model_name"):
+        for key in ("port", "key", "host", "cors_origins", "model_name", "model_routes"):
             if key in api_plat and key not in api_extra:
                 api_extra[key] = api_plat.pop(key)
     return platforms_data
@@ -374,6 +374,8 @@ def load_yaml_layer(home: Path, gw_data: dict) -> None:
     yaml_cfg = read_yaml_layers(home)
     if not yaml_cfg:
         return
+    from hermes_cli.model_presets import expand_model_presets
+    yaml_cfg = expand_model_presets(yaml_cfg)
 
     gateway_section = yaml_cfg.get("gateway")
     bridge_toplevel_keys(yaml_cfg, gateway_section, gw_data)

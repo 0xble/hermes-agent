@@ -8,6 +8,7 @@ export interface CronJobFormState {
   skills: string[];
   provider: string;
   model: string;
+  model_preset: string;
   base_url: string;
   script: string;
   no_agent: boolean;
@@ -59,6 +60,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     skills: form.skills.filter(Boolean),
     provider: optionalText(form.provider),
     model: optionalText(form.model),
+    model_preset: optionalText(form.model_preset),
     base_url: optionalText(form.base_url, true),
     script: optionalText(form.script),
     no_agent: Boolean(form.no_agent),
@@ -95,6 +97,7 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     skills: Array.isArray(job.skills) ? job.skills.filter(Boolean) : [],
     provider: asString(job.provider),
     model: asString(job.model),
+    model_preset: asString(job.model_preset),
     base_url: asString(job.base_url),
     script: asString(job.script),
     no_agent: Boolean(job.no_agent),

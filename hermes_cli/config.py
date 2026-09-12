@@ -3091,7 +3091,7 @@ def cron_model_drift_axes(
 ) -> List[str]:
     """Return the unpinned axes on which *job* will keep running on its creation snapshot rather
     than the new global assignment (the scheduler treats the snapshot as the effective pin)."""
-    if not isinstance(job, dict):
+    if not isinstance(job, dict) or _model_assignment_text(job.get("model_preset")):
         return []
 
     current = {
@@ -3100,6 +3100,8 @@ def cron_model_drift_axes(
     # A cron.model / cron.model_provider fleet default covers its axis: that axis never reads the
     # snapshot at fire time, so reporting it would be false.
     fleet = _cron_section(config) or {}
+    if _model_assignment_text(fleet.get("model_preset")):
+        return []
     drifted: List[str] = []
     for axis, fleet_key in (("provider", "model_provider"), ("model", "model")):
         if _model_assignment_text(fleet.get(fleet_key)) or _model_assignment_text(job.get(axis)):

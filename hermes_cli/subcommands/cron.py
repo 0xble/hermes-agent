@@ -71,6 +71,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Pin this job to a specific inference model (user-owned; the "
             "agent's cronjob tool cannot set this). Omit to follow "
             "cron.model / model.default from config.yaml.")
+    cron_create.add_argument("--model-preset", help="Named model preset, resolved each fire; cannot combine with inline model/provider/reasoning pins. Empty clears.")
     cron_create.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').")
     cron_create.add_argument("--reasoning-effort", dest="reasoning_effort",
@@ -142,6 +143,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Pin this job to a specific inference model (user-owned; the "
             "agent's cronjob tool cannot set this). Pass empty string to "
             "clear the pin and follow cron.model / model.default.")
+    cron_edit.add_argument("--model-preset", help="Named model preset, resolved each fire; cannot combine with inline model/provider/reasoning pins. Empty clears.")
     cron_edit.add_argument("--provider", dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.")
     cron_edit.add_argument("--reasoning-effort", dest="reasoning_effort",

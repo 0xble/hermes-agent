@@ -1621,6 +1621,7 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
 # storing.
 _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
+    "model_preset": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
     "base_url": _normalize_base_url,
     "script": _normalize_job_optional_text,
@@ -1730,6 +1731,14 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+def _validate_model_preset(job: Dict[str, Any]) -> None:
+    if not job.get("model_preset"):
+        return
+    from hermes_cli.config import load_config
+    from hermes_cli.model_presets import resolve_cron_model_preset
+    resolve_cron_model_preset(job, load_config())
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1757,6 +1766,7 @@ def create_job(
     allow_messaging: bool = False,
     paused: bool = False,
     paused_reason: Optional[str] = None,
+    model_preset: Optional[str] = None,
     *,
     completion_script_sha256: Optional[str] = None,
     trusted_completion_config: bool = False,
@@ -1793,6 +1803,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_timezone = normalize_job_timezone(timezone)
+    _validate_model_preset({**f, "reasoning_effort": normalized_reasoning_effort})
 
     _validate_job_mode_invariants(
         f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"],
@@ -1832,6 +1843,7 @@ def create_job(
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": f["model"],
+        **({"model_preset": f["model_preset"]} if f["model_preset"] else {}),
         "provider": f["provider"],
         "provider_snapshot": provider_snapshot,
         "model_snapshot": model_snapshot,
@@ -2062,6 +2074,8 @@ def update_job(
         previous_inference_axes = _normalized_inference_axes(job)
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
+        if {"model_preset", "model", "provider", "base_url", "reasoning_effort", "fallbacks"}.intersection(updates):
+            _validate_model_preset(updated)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {
             "monitor_script", "monitor_url", "no_agent", "script", "completion_script"
@@ -2102,7 +2116,7 @@ def update_job(
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             # An effective timezone move counts too: the slot was computed in the old zone.
             updated.pop("pending_slot", None)
-        if inference_fields_changed:
+        if inference_fields_changed and not updated.get("model_preset"):
             snapshots = _compute_provider_model_snapshots(
                 provider=updated.get("provider"),
                 model=updated.get("model"),

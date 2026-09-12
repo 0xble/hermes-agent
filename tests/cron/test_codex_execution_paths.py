@@ -155,16 +155,8 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
     runner._session_db = None
-    # Ensure model resolution returns the codex model even if xdist
-    # leaked env vars cleared HERMES_MODEL.
-    monkeypatch.setattr(
-        gateway_run.GatewayRunner,
-        "_resolve_turn_agent_config",
-        lambda self, msg, model, runtime: {
-            "model": model or "gpt-5.3-codex",
-            "runtime": runtime,
-        },
-    )
+    # Pin the config-read seam, retaining the real turn-route builder.
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *_: "gpt-5.3-codex")
 
     source = SessionSource(
         platform=Platform.LOCAL,
