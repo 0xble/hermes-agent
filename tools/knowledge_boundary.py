@@ -178,7 +178,16 @@ def _command_roots(text: str) -> str | None:
     return None
 
 
-def command_denial_reason(command: str, *, tool: str = "terminal") -> str | None:
+def _relative_command_root(command: str, cwd: Path | str) -> str | None:
+    """Conservative literal references, including quoted interpreter source."""
+    for protected in protected_roots():
+        spelling = os.path.relpath(protected, cwd)
+        if spelling not in (".", "..") and spelling in command:
+            return _real(protected)
+    return None
+
+
+def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | None = None) -> str | None:
     """Deny a shell command / interpreter source that reaches shared knowledge.
 
     Reference-based on purpose (see the module docstring): a read-only child
@@ -189,6 +198,31 @@ def command_denial_reason(command: str, *, tool: str = "terminal") -> str | None
         return None
     try:
         root = _command_roots(command)
+        if root is None and cwd is not None:
+            import shlex
+            # Literal paths and literal cd transitions only. Runtime-computed
+            # paths remain outside this reference guard's documented contract.
+            tokens = list(shlex.shlex(command, posix=True, punctuation_chars=";&|<>()"))
+            bases = {Path(cwd)}
+            root = _relative_command_root(command, cwd)
+            for index, token in enumerate(tokens):
+                if root is not None:
+                    break
+                if token == "cd" and index + 1 < len(tokens):
+                    target = tokens[index + 1]
+                    if "$" not in target and "`" not in target:
+                        bases.update((base / os.path.expanduser(target)).resolve() for base in tuple(bases))
+                        if len(bases) > 64:
+                            return _UNEVALUATED
+                if not token or token.startswith("-") or any(ch in token for ch in "$`\n"):
+                    continue
+                for base in tuple(bases):
+                    root = (_relative_command_root(command, base)
+                            or _protected_root_for(base / os.path.expanduser(token)))
+                    if root is not None:
+                        break
+                if root is not None:
+                    break
     except Exception:
         return _UNEVALUATED
     if root is None:

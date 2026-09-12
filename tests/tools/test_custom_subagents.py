@@ -277,3 +277,45 @@ def test_discovery_exposes_only_selection_guidance(monkeypatch):
     assert raw["description"] in field["description"]
     assert raw["instructions"] not in str(schema)
     assert "subagent_type" not in delegate_tool.DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_unused_legacy_route_is_not_resolved_for_named_batch(monkeypatch, legacy):
+    from types import SimpleNamespace
+    from tools import delegate_tool
+    from tools.custom_subagents import ResolvedSubagentLaunch
+    cfg = {"provider": "acp", "command": "missing-command", "subagents": {"worker": definition()}}
+    calls = []
+    def legacy_route(*args):
+        calls.append("legacy")
+        raise ValueError("unavailable legacy route")
+    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", legacy_route)
+    monkeypatch.setattr("tools.custom_subagents.resolve_named_credentials", lambda *a: ({"provider": "openai-codex", "model": "m"}, None))
+    monkeypatch.setattr("tools.custom_subagents.freeze_fallback_routes", lambda *a, **k: ())
+    tasks = [{"goal": "inspect", "subagent_type": "worker"}]
+    if legacy:
+        tasks.append({"goal": "legacy"})
+    launches, error = delegate_tool._preflight_task_runtime(tasks, cfg, None, SimpleNamespace(), None)
+    if legacy:
+        assert "unavailable legacy route" in error
+        assert not launches
+        assert calls == ["legacy"]
+    else:
+        assert error is None
+        assert isinstance(launches[0], ResolvedSubagentLaunch)
+        assert calls == []
+
+
+def test_all_named_entrypoint_reaches_preflight_without_resolving_unused_default(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from tools import delegate_tool
+    cfg = {"provider": "acp", "command": "missing", "subagents": {"worker": definition()}}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
+    monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", lambda *a: pytest.fail("unused default route"))
+    def stop_at_preflight(tasks, *args):
+        assert tasks[0]["subagent_type"] == "worker"
+        return [], "preflight reached"
+    monkeypatch.setattr(delegate_tool, "_preflight_task_runtime", stop_at_preflight)
+    result = json.loads(delegate_tool.delegate_task(tasks=[{"goal": "inspect", "task_label": "Inspect", "subagent_type": "worker"}], parent_agent=SimpleNamespace()))
+    assert "preflight reached" in result["error"]

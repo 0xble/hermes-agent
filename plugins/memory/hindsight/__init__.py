@@ -682,8 +682,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _track_retain_ops(self, retain_response, bank_id: str, *,
                           source_candidates: list[SourceCandidate] | None = None) -> None:
         """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply
-        (pending until recall-visible). No id (older API / sync completion) leaves
-        only the local queue drain as a signal."""
+        (pending until recall-visible). Source replies without IDs still require
+        document/hash readback before their deduplication claim is completed."""
         raw_ids = [getattr(retain_response, "operation_id", None), *(getattr(retain_response, "operation_ids", None) or [])]
         ids = [str(op) for op in raw_ids if op]
         candidate = source_candidates[0] if source_candidates else None
@@ -692,6 +692,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 "candidate": candidate, "status": "accepted", "operation_ids": ids,
             }
         if not ids:
+            if candidate is not None and not self._verify_source_candidate(bank_id, candidate):
+                raise ValueError("Hindsight source retention could not be verified without an operation ID")
             return
         self._retain_ops_bank_id = bank_id
         with self._pending_retain_ops_lock:

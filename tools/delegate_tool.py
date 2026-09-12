@@ -674,15 +674,14 @@ def _parse_model_config(value) -> dict:
     return {}
 
 
-def _resolve_resume_launch(task, definitions, parent_agent):
+def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     """Restore one completed child from durable, nonsecret launch metadata."""
     from hermes_cli.profiles import get_active_profile_name
     from hermes_cli.route_identity import normalize_route_base_url
-    from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import parse_reasoning_effort
     from tools.custom_subagents import (
         FallbackDefinition, ResolvedSubagentLaunch, SubagentDefinition,
-        freeze_fallback_routes, nonsecret_route_url, _authority_mapping_matches,
+        freeze_fallback_routes, nonsecret_route_url, _authority_mapping_matches, resolve_named_credentials,
     )
 
     requested = task.get("resume_session_id")
@@ -756,7 +755,15 @@ def _resolve_resume_launch(task, definitions, parent_agent):
         reasoning = None
         fallbacks = ()
     else:
-        creds = resolve_runtime_provider(requested=provider, target_model=model)
+        # Reauthorize through the same current trusted owner as a fresh launch.
+        # Stored execution instructions remain frozen; current authority must
+        # still satisfy every persisted route/credential/override comparison.
+        from dataclasses import replace
+        authority_definition = replace(definitions[role], reasoning_effort=None)
+        creds, _ = resolve_named_credentials(authority_definition, defaults if defaults is not None else _load_config(), parent_agent)
+        for key in ("provider", "model", "base_url", "api_mode", "api_key"):
+            if creds.get(key) is None:
+                creds[key] = getattr(parent_agent, key, None)
         stable_credential_id = launch.get("credential_pool_entry_id")
         if stable_credential_id is not None:
             pool = _resolve_child_credential_pool(provider, parent_agent, creds.get("base_url"))
@@ -864,7 +871,7 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
             if task.get("resume_session_id") is not None:
                 if credentials_cfg:
                     raise ValueError("resumed named subagents cannot override credentials_cfg")
-                task_runtime.append(_resolve_resume_launch(task, definitions, parent_agent))
+                task_runtime.append(_resolve_resume_launch(task, definitions, parent_agent, defaults=cfg))
                 continue
             definition = resolve_definition(definitions, task.get("subagent_type"))
             if definition is not None and credentials_cfg:
@@ -872,6 +879,8 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
             if definition is None:
                 if task.get("moa_preset") is not None:
                     raise ValueError("moa_preset is only valid for a named MoA subagent")
+                if legacy_creds is None:
+                    legacy_creds = _resolve_delegation_credentials(credentials_cfg or cfg, parent_agent)
                 task_runtime.append(ResolvedSubagentLaunch(None, legacy_creds, None))
                 continue
             selected_preset = task.get("moa_preset")
@@ -1172,12 +1181,7 @@ def delegate_task(
     # An EMPTY block is not a route: it falls back to the general delegation config rather than
     # to bare parent inheritance (tests/tools/test_custom_subagents.py).
     routing_cfg = credentials_cfg if credentials_cfg else cfg
-    try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
-    except ValueError as exc:
-        # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
-        # spawn loudly (#80450).
-        return tool_error(str(exc))
+    creds = None  # Resolve only if batch preflight encounters a legacy task.
 
     # Capture immutable conversation ownership before child construction changes context.
     try:

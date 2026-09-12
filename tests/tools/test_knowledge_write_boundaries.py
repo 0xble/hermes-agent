@@ -143,3 +143,38 @@ def test_terminal_binds_checked_cwd_even_if_session_record_changes(tmp_path, mon
         assert json.loads(terminal.terminal_tool("echo ok", task_id=session, background=background))["exit_code"] == 0
     assert captured[0]["execution_cwd"] == str(tmp_path.resolve())
     assert captured[0]["workdir"] is None  # preserve foreground cd bookkeeping
+
+
+@pytest.mark.parametrize("command", ['python -c "open(\'memories/MEMORY.md\',\'w\').write(\'x\')"', "printf changed > memories/MEMORY.md", "printf changed > './memories/MEMORY.md'", "cd memories && printf changed > MEMORY.md", "printf changed > ../hermes/memories/MEMORY.md"])
+@pytest.mark.parametrize("background", [False, True])
+def test_literal_relative_shell_reference_is_denied_before_environment(tmp_path, monkeypatch, command, background):
+    from tools import terminal_tool as terminal
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("acquired environment"))
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(command, workdir=str(home), task_id="relative-guard", background=background))
+    assert "Parent-owned shared knowledge" in result["error"]
+
+
+def test_relative_scanner_preserves_unrelated_shell_and_parent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    with delegated_child_context(read_only_knowledge=True):
+        assert knowledge_boundary.command_denial_reason("printf changed > ordinary.txt", cwd=str(tmp_path)) is None
+    assert knowledge_boundary.command_denial_reason("printf changed > memories/MEMORY.md", cwd=str(tmp_path / "hermes")) is None
+
+
+
+def test_literal_cd_then_quoted_interpreter_reference_is_denied(tmp_path, monkeypatch):
+    from tools import terminal_tool as terminal
+    home = tmp_path / "hermes"
+    (home / "memories").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("acquired environment"))
+    command = "cd '../hermes'; python -c \"open('memories/MEMORY.md','w').write('x')\""
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(command, workdir=str(workspace), task_id="cd-interpreter"))
+    assert "Parent-owned shared knowledge" in result["error"]

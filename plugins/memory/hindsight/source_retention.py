@@ -506,8 +506,8 @@ def discover_source_candidates(
             content=pasted,
             origin="user message",
             context=(
-                "Long source-like text pasted by Brian in chat and used in the completed turn. "
-                "Treat it as source evidence, not as Brian's decision or Hermes analysis."
+                "Long source-like text supplied in a user message and used in the completed turn. "
+                "Treat it as source evidence, not as the user's own statements or decisions or Hermes analysis."
             ),
             session_id=session_id,
             tags=("source:pasted",),

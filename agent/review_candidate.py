@@ -250,16 +250,58 @@ def _literal_pathspecs(scope: tuple[str, ...]) -> list[str]:
 
 
 def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
-    path = repo / relative
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode):
-        content = os.fsencode(os.readlink(path))
-        mode = "120000"
-    elif stat.S_ISREG(info.st_mode):
-        content = path.read_bytes()
-        mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
-    else:
-        raise ValueError(f"Unsupported untracked candidate file type: {relative}")
+    from contextlib import ExitStack
+
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or not hasattr(os, "O_NONBLOCK")
+            or any(fn not in os.supports_dir_fd for fn in (os.open, os.stat, os.readlink))
+            or os.stat not in os.supports_follow_symlinks):
+        raise ValueError("Safe untracked review capture is unsupported on this platform")
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts or not relative_path.parts:
+        raise ValueError("Untracked review evidence must be repository-relative")
+    path = repo / relative_path
+    if not path.is_absolute():
+        raise ValueError("Review repository must be absolute")
+
+    def identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    try:
+        with ExitStack() as stack:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            parent_fd = os.open(path.anchor, flags)
+            stack.callback(os.close, parent_fd)
+            # Anchor every component, including repository ancestors. No pathname
+            # resolution after this walk may follow a replacement symlink.
+            for component in path.parts[1:-1]:
+                parent_fd = os.open(component, flags, dir_fd=parent_fd)
+                stack.callback(os.close, parent_fd)
+            leaf = path.name
+            info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                content = os.fsencode(os.readlink(leaf, dir_fd=parent_fd))
+                mode = "120000"
+            elif stat.S_ISREG(info.st_mode):
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+                stack.callback(os.close, fd)
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(info):
+                    raise ValueError("Untracked review evidence changed while opening")
+                chunks = []
+                while chunk := os.read(fd, 1024 * 1024):
+                    chunks.append(chunk)
+                content = b"".join(chunks)
+                if identity(os.fstat(fd)) != identity(info):
+                    raise ValueError("Untracked review evidence changed while reading")
+                mode = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+            else:
+                raise ValueError(f"Unsupported untracked candidate file type: {relative}")
+            if identity(os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)) != identity(info):
+                raise ValueError("Untracked review evidence changed during capture")
+    except OSError as exc:
+        raise ValueError("Could not safely capture untracked review evidence") from exc
     return ReviewUntrackedFileV1(
         path=relative,
         mode=mode,

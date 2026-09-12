@@ -301,7 +301,8 @@ def test_resume_preserves_launch_metadata_and_uses_stable_pool_identity(monkeypa
     parent._fallback_chain, parent.request_overrides = [], {}
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
     monkeypatch.setattr(delegate_tool, "_resolve_child_runtime", lambda *a, **k: {
-        **launch.credentials, "fallback_model": None})
+        **{key: launch.credentials[key] for key in ("provider", "model", "base_url", "api_key", "api_mode")},
+        "fallback_model": None})
     monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *a, **k: ([], []))
     monkeypatch.setattr(delegate_tool, "_open_child_session_db", lambda *a: None)
     monkeypatch.setattr(delegate_tool, "_attach_child", lambda *a: None)
@@ -657,7 +658,7 @@ def test_resume_preflight_claims_only_after_whole_batch_validates(monkeypatch):
 
     parent = SimpleNamespace(_session_db=DB())
 
-    def resolve(task, _definitions, _parent):
+    def resolve(task, _definitions, _parent, *, defaults=None):
         if task["resume_session_id"] == "invalid":
             raise ValueError("invalid resume fixture")
         return ResolvedSubagentLaunch(
@@ -955,3 +956,27 @@ def test_fallback_resume_refresh_requires_same_authorized_account(monkeypatch, m
         else:
             assert launch.fallback_routes[0].api_key == "new-token"
             assert launch.fallback_routes[0].credential_pool_entry_id == "fallback-account"
+
+
+@pytest.mark.parametrize("owner", ["parent", "delegation"])
+def test_resume_reauthorizes_unchanged_trusted_owner_overrides(monkeypatch, owner):
+    from dataclasses import replace
+    from tools import delegate_tool
+    from tools.custom_subagents import _authority_mapping_fingerprint, _nonsecret_mapping
+    metadata, definitions, parent = _resume_fixture(monkeypatch)
+    overrides = {"extra_headers": {"X-Api-Key": "owner-secret"}, "max_tokens": 321}
+    metadata["request_overrides"] = _nonsecret_mapping(overrides)
+    metadata["request_overrides_fingerprint"] = _authority_mapping_fingerprint(overrides)
+    definitions["advisor"] = replace(definitions["advisor"], provider=None, model=None, inherit_parent=owner == "parent")
+    parent.provider, parent.model, parent.api_mode = "fixture", "m", "chat_completions"
+    parent.base_url, parent.api_key = "https://fixture/v1", "secret"
+    parent.request_overrides = overrides if owner == "parent" else {}
+    defaults = {"request_overrides": overrides} if owner == "delegation" else {}
+    launch = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent, defaults=defaults)
+    assert launch.credentials["request_overrides"] == overrides
+    if owner == "parent":
+        parent.request_overrides = {"max_tokens": 322}
+    else:
+        defaults["request_overrides"] = {"max_tokens": 322}
+    with pytest.raises(ValueError, match="primary route can no longer be authorized exactly"):
+        delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent, defaults=defaults)

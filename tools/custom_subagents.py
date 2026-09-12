@@ -582,25 +582,25 @@ def _validate_physical_auth(client, kwargs, *, digest: str, pinned: bool, overri
             raise ValueError(error)
         return dict(value)
 
-    def auth_only(value):
+    omit_types = (OpenAIOmit, AnthropicOmit)
+
+    def auth_only(values):
         selected = {}
-        for name, value in value.items():
+        for name, value in values.items():
             name = str(name).lower()
-            if name not in auth_names or isinstance(value, (OpenAIOmit, AnthropicOmit)):
+            if name not in auth_names or isinstance(value, omit_types):
                 continue
-            if name in selected or not isinstance(value, str):
+            if not isinstance(value, str) or (name in selected and selected[name] != value):
                 raise ValueError(error)
             selected[name] = value
         return selected
 
     frozen = auth_only(headers(json.loads(overrides).get("extra_headers")))
     request_headers = headers(kwargs.get("extra_headers"))
-    request_auth = auth_only(request_headers)
-    if request_auth != frozen:
+    if auth_only(request_headers) != frozen:
         raise ValueError(error)
     defaults = getattr(client, "default_headers", None)
     if not isinstance(defaults, Mapping):
-        # Minimal clients used by local routes still carry a static credential.
         defaults = {}
         key = getattr(client, "api_key", None)
         token = getattr(client, "auth_token", None)
@@ -608,22 +608,44 @@ def _validate_physical_auth(client, kwargs, *, digest: str, pinned: bool, overri
             defaults["Authorization"] = "Bearer " + key
         if isinstance(token, str) and token:
             defaults["Authorization"] = "Bearer " + token
-    effective = auth_only({**defaults, **request_headers})
-    if any(effective.get(name) != value for name, value in frozen.items()):
-        raise ValueError(error)
-    if pinned and not effective:
-        raise ValueError(error)
-    for name, value in effective.items():
+
+    def authorized(name, value):
         if frozen.get(name) == value:
-            continue
+            return True
         credential = value[7:] if name == "authorization" and value.startswith("Bearer ") else value
         if hashlib.sha256(credential.encode()).hexdigest() == digest:
-            continue
-        # Preserve the SDK placeholder for a genuinely keyless local route only.
-        if (not pinned and not frozen and not getattr(client, "auth_token", None)
-                and name == "authorization" and value == "Bearer " + str(getattr(client, "api_key", ""))):
-            continue
+            return True
+        return (not pinned and not frozen and not getattr(client, "auth_token", None)
+                and name == "authorization" and value == "Bearer " + str(getattr(client, "api_key", "")))
+
+    # Do not conceal a foreign or internally conflicting SDK default behind a
+    # legitimate request override. Omit suppresses only its exact SDK key.
+    default_auth = auth_only(defaults)
+    if any(not authorized(name, value) for name, value in default_auth.items()):
         raise ValueError(error)
+
+    # The SDK merges dicts case-sensitively before constructing httpx.Headers.
+    # Normalize the ACTUAL request override, suppressing every shadowed default
+    # spelling so both the verifier and wire see one authorized channel.
+    normalized = {key: value for key, value in request_headers.items() if str(key).lower() not in auth_names}
+    requested_names = {str(key).lower() for key in request_headers if str(key).lower() in auth_names}
+    omit = AnthropicOmit if type(client).__module__.startswith("anthropic") else OpenAIOmit
+    for name in requested_names:
+        supplied = [value for key, value in request_headers.items() if str(key).lower() == name]
+        if any(isinstance(value, omit_types) for value in supplied) and not all(isinstance(value, omit_types) for value in supplied):
+            raise ValueError(error)
+        default_keys = [key for key in defaults if str(key).lower() == name]
+        key = default_keys[0] if default_keys else next(key for key in request_headers if str(key).lower() == name)
+        for shadow in default_keys:
+            normalized[shadow] = omit()
+        normalized[key] = omit() if isinstance(supplied[0], omit_types) else supplied[0]
+    effective = auth_only({**defaults, **normalized})
+    if (any(effective.get(name) != value for name, value in frozen.items())
+            or (pinned and not effective)
+            or any(not authorized(name, value) for name, value in effective.items())):
+        raise ValueError(error)
+    if requested_names:
+        kwargs["extra_headers"] = normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -867,7 +889,11 @@ class RuntimePin:
             # Nothing was pinned to compare against (provider-default route).
             return
         else:
-            changed = _route_host(str(base_url)) != _route_host(self.base_url)
+            expected_base = self.base_url
+            if self.api_mode == "anthropic_messages":
+                from agent.anthropic_adapter import _base_client_kwargs
+                expected_base, _ = _base_client_kwargs(expected_base, None)
+            changed = not _same_pinned_base_url(str(base_url), expected_base)
         if changed:
             raise ValueError(
                 f"subagent_type {self.subagent_type!r}: SDK client route changed after launch"

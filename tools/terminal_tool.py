@@ -1253,7 +1253,8 @@ def terminal_tool(
                         workdir=None, default_cwd=cwd, session_key=session_key, env_type=env_type)
                     execution_cwd = os.path.join(os.path.abspath(os.path.expanduser(base)), execution_cwd)
                 execution_cwd = os.path.realpath(execution_cwd)
-            knowledge_denial = write_denial_reason([execution_cwd], how="terminal execution")
+            knowledge_denial = (write_denial_reason([execution_cwd], how="terminal execution")
+                                or command_denial_reason(command, tool="terminal", cwd=execution_cwd))
             if knowledge_denial:
                 return _error_json(knowledge_denial, status="error")
 

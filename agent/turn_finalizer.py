@@ -182,6 +182,8 @@ def _collapse_verification_candidates(messages, final_response, agent) -> bool:
                 canonical_index -= 1
         canonical = messages[canonical_index]
         canonical["content"] = final_response
+        from agent.turn_context import drop_stale_api_content
+        drop_stale_api_content(canonical)
         canonical.pop("_verification_candidate", None)
         canonical.pop(_DB_PERSISTED_MARKER, None)
         canonical.pop("_row_id", None)
@@ -207,6 +209,8 @@ def synchronize_terminal_response(agent, result, final_response):
     if (last_user >= 0 and len(messages) - 1 > last_user and isinstance(tail, dict)
             and tail.get("role") == "assistant" and not tail.get("tool_calls")):
         tail["content"] = final_response
+        from agent.turn_context import drop_stale_api_content
+        drop_stale_api_content(tail)
         tail.pop(_DB_PERSISTED_MARKER, None)
         tail.pop("_row_id", None)
     else:
@@ -740,6 +744,8 @@ def finalize_turn(
                 and _message.get("content") == _canonical_response_before_output_transform
             ):
                 _message["content"] = final_response
+                from agent.turn_context import drop_stale_api_content
+                drop_stale_api_content(_message)
                 _message.pop(_DB_PERSISTED_MARKER, None)
                 _message.pop("_row_id", None)
                 agent._db_flush_scan_prefix = None

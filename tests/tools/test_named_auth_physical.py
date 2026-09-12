@@ -127,3 +127,90 @@ def test_transition_probe_defers_final_header_requirement_but_final_request_does
             enforce_delegation_pin(child, {"model": "m", "extra_headers": {"Authorization": "Bearer explicit"}}, client=client)
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("anthropic", [False, True])
+@pytest.mark.parametrize("value", ["synthetic-frozen", "explicit-frozen"])
+def test_lowercase_frozen_override_sends_exactly_one_physical_auth_header(anthropic, value):
+    import openai
+    import anthropic as ant
+    calls = []
+    def response(request):
+        calls.append(request)
+        payload = {"id": "msg", "type": "message", "role": "assistant", "model": "m", "content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}} if anthropic else {"id": "chat", "choices": [], "model": "m", "object": "chat.completion", "created": 0}
+        return httpx.Response(200, json=payload)
+    options = {"api_key": "synthetic-frozen", "base_url": "https://fixture.invalid", "http_client": httpx.Client(transport=httpx.MockTransport(response))}
+    client = ant.Anthropic(**options) if anthropic else openai.OpenAI(**options)
+    name = "x-api-key" if anthropic else "authorization"
+    value = value if anthropic else "Bearer " + value
+    overrides = {"extra_headers": {name: value}}
+    child = fixture(client, anthropic=anthropic, overrides=overrides)
+    kwargs = {"model": "m", "messages": [{"role": "user", "content": "x"}], **overrides}
+    if anthropic:
+        kwargs["max_tokens"] = 1
+    try:
+        before = dict(client._custom_headers)
+        enforce_delegation_pin(child, kwargs, client=client)
+        (client.messages.create if anthropic else client.chat.completions.create)(**kwargs)
+        assert [v.decode() for k, v in calls[0].headers.raw if k.lower() == name.encode()] == [value]
+        assert dict(client._custom_headers) == before
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("anthropic", [False, True])
+def test_primary_sdk_tenant_path_is_frozen(anthropic):
+    import openai
+    import anthropic as ant
+    client = (ant.Anthropic if anthropic else openai.OpenAI)(api_key="synthetic-frozen", base_url="https://fixture.invalid/team-b/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("transport"))))
+    child = fixture(client, anthropic=anthropic)
+    from dataclasses import replace
+    child.base_url = "https://fixture.invalid/team-a/v1"
+    child._delegation_runtime_pin = replace(child._delegation_runtime_pin, base_url=child.base_url)
+    try:
+        with pytest.raises(ValueError, match="route changed"):
+            enforce_delegation_pin(child, {"model": "m"}, client=client)
+    finally:
+        client.close()
+
+
+
+def test_anthropic_primary_uses_exact_constructor_tenant_path_and_sends_one_bearer():
+    from dataclasses import replace
+    import anthropic
+    from agent.anthropic_adapter import _base_client_kwargs
+    calls = []
+    def response(request):
+        calls.append(request)
+        return httpx.Response(200, json={"id": "msg", "type": "message", "role": "assistant", "model": "m", "content": [], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}})
+    frozen_base = "https://fixture.invalid/team-a/v1"
+    _, options = _base_client_kwargs(frozen_base, None)
+    client = anthropic.Anthropic(**options, api_key="ambient-unused", auth_token="synthetic-frozen",
+        default_headers={"X-Api-Key": anthropic.Omit()}, http_client=httpx.Client(transport=httpx.MockTransport(response)))
+    child = fixture(client, anthropic=True)
+    child.base_url = frozen_base
+    child._delegation_runtime_pin = replace(child._delegation_runtime_pin, base_url=frozen_base)
+    kwargs = {"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}
+    try:
+        enforce_delegation_pin(child, kwargs, client=client)
+        client.messages.create(**kwargs)
+        assert calls[0].url.path == "/team-a/v1/messages"
+        assert [v for k, v in calls[0].headers.raw if k.lower() == b"authorization"] == [b"Bearer synthetic-frozen"]
+        assert "x-api-key" not in calls[0].headers
+    finally:
+        client.close()
+
+
+def test_frozen_request_override_cannot_hide_conflicting_sdk_defaults():
+    import openai
+    client = openai.OpenAI(api_key="synthetic-frozen", base_url="https://fixture.invalid",
+        default_headers={"authorization": "Bearer foreign"},
+        http_client=httpx.Client(transport=httpx.MockTransport(lambda _: pytest.fail("transport"))))
+    override = {"extra_headers": {"authorization": "Bearer explicit-frozen"}}
+    child = fixture(client, overrides=override)
+    try:
+        with pytest.raises(ValueError):
+            enforce_delegation_pin(child, {"model": "m", **override}, client=client)
+    finally:
+        client.close()

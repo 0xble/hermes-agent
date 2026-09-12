@@ -410,3 +410,83 @@ def test_capture_and_freshness_never_execute_textconv(candidate_repo, tmp_path):
     assert "converted evidence" not in candidate.tracked_patch
     require_fresh_candidate(candidate)
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("replacement", ["leaf", "parent", "fifo"])
+def test_untracked_capture_refuses_replacement_without_reading_outside(candidate_repo, monkeypatch, replacement):
+    from agent import review_candidate as capture
+    import os
+    directory = candidate_repo / "untracked"
+    directory.mkdir()
+    leaf = directory / "new.txt"
+    leaf.write_text("original")
+    outside = candidate_repo.parent / "outside"
+    outside.mkdir()
+    (outside / "new.txt").write_text("OUTSIDE SECRET SENTINEL")
+    original_stat = os.stat
+    changed = False
+    def swap(path, *args, **kwargs):
+        nonlocal changed
+        result = original_stat(path, *args, **kwargs)
+        if path == "new.txt" and kwargs.get("dir_fd") is not None and not changed:
+            changed = True
+            if replacement == "parent":
+                directory.rename(candidate_repo / "moved")
+                directory.symlink_to(outside, target_is_directory=True)
+            else:
+                leaf.unlink()
+                if replacement == "leaf":
+                    leaf.symlink_to(outside / "new.txt")
+                else:
+                    os.mkfifo(leaf)
+        return result
+    monkeypatch.setattr(os, "stat", swap)
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {swap})
+    monkeypatch.setattr(os, "supports_follow_symlinks", os.supports_follow_symlinks | {swap})
+    if replacement == "parent":
+        # A held parent descriptor may safely finish the original object, never
+        # traversing the outside symlink that replaced its former pathname.
+        result = capture._untracked_entry(candidate_repo, "untracked/new.txt")
+        assert base64.b64decode(result.content_base64) == b"original"
+    else:
+        with pytest.raises(ValueError):
+            capture._untracked_entry(candidate_repo, "untracked/new.txt")
+    assert (outside / "new.txt").read_text() == "OUTSIDE SECRET SENTINEL"
+
+
+def test_untracked_symlink_records_only_link_text(candidate_repo):
+    from agent.review_candidate import _untracked_entry
+    link = candidate_repo / "link"
+    link.symlink_to("/nonexistent/outside")
+    captured = _untracked_entry(candidate_repo, "link")
+    assert captured.mode == "120000"
+    assert base64.b64decode(captured.content_base64) == b"/nonexistent/outside"
+
+
+def test_untracked_capture_refuses_unsupported_descriptor_platform(candidate_repo, monkeypatch):
+    import os
+    from agent.review_candidate import _untracked_entry
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    with pytest.raises(ValueError, match="unsupported on this platform"):
+        _untracked_entry(candidate_repo, "new.txt")
+
+
+def test_untracked_parent_replacement_before_open_cannot_follow_outside(candidate_repo, monkeypatch):
+    import os
+    from agent.review_candidate import _untracked_entry
+    parent = candidate_repo / "race-parent"
+    parent.mkdir()
+    (parent / "new.txt").write_text("original")
+    outside = candidate_repo.parent / "outside"
+    outside.mkdir()
+    (outside / "new.txt").write_text("OUTSIDE SENTINEL")
+    real_open = os.open
+    def replace_parent(path, flags, *args, **kwargs):
+        if path == "race-parent":
+            parent.rename(candidate_repo / "moved")
+            parent.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(os, "open", replace_parent)
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {replace_parent})
+    with pytest.raises(ValueError, match="safely capture"):
+        _untracked_entry(candidate_repo, "race-parent/new.txt")

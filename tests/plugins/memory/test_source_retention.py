@@ -309,7 +309,7 @@ def test_long_pasted_source_is_retained_but_short_prompt_is_not():
     candidates = discover_source_candidates(messages)
     assert len(candidates) == 1
     assert candidates[0].source_type == "pasted_source"
-    assert "Brian's decision" in candidates[0].context
+    assert "user's own statements or decisions" in candidates[0].context
     assert discover_source_candidates([{"role": "user", "content": "short request"}]) == []
 
 
@@ -431,3 +431,29 @@ def test_query_addressed_documents_keep_distinct_private_identities():
     assert candidate("id=").source_id != candidate("").source_id
     assert first.metadata["source_origin"] == "https://example.com/document"
     assert "secret" not in json.dumps(first.metadata)
+
+
+@pytest.mark.parametrize("matches", [True, False])
+@pytest.mark.parametrize("file_response", [False, True])
+def test_no_operation_id_source_requires_readback_and_releases_failed_dedup(tmp_path, matches, file_response):
+    from hindsight_client_api.models.retain_response import RetainResponse
+    from hindsight_client_api.models.file_retain_response import FileRetainResponse
+    provider = _provider_for_source_tests()
+    candidate = _source_candidate(tmp_path)
+    response = FileRetainResponse(operation_ids=[]) if file_response else RetainResponse(
+        success=True, bank_id="bank", items_count=1, **{"async": False})
+    readback = SimpleNamespace(id=candidate.source_id, document_metadata={"content_hash": candidate.content_hash}) if matches else None
+    provider._run_hindsight_operation = MagicMock(side_effect=[response, readback])
+    with patch("plugins.memory.hindsight.read_verified_source_file", return_value=b"source material"):
+        provider._retain_source_candidates([candidate], "bank")
+    assert provider._run_hindsight_operation.call_count == 2
+    assert provider._source_ledger[candidate.automatic_key]["status"] == ("completed" if matches else "failed")
+    assert provider._source_candidate_already_submitted(candidate) is matches
+
+
+def test_pasted_source_context_does_not_invent_human_identity():
+    pasted = "Source: contract excerpt\n\n" + "\n".join(f"A substantive paragraph {n}." for n in range(120))
+    candidate, = discover_source_candidates([{"role": "user", "content": pasted}])
+    assert "Brian" not in candidate.context
+    assert "user" in candidate.context
+    assert candidate.content == pasted
