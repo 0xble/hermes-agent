@@ -1199,12 +1199,26 @@ def _create_quick_snapshot_locked(
         "total_size": sum(manifest.values()), "files": manifest,
         "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
     }
+    namespace = _quick_snapshot_namespace(label)
+    previous = {d: _snapshot_metadata(d) for d in _snapshot_dirs(root)}
+    previous = {d: m for d, m in previous.items()
+                if _snapshot_retention_namespace(d, m) == namespace}
+    # Serialized publication makes this order independent of same-second labels,
+    # collision suffixes, and wall-clock movement. Legacy manifests precede it.
+    meta["recovery_sequence"] = max((_snapshot_recovery_sequence(m) for m in previous.values()), default=0) + 1
+    recovery_metadata = {staging_dir: meta, **previous}
+    required, _ = _snapshot_recovery_state(
+        _snapshot_recovery_order(list(recovery_metadata), recovery_metadata), recovery_metadata,
+    )
+    # A cumulative checkpoint, not a claim that these DBs failed this copy attempt.
+    # An empty checkpoint also supersedes resolved omissions in older manifests.
+    meta["recovery_required_dbs"] = sorted(required)
     with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     os.replace(staging_dir, root / snap_id)
     # Auto-prune (pre-update callers pass a smaller keep so state.db copies don't accumulate).
-    # When a present DB failed to capture or was skipped for size (#68805), preserve the newest
-    # recovery copy of each omitted DB in addition to the retention window. Still prune stale
+    # Preserve the newest recovery copy of each unresolved omitted DB, including
+    # inherited omissions, in addition to the retention window. Still prune stale
     # partial snapshots that add no recovery coverage: they contain config/auth copies and must
     # stay bounded.
     incomplete = failed_dbs or oversized_skipped
@@ -1220,8 +1234,7 @@ def _create_quick_snapshot_locked(
     _prune_quick_snapshots(
         root,
         keep=retention,
-        preserve_recovery_for=set(failed_dbs) | set(oversized_skipped),
-        namespace=_quick_snapshot_namespace(label),
+        namespace=namespace,
     )
     # Damaged manifests cannot identify their original retention policy. Bound
     # recognizable snapshot artifacts separately using the normal (not updater) window.
@@ -1305,6 +1318,75 @@ def _is_complete_quick_snapshot(directory: Path, meta: Dict[str, Any]) -> bool:
         if rel.endswith(".db") and not _verified_snapshot_db(directory, rel):
             return False
     return True
+
+
+def _snapshot_recovery_paths(directory: Path, meta: Dict[str, Any], key: str) -> Optional[set[str]]:
+    """A malformed checkpoint must never masquerade as an authoritative empty one."""
+    if key not in meta:
+        return None
+    values = meta[key]
+    try:
+        if isinstance(values, list) and all(
+            isinstance(rel, str) and rel.endswith(".db") and not Path(rel).is_absolute()
+            and ".." not in Path(rel).parts and _is_within(directory / rel, directory.resolve())
+            for rel in values
+        ):
+            return set(values)
+    except OSError:
+        pass
+    logger.warning("Ignoring malformed %s in snapshot %s", key, directory.name)
+    return None
+
+
+def _snapshot_recovery_state(
+    dirs: List[Path], metadata: Dict[Path, Optional[Dict[str, Any]]],
+) -> tuple[set[str], set[Path]]:
+    """Resolve omissions newest-checkpoint-first, returning obligations and their witnesses.
+
+    Keep one cumulative carrier, even empty, so old retained failures cannot resurrect.
+    Newer legacy records need their latest omission/verified-clear witness per affected DB
+    until the next published snapshot consolidates them into its single checkpoint.
+    """
+    required: set[str] = set()
+    retained: set[Path] = set()
+    newer = []
+    for directory in dirs:
+        meta = metadata[directory] or {}
+        checkpoint = _snapshot_recovery_paths(directory, meta, "recovery_required_dbs")
+        if checkpoint is not None:
+            required = checkpoint
+            retained.add(directory)
+            break
+        newer.append(directory)
+    witnesses: Dict[str, Path] = {}
+    for directory in reversed(newer):
+        meta = metadata[directory] or {}
+        for key in ("failed_dbs", "oversized_skipped"):
+            for rel in _snapshot_recovery_paths(directory, meta, key) or ():
+                required.add(rel)
+                witnesses[rel] = directory
+        files = meta.get("files")
+        if not isinstance(files, dict):
+            continue
+        # Only a newly verified, listed SQLite payload clears an obligation.
+        for rel in required | witnesses.keys():
+            if rel in files and _verified_snapshot_db(directory, rel):
+                required.discard(rel)
+                witnesses[rel] = directory
+    retained.update(witnesses.values())
+    return required, retained
+
+
+def _snapshot_recovery_sequence(meta: Optional[Dict[str, Any]]) -> int:
+    sequence = (meta or {}).get("recovery_sequence")
+    return sequence if type(sequence) is int and sequence > 0 else 0
+
+
+def _snapshot_recovery_order(
+    dirs: List[Path], metadata: Dict[Path, Optional[Dict[str, Any]]],
+) -> List[Path]:
+    """Order this namespace's numbered publications; legacy order remains best-effort."""
+    return sorted(dirs, key=lambda d: (_snapshot_recovery_sequence(metadata[d]), d.name), reverse=True)
 
 
 def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -1610,7 +1692,8 @@ def _prune_quick_snapshots(
     """Bound one snapshot namespace without discarding recovery generations.
 
     Retain the configured recent window, newest verified complete generation,
-    and the newest readable SQLite copy for each DB omitted by this run.
+    and the newest readable SQLite copy for each unresolved omission. One cumulative
+    carrier (or bounded legacy witnesses) also survives keep=0 to preserve that obligation.
     """
     if namespace is None:
         namespaces = {_snapshot_retention_namespace(d, _snapshot_metadata(d))
@@ -1620,19 +1703,10 @@ def _prune_quick_snapshots(
     metadata = {d: _snapshot_metadata(d) for d in _snapshot_dirs(root)}
     dirs = [d for d, meta in metadata.items()
             if _snapshot_retention_namespace(d, meta) == namespace]
-    retained = set(dirs[:keep])
-    if preserve_recovery_for is None:
-        missing = set()
-        for d in dirs:
-            meta = _snapshot_metadata(d)
-            if meta is None:
-                continue
-            for key in ("failed_dbs", "oversized_skipped"):
-                omissions = meta.get(key)
-                if isinstance(omissions, list):
-                    missing.update(rel for rel in omissions if isinstance(rel, str))
-    else:
-        missing = set(preserve_recovery_for)
+    dirs = _snapshot_recovery_order(dirs, metadata)
+    missing, retained = _snapshot_recovery_state(dirs, metadata)
+    retained.update(dirs[:keep])
+    missing.update(preserve_recovery_for or ())
     for d in dirs:
         meta = _snapshot_metadata(d)
         if meta is None:
@@ -1655,8 +1729,10 @@ def _prune_quick_snapshots(
 
 
 def prune_quick_snapshots(keep: int = _QUICK_DEFAULT_KEEP, hermes_home: Optional[Path] = None) -> int:
-    """Remove oldest quick snapshots beyond the keep limit. Returns count deleted."""
-    return _prune_quick_snapshots(_quick_snapshot_root(hermes_home), keep=keep, namespace=None)
+    """Prune beyond the recent window, retaining recovery copies and their checkpoint evidence."""
+    home = hermes_home or get_hermes_home()
+    with _backup_operation_lock(home):
+        return _prune_quick_snapshots(_quick_snapshot_root(home), keep=keep, namespace=None)
 
 
 def run_quick_backup(args) -> None:
