@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+from cron.env_settings import cron_env_setting
 from cron.jobs import _ensure_cron_dir
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Optional, TYPE_CHECKING
@@ -42,7 +43,7 @@ def _timeout_from_env_or_config(
     env_var: str, config_key: str, parse: Callable[[Any], Any], label: str):
     """Shared env → ``cron.<config_key>`` resolution. ``parse`` returns the value or None to keep
     looking; a parse error on the env var WARNs, on config DEBUGs. None when neither yields."""
-    env_value = os.getenv(env_var, "").strip()
+    env_value = cron_env_setting(env_var).strip()
     if env_value:
         try:
             value = parse(env_value)

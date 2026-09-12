@@ -189,7 +189,9 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     """Best-effort local workspace hint for child prompts: only a concrete
     absolute directory is ever injected (never a fake container path)."""
     # HERMES-015: the session cwd authority, not raw TERMINAL_CWD — a cron workdir job binds its
-    # workspace on the ContextVar without touching the process env.
+    # workspace on the ContextVar without touching the process env. resolve_tool_cwd() falls
+    # through to scope_terminal_cwd(), so the multiplexed per-turn terminal scope still wins
+    # whenever no session cwd is bound.
     from agent.runtime_cwd import resolve_tool_cwd
     candidates = [
         resolve_tool_cwd() or None,
