@@ -26,7 +26,8 @@ class Projection:
 
 
 class RiskReplay(TypedDict):
-    conservative_full_confirmations: int
+    risk_full_revision_count: int
+    unmatched_summary_runs: int
 
 
 class UsageSummary(TypedDict):
@@ -54,7 +55,10 @@ def project(
     baseline = summary["rounded_minutes"]
     pull_request_runs = summary["fork_ci_pull_request_runs"]
     confirmations = (
-        summary["risk_replay"]["conservative_full_confirmations"]
+        # Classification runs on revisions, not once per PR. Without evidence
+        # that unmatched runs avoided full checks, count those conservatively too.
+        summary["risk_replay"]["risk_full_revision_count"]
+        + summary["risk_replay"]["unmatched_summary_runs"]
         if full_confirmations is None
         else full_confirmations
     )
@@ -108,7 +112,7 @@ def main() -> int:
     parser.add_argument(
         "--full-confirmations",
         type=int,
-        help="override the fixture's conservative risk-PR confirmation count",
+        help="override observed risk revisions plus unmatched runs for an explicit scenario",
     )
     parser.add_argument("--minimum-reduction", type=float, default=80.0)
     args = parser.parse_args()

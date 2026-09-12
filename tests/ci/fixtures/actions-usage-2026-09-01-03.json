@@ -25,7 +25,6 @@
     "risk_full_revision_count": 27,
     "risk_pull_request_count": 15,
     "unmatched_summary_runs": 2,
-    "conservative_full_confirmations": 17,
     "risk_pull_request_branches": [
       "dependabot/github_actions/actions-minor-patch-f5d4e90336",
       "dependabot/github_actions/actions/checkout-7.0.1",

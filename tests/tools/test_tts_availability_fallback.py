@@ -165,15 +165,16 @@ def test_real_command_dependency_failure_respects_fallback_boundary(tmp_path, mo
         assert Path(result["file_path"]).read_bytes() == wav_bytes()
 
 
-def test_command_fallback_discards_partial_chunks_and_restarts_whole_utterance(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure_command", ["hermes_missing_synthesis_fixture_01a09205", "sleep 2"])
+def test_command_fallback_discards_partial_chunks_and_restarts_whole_utterance(tmp_path, monkeypatch, failure_command):
     marker = shlex.quote(str(tmp_path / "first-generated"))
     source = tmp_path / "source.wav"
     source.write_bytes(wav_bytes())
-    command = (f"if [ -e {marker} ]; then hermes_missing_synthesis_fixture_01a09205; "
+    command = (f"if [ -e {marker} ]; then {failure_command}; "
                f"else printf generated > {marker}; cp {shlex.quote(str(source))} {{output_path}}; fi")
     config = {"tts": {"provider": "fixture-command", "fallback_providers": ["edge"],
                       "providers": {"fixture-command": {"type": "command", "command": command,
-                                                        "output_format": "wav", "max_text_length": 12}}}}
+                                                        "timeout": 0.2, "output_format": "wav", "max_text_length": 12}}}}
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     fallback_text = []
     def edge(text, path, cfg):
@@ -188,6 +189,31 @@ def test_command_fallback_discards_partial_chunks_and_restarts_whole_utterance(t
     assert fallback_text == [text]
     assert result["fallback_from"] == "fixture-command"
     assert not list(tmp_path.glob("speech.chunk*"))
+
+
+@pytest.mark.parametrize("override,fallbacks,expected", [(False, ["edge"], True), (True, ["edge"], False), (False, [], False)])
+def test_real_command_timeout_only_uses_opted_in_fallback(tmp_path, monkeypatch, override, fallbacks, expected):
+    config = {"tts": {"provider": "fixture-command", "fallback_providers": fallbacks,
+                      "providers": {"fixture-command": {"type": "command", "command": "sleep 2",
+                                                        "timeout": 0.2, "output_format": "wav"}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    called = []
+
+    def edge(text, path, cfg):
+        called.append(text)
+        Path(path).write_bytes(wav_bytes())
+
+    monkeypatch.setattr(tts, "_run_edge_tts", edge)
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    args = {"text": "One complete utterance.", "output_path": str(tmp_path / "speech.wav")}
+    if override:
+        args["provider"] = "fixture-command"
+    result = json.loads(registry.get_entry("text_to_speech").handler(args))
+    assert bool(result.get("success")) is expected
+    assert called == ([args["text"]] if expected else [])
+    if expected:
+        assert result["attempted_providers"] == ["fixture-command", "edge"]
+        assert Path(result["file_path"]).read_bytes() == wav_bytes()
 
 
 def test_output_path_failure_never_switches_command_provider(tmp_path, monkeypatch):

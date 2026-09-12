@@ -28,12 +28,12 @@ def is_availability_failure(exc):
     import httpx
     import requests
     from openai import APIConnectionError
-    from tools.tts_command_provider import TTSCommandDependencyUnavailable
+    from tools.tts_command_provider import TTSCommandDependencyUnavailable, TTSCommandTimeout
 
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int):
         return status in (408, 429) or 500 <= status < 600
-    return isinstance(exc, (TTSCommandDependencyUnavailable, TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError,
+    return isinstance(exc, (TTSCommandDependencyUnavailable, TTSCommandTimeout, TimeoutError, ConnectionError, httpx.TimeoutException, httpx.NetworkError,
                             requests.exceptions.ConnectionError, requests.exceptions.Timeout, APIConnectionError))

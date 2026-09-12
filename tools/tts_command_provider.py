@@ -310,6 +310,10 @@ class TTSCommandDependencyUnavailable(RuntimeError):
     """A supported shell reported that the configured synthesis command is missing."""
 
 
+class TTSCommandTimeout(RuntimeError):
+    """The synthesis command timed out, allowing an explicitly configured fallback."""
+
+
 def _missing_synthesis_command(exc: subprocess.CalledProcessError) -> bool:
     # Do not parse arbitrary shell templates, or classify bare 127 and generic
     # filesystem errors as provider outages. Only known POSIX shell diagnostics
@@ -347,7 +351,7 @@ def _generate_command_tts(
         try:
             run_command_provider(command, timeout, env_passthrough=command_env_passthrough(config))
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"TTS provider '{provider_name}' timed out after {timeout:g}s") from exc
+            raise TTSCommandTimeout(f"TTS provider '{provider_name}' timed out after {timeout:g}s") from exc
         except subprocess.CalledProcessError as exc:
             if _missing_synthesis_command(exc):
                 raise TTSCommandDependencyUnavailable(
