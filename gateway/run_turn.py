@@ -2129,8 +2129,7 @@ class GatewayTurnMixin:
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
             await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
-            if goal_post_turn_state.get("handled"):
-                event._goal_post_turn_complete = True
+            event._goal_post_turn_state = goal_post_turn_state
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -4213,19 +4212,20 @@ class GatewayTurnMixin:
                 and getattr(next_goal_entry, "session_id", None) == session_id
             )
             if response and goal_session_entry is not None:
-                final_text = self._final_text_for_post_turn_hooks(response, None)
-                if final_text.strip():
-                    await self._post_turn_goal_continuation(
-                        session_entry=goal_session_entry,
-                        source=source,
-                        final_response=final_text,
-                        session_key=session_key,
-                        enqueue_continuation=not same_goal_session_pending,
-                        emit_status_notice=not same_goal_session_pending,
-                        agent_result=result,
-                    )
+                # Each queued turn owns a separate closure/state. The outer hook
+                # sees only the terminal turn's registration, never an early
+                # "handled" marker belonging to its predecessor.
+                delivery_state: Dict[str, Any] = {}
                 if goal_post_turn_state is not None:
-                    goal_post_turn_state["handled"] = True
+                    goal_post_turn_state["delivery"] = delivery_state
+                owner = (getattr(turn_ctx, "_post_delivery_owner", None)
+                         or getattr(turn_ctx, "_post_delivery_adapter", None) or adapter)
+                turn_ctx._post_delivery_owner = owner
+                self._schedule_goal_after_delivery(
+                    adapter=owner, session_key=session_key, generation=turn_ctx.run_generation,
+                    session_entry=goal_session_entry, source=source, agent_result=response,
+                    state=delivery_state, same_session_pending=same_goal_session_pending,
+                )
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,

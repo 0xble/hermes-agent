@@ -259,6 +259,37 @@ class GatewayGoalsMixin:
         await self._warm_goals_session_db(label)
         return factory(sid)
 
+    def _schedule_goal_after_delivery(
+        self, *, adapter, session_key, generation, session_entry, source,
+        agent_result, state, same_session_pending=False,
+    ) -> None:
+        """Carry the prepared envelope to the existing generation-owned receipt.
+
+        Registration is not handling. Failed delivery leaves the decision unconsumed;
+        a retry of the same receipt can handle it once. No adapter means no receipt,
+        not permission to advance a goal before its answer reaches the user.
+        """
+        state["scheduled"] = True
+        if (adapter is None or not session_key
+                or not callable(getattr(adapter, "register_post_delivery_callback", None))):
+            return
+        evidence = self._tool_evidence_for_goal(agent_result)
+
+        async def delivered():
+            from gateway.status_delivery import final_delivery_succeeded
+            if not final_delivery_succeeded.get() or state.get("handled"):
+                return
+            await self._post_turn_goal_continuation(
+                session_entry=session_entry, source=source,
+                final_response=self._final_text_for_post_turn_hooks(agent_result),
+                session_key=session_key, enqueue_continuation=not same_session_pending,
+                emit_status_notice=not same_session_pending,
+                tool_evidence=evidence, agent_result=agent_result,
+            )
+            state["handled"] = True
+
+        adapter.register_post_delivery_callback(session_key, delivered, generation=generation)
+
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,
         session_key: Optional[str] = None, enqueue_continuation: bool = True,
@@ -310,7 +341,9 @@ class GatewayGoalsMixin:
             and mgr.claim_transition_notice(decision)
         )
         if notify:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
+            # This hook is already at the receipt boundary; registering another
+            # callback here would strand the notice in a lane already popped.
+            await self._send_goal_status_notice(source, msg)
         prompt = decision.get("continuation_prompt") or ""
         if not enqueue_continuation or not decision.get("should_continue") or not prompt or source is None:
             return
@@ -335,29 +368,36 @@ class GatewayGoalsMixin:
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
-        # The inner drain path can evaluate a goal before processing a queued
-        # same-session turn. Consume its marker so the outer hook does not
-        # judge the same visible response twice.
-        goal_already_handled = bool(getattr(event, "_goal_post_turn_complete", False))
-        if event is not None:
-            try:
-                delattr(event, "_goal_post_turn_complete")
-            except AttributeError:
-                pass
+        # The inner drain registers a receipt for each logical response. Keep
+        # its state on the event: repeated outer hooks must not rejudge a turn,
+        # whether its delivery is pending, failed, or already handled.
+        goal_delivery = getattr(event, "_goal_post_turn_state", {}) or {}
+        goal_already_scheduled = bool(goal_delivery.get("delivery", {}).get("scheduled"))
         # Routine empty replies must not start a goal continuation (notably a /loop wakeup with no
         # agent output). Failed turns remain observable to the lifecycle even when their final text
         # is empty, so persisted stop/failure replies cannot be silently dropped.
         failed_turn = isinstance(agent_result, dict) and bool(agent_result.get("failed"))
         hooks = [("loop completion", self._post_turn_loop_completion)]
         prepared_goal = isinstance(agent_result, dict) and bool(agent_result.get("_goal_decision"))
-        if not goal_already_handled and (final_text.strip() or failed_turn or prepared_goal):
+        if not goal_already_scheduled and (final_text.strip() or failed_turn or prepared_goal):
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
                 kwargs = dict(session_entry=session_entry, source=source, final_response=final_text)
                 if label == "goal continuation":
-                    kwargs["tool_evidence"] = self._tool_evidence_for_goal(agent_result)
-                    kwargs["agent_result"] = agent_result
+                    adapter = self._adapter_for_source(source)
+                    key = self._session_key_for_source(source)
+                    active = getattr(adapter, "_active_sessions", {}).get(key)
+                    result = agent_result if isinstance(agent_result, dict) else {"final_response": final_text}
+                    state = {}
+                    if event is not None:
+                        event._goal_post_turn_state = {"delivery": state}
+                    self._schedule_goal_after_delivery(
+                        adapter=adapter, session_key=key,
+                        generation=getattr(active, "_hermes_run_generation", None),
+                        session_entry=session_entry, source=source, agent_result=result, state=state,
+                    )
+                    continue
                 await hook(**kwargs)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)

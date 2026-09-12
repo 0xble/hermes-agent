@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 import types
@@ -13,8 +14,17 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 from gateway.session import SessionEntry, SessionSource
+
+
+def _receipt_adapter():
+    cls = type("ReceiptAdapter", (BasePlatformAdapter,), {})
+    cls.__abstractmethods__ = frozenset()
+    adapter = cls.__new__(cls)
+    adapter._post_delivery_callbacks = {}
+    adapter._post_delivery_callbacks_by_generation = {}
+    return adapter
 
 
 class _NoopAgent:
@@ -210,7 +220,7 @@ def _setup_handler_runner(monkeypatch, tmp_path):
     runner.session_store.load_transcript.return_value = []
     runner.session_store.has_platform_message_id.return_value = False
     async def _run_agent_with_goal_state(**kwargs):
-        kwargs["goal_post_turn_state"]["handled"] = True
+        kwargs["goal_post_turn_state"]["delivery"] = {"scheduled": True}
         return {
             "final_response": "Partial progress.",
             "messages": [],
@@ -240,7 +250,11 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
     runner._post_turn_goal_continuation = AsyncMock()
     runner._post_turn_loop_completion = AsyncMock()
     goal_post_turn_state = {}
+    adapter = _receipt_adapter()
+    runner._run_agent_schedule_bubble_cleanup = lambda _response, _adapter, ctx: setattr(
+        ctx, "_post_delivery_adapter", adapter)
     result = await runner._run_agent(
+        run_generation=7,
         message="Keep implementing the standing goal.",
         context_prompt="",
         history=[],
@@ -251,8 +265,8 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
         goal_post_turn_state=goal_post_turn_state,
     )
 
-    assert runner._post_turn_goal_continuation.await_count == 1
-    assert goal_post_turn_state == {"handled": True}
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    assert goal_post_turn_state == {"delivery": {"scheduled": True}}
 
     # _handle_message_with_agent returns only text (or None after streaming),
     # so the event is the sole bridge that can carry the inner hook's marker
@@ -260,7 +274,7 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
     event = SimpleNamespace(
         metadata={},
         _streamed_final_response=result["final_response"],
-        _goal_post_turn_complete=goal_post_turn_state["handled"],
+        _goal_post_turn_state=goal_post_turn_state,
     )
     await runner._run_post_turn_hooks(
         agent_result=None,
@@ -269,7 +283,11 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
         event=event,
     )
 
-    assert runner._post_turn_goal_continuation.await_count == 1
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    await adapter._fire_post_delivery_callback("agent:main:telegram:dm:12345", asyncio.Event(), 7)
+    await runner._run_post_turn_hooks(agent_result=None, source=source, is_internal=False, event=event)
+    await adapter._fire_post_delivery_callback("agent:main:telegram:dm:12345", asyncio.Event(), 7)
+    assert goal_post_turn_state["delivery"]["handled"]
     runner._post_turn_goal_continuation.assert_awaited_once_with(
         session_entry=session_entry,
         source=source,
@@ -278,6 +296,7 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
         enqueue_continuation=True,
         emit_status_notice=True,
         agent_result=ANY,
+        tool_evidence=[],
     )
 
 
@@ -298,25 +317,22 @@ async def test_handler_preserves_inner_goal_marker_for_outer_hook(monkeypatch, t
         chat_type="dm",
     )
 
+    adapter = _receipt_adapter()
+
     async def _run_agent_after_inner_goal_hook(**kwargs):
-        # Model the inner hook that already judged this response.  The optional
-        # state holder is the fixed bridge; its absence exercises the old
-        # raw-result/finalized-result boundary without requiring the new API.
-        await runner._post_turn_goal_continuation(
-            session_entry=goal_entry,
-            source=source,
-            final_response="Partial progress.",
+        state = {}
+        kwargs["goal_post_turn_state"]["delivery"] = state
+        runner._schedule_goal_after_delivery(
+            adapter=adapter, session_key="agent:main:telegram:dm:12345", generation=1,
+            session_entry=goal_entry, source=source,
+            agent_result={"final_response": "Partial progress."}, state=state,
         )
-        goal_state = kwargs.get("goal_post_turn_state")
-        if goal_state is not None:
-            goal_state["handled"] = True
         return {
             "final_response": "Partial progress.",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
-            "_goal_post_turn_complete": True,
         }
 
     runner._run_agent = AsyncMock(side_effect=_run_agent_after_inner_goal_hook)
@@ -336,5 +352,9 @@ async def test_handler_preserves_inner_goal_marker_for_outer_hook(monkeypatch, t
         event=event,
     )
 
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    assert not event._goal_post_turn_state["delivery"].get("handled")
+    await adapter._fire_post_delivery_callback("agent:main:telegram:dm:12345", asyncio.Event(), 1)
+    await runner._run_post_turn_hooks(agent_result=response, source=source, is_internal=False, event=event)
     assert runner._post_turn_goal_continuation.await_count == 1
-    assert not hasattr(event, "_goal_post_turn_complete")
+    assert event._goal_post_turn_state["delivery"]["handled"]
