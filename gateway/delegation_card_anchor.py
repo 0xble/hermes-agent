@@ -128,12 +128,18 @@ async def replace(manager, key):
             manager._save()
 
     async with lock:
-        if receipt["send_attempts"] >= 3:
-            return
         projection = manager._projection(key)
         if not any(r.get("state") == "running" for r in projection["rows"].values()):
             return  # terminal-only/handled during the gap must not resurrect a card
+        if receipt["send_attempts"] >= 3:
+            if not receipt.get("new_work_pending"):
+                return
+            # This branch is reachable only with confirmed deletion/rejection.
+            # A new admitted delegation gets a bounded burst; an uncertain send
+            # still returns above, regardless of later work or process restart.
+            receipt["send_attempts"] = 0
         receipt["state"] = "sending"
+        receipt.pop("new_work_pending", None)
         receipt["send_attempts"] += 1
         manager._save()
 
@@ -165,7 +171,10 @@ async def replace(manager, key):
                 receipt["send_attempts"] -= 1
             elif raw.get("definite_rejection") or (getattr(result, "retryable", False) and retry_after is not None):
                 receipt["state"] = "deleted"
-                if receipt["send_attempts"] < 3:
-                    card["retry_at"] = time.time() + max(manager.interval, 1.0, float(retry_after or 0))
+                # Persist the cooldown even on exhaustion, without scheduling an
+                # endless retry. Later admitted work/restart must honor it too.
+                receipt["retry_not_before"] = time.time() + max(manager.interval, 1.0, float(retry_after or 0))
+                if receipt["send_attempts"] < 3 or receipt.get("new_work_pending"):
+                    card["retry_at"] = receipt["retry_not_before"]
             # Every other failure retains sending: a lost receipt fences resends.
             manager._save()
