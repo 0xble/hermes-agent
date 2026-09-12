@@ -1958,3 +1958,41 @@ class TestMemoryCuration:
         )
 
         assert "error" in result
+
+
+
+@pytest.mark.parametrize("args", [{"tags": ["private"]}, {"tag_groups": [{"tags": ["private"]}]}])
+def test_incompatible_recall_never_drops_mandatory_filters(provider, monkeypatch, args):
+    import asyncio
+    calls = []
+
+    class OldClient:
+        async def arecall(self, bank_id, query, types, budget, max_tokens):
+            calls.append(query)
+            return SimpleNamespace(results=[])
+
+    client = OldClient()
+    monkeypatch.setattr(provider, "_run_hindsight_operation", lambda operation: asyncio.run(operation(client)))
+    with pytest.raises(ValueError, match="cannot enforce recall filters"):
+        provider._compatible_recall("private query", args)
+    assert calls == []
+    # Response expansions are optional; unfiltered recall remains compatible.
+    provider._compatible_recall("public query", {"include_entities": True})
+    assert calls == ["public query"]
+
+
+def test_supported_recall_preserves_configured_filters(provider, monkeypatch):
+    import asyncio
+    calls = []
+    provider._recall_tags = ["private"]
+    provider._recall_tags_match = "all"
+
+    class Client:
+        async def arecall(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(results=[])
+
+    monkeypatch.setattr(provider, "_run_hindsight_operation", lambda operation: asyncio.run(operation(Client())))
+    provider._compatible_recall("query", explicit=True)
+    assert calls[0]["tags"] == ["private"]
+    assert calls[0]["tags_match"] == "all"

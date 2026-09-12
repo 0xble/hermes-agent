@@ -1153,6 +1153,11 @@ class HindsightMemoryProvider(MemoryProvider):
         for key, default in optional_defaults.items():
             if args.get(key, default):
                 optional[key] = args.get(key, default)
+        filters = {key: optional.pop(key) for key in ("tags", "tags_match", "tag_groups") if key in optional}
+        unsupported_filters = [key for key in filters if not _supports_kwarg(client, "arecall", key)]
+        if unsupported_filters:
+            raise ValueError("Hindsight client cannot enforce recall filters: " + ", ".join(unsupported_filters))
+        required.update(filters)
         supported = {key: value for key, value in optional.items() if _supports_kwarg(client, "arecall", key)}
         if (omitted := set(optional) - set(supported)):
             logger.warning("Hindsight recall optional fields unavailable in installed client: %s", sorted(omitted))

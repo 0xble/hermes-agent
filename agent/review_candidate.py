@@ -36,6 +36,8 @@ _GIT_TIMEOUT_SECONDS = 30
 _GIT_TERMINATE_GRACE_SECONDS = 1
 _GIT_READ_CHUNK_BYTES = 64 * 1024
 _MAX_GIT_ERROR_BYTES = 64 * 1024
+MAX_EVIDENCE_ENTRIES = 16_384
+MAX_ENUMERATION_BYTES = 2 * 1024 * 1024
 
 
 class ReviewCandidateStale(ValueError):
@@ -245,11 +247,14 @@ def _stop_git_process(process: subprocess.Popen[bytes]) -> None:
 
 def _git(repo: Path, *args: str, max_stdout_bytes: int | None = None) -> bytes:
     """Run Git while retaining no more than the requested stdout evidence budget."""
+    if max_stdout_bytes is None:
+        max_stdout_bytes = MAX_ENUMERATION_BYTES
     process: subprocess.Popen[bytes] | None = None
     streams: list[threading.Thread] = []
     try:
         process = subprocess.Popen(
-            ["git", *args], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args],
+            cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         assert process.stdout is not None and process.stderr is not None
         stdout: list[bytes] = []
@@ -336,8 +341,14 @@ def _git(repo: Path, *args: str, max_stdout_bytes: int | None = None) -> bytes:
 
 def _normalize_scope(scope: Iterable[str]) -> tuple[str, ...]:
     normalized: list[str] = []
-    for raw in scope:
+    scope_bytes = 0
+    for index, raw in enumerate(scope):
+        if index >= MAX_EVIDENCE_ENTRIES:
+            raise ValueError("Accepted review scope exceeds the evidence entry bound")
         value = str(raw).strip().replace(os.sep, "/")
+        scope_bytes += len(value.encode("utf-8", "surrogateescape"))
+        if scope_bytes > MAX_ENUMERATION_BYTES:
+            raise ValueError("Accepted review scope exceeds the evidence enumeration bound")
         path = Path(value)
         if not value or path.is_absolute() or value in (".", "..") or ".." in path.parts:
             raise ValueError("accepted_scope entries must be repository-relative paths")
@@ -362,6 +373,29 @@ def descriptor_capture_supported() -> bool:
     )
 
 
+def _filter_guards(root: Path) -> list[str]:
+    """Disable conversion commands and require failure if a file needs one.
+
+    --no-ext-diff/--no-textconv do not cover clean/process filters. Empty
+    commands plus required=true prevent execution without substituting raw
+    worktree bytes for the repository's required representation.
+    """
+    keys = _git(root, "config", "--null", "--name-only", "--list").decode("utf-8").split("\0")
+    names = {key[7:key.rfind(".")] for key in keys
+             if key.startswith("filter.") and key.endswith((".clean", ".process"))}
+    guards = []
+    for name in sorted(names):
+        guards.extend(["-c", f"filter.{name}.clean=", "-c", f"filter.{name}.process=",
+                       "-c", f"filter.{name}.required=true"])
+    return guards
+
+
+def _bounded_entries(raw: bytes) -> list[bytes]:
+    if raw.count(b"\0") > MAX_EVIDENCE_ENTRIES:
+        raise ValueError("Review evidence enumeration exceeds the entry bound")
+    return [entry for entry in raw.split(b"\0") if entry]
+
+
 def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
     """Fail closed when a checked-out submodule in scope has uncaptured changes.
 
@@ -372,7 +406,7 @@ def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
     at every nesting depth.
     """
     staged = _git(root, "ls-files", "--stage", "-z", "--", *pathspecs)
-    for entry in staged.split(b"\0"):
+    for entry in _bounded_entries(staged):
         if not entry.startswith(b"160000 "):
             continue
         relative = entry.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")
@@ -380,7 +414,7 @@ def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
         if not (submodule / ".git").exists():
             continue  # never checked out, so no worktree content can drift
         status = _git(
-            submodule, "--no-optional-locks", "status", "--porcelain=v2", "-z",
+            submodule, *_filter_guards(submodule), "--no-optional-locks", "status", "--porcelain=v2", "-z",
             "--ignore-submodules=none", "--untracked-files=all",
         )
         if status.strip(b"\0"):
@@ -395,11 +429,6 @@ def _evidence_bound_error(relative: str, budget: int) -> ValueError:
         f"Untracked review evidence {relative} exceeds the {budget}-byte review evidence bound "
         f"(per-file limit {MAX_UNTRACKED_FILE_BYTES}, aggregate limit {MAX_EVIDENCE_BYTES})"
     )
-
-
-def _untracked_byte_count(entry: ReviewUntrackedFileV1) -> int:
-    encoded = entry.content_base64
-    return len(encoded) * 3 // 4 - encoded.count("=")
 
 
 def _untracked_entry(
@@ -510,19 +539,22 @@ def capture_review_candidate(
     pathspecs = _literal_pathspecs(scope)
     _reject_dirty_submodules(root, pathspecs)
     patch_bytes = _git(
-        root, "diff", "--binary", "--no-ext-diff", "--no-textconv",
+        root, *_filter_guards(root), "diff", "--binary", "--no-ext-diff", "--no-textconv",
         "--ignore-submodules=none", "--submodule=short", base_commit, "--", *pathspecs,
         max_stdout_bytes=MAX_EVIDENCE_BYTES,
     )
     remaining = MAX_EVIDENCE_BYTES - len(patch_bytes)
     untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
     untracked_paths = sorted(
-        item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item
+        item.decode("utf-8", "surrogateescape") for item in _bounded_entries(untracked_raw)
     )
     entries: list[ReviewUntrackedFileV1] = []
     for path in untracked_paths:
         entry = _untracked_entry(root, path, budget=min(MAX_UNTRACKED_FILE_BYTES, remaining))
-        remaining -= _untracked_byte_count(entry)
+        # JSON metadata and base64 expansion count even for zero-byte files.
+        remaining -= len(json.dumps(asdict(entry), ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+        if remaining < 0:
+            raise _evidence_bound_error(path, MAX_EVIDENCE_BYTES)
         entries.append(entry)
     untracked = tuple(entries)
     if not patch_bytes and not untracked:
@@ -544,6 +576,8 @@ def capture_review_candidate(
     canonical = json.dumps(
         _identity_payload(provisional), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")
+    if len(canonical) > MAX_EVIDENCE_BYTES:
+        raise ValueError("Serialized review evidence exceeds the aggregate review evidence bound")
     return ReviewCandidateV1(
         repository=provisional.repository,
         base_commit=base_commit,

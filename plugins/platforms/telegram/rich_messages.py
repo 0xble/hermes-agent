@@ -28,16 +28,29 @@ class _RenderState:
     max_depth: int
     max_nodes: int
     nodes: int = 0
+    chars: int = 0
     block_count: int = 0
     block_types: list[str] = field(default_factory=list)
     truncated: bool = False
 
     def enter(self, depth: int) -> bool:
-        if depth > self.max_depth or self.nodes >= self.max_nodes:
+        if depth > self.max_depth or self.nodes >= self.max_nodes or self.chars >= self.max_chars:
             self.truncated = True
             return False
         self.nodes += 1
         return True
+
+    def text(self, value: Any) -> str:
+        # Slice before transformations/formatting allocate larger intermediates.
+        if value is None:
+            return ""
+        text = value if isinstance(value, str) else str(value)
+        remaining = self.max_chars - self.chars
+        if len(text) > remaining:
+            self.truncated = True
+        result = text[:remaining]
+        self.chars += len(result)
+        return result
 
     def record_block(self, block_type: str) -> None:
         self.block_count += 1
@@ -74,29 +87,35 @@ def _sequence(value: Any) -> Sequence[Any] | None:
 def _inline(value: Any, state: _RenderState, depth: int) -> str:
     if value is None:
         return ""
-    if isinstance(value, str):
-        return value
     if not state.enter(depth):
         return ""
+    if isinstance(value, str):
+        return state.text(value)
 
     items = _sequence(value)
     if items is not None:
-        return "".join(_inline(item, state, depth + 1) for item in items)
+        parts = []
+        for item in items:
+            if state.nodes >= state.max_nodes or state.chars >= state.max_chars:
+                state.truncated = True
+                break
+            parts.append(_inline(item, state, depth + 1))
+        return "".join(parts)
 
     node = _mapping(value)
     if node is None:
         return ""
 
-    node_type = str(node.get("type") or "").lower()
+    node_type = str(node.get("type") or "")[:64].lower()
     rendered = _inline(node.get("text"), state, depth + 1)
     if not rendered:
         rendered = _inline(node.get("children"), state, depth + 1)
 
     if node_type == "url":
-        url = str(node.get("url") or "").strip()
+        url = state.text(node.get("url")).strip()
         return f"[{rendered}]({url})" if rendered and url else (url or rendered)
     if node_type == "email_address":
-        address = str(node.get("email_address") or "").strip()
+        address = state.text(node.get("email_address")).strip()
         return (
             f"[{rendered}](mailto:{address})"
             if rendered and address
@@ -104,19 +123,19 @@ def _inline(value: Any, state: _RenderState, depth: int) -> str:
         )
     if node_type == "text_mention":
         user = _mapping(node.get("user"))
-        user_id = user.get("id") if user else None
+        user_id = state.text(user.get("id")) if user and user.get("id") is not None else None
         return (
             f"[{rendered}](tg://user?id={user_id})"
             if rendered and user_id is not None
             else rendered
         )
     if node_type == "mention":
-        username = str(node.get("username") or rendered or "").strip()
+        username = (state.text(node.get("username")) or rendered).strip()
         return f"@{username.lstrip('@')}" if username else ""
     if node_type == "bot_command":
-        return rendered or str(node.get("bot_command") or "")
+        return rendered or state.text(node.get("bot_command"))
     if node_type == "mathematical_expression":
-        expression = str(node.get("expression") or rendered or "")
+        expression = (state.text(node.get("expression")) or rendered)
         return f"${expression}$" if expression else ""
 
     wrappers = {
@@ -169,8 +188,8 @@ def _render_list(
         if not content:
             continue
 
-        label = str(item.get("label") or "").strip()
-        value = item.get("value")
+        label = state.text(item.get("label")).strip()
+        value = state.text(item.get("value")) if item.get("value") is not None else None
         prefix = f"{value}." if value is not None else (label or "-")
         if item.get("has_checkbox"):
             prefix = f"{prefix} [{'x' if item.get('is_checked') else ' '}]"
@@ -188,6 +207,8 @@ def _render_table(
     max_columns = 0
 
     for row_value in rows:
+        if not state.enter(depth + 1):
+            break
         row = _sequence(row_value)
         if row is None:
             continue
@@ -224,18 +245,24 @@ def _render_table(
     lines = [caption] if caption else []
     lines.append("| " + " | ".join(header) + " |")
     lines.append("| " + " | ".join(["---"] * max_columns) + " |")
+    output_chars = sum(map(len, lines))
     for index, row in enumerate(rendered_rows):
+        if output_chars >= state.max_chars:
+            state.truncated = True
+            break
         if index == header_index:
             continue
         padded = row + [""] * (max_columns - len(row))
-        lines.append("| " + " | ".join(padded) + " |")
+        line = "| " + " | ".join(padded) + " |"
+        lines.append(line[:max(0, state.max_chars - output_chars)])
+        output_chars += len(line)
     return lines
 
 
 def _render_block(
     block: Mapping[str, Any], state: _RenderState, depth: int
 ) -> list[str]:
-    block_type = str(block.get("type") or "unknown").lower()
+    block_type = str(block.get("type") or "unknown")[:64].lower()
     state.record_block(block_type)
 
     if block_type == "divider":
@@ -258,7 +285,7 @@ def _render_block(
 
     if block_type == "preformatted":
         text = _inline(block.get("text"), state, depth + 1)
-        language = str(block.get("language") or "").strip()
+        language = state.text(block.get("language")).strip()
         return [f"```{language}\n{text}\n```"] if text else []
 
     if block_type == "footer":
@@ -266,7 +293,7 @@ def _render_block(
         return [f"*{text}*"] if text else []
 
     if block_type == "mathematical_expression":
-        expression = str(block.get("expression") or "").strip()
+        expression = state.text(block.get("expression")).strip()
         return [f"$${expression}$$"] if expression else []
 
     if block_type == "paragraph":
@@ -306,8 +333,8 @@ def _render_block(
         location = _mapping(block.get("location"))
         marker = "[Map]"
         if location is not None:
-            latitude = location.get("latitude")
-            longitude = location.get("longitude")
+            latitude = state.text(location.get("latitude")) if location.get("latitude") is not None else None
+            longitude = state.text(location.get("longitude")) if location.get("longitude") is not None else None
             if latitude is not None and longitude is not None:
                 marker = f"[Map: {latitude},{longitude}]"
         caption = _caption(block.get("caption"), state, depth + 1).strip()
@@ -317,12 +344,16 @@ def _render_block(
         buttons = _sequence(block.get("buttons")) or ()
         rendered: list[str] = []
         for row in buttons:
+            if not state.enter(depth + 1):
+                break
             for button_value in _sequence(row) or ():
+                if not state.enter(depth + 2):
+                    break
                 button = _mapping(button_value)
                 if button is None:
                     continue
                 text = _inline(button.get("text"), state, depth + 1).strip()
-                url = str(button.get("url") or "").strip()
+                url = state.text(button.get("url")).strip()
                 if text and url:
                     rendered.append(f"[{text}]({url})")
                 elif text or url:
@@ -348,7 +379,7 @@ def _render_block(
     )
     summary = _inline(block.get("summary"), state, depth + 1).strip()
     caption = _caption(block.get("caption"), state, depth + 1).strip()
-    expression = str(block.get("expression") or "").strip()
+    expression = state.text(block.get("expression")).strip()
     return (
         ([text] if text else [])
         + ([summary] if summary else [])

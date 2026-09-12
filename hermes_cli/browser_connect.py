@@ -633,7 +633,7 @@ def _real_profile_refresh_mode() -> tuple[str | None, str | None]:
         )
     except Exception as e:
         logger.debug("could not read real_profile_refresh: %s", e)
-        return "launch", None
+        return None, "Could not read browser.real_profile_refresh; refusing authentication refresh"
     mode = raw.strip().lower() if isinstance(raw, str) else ""
     if mode not in _REAL_PROFILE_REFRESH_MODES:
         allowed = ", ".join(sorted(_REAL_PROFILE_REFRESH_MODES))

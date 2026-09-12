@@ -615,7 +615,7 @@ def test_untracked_capture_rejects_aggregate_over_evidence_bound(candidate_repo,
     base = _git(candidate_repo, "rev-parse", "HEAD")
     (candidate_repo / "a.txt").write_bytes(b"a" * 60)
     (candidate_repo / "b.txt").write_bytes(b"b" * 60)
-    with pytest.raises(ValueError, match="b.txt exceeds the 40-byte review evidence bound"):
+    with pytest.raises(ValueError, match="exceeds the .*review evidence bound"):
         capture_review_candidate(candidate_repo, base, ["a.txt", "b.txt"])
 
 
@@ -634,68 +634,42 @@ def test_tracked_patch_counts_against_aggregate_evidence_bound(candidate_repo, m
         capture_review_candidate(candidate_repo, base, ["tracked.py", "new.txt"])
 
 
-def test_tracked_patch_bound_stops_and_reaps_streaming_producer(candidate_repo, monkeypatch, tmp_path):
+def test_tracked_patch_bound_stops_and_reaps_streaming_producer(candidate_repo, monkeypatch):
     from agent import review_candidate as capture
 
-    stopped = tmp_path / "producer-stopped"
-    producer = (
-        "import os, signal, sys\n"
-        f"stopped = {str(stopped)!r}\n"
-        "def stop(*_):\n"
-        "    open(stopped, 'w').write(str(os.getpid()))\n"
-        "    raise SystemExit\n"
-        "signal.signal(signal.SIGTERM, stop)\n"
-        "while True:\n"
-        "    os.write(sys.stdout.fileno(), b'x' * 1024)\n"
-    )
     real_popen = subprocess.Popen
+    children = []
 
     def streaming_producer(_args, **kwargs):
-        return real_popen([sys.executable, "-c", producer], **kwargs)
+        process = real_popen([sys.executable, "-c",
+            "import os, sys\nwhile True: os.write(sys.stdout.fileno(), b'x' * 1024)"], **kwargs)
+        children.append(process)
+        return process
 
     monkeypatch.setattr(capture.subprocess, "Popen", streaming_producer)
-    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 4096)
     with pytest.raises(ValueError, match="Tracked review evidence .* exceeds the 4096-byte aggregate"):
-        capture._git(candidate_repo, "diff", max_stdout_bytes=capture.MAX_EVIDENCE_BYTES)
-    pid = int(stopped.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+        capture._git(candidate_repo, "diff", max_stdout_bytes=4096)
+    assert children[0].returncode is not None
+    assert children[0].wait(timeout=2) == children[0].returncode
 
 
-def test_git_timeout_stops_and_reaps_producer(candidate_repo, monkeypatch, tmp_path):
+def test_git_timeout_stops_and_reaps_producer(candidate_repo, monkeypatch):
     from agent import review_candidate as capture
 
-    stopped = tmp_path / "producer-stopped"
-    ready = tmp_path / "producer-ready"
-    producer = (
-        "import os, signal, time\n"
-        f"stopped = {str(stopped)!r}\n"
-        f"ready = {str(ready)!r}\n"
-        "def stop(*_):\n"
-        "    open(stopped, 'w').write(str(os.getpid()))\n"
-        "    raise SystemExit\n"
-        "signal.signal(signal.SIGTERM, stop)\n"
-        "open(ready, 'w').close()\n"
-        "time.sleep(60)\n"
-    )
     real_popen = subprocess.Popen
+    children = []
 
     def sleeping_producer(_args, **kwargs):
-        process = real_popen([sys.executable, "-c", producer], **kwargs)
-        deadline = time.monotonic() + 2
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert ready.exists()
+        process = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        children.append(process)
         return process
 
     monkeypatch.setattr(capture.subprocess, "Popen", sleeping_producer)
     monkeypatch.setattr(capture, "_GIT_TIMEOUT_SECONDS", 0.01)
     with pytest.raises(ValueError, match="timed out"):
         capture._git(candidate_repo, "diff", max_stdout_bytes=64)
-    pid = int(stopped.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
-
+    assert children[0].returncode is not None
+    assert children[0].wait(timeout=2) == children[0].returncode
 
 @requires_descriptor_capture
 def test_untracked_capture_rejects_growth_after_size_check_without_reading_to_eof(
@@ -735,7 +709,7 @@ def test_untracked_capture_rejects_growth_after_size_check_without_reading_to_eo
 def test_untracked_capture_keeps_files_at_or_under_bound(candidate_repo, monkeypatch):
     from agent import review_candidate as capture
     monkeypatch.setattr(capture, "MAX_UNTRACKED_FILE_BYTES", 16)
-    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 32)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 2048)
     base = _git(candidate_repo, "rev-parse", "HEAD")
     (candidate_repo / "exact.txt").write_bytes(b"e" * 16)
     (candidate_repo / "rest.txt").write_bytes(b"r" * 16)
@@ -743,3 +717,41 @@ def test_untracked_capture_keeps_files_at_or_under_bound(candidate_repo, monkeyp
     assert [entry.path for entry in candidate.untracked_files] == ["exact.txt", "rest.txt"]
     assert base64.b64decode(candidate.untracked_files[0].content_base64) == b"e" * 16
     assert base64.b64decode(candidate.untracked_files[1].content_base64) == b"r" * 16
+
+
+@pytest.mark.parametrize("driver", ["clean", "process"])
+def test_capture_never_executes_conversion_filter(candidate_repo, driver):
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    (candidate_repo / ".gitattributes").write_text("tracked.py filter=probe\n")
+    # Marker-only commands: no credential or external access even on the bad path.
+    marker = candidate_repo / "filter-ran"
+    import shlex
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote("open('filter-ran', 'w').write('ran')")
+    _git(candidate_repo, "config", f"filter.probe.{driver}", command)
+    (candidate_repo / "tracked.py").write_text("value = 222\n")
+    try:
+        with pytest.raises(ValueError, match="filter"):
+            capture_review_candidate(candidate_repo, base, ["tracked.py"])
+    finally:
+        assert not marker.exists()
+    # Unrelated scope still works despite an installed filter driver.
+    (candidate_repo / "other.py").write_text("other = 2\n")
+    assert "other = 2" in capture_review_candidate(candidate_repo, base, ["other.py"]).tracked_patch
+
+
+@requires_descriptor_capture
+def test_empty_file_metadata_and_enumeration_are_bounded(candidate_repo, monkeypatch):
+    from agent import review_candidate as capture
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    for index in range(20):
+        (candidate_repo / f"empty-{index}").touch()
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_ENTRIES", 10, raising=False)
+    with pytest.raises(ValueError, match="entry bound"):
+        capture_review_candidate(candidate_repo, base, ["empty-0", *[f"empty-{i}" for i in range(1, 20)]])
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_ENTRIES", 100)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 1024)
+    with pytest.raises(ValueError, match="evidence bound"):
+        capture_review_candidate(candidate_repo, base, [f"empty-{i}" for i in range(20)])
+    monkeypatch.setattr(capture, "MAX_ENUMERATION_BYTES", 16)
+    with pytest.raises(ValueError, match="aggregate review evidence bound"):
+        capture._git(candidate_repo, "ls-files", "--others", "-z")
