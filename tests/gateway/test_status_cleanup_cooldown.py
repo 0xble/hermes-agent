@@ -16,10 +16,11 @@ from gateway.session import SessionSource
 @pytest.mark.parametrize('persistent_flood', [False, True])
 async def test_cooldown_defers_delegation_cleanup_without_consuming_attempts(persistent_flood, tmp_path):
     deadline = [0.0]
+    initial_cooldown = [False]
     adapter = SimpleNamespace(send=AsyncMock(return_value=SendResult(success=True,message_id='one')),
         send_delegation_card=AsyncMock(return_value=SendResult(success=True,message_id='one')),
         edit_message=AsyncMock(return_value=SendResult(success=True)), delete_message=AsyncMock(return_value=True),
-        deletion_retry_after=lambda _:max(0,deadline[0]-time.monotonic()))
+        deletion_retry_after=lambda _:0.01 if initial_cooldown[0] else max(0,deadline[0]-time.monotonic()))
     async def delete(*args):
         if persistent_flood:
             deadline[0] = time.monotonic()+0.01
@@ -43,10 +44,13 @@ async def test_cooldown_defers_delegation_cleanup_without_consuming_attempts(per
     receipt = manager.receipt(event,'r',2)
     item = manager.cards['a'*32]
     pending = manager.pending
-    deadline[0] = time.monotonic()+0.05
+    # Hold the cooldown until the deferred state is observed; durable receipt
+    # writes may legitimately take longer than a short wall-clock window.
+    initial_cooldown[0] = True
     await manager.delivered(receipt)
     assert item['retired'] and item.get('delete_attempts',0) == 0
     adapter.delete_message.assert_not_awaited()
+    initial_cooldown[0] = False
     while pending:
         await asyncio.gather(*list(pending.values()))
     if persistent_flood:
