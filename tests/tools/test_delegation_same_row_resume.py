@@ -53,7 +53,8 @@ def test_resume_authority_resolution_errors_do_not_expose_values(monkeypatch):
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
-def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt):
+@pytest.mark.parametrize("stopped", [False, True])
+def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped):
     from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, _, _ = _resume_fixture(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -73,9 +74,12 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     entry = {"status": "interrupted"}
     checkpoint_child_resume(interrupted, {"messages": db.get_messages_as_conversation("child")}, entry)
     assert entry["resume_available"]
+    if stopped:
+        db.patch_session_model_config("child", {"_delegation_completed": False, "_delegation_user_stopped": True})
     db.close()
     db = SessionDB(db_path=tmp_path / "state.db")
-    parent = SimpleNamespace(session_id="root", _session_db=db, _delegate_depth=0)
+    parent = SimpleNamespace(session_id="root", _session_db=db, _delegate_depth=0,
+        _delegation_visible_window=[{"role": "user", "content": "NEW_PARENT_CONTEXT_NOT_FOR_RESUME"}])
     cfg = {"subagents": {"advisor": {"description": "Advise", "instructions": "Analyze", "provider": "fixture", "model": "m", "reasoning_effort": "high"}}}
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
     monkeypatch.setattr(delegate_tool, "last_delegation_config_error", lambda: None)
@@ -97,11 +101,17 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
 
     monkeypatch.setattr(delegate_tool, "_build_children", build)
     monkeypatch.setattr(delegate_tool, "_run_batch", lambda batch, background: json.dumps(batch.delegation_metadata))
-    payload = json.loads(delegate_tool.delegate_task(tasks=[{"goal": "Continue safely", "task_label": "Recover renamed", "resume_session_id": "child"}], parent_agent=parent, background=False))
+    task = {"goal": "Continue safely", "task_label": "Recover renamed", "resume_session_id": "child"}
+    if stopped:
+        task["resume_authorization"] = {"authorization": "User asked to resume.", "reconciliation": "Verified effects and processes."}
+    payload = json.loads(delegate_tool.delegate_task(tasks=[task], parent_agent=parent, background=False))
     if corrupt:
         assert "Legacy/uncheckpointed identity" in payload["error"]
         assert not built
-        assert db.claim_delegated_resumes(["child"], claim_id="restored-after-refusal")
+        if stopped:
+            assert json.loads(db.get_session("child")["model_config"])["_delegation_user_stopped"]
+        else:
+            assert db.claim_delegated_resumes(["child"], claim_id="restored-after-refusal")
         db.close()
         return
     assert "error" not in payload, payload
@@ -110,6 +120,9 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     assert payload["task_labels"] == ["Refine layering skill"]
     assert payload["attempts"] == {"A": 1}
     assert built[0]._progress_identity_ref["session_id"] == "child"
+    assert built[0]._delegation_context_mode == "resume"
+    assert not hasattr(built[0], "_delegation_fork_history")
+    assert payload["threads"][0]["context_mode"] == "resume"
     assert db.get_messages_as_conversation("child")[0]["content"] == "Original authorized context"
     assert not db.claim_delegated_resumes(["child"], claim_id="duplicate")
     following = reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=["New work"])

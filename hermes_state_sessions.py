@@ -698,6 +698,7 @@ class SessionSessionsMixin:
 
     def claim_delegated_resumes(
         self, session_ids: List[str], *, claim_id: Optional[str] = None,
+        reconciliations: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Atomically consume a batch of safe delegated-child resume grants.
 
@@ -776,7 +777,21 @@ class SessionSessionsMixin:
                 if row is None:
                     return False
                 config = _parse_model_config(row[0])
-                if config.get("_delegation_completed") is not True:
+                recovery = (reconciliations or {}).get(session_id)
+                if recovery is not None:
+                    from tools.delegate_tool_checkpoint import resume_message_fingerprint
+                    launch = config.get("_delegation_launch") or {}
+                    rows = conn.execute("SELECT id, role, content, tool_calls, tool_call_id FROM messages "
+                                        "WHERE session_id = ? AND active = 1 ORDER BY id", (session_id,)).fetchall()
+                    if (not isinstance(recovery, dict) or recovery.get("expected_config") != config
+                            or not recovery.get("parent_session_root")
+                            or recovery["parent_session_root"] != launch.get("parent_session_root")
+                            or not rows or resume_message_fingerprint(rows) != recovery.get("messages_fingerprint")
+                            or config.get("_delegation_resume_claimed_at") is not None
+                            or any(not isinstance(recovery.get(k), str) or not recovery[k].strip()
+                                   for k in ("authorization", "reconciliation"))):
+                        return False
+                elif config.get("_delegation_completed") is not True or config.get("_delegation_user_stopped"):
                     return False
                 if _has_active_turn_lease(conn, session_id, now):
                     return False
@@ -784,6 +799,19 @@ class SessionSessionsMixin:
                     return False
                 configs.append((session_id, config))
             for session_id, config in configs:
+                recovery = (reconciliations or {}).get(session_id)
+                if recovery is not None:
+                    config["_delegation_resume_recovery_previous"] = {
+                        key: config.get(key) for key in ("_delegation_completed", "_delegation_user_stopped",
+                                                        "_delegation_resume_blocked_reason")}
+                    config.setdefault("_delegation_resume_authorizations", []).append({
+                        "claim_id": claimed_at, "at": now, "parent_session_root": recovery["parent_session_root"],
+                        "authorization": recovery["authorization"], "reconciliation": recovery["reconciliation"],
+                        "messages_fingerprint": recovery["messages_fingerprint"],
+                        "was_user_stopped": bool(config.get("_delegation_user_stopped")),
+                    })
+                    config["_delegation_user_stopped"] = False
+                    config.pop("_delegation_resume_blocked_reason", None)
                 config["_delegation_completed"] = False
                 config["_delegation_resume_claimed_at"] = claimed_at
                 conn.execute(
@@ -835,7 +863,11 @@ class SessionSessionsMixin:
                     return False
                 configs.append((session_id, config))
             for session_id, config in configs:
-                config["_delegation_completed"] = True
+                previous = config.pop("_delegation_resume_recovery_previous", None)
+                if previous is not None:
+                    config.update(previous)
+                else:
+                    config["_delegation_completed"] = True
                 config.pop("_delegation_resume_claimed_at", None)
                 conn.execute(
                     "UPDATE sessions SET model_config = ? WHERE id = ?",

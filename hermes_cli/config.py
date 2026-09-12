@@ -3277,7 +3277,7 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
 # closed runtime field set.
 _SUBAGENT_FIELDS = frozenset({
     "description", "instructions", "provider", "model", "reasoning_effort",
-    "inherit_parent", "moa_presets", "fallbacks", "model_preset",
+    "inherit_parent", "moa_presets", "fallbacks", "model_preset", "context_mode",
 })
 _SUBAGENT_FALLBACK_FIELDS = frozenset({"provider", "model", "reasoning_effort"})
 _SUBAGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*\Z")

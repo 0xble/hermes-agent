@@ -347,7 +347,8 @@ def test_native_result_rejects_wrong_candidate_identity(candidate_repo):
         )
 
 
-def test_start_review_binds_candidate_schema_and_policy(candidate_repo, monkeypatch):
+@pytest.mark.parametrize("history", [[], [{"role": "assistant", "content": "IMPLEMENTER_CONFIRMATION_BIAS"}]])
+def test_start_review_binds_candidate_schema_and_policy(candidate_repo, monkeypatch, history):
     base = _git(candidate_repo, "rev-parse", "HEAD")
     candidate = _capture_changed_candidate(candidate_repo, base)
     captured = {}
@@ -367,7 +368,7 @@ def test_start_review_binds_candidate_schema_and_policy(candidate_repo, monkeypa
 
     result = start_review(
         SimpleNamespace(ephemeral_system_prompt=""),
-        [{"role": "user", "content": "Review the candidate."}],
+        history,
         candidate=candidate,
     )
 
@@ -375,6 +376,7 @@ def test_start_review_binds_candidate_schema_and_policy(candidate_repo, monkeypa
     assert captured["child_tool_policy"] == "inspection_only"
     assert captured["output_schema"]["properties"]["candidate_id"]["const"] == candidate.candidate_id
     assert candidate.candidate_id in captured["context"]
+    assert "IMPLEMENTER_CONFIRMATION_BIAS" not in captured["context"]
     assert "Do not run repository tests" in captured["goal"]
 
 

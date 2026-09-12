@@ -6,6 +6,53 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def resume_message_fingerprint(messages):
+    """Bind reconciliation to the exact active durable window, not a moving session id."""
+    import hashlib
+    rows = []
+    for message in messages:
+        row = dict(message)
+        calls = row.get("tool_calls")
+        if isinstance(calls, str):
+            calls = json.loads(calls)
+        rows.append([row.get("id"), row.get("role"), row.get("content"), calls, row.get("tool_call_id")])
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def prepare_resume_recovery(task, db, session_id, config, parent_root):
+    """Parent attestation is separate from mechanical safety; neither overrides the other."""
+    from tools.delegate_tool import _resume_history_is_safe
+    authorization = task.get("resume_authorization")
+    blocked = config.get("_delegation_user_stopped") or not config.get("_delegation_completed")
+    if authorization is None:
+        if blocked:
+            raise ValueError(
+                "Child continuation requires resume_authorization with authorization and reconciliation: "
+                "cite renewed user/parent authority and verify prior tool effects/processes. "
+                "An applicable user request to resume is sufficient; do not ask again."
+            )
+        return None
+    if (not isinstance(authorization, dict) or set(authorization) != {"authorization", "reconciliation"}
+            or any(not isinstance(v, str) or not v.strip() for v in authorization.values())):
+        raise ValueError("resume_authorization requires nonempty authorization and reconciliation strings")
+    if config.get("_delegation_resume_claimed_at") is not None:
+        raise ValueError("Child continuation is already claimed; reconcile the existing attempt first")
+    messages = db.get_messages(session_id)
+    if not messages or not _resume_history_is_safe(messages):
+        raise ValueError("Unresolved tool effects still block resume: verify each missing/cancelled tool outcome; "
+                         "resume_authorization cannot manufacture a successful tool receipt")
+    if config.get("_delegation_resume_blocked_reason") in {
+        "unreconciled_background_processes", "background_process_registry_unavailable"
+    }:
+        raise ValueError("Reconcile background process receipts through process tools before continuation")
+    if not config.get("_delegation_completed") and config.get("_delegation_outcome") not in {
+        "interrupted", "error", "timeout", "budget_exhausted", "completed"
+    }:
+        raise ValueError("Child has no settled outcome; reconcile the live/unknown launch before continuation")
+    return {**authorization, "parent_session_root": parent_root, "expected_config": deepcopy(config),
+            "messages_fingerprint": resume_message_fingerprint(messages)}
+
+
 def unresolved_tool_result(content):
     """Recognize real cancellation and orphan receipts, not successful tool prose."""
     from agent.replay_cleanup import is_interrupted_tool_result
@@ -30,7 +77,7 @@ def _signature(messages):
 
 def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
     from tools.delegate_tool import _resume_history_is_safe, _refresh_resumable_launch_metadata
-    if entry.get("status") in {"completed", "budget_exhausted", "interrupted"}:
+    if entry.get("status") in {"completed", "budget_exhausted", "interrupted", "error", "timeout"}:
         db = getattr(child, "_session_db", None)
         named_child = getattr(child, "_delegation_named_type", None) is not None
         if named_child:
@@ -52,7 +99,7 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
             entry["resume_blocked_reason"] = "unreconciled_background_processes"
         if getattr(child, "_delegation_user_stopped", False) is True:
             safe_history = False
-            entry["resume_blocked_reason"] = "user_stopped_requires_explicit_authorization"
+            entry.setdefault("resume_blocked_reason", "user_stopped_requires_explicit_authorization")
         if db is not None and callable(getattr(type(db), "get_messages_as_conversation", None)):
             # Actual durable transcript, not merely the in-memory successful result.
             durable = db.get_messages_as_conversation(child.session_id, repair_alternation=False)
@@ -65,6 +112,10 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
                     db.patch_session_model_config(child.session_id, {
                         "_delegation_completed": False, "_delegation_outcome": entry["status"],
                         "_delegation_user_stopped": getattr(child, "_delegation_user_stopped", False) is True,
+                        "_delegation_interrupt_reason": getattr(child, "_delegation_interrupt_reason", None),
+                        "_delegation_stop_token": getattr(child, "_delegation_stop_token", None),
+                        "_delegation_resume_claimed_at": None,
+                        "_delegation_resume_recovery_previous": None,
                         "_delegation_resume_blocked_reason": entry["resume_blocked_reason"],
                     })
                 except Exception:
@@ -81,6 +132,9 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
                     "_delegation_resume_blocked_reason": None,
                     "_delegation_outcome": entry["status"],
                     "_delegation_resume_claimed_at": None,
+                    "_delegation_resume_recovery_previous": None,
+                    "_delegation_interrupt_reason": getattr(child, "_delegation_interrupt_reason", None),
+                    "_delegation_stop_token": getattr(child, "_delegation_stop_token", None),
                     "_delegation_active_route": {
                         "provider": getattr(child, "provider", None),
                         "model": getattr(child, "model", None),

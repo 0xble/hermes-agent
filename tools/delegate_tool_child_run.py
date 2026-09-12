@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import contextvars
+from copy import deepcopy
 import json
 import threading
 import time
@@ -73,10 +74,10 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
     except (ValueError, UnboundLocalError) as e:
         logger.debug("Could not remove child from active_children: %s", e)
 
-def _signal_child_stop(child: Any, *reason: str) -> None:
+def _signal_child_stop(child: Any, *reason: str, tool_reason: str = "delegation cancelled") -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly."""
     with _quiet(None):
-        if child is not None and not request_hard_interrupt(child, *reason) and hasattr(child, "_interrupt_requested"):
+        if child is not None and not request_hard_interrupt(child, *reason, tool_reason=tool_reason) and hasattr(child, "_interrupt_requested"):
             child._interrupt_requested = True
 
 # ── 0-API-call timeout diagnostic ────────────────────────────────────────────
@@ -675,8 +676,15 @@ class _ChildRun:
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                goal = self.goal
+                fork_history = deepcopy(vars(child).get("_delegation_fork_history"))
+                if fork_history is not None:
+                    # A fork is new child input, not already-persisted resume history.
+                    # Store its quoted reference alongside the assignment so same-child
+                    # resume retains it through the ordinary turn persistence path.
+                    goal = "\n\n".join(row["content"] for row in fork_history) + "\n\n" + goal
                 return child.run_conversation(
-                    user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    user_message=goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
@@ -689,8 +697,8 @@ class _ChildRun:
             executor.shutdown(wait=False)
 
         _late_pending_steer = self.close_steering()
-        _signal_child_stop(child)
         is_timeout = isinstance(exc, (FuturesTimeoutError, TimeoutError))
+        _signal_child_stop(child, tool_reason="delegation timeout" if is_timeout else "delegation error")
         duration = self.elapsed()
         logger.warning("Subagent %d %s after %.1fs", task_index, "timed out" if is_timeout else f"raised {type(exc).__name__}", duration)
         child_api_calls = 0
