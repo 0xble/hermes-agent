@@ -173,15 +173,15 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
 def _load_review_tool_policy() -> str:
     """Resolve the review capability policy; reject malformed explicit values."""
     from agent.review_policy import LEGACY_UNRESTRICTED, VALID_REVIEW_TOOL_POLICIES
-    try:
-        from hermes_cli.config import load_config_readonly
-        review = (load_config_readonly().get("auxiliary") or {}).get("review") or {}
-    except Exception:
-        review = {}
+    from hermes_cli.config import load_config_readonly_strict
+    auxiliary = load_config_readonly_strict().get("auxiliary", {})
+    if not isinstance(auxiliary, dict):
+        raise ValueError("auxiliary must be an object")
+    review = auxiliary.get("review", {})
     if not isinstance(review, dict):
         raise ValueError("auxiliary.review must be an object")
     policy = review.get("tool_policy", LEGACY_UNRESTRICTED)
-    if policy not in VALID_REVIEW_TOOL_POLICIES:
+    if not isinstance(policy, str) or policy not in VALID_REVIEW_TOOL_POLICIES:
         allowed = ", ".join(sorted(VALID_REVIEW_TOOL_POLICIES))
         raise ValueError(f"auxiliary.review.tool_policy must be one of: {allowed}")
     return policy

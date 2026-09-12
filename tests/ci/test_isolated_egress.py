@@ -7,6 +7,8 @@ import socket
 import ssl
 import threading
 import unittest
+
+import pytest
 from unittest import mock
 
 from scripts.ci import isolated_egress as proxy
@@ -175,3 +177,71 @@ def test_doh_decodes_chunked_response_on_pinned_transport():
     with mock.patch.object(proxy.socket, 'create_connection', return_value=FakeRaw()), \
          mock.patch.object(proxy.ssl, 'create_default_context', return_value=FakeContext(tls)):
         assert proxy.resolve_public_a('github.com') == ('8.8.8.8',)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_relay_keeps_reverse_direction_after_half_close(reverse):
+    import time
+    client, left = socket.socketpair()
+    right, server = socket.socketpair()
+    worker = threading.Thread(target=proxy.relay, args=(left, right))
+    if reverse:
+        client, server = server, client
+    payload = b"response" * 32768
+    received = bytearray()
+    try:
+        client.settimeout(3)
+        server.settimeout(3)
+        worker.start()
+        client.sendall(b"request")
+        client.shutdown(socket.SHUT_WR)
+        assert server.recv(100) == b"request"
+        assert server.recv(1) == b""
+        # Response starts only after the request EOF has been processed.
+        def reply():
+            for offset in range(0, len(payload), 4096):
+                server.sendall(payload[offset:offset + 4096])
+                time.sleep(0.001)
+            server.shutdown(socket.SHUT_WR)
+        sender = threading.Thread(target=reply)
+        sender.start()
+        while len(received) < len(payload):
+            block = client.recv(65536)
+            if not block:
+                break
+            received.extend(block)
+        assert bytes(received) == payload
+        assert client.recv(1) == b""
+        sender.join(3)
+        worker.join(3)
+        assert not worker.is_alive()
+        assert not sender.is_alive()
+    finally:
+        for sock in (client, left, right, server):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        worker.join(3)
+        if "sender" in locals():
+            sender.join(3)
+
+
+def test_relay_idle_timeout_joins_both_directions(monkeypatch):
+    monkeypatch.setattr(proxy, "CLIENT_TIMEOUT", 0.1)
+    client, left = socket.socketpair()
+    right, server = socket.socketpair()
+    worker = threading.Thread(target=proxy.relay, args=(left, right))
+    try:
+        worker.start()
+        worker.join(2)
+        assert not worker.is_alive()
+        client.settimeout(1)
+        server.settimeout(1)
+        assert client.recv(1) == b""
+        assert server.recv(1) == b""
+    finally:
+        for sock in (client, left, right, server):
+            sock.close()
+        worker.join(2)

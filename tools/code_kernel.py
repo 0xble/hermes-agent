@@ -777,6 +777,23 @@ def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, chi
                 _spawn(kernel, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                        sandbox_tools=sandbox_tools, max_tool_calls=max_tool_calls)
             assert kernel.proc is not None and kernel.proc.stdin is not None
+            from tools.knowledge_boundary import execution_denial_reason
+
+            def current_cwd():
+                import psutil
+                # Parent-side OS observation does not trust persistent Python
+                # globals, and includes strict staging and prior os.chdir().
+                if kernel.proc.poll() is not None:
+                    raise RuntimeError("kernel exited before cwd inspection")
+                cwd = psutil.Process(kernel.proc.pid).cwd()
+                if kernel.proc.poll() is not None:
+                    raise RuntimeError("kernel exited during cwd inspection")
+                return cwd
+
+            denial = execution_denial_reason(code, current_cwd=current_cwd)
+            if denial:
+                from tools.code_execution_tool import _error_result
+                return _error_result(denial)
             # Per-cell tool budget: the RPC loop enforces counter < max; reset without restarting.
             kernel.tool_call_counter[0] = 0
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell

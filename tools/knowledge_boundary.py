@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 # Roots whose *contents* are parent-owned shared knowledge.  Resolved live
 # (never cached across HERMES_HOME changes) because profile switches and the
@@ -237,6 +237,24 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
     )
 
 
+def execution_denial_reason(command: str, *, current_cwd: Callable[[], str]) -> str | None:
+    """Check a local process's actual cwd only under the delegated boundary.
+
+    Called under the kernel cell lock immediately before dispatch. This is a
+    per-cell snapshot, not an OS fence against background threads changing cwd.
+    Remote process paths require their own namespace mapping, not host cwd.
+    """
+    if not _read_only_context():
+        return None
+    try:
+        cwd = current_cwd()
+        if not cwd or not os.path.isabs(cwd):
+            return _UNEVALUATED
+        return command_denial_reason(command, tool="execute_code", cwd=cwd)
+    except Exception:
+        return _UNEVALUATED
+
+
 def boundary_report() -> dict:
     """Nonsecret description of the boundary actually in force.
 
@@ -255,5 +273,7 @@ def boundary_report() -> dict:
         "not_enforced": [
             "runtime-computed paths inside a subprocess (no OS sandbox)",
             "writes made outside Hermes's tool surface",
+            "background-thread cwd changes racing a local kernel cell's cwd snapshot",
+            "remote filesystem aliases without an authoritative host-root mapping",
         ],
     }

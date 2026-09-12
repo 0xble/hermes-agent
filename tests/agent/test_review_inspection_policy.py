@@ -22,14 +22,14 @@ def test_review_inspection_toolset_is_static_read_and_search_only():
 
 
 def test_review_policy_omitted_is_deliberately_legacy(monkeypatch):
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"auxiliary": {"review": {}}})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly_strict", lambda: {"auxiliary": {"review": {}}})
     assert review_engine._load_review_tool_policy() == "legacy_unrestricted"
 
 
 def test_review_policy_accepts_explicit_modes(monkeypatch):
     for value in ("legacy_unrestricted", "inspection_only"):
         monkeypatch.setattr(
-            "hermes_cli.config.load_config_readonly",
+            "hermes_cli.config.load_config_readonly_strict",
             lambda value=value: {"auxiliary": {"review": {"tool_policy": value}}},
         )
         assert review_engine._load_review_tool_policy() == value
@@ -37,7 +37,7 @@ def test_review_policy_accepts_explicit_modes(monkeypatch):
 
 def test_review_policy_invalid_explicit_config_fails_closed(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config_readonly",
+        "hermes_cli.config.load_config_readonly_strict",
         lambda: {"auxiliary": {"review": {"tool_policy": "read-mostly"}}},
     )
     with pytest.raises(ValueError, match="tool_policy"):

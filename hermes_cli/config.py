@@ -1947,39 +1947,56 @@ _FIX_PERMS = "Fix the file permissions or move it aside first."
 _FIX_YAML = "Fix the file or restore a copy from backups/config/ first."
 
 
-def require_readable_config_before_write(config_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Refuse to replace an existing config.yaml that cannot be read or parsed; return the mapping.
-    Guards two collapse-to-empty failure modes that would let a read-then-write caller silently
-    wipe user overrides: an unreadable file (permissions / broken mount) and an unparseable or
-    non-mapping root — bare-``except`` loaders treat both as ``{}``, so a subsequent write would
-    replace the recoverable file with only the caller's partial dict. Fails closed."""
-    if config_path is None:
-        config_path = get_config_path()
+class ConfigReadError(RuntimeError):
+    """An existing configuration layer could not be read as a YAML mapping."""
+
+    def __init__(self, path: Path, reason: str, cause: Exception, fix: str, *, parse_failure=False):
+        super().__init__(f"Cannot load {path}: {reason} ({cause}). {fix}")
+        self.reason, self.cause, self.fix = reason, cause, fix
+        self.parse_failure = parse_failure
+
+
+def read_config_mapping_strict(config_path: Path) -> Dict[str, Any]:
+    """Read a layer for validation/merging, distinguishing absence from damage."""
     try:
         config_path.stat()
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        # A dangling configured symlink is damaged, not intentional omission.
+        if config_path.is_symlink():
+            raise ConfigReadError(config_path, "cannot be read", exc, _FIX_PERMS) from exc
         return {}
     except OSError as exc:
-        raise _refuse_overwrite(config_path, "cannot be accessed", exc, _FIX_PERMS) from exc
-
+        raise ConfigReadError(config_path, "cannot be accessed", exc, _FIX_PERMS) from exc
     try:
         with open(config_path, encoding="utf-8") as f:
             loaded = fast_safe_load(f)
     except OSError as exc:
-        raise _refuse_overwrite(config_path, "cannot be read", exc, _FIX_PERMS) from exc
+        raise ConfigReadError(config_path, "cannot be read", exc, _FIX_PERMS) from exc
     except Exception as exc:
-        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
-        raise _refuse_overwrite(config_path, "is not valid YAML", exc, _FIX_YAML) from exc
+        raise ConfigReadError(config_path, "is not valid YAML", exc, _FIX_YAML, parse_failure=True) from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
         exc = TypeError(f"top-level YAML must be a mapping, got {type(loaded).__name__}")
-        _warn_config_parse_failure(config_path, exc, fallback="refuse-write")
-        raise RuntimeError(
-            f"Refusing to overwrite {config_path}: top-level YAML must be a mapping, got "
-            f"{type(loaded).__name__}. Fix the file or restore a copy from backups/config/ first."
-        ) from exc
+        raise ConfigReadError(config_path, str(exc), exc, _FIX_YAML, parse_failure=True) from exc
     return loaded
+
+
+def require_readable_config_before_write(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Fail closed before overwriting a layer, preserving overwrite diagnostics."""
+    if config_path is None:
+        config_path = get_config_path()
+    try:
+        return read_config_mapping_strict(config_path)
+    except ConfigReadError as exc:
+        if exc.parse_failure:
+            _warn_config_parse_failure(config_path, exc.cause, fallback="refuse-write")
+        if exc.reason.startswith("top-level YAML must be a mapping"):
+            raise RuntimeError(
+                f"Refusing to overwrite {config_path}: {exc.reason}. "
+                "Fix the file or restore a copy from backups/config/ first."
+            ) from exc.cause
+        raise _refuse_overwrite(config_path, exc.reason, exc.cause, exc.fix) from exc.cause
 
 
 def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
@@ -2000,6 +2017,22 @@ def load_config_readonly() -> Dict[str, Any]:
     **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
     every subsequent caller** — only for code paths that never write to the result."""
     return _load_config_impl(want_deepcopy=False)
+
+
+def load_config_readonly_strict() -> Dict[str, Any]:
+    """Merged policy read without stale-cache/default recovery on damaged layers.
+
+    Ordinary configuration reads retain their existing recovery behavior.
+    """
+    return _load_config_impl(want_deepcopy=False, strict=True)
+
+
+def _strict_layer_signature(path: Path):
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
 def _ensure_dict(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -2157,13 +2190,17 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
-def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) -> Tuple[Dict[str, Any], Any]:
     """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
     (docs/design/managed-scope.md §4.1)."""
-    managed_config = managed_scope.load_managed_config()
+    if strict:
+        managed_dir = managed_scope.get_managed_dir()
+        managed_config = read_config_mapping_strict(managed_dir / "config.yaml") if managed_dir else {}
+    else:
+        managed_config = managed_scope.load_managed_config()
     if not managed_config:
         return expanded, managed_config
     # Same canonicalization as the user config BEFORE merging (parity with
@@ -2175,16 +2212,22 @@ def _merge_managed_overlay(expanded: Dict[str, Any]) -> Tuple[Dict[str, Any], An
     return _merge_config_layer(expanded, _expand_env_vars(managed_normalized)), managed_config
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
+        if strict:
+            managed_dir = managed_scope.get_managed_dir()
+            strict_paths = [config_path]
+            if managed_dir is not None:
+                strict_paths.append(managed_dir / "config.yaml")
+            signatures = [_strict_layer_signature(path) for path in strict_paths]
         user_sig, cache_sig = _load_config_cache_sig(config_path)
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if not strict and cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # Signatures match, but the cached expansion is only valid if every ${VAR} it was
             # expanded against still has the same value — otherwise a load before
             # load_hermes_dotenv() pins unexpanded literals for the process lifetime.
@@ -2196,10 +2239,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
-        if user_sig is not None:
+        if strict or user_sig is not None:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                if strict:
+                    user_config = read_config_mapping_strict(config_path)
+                else:
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = fast_safe_load(f) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -2215,13 +2261,19 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 config = _merge_config_layer(config, user_config)
             except Exception as e:
                 from hermes_cli.model_presets import ModelPresetError
-                if isinstance(e, ModelPresetError):
+                if strict or isinstance(e, ModelPresetError):
                     raise
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _canonicalize_config(config)
+        if strict:
+            expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized), strict=True)
+            if (get_config_path() != config_path or managed_scope.get_managed_dir() != managed_dir
+                    or signatures != [_strict_layer_signature(path) for path in strict_paths]):
+                raise RuntimeError("Configuration layers changed during strict policy loading; retry")
+            return expanded
         expanded, managed_config = _merge_managed_overlay(_expand_env_vars(normalized))
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:

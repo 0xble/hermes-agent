@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -54,7 +56,7 @@ def _git(root: Path, *args: str) -> str:
         encoding="utf-8",
         errors="surrogateescape",
     )
-    return completed.stdout.strip()
+    return completed.stdout.rstrip("\n")
 
 
 def changed_files(root: Path, base: str | None, head: str) -> list[str]:
@@ -67,7 +69,7 @@ def changed_files(root: Path, base: str | None, head: str) -> list[str]:
             "-z",
             "--find-renames",
             "--find-copies",
-            "--diff-filter=ACMRD",
+            "--diff-filter=ACMRDT",
             f"{base}...{head}",
         )
         if not output:
@@ -80,7 +82,7 @@ def changed_files(root: Path, base: str | None, head: str) -> list[str]:
         while index < len(fields):
             status = fields[index]
             count = 2 if status.startswith(("R", "C")) else 1
-            if (not status or status[0] not in "ACMRD" or index + count >= len(fields)
+            if (not status or status[0] not in "ACMRDT" or index + count >= len(fields)
                     or any(not path for path in fields[index + 1:index + count + 1])):
                 raise ValueError("Malformed Git name-status record")
             paths.extend(fields[index + 1:index + count + 1])
@@ -112,6 +114,85 @@ def project_python(root: Path) -> str:
         if candidate.is_file():
             return str(candidate)
     return sys.executable
+
+
+def _windows_bash() -> str:
+    """Locate Git Bash/MSYS bash, never the legacy Windows WSL launcher."""
+    candidates = []
+    git = shutil.which("git")
+    if git:
+        git_root = Path(git).parent.parent
+        candidates.extend((git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"))
+    for name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        location = os.environ.get(name)
+        if location:
+            candidates.append(Path(location) / ("Programs/Git" if name == "LOCALAPPDATA" else "Git") / "bin/bash.exe")
+    bash = shutil.which("bash")
+    if bash:
+        candidates.append(Path(bash))
+    for candidate in candidates:
+        # Git and MSYS distributions carry sh alongside bash. System32's
+        # bash.exe is a WSL launcher and cannot run this native venv contract.
+        if candidate.is_file() and candidate.with_name("sh.exe").is_file():
+            return str(candidate)
+    raise ValueError("Python tests on Windows require Git Bash or MSYS bash (with sh.exe)")
+
+
+def _python_test_command(targets: Sequence[str] = ()) -> tuple[str, ...]:
+    prefix = (_windows_bash(),) if sys.platform == "win32" else ()
+    return (*prefix, "scripts/run_tests.sh", *targets)
+
+
+def worktree_fingerprint(root: Path) -> str:
+    """Bind index entries and tracked/nonignored worktree bytes, not stat cache.
+
+    Ignored outputs are excluded. Submodules bind their gitlink and immediate
+    status, not recursively ignored state. Before/after detection cannot prove
+    that a mutation was not restored between snapshots.
+    """
+    digest = hashlib.sha256()
+
+    def add(value: bytes):
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    staged = _git(root, "ls-files", "--stage", "-z")
+    add(staged.encode("utf-8", "surrogateescape"))
+    add(_git(root, "ls-files", "-v", "-z").encode("utf-8", "surrogateescape"))
+    tracked = set()
+    gitlinks = set()
+    for record in staged.split("\0"):
+        if not record:
+            continue
+        metadata, path = record.split("\t", 1)
+        tracked.add(path)
+        if metadata.startswith("160000 "):
+            gitlinks.add(path)
+    others = _git(root, "ls-files", "--others", "--exclude-standard", "-z")
+    paths = tracked | {path for path in others.split("\0") if path}
+    for relative in sorted(paths):
+        add(relative.encode("utf-8", "surrogateescape"))
+        path = root / relative
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            add(b"missing")
+            continue
+        add(str(stat.S_IFMT(info.st_mode)).encode())
+        add(str(stat.S_IMODE(info.st_mode)).encode())
+        if stat.S_ISLNK(info.st_mode):
+            add(os.fsencode(os.readlink(path)))
+        elif stat.S_ISREG(info.st_mode):
+            content = hashlib.sha256()
+            with path.open("rb") as source:
+                while block := source.read(1024 * 1024):
+                    content.update(block)
+            add(content.digest())
+        elif relative in gitlinks and stat.S_ISDIR(info.st_mode):
+            add(_git(root, "submodule", "status", "--", relative).encode("utf-8", "surrogateescape"))
+        else:
+            raise ValueError(f"Cannot fingerprint worktree entry: {relative}")
+    return digest.hexdigest()
 
 
 def build_checks(
@@ -151,7 +232,7 @@ def build_checks(
     if profile == "affected":
         if lanes["python"]:
             targets = tuple(python_tests) if python_tests else ()
-            checks.append(Check("Python tests", ("scripts/run_tests.sh", *targets)))
+            checks.append(Check("Python tests", _python_test_command(targets)))
         if lanes["frontend"]:
             checks.append(
                 Check(
@@ -223,7 +304,7 @@ def build_checks(
 
     checks.extend(
         [
-            Check("Python tests", ("scripts/run_tests.sh",)),
+            Check("Python tests", _python_test_command()),
             Check(
                 "JS and TS workspace checks",
                 (
@@ -366,16 +447,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         status_before = _git(root, "status", "--porcelain", "--untracked-files=all")
         dirty = bool(status_before)
         validate_worktree(args.profile, dirty, args.allow_dirty)
+        fingerprint_before = worktree_fingerprint(root)
         checks = build_checks(root, args.profile, paths, args.python_test)
         results = run_checks(root, checks, args.dry_run)
         if _git(root, "rev-parse", "HEAD") != head_sha:
             raise ValueError("checkout HEAD changed during local checks")
         status_after = _git(root, "status", "--porcelain", "--untracked-files=all")
-        if status_after != status_before:
+        if status_after != status_before or worktree_fingerprint(root) != fingerprint_before:
             results.append(
                 Result(
                     "Worktree mutation guard",
-                    ["git", "status", "--porcelain", "--untracked-files=all"],
+                    ["worktree-content-and-index-fingerprint"],
                     "failed",
                     1,
                     0.0,

@@ -795,7 +795,6 @@ class RuntimePin:
         if client is None:
             client = getattr(child, "client", None)
         if client is not None:
-            from hermes_cli.route_identity import normalize_route_base_url
             if active_provider == "openai-codex":
                 active_pin = self if fallback is None else replace(
                     self, provider=fallback.provider, base_url=fallback.base_url,
@@ -805,9 +804,11 @@ class RuntimePin:
             else:
                 if fallback is None:
                     self._validate_client_route(client)
-                elif (normalize_route_base_url(str(getattr(client, "base_url", "") or ""))
-                      != normalize_route_base_url(fallback.base_url)):
-                    raise ValueError("named subagent fallback client route changed after launch")
+                else:
+                    if getattr(client, "base_url", None) is None:
+                        raise ValueError("named subagent fallback client route is unavailable")
+                    replace(self, provider=fallback.provider, base_url=fallback.base_url,
+                            api_mode=fallback.api_mode)._validate_client_route(client)
                 auth_kwargs = kwargs if final_request else json.loads(expected_overrides)
                 _validate_physical_auth(
                     client, auth_kwargs, digest=expected_digest,

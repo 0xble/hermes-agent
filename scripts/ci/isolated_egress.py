@@ -214,6 +214,14 @@ def relay(left, right):
     right.settimeout(CLIENT_TIMEOUT)
     done = threading.Event()
 
+    def abort():
+        done.set()
+        for peer in (left, right):
+            try:
+                peer.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def copy(source, destination):
         try:
             while not done.is_set():
@@ -226,15 +234,19 @@ def relay(left, right):
                     return
                 destination.sendall(block)
         except (OSError, socket.timeout):
-            pass
-        finally:
-            done.set()
+            abort()
 
     first = threading.Thread(target=copy, args=(left, right), daemon=True)
     first.start()
-    copy(right, left)
-    done.set()
-    first.join(timeout=1)
+    try:
+        copy(right, left)
+        # Ordinary EOF preserves the opposite direction until its own EOF or
+        # idle timeout. Fatal I/O aborts both sockets and wakes a blocked recv.
+        first.join()
+    finally:
+        if first.is_alive():
+            abort()
+            first.join()
 
 
 class ConnectHandler(socketserver.BaseRequestHandler):
