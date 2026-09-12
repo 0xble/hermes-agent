@@ -52,6 +52,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     get_subagent_attribution, interrupt_subagent, is_spawn_paused, list_active_subagents, set_spawn_paused,
     steer_subagent,
 )
+from agent.delegation_disposition import DEFER_REASON_GUIDANCE
 from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
@@ -1704,7 +1705,7 @@ DELEGATE_TASK_SCHEMA = {
             ),
             "handled_refs": {"type": "array", "items": {"type": "string"}, "description": "For action=handle: exact terminal thread_refs under parent_task_id, after incorporating their results or preparing their blocker report. Arrival alone is not handling; never infer task success."},
             "handling": _p("string", "For action=handle: incorporated, blocker_report, or deferred (requires defer_reason and stays visible). Persist before the associated response; retirement requires verified delivery. Revision is recorded only by successful linked continuation, never by handle.", enum=["incorporated", "blocker_report", "deferred"]),
-            "defer_reason": _p("string", "Required for handling=deferred: short actionable reason, at most 160 characters. Keeps the result visible."),
+            "defer_reason": _p("string", f"Required for handling=deferred. {DEFER_REASON_GUIDANCE} Keeps the result visible."),
             "delegation_id": _p("string", "For action=result: exact durable delegation_id returned by dispatch/completion. Retrieves only this conversation owner’s recorded results, without acknowledging them."),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent.delegation_disposition import begin_result_turn, finish_result_turn, observe_tool_results
+from agent.delegation_disposition import DEFER_REASON_GUIDANCE, begin_result_turn, finish_result_turn, observe_tool_results
 from gateway.delegation_cards import DelegationCards, render_card
 from tests.gateway.test_delegation_handling import setup, drain
 
@@ -41,20 +41,64 @@ async def test_omitted_partial_batch_and_unrelated_turn(tmp_path, monkeypatch):
 async def test_deferred_reason_visible_persisted_not_delivery_receipt(tmp_path, monkeypatch):
     cards, source, _, data, _ = await setup(tmp_path, monkeypatch)
     await terminal(cards, source, data, state="interrupted")
-    for reason in (None, "", " ", "x" * 161):
-        with pytest.raises(ValueError, match="short nonempty"):
+    before = cards.path.read_bytes()
+    for reason in ("Await explicit authorization", None, "", " ", 42, "x" * 161,
+                   "Await\nCI approval", "Await\u00a0CI\u00a0approval", "***", "<>"):
+        with pytest.raises(ValueError, match="1-2 words"):
             await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=data["parent_task_id"],
                                  refs=["A"], reason="deferred", detail=reason)
+        assert cards.path.read_bytes() == before
+        assert not cards.cards[data["parent_task_id"]].get("handling")
     await cards.result_turn(actor_session_id="s", turn_id="t", results=[{"parent_task_id": data["parent_task_id"], "thread_refs": ["A"]}])
-    await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=data["parent_task_id"],
-                         refs=["A"], reason="deferred", detail="Await explicit authorization", turn_id="t")
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _build_dynamic_schema_overrides, delegate_task
+    for schema in (DELEGATE_TASK_SCHEMA, _build_dynamic_schema_overrides()):
+        assert DEFER_REASON_GUIDANCE in schema["parameters"]["properties"]["defer_reason"]["description"]
+    assert isinstance(data["parent_task_id"], str)
+    loop = asyncio.get_running_loop()
+    def callback(event, **kwargs):
+        assert event == "subagent.handling"
+        return asyncio.run_coroutine_threadsafe(
+            cards.handling(source, "r", "s", 2, **kwargs), loop).result(timeout=5)
+    agent = SimpleNamespace(session_id="s", _delegation_result_turn="t", tool_progress_callback=callback)
+    for label in ("Wait", "Under review", "Review failed", " Awaiting\t\nCI ", "Awaiting\u00a0CI"):
+        result = json.loads(await asyncio.to_thread(delegate_task, action="handle", parent_agent=agent,
+            parent_task_id=data["parent_task_id"], handled_refs=["A"], handling="deferred", defer_reason=label))
+        assert result["recorded"] and not result["awaiting_delivery"]
+        assert cards.cards[data["parent_task_id"]]["rows"]["A"]["disposition"]["detail"] == " ".join(label.split())
+    before = cards.path.read_bytes()
+    rejected = json.loads(await asyncio.to_thread(delegate_task, action="handle", parent_agent=agent,
+        parent_task_id=data["parent_task_id"], handled_refs=["A"], handling="deferred",
+        defer_reason="Await explicit authorization"))
+    assert "1-2 words" in rejected["error"]
+    assert cards.path.read_bytes() == before
     await drain(cards)
     assert await cards.result_turn(actor_session_id="s", turn_id="t") == {"missing": []}
     assert cards.receipt(None, "r", 2) == {}
     restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
     text = render_card(restored.cards[data["parent_task_id"]])
-    assert "Ⅱ" in text and "Deferred · Await explicit authorization" in text
+    assert "Ⅱ" in text and "Deferred · Awaiting CI" in text
     assert data["parent_task_id"] not in text and not restored.cards[data["parent_task_id"]].get("handled")
+
+
+@pytest.mark.asyncio
+async def test_legacy_deferred_explanation_survives_reload_and_unrelated_save(tmp_path, monkeypatch):
+    cards, source, _, data, _ = await setup(tmp_path, monkeypatch)
+    await terminal(cards, source, data)
+    # Persist a pre-limit record, not a new runtime deferral.
+    explanation = "Await explicit authorization before publishing the reviewed change"
+    intent = {"reason": "deferred", "detail": explanation}
+    card = cards.cards[data["parent_task_id"]]
+    card["handling"] = {"A": dict(intent)}
+    card["rows"]["A"]["disposition"] = dict(intent)
+    cards._save()
+    restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
+    await terminal(restored, source, data, ref="B")
+    reloaded = DelegationCards(cards.runner, home=tmp_path, interval=0)
+    card = reloaded.cards[data["parent_task_id"]]
+    assert card["handling"]["A"] == intent
+    assert card["rows"]["A"]["disposition"] == intent
+    assert "Deferred · " + explanation in render_card(card)
+    assert not card.get("handled")
 
 
 @pytest.mark.asyncio
@@ -132,6 +176,7 @@ async def test_bounded_boundary_correction_preserves_original_answer(tmp_path, m
     calls = []
     def run_turn(a, prompt, system, history, task, **kw):
         calls.append(prompt)
+        assert DEFER_REASON_GUIDANCE in prompt
         assert history is original_messages and a.max_iterations == 2
         assert history[-1]["role"] == "assistant" and kw["persist_user_display_kind"] == "hidden"
         assert a._delegation_disposition_correction == {data["parent_task_id"]: ["A"]}
