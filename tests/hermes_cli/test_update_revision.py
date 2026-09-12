@@ -129,7 +129,7 @@ def test_unexpected_head_is_refused_and_same_target_skips_apply(monkeypatch, tmp
     monkeypatch.setattr(update_cmd, "_finish_already_up_to_date", finish)
     monkeypatch.setattr(update_revision, "verify_revision_head", lambda *args: calls.append("verify"))
     monkeypatch.setattr(update_cmd, "_apply_pulled_update", lambda *args, **kwargs: calls.append("apply"))
-    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda sha: calls.append("runtime"))
+    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda sha, plan=None: calls.append("runtime"))
     opts = SimpleNamespace(assume_yes=True, gw_input_fn=None, active_lazy_features=None, active_tool_dependencies=None)
     update_cmd._run_pinned_revision_update(
         ["git"], update_revision.RevisionTarget(first, "tree"), opts, None,
@@ -152,7 +152,7 @@ def test_already_pinned_update_rejects_checkout_movement_during_catchup(monkeypa
         _resume_windows_gateways_after_update=lambda *_args: None,
     ))
     monkeypatch.setattr(update_cmd, "_finalize_receipt", lambda status, *_args: outcomes.append(status))
-    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda _sha: None)
+    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda _sha, _plan=None: None)
     def catchup(*args, **kwargs):
         _git(["checkout", "--detach", later], checkout)
         kwargs["final_head_guard"]()
@@ -262,7 +262,7 @@ def test_failed_runtime_readback_still_runs_catch_up(monkeypatch, tmp_path):
         kwargs["final_head_guard"]()
     monkeypatch.setattr(update_cmd, "_finish_already_up_to_date", finish)
     monkeypatch.setattr(update_revision, "verify_revision_head", lambda *args: "a" * 40)
-    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda sha: (_ for _ in ()).throw(RuntimeError("identity is unknown")))
+    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda sha, plan=None: (_ for _ in ()).throw(RuntimeError("identity is unknown")))
     monkeypatch.setattr(update_cmd, "_finalize_receipt", lambda *args, **kwargs: calls.append("failed"))
     monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(
         PROJECT_ROOT=tmp_path,
@@ -409,3 +409,65 @@ def test_pinned_checkout_failure_finalizes_failed_receipt(monkeypatch, tmp_path)
     assert error.value.code == 1
     assert calls == [("exit", False), "resume", "failed"]
     assert "apply" not in calls
+
+
+def _gateway_plan(*records):
+    from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
+    return UpdatePlan(runtimes=[RuntimeRecord(kind=k, profile=p, pid=pid, supervisor="systemd") for k, p, pid in records])
+
+
+def test_pinned_readback_rejects_expected_gateway_with_no_live_evidence(monkeypatch):
+    """A pre-update gateway that vanished yields NO collector row (the collector only reports
+    ``down`` for pids it was told about); an empty fleet must not pass as verified."""
+    from hermes_cli import update_receipt, update_cmd
+    seen = {}
+
+    def collector(**kw):
+        seen.update(kw)
+        return []
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", collector)
+    plan = _gateway_plan(("gateway", "default", 4242), ("serve", "default", 5151))
+    with pytest.raises(RuntimeError, match="default"):
+        update_cmd._verify_pinned_runtime_readback("a" * 40, plan)
+    assert seen["strict"] is True
+    assert sorted(seen["pre_restart_pids"]) == [4242]
+
+
+def test_pinned_readback_requires_every_expected_gateway_profile(monkeypatch):
+    from hermes_cli import update_receipt, update_cmd
+    sha = "a" * 40
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions",
+                        lambda **_kw: [{"profile": "default", "pid": 9001, "state": "current", "code_sha": sha}])
+    plan = _gateway_plan(("gateway", "default", 4242), ("gateway", "work", 4343))
+    with pytest.raises(RuntimeError, match="work"):
+        update_cmd._verify_pinned_runtime_readback(sha, plan)
+
+
+def test_pinned_readback_accepts_replacement_gateways_and_genuinely_empty_fleet(monkeypatch):
+    from hermes_cli import update_receipt, update_cmd
+    sha = "a" * 40
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions",
+                        lambda **_kw: [{"profile": "default", "pid": 9001, "state": "current", "code_sha": sha}])
+    assert update_cmd._verify_pinned_runtime_readback(sha, _gateway_plan(("gateway", "default", 4242))) is None
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **_kw: [])
+    assert update_cmd._verify_pinned_runtime_readback(sha, _gateway_plan(("serve", "default", 5151))) is None
+    assert update_cmd._verify_pinned_runtime_readback(sha, _gateway_plan()) is None
+
+
+def test_pinned_readback_without_inventory_rejects_empty_fleet(monkeypatch):
+    """No pre-update plan means the expected fleet is unknown: an empty probe proves nothing."""
+    from hermes_cli import update_receipt, update_cmd
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **_kw: [])
+    with pytest.raises(RuntimeError, match="inventory"):
+        update_cmd._verify_pinned_runtime_readback("a" * 40)
+
+
+def test_pinned_completion_threads_inventory_into_readback(monkeypatch, tmp_path):
+    from hermes_cli import main, update_cmd
+    seed, checkout, first = _repo(tmp_path)
+    monkeypatch.setattr(main, "PROJECT_ROOT", checkout)
+    seen = []
+    monkeypatch.setattr(update_cmd, "_verify_pinned_runtime_readback", lambda sha, plan=None: seen.append((sha, plan)))
+    plan = _gateway_plan(("gateway", "default", 4242))
+    update_cmd._verify_pinned_completion(["git"], first, plan)
+    assert seen == [(first, plan)]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
 from types import SimpleNamespace
 
@@ -14,9 +15,18 @@ from agent.review_candidate import (
     ReviewCandidateStale,
     ReviewCandidateV1,
     capture_review_candidate,
+    descriptor_capture_supported,
     native_review_completion_contract,
     require_fresh_candidate,
 )
+
+# Successful untracked capture needs POSIX descriptor-relative operations that
+# Windows lacks. The unsupported-platform rejection test below stays unconditional.
+requires_descriptor_capture = pytest.mark.skipif(
+    not descriptor_capture_supported(),
+    reason="untracked capture requires descriptor-relative filesystem operations",
+)
+requires_mkfifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is unavailable")
 
 
 def _git(repo, *args, input_bytes=None):
@@ -31,13 +41,23 @@ def _capture_changed_candidate(repo, base):
     return capture_review_candidate(repo, base, ["tracked.py"])
 
 
+def _init_repo(path):
+    path.mkdir()
+    _git(path, "init", "-q")
+    _git(path, "config", "user.name", "Review Test")
+    _git(path, "config", "user.email", "review@example.invalid")
+    return path
+
+
+def _add_submodule(superproject, source, name):
+    _git(superproject, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), name)
+    _git(superproject / name, "config", "user.name", "Review Test")
+    _git(superproject / name, "config", "user.email", "review@example.invalid")
+
+
 @pytest.fixture
 def candidate_repo(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.name", "Review Test")
-    _git(repo, "config", "user.email", "review@example.invalid")
+    repo = _init_repo(tmp_path / "repo")
     (repo / "tracked.py").write_text("value = 1\n", encoding="utf-8")
     (repo / "other.py").write_text("other = 1\n", encoding="utf-8")
     _git(repo, "add", "tracked.py", "other.py")
@@ -45,6 +65,30 @@ def candidate_repo(tmp_path):
     return repo
 
 
+@pytest.fixture
+def submodule_repo(tmp_path):
+    """Superproject with a checked-out submodule ``sub`` that itself contains ``sub/leaf``."""
+    leaf = _init_repo(tmp_path / "leaf-src")
+    (leaf / "deep.py").write_text("deep = 1\n", encoding="utf-8")
+    _git(leaf, "add", "deep.py")
+    _git(leaf, "commit", "-qm", "leaf base")
+    middle = _init_repo(tmp_path / "middle-src")
+    (middle / "inner.py").write_text("inner = 1\n", encoding="utf-8")
+    _git(middle, "add", "inner.py")
+    _add_submodule(middle, leaf, "leaf")
+    _git(middle, "commit", "-qm", "middle base")
+    repo = _init_repo(tmp_path / "repo")
+    (repo / "tracked.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "tracked.py")
+    _add_submodule(repo, middle, "sub")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "-q")
+    _git(repo / "sub" / "leaf", "config", "user.name", "Review Test")
+    _git(repo / "sub" / "leaf", "config", "user.email", "review@example.invalid")
+    return repo
+
+
+@requires_descriptor_capture
 def test_capture_binds_explicit_base_scope_dirty_and_untracked_without_mutating_index(candidate_repo):
     base = _git(candidate_repo, "rev-parse", "HEAD")
     (candidate_repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
@@ -64,6 +108,7 @@ def test_capture_binds_explicit_base_scope_dirty_and_untracked_without_mutating_
     assert (candidate_repo / ".git" / "index").read_bytes() == index_before
 
 
+@requires_descriptor_capture
 def test_candidate_identity_changes_for_each_bound_input(candidate_repo):
     base = _git(candidate_repo, "rev-parse", "HEAD")
     (candidate_repo / "tracked.py").write_text("value = 2\n", encoding="utf-8")
@@ -89,6 +134,58 @@ def test_require_fresh_candidate_rejects_changes(candidate_repo):
     require_fresh_candidate(candidate)
     (candidate_repo / "tracked.py").write_text("changed\n", encoding="utf-8")
     with pytest.raises(ReviewCandidateStale, match="candidate changed"):
+        require_fresh_candidate(candidate)
+
+
+def test_capture_rejects_dirty_submodule_independently_of_ignore_settings(submodule_repo):
+    base = _git(submodule_repo, "rev-parse", "HEAD")
+    inner = submodule_repo / "sub" / "inner.py"
+    inner.write_text("inner = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Submodule sub has uncommitted changes"):
+        capture_review_candidate(submodule_repo, base, ["tracked.py", "sub"])
+    _git(submodule_repo, "config", "diff.ignoreSubmodules", "all")
+    _git(submodule_repo, "config", "submodule.sub.ignore", "all")
+    with pytest.raises(ValueError, match="Submodule sub has uncommitted changes"):
+        capture_review_candidate(submodule_repo, base, ["sub"])
+
+    inner.write_text("inner = 1\n", encoding="utf-8")
+    (submodule_repo / "sub" / "junk.txt").write_text("untracked inside submodule\n", encoding="utf-8")
+    _git(submodule_repo / "sub", "config", "status.showUntrackedFiles", "no")
+    with pytest.raises(ValueError, match="Submodule sub has uncommitted changes"):
+        capture_review_candidate(submodule_repo, base, ["sub"])
+
+    (submodule_repo / "sub" / "junk.txt").unlink()
+    (submodule_repo / "sub" / "leaf" / "deep.py").write_text("deep = 2\n", encoding="utf-8")
+    _git(submodule_repo / "sub", "config", "submodule.leaf.ignore", "all")
+    with pytest.raises(ValueError, match="Submodule (sub|leaf) has uncommitted changes"):
+        capture_review_candidate(submodule_repo, base, ["sub"])
+
+    # The middle submodule's own status cannot see an untracked file that the
+    # nested repository hides, so only recursive inspection can reject it.
+    (submodule_repo / "sub" / "leaf" / "deep.py").write_text("deep = 1\n", encoding="utf-8")
+    (submodule_repo / "sub" / "leaf" / "hidden.txt").write_text("nested untracked\n", encoding="utf-8")
+    _git(submodule_repo / "sub" / "leaf", "config", "status.showUntrackedFiles", "no")
+    assert not _git(submodule_repo / "sub", "status", "--porcelain=v2", "--ignore-submodules=none")
+    with pytest.raises(ValueError, match="Submodule leaf has uncommitted changes"):
+        capture_review_candidate(submodule_repo, base, ["sub"])
+
+
+def test_submodule_commit_change_is_bound_and_later_dirtiness_blocks_freshness(submodule_repo):
+    base = _git(submodule_repo, "rev-parse", "HEAD")
+    _git(submodule_repo, "config", "diff.ignoreSubmodules", "all")
+    inner = submodule_repo / "sub" / "inner.py"
+    inner.write_text("inner = 2\n", encoding="utf-8")
+    _git(submodule_repo / "sub", "commit", "-qam", "advance submodule")
+    advanced = _git(submodule_repo / "sub", "rev-parse", "HEAD")
+
+    candidate = capture_review_candidate(submodule_repo, base, ["sub"])
+    assert f"+Subproject commit {advanced}" in candidate.tracked_patch
+    assert "-dirty" not in candidate.tracked_patch
+    assert not candidate.untracked_files
+    require_fresh_candidate(candidate)
+
+    inner.write_text("inner = 3\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Submodule sub has uncommitted changes"):
         require_fresh_candidate(candidate)
 
 
@@ -412,10 +509,10 @@ def test_capture_and_freshness_never_execute_textconv(candidate_repo, tmp_path):
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("replacement", ["leaf", "parent", "fifo"])
+@requires_descriptor_capture
+@pytest.mark.parametrize("replacement", ["leaf", "parent", pytest.param("fifo", marks=requires_mkfifo)])
 def test_untracked_capture_refuses_replacement_without_reading_outside(candidate_repo, monkeypatch, replacement):
     from agent import review_candidate as capture
-    import os
     directory = candidate_repo / "untracked"
     directory.mkdir()
     leaf = directory / "new.txt"
@@ -454,6 +551,7 @@ def test_untracked_capture_refuses_replacement_without_reading_outside(candidate
     assert (outside / "new.txt").read_text() == "OUTSIDE SECRET SENTINEL"
 
 
+@requires_descriptor_capture
 def test_untracked_symlink_records_only_link_text(candidate_repo):
     from agent.review_candidate import _untracked_entry
     link = candidate_repo / "link"
@@ -464,15 +562,14 @@ def test_untracked_symlink_records_only_link_text(candidate_repo):
 
 
 def test_untracked_capture_refuses_unsupported_descriptor_platform(candidate_repo, monkeypatch):
-    import os
     from agent.review_candidate import _untracked_entry
     monkeypatch.setattr(os, "supports_dir_fd", set())
     with pytest.raises(ValueError, match="unsupported on this platform"):
         _untracked_entry(candidate_repo, "new.txt")
 
 
+@requires_descriptor_capture
 def test_untracked_parent_replacement_before_open_cannot_follow_outside(candidate_repo, monkeypatch):
-    import os
     from agent.review_candidate import _untracked_entry
     parent = candidate_repo / "race-parent"
     parent.mkdir()

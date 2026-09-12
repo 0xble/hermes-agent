@@ -17,7 +17,8 @@ Enforced (deterministic, tested):
   * ``write_file`` (all modes)
   * ``patch`` (replace + V4A Update/Add/Delete/Move, both endpoints)
   * ``terminal`` commands that reference or execute within a protected root
-  * ``execute_code`` source that references a protected root
+  * ``execute_code`` source that references a protected root, including
+    relatively after a literal ``os.chdir`` (the Python spelling of ``cd``)
 
 Not enforced (documented, not silently implied):
   * a subprocess that reconstructs a protected path at runtime from pieces
@@ -31,6 +32,7 @@ read-only child never needs shell access to these roots — it has
 """
 from __future__ import annotations
 
+import ast
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -198,6 +200,77 @@ def _relative_command_root(command: str, cwd: Path | str) -> str | None:
     return None
 
 
+def _python_chdir_targets(source: str) -> list[str]:
+    """Literal ``os.chdir`` operands in Python *source*.
+
+    A cell that changes directory and then names a protected file relatively
+    is the Python spelling of ``cd <root>; > MEMORY.md``, so it gets the same
+    literal-transition tracking. Aliases (``import os as o``, ``from os import
+    chdir``) and a literal ``Path(...)`` operand are followed; anything computed
+    stays under the documented not-enforced contract, exactly like ``cd "$X"``.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []  # invalid Python will not execute
+    nodes = list(ast.walk(tree))
+    if len(nodes) > 10000:
+        raise ValueError("literal source exceeds knowledge scan bound")
+    aliases: dict[str, str] = {}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+
+    def qualified(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return aliases.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            return f"{qualified(node.value)}.{node.attr}"
+        return ""
+
+    def literal(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Call) and qualified(node.func) in {"pathlib.Path", "Path"}:
+            if not node.args:
+                return "."
+            if len(node.args) == 1:
+                return literal(node.args[0])
+        return None
+
+    targets = []
+    for node in nodes:
+        if not isinstance(node, ast.Call) or qualified(node.func) != "os.chdir":
+            continue
+        operand = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "path"), None)
+        if operand is not None and (target := literal(operand)) is not None:
+            targets.append(target)
+    return targets
+
+
+def _cwd_transitions(command: str, *, tool: str) -> list[str]:
+    """Literal cwd transitions only (shell ``cd``, Python ``os.chdir``).
+
+    Runtime-computed targets remain outside this lexical boundary's documented
+    contract, so ``$``/backtick shell targets are skipped rather than denied.
+    """
+    if tool == "execute_code":
+        return _python_chdir_targets(command)
+    from tools.knowledge_command_paths import shell_tokens
+
+    tokens = shell_tokens(command)
+    return [
+        tokens[index + 1] for index, token in enumerate(tokens)
+        if token == "cd" and index + 1 < len(tokens)
+        and "$" not in tokens[index + 1] and "`" not in tokens[index + 1]
+    ]
+
+
 def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | None = None) -> str | None:
     """Deny a shell command / interpreter source that reaches shared knowledge.
 
@@ -208,23 +281,23 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
     if not _read_only_context() or not isinstance(command, str) or not command:
         return None
     try:
-        from tools.knowledge_command_paths import literal_paths, shell_tokens
+        from tools.knowledge_command_paths import literal_paths
 
         root = _command_roots(command)
         references, destructive = literal_paths(command, python_source=tool == "execute_code")
         bases = {Path(cwd)} if cwd is not None else set()
-        if root is None and cwd is not None:
-            # Literal cd transitions only. Runtime-computed paths remain
-            # outside this lexical boundary's documented contract.
-            tokens = shell_tokens(command) if tool != "execute_code" else []
-            root = _relative_command_root(command, cwd)
-            for index, token in enumerate(tokens):
-                if token == "cd" and index + 1 < len(tokens):
-                    target = tokens[index + 1]
-                    if "$" not in target and "`" not in target:
-                        bases.update((base / os.path.expanduser(target)).resolve() for base in tuple(bases))
-                        if len(bases) > 64:
-                            return _UNEVALUATED
+        if root is None:
+            # Every literal transition widens the set of directories a later
+            # relative operand may resolve against (order-insensitive union).
+            # An absolute target counts even without a known starting cwd.
+            for target in _cwd_transitions(command, tool=tool):
+                expanded = Path(os.path.expanduser(target))
+                if expanded.is_absolute():
+                    bases.add(expanded.resolve())
+                else:
+                    bases.update((base / expanded).resolve() for base in tuple(bases))
+                if len(bases) > 64:
+                    return _UNEVALUATED
             for base in bases:
                 root = root or _relative_command_root(command, base)
         for token in references:

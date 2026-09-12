@@ -131,7 +131,10 @@ def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
     deliberately no ``MemoryMax``: an updater syncing dependencies must not inherit a
     worker-sized memory cap). Unusable scope (no binary, no reachable user bus,
     probe failed) degrades to the plain spawn — today's behavior — instead of
-    blocking the update.
+    blocking the update. The unit name is unique per launch: two gateway profiles under
+    one OS user both pass their per-home admission checks, and a fixed name makes the second
+    ``systemd-run`` fail asynchronously (unit already exists), so its wrapper never records an
+    exit code and that profile is stuck behind its pending marker.
     """
     try:
         if sys.platform == "win32":
@@ -155,9 +158,10 @@ def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
         binary = shutil.which("systemd-run")
         if not binary:
             return argv, None
+        import uuid
         wrapped = [
             binary, "--user", "--scope", "--quiet", "--collect",
-            "--unit", "hermes-gateway-update.scope",
+            "--unit", f"hermes-gateway-update-{os.getpid()}-{uuid.uuid4().hex[:8]}.scope",
             "--", *argv,
         ]
         return wrapped, systemd_user_bus_env()

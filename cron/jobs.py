@@ -2095,9 +2095,12 @@ def update_job(
                 updated_schedule.get("display", updated.get("schedule_display")))
         if schedule_changed or timezone_changed:
             updated["next_run_at"] = _compute_next_run_for_job(updated)
-        if {"schedule", "next_run_at", "enabled", "state"}.intersection(updates):
+        if timezone_changed or {
+            "schedule", "next_run_at", "enabled", "state"
+        }.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
+            # An effective timezone move counts too: the slot was computed in the old zone.
             updated.pop("pending_slot", None)
         if inference_fields_changed:
             snapshots = _compute_provider_model_snapshots(

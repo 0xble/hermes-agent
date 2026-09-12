@@ -551,6 +551,7 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
     last_result = None
     text_message_id = None
     delivered = 0
+    media_message_ids = []
     if separate_text and separate_text.strip():
         last_result = await adapter.send(chat_id=chat_id, content=separate_text, metadata=metadata)
         if not last_result.success:
@@ -607,6 +608,7 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
                                                    if getattr(r, "message_id", None)]}
                 batched_indices = {index for index, _path in images}
                 delivered += len(images)
+                media_message_ids.extend(r.message_id for r in successful if getattr(r, "message_id", None))
                 last_result = receipts[-1]
                 caption = None
     for index, descriptor in enumerate(media_files):
@@ -637,10 +639,13 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
         else:
             if last_result.success:
                 delivered += 1
+                if getattr(last_result, "message_id", None):
+                    media_message_ids.append(last_result.message_id)
                 continue
             detail = _bounded_send_error(last_result.error or "media send failed")
         return {"error": f"Adapter media send failed after {index}/{total} files: {detail}",
-                "_text_message_id": text_message_id, "_media_delivered": delivered}
+                "_text_message_id": text_message_id, "_media_delivered": delivered,
+                "_media_message_ids": list(media_message_ids)}
     if last_result is None:
         return {"error": _NO_DELIVERABLE, "_text_message_id": text_message_id,
                 "_media_delivered": delivered}
@@ -878,6 +883,12 @@ async def _send_via_adapter(
                 # it ships under a name that cannot be mistaken for success.
                 if _n:
                     _partial["media_partial_count"] = _n
+                # Confirmed media receipts ride under a name that cannot be
+                # read as complete delivery, so the ledger can reconcile the
+                # attachments that did land instead of losing their IDs.
+                _media_ids = [str(_id) for _id in (result.get("_media_message_ids") or []) if _id]
+                if _media_ids:
+                    _partial["delivered_media_message_ids"] = _media_ids
                 return _partial
             payload = {"success": True, "message_id": result.get("message_id")}
             if media_files:
@@ -960,7 +971,10 @@ async def _send_chunks(chunks, send_one):
             if delivered:
                 result = dict(result)
                 result["delivery_stage"] = "partial_send"
-                result["message_id"] = last_message_id
+                # The failing chunk may itself have landed text before its media
+                # failed; that newer receipt outranks the previous chunk's ID.
+                if result.get("message_id") is None:
+                    result["message_id"] = last_message_id
                 result["chunk_partial_count"] = delivered
             break
         delivered += 1

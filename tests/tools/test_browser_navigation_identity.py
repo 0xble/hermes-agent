@@ -130,3 +130,48 @@ def test_force_local_session_ignores_identity_and_cdp_but_new_navigation_respect
     assert created == [('private::local', False, None)]
     assert bt._read_browser_identity_binding('private::local') is None
     assert bt._navigation_session_key('new-task', 'http://127.0.0.1:3000/') == 'new-task'
+
+
+@pytest.mark.parametrize('backend', ['cdp_override', 'cloud_provider'])
+def test_backend_rejection_before_attachment_leaves_no_durable_identity_claim(browser_boundary, monkeypatch, backend):
+    """A named identity refused by the backend configuration must not bind the task: once the
+    operator fixes the configuration, any valid alias (not just the refused one) must still work."""
+    config, created, _, _ = browser_boundary
+    if backend == 'cdp_override':
+        monkeypatch.setattr(bt, '_get_cdp_override_raw', lambda: 'ws://operator:9222')
+        monkeypatch.setattr(bt, '_get_cdp_override', Mock(side_effect=AssertionError('gate resolved the CDP URL')))
+        expected = 'incompatible'
+    else:
+        monkeypatch.setattr(bt, '_get_cloud_provider', lambda: Mock())
+        expected = 'cloud providers cannot use'
+    with pytest.raises(RuntimeError, match=expected):
+        sessions._get_session_info('rejected', identity='lpg')
+    assert created == []
+    assert bt._read_browser_identity_binding('rejected') is None
+    assert 'rejected' not in bt._active_sessions
+
+    # Operator removes the incompatible backend and picks a different valid alias.
+    monkeypatch.setattr(bt, '_get_cdp_override_raw', lambda: None)
+    monkeypatch.setattr(bt, '_get_cdp_override', lambda: None)
+    monkeypatch.setattr(bt, '_get_cloud_provider', lambda: None)
+    info = sessions._get_session_info('rejected', identity='personal')
+    assert info['browser_identity'] == 'personal'
+    assert bt._read_browser_identity_binding('rejected')[0] == 'personal'
+    assert created == [('rejected', True, 'personal')]
+
+
+def test_backend_rejection_never_unbinds_an_already_bound_task(browser_boundary, monkeypatch):
+    """The fix must only skip a NEW claim; a task that already owns its cookie jar keeps it."""
+    config, created, _, _ = browser_boundary
+    first = sessions._get_session_info('bound', identity='lpg')
+    assert first['browser_identity'] == 'lpg'
+    claim = bt._read_browser_identity_binding('bound')
+    bt._active_sessions.clear()
+    monkeypatch.setattr(bt, '_get_cdp_override_raw', lambda: 'ws://operator:9222')
+    with pytest.raises(RuntimeError, match='incompatible'):
+        sessions._get_session_info('bound')
+    assert bt._read_browser_identity_binding('bound') == claim
+    monkeypatch.setattr(bt, '_get_cdp_override_raw', lambda: None)
+    with pytest.raises(RuntimeError, match='already bound'):
+        sessions._get_session_info('bound', identity='personal')
+    assert bt._read_browser_identity_binding('bound') == claim

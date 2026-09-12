@@ -370,7 +370,12 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             restored = deepcopy(actual_site)
             for route_key in ("provider", "model", "reasoning_effort"):
                 restored.pop(route_key, None)
-            if fallback_key and isinstance(expected_site, dict) and fallback_key in expected_site:
+            # same_route treats an absent preset chain and an exposed empty default as equal,
+            # so an unauthored empty chain must go too or the reference fails on its next load.
+            if fallback_key and (
+                (isinstance(expected_site, dict) and fallback_key in expected_site)
+                or (fallback_key not in raw_site and restored.get(fallback_key) in (None, []))
+            ):
                 restored.pop(fallback_key, None)
             # strip_defaults=False exposes empty provider-owned defaults which would otherwise
             # become inline route fields and make a saved reference fail on its next load.

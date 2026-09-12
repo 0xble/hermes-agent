@@ -446,3 +446,18 @@ def test_fallback_preset_roundtrip_handles_injected_route_defaults(tmp_path, mon
     assert entry["model"] == (expected[0] if as_list else expected)["model"]
     if value == "meaningful":
         assert entry["api_key"] == value
+
+
+@pytest.mark.parametrize("site, fallback_key", [("delegation", "fallback_providers"), ("auxiliary", "fallback_chain")])
+def test_unauthored_empty_fallback_defaults_are_stripped_from_restored_references(site, fallback_key):
+    from hermes_cli.model_presets import preserve_model_preset_references
+    reference = {"model_preset": "fast", "timeout": 20}
+    authored = {**routes(), site: reference if site == "delegation" else {"vision": dict(reference)}}
+    actual = expand_model_presets(authored)
+    exposed = actual[site] if site == "delegation" else actual[site]["vision"]
+    assert fallback_key not in exposed
+    exposed[fallback_key] = []  # empty provider default exposed by a strip_defaults=False load
+    restored = preserve_model_preset_references(actual, authored)
+    restored_site = restored[site] if site == "delegation" else restored[site]["vision"]
+    assert restored_site == reference
+    assert expand_model_presets(restored) == expand_model_presets(authored)

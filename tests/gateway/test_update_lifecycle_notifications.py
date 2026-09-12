@@ -211,3 +211,28 @@ def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path,
         assert result[0] is False
     else:
         assert result[0] is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd scope wrapper is POSIX-only")
+def test_supervised_update_scope_unit_is_unique_per_launch(monkeypatch):
+    """Two gateway profiles under one OS user must not race for a single fixed scope unit:
+    the second ``systemd-run`` fails asynchronously, the wrapper never records an exit code,
+    and that profile is stuck behind a pending marker."""
+    from gateway import slash_commands
+    monkeypatch.setenv("INVOCATION_ID", "fixture-supervised")
+    monkeypatch.setattr("tools.process_registry._systemd_run_user_scope_available", lambda: True)
+    monkeypatch.setattr("tools.process_registry.systemd_user_bus_env",
+                        lambda base_env=None: {"XDG_RUNTIME_DIR": "/run/user/1000"})
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None)
+    argv = ["setsid", "bash", "-c", "true"]
+
+    def unit(wrapped):
+        return wrapped[wrapped.index("--unit") + 1]
+
+    first, env = slash_commands._systemd_scope_wrap_if_supervised(argv)
+    second, _ = slash_commands._systemd_scope_wrap_if_supervised(argv)
+    assert env == {"XDG_RUNTIME_DIR": "/run/user/1000"}
+    assert first[0] == "/usr/bin/systemd-run" and first[-len(argv):] == argv
+    assert unit(first) != unit(second)
+    for name in (unit(first), unit(second)):
+        assert name.startswith("hermes-gateway-update-") and name.endswith(".scope")

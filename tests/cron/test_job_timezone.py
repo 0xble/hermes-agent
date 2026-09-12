@@ -141,6 +141,38 @@ def test_update_and_clear_timezone_recalculate_without_resuming_paused_job(
     assert paused["state"] == "paused"
 
 
+def test_timezone_update_invalidates_unclaimed_pending_slot(cron_store, fixed_now):
+    """An occurrence the dispatcher left unclaimed belongs to the OLD zone's schedule. Moving
+    the job to another timezone recomputes ``next_run_at``; the stale slot must not survive to
+    fire under the new zone (same invariant as a schedule or lifecycle edit)."""
+    from cron.occurrences import pending_slot_stamp
+
+    job = create_job("test", "0 9 * * *", timezone="America/New_York")
+    stored = load_jobs()
+    rec = next(r for r in stored if r["id"] == job["id"])
+    rec["pending_slot"] = pending_slot_stamp(job["next_run_at"], fixed_now)
+    save_jobs(stored)
+    assert "pending_slot" in get_job(job["id"])
+
+    # Same zone: no effective change, so the pending occurrence is left alone.
+    same = update_job(job["id"], {"timezone": "America/New_York"})
+    assert "pending_slot" in same
+
+    moved = update_job(job["id"], {"timezone": "America/Los_Angeles"})
+    assert moved["next_run_at"] != job["next_run_at"]
+    assert "pending_slot" not in moved
+    assert "pending_slot" not in get_job(job["id"])
+
+    # Clearing the pin (profile timezone) is an effective change too.
+    stored = load_jobs()
+    next(r for r in stored if r["id"] == job["id"])["pending_slot"] = pending_slot_stamp(
+        moved["next_run_at"], fixed_now)
+    save_jobs(stored)
+    cleared = update_job(job["id"], {"timezone": ""})
+    assert cleared["timezone"] is None
+    assert "pending_slot" not in cleared
+
+
 def test_timezone_does_not_change_interval_or_absolute_oneshot_semantics(
     cron_store, fixed_now
 ):

@@ -18,8 +18,9 @@ def isolated(tmp_path, monkeypatch):
     delegation._completion_retry_homes.clear()
 
 
+@pytest.mark.parametrize("status", ["completed", "budget_exhausted", "interrupted", "stalled"])
 @pytest.mark.parametrize("failure", ["persist", "publish"])
-def test_same_owner_retry_and_single_delivery_claim(monkeypatch, failure):
+def test_same_owner_retry_and_single_delivery_claim(monkeypatch, failure, status):
     from tools.process_registry import process_registry
     target = queue.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", target)
@@ -30,13 +31,16 @@ def test_same_owner_retry_and_single_delivery_claim(monkeypatch, failure):
         monkeypatch.setattr(delegation, "_persist_completion", lambda *_: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
     else:
         monkeypatch.setattr(target, "put", lambda _: (_ for _ in ()).throw(RuntimeError("queue unavailable")))
-    delegation._push_completion_event(record, {"summary": "exact result"}, "completed")
+    delegation._push_completion_event(record, {"summary": "exact result"}, status)
     assert target.empty()
     monkeypatch.setattr(delegation, "_persist_completion", original)
     monkeypatch.setattr(target, "put", queue.Queue.put.__get__(target))
     assert delegation.retry_current_owner_terminal_checkpoints(target) == 1
     event = target.get_nowait()
     assert event["summary"] == "exact result"
+    assert event["status"] == status
+    with delegation._transaction() as conn:
+        assert conn.execute("SELECT state FROM async_delegations WHERE delegation_id='retry-test'").fetchone()[0] == status
     assert delegation.retry_current_owner_terminal_checkpoints(target) == 0
     assert target.empty()
     assert delegation.claim_event_delivery(event, "first")

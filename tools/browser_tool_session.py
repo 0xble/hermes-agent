@@ -272,6 +272,23 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
         return session_info
 
 
+def _reject_identity_incompatible_backend(identity: Optional[str]) -> None:
+    """Fail closed when a named identity is requested but the configured backend cannot honour it.
+
+    Pure configuration gate (no network I/O, nothing created): ``_get_session_info`` runs it BEFORE
+    committing the durable identity claim so a refused request never binds the task, and
+    ``_create_session_for_key`` runs it again so the routing contract holds for any caller.
+    """
+    if not identity:
+        return
+    if _bt._get_cdp_override_raw():
+        raise RuntimeError("named browser identities are incompatible with browser.cdp_url or "
+                           "BROWSER_CDP_URL; remove the override or omit identity")
+    if _bt._get_cloud_provider() is not None:
+        raise RuntimeError("named browser identities require the local real-profile backend; "
+                           "cloud providers cannot use local Chromium identities")
+
+
 def _create_session_for_key(task_id: str, force_local: bool,
                             identity: Optional[str] = None) -> Dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
@@ -282,16 +299,11 @@ def _create_session_for_key(task_id: str, force_local: bool,
     """
     if force_local:
         return _bt._create_local_session(task_id, allow_real_profile=False)
+    _reject_identity_incompatible_backend(identity)
     cdp_override = _bt._get_cdp_override()
-    if identity and cdp_override:
-        raise RuntimeError("named browser identities are incompatible with browser.cdp_url or "
-                           "BROWSER_CDP_URL; remove the override or omit identity")
     if cdp_override:
         return _create_cdp_session(task_id, cdp_override)
     provider = _bt._get_cloud_provider()
-    if identity and provider is not None:
-        raise RuntimeError("named browser identities require the local real-profile backend; "
-                           "cloud providers cannot use local Chromium identities")
     if provider is None:
         return (_bt._create_local_session(task_id, identity=identity) if identity
                 else _bt._create_local_session(task_id))
@@ -419,6 +431,10 @@ def _get_session_info(task_id: Optional[str] = None, identity: Optional[str] = N
             requested_identity_key = browser_identity_scope_key(resolved_default.runtime_key)
 
     if identity and not force_local:
+        # Backend compatibility is checked BEFORE the claim: a request the backend refuses must not
+        # durably bind the task, or a later valid alias would fail with the identity-switch error.
+        # The claim itself still lands before browser attachment so two processes cannot both win.
+        _reject_identity_incompatible_backend(identity)
         _bt._claim_browser_identity_binding(task_id, identity, str(requested_identity_key or ""))
 
     session_info = _create_session_for_key(task_id, force_local, identity)

@@ -328,3 +328,59 @@ def test_shell_target_directory_move_preserves_unrelated_sibling_work(tmp_path, 
     with delegated_child_context(read_only_knowledge=True):
         assert knowledge_boundary.command_denial_reason(f"mv -t {home} {tmp_path}/ordinary.txt", cwd=str(tmp_path)) is None
         assert knowledge_boundary.command_denial_reason(f"mv -t elsewhere {home}", cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize("source", [
+    "import os; os.chdir({home}); open('memories/MEMORY.md', 'w').write('replacement')",
+    "import os; os.chdir({home}); open('skills/x/SKILL.md', 'w').write('replacement')",
+    "import os as o; o.chdir({home}); open('memories/MEMORY.md', 'w').write('x')",
+    "from os import chdir; chdir(path={home}); open('memories/MEMORY.md', 'w').write('x')",
+    "import os; from pathlib import Path; os.chdir(Path({home})); Path('memories/MEMORY.md').write_text('x')",
+    # Relative transition from the workspace, then a relative operand.
+    "import os; os.chdir('../home'); open('memories/MEMORY.md', 'w').write('x')",
+    "import os; os.chdir('..'); os.chdir('home'); open('memories/MEMORY.md', 'w').write('x')",
+])
+def test_execute_code_literal_chdir_transition_is_tracked(tmp_path, monkeypatch, source):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    (home / "skills").mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    code = source.format(home=repr(str(home)))
+    with delegated_child_context(read_only_knowledge=True):
+        denial = knowledge_boundary.command_denial_reason(code, tool="execute_code", cwd=str(workspace))
+    assert denial is not None and "Parent-owned shared knowledge" in denial
+    assert knowledge_boundary.command_denial_reason(code, tool="execute_code", cwd=str(workspace)) is None
+
+
+def test_execute_code_absolute_chdir_counts_without_known_cwd(tmp_path, monkeypatch):
+    # The pre-spawn check has no cwd yet; an absolute literal transition still
+    # gives later relative operands a base to resolve against.
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    code = f"import os; os.chdir({str(home)!r}); open('memories/MEMORY.md', 'w').write('x')"
+    with delegated_child_context(read_only_knowledge=True):
+        assert knowledge_boundary.command_denial_reason(code, tool="execute_code") is not None
+        assert knowledge_boundary.command_denial_reason(
+            f"import os; os.chdir({str(home)!r}); open('ordinary.txt', 'w').write('x')", tool="execute_code") is None
+
+
+def test_execute_code_benign_chdir_keeps_unrelated_work_allowed(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    benign = [
+        f"import os; os.chdir({str(workspace / 'sub')!r}); open('memories.txt', 'w').write('x')",
+        f"import os; os.chdir({str(home)!r}); open('ordinary.txt', 'w').write('x')",
+        "import os; os.chdir('build'); open('out.log', 'w').write('x')",
+        # Computed targets stay under the documented not-enforced contract
+        # rather than turning every chdir into a refusal.
+        "import os; os.chdir(os.getcwd()); open('out.log', 'w').write('x')",
+    ]
+    with delegated_child_context(read_only_knowledge=True):
+        for code in benign:
+            assert knowledge_boundary.command_denial_reason(code, tool="execute_code", cwd=str(workspace)) is None, code

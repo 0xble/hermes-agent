@@ -249,13 +249,47 @@ def _literal_pathspecs(scope: tuple[str, ...]) -> list[str]:
     return [f":(literal){path}" for path in scope]
 
 
+def descriptor_capture_supported() -> bool:
+    """Whether this platform offers the descriptor-relative operations safe capture needs."""
+    return (
+        hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NONBLOCK")
+        and all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.readlink))
+        and os.stat in os.supports_follow_symlinks
+    )
+
+
+def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
+    """Fail closed when a checked-out submodule in scope has uncaptured changes.
+
+    Submodule worktrees never appear in the superproject patch or untracked
+    listing, so their contents could change without changing the candidate
+    identity. Explicit command-line overrides keep this check independent of
+    diff.ignoreSubmodules, submodule.<name>.ignore and status.showUntrackedFiles
+    at every nesting depth.
+    """
+    staged = _git(root, "ls-files", "--stage", "-z", "--", *pathspecs)
+    for entry in staged.split(b"\0"):
+        if not entry.startswith(b"160000 "):
+            continue
+        relative = entry.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")
+        submodule = root / relative
+        if not (submodule / ".git").exists():
+            continue  # never checked out, so no worktree content can drift
+        status = _git(
+            submodule, "--no-optional-locks", "status", "--porcelain=v2", "-z",
+            "--ignore-submodules=none", "--untracked-files=all",
+        )
+        if status.strip(b"\0"):
+            raise ValueError(
+                f"Submodule {relative} has uncommitted changes that review evidence cannot capture"
+            )
+        _reject_dirty_submodules(submodule, [])
+
+
 def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
     from contextlib import ExitStack
 
-    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
-            or not hasattr(os, "O_NONBLOCK")
-            or any(fn not in os.supports_dir_fd for fn in (os.open, os.stat, os.readlink))
-            or os.stat not in os.supports_follow_symlinks):
+    if not descriptor_capture_supported():
         raise ValueError("Safe untracked review capture is unsupported on this platform")
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts or not relative_path.parts:
@@ -334,7 +368,11 @@ def capture_review_candidate(
     base_commit = _git(root, "rev-parse", "--verify", f"{base_revision}^{{commit}}").decode().strip()
     head_commit = _git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
     pathspecs = _literal_pathspecs(scope)
-    patch_bytes = _git(root, "diff", "--binary", "--no-ext-diff", "--no-textconv", base_commit, "--", *pathspecs)
+    _reject_dirty_submodules(root, pathspecs)
+    patch_bytes = _git(
+        root, "diff", "--binary", "--no-ext-diff", "--no-textconv",
+        "--ignore-submodules=none", "--submodule=short", base_commit, "--", *pathspecs,
+    )
     untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
     untracked_paths = sorted(
         item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item

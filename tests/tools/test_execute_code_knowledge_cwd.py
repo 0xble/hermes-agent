@@ -77,3 +77,38 @@ def test_project_task_cwd_is_checked_on_first_cell(execution, monkeypatch):
         result = run("open('notes.txt', 'w').write('bad')")
     assert "Parent-owned shared knowledge" in result["error"]
     assert not (protected / "notes.txt").exists()
+
+
+@pytest.mark.parametrize("root_name", ["memories", "skills"])
+def test_literal_python_chdir_into_home_then_relative_write_is_denied(execution, root_name):
+    # F10: the home itself is not protected, the source never spells the
+    # protected root, and the relative operand only lands inside it after the
+    # cell's own os.chdir. The literal transition must be tracked.
+    run, protected = execution
+    home = protected.parent
+    (home / root_name).mkdir(exist_ok=True)
+    target = home / root_name / "MEMORY.md"
+    code = f"import os; os.chdir({str(home)!r}); open({root_name + '/MEMORY.md'!r}, 'w').write('replacement')"
+    with delegated_child_context(read_only_knowledge=True):
+        denied = run(code)
+    assert "Parent-owned shared knowledge" in denied["error"]
+    assert not target.exists()
+    # The kernel survives the refusal and the cell never ran its chdir.
+    assert run("import os; print(os.getcwd())")["output"].strip() != str(home)
+
+
+def test_literal_python_chdir_to_unprotected_directory_stays_allowed(execution, tmp_path):
+    run, protected = execution
+    home = protected.parent
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    with delegated_child_context(read_only_knowledge=True):
+        outside = run(f"import os; os.chdir({str(elsewhere)!r}); open('notes.txt', 'w').write('ok')")
+        # The home directory itself is not a protected root; only its shared
+        # knowledge subtrees are.
+        in_home = run(f"import os; os.chdir({str(home)!r}); open('ordinary.txt', 'w').write('ok')")
+    assert outside["status"] == "success", outside
+    assert in_home["status"] == "success", in_home
+    assert (elsewhere / "notes.txt").read_text() == "ok"
+    assert (home / "ordinary.txt").read_text() == "ok"
+    assert not (protected / "notes.txt").exists()

@@ -421,8 +421,10 @@ def retry_current_owner_terminal_checkpoints(target_queue) -> int:
                     if checkpoint is None:
                         continue
                     event = checkpoint["event"]
-                    if event.get("status") in _ACTIVE_STATES or event.get("status") not in {
-                            "completed", "failed", "error", "cancelled", "stalled", "unknown"}:
+                    # A checkpoint only exists for a finalized unit, so any non-live status is
+                    # terminal (completed/failed/error/cancelled/stalled/unknown as well as
+                    # budget_exhausted and interrupted from the child's own classification).
+                    if event.get("status") in _LIVE_STATES:
                         continue
                     if _persist_completion(event, checkpoint["result"]):
                         _completion_publications[(home, delegation_id)] = event

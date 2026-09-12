@@ -1869,3 +1869,181 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+# ---------------------------------------------------------------------------
+# Partial-delivery receipts (fork contract: the outbound ledger reconciles on
+# the IDs that actually landed, so a failure payload must never drop them)
+# ---------------------------------------------------------------------------
+
+class TestPartialDeliveryReceipts:
+    """Review findings F12/F13: confirmed receipts survive a partial failure.
+
+    F12: an incomplete album collects confirmed media IDs in the helper's
+    ``_media_message_ids`` but ``_send_via_adapter`` used to discard them,
+    returning only ``media_partial_count`` and the text ID.
+    F13: ``_send_chunks`` used to overwrite a failing chunk's own ``message_id``
+    with the previous chunk's, destroying the newest confirmed receipt.
+    """
+
+    @staticmethod
+    def _send_live(monkeypatch, adapter, message, media_files):
+        from tools.send_message_tool import _send_via_adapter
+
+        runner = SimpleNamespace(
+            adapters={Platform.TELEGRAM: adapter},
+            _profile_adapters={},
+            _active_profile_name=lambda: "default",
+            _gateway_loop=None,
+        )
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        async def _run():
+            runner._gateway_loop = asyncio.get_running_loop()
+            return await _send_via_adapter(
+                Platform.TELEGRAM, SimpleNamespace(), "2027045491", message,
+                media_files=media_files,
+            )
+
+        return asyncio.run(_run())
+
+    def test_incomplete_album_forwards_confirmed_media_ids(self, monkeypatch, tmp_path):
+        """F12: one image receipt confirmed, one failed -> the confirmed ID is
+        forwarded under a name that does not imply complete delivery."""
+        from gateway.platforms.base import SendResult
+
+        first = tmp_path / "a.png"
+        second = tmp_path / "b.png"
+        first.write_bytes(b"\x89PNG")
+        second.write_bytes(b"\x89PNG")
+
+        class AlbumAdapter:
+            async def send(self, chat_id, content, metadata=None, **kw):
+                return SimpleNamespace(success=True, message_id="m-text", error=None)
+
+            async def send_multiple_images(self, chat_id, images, metadata=None, **kw):
+                return [
+                    SendResult(success=True, message_id="img-1"),
+                    SendResult(success=False, error="rate_limited"),
+                ]
+
+        result = self._send_live(
+            monkeypatch, AlbumAdapter(), "long enough to be sent as separate text " * 2,
+            [(str(first), False), (str(second), False)],
+        )
+
+        assert "error" in result
+        assert "rate_limited" in result["error"]
+        assert result.get("delivery_stage") != "pre_send"
+        assert result["message_id"] == "m-text"
+        assert result["media_partial_count"] == 1
+        assert result["delivered_media_message_ids"] == ["img-1"]
+        # Still not a success claim.
+        assert "media_delivered" not in result
+        assert "success" not in result
+
+    def test_sequential_partial_media_forwards_confirmed_media_ids(self, monkeypatch, tmp_path):
+        """F12 (same contract, per-file path): the image that landed before the
+        document failed keeps its receipt."""
+        good = tmp_path / "chart.png"
+        good.write_bytes(b"\x89PNG")
+        bad = tmp_path / "report.pdf"
+        bad.write_bytes(b"%PDF-1.4")
+
+        class MediaAdapter:
+            async def send(self, chat_id, content, metadata=None, **kw):
+                return SimpleNamespace(success=True, message_id="m-text", error=None)
+
+            async def send_image_file(self, chat_id, path, **kw):
+                return SimpleNamespace(success=True, message_id="m-img", error=None)
+
+            async def send_document(self, chat_id, path, **kw):
+                return SimpleNamespace(success=False, message_id=None, error="upload rejected")
+
+        result = self._send_live(
+            monkeypatch, MediaAdapter(), "report attached",
+            [(str(good), False), (str(bad), False)],
+        )
+
+        assert "upload rejected" in result["error"]
+        assert result["message_id"] == "m-text"
+        assert result["media_partial_count"] == 1
+        assert result["delivered_media_message_ids"] == ["m-img"]
+        assert "media_delivered" not in result
+
+    def test_partial_failure_without_confirmed_media_ids_omits_field(self, monkeypatch, tmp_path):
+        """Text landed, first media failed: nothing to reconcile, so the
+        reconciliation field is absent rather than an empty list. Two files
+        force the text to go as its own send instead of riding as a caption."""
+        bad = tmp_path / "report.pdf"
+        bad.write_bytes(b"%PDF-1.4")
+        other = tmp_path / "other.pdf"
+        other.write_bytes(b"%PDF-1.4")
+
+        class MediaAdapter:
+            async def send(self, chat_id, content, metadata=None, **kw):
+                return SimpleNamespace(success=True, message_id="m-text", error=None)
+
+            async def send_document(self, chat_id, path, **kw):
+                return SimpleNamespace(success=False, message_id=None, error="upload rejected")
+
+        result = self._send_live(
+            monkeypatch, MediaAdapter(), "report attached",
+            [(str(bad), False), (str(other), False)],
+        )
+
+        assert "error" in result
+        assert result["message_id"] == "m-text"
+        assert "media_partial_count" not in result
+        assert "delivered_media_message_ids" not in result
+
+    def test_send_chunks_keeps_failing_chunks_own_receipt(self):
+        """F13: the final chunk's text landed before its media failed; its ID
+        must not be replaced by the preceding chunk's."""
+        from tools.send_message_tool import _send_chunks
+
+        async def send_one(chunk, is_last):
+            if is_last:
+                return {
+                    "error": "Adapter delivered text but media attachment delivery failed: boom",
+                    "message_id": "m-text-last",
+                    "media_partial_count": 1,
+                }
+            return {"success": True, "message_id": "m-text-first"}
+
+        result = asyncio.run(_send_chunks(["one", "two"], send_one))
+
+        assert result["delivery_stage"] == "partial_send"
+        assert result["chunk_partial_count"] == 1
+        assert result["message_id"] == "m-text-last"
+        assert result["media_partial_count"] == 1
+
+    def test_send_chunks_falls_back_to_previous_receipt_when_failure_has_none(self):
+        """F13 (existing contract preserved): a chunk that failed outright
+        carries no ID, so the previous chunk's receipt is reported."""
+        from tools.send_message_tool import _send_chunks
+
+        async def send_one(chunk, is_last):
+            if is_last:
+                return {"error": "gateway stopped", "delivery_stage": "pre_send"}
+            return {"success": True, "message_id": "m-text-first"}
+
+        result = asyncio.run(_send_chunks(["one", "two"], send_one))
+
+        assert result == {
+            "error": "gateway stopped",
+            "delivery_stage": "partial_send",
+            "message_id": "m-text-first",
+            "chunk_partial_count": 1,
+        }
+
+    def test_send_chunks_first_chunk_failure_is_untouched(self):
+        """No chunk delivered: the error passes through without partial fields."""
+        from tools.send_message_tool import _send_chunks
+
+        async def send_one(chunk, is_last):
+            return {"error": "gateway stopped", "delivery_stage": "pre_send"}
+
+        result = asyncio.run(_send_chunks(["one", "two"], send_one))
+
+        assert result == {"error": "gateway stopped", "delivery_stage": "pre_send"}

@@ -3685,6 +3685,9 @@ class GatewayTurnMixin:
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, inbound_message_id=next_inbound_id,
             channel_prompt=next_channel_prompt, message_type=next_message_type,
+            # The one-turn reasoning override is per-event: forward the SUCCESSOR event's own
+            # config (None for a text-only steer follow-up), never the preceding turn's.
+            turn_reasoning_config=getattr(pending_event, "turn_reasoning_config", None),
             # A mid-turn reconnect makes the follow-up's own adapter a different object; keep
             # the callback owner stable so the caller can still pop this chain's callbacks.
             _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_owner", None) or adapter,

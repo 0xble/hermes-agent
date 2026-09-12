@@ -1280,32 +1280,54 @@ def _apply_pulled_update(
         _restart, _pre_update_plan=_pre_update_plan, _windows_gateway_resume=_windows_gateway_resume,
         node_failures=node_failures, update_complete=update_complete,
         final_head_guard=(
-            (lambda: _verify_pinned_completion(git_cmd, pinned_revision))
+            (lambda: _verify_pinned_completion(git_cmd, pinned_revision, _pre_update_plan))
             if pinned_revision else None
         ),
     )
 
 
-def _verify_pinned_completion(git_cmd, expected_sha: str) -> None:
+def _verify_pinned_completion(git_cmd, expected_sha: str, pre_update_plan=None) -> None:
     from hermes_cli.update_revision import verify_revision_head
     verify_revision_head(_git_run, git_cmd, _m().PROJECT_ROOT, expected_sha)
-    _verify_pinned_runtime_readback(expected_sha)
+    _verify_pinned_runtime_readback(expected_sha, pre_update_plan)
 
 
-def _verify_pinned_runtime_readback(expected_sha: str) -> None:
+def _verify_pinned_runtime_readback(expected_sha: str, pre_update_plan=None) -> None:
     """Fail closed when a live runtime cannot prove it uses an explicit pinned SHA.
 
     This deliberately reads live fleet state rather than trusting a prior receipt, which
     may be absent or stale after a failed/retried update.
+
+    ``pre_update_plan`` (the plan-phase runtime inventory) is the expected fleet: the
+    collector only reports a stopped gateway as ``down`` for pids named in
+    ``pre_restart_pids``, and a gateway whose profile no longer has a live row at all
+    would otherwise be silently omitted, so an empty probe passed as verified. Every
+    gateway profile in the inventory needs a live replacement row; an empty probe is
+    accepted only when the inventory proves no gateway was running. Without an
+    inventory (plan probe failed) an empty probe proves nothing and is rejected.
     """
     from hermes_cli.update_receipt import collect_fleet_versions
-    rows = collect_fleet_versions(strict=True)
+    expected_gateways = [
+        runtime for runtime in getattr(pre_update_plan, "runtimes", None) or []
+        if getattr(runtime, "kind", None) == "gateway"
+    ]
+    expected_pids = sorted({r.pid for r in expected_gateways if isinstance(r.pid, int)})
+    rows = collect_fleet_versions(pre_restart_pids=expected_pids, strict=True)
     invalid = [
         row for row in rows
         if row.get("state") in {"stale", "down"} or row.get("code_sha") != expected_sha
     ]
     if invalid:
         raise RuntimeError("live runtime code SHA is unknown or does not match the approved revision")
+    if pre_update_plan is None and not rows:
+        raise RuntimeError(
+            "no live runtime reported and the pre-update runtime inventory is unavailable; "
+            "runtime identity is unknown")
+    live_profiles = {row.get("profile") for row in rows}
+    missing = sorted({r.profile for r in expected_gateways} - live_profiles)
+    if missing:
+        raise RuntimeError(
+            "expected gateway(s) have no live runtime at the approved revision: " + ", ".join(missing))
 
 
 def _run_pinned_revision_update(
@@ -1339,7 +1361,7 @@ def _run_pinned_revision_update(
                 active_lazy_features=opts.active_lazy_features,
                 active_tool_dependencies=opts.active_tool_dependencies,
                 _windows_gateway_resume=_windows_gateway_resume,
-                final_head_guard=lambda: _verify_pinned_completion(git_cmd, target.sha))
+                final_head_guard=lambda: _verify_pinned_completion(git_cmd, target.sha, _pre_update_plan))
             return
         rollback = retain_precheckout_rollback(_git_run, git_cmd, _m().PROJECT_ROOT, target)
         record_revision_receipt(target, rollback)

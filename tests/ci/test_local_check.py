@@ -126,13 +126,16 @@ def test_documentation_build_uses_website_prefix() -> None:
     )
 
 
-def test_affected_python_defaults_to_full_suite_when_targets_are_not_explicit() -> None:
+def test_affected_python_defaults_to_full_suite_when_targets_are_not_explicit(monkeypatch) -> None:
+    # POSIX has no shell prefix; the Windows shape is covered by the win32 tests below.
+    monkeypatch.setattr(MODULE.sys, "platform", "linux")
     checks = MODULE.build_checks(ROOT, "affected", ["scripts/ci/local_check.py"], [])
     python = next(check for check in checks if check.name == "Python tests")
     assert python.command == ("scripts/run_tests.sh",)
 
 
-def test_affected_python_preserves_explicit_focused_targets() -> None:
+def test_affected_python_preserves_explicit_focused_targets(monkeypatch) -> None:
+    monkeypatch.setattr(MODULE.sys, "platform", "linux")
     checks = MODULE.build_checks(
         ROOT,
         "affected",
