@@ -1500,6 +1500,10 @@ class GatewayInboundMixin:
         message_text, _successful_transcripts = await self._enrich_message_with_transcription(
             message_text, audio_paths,
         )
+        # This is the only non-typed text that can carry current-user goal authority:
+        # successful STT from this authenticated inbound event. Keep it separate from
+        # rendered prompt context such as reply quotes and image descriptions.
+        setattr(event, "_gateway_goal_authority_transcripts", list(_successful_transcripts))
         # Echo each successful transcript back immediately when configured so users can verify STT
         # quality in real time. On transcription failure do NOT send a hardcoded notice: that
         # bypassed the LLM and produced two replies; enrichment leaves one neutral marker instead.
@@ -1509,6 +1513,19 @@ class GatewayInboundMixin:
                 _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                 await self._echo_stt_transcripts(_echo_adapter, source, _successful_transcripts, metadata=_echo_meta)
         return message_text
+
+    @staticmethod
+    def _goal_authority_text_for_event(event: MessageEvent, *, typed_text: str) -> str:
+        """Return current authenticated typed text plus successful current-event STT only."""
+        if getattr(event, "internal", False):
+            return ""
+        parts = []
+        if isinstance(typed_text, str) and typed_text.strip():
+            parts.append(typed_text)
+        transcripts = getattr(event, "_gateway_goal_authority_transcripts", ())
+        if isinstance(transcripts, (list, tuple)):
+            parts.extend(text for text in transcripts if isinstance(text, str) and text.strip())
+        return "\n\n".join(parts)
 
     @staticmethod
     def _inbound_attachment_display_name(path: str) -> Tuple[str, str]:
@@ -2122,6 +2139,7 @@ class GatewayInboundMixin:
         enriched_text, successful_transcripts = await self._enrich_message_with_transcription(text, audio_paths)
         event._gateway_pending_stt_text = enriched_text
         event._gateway_pending_stt_transcripts = list(successful_transcripts)
+        setattr(event, "_gateway_goal_authority_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
 
     async def _echo_pending_stt_transcripts_once(
