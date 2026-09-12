@@ -23,6 +23,7 @@ import socket
 import socketserver
 import ssl
 import threading
+import time
 import urllib.parse
 
 LISTEN_HOST = "127.0.0.1"
@@ -209,10 +210,21 @@ def read_connect_header(sock):
 
 
 def relay(left, right):
-    """Bidirectional opaque byte relay until both peers close or timeout."""
+    """Relay until both peers close, shared receive inactivity, or fatal I/O.
+
+    Writes retain a separate CLIENT_TIMEOUT stall limit. A timed-out sendall
+    may have sent a partial block and must never be retried.
+    """
     left.settimeout(CLIENT_TIMEOUT)
     right.settimeout(CLIENT_TIMEOUT)
     done = threading.Event()
+    activity_lock = threading.Lock()
+    last_activity = time.monotonic()
+
+    def record_activity():
+        nonlocal last_activity
+        with activity_lock:
+            last_activity = time.monotonic()
 
     def abort():
         done.set()
@@ -225,14 +237,24 @@ def relay(left, right):
     def copy(source, destination):
         try:
             while not done.is_set():
-                block = source.recv(64 * 1024)
+                try:
+                    block = source.recv(64 * 1024)
+                except socket.timeout:
+                    # A quiet receive direction must not interrupt traffic in
+                    # the other direction. Serialize expiry with activity.
+                    with activity_lock:
+                        if time.monotonic() - last_activity >= CLIENT_TIMEOUT:
+                            abort()
+                    continue
                 if not block:
                     try:
                         destination.shutdown(socket.SHUT_WR)
                     except OSError:
                         pass
                     return
+                record_activity()
                 destination.sendall(block)
+                record_activity()
         except (OSError, socket.timeout):
             abort()
 
@@ -241,7 +263,7 @@ def relay(left, right):
     try:
         copy(right, left)
         # Ordinary EOF preserves the opposite direction until its own EOF or
-        # idle timeout. Fatal I/O aborts both sockets and wakes a blocked recv.
+        # shared idle timeout. Fatal I/O wakes a blocked recv in either direction.
         first.join()
     finally:
         if first.is_alive():

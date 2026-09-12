@@ -245,3 +245,78 @@ def test_relay_idle_timeout_joins_both_directions(monkeypatch):
         for sock in (client, left, right, server):
             sock.close()
         worker.join(2)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_relay_continuous_one_way_activity_then_idle_expiry(monkeypatch, reverse):
+    import time
+
+    idle_timeout = 0.3
+    monkeypatch.setattr(proxy, "CLIENT_TIMEOUT", idle_timeout)
+    client, left = socket.socketpair()
+    right, server = socket.socketpair()
+    if reverse:
+        client, server = server, client
+    worker = threading.Thread(target=proxy.relay, args=(left, right))
+    expected = bytearray()
+    received = bytearray()
+    try:
+        client.settimeout(2)
+        server.settimeout(2)
+        worker.start()
+        started = time.monotonic()
+        # Neither peer half-closes: the quiet receive loop stays blocked.
+        while time.monotonic() - started < 3 * idle_timeout:
+            block = f"chunk-{len(expected)}\n".encode()
+            server.sendall(block)
+            expected.extend(block)
+            while len(received) < len(expected):
+                chunk = client.recv(len(expected) - len(received))
+                assert chunk, "relay closed during continuous one-way traffic"
+                received.extend(chunk)
+            assert worker.is_alive()
+            time.sleep(0.02)
+        assert time.monotonic() - started >= 2 * idle_timeout
+        assert received == expected
+        # Shared activity must postpone expiry without disabling it.
+        worker.join(2)
+        assert not worker.is_alive()
+        assert client.recv(1) == b""
+        assert server.recv(1) == b""
+    finally:
+        for sock in (client, left, right, server):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        worker.join(2)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_relay_fatal_write_error_aborts_other_direction(monkeypatch, reverse):
+    monkeypatch.setattr(proxy, "CLIENT_TIMEOUT", 5)
+    client, left = socket.socketpair()
+    right, server = socket.socketpair()
+    if reverse:
+        client, server = server, client
+    worker = threading.Thread(target=proxy.relay, args=(left, right))
+    try:
+        client.settimeout(2)
+        server.settimeout(2)
+        # Shut only the relay destination write half to produce a real EPIPE.
+        # Its receiving half stays open, leaving the opposite copy blocked.
+        (right if reverse else left).shutdown(socket.SHUT_WR)
+        worker.start()
+        server.sendall(b"cannot deliver")
+        worker.join(2)
+        assert not worker.is_alive(), "fatal write must wake the opposite recv"
+        assert server.recv(1) == b""
+    finally:
+        for sock in (client, left, right, server):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        worker.join(2)
