@@ -211,7 +211,33 @@ never for auth, billing, invalid configuration, refusals, or tool failures. The
 result reports the reason and actual route for each transition. Exhausting the
 frozen chain produces an error rather than consulting current config.
 
-### Continue a completed or budget-exhausted child
+### Continue a completed or interrupted child
+
+Ordinary interruption, cancellation, shutdown, stall, timeout and error are not
+user-stop decisions. An actual `/stop` or explicit child stop still terminates the
+current attempt. Neither kind of interruption permanently disables continuation.
+After reconciling prior effects, an owning parent can resume a stopped or legacy
+uncheckpointed child with a per-task receipt:
+
+```python
+delegate_task(tasks=[{
+    "resume_session_id": "<exact-child-session-id>",
+    "goal": "Continue from the verified checkpoint",
+    "resume_authorization": {
+        "authorization": "The user has now asked to resume this work.",
+        "reconciliation": "Verified the worktree, prior writes and process receipts; no action needs blind replay.",
+    },
+}])
+```
+
+An applicable current user request to resume is sufficient authorization: record
+it, do not repeatedly ask for confirmation. The receipt is consumed atomically for
+one attempt and retained as audit evidence. A changed transcript, new stop or live
+turn lease invalidates a stale receipt. Foreign ownership, unresolved tool effects
+and background process receipts still block continuation; the receipt does not
+invent successful outcomes. The same session, card row, context and frozen routing
+are retained. No refork, raw database edits or automatic restart after a new stop.
+
 
 Each result includes `child_session_id`. A later task may pass it as
 `resume_session_id` to append a new user turn to the same named child's durable

@@ -69,7 +69,7 @@ def test_interrupted_resume_freezes_route_owner_and_context(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="foreign"):
         _resolve_resume_launch({"resume_session_id": "child"}, definitions, SimpleNamespace(session_id="other", _session_db=db))
     db.patch_session_model_config("child", {"_delegation_user_stopped": True})
-    with pytest.raises(ValueError, match="User-stopped"):
+    with pytest.raises(ValueError, match="resume_authorization"):
         _resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
     db.close()
 

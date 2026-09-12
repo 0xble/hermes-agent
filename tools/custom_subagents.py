@@ -159,6 +159,7 @@ class ResolvedSubagentLaunch:
     resume_claim_id: str | None = None
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
     resume_credential_id: str | None = None
+    resume_recovery: Mapping | None = None
 
 
 _FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort", "inherit_parent", "moa_presets", "fallbacks", "context_mode"})

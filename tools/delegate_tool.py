@@ -604,6 +604,9 @@ def _run_single_child(
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
+            from tools.delegate_tool_checkpoint import checkpoint_child_resume
+            run.account_background_processes(failure_entry)
+            checkpoint_child_resume(child, None, failure_entry, child_task_id=run.child_task_id)
             return failure_entry
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
@@ -689,10 +692,7 @@ def _resolve_resume_launch(task, definitions, parent_agent):
     launch = config.get("_delegation_launch")
     if not isinstance(launch, dict) or launch.get("version") != 1:
         raise ValueError("resume_session_id is not a resumable delegated child")
-    if config.get("_delegation_user_stopped"):
-        raise ValueError("User-stopped child requires explicit authorization and reconciliation before continuation")
-    if not config.get("_delegation_completed"):
-        raise ValueError("delegated child has no verified resumable checkpoint; reconcile interrupted tool effects or an unresolved launch before retrying")
+
     role = launch.get("subagent_type")
     if not isinstance(role, str) or role not in definitions:
         raise ValueError("delegated child references an unknown configured role")
@@ -712,6 +712,9 @@ def _resolve_resume_launch(task, definitions, parent_agent):
     delegated_root = delegated_lineage[0] if delegated_lineage else delegated_from
     if not delegated_root or delegated_root != parent_root:
         raise ValueError("resume_session_id is not a delegated child of the requesting parent lineage")
+
+    from tools.delegate_tool_checkpoint import prepare_resume_recovery
+    resume_recovery = prepare_resume_recovery(task, db, tip, config, parent_root)
 
     provider, model = str(launch.get("provider") or ""), str(launch.get("model") or "")
     effort = launch.get("reasoning_effort")
@@ -819,6 +822,7 @@ def _resolve_resume_launch(task, definitions, parent_agent):
         launch_metadata=deepcopy(launch),
         _credential_pool=resume_credential_pool if provider != "moa" else None,
         resume_credential_id=resume_credential_id if provider != "moa" else None,
+        resume_recovery=resume_recovery,
     )
 
 
@@ -848,6 +852,8 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
     task_runtime: List[ResolvedSubagentLaunch] = []
     try:
         for task in task_list:
+            if task.get("resume_authorization") is not None and task.get("resume_session_id") is None:
+                raise ValueError("resume_authorization is only valid with resume_session_id")
             if task.get("resume_session_id") is not None:
                 if credentials_cfg:
                     raise ValueError("resumed named subagents cannot override credentials_cfg")
@@ -892,7 +898,10 @@ def _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, legac
         db = getattr(parent_agent, "_session_db", None)
         claim_batch = getattr(db, "claim_delegated_resumes", None)
         claim_id = uuid.uuid4().hex
-        if not callable(claim_batch) or not claim_batch(resume_ids, claim_id=claim_id):
+        reconciliations = {launch.resume_session_id: launch.resume_recovery for launch in task_runtime
+                           if launch.resume_recovery is not None}
+        recovery_kwargs = {"reconciliations": reconciliations} if reconciliations else {}
+        if not callable(claim_batch) or not claim_batch(resume_ids, claim_id=claim_id, **recovery_kwargs):
             return [], (
                 "Delegated child resume batch is unsafe, already claimed, or no longer resumable. "
                 "No child was started."
@@ -960,6 +969,11 @@ def _build_children(
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
+        if t.get("resume_authorization"):
+            receipt = t["resume_authorization"]
+            _child_context = ((_child_context or "") + "\n\nParent continuation receipt:\n"
+                + receipt["authorization"] + "\nReconciliation: " + receipt["reconciliation"]
+                + "\nContinue from the verified state; do not blindly repeat prior external actions.")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         _launch = task_runtime[i] if task_runtime and i < len(task_runtime) else None
@@ -1658,6 +1672,15 @@ DELEGATE_TASK_SCHEMA = {
                             "completed, budget-exhausted, or safely checkpointed interrupted delegation. Continues that exact named child's durable session and logical row with its "
                             "frozen route; omit subagent_type or repeat the same role.",
                         ),
+                        "resume_authorization": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["authorization", "reconciliation"],
+                            "properties": {
+                                "authorization": _p("string", "Applicable renewed user/parent authority to resume this exact child. A current Resume request suffices; do not ask again."),
+                                "reconciliation": _p("string", "What you verified about prior tool effects, worktrees and processes before continuing. Never infer success or bypass unresolved effects."),
+                            },
+                            "description": "Only with resume_session_id. Explicit one-attempt recovery of a stopped/interrupted checkpoint; no sticky stop, no automatic restart after a new stop. Owner, route, leases and tool receipts remain enforced.",
+                        },
                         "moa_preset": _p(
                             "string",
                             "Optional native MoA preset for a named provider: moa role. The preset must be in "

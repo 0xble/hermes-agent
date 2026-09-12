@@ -1384,12 +1384,13 @@ def _sweep_stale_locked(now: float):
     return stalled, expired, any_monitorable
 
 
-def _call_interrupt(fn, msg: str, *args) -> bool:
+def _call_interrupt(fn, msg: str, *args, tool_reason="delegation cancelled") -> bool:
     """Invoke an ``interrupt_fn``; True on success, else debug-log ``msg`` (+ exc)."""
     if not callable(fn):
         return False
     try:
-        fn()
+        from agent.interrupt_compat import _accepts_keyword
+        fn(**{"tool_reason": tool_reason} if _accepts_keyword(fn, "tool_reason") else {})
         return True
     except Exception as exc:
         logger.debug(msg, *args, exc)
@@ -1411,7 +1412,8 @@ def _stale_monitor_loop() -> None:
                            delegation_id, quiet_for, in_tool, _STALL_GRACE_SECONDS)
             with _records_lock:
                 fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
-            _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
+            _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id,
+                            tool_reason="delegation stalled")
         for delegation_id in expired:
             _finalize(delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
         if not any_monitorable:
@@ -1506,7 +1508,8 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, msg: str) -> int:
     """Call ``interrupt_fn`` on each record; log ``msg`` once; returns how many succeeded."""
     count = sum(
-        _call_interrupt(r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"))
+        _call_interrupt(r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"),
+                        tool_reason="explicit stop requested" if reason == "/stop" else "delegation cancelled")
         for r in targets)
     if count:
         logger.info(msg, count, reason)
