@@ -864,7 +864,8 @@ class TestLiveAdapterMedia:
 
             async def send_multiple_images(self, chat_id, images, metadata=None, **kw):
                 calls.append("images")
-                return [SimpleNamespace(success=True, message_id="m-album", error=None)]
+                return [SimpleNamespace(success=True, message_id=f"m-album-{i}", error=None)
+                        for i, _image in enumerate(images)]
 
             async def send_image_file(self, chat_id, path, **kw):
                 calls.append("image")

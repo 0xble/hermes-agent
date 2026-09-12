@@ -204,12 +204,12 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
 
     pin = child._delegation_runtime_pin
     assert "PRIMARY-AUTH-SENTINEL" in pin.request_overrides_json
-    pin.validate_request(child, {"model": "m"}, client=SimpleNamespace(
+    pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
         api_key="PRIMARY-API-SENTINEL", base_url="https://fixture/v1",
     ))
     child.request_overrides = {"max_output_tokens": 321}
     with pytest.raises(ValueError, match="pinned request overrides changed"):
-        pin.validate_request(child, {"model": "m"}, client=SimpleNamespace(
+        pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
             api_key="PRIMARY-API-SENTINEL", base_url="https://fixture/v1",
         ))
 
