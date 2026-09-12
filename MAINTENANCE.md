@@ -4,6 +4,15 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 ## Background
 
+### Frozen upstream reconciliation, September 12, 2026
+
+- Frozen upstream: `f364c19775617acb6c16140b790cda9fb05e1906`, integrating 177 commits from the September 11 cutoff. Source verification and publication remain separate from runtime promotion.
+- Adopt upstream's `_interrupt_running_turn` sync core and `_drop_turn_slot` guarded release. The fork's /stop contracts — generation-owned continuation and restart-turn stop-owner cancellation — are re-expressed in the async `_interrupt_and_clear_session` wrapper, not duplicated in the sync core.
+- `gateway.multiplex_profile_allowlist` is retired in favour of upstream's config migration 42 to 43. The fork keeps only its own `restart_resume_policy` normalization in that hook.
+- Keep the fork's inline cron schedule/timezone recompute and run-scoped fire claim, and carry upstream's `pending_slot` invalidation on both explicit lifecycle rewrite and occurrence claim.
+- Hindsight profile-env drift stays scoped to managed keys, now gated by upstream's keyless fail-closed check so a scopeless process neither rewrites nor restarts the daemon.
+- `resolve_tool_cwd()` remains the delegation cwd authority; it falls through to upstream's `scope_terminal_cwd()`, so multiplexed per-turn terminal scoping is preserved.
+
 ### Frozen upstream reconciliation, September 11, 2026
 
 - Frozen upstream: `939e45c91d751fadd94dcd1b873ac3cb44846213`. Source verification and publication are separate from the separately authorized default-local runtime activation.
