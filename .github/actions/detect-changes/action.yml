@@ -106,9 +106,9 @@ runs:
           # freshly-pushed HEAD would otherwise block this run.
           #
           # The compare endpoint caps `files` at 300 even when `total_files` is
-          # larger. compare_files.py rejects any incomplete or malformed
-          # response so this action blocks instead of silently skipping lanes
-          # affected only by omitted files.
+          # larger. compare_files.py turns a valid capped response into the
+          # classifier's empty-diff all-lanes signal; malformed or unavailable
+          # responses still fail closed after retries.
           CHANGED=""
           for i in 1 2 3; do
             if CHANGED="$(gh api \

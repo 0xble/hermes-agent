@@ -110,7 +110,8 @@ def test_quoted_git_paths_reach_actual_compile_check(tmp_path, filename):
     assert MODULE.run_checks(tmp_path, checks, dry_run=False)[0].status == "failed"
 
 
-def test_documentation_build_uses_website_prefix() -> None:
+def test_documentation_build_uses_website_prefix_on_posix(monkeypatch) -> None:
+    monkeypatch.setattr(MODULE.sys, "platform", "linux")
     checks = MODULE.build_checks(ROOT, "affected", ["website/docs/example.md"], [])
     dependencies = next(
         check for check in checks if check.name == "Documentation dependencies"

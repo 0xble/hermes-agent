@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import stat
 import subprocess
+import threading
+import time
 from typing import Any, Iterable, Mapping
 
 
@@ -30,6 +32,10 @@ MAX_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024
 """Largest single untracked file (or symlink target) capture will read."""
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 """Largest tracked patch plus all untracked content one candidate may carry."""
+_GIT_TIMEOUT_SECONDS = 30
+_GIT_TERMINATE_GRACE_SECONDS = 1
+_GIT_READ_CHUNK_BYTES = 64 * 1024
+_MAX_GIT_ERROR_BYTES = 64 * 1024
 
 
 class ReviewCandidateStale(ValueError):
@@ -227,16 +233,105 @@ def native_review_completion_contract(
     }
 
 
-def _git(repo: Path, *args: str) -> bytes:
+def _stop_git_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop and reap a producer whose output cannot be retained."""
+    process.terminate()
     try:
-        return subprocess.run(
-            ["git", *args], cwd=repo, check=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=30,
-        ).stdout
+        process.wait(timeout=_GIT_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=_GIT_TERMINATE_GRACE_SECONDS)
+
+
+def _git(repo: Path, *args: str, max_stdout_bytes: int | None = None) -> bytes:
+    """Run Git while retaining no more than the requested stdout evidence budget."""
+    process: subprocess.Popen[bytes] | None = None
+    streams: list[threading.Thread] = []
+    try:
+        process = subprocess.Popen(
+            ["git", *args], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        assert process.stdout is not None and process.stderr is not None
+        stdout: list[bytes] = []
+        stderr: list[bytes] = []
+        exceeded: list[str] = []
+        stream_errors: list[OSError] = []
+
+        def capture_stream(stream, chunks: list[bytes], limit: int | None, name: str) -> None:
+            try:
+                captured = 0
+                read = getattr(stream, "read1", stream.read)
+                while True:
+                    read_size = _GIT_READ_CHUNK_BYTES if limit is None else min(
+                        _GIT_READ_CHUNK_BYTES, max(1, limit - captured + 1),
+                    )
+                    chunk = read(read_size)
+                    if not chunk:
+                        return
+                    if limit is not None and captured + len(chunk) > limit:
+                        exceeded.append(name)
+                        return
+                    chunks.append(chunk)
+                    captured += len(chunk)
+            except OSError as exc:
+                stream_errors.append(exc)
+
+        streams = [
+            threading.Thread(
+                target=capture_stream, args=(process.stdout, stdout, max_stdout_bytes, "stdout"), daemon=True,
+            ),
+            threading.Thread(
+                target=capture_stream, args=(process.stderr, stderr, _MAX_GIT_ERROR_BYTES, "stderr"), daemon=True,
+            ),
+        ]
+        for stream in streams:
+            stream.start()
+        deadline = time.monotonic() + _GIT_TIMEOUT_SECONDS
+        while process.poll() is None and not exceeded:
+            if time.monotonic() >= deadline:
+                _stop_git_process(process)
+                raise subprocess.TimeoutExpired(process.args, _GIT_TIMEOUT_SECONDS)
+            time.sleep(0.01)
+        if exceeded:
+            _stop_git_process(process)
+            if exceeded[0] == "stdout":
+                raise ValueError(
+                    f"Tracked review evidence (over {max_stdout_bytes} bytes) exceeds the "
+                    f"{max_stdout_bytes}-byte aggregate review evidence bound"
+                )
+            raise ValueError("Git error output exceeds the capture error bound")
+        returncode = process.wait()
+        for stream in streams:
+            stream.join()
+        if stream_errors:
+            raise stream_errors[0]
+        if exceeded:
+            if exceeded[0] == "stdout":
+                raise ValueError(
+                    f"Tracked review evidence (over {max_stdout_bytes} bytes) exceeds the "
+                    f"{max_stdout_bytes}-byte aggregate review evidence bound"
+                )
+            raise ValueError("Git error output exceeds the capture error bound")
+        if returncode:
+            raise subprocess.CalledProcessError(returncode, process.args, output=b"".join(stdout), stderr=b"".join(stderr))
+        return b"".join(stdout)
     except (OSError, subprocess.SubprocessError) as exc:
         detail = getattr(exc, "stderr", b"")
         rendered = detail.decode("utf-8", "replace").strip() if isinstance(detail, bytes) else str(detail or "")
         raise ValueError(f"Could not capture review candidate with git: {rendered or exc}") from exc
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                try:
+                    _stop_git_process(process)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        for stream in streams:
+            stream.join()
 
 
 def _normalize_scope(scope: Iterable[str]) -> tuple[str, ...]:
@@ -417,13 +512,9 @@ def capture_review_candidate(
     patch_bytes = _git(
         root, "diff", "--binary", "--no-ext-diff", "--no-textconv",
         "--ignore-submodules=none", "--submodule=short", base_commit, "--", *pathspecs,
+        max_stdout_bytes=MAX_EVIDENCE_BYTES,
     )
     remaining = MAX_EVIDENCE_BYTES - len(patch_bytes)
-    if remaining < 0:
-        raise ValueError(
-            f"Tracked review evidence ({len(patch_bytes)} bytes) exceeds the "
-            f"{MAX_EVIDENCE_BYTES}-byte aggregate review evidence bound"
-        )
     untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
     untracked_paths = sorted(
         item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item

@@ -188,8 +188,18 @@ class GatewayStartupMixin:
                 task.add_done_callback(completed)
             elif (getattr(event, "_restart_inbox_agent_started", False)
                   and not getattr(event, "_restart_input_admission_failed", False)):
-                if (await asyncio.to_thread(linked_row, event._restart_inbox_claim))["state"] == "delivered":
-                    self._schedule_restart_inbox_drain()
+                # The turn has executed and owns the claim. A transient DB read failure must not
+                # release it (which could replay executed input), nor abort settlement of later rows.
+                try:
+                    linked = await asyncio.to_thread(linked_row, event._restart_inbox_claim)
+                except Exception:
+                    logger.exception(
+                        "Could not read executed restart inbox claim %s; preserving it for reconciliation",
+                        row["queue_id"],
+                    )
+                else:
+                    if linked["state"] == "delivered":
+                        self._schedule_restart_inbox_drain()
             if (not getattr(event, "_restart_input_admission_failed", False)
                     and not getattr(event, "_restart_inbox_agent_started", False)
                     and (not isinstance(session_tasks, dict) or not session_tasks.get(row["session_key"]))):

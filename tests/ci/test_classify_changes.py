@@ -8,6 +8,7 @@ change could have broken.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -424,10 +425,10 @@ def test_detect_changes_retries_then_classifies_with_immutable_compare(tmp_path:
     [
         "__FAIL__",
         "not json",
-        '{"files": [' + ",".join('{"filename": "docs/%s.md"}' % i for i in range(300)) + "]}",
         '{"files": [{}]}',
+        json.dumps({"files": [{"filename": "valid.py"}] * 299 + [{}]}),
     ],
-    ids=["api-exhausted", "malformed", "truncated", "invalid-file"],
+    ids=["api-exhausted", "malformed", "invalid-file", "invalid-file-at-cap"],
 )
 def test_detect_changes_blocks_after_exhausted_untrusted_compare(
     tmp_path: Path, response: str
@@ -438,6 +439,25 @@ def test_detect_changes_blocks_after_exhausted_untrusted_compare(
     assert calls.read_text() == "3"
     assert sleeps.read_text().splitlines() == ["10", "10"]
     assert not output.exists(), "the classifier must not emit lane outputs after compare failure"
+
+
+def test_detect_changes_selects_all_lanes_for_a_capped_compare_response(tmp_path: Path) -> None:
+    response = '{"files": [' + ",".join(
+        '{"filename": "docs/%s.md"}' % index for index in range(300)
+    ) + "]}"
+    completed, output, calls, sleeps = _run_detect_changes(tmp_path, [response])
+
+    assert completed.returncode == 0, completed.stderr
+    assert calls.read_text() == "1"
+    assert not sleeps.exists()
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert all(
+        value == "true"
+        for lane, value in outputs.items()
+        if lane not in {"mcp_catalog", "ci_review_files"}
+    )
+    assert outputs["mcp_catalog"] == "false"
+    assert outputs["ci_review_files"] == "[]"
 
 
 def test_detect_changes_accepts_a_valid_empty_immutable_diff(tmp_path: Path) -> None:

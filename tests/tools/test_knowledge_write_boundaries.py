@@ -213,6 +213,7 @@ def test_literal_symlink_target_refused_before_terminal_dispatch(tmp_path, monke
 @pytest.mark.parametrize("source", [
     "rm -rf {home}", "/bin/rm --recursive --force -- {home}",
     "echo ready; rm -r {home}", "mv {home} displaced",
+    "bash -lc 'rm -rf {home}'", "bash -cl 'rm -rf {home}'",
     'python -c "import shutil; shutil.rmtree({quoted})"',
 ])
 def test_destructive_ancestor_refused_before_terminal_dispatch(tmp_path, monkeypatch, source):
@@ -236,6 +237,7 @@ def test_destructive_ancestor_refused_before_terminal_dispatch(tmp_path, monkeyp
     "from shutil import rmtree as wipe; wipe(path={home})",
     "import os; os.rename({home}, 'displaced')",
     "from pathlib import Path; Path({home}).rename('displaced')",
+    "import subprocess; subprocess.run(args=['rm', '-rf', {home}])",
     "shell-literal",
 ])
 def test_execute_code_destructive_literal_ancestor_never_spawns(tmp_path, monkeypatch, source):

@@ -1135,7 +1135,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
             session.append_output(
                 "\nDeadline expired; termination could not be confirmed. The process may still be "
                 "running. Reconcile external effects before retrying.\n")
-        delay = min(DEADLINE_KILL_RETRY_SECONDS * (2 ** (attempts - 1)), DEADLINE_KILL_RETRY_MAX_SECONDS)
+        # Cap the exponent before computing it: persisted attempt counts can come from
+        # an older crashed registry and may be arbitrarily large. Capping only the
+        # result still constructs an enormous integer and can overflow converting it
+        # to the float retry interval.
+        if DEADLINE_KILL_RETRY_SECONDS >= DEADLINE_KILL_RETRY_MAX_SECONDS:
+            delay = DEADLINE_KILL_RETRY_MAX_SECONDS
+        else:
+            import math
+            max_exponent = math.ceil(math.log2(DEADLINE_KILL_RETRY_MAX_SECONDS / DEADLINE_KILL_RETRY_SECONDS))
+            exponent = min(max(attempts - 1, 0), max_exponent)
+            delay = min(DEADLINE_KILL_RETRY_SECONDS * (2 ** exponent), DEADLINE_KILL_RETRY_MAX_SECONDS)
         logger.warning(
             "Deadline kill of %s unconfirmed (attempt %d: %s); process kept as running, retrying in %.0fs",
             session.id, attempts, error, delay)
@@ -1920,8 +1930,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     os.kill(session.pid, signal.SIGTERM)
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
-            # leaves Git Bash descendants behind.
+            # leaves Git Bash descendants behind. Reap the direct child before the
+            # deadline path publishes completion; after a successful signal, a caller
+            # can otherwise observe the timeout result while ``Popen.poll()`` still
+            # reports the unreaped child as running.
             self._terminate_host_pid(session.process.pid, session.host_start_time)
+            try:
+                session.process.wait(timeout=1)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("local process termination could not be confirmed") from exc
         elif session.env_ref and session.pid:
             if session.sandbox_process_group:
                 # New sandbox wrappers run as a job-control process group. Kill

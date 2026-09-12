@@ -2,7 +2,9 @@
 import json
 import shlex
 import shutil
+import subprocess
 import sys
+import threading
 import time
 from unittest.mock import Mock
 
@@ -38,6 +40,35 @@ def test_explicit_deadline_exits_once_and_preserves_timeout_result(registry):
     registry._move_to_finished(session)
     assert session.exit_code == 124
     assert registry.completion_queue.empty()
+
+
+def test_deadline_completion_waits_for_local_process_reap(registry, monkeypatch):
+    reap_started = threading.Event()
+    allow_reap = threading.Event()
+
+    def wait_for_reap(timeout):
+        reap_started.set()
+        if not allow_reap.wait(timeout):
+            raise subprocess.TimeoutExpired("process", timeout)
+        return -15
+
+    process = Mock()
+    process.pid = 1234
+    process.wait.side_effect = wait_for_reap
+    session = ProcessSession(id="proc_reap", command="verification", started_at=time.time(), process=process)
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_terminate_host_pid", lambda *args: None)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        registry.kill_process(session.id, source="terminal.timeout", consume_output=False)))
+    worker.start()
+    assert reap_started.wait(1), "deadline kill did not wait for local process reap"
+    assert not session._completion_event.is_set()
+    allow_reap.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert result[0]["status"] == "timed_out"
+    assert session._completion_event.is_set()
 
 
 def test_large_finite_deadline_keeps_watchdog_alive(registry):
@@ -271,6 +302,24 @@ def test_unconfirmed_backoff_is_bounded(registry, monkeypatch):
     assert delays == [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
     assert session.termination_attempts == 6 and session.termination_error == "err 5"
     assert not session.exited
+
+
+def test_unconfirmed_backoff_handles_huge_persisted_attempt_count(registry, monkeypatch):
+    session = ProcessSession(id="proc_huge_backoff", command="x", pid=1234, host_start_time=5678,
+                             started_at=time.time(), termination_attempts=1_000_000)
+    registry._running[session.id] = session
+    registry._write_checkpoint()
+    recovered = ProcessRegistry()
+    monkeypatch.setattr(recovered, "_host_pid_is_ours", lambda *args: True)
+    monkeypatch.setattr(recovered, "_start_deadline", Mock())
+    assert recovered.recover_from_checkpoint() == 1
+    restored = recovered.get(session.id)
+    assert restored is not None
+    monkeypatch.setattr(recovered, "_write_checkpoint", lambda *a, **k: None)
+    assert recovered._record_unconfirmed_termination(restored, "backend unavailable") == module.DEADLINE_KILL_RETRY_MAX_SECONDS
+    assert restored.termination_attempts == 1_000_001
+    registry._running.clear()
+    recovered._running.clear()
 
 
 def test_unconfirmed_state_survives_checkpoint_recovery(registry, monkeypatch):

@@ -882,6 +882,52 @@ class TestReviewBugFixes:
         det.assert_not_called()  # guard fires before detection
         bt._real_profile_cdp_cache.clear()
 
+    def test_named_identity_without_profile_fails_before_source_access(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        monkeypatch.setattr(bc, "_real_profile_refresh_mode", lambda: ("initial", None))
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: None)
+        monkeypatch.setattr(
+            bc,
+            "real_profile_copy_dir",
+            lambda *_args, **_kwargs: pytest.fail("ambiguous identity must not resolve a snapshot path"),
+        )
+        monkeypatch.setattr(
+            bc,
+            "_last_used_profile",
+            lambda *_args: pytest.fail("ambiguous identity must not inspect the source profile"),
+        )
+
+        dst, err = bc.snapshot_real_profile(
+            "chrome", src=str(tmp_path / "source"), identity="work"
+        )
+
+        assert dst is None
+        assert err and "explicit source_profile" in err
+
+    def test_explicit_named_profile_reuses_durable_snapshot_without_source(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        src = self._multi_profile(tmp_path / "real")
+        home = tmp_path / "hh"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_refresh_mode", lambda: ("initial", None))
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: None)
+
+        first, first_err = bc.snapshot_real_profile(
+            "chrome", src=str(src), source_profile="Profile 6", identity="work"
+        )
+        assert first_err is None and first
+
+        second, second_err = bc.snapshot_real_profile(
+            "chrome",
+            src=str(tmp_path / "source-now-unavailable"),
+            source_profile="Profile 6",
+            identity="work",
+        )
+
+        assert second_err is None and second == first
+
 
 class TestReviewRound3:
     """Regressions for the round-3 review findings (Adolanium + kshitij)."""
@@ -1102,25 +1148,76 @@ class TestReviewRound3:
         bt._real_profile_cdp_cache.clear()
 
     def test_relaunch_path_does_snapshot(self, tmp_path):
-        """When there's no reusable session, the overlay DOES run (relaunch)."""
+        """When there's no reusable session, the overlay DOES run (relaunch).
+
+        The live Chrome launch seam is patched here so this regression can never
+        spawn a real browser or leave a child process behind while the rest of
+        this file runs.
+        """
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
+        launched = []
+
+        class FakeChrome:
+            pid = 4242
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def fake_popen(argv, **kwargs):
+            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            proc = FakeChrome()
+            launched.append(proc)
+            return proc
+
         proc = Mock(returncode=0, stdout="", stderr="")
-        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
-             patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile",
-                   return_value=(str(tmp_path), None)) as snap, \
-             patch.object(bt_real_profile, "_agent_browser_get_cdp",
-                          side_effect=[None, "http://127.0.0.1:9251"]), \
-             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
-            cdp, err = bt_real_profile._real_profile_cdp()
-        assert err is None
-        snap.assert_called_once()
-        bt._real_profile_cdp_cache.clear()
+        try:
+            with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+                 patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
+                 patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+                 patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
+                 patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
+                 patch("hermes_cli.browser_connect.snapshot_real_profile",
+                       return_value=(str(tmp_path), None)) as snap, \
+                 patch.object(bt_real_profile, "_agent_browser_get_cdp",
+                              side_effect=[None, "http://127.0.0.1:9251"]), \
+                 patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+                 patch.object(bt_real_profile.subprocess, "Popen", side_effect=fake_popen), \
+                 patch.object(bt.subprocess, "run", return_value=proc), \
+                 patch.object(bt, "_cdp_http_ready", return_value=True), \
+                 patch.object(bt, "_cdp_owned_by_data_dir", return_value=True), \
+                 patch("hermes_cli.browser_connect.stop_snapshot_browser_processes", return_value=0), \
+                 patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+                cdp, err = bt_real_profile._real_profile_cdp()
+
+            assert err is None
+            assert cdp == "http://127.0.0.1:41000"
+            snap.assert_called_once()
+            assert launched
+        finally:
+            # Reap the fake live browser before fixture teardown/reset, so no
+            # tracked child can affect later tests in this file.
+            for cache_key in list(bt._real_profile_browser_processes):
+                bt._stop_real_profile_browser(cache_key)
+            bt._real_profile_cdp_cache.clear()
+            bt._real_profile_headed_modes.clear()
+            bt._real_profile_session_names.clear()
+            bt._real_profile_session_homes.clear()
+            bt._real_profile_browser_processes.clear()
+
+        assert launched[0].returncode == -15
 
 
 class TestWindowsLockedProfileCopy:

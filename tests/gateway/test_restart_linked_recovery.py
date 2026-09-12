@@ -499,6 +499,61 @@ async def test_adapter_busy_race_refuses_before_coalescing(state):
 
 
 @pytest.mark.asyncio
+async def test_settlement_read_failure_preserves_executed_claim_and_dispatches_remaining(state, monkeypatch):
+    store, first_entry, first_event, path = state
+    second_source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="second-chat", user_id="owner", chat_type="dm"
+    )
+    second_entry = store.get_or_create_session(second_source)
+    second_event = MessageEvent(
+        text="second input", source=second_source, message_type=MessageType.TEXT,
+        message_id="second-message",
+    )
+    first_id = inbox.record_event(first_entry.session_key, first_event)
+    second_id = inbox.record_event(second_entry.session_key, second_event)
+    orphan(path, first_id)
+    orphan(path, second_id)
+
+    runner, adapter = make_restart_runner()
+    runner.session_store = store
+    # The real lifecycle schedules another drain after settlement. Keep this test focused on the
+    # current preclaimed batch while still using the real SQLite claim/dispatch/finalization path.
+    runner._schedule_restart_inbox_drain = MagicMock()
+    original_linked_row = inbox.linked_row
+
+    async def handle(replay):
+        session_key = {
+            first_event.source.chat_id: first_entry.session_key,
+            second_source.chat_id: second_entry.session_key,
+        }[replay.source.chat_id]
+        assert await runner._mark_durable_active_turn(replay, session_key)
+        if replay._restart_inbox_queue_id == first_id:
+            def flaky_linked_row(link):
+                if link["queue_id"] == first_id:
+                    raise OSError("inbox settlement read failed")
+                return original_linked_row(link)
+            monkeypatch.setattr(inbox, "linked_row", flaky_linked_row)
+            return
+        assert await runner._clear_durable_active_turn(replay)
+
+    adapter.handle_message = AsyncMock(side_effect=handle)
+
+    assert await runner._drain_restart_inbox() == 2
+    assert {call.args[0]._restart_inbox_queue_id for call in adapter.handle_message.await_args_list} == {
+        first_id, second_id
+    }
+    rows = {row["queue_id"]: row for row in inbox.read_rows(path)}
+    # The first turn executed, so its claim remains attempting/owned for reconciliation; it must
+    # not be released and replayed merely because the settlement read was unavailable.
+    assert rows[first_id]["state"] == "attempting"
+    assert rows[first_id]["attempts"] == 1
+    assert first_entry.restart_inbox_link and first_entry.restart_inbox_link["mode"] == "active"
+    # A later preclaimed row still settles in the same batch.
+    assert rows[second_id]["state"] == "delivered"
+    assert not second_entry.restart_inbox_link
+
+
+@pytest.mark.asyncio
 async def test_fast_completed_model_schedules_remaining_inbox(state):
     store, entry, event, path = state
     first = inbox.record_event(entry.session_key, event)

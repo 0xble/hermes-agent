@@ -20,12 +20,11 @@ def extract_complete_file_list(payload: str) -> list[str]:
     if not isinstance(files, list):
         raise ValueError("compare response files must be a list")
     # GitHub's compare endpoint does not expose a total file count and caps the
-    # response at 300 files. Treat a response at the cap as potentially
-    # truncated and make the caller fail open to all CI lanes.
-    if len(files) >= 300:
-        raise ValueError(
-            f"compare response reached GitHub's 300-file cap: returned_files={len(files)}"
-        )
+    # response at 300 files. An empty list is the classifier's conservative
+    # all-lanes signal, so use it when the response may be truncated. Keep
+    # malformed API responses below fail-closed: only a valid list at the cap
+    # can take this path.
+    capped = len(files) >= 300
 
     filenames: list[str] = []
     for index, item in enumerate(files):
@@ -40,7 +39,7 @@ def extract_complete_file_list(payload: str) -> list[str]:
                 )
             filenames.append(previous)
         filenames.append(item["filename"])
-    return list(dict.fromkeys(filenames))
+    return [] if capped else list(dict.fromkeys(filenames))
 
 
 def main() -> int:

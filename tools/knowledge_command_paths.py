@@ -109,7 +109,14 @@ def _shell_paths(tokens: list[str], depth: int) -> tuple[list[str], list[str], l
             moves.append(move)
     if name in {"sh", "bash", "zsh", "dash", "ksh"} or re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", name):
         for index, option in enumerate(args[:-1]):
-            if option == "-c":
+            has_command_flag = option == "-c" or (
+                name in {"sh", "bash", "zsh", "dash", "ksh"}
+                and option.startswith("-")
+                and not option.startswith("--")
+                and option[1:].isalpha()
+                and "c" in option[1:]
+            )
+            if has_command_flag:
                 more_refs, more_targets, more_moves = literal_paths(
                     args[index + 1], python_source=name.startswith("python"), _depth=depth + 1)
                 refs.extend(more_refs)
@@ -208,9 +215,10 @@ def _python_paths(source: str, depth: int) -> tuple[list[str], list[str], list[s
                 operand = node.func.value
         if operand is not None and (target := path(operand)) is not None:
             targets.append(target)
-        if not node.args:
+        first = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "args"), None)
+        if first is None:
             continue
-        first = node.args[0]
         if name in {"os.system", "os.popen", "exec", "eval"} and isinstance(first, ast.Constant) and isinstance(first.value, str):
             more_refs, more_targets, more_moves = literal_paths(first.value, python_source=name in {"exec", "eval"}, _depth=depth + 1)
             refs.extend(more_refs)

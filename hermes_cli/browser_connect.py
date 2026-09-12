@@ -900,6 +900,19 @@ def snapshot_real_profile(
     if refresh_error:
         return None, refresh_error
 
+    # Named identities must carry an explicit source-profile binding. Without
+    # one, resolving the mutable last-used profile would make the durable path
+    # key differ between the pre-source lookup and the eventual publication.
+    # Fail closed before touching the source data directory; callers that have
+    # a configured real_profile_pin still provide an explicit binding.
+    configured_pin = _real_profile_pin()
+    if identity is not None and not source_profile and not configured_pin:
+        return None, (
+            "named browser identities require an explicit source_profile (or "
+            "browser.real_profile_pin); refusing to resolve a mutable last-used "
+            "profile"
+        )
+
     # Durable managed profiles must not depend on the normal browser after the
     # initial seed. Resolve their identity-owned destination and completion
     # marker before touching the source profile, which may be unavailable or
@@ -909,7 +922,7 @@ def snapshot_real_profile(
         # identity. A changed pin must not silently adopt the old snapshot. With
         # no pin, the completion marker is the durable source-of-truth after the
         # first active-profile seed.
-        durable_requested_profile = source_profile or _real_profile_pin()
+        durable_requested_profile = source_profile or configured_pin
         durable_dst = real_profile_copy_dir(
             browser,
             identity=identity,

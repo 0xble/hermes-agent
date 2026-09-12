@@ -6,6 +6,8 @@ import base64
 import json
 import os
 import subprocess
+import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -482,6 +484,12 @@ def test_valid_replacement_character_and_binary_patch_roundtrip(candidate_repo):
     path.write_bytes(b"after\0\x81")
     (candidate_repo / "tracked.py").write_text("value = '�'\n", encoding="utf-8")
     candidate = capture_review_candidate(candidate_repo, "HEAD", ["tracked.py", "binary.dat"])
+    expected_patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none",
+         "--submodule=short", "HEAD", "--", ":(literal)tracked.py", ":(literal)binary.dat"],
+        cwd=candidate_repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout
+    assert candidate.tracked_patch.encode("utf-8") == expected_patch
     assert "GIT binary patch" in candidate.tracked_patch
     assert "�" in candidate.tracked_patch
     assert ReviewCandidateV1.from_payload(json.loads(candidate.to_json())) == candidate
@@ -624,6 +632,69 @@ def test_tracked_patch_counts_against_aggregate_evidence_bound(candidate_repo, m
     monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", patch_size + 20)
     with pytest.raises(ValueError, match="new.txt exceeds the 20-byte review evidence bound"):
         capture_review_candidate(candidate_repo, base, ["tracked.py", "new.txt"])
+
+
+def test_tracked_patch_bound_stops_and_reaps_streaming_producer(candidate_repo, monkeypatch, tmp_path):
+    from agent import review_candidate as capture
+
+    stopped = tmp_path / "producer-stopped"
+    producer = (
+        "import os, signal, sys\n"
+        f"stopped = {str(stopped)!r}\n"
+        "def stop(*_):\n"
+        "    open(stopped, 'w').write(str(os.getpid()))\n"
+        "    raise SystemExit\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "while True:\n"
+        "    os.write(sys.stdout.fileno(), b'x' * 1024)\n"
+    )
+    real_popen = subprocess.Popen
+
+    def streaming_producer(_args, **kwargs):
+        return real_popen([sys.executable, "-c", producer], **kwargs)
+
+    monkeypatch.setattr(capture.subprocess, "Popen", streaming_producer)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 4096)
+    with pytest.raises(ValueError, match="Tracked review evidence .* exceeds the 4096-byte aggregate"):
+        capture._git(candidate_repo, "diff", max_stdout_bytes=capture.MAX_EVIDENCE_BYTES)
+    pid = int(stopped.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_git_timeout_stops_and_reaps_producer(candidate_repo, monkeypatch, tmp_path):
+    from agent import review_candidate as capture
+
+    stopped = tmp_path / "producer-stopped"
+    ready = tmp_path / "producer-ready"
+    producer = (
+        "import os, signal, time\n"
+        f"stopped = {str(stopped)!r}\n"
+        f"ready = {str(ready)!r}\n"
+        "def stop(*_):\n"
+        "    open(stopped, 'w').write(str(os.getpid()))\n"
+        "    raise SystemExit\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "open(ready, 'w').close()\n"
+        "time.sleep(60)\n"
+    )
+    real_popen = subprocess.Popen
+
+    def sleeping_producer(_args, **kwargs):
+        process = real_popen([sys.executable, "-c", producer], **kwargs)
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        return process
+
+    monkeypatch.setattr(capture.subprocess, "Popen", sleeping_producer)
+    monkeypatch.setattr(capture, "_GIT_TIMEOUT_SECONDS", 0.01)
+    with pytest.raises(ValueError, match="timed out"):
+        capture._git(candidate_repo, "diff", max_stdout_bytes=64)
+    pid = int(stopped.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 @requires_descriptor_capture
