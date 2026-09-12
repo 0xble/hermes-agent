@@ -378,6 +378,15 @@ class DelegationCards:
             card["generation"] += 1
             self._bind(key)
             anchor = self.cards[self._anchor(key)]
+            if (anchor.get("message_deleted") and not anchor.get("message_id")
+                    and not anchor.get("reanchor")):
+                # Only confirmed retirement plus this validated admission grants
+                # a fresh send. Bind first: a live topic survivor needs only edit.
+                anchor.update(send_attempts=0, rendered="", delete_attempts=0,
+                              recoveries=0, rejections=0)
+                anchor.pop("message_deleted", None)
+                anchor.pop("delete_retry_at", None)
+                anchor.pop("retry_at", None)
             if anchoring.pending(anchor):
                 # Only the validated new attempt above grants another burst.
                 anchor["reanchor"]["new_work_pending"] = True

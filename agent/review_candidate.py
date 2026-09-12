@@ -539,6 +539,12 @@ def capture_review_candidate(
     base_commit = _git(root, "rev-parse", "--verify", f"{base_revision}^{{commit}}").decode().strip()
     head_commit = _git(root, "rev-parse", "--verify", "HEAD^{commit}").decode().strip()
     pathspecs = _literal_pathspecs(scope)
+    # Diff trusts index flags and can silently omit changed worktree bytes.
+    # Sparse/assume-unchanged entries are not provable evidence: never clear them.
+    flagged = _git(root, "ls-files", "-v", "-z", "--", *pathspecs)
+    if any(entry[:1].islower() or entry[:1] == b"S" for entry in _bounded_entries(flagged)):
+        raise ValueError("Tracked index flags in accepted scope prevent proving review bytes "
+                         "(assume-unchanged or skip-worktree, including sparse checkout)")
     _reject_dirty_submodules(root, pathspecs)
     patch_bytes = _git(
         root, *_filter_guards(root), "diff", "--binary", "--no-ext-diff", "--no-textconv",

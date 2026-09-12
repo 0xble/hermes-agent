@@ -153,7 +153,8 @@ def _resume_fixture(monkeypatch):
     return metadata, parse_definitions(cfg), type("P", (), {"session_id": "parent", "_session_db": DB()})()
 
 
-def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resumes(monkeypatch):
+@pytest.mark.parametrize("endpoint", ["https://fixture/v1", "http://[::1]:8000/v1"])
+def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resumes(monkeypatch, endpoint):
     """Durable primary metadata is public; the in-memory pin remains exact."""
     from tools import delegate_tool
     from tools.custom_subagents import parse_definitions
@@ -179,7 +180,7 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     )
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
     monkeypatch.setattr(delegate_tool, "_resolve_child_runtime", lambda *_a, **_k: {
-        "provider": "fixture", "model": "m", "base_url": "https://fixture/v1",
+        "provider": "fixture", "model": "m", "base_url": endpoint,
         "api_key": "PRIMARY-API-SENTINEL", "api_mode": "chat_completions",
         "fallback_model": None,
     })
@@ -190,11 +191,12 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
 
     child = delegate_tool._build_child_agent(
         0, "analyze", None, None, "m", 1, 1, parent, override_provider="fixture",
-        override_base_url="https://fixture/v1", override_api_key="PRIMARY-API-SENTINEL",
+        override_base_url=endpoint, override_api_key="PRIMARY-API-SENTINEL",
         override_api_mode="chat_completions", override_request_overrides=raw_overrides,
         subagent_definition=definition,
     )
     launch = child._delegation_launch_metadata
+    assert launch["base_url"] == endpoint
     durable = json.dumps(launch)
     assert launch["request_overrides"] == {"max_output_tokens": 321, "nested": {"safe": "value"}}
     assert all(sentinel not in durable for sentinel in (
@@ -205,12 +207,12 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     pin = child._delegation_runtime_pin
     assert "PRIMARY-AUTH-SENTINEL" in pin.request_overrides_json
     pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
-        api_key="PRIMARY-API-SENTINEL", base_url="https://fixture/v1",
+        api_key="PRIMARY-API-SENTINEL", base_url=endpoint,
     ))
     child.request_overrides = {"max_output_tokens": 321}
     with pytest.raises(ValueError, match="pinned request overrides changed"):
         pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
-            api_key="PRIMARY-API-SENTINEL", base_url="https://fixture/v1",
+            api_key="PRIMARY-API-SENTINEL", base_url=endpoint,
         ))
 
     child.request_overrides = raw_overrides
@@ -223,7 +225,7 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     resume_parent = SimpleNamespace(session_id="root", _session_db=DB())
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_k: {
-        "provider": "fixture", "model": "m", "base_url": "https://fixture/v1",
+        "provider": "fixture", "model": "m", "base_url": endpoint,
         "api_key": "PRIMARY-API-SENTINEL", "api_mode": "chat_completions",
         "request_overrides": raw_overrides,
     })

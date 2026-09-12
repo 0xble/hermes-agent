@@ -67,6 +67,37 @@ def candidate_repo(tmp_path):
     return repo
 
 
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_flagged_tracked_scope_is_rejected_without_mutating_index(candidate_repo, flag):
+    repo = candidate_repo
+    _git(repo, "update-index", "--" + flag, "tracked.py")
+    (repo / "tracked.py").write_text("hidden = 2\n")
+    (repo / "other.py").write_text("visible = 2\n")
+    before = (repo / ".git/index").read_bytes()
+    with pytest.raises(ValueError, match="index flags"):
+        capture_review_candidate(repo, "HEAD", ["tracked.py", "other.py"])
+    assert (repo / ".git/index").read_bytes() == before
+
+
+@pytest.mark.parametrize("flag", ["assume-unchanged", "skip-worktree"])
+def test_flag_guard_is_literal_scoped_and_applies_to_freshness(candidate_repo, flag):
+    repo = candidate_repo
+    (repo / "visible.py").write_text("base\n")
+    _git(repo, "add", "visible.py")
+    _git(repo, "commit", "-qm", "visible")
+    (repo / "visible.py").write_text("changed\n")
+    candidate = capture_review_candidate(repo, "HEAD", ["tracked.py", "visible.py"])
+    _git(repo, "update-index", "--" + flag, "other.py")
+    (repo / "other.py").write_text("hidden = 2\n")
+    assert require_fresh_candidate(candidate).candidate_id == candidate.candidate_id
+    _git(repo, "update-index", "--" + flag, "tracked.py")
+    (repo / "tracked.py").write_text("hidden = 3\n")
+    before = (repo / ".git/index").read_bytes()
+    with pytest.raises(ValueError, match="index flags"):
+        require_fresh_candidate(candidate)
+    assert (repo / ".git/index").read_bytes() == before
+
+
 @pytest.fixture
 def submodule_repo(tmp_path):
     """Superproject with a checked-out submodule ``sub`` that itself contains ``sub/leaf``."""

@@ -16,6 +16,31 @@ def test_documented_preset_example_expands():
     assert expanded["delegation"]["fallback_providers"][0]["provider"] == "openai"
 
 
+def test_named_preset_config_set_check_and_runtime_expansion(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from hermes_cli import config as c
+    from tools.custom_subagents import parse_definitions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump({
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}},
+        "delegation": {"subagents": {"reader": {"description": "Read", "instructions": "Inspect"}}},
+    }))
+    c.set_config_value("delegation.subagents.reader.model_preset", "plain")
+    assert "not a recognized config key" not in capsys.readouterr().out
+    assert c._validate_config_key("delegation.subagents.reader.model_preset") == (True, None)
+    c._cmd_config_check(SimpleNamespace())
+    assert "delegation.subagents.reader.model_preset" not in capsys.readouterr().out
+    expanded = c.load_config()["delegation"]
+    assert "model_preset" not in expanded["subagents"]["reader"]
+    assert parse_definitions(expanded)["reader"].model == "test/model"
+    assert yaml.safe_load(path.read_text())["delegation"]["subagents"]["reader"]["model_preset"] == "plain"
+    assert not c._validate_config_key("delegation.subagents.reader.model_presett")[0]
+    with pytest.raises(ValueError, match="model_preset"):
+        parse_definitions({"subagents": {"reader": {"description": "Read", "instructions": "Inspect", "model_preset": "plain"}}})
+
+
 def routes():
     return {"model_presets": {
         "primary": {"provider": "provider-a", "model": "model-a", "reasoning_effort": "high", "fallbacks": [{"provider": "provider-b", "model": "model-b", "reasoning_effort": "low"}]},

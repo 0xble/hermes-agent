@@ -3272,12 +3272,12 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
 
 # Fields of a ``delegation.subagents.<name>`` entry, mirrored from
 # tools/custom_subagents so `hermes config set` validates without importing
-# the delegation runtime (which pulls in the provider stack).  Kept honest by
-# tests/test_subagent_audit_recommendations.py, which asserts the two sets
-# stay identical.
+# the delegation runtime (which pulls in the provider stack). The audit regression
+# separates authoring-only fields (expanded before runtime parsing) from the
+# closed runtime field set.
 _SUBAGENT_FIELDS = frozenset({
     "description", "instructions", "provider", "model", "reasoning_effort",
-    "inherit_parent", "moa_presets", "fallbacks",
+    "inherit_parent", "moa_presets", "fallbacks", "model_preset",
 })
 _SUBAGENT_FALLBACK_FIELDS = frozenset({"provider", "model", "reasoning_effort"})
 _SUBAGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*\Z")

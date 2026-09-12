@@ -400,6 +400,8 @@ def _build_child_agent(
                     getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
                 ))),
                 "fallbacks": [route.metadata() for route in resolved_fallback_routes],
+                "fallback_source": ("parent" if subagent_definition.inherit_parent
+                                    and subagent_definition.fallbacks is None else "role"),
                 "enabled_toolsets": list(child_toolsets or []),
                 # Display metadata is deliberately caller-authored, never derived
                 # from the private child goal.  It lets a later named resume keep
@@ -803,9 +805,19 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             raise ValueError("delegated child primary route can no longer be authorized exactly; "
                              "mismatched fields: " + ", ".join(mismatches))
         reasoning = parse_reasoning_effort(effort) if effort is not None else None
-        fallbacks = freeze_fallback_routes(
-            definition, primary_provider=provider, primary_model=model
-        )
+        fallback_source = launch.get("fallback_source")
+        if fallback_source == "parent":
+            # _delegate_from/profile/lineage ownership was proved above. Only
+            # launch-time provenance grants access to this trusted parent's
+            # complete route authority, never today's edited role definition.
+            from tools.custom_subagent_fallbacks import freeze_parent_fallback_routes
+            fallbacks = freeze_parent_fallback_routes(parent_agent, provider, model)
+        elif fallback_source in (None, "role"):
+            # Legacy rows lack provenance: retain global-provider authorization,
+            # never infer parent inheritance or recover secrets from metadata.
+            fallbacks = freeze_fallback_routes(definition, primary_provider=provider, primary_model=model)
+        else:
+            raise ValueError("delegated child fallback authority source is invalid")
         expected_fallbacks = launch.get("fallbacks") or []
         fallbacks, refreshed_accounts = _restore_fallback_authority(
             fallbacks, expected_fallbacks, normalize_route_base_url)

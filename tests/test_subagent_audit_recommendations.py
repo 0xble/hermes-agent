@@ -539,7 +539,7 @@ def test_config_key_validation_matches_the_runtime_field_set():
     from hermes_cli.config import _SUBAGENT_FIELDS, _validate_config_key
     from tools.custom_subagents import SUBAGENT_FIELDS
 
-    assert _SUBAGENT_FIELDS == SUBAGENT_FIELDS
+    assert _SUBAGENT_FIELDS == SUBAGENT_FIELDS | {"model_preset"}
     assert _validate_config_key("delegation.subagents") == (True, None)
     assert _validate_config_key("delegation.subagents.explorer") == (True, None)
     assert _validate_config_key("delegation.subagents.explorer.model") == (True, None)

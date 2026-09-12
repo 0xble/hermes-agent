@@ -92,7 +92,9 @@ def nonsecret_route_url(value: str) -> str:
     try:
         parsed = urlsplit(str(value or ""))
         host = parsed.hostname or ""
-        if parsed.port:
+        if ":" in host:
+            host = f"[{host}]"
+        if parsed.port is not None:
             host = f"{host}:{parsed.port}"
         return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
     except (TypeError, ValueError):
