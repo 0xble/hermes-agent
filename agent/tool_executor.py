@@ -1767,7 +1767,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i, budget=_tool_budget):
             return
 
-        if ref.name == "review_current_work" and not managed.blocked:
+        if ref.name == "review_changes" and not managed.blocked:
             # Candidate capture and dispatch form a hard boundary: later calls in
             # the same model batch could mutate the evidence while its review is
             # running. Preserve tool-call pairing by emitting explicit skips.
@@ -1777,7 +1777,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 notice="post-review tool call(s)",
                 content=(
                     "[Tool execution skipped — {name} was not started because "
-                    "review_current_work ended this tool batch]"
+                    "review_changes ended this tool batch]"
                 ),
                 flush_stage="post-review skipped tool result",
             ):
@@ -1828,7 +1828,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                     notice="post-review tool call(s)",
                     content=(
                         "[Tool execution skipped — {name} was not started because "
-                        "review_current_work ended this tool batch]"
+                        "review_changes ended this tool batch]"
                     ),
                     flush_stage="post-review skipped tool result",
                 )

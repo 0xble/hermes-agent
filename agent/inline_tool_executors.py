@@ -172,12 +172,12 @@ def _desktop_preview(agent, args: dict, ctx: InlineToolContext) -> Any:
     return _handle_preview(args)
 
 
-def _review_current_work(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
+def _review_changes(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
     from agent.review_candidate import capture_review_candidate
     from agent.review_engine import start_review
 
     if getattr(agent, "is_subagent", False) is True or int(getattr(agent, "_delegate_depth", 0) or 0) > 0:
-        raise ValueError("review_current_work is parent-only and cannot be invoked by a delegated child")
+        raise ValueError("review_changes is parent-only and cannot be invoked by a delegated child")
 
     candidate = capture_review_candidate(
         args["repository"], base_revision=args["base_revision"],
@@ -196,7 +196,7 @@ def _review_current_work(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
 
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 INLINE_TOOL_EXECUTORS: Dict[str, InlineToolExecutor] = {
-    "review_current_work": _review_current_work,
+    "review_changes": _review_changes,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

@@ -9,7 +9,7 @@ LEGACY_UNRESTRICTED = "legacy_unrestricted"
 INSPECTION_ONLY = "inspection_only"
 VALID_REVIEW_TOOL_POLICIES = frozenset({LEGACY_UNRESTRICTED, INSPECTION_ONLY})
 INSPECTION_TOOL_NAMES = frozenset({"read_file", "search_files", "skills_list", "skill_view"})
-PARENT_ONLY_REVIEW_TOOLS = frozenset({"review_current_work"})
+PARENT_ONLY_REVIEW_TOOLS = frozenset({"review_changes"})
 
 
 def tool_name_from_definition(definition: Any) -> str:

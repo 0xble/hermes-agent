@@ -7,6 +7,27 @@ import pytest
 from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
 
 
+def test_review_tool_schema_routes_to_parent_context_only():
+    import json
+
+    from model_tools import get_tool_definitions, handle_function_call
+    from tools.registry import registry
+    from tools.review_tool import REVIEW_CHANGES_SCHEMA
+    from toolsets import _HERMES_CORE_TOOLS
+
+    definitions = get_tool_definitions(enabled_toolsets=["review"], quiet_mode=True)
+    name = REVIEW_CHANGES_SCHEMA["name"]
+    assert any(tool["function"] == REVIEW_CHANGES_SCHEMA for tool in definitions)
+    assert name in _HERMES_CORE_TOOLS
+    assert name in INLINE_TOOL_EXECUTORS
+    entry = registry.get_entry(name)
+    assert entry is not None and entry.schema == REVIEW_CHANGES_SCHEMA
+    assert "agent loop" in json.loads(handle_function_call(name, {}))["error"]
+    result = registry.dispatch(name, {})
+    assert isinstance(result, str)
+    assert "parent agent loop" in json.loads(result)["error"]
+
+
 def test_review_tool_dispatches_with_parent_and_candidate():
     parent = SimpleNamespace()
     messages = [{"role": "user", "content": "Review the accepted change"}]
@@ -15,7 +36,7 @@ def test_review_tool_dispatches_with_parent_and_candidate():
     with patch("agent.review_candidate.capture_review_candidate", return_value=candidate) as capture, patch(
         "agent.review_engine.start_review", return_value={"status": "dispatched"}
     ) as dispatch:
-        result = INLINE_TOOL_EXECUTORS["review_current_work"](
+        result = INLINE_TOOL_EXECUTORS["review_changes"](
             parent, args, InlineToolContext("parent-task", messages=messages)
         )
     assert result == {"status": "dispatched"}
@@ -33,14 +54,14 @@ def test_review_tool_keeps_phase_boundary_without_native_status_callback():
     with patch("agent.review_candidate.capture_review_candidate", return_value=object()), patch(
         "agent.review_engine.start_review", return_value={"status": "dispatched", "delegation_id": "review-1"}
     ):
-        INLINE_TOOL_EXECUTORS["review_current_work"](parent, args, InlineToolContext("parent-task", messages=messages))
+        INLINE_TOOL_EXECUTORS["review_changes"](parent, args, InlineToolContext("parent-task", messages=messages))
     assert parent._review_yield_requested is True
 
 
 def test_review_tool_is_parent_only():
     child = SimpleNamespace(is_subagent=True, _delegate_depth=1)
     with pytest.raises(ValueError, match="parent-only"):
-        INLINE_TOOL_EXECUTORS["review_current_work"](
+        INLINE_TOOL_EXECUTORS["review_changes"](
             child,
             {"repository": "/candidate", "base_revision": "HEAD", "accepted_scope": ["a.py"]},
             InlineToolContext("child-task", messages=[]),

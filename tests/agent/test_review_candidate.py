@@ -369,7 +369,7 @@ def test_capture_rejects_real_legacy_encoded_source_before_dispatch(candidate_re
     monkeypatch.setattr("agent.review_engine.start_review", lambda **k: pytest.fail("dispatched lossy evidence"))
     parent = SimpleNamespace()
     with pytest.raises(ValueError, match="UTF-8"):
-        INLINE_TOOL_EXECUTORS["review_current_work"](parent, {
+        INLINE_TOOL_EXECUTORS["review_changes"](parent, {
             "repository": str(candidate_repo), "base_revision": "HEAD", "accepted_scope": ["legacy.py"],
         }, InlineToolContext("test", messages=[]))
     assert not getattr(parent, "_review_yield_requested", False)

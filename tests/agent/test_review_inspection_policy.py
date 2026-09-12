@@ -132,8 +132,8 @@ def test_non_string_synthetic_policy_attribute_does_not_block_normal_agent(monke
 
 def test_delegated_child_schema_hides_parent_only_review_tool():
     child = SimpleNamespace(
-        tools=[{"function": {"name": "review_current_work"}}, {"function": {"name": "read_file"}}],
-        valid_tool_names={"review_current_work", "read_file"},
+        tools=[{"function": {"name": "review_changes"}}, {"function": {"name": "read_file"}}],
+        valid_tool_names={"review_changes", "read_file"},
     )
     remove_parent_only_review_tools(child)
     assert [tool["function"]["name"] for tool in child.tools] == ["read_file"]
@@ -147,7 +147,7 @@ def test_parent_only_contract_blocks_a_child_even_if_a_stale_schema_reintroduces
     called = []
     state = tool_executor._ManagedToolResult(None, {}, [], False, False)
     result = tool_executor._dispatch_authorized_once(
-        child, state, _ref("review_current_work"), execute=lambda _args: called.append(True),
+        child, state, _ref("review_changes"), execute=lambda _args: called.append(True),
         scope_block=None, display_index=None, begin_execution=None, authorization_gate=None,
     )
     assert called == [] and state.blocked is True

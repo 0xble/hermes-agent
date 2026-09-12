@@ -355,20 +355,20 @@ def test_delegated_child_refresh_and_restore_keep_parent_only_review_tool_exclud
     from agent.review_policy import remove_parent_only_review_tools
     from tools import registry as registry_mod
 
-    agent = _agent(["read_file", "review_current_work"])
+    agent = _agent(["read_file", "review_changes"])
     agent._delegate_role = role
     remove_parent_only_review_tools(agent)
-    _serve(monkeypatch, [_tool("read_file"), _tool("review_current_work"), _tool("mcp_late")])
+    _serve(monkeypatch, [_tool("read_file"), _tool("review_changes"), _tool("mcp_late")])
     entries = {
         name: types.SimpleNamespace(name=name, schema=_tool(name)["function"])
-        for name in ("read_file", "review_current_work", "mcp_late")
+        for name in ("read_file", "review_changes", "mcp_late")
     }
     monkeypatch.setattr(registry_mod.registry, "get_all_entries", lambda: list(entries.values()), raising=False)
     monkeypatch.setattr(registry_mod.registry, "get_entry", lambda name, **_kw: entries.get(name), raising=False)
 
     assert _mcp_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True) == {"mcp_late"}
     assert agent.valid_tool_names == {"read_file", "mcp_late"}
-    assert _mcp_agent.restore_agent_tool_prefix(agent, ["review_current_work", "read_file", "mcp_late"]) is False
+    assert _mcp_agent.restore_agent_tool_prefix(agent, ["review_changes", "read_file", "mcp_late"]) is False
     assert agent.valid_tool_names == {"read_file", "mcp_late"}
 
 
