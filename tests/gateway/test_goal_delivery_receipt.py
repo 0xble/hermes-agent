@@ -125,3 +125,93 @@ async def test_receipt_gates_consumption_retry_and_fifo(receipt_context, lane, p
     await callback()  # duplicate receipt cannot claim/queue/evaluate twice
     assert judge.call_count == 1
     assert len(runner._overflow_queue("route") or []) == (0 if pending else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted,depth_limited", [(True, False), (False, False), (True, True)])
+async def test_recursive_delivery_owns_only_its_goal_decision(monkeypatch, tmp_path, interrupted, depth_limited):
+    """A discarded predecessor cannot borrow its successor's generation receipt."""
+    import socket
+    import sys
+    from tests.gateway.test_goal_exactly_once import _NoopAgent
+    from hermes_cli.goal_outcomes import consume_goal_decision
+
+    network_attempts = []
+
+    def forbid(*args, **kwargs):
+        network_attempts.append(args)
+        raise AssertionError("network forbidden")
+
+    monkeypatch.setattr(socket.socket, "connect", forbid)
+    monkeypatch.setattr(socket, "create_connection", forbid)
+    runner = _setup_runner(monkeypatch, tmp_path)
+    adapter = _receipt_adapter()
+    adapter._pending_messages = {}
+    # Keep agent/transport boundaries fake; run real registration, recursive drain,
+    # queued receipt and adapter receipt dispatch with the same generation.
+    old = {"final_response": "predecessor", "messages": [], "completed": not interrupted,
+           "interrupted": interrupted, "pending_steer": "queued user",
+           "_goal_decision": {"should_continue": False}}
+    new = {"final_response": "successor", "messages": [], "completed": True,
+           "_goal_decision": {"should_continue": False}}
+    answers = iter([old, new])
+
+    class Agent(_NoopAgent):
+        def run_conversation(self, *args, **kwargs):
+            return next(answers)
+
+    monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", Agent)
+    cleanup = []
+
+    def schedule_cleanup(response, unused, ctx):
+        ctx._post_delivery_adapter = adapter
+        adapter.register_post_delivery_callback(
+            ctx.session_key, lambda: cleanup.append(response["final_response"]), generation=ctx.run_generation)
+
+    monkeypatch.setattr(runner, "_run_agent_schedule_bubble_cleanup", schedule_cleanup)
+    delivered = []
+
+    async def send_first(text, **kwargs):
+        delivered.append(text)
+        return True
+
+    monkeypatch.setattr(runner, "_deliver_queued_first_response", send_first)
+    evaluated = []
+
+    async def consume(**kwargs):
+        evaluated.append(kwargs["agent_result"]["final_response"])
+        consume_goal_decision(kwargs["agent_result"])
+
+    runner._post_turn_goal_continuation = consume
+    states = []
+    scheduled_results = []
+    schedule = runner._schedule_goal_after_delivery
+
+    def capture(**kwargs):
+        states.append(kwargs["state"])
+        scheduled_results.append(kwargs["agent_result"])
+        schedule(**kwargs)
+
+    runner._schedule_goal_after_delivery = capture
+    # Depth-capped interrupted results are returned for outer delivery, not discarded.
+    if depth_limited:
+        monkeypatch.setattr(runner, "_MAX_INTERRUPT_DEPTH", 0)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+    state = {}
+    result = await runner._run_agent(
+        message="first", context_prompt="", history=[], source=source,
+        session_id="goal-session", session_key="route", run_generation=7,
+        goal_session_entry=SimpleNamespace(session_id="goal-session"), goal_post_turn_state=state,
+    )
+    delivered.append(result["final_response"])
+    callback = adapter._post_delivery_callbacks_by_generation[("route", 7)]
+    await adapter._fire_post_delivery_callback("route", asyncio.Event(), 7)
+    await callback()  # duplicate receipt must not consume any decision again
+    expected = ["predecessor"] if depth_limited else (["successor"] if interrupted else ["predecessor", "successor"])
+    assert delivered == expected
+    assert evaluated == expected
+    assert bool(scheduled_results[0].get("_goal_decision_consumed")) == (not interrupted or depth_limited)
+    assert bool(states[0].get("handled")) == (not interrupted or depth_limited)
+    assert state["delivery"]["handled"]
+    assert set(cleanup) == ({"predecessor"} if depth_limited else {"predecessor", "successor"})
+    assert not network_attempts

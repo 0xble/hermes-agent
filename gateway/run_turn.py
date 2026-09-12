@@ -3715,6 +3715,14 @@ class GatewayTurnMixin:
         # guard will consult. Fail-safe in helper.
         await self._refresh_agent_cache_message_count(session_key, session_id)
 
+        # This response will not be returned for outer delivery. Revoke only its
+        # goal receipt, not the shared generation lane (which also owns cleanup).
+        # Do this after early-return guards: those still return the predecessor.
+        if result.get("interrupted"):
+            delivery_state = getattr(turn_ctx, "_goal_delivery_state", None)
+            if delivery_state is not None:
+                delivery_state["discarded"] = True
+
         followup_result = await self._run_agent(
             goal_user_text=(
                 self._goal_authority_text_for_event(pending_event, typed_text=next_goal_typed_text)
@@ -4216,6 +4224,7 @@ class GatewayTurnMixin:
                 # sees only the terminal turn's registration, never an early
                 # "handled" marker belonging to its predecessor.
                 delivery_state: Dict[str, Any] = {}
+                turn_ctx._goal_delivery_state = delivery_state
                 if goal_post_turn_state is not None:
                     goal_post_turn_state["delivery"] = delivery_state
                 owner = (getattr(turn_ctx, "_post_delivery_owner", None)

@@ -277,7 +277,8 @@ class GatewayGoalsMixin:
 
         async def delivered():
             from gateway.status_delivery import final_delivery_succeeded
-            if not final_delivery_succeeded.get() or state.get("handled"):
+            if (not final_delivery_succeeded.get() or state.get("handled")
+                    or state.get("discarded")):
                 return
             await self._post_turn_goal_continuation(
                 session_entry=session_entry, source=source,
