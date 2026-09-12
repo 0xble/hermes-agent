@@ -11,19 +11,32 @@ import pytest
 from hermes_cli import gateway, main, update_cmd, update_cmd_fleet as fleet, update_receipt as receipt
 
 
-@pytest.mark.parametrize("budget", [50.0, 240.0])
+@pytest.mark.macos_only
+@pytest.mark.parametrize("cron_timeout, replacement_at", [(30, 76.0), (45, 91.0), (0, 51.0)])
 @pytest.mark.parametrize("replacement", ["current", "stale", "never", "down", "empty"])
-def test_restart_verification_waits_for_long_drain_and_finalizes(monkeypatch, tmp_path, replacement, budget):
+def test_restart_verification_waits_for_long_drain_and_finalizes(
+    monkeypatch, tmp_path, replacement, cron_timeout, replacement_at,
+):
+    from hermes_constants import get_hermes_home
+
+    # Real profile config -> CLI resolver -> fleet deadline. The chronology is
+    # after-turn (30s), chat/cron drain, then interruption/cleanup/startup (16s).
+    # In particular, the default cron successor appears after the old 50s cap.
+    (get_hermes_home() / "config.yaml").write_text(
+        f"agent:\n  restart_drain_timeout: 5\n  restart_after_turn_timeout: 30\n"
+        f"  cron_drain_timeout: {cron_timeout}\n", encoding="utf-8",
+    )
+    for key in ("HERMES_RESTART_DRAIN_TIMEOUT", "HERMES_RESTART_AFTER_TURN_TIMEOUT", "HERMES_CRON_DRAIN_TIMEOUT"):
+        monkeypatch.delenv(key, raising=False)
+    budget = gateway._get_restart_exit_wait_budget()
     expected_sha, old_sha = "a" * 40, "b" * 40
     clock = SimpleNamespace(now=0.0)
-    replacement_at = min(126.0, budget - 10)
     probe_times = []
 
     def sleep(seconds):
         clock.now += seconds
 
     monkeypatch.setattr(fleet, "_time", SimpleNamespace(monotonic=lambda: clock.now, time=lambda: clock.now, sleep=sleep))
-    monkeypatch.setattr(gateway, "_get_restart_exit_wait_budget", lambda: budget)
     monkeypatch.setattr(receipt, "_code_identity", lambda **kwargs: {"sha": expected_sha})
     monkeypatch.setattr(receipt, "_profile_homes", lambda: [("default", tmp_path)])
 
@@ -52,9 +65,6 @@ def test_restart_verification_waits_for_long_drain_and_finalizes(monkeypatch, tm
     # A gateway-descendant updater's cleanup scan skips its ancestor; launchd
     # contributes the stderr wrapper instead of the socket-owning gateway.
     from hermes_cli import update_inventory
-    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "is_macos", lambda: True)
-    monkeypatch.setattr(gateway, "is_windows", lambda: False)
     parents = {gateway.os.getpid(): 17178, 17178: 17177, 17177: 1}
     monkeypatch.setattr(gateway, "_get_parent_pid", parents.get)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
@@ -107,7 +117,8 @@ def test_restart_verification_waits_for_long_drain_and_finalizes(monkeypatch, tm
     assert saved["outcome"] == ("success" if replacement == "current" else "partial")
     assert fleet._fleet_restart_pending_marker_path().exists() == (replacement != "current")
     if replacement in {"current", "stale"}:
-        assert replacement_at <= clock.now < budget
+        assert replacement_at <= clock.now <= replacement_at + 2
+        assert clock.now < budget
         assert saved["fleet"][0]["pid"] == 91110
         assert saved["fleet"][0]["state"] == replacement
     else:
