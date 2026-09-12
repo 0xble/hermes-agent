@@ -2378,7 +2378,9 @@ def run_kanban_goal_loop(
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        from hermes_cli.kanban_evidence import collect_kanban_evidence
+        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(
+            goal_text, last_response, tool_evidence=collect_kanban_evidence(task_id))
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")

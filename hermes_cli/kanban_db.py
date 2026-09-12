@@ -993,7 +993,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Runtime-owned attempt transcript binding; never populated from handoff metadata.
+    worker_session_id   TEXT,
+    worker_home         TEXT,
+    worker_start_message_id INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob

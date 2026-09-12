@@ -379,8 +379,10 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     if not task or not task.goal_mode or not _goal_judge_available():
         return
     try:
+        from hermes_cli.kanban_evidence import collect_kanban_evidence
         verdict, reason, _, directive, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+            goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip(),
+            tool_evidence=collect_kanban_evidence(tid, expected_run_id=task.current_run_id))
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)

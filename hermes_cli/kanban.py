@@ -830,8 +830,10 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
     verdict, reason = "done", ""
     try:
+        from hermes_cli.kanban_evidence import collect_kanban_evidence
         verdict, reason, _, directive, _ = judge_goal(goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                                              last_response=evidence.strip())
+            last_response=evidence.strip(),
+            tool_evidence=collect_kanban_evidence(task.id, expected_run_id=task.current_run_id))
     except Exception as judge_exc:
         import logging as _logging
 

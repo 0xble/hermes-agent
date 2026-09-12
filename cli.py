@@ -4083,6 +4083,9 @@ def _run_quiet_single_query(cli, effective_query):
     from agent.interrupt_compat import _accepts_keyword
     from agent.turn_author import take_turn_author_from_env
 
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        from hermes_cli.kanban_evidence import bind_worker_session
+        bind_worker_session(cli.agent)
     author = take_turn_author_from_env()
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
     try:

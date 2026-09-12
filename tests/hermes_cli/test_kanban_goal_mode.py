@@ -153,11 +153,13 @@ class TestCLIJudgeGate:
         from hermes_cli.kanban import _cmd_complete
 
         fake_task = types.SimpleNamespace(
+            id="t1", current_run_id=None,
             goal_mode=goal_mode,
             title="Finish report",
             body="acceptance: criteria",
         )
         fake_conn = MagicMock()
+        fake_conn.execute.return_value.fetchone.return_value = None
         complete_calls: list = []
 
         def fake_connect_closing():
