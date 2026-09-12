@@ -3,8 +3,8 @@
 from tools.registry import registry, tool_error
 
 
-REVIEW_CURRENT_WORK_SCHEMA = {
-    "name": "review_current_work",
+REVIEW_CHANGES_SCHEMA = {
+    "name": "review_changes",
     "description": (
         "Capture and dispatch an independent inspection-only review of an explicit Git candidate. "
         "The candidate is bound to repository, base revision, accepted paths, tracked patch, and "
@@ -40,14 +40,14 @@ REVIEW_CURRENT_WORK_SCHEMA = {
 
 def _parent_context_required(args, **_kwargs):
     return tool_error(
-        "review_current_work requires the parent agent loop context and cannot run as a generic tool call."
+        "review_changes requires the parent agent loop context and cannot run as a generic tool call."
     )
 
 
 registry.register(
-    name="review_current_work",
+    name="review_changes",
     toolset="review",
-    schema=REVIEW_CURRENT_WORK_SCHEMA,
+    schema=REVIEW_CHANGES_SCHEMA,
     handler=_parent_context_required,
     emoji="⚖",
 )

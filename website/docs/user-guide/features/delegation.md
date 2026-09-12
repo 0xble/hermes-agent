@@ -457,6 +457,24 @@ Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then
 
 Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
 
+## The `review_changes` Tool
+
+In this maintained fork, the parent agent can call `review_changes` to request an
+independent, inspection-only review of an explicit Git candidate. It takes
+`repository`, `base_revision`, and `accepted_scope` (repository-relative paths),
+plus an optional `focus`. Candidate capture binds the tracked patch and untracked
+file bytes to that repository, base, and scope.
+
+The tool uses the existing native review engine and `auxiliary.review` routing.
+Dispatch ends the current tool batch, skips later calls in that batch, and yields
+the parent until the existing completion route returns the review. Delegated
+children cannot invoke it. It is not a generic tool-execution endpoint: it needs
+the parent agent-loop context.
+
+This model-facing tool does not rename or change the human `/review` command
+below. Existing sessions retain their cached tool surface until a fresh runtime
+and session adopt the updated schema.
+
 ## The `/review` Command
 
 `/review` spawns an independent, full-privilege background subagent whose only job is to review the work your conversation just produced — a PR, a diff, code, documentation, a design. It works on every surface: CLI, TUI, the Desktop app, and every gateway messaging platform.

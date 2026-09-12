@@ -5,7 +5,7 @@ from agent.review_policy import filter_child_tool_snapshot, remove_parent_only_r
 
 
 def test_child_exclusion_preserves_staged_name_only_tools():
-    agent = SimpleNamespace(tools=[{'name': 'read_file'}], valid_tool_names={'read_file', 'terminal', 'review_current_work'})
+    agent = SimpleNamespace(tools=[{'name': 'read_file'}], valid_tool_names={'read_file', 'terminal', 'review_changes'})
     remove_parent_only_review_tools(agent)
     assert agent.valid_tool_names == {'read_file', 'terminal'}
     defs, names = filter_child_tool_snapshot(SimpleNamespace(), [{'name':'read_file'}], {'read_file','engine_tool'})

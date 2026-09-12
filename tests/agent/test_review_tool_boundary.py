@@ -9,8 +9,8 @@ def _call(name, call_id):
     return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments="{}"))
 
 
-def test_review_current_work_skips_remaining_sequential_calls(monkeypatch):
-    calls = [_call("review_current_work", "review"), _call("write_file", "write")]
+def test_review_changes_skips_remaining_sequential_calls(monkeypatch):
+    calls = [_call("review_changes", "review"), _call("write_file", "write")]
     executed = []
     skipped = []
     agent = SimpleNamespace(
@@ -46,5 +46,5 @@ def test_review_current_work_skips_remaining_sequential_calls(monkeypatch):
         agent, SimpleNamespace(tool_calls=calls), [], "task",
     )
 
-    assert executed == ["review_current_work"]
+    assert executed == ["review_changes"]
     assert [call.function.name for call in skipped] == ["write_file"]

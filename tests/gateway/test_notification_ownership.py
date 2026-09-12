@@ -181,7 +181,7 @@ async def test_cancelled_accepted_progress_receipt_is_cleaned_after_final():
     c, t = turn(g, "101")
     w.block_once = True
     c.progress_callback(
-        "tool.started", "review_current_work", preview="Review candidate"
+        "tool.started", "review_changes", preview="Review candidate"
     )
     task = asyncio.create_task(t.send_progress_messages())
     await asyncio.wait_for(w.accepted.wait(), 5)
