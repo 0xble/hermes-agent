@@ -251,7 +251,8 @@ def _format_native_review(evt: dict, deleg_id: str, completed_at: float) -> str:
         )
         require_fresh_candidate(candidate)
     except Exception as exc:
-        candidate_id = str((contract.get("candidate") or {}).get("candidate_id") or "")
+        payload = contract.get("candidate") if isinstance(contract, dict) else None
+        candidate_id = str(payload.get("candidate_id") or "") if isinstance(payload, dict) else ""
         result = NativeReviewResultV1(
             candidate_id=candidate_id,
             runtime_status=str(evt.get("status") or "failed"),

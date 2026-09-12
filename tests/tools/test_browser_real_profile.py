@@ -267,6 +267,35 @@ class TestRealProfileCdpLaunch:
         assert cdp is None
         assert "already running headed" in err
 
+    @pytest.mark.parametrize("live_runtime", ["cache", "existing", "recovered"])
+    def test_explicit_headed_without_display_cannot_reuse_headless(self, tmp_path, monkeypatch, live_runtime):
+        import tools.browser_tool as bt
+        from hermes_cli.browser_identity import BrowserIdentity
+
+        identity = BrowserIdentity("work", "chrome", "Default", "fixture-runtime")
+        _session, _lock, cache_key = bt._real_profile_runtime_resources(identity)
+        endpoint = "http://127.0.0.1:9222"
+        if live_runtime == "cache":
+            bt._real_profile_cdp_cache[cache_key] = endpoint
+            bt._real_profile_headed_modes[cache_key] = False
+        monkeypatch.setattr(bt_real_profile.sys, "platform", "linux")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setattr(bt_cloud, "_use_real_profile", lambda: True)
+        monkeypatch.setattr("hermes_cli.browser_identity.resolve_browser_identity", lambda _name: identity)
+        monkeypatch.setattr("hermes_cli.browser_connect.real_profile_copy_dir", lambda *_a, **_k: str(tmp_path))
+        monkeypatch.setattr(bt_real_profile, "_agent_browser_get_cdp", lambda _s: endpoint if live_runtime == "existing" else None)
+        monkeypatch.setattr(bt_real_profile, "_read_real_profile_headed_mode", lambda _p: False)
+        monkeypatch.setattr(bt_real_profile, "_surviving_chrome_cdp", lambda _p: None)
+        monkeypatch.setattr(bt_real_profile, "_owned_profile_cdp", lambda _p: endpoint if live_runtime == "recovered" else None)
+        attached = []
+        monkeypatch.setattr(bt_real_profile, "_attach_agent_browser_to_cdp", lambda *args: attached.append(args))
+
+        cdp, error = bt_real_profile._real_profile_cdp("work", headed=True)
+        assert cdp is None
+        assert "requires a graphical display" in error
+        assert attached == []
+
     def test_non_chromium_default_fails_closed(self):
         self._reset()
         with patch.object(bt_cloud, "_use_real_profile", return_value=True), \

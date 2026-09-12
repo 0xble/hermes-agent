@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 from scripts.ci import local_check as MODULE
 
 
@@ -58,7 +60,7 @@ def test_changed_files_includes_deleted_and_renamed_paths(
 
     def fake_git(_root: Path, *args: str) -> str:
         captured.append(args)
-        return "D\ttools/deleted_tool.py\nR100\tpyproject.toml\tdocs/pyproject.md"
+        return "D\0tools/deleted_tool.py\0R100\0pyproject.toml\0docs/pyproject.md\0C100\0copy.py\0copied.py\0"
 
     monkeypatch.setattr(MODULE, "_git", fake_git)
 
@@ -66,17 +68,46 @@ def test_changed_files_includes_deleted_and_renamed_paths(
         "tools/deleted_tool.py",
         "pyproject.toml",
         "docs/pyproject.md",
+        "copy.py",
+        "copied.py",
     ]
     assert captured == [
         (
             "diff",
             "--name-status",
+            "-z",
             "--find-renames",
             "--find-copies",
             "--diff-filter=ACMRD",
             "origin/main...HEAD",
         )
     ]
+
+
+@pytest.mark.parametrize("filename", ["café.py", "tab\tcode.py", "line\ncode.py"])
+def test_quoted_git_paths_reach_actual_compile_check(tmp_path, filename):
+    if sys.platform == "win32" and any(c in filename for c in "\t\n"):
+        pytest.skip("Windows filenames cannot contain control characters")
+    def git(*args):
+        return subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", *args],
+                              cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    git("init", "-q")
+    (tmp_path / "original.py").write_text("answer = 1\n")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "original.py").rename(tmp_path / filename)
+    git("add", "-A")
+    git("commit", "-qm", "rename")
+    assert MODULE.changed_files(tmp_path, base, "HEAD") == ["original.py", filename]
+    (tmp_path / filename).write_text("def broken(:\n")
+    git("add", "-A")
+    git("commit", "-qm", "syntax error")
+    paths = MODULE.changed_files(tmp_path, "HEAD^", "HEAD")
+    assert paths == [filename]
+    checks = [c for c in MODULE.build_checks(tmp_path, "smoke", paths, []) if c.name.startswith("compile changed Python")]
+    assert len(checks) == 1
+    assert MODULE.run_checks(tmp_path, checks, dry_run=False)[0].status == "failed"
 
 
 def test_documentation_build_uses_website_prefix() -> None:

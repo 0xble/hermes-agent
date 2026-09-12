@@ -112,6 +112,20 @@ def test_required_ci_gate_cannot_be_self_attested(tmp_path: Path, old: str, new:
     assert any(message in error for error in validate(root, ROOT))
 
 
+@pytest.mark.parametrize("key,value", [
+    ("defaults", {"run": {"shell": 'bash -c "exit 0" {0}'}}),
+    ("defaults", {"run": {"working-directory": "candidate"}}),
+    ("env", {"BASH_ENV": "candidate/skip-checks.sh"}),
+])
+def test_required_ci_inherited_execution_settings_are_protected(tmp_path, key, value):
+    root = candidate(tmp_path)
+    path = root / ".github/workflows/ci.yaml"
+    data = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+    data[key] = value
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    assert any("mandatory smoke/result correctness" in error for error in validate(root, ROOT))
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

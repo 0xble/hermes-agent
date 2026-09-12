@@ -350,7 +350,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             result["model"] = restored_model
             expected_agent = (expanded_authored.get("agent") or {}).get("reasoning_effort")
             raw_agent = authored.get("agent")
-            if (expected_agent is not None and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
+            if ("reasoning_effort" in preset and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
                     and isinstance(result.get("agent"), dict) and result["agent"].get("reasoning_effort") == expected_agent):
                 result["agent"].pop("reasoning_effort", None)
             if (("fallbacks" in preset or "fallbacks" in raw_model)

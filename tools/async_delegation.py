@@ -303,7 +303,8 @@ def _native_review_result(contract: Any, entry: Dict[str, Any]) -> Optional[Dict
         candidate = ReviewCandidateV1.from_payload(contract.get("candidate") or {})
         return asdict(NativeReviewResultV1.from_delegation_entry(entry, candidate))
     except Exception as exc:
-        candidate_id = str((contract.get("candidate") or {}).get("candidate_id") or "")
+        payload = contract.get("candidate")
+        candidate_id = str(payload.get("candidate_id") or "") if isinstance(payload, dict) else ""
         return asdict(NativeReviewResultV1(
             candidate_id=candidate_id,
             runtime_status=str(entry.get("status") or "failed"),

@@ -52,7 +52,7 @@ def _git(root: Path, *args: str) -> str:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="surrogateescape",
     )
     return completed.stdout.strip()
 
@@ -64,21 +64,27 @@ def changed_files(root: Path, base: str | None, head: str) -> list[str]:
             root,
             "diff",
             "--name-status",
+            "-z",
             "--find-renames",
             "--find-copies",
             "--diff-filter=ACMRD",
             f"{base}...{head}",
         )
+        if not output:
+            return []
+        if not output.endswith("\0"):
+            raise ValueError("Git name-status output is not NUL terminated")
+        fields = output[:-1].split("\0")
         paths: list[str] = []
-        for line in output.splitlines():
-            fields = line.split("\t")
-            if len(fields) < 2:
-                continue
-            status = fields[0]
-            if status.startswith(("R", "C")) and len(fields) >= 3:
-                paths.extend(fields[1:3])
-            else:
-                paths.append(fields[1])
+        index = 0
+        while index < len(fields):
+            status = fields[index]
+            count = 2 if status.startswith(("R", "C")) else 1
+            if (not status or status[0] not in "ACMRD" or index + count >= len(fields)
+                    or any(not path for path in fields[index + 1:index + count + 1])):
+                raise ValueError("Malformed Git name-status record")
+            paths.extend(fields[index + 1:index + count + 1])
+            index += count + 1
         return list(dict.fromkeys(paths))
     return []
 

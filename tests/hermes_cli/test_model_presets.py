@@ -23,6 +23,20 @@ def routes():
     }}
 
 
+@pytest.mark.parametrize("effort", [None, "none", "high"])
+def test_main_preset_reasoning_survives_unrelated_save(effort):
+    from hermes_cli.model_presets import preserve_model_preset_references
+
+    authored = {**routes(), "model": {"model_preset": "fast"}, "agent": {"max_turns": 12}}
+    authored["model_presets"]["fast"]["reasoning_effort"] = effort
+    expanded = expand_model_presets(authored)
+    expanded["display"] = {"compact": True}
+    restored = preserve_model_preset_references(expanded, authored)
+    assert restored["agent"] == {"max_turns": 12}
+    assert restored["model"] == {"model_preset": "fast"}
+    assert expand_model_presets(restored) == expanded
+
+
 def test_expands_all_runtime_consumers_without_mutating_authored_routes():
     config = {**routes(), "model": {"model_preset": "fast"}, "delegation": {"model_preset": "primary", "max_concurrent_children": 3}, "auxiliary": {"compression": {"model_preset": "primary", "timeout": 20}}, "fallback_providers": [{"model_preset": "fast"}], "moa": {"presets": {"review": {"reference_models": [{"model_preset": "fast"}], "aggregator": {"model_preset": "fast"}}}}}
     authored = copy.deepcopy(config)

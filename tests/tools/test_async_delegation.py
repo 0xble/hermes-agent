@@ -999,14 +999,15 @@ def _grouped_fanout(monkeypatch, tasks, gates, *, completion_contract=None):
     ))
 
 
-def test_native_review_contract_survives_grouped_dispatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("candidate", [{"candidate_id": "invalid-candidate"}, ["malformed"], "malformed"])
+def test_native_review_contract_survives_grouped_dispatch(tmp_path, monkeypatch, candidate):
     """The actual delegate -> unit -> ledger -> formatter rail must keep typed review metadata.
 
     An invalid candidate deliberately yields unknown, never an ordinary completed-child notice.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     gate = threading.Event()
-    contract = {"kind": "native_review_result_v1", "candidate": {"candidate_id": "invalid-candidate"}}
+    contract = {"kind": "native_review_result_v1", "candidate": candidate}
     handle = _grouped_fanout(
         monkeypatch, [{"goal": "inspect the accepted candidate and report", "group": "review"}],
         [gate], completion_contract=contract,
@@ -1170,9 +1171,10 @@ print(json.dumps(q.get_nowait(), sort_keys=True))
     assert "done: fast member" in format_process_notification(evt)
 
 
-def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("candidate", [{}, ["malformed"], "malformed"])
+def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path, monkeypatch, candidate):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    task = {"goal": "review", "completion_contract": {"kind": "native_review_result_v1"}}
+    task = {"goal": "review", "completion_contract": {"kind": "native_review_result_v1", "candidate": candidate}}
     with ad._transaction() as conn:
         conn.execute(
             """INSERT INTO async_delegations
@@ -1183,9 +1185,8 @@ def test_abandoned_native_review_recovery_persists_unknown_typed_result(tmp_path
         )
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
     seen = []
-    monkeypatch.setattr(ad, "_native_review_result", lambda contract, entry: seen.append((contract, entry)) or {
-        "contract": "native_review_result_v1", "runtime_status": "unknown", "judgment": "unknown",
-    })
+    native_result = ad._native_review_result
+    monkeypatch.setattr(ad, "_native_review_result", lambda contract, entry: seen.append((contract, entry)) or native_result(contract, entry))
 
     assert ad.recover_abandoned_delegations() == 1
     assert seen[0][1] == {

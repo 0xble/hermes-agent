@@ -130,7 +130,10 @@ def _required_ci_gate(data: dict[str, Any]) -> dict[str, Any]:
         name: jobs.get(name) if isinstance(jobs, dict) else None
         for name in ("smoke", "result")
     }
-    return _without_cosmetic_names({"on": data.get("on"), "jobs": selected})
+    return _without_cosmetic_names({
+        "on": data.get("on"), "jobs": selected,
+        "defaults": data.get("defaults"), "env": data.get("env"),
+    })
 
 
 def _permission_errors(value: Any, location: str) -> list[str]:

@@ -356,6 +356,9 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
     effective_headed = _bt._is_headed_mode() if headed is None else headed
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     wants_headed = effective_headed and (has_display or not sys.platform.startswith("linux"))
+    if headed is True and not wants_headed:
+        return None, ("headed=true requires a graphical display, but no DISPLAY or "
+                      "WAYLAND_DISPLAY is available on this Linux host.")
 
     from contextlib import nullcontext
     from hermes_cli.browser_connect import (chromium_executable, detect_default_chromium,
@@ -522,9 +525,6 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
         except OSError as exc:
             return None, f"{_RP}the stale debug-port marker could not be removed: {exc}"
 
-        if headed is True and not wants_headed:
-            return None, ("headed=true requires a graphical display, but no DISPLAY or "
-                          "WAYLAND_DISPLAY is available on this Linux host.")
         chrome_argv = [executable, "--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
                        f"--user-data-dir={copy_dir}", "--profile-directory=Default", "--no-first-run",
                        "--no-default-browser-check", "--no-startup-window",
