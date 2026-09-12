@@ -1,6 +1,7 @@
 """Durable native update notices and conservative finalized-receipt interpretation."""
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,13 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
         except (OSError, ValueError):
             continue
     return None
+
+
+def request_identity(pending: dict) -> str:
+    """Stable across pending-to-claimed moves and delivery checkpoints."""
+    progress = {"output_offset", "output_batch", "updating_notified", "restarting_notified"}
+    request = {key: value for key, value in pending.items() if key not in progress}
+    return hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
 
 
 def notice(heading: str, pending: dict, detail: str) -> str:

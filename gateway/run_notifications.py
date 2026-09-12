@@ -492,29 +492,102 @@ class GatewayNotificationsMixin:
     def _update_exit_code(paths: "_UpdatePaths") -> int:
         return int(paths.exit_code.read_text(encoding="utf-8").strip() or "1")
 
-    @staticmethod
-    def _read_update_output_since(path: Path, offset: int) -> tuple[str, int]:
-        """Read update output defensively; logs may contain invalid UTF-8."""
-        try:
-            data = path.read_bytes()
-        except OSError:
-            return "", offset
-        if len(data) <= offset:
-            return "", len(data)
-        return data[offset:].decode("utf-8", errors="replace"), len(data)
-
     async def _send_update_output(self, target: "_UpdateTarget", text: str) -> bool:
+        """Send one already-sanitized chunk; its caller owns durable acknowledgement."""
+        try:
+            return not _send_failed(await target.send(f"```\n{text}\n```"))
+        except Exception:
+            logger.debug("Update stream send failed", exc_info=True)
+            return False
+
+    async def _drain_update_output(self, target: "_UpdateTarget", paths: "_UpdatePaths", request: str) -> bool:
+        """Resume a frozen raw range with a durable sanitized-character cursor.
+
+        Acceptance followed by a crash before checkpoint remains ambiguous. A saved
+        checkpoint, however, is never replayed merely because a later chunk failed.
+        """
+        import hashlib
+        from gateway.update_notifications import read_pending, request_identity, save_pending
         from tools.ansi_strip import strip_ansi
-        clean = strip_ansi(text).strip()
-        for i in range(0, len(clean), 3500):
+
+        lock = getattr(self, "_update_output_send_lock", None)
+        if lock is None:
+            lock = self._update_output_send_lock = asyncio.Lock()
+        async with lock:
+            def current_record():
+                current = read_pending(paths.pending.parent)
+                if current is None or request_identity(current[1]) != request:
+                    raise ValueError("Update output request was replaced")
+                return current
+
+            def frozen_bytes(batch):
+                start, end = batch["start"], batch["end"]
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+                    raise ValueError("Invalid update output range")
+                with paths.output.open("rb") as stream:
+                    stream.seek(start)
+                    raw = stream.read(end - start)
+                if len(raw) != end - start or hashlib.sha256(raw).hexdigest() != batch["sha256"]:
+                    raise ValueError("Frozen update output changed or was truncated")
+                return raw
+
             try:
-                result = await target.send(f"```\n{clean[i:i + 3500]}\n```")
-                if _send_failed(result):
-                    return False
+                # Limit this drain to the observed EOF. Later output is another batch.
+                marker, pending = current_record()
+                offset = pending.get("output_offset", 0)
+                if type(offset) is not int or offset < 0:
+                    raise ValueError("Invalid update output offset")
+                batch = pending.get("output_batch")
+                if batch is None:
+                    try:
+                        raw = paths.output.read_bytes()
+                    except FileNotFoundError:
+                        if offset:
+                            raise ValueError("Acknowledged update output disappeared")
+                        return True
+                    if len(raw) < offset:
+                        raise ValueError("Acknowledged update output was truncated")
+                    if len(raw) == offset:
+                        return True
+                    batch = {"version": 1, "request": request, "start": offset, "end": len(raw),
+                             "sha256": hashlib.sha256(raw[offset:]).hexdigest(), "ack": 0}
+                    pending["output_batch"] = batch
+                    save_pending(marker, pending)
+                if (not isinstance(batch, dict) or batch.get("version") != 1
+                        or batch.get("start") != offset or batch.get("request") != request):
+                    raise ValueError("Invalid update output batch")
+                raw = frozen_bytes(batch)
+                clean = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                ack = batch["ack"]
+                if type(ack) is not int or not 0 <= ack <= len(clean):
+                    raise ValueError("Invalid update output acknowledgement")
+                while True:
+                    marker, pending = current_record()
+                    if pending.get("output_batch") != batch or pending.get("output_offset", 0) != offset:
+                        raise ValueError("Update output checkpoint changed")
+                    frozen_bytes(batch)
+                    if ack < len(clean):
+                        end = min(ack + 3500, len(clean))
+                        if not await self._send_update_output(target, clean[ack:end]):
+                            return False
+                        # A send can suspend while phases, markers or the source log change.
+                        marker, pending = current_record()
+                        if pending.get("output_batch") != batch or pending.get("output_offset", 0) != offset:
+                            raise ValueError("Update output checkpoint changed during send")
+                        frozen_bytes(batch)
+                        batch = {**batch, "ack": end}
+                        pending["output_batch"] = batch
+                        save_pending(marker, pending)
+                        ack = end
+                        continue
+                    pending["output_offset"] = batch["end"]
+                    pending.pop("output_batch", None)
+                    save_pending(marker, pending)
+                    # Appended data must be drained before a final notice may clear the log.
+                    return paths.output.stat().st_size == batch["end"]
             except Exception:
-                logger.debug("Update stream send failed", exc_info=True)
+                logger.warning("Update output delivery/checkpoint failed", exc_info=True)
                 return False
-        return True
 
     async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
@@ -560,46 +633,35 @@ class GatewayNotificationsMixin:
             await self._watch_update_completion_only(paths, deadline, poll_interval)
             return
         session_key = target.session_key
-        from gateway.update_notifications import final_outcome, read_pending, save_pending
+        from gateway.update_notifications import final_outcome, read_pending, request_identity
         record = read_pending(paths.pending.parent)
-        bytes_sent = int(record[1].get("output_offset", 0)) if record else 0
+        if record is None:
+            return
+        request = request_identity(record[1])
         last_stream_time = loop.time()
-        buffer = ""
 
-        async def _flush_buffer() -> None:
-            nonlocal buffer, last_stream_time
-            # Whitespace consumes output bytes too, but never needs a chat send.
-            if buffer and (not buffer.strip() or await self._send_update_output(target, buffer)):
-                buffer = ""
-                last_stream_time = loop.time()
-                current = read_pending(paths.pending.parent)
-                if current:
-                    marker, pending = current
-                    pending["output_offset"] = bytes_sent
-                    save_pending(marker, pending)
+        async def _flush_output() -> bool:
+            nonlocal last_stream_time
+            drained = await self._drain_update_output(target, paths, request)
+            last_stream_time = loop.time()
+            return drained
 
-        def _read_new_output() -> None:
-            nonlocal buffer, bytes_sent
-            if paths.output.exists():
-                with suppress(OSError):
-                    chunk, bytes_sent = self._read_update_output_since(paths.output, bytes_sent)
-                    buffer += chunk
+        def still_current() -> bool:
+            current = read_pending(paths.pending.parent)
+            return current is not None and request_identity(current[1]) == request
 
         while loop.time() < deadline:
-            if not paths.any_pending():
+            if not still_current():
                 return
             if not await self._send_update_phase("updating"):
                 await asyncio.sleep(poll_interval)
                 continue
             current = read_pending(paths.pending.parent)
             if current and final_outcome(paths.pending.parent, current[1]) is not None:
-                _read_new_output()
-                await _flush_buffer()
-                if not buffer and await self._send_update_notification():
+                if await _flush_output() and still_current() and await self._send_update_notification():
                     return
-            _read_new_output()
-            if buffer.strip() and (loop.time() - last_stream_time) >= stream_interval:
-                await _flush_buffer()
+            if (loop.time() - last_stream_time) >= stream_interval:
+                await _flush_output()
             # Forward a prompt only when none is pending, else every poll re-forwards the same prompt.
             _pending_state = self._peek_session_state(session_key) if session_key else None
             if paths.prompt.exists() and session_key and not getattr(
@@ -609,13 +671,13 @@ class GatewayNotificationsMixin:
                     prompt_data = json.loads(paths.prompt.read_text(encoding="utf-8"))
                     prompt_text = prompt_data.get("prompt", "")
                     if prompt_text:
-                        await _flush_buffer()  # user sees context before the prompt
-                        await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""))
+                        if await _flush_output() and still_current():  # context precedes the prompt
+                            await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""))
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
             await asyncio.sleep(poll_interval)
-        await _flush_buffer()
-        await self._send_update_notification(timed_out=True)
+        if await _flush_output() and still_current():
+            await self._send_update_notification(timed_out=True)
 
     async def _send_update_phase(self, phase: str) -> bool:
         lock = getattr(self, "_update_phase_send_lock", None)
@@ -625,13 +687,14 @@ class GatewayNotificationsMixin:
             return await self._send_update_phase_inner(phase)
 
     async def _send_update_phase_inner(self, phase: str) -> bool:
-        from gateway.update_notifications import notice, read_pending, save_pending
+        from gateway.update_notifications import notice, read_pending, request_identity, save_pending
         paths = self._update_paths()
         current = read_pending(paths.pending.parent)
         target = self._resolve_update_target(paths)
         if not current or target is None:
             return False
         marker, pending = current
+        request = request_identity(pending)
         flag = phase + "_notified"
         if pending.get(flag):
             return True
@@ -645,10 +708,11 @@ class GatewayNotificationsMixin:
             if _send_failed(await target.send(notice(heading, pending, detail))):
                 return False
             current = read_pending(paths.pending.parent)
-            if current:
-                marker, pending = current
-                pending[flag] = True
-                save_pending(marker, pending)
+            if current is None or request_identity(current[1]) != request:
+                return False
+            marker, pending = current
+            pending[flag] = True
+            save_pending(marker, pending)
             return True
         except Exception:
             logger.warning("Update phase notification failed", exc_info=True)
@@ -656,7 +720,7 @@ class GatewayNotificationsMixin:
 
     async def _send_update_notification(self, *, timed_out: bool = False) -> bool:
         """One final send path for live watchers and startup; retain state on send failure."""
-        from gateway.update_notifications import final_outcome, notice, read_pending, save_pending
+        from gateway.update_notifications import final_outcome, notice, read_pending, request_identity
         if getattr(self, "_update_final_send_active", False):
             return False
         self._update_final_send_active = True
@@ -667,6 +731,7 @@ class GatewayNotificationsMixin:
             if not current or target is None:
                 return False
             _, pending = current
+            request = request_identity(pending)
             outcome = final_outcome(paths.pending.parent, pending)
             if outcome is None:
                 if not timed_out:
@@ -677,23 +742,22 @@ class GatewayNotificationsMixin:
                 if not await self._send_update_phase("updating"):
                     return False
                 current = read_pending(paths.pending.parent)
-                if not current:
+                if current is None or request_identity(current[1]) != request:
                     return False
                 _, pending = current
             # Startup can reach here without a live watcher; preserve unsent native output.
-            offset = int(pending.get("output_offset", 0))
-            output, end_offset = self._read_update_output_since(paths.output, offset)
-            if output.strip():
-                if not await self._send_update_output(target, output):
-                    return False
-                current = read_pending(paths.pending.parent)
-                if current:
-                    marker, pending = current
-                    pending["output_offset"] = end_offset
-                    save_pending(marker, pending)
+            if not await self._drain_update_output(target, paths, request):
+                return False
+            current = read_pending(paths.pending.parent)
+            if current is None or request_identity(current[1]) != request:
+                return False
+            _, pending = current
             heading = "✅ Update Complete" if success else "❌ Update Failed"
             result = await target.send(notice(heading, pending, detail))
             if _send_failed(result):
+                return False
+            current = read_pending(paths.pending.parent)
+            if current is None or request_identity(current[1]) != request:
                 return False
             self._clear_update_markers(paths, target.session_key)
             (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)

@@ -4730,7 +4730,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if "reply message not found" in str(send_err).lower():
                     # Private DM topic fallback needs anchor + topic id together; forum topics keep thread id.
                     retry_thread_kwargs = (
-                        {} if self._dm_topic_fallback(metadata)
+                        self._business_connection_kwargs(metadata) if self._dm_topic_fallback(metadata)
                         else self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=None))
                     try:
                         sent = await self._run_send_call(chat_id, self._bot.send_message,
