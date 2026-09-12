@@ -666,6 +666,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
+            model_preset=_normalize_optional_job_value(a["model_preset"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             timezone=a["timezone"],
             allow_messaging=bool(a["allow_messaging"]),
@@ -815,6 +816,8 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
         canonical_skills = _canonical_skills(skill, skills)
         updates["skills"] = canonical_skills
         updates["skill"] = canonical_skills[0] if canonical_skills else None
+    if a["model_preset"] is not None:
+        updates["model_preset"] = _normalize_optional_job_value(a["model_preset"])
     if a["model"] is not None:
         updates["model"] = _normalize_optional_job_value(a["model"])
     if a["provider"] is not None:
@@ -984,7 +987,8 @@ def cronjob(
     task_id: str = None,
     session_id: Optional[str] = None,
     paused: bool = False,
-    paused_reason: Optional[str] = None) -> str:
+    paused_reason: Optional[str] = None,
+    model_preset: Optional[str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility

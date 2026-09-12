@@ -277,6 +277,87 @@ def _expand_moa(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) 
             block["aggregator"] = _expand_moa_slot(block["aggregator"], f"{prefix}.aggregator", definitions)
 
 
+def resolve_cron_model_preset(site: Any, config: dict[str, Any], *, fleet: bool = False) -> dict[str, Any] | None:
+    """Resolve a cron reference without flattening its stored record.
+
+    Empty optional fields in job records/forms are not inline route selections.
+    Fleet config uses its historical ``model_provider`` spelling.
+    """
+    if not isinstance(site, dict) or site.get("model_preset") in (None, ""):
+        return None
+    path = "cron" if fleet else "cron job"
+    conflicts = {"model", "provider", "model_provider", "base_url", "api_key", "api_mode",
+                 "reasoning_effort", "fallback_providers", "fallback_chain"}
+    reference = {key: value for key, value in site.items()
+                 if key not in conflicts or value not in (None, "")}
+    disabled = _fallbacks_disabled(reference, path)
+    route = _reference(reference, path, _definitions(config), conflicts=conflicts)
+    assert route is not None
+    if disabled:
+        route["fallbacks"] = []
+    return route
+
+
+def _expand_cron(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
+    site = config.get("cron")
+    route = resolve_cron_model_preset(site, config, fleet=True)
+    if route is None:
+        return
+    assert isinstance(site, dict)
+    fields = _route_fields(route, fallback_key="fallback_providers")
+    fields["model_provider"] = fields.pop("provider")
+    config["cron"] = {**{key: value for key, value in site.items()
+                         if key not in {"model_preset", "fallbacks"}}, **fields}
+
+
+def _platform_route_collections(config: dict[str, Any]):
+    """Visit only existing structured platform route sites, never model strings."""
+    # Top-level <platform>.channel_overrides is a long-standing YAML bridge.
+    # Visit only route-shaped blocks; do not recursively interpret arbitrary app data.
+    for name, block in config.items():
+        if isinstance(block, dict) and isinstance(block.get("channel_overrides"), dict):
+            yield f"{name}.channel_overrides", block["channel_overrides"]
+    gateway = config.get("gateway")
+    gateway = gateway if isinstance(gateway, dict) else {}
+    groups = [("platforms", config.get("platforms")),
+              ("gateway.platforms", gateway.get("platforms")),
+              ("gateway", gateway)]
+    for prefix, platforms in groups:
+        if not isinstance(platforms, dict):
+            continue
+        for name, block in platforms.items():
+            if not isinstance(block, dict):
+                continue
+            path = f"{prefix}.{name}"
+            overrides = block.get("channel_overrides")
+            if isinstance(overrides, dict):
+                yield f"{path}.channel_overrides", overrides
+            if name == "api_server":
+                for suffix, container in (("", block), (".extra", block.get("extra"))):
+                    routes = container.get("model_routes") if isinstance(container, dict) else None
+                    if isinstance(routes, dict):
+                        yield f"{path}{suffix}.model_routes", routes
+
+
+def _expand_platform_routes(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
+    for path, sites in _platform_route_collections(config):
+        for name, site in list(sites.items()):
+            site_path = f"{path}.{name}"
+            disabled = _fallbacks_disabled(site, site_path)
+            route = _reference(site, site_path, definitions, conflicts={
+                "provider", "model", "reasoning_effort", "fallback_model",
+                "fallback_providers", "fallback_chain", *_MAIN_FORBIDDEN_REFERENCE_FIELDS,
+            })
+            if route is None:
+                continue
+            if disabled:
+                route["fallbacks"] = []
+            sites[name] = {
+                **{key: value for key, value in site.items() if key not in {"model_preset", "fallbacks"}},
+                **route,
+            }
+
+
 def expand_model_presets(config: Any) -> dict[str, Any]:
     """Return a copied config with every supported ``model_preset`` reference expanded.
 
@@ -288,10 +369,12 @@ def expand_model_presets(config: Any) -> dict[str, Any]:
     expanded = deepcopy(config)
     definitions = _definitions(expanded)
     _expand_model(expanded, definitions)
+    _expand_cron(expanded, definitions)
     _expand_delegation(expanded, definitions)
     _expand_auxiliary(expanded, definitions)
     _expand_fallback_entries(expanded, definitions)
     _expand_moa(expanded, definitions)
+    _expand_platform_routes(expanded, definitions)
     return expanded
 
 
@@ -381,6 +464,28 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             if raw_site.get("fallbacks") == []:
                 restored["fallbacks"] = []
             container[key] = restored
+
+    actual_platforms = dict(_platform_route_collections(result))
+    expected_platforms = dict(_platform_route_collections(expanded_authored))
+    for path, raw_sites in _platform_route_collections(authored):
+        actual_sites = actual_platforms.get(path)
+        if actual_sites is not None:
+            for name in raw_sites:
+                restore_site(actual_sites, raw_sites, expected_platforms.get(path), name, "fallbacks")
+
+    # Reuse the common route roundtrip with the fleet's provider-key alias.
+    raw_cron = authored.get("cron")
+    if isinstance(raw_cron, dict) and raw_cron.get("model_preset"):
+        containers = [deepcopy(value) for value in (result, authored, expanded_authored)]
+        for container in containers:
+            site = container.get("cron")
+            if isinstance(site, dict) and "model_provider" in site:
+                site["provider"] = site.pop("model_provider")
+        restore_site(containers[0], containers[1], containers[2], "cron", "fallback_providers")
+        restored_cron = containers[0].get("cron")
+        if isinstance(restored_cron, dict) and "provider" in restored_cron:
+            restored_cron["model_provider"] = restored_cron.pop("provider")
+        result["cron"] = restored_cron
 
     restore_site(result, authored, expanded_authored, "delegation", "fallback_providers")
     actual_delegation = result.get("delegation")

@@ -64,7 +64,7 @@ A preset definition is flat: `provider`, `model`, optional `reasoning_effort`, a
 ordered `fallbacks` only. Fallback entries are themselves inline flat routes; presets cannot
 reference other presets or inherit from one another. At a reference site, do not combine
 `model_preset` with inline route fields. The exception is `fallbacks: []`, which explicitly
-turns off a preset's fallback chain for main, delegation, and auxiliary consumers. A main preset
+turns off a preset's fallback chain for main, delegation, auxiliary, cron, and platform routes. A main preset
 that declares fallbacks cannot also be combined with a top-level fallback chain. Hermes rejects
 unknown names, malformed definitions, route conflicts, and recursive fallback routes with the
 affected config path. Config writes preserve unchanged references; deliberate route edits stay
@@ -75,6 +75,73 @@ launch snapshots are frozen. Later config edits do not reroute resumed children.
 reference and aggregator slots translate preset fallbacks to `fallback_models`; an explicit
 `fallback_models: []` disables that chain. Inline MoA fallback slots can reference a preset
 without its own fallbacks.
+
+### Scheduled jobs
+
+Use `cron.model_preset: coding` for the fleet default, or store a per-job reference:
+
+```bash
+hermes cron create --name briefing --schedule 'every 8h' --prompt 'Prepare the briefing' --model-preset coding
+hermes cron edit JOB_ID --model-preset coding --model '' --provider '' --reasoning-effort ''
+```
+
+The edit clears old explicit pins in the same update. The dashboard's advanced editor and
+`POST /api/cron/jobs` also accept `model_preset`; update JSON can set it or clear it with
+`null`/`""`. Clear any explicit base URL in the dashboard/API before selecting a preset.
+The model-facing cron tool cannot set model presets, just as it cannot set model/provider pins.
+
+A job reference resolves the current definition on every fire, ahead of fleet defaults and
+creation snapshots. Inline job model/provider pins still beat fleet defaults. A fleet preset's
+reasoning/fallback bundle applies to jobs without an inline route override; a job preset carries
+its own bundle. Preset fallback chains replace both modern and legacy inherited chains, including
+when explicitly empty. Concrete fallback reasoning can replace preset reasoning; existing
+explicit per-job reasoning pins remain authoritative for inline routes. Unknown names and mixed
+nonempty inline/preset route settings fail before execution. Unrelated job edits do not flatten
+references or change schedules; config load/save/reload retains fleet references.
+
+**Names are not model-string aliases.** Cron `model`/`--model` remains a literal model ID: local
+tags such as `qwen:7b` and provider IDs containing slashes retain their existing meaning. Supply
+`--provider custom:local` separately, or use `--model-preset NAME`. The interactive `/model`
+command's existing known-provider `provider:model` grammar is unchanged; it is not a new cron
+prefix grammar. OpenRouter `@preset` model IDs are unrelated to Hermes named presets.
+
+### API and channel routes
+
+Existing structured platform routes accept the same explicit reference:
+
+```yaml
+gateway:
+  platforms:
+    api_server:
+      model_routes:
+        coding-client:
+          model_preset: coding
+    discord:
+      channel_overrides:
+        "1234567890":
+          model_preset: coding
+          system_prompt: "Help with this project's code."
+```
+
+The equivalent `platforms.<name>` and `gateway.<name>` blocks and existing top-level
+`<platform>.channel_overrides` are supported too, as is
+`api_server.extra.model_routes` within those blocks. Platform routes expand when gateway
+configuration is loaded; like existing inline channel/API routing, edits require a gateway
+configuration reload, not just another message. Cron references instead resolve on every fire.
+A channel's system prompt is preserved. Provider credentials/endpoints remain provider-owned:
+references cannot mix in `api_key` or `base_url`. A route's reasoning and ordered fallbacks reach
+agent construction and cached channel turns; `fallbacks: []` disables inherited fallbacks.
+Session `/model` selections supersede the channel/API route and its bundle; session `/reasoning`
+and API request reasoning options supersede route reasoning. Confirmed API runtime locks still
+disable fallbacks. Missing preset names fail configuration loading rather than silently using
+the default provider.
+
+This is explicit reference support at documented structured sites, not a universal string alias.
+Interactive model pickers, `hermes --model`, Kanban worker `--model`, and existing
+`HERMES_MODEL` / `HERMES_INFERENCE_MODEL` invocation seeds retain their literal model-ID grammar;
+no bare name or speculative prefix is reinterpreted. To use a named route for those sessions,
+omit the explicit model/provider pins and set `model: {model_preset: NAME}` in the assigned
+profile's config. Use `hermes cron ... --model-preset NAME` for an explicit job reference.
 
 ## The Models page
 

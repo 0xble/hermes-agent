@@ -1735,7 +1735,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @staticmethod
     def _parse_model_routes(raw: Any) -> Dict[str, Dict[str, Any]]:
-        """Validate ``model_routes`` (``alias -> {model, provider?, api_key?, base_url?}``); invalid
+        """Parse expanded ``model_routes`` (model/provider, reasoning/fallbacks, optional transport); invalid
         shapes are dropped, never raised. Route ``api_key`` is an UPSTREAM credential: never log."""
         if not isinstance(raw, dict):
             if raw:
@@ -1758,6 +1758,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 logger.warning(
                     "api_server model_routes: route %r has no 'model'; dropping", alias_str)
                 continue
+            for key in ("reasoning_effort", "fallbacks"):
+                if key in cfg:
+                    route[key] = cfg[key]
             routes[alias_str] = route
         return routes
 
@@ -2111,7 +2114,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # global provider's credentials.
                 applied = self._apply_provider_runtime(
                     runtime_kwargs, effective_provider, target_model=effective_model,
-                    required=bool(request_provider) or confirmed_runtime_lock)
+                    required=bool(request_provider) or confirmed_runtime_lock
+                    or bool(route_provider and not route_cfg.get("api_key")))
             if not applied and effective_provider and effective_provider != current_provider:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
@@ -2171,8 +2175,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             max_iterations = policy.max_iterations
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
+        selected_route = route if not session_override and not session_model and not confirmed_runtime_lock else None
+        if request_reasoning_config is None and selected_route and "reasoning_effort" in selected_route:
+            from hermes_constants import parse_reasoning_effort
+            request_reasoning_config = parse_reasoning_effort(selected_route["reasoning_effort"])
         if request_reasoning_config is None:
             request_reasoning_config = GatewayRunner._load_reasoning_config(model)
+        fallback_model = None
+        if not confirmed_runtime_lock:
+            fallback_model = (selected_route["fallbacks"] if selected_route and "fallbacks" in selected_route
+                              else GatewayRunner._load_fallback_model())
         agent_kwargs = {
             "model": model, **runtime_kwargs, **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
@@ -2185,7 +2197,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "tool_complete_callback": tool_complete_callback,
             "session_db": self._ensure_session_db(),
             # Same fallback provider chain as Telegram/Discord/Slack.
-            "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
+            "fallback_model": fallback_model,
             "reasoning_config": request_reasoning_config,
             "gateway_session_key": gateway_session_key}
         if request_service_tier is not _REQUEST_OPTION_MISSING:

@@ -1436,7 +1436,7 @@ class TurnRunner:
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=self._runner._refresh_fallback_model(),
+            fallback_model=runner._fallback_chain_for_route(turn_route),
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
@@ -1465,7 +1465,8 @@ class TurnRunner:
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
         # configured after caching must reach the next turn; per-session serialization keeps it safe.
         if found.reused and agent is not None:
-            self._runner._apply_fallback_chain_to_agent(agent, runner._refresh_fallback_model())
+            chain = runner._fallback_chain_for_route(turn_route)
+            runner._apply_fallback_chain_to_agent(agent, chain)
         if found.evicted is not None:
             self._release_evicted_agent(found.evicted)
         if agent is None:
@@ -2213,12 +2214,17 @@ class TurnRunner:
         except Exception as exc:
             return self._prepare_failed_goal_result(exc, "Provider authentication failed")
         pr = runner._provider_routing
-        reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
+        channel_route = runner._resolve_channel_route_config(ctx.source, ctx.session_key)
+        reasoning_config = runner._resolve_session_reasoning_config(
+            source=ctx.source, session_key=ctx.session_key, model=model, route=channel_route,
+        )
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, clarify_cb, want_interim = self._setup_stream_consumer(
             platform_key, model)
-        turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        turn_route = runner._resolve_turn_agent_config(
+            ctx.message, model, runtime_kwargs, channel_route=channel_route,
+        )
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )

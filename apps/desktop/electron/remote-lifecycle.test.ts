@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -44,6 +44,7 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
@@ -1899,8 +1900,20 @@ test.skipIf(process.platform === 'win32')(
       // argv: ['-c', <mutex script>, <mutex path>, <payload>]
       assert.equal(
         argv[2],
-        `${fakeHome}/.hermes/.hermes-update-in-progress.mutex`,
-        'mutex path must reach python fully expanded, with no quote characters'
+        '~/.hermes/.hermes-update-in-progress.mutex',
+        'mutex path must reach python cleanly for wrapper expansion'
+      )
+      // The mutex path is inert shell data, unlike expandRemotePath fragments.
+      // Exercise the actual wrapper with a harmless payload and an isolated HOME:
+      // Python, not the shell, must expand the path and create the lock there.
+      const { stdout: mutexOutput } = await execFile(
+        'python3', ['-c', argv[1], argv[2], 'printf mutex-executed'],
+        { env: { ...process.env, HOME: fakeHome } }
+      )
+      assert.equal(mutexOutput, 'mutex-executed')
+      assert.equal(
+        (await readFile(path.join(fakeHome, '.hermes/.hermes-update-in-progress.mutex'))).length,
+        0
       )
 
       // The payload assigns reservation/lock/owner_file before its mkdir loop.

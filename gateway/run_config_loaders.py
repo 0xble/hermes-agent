@@ -171,9 +171,9 @@ class GatewayConfigLoadersMixin:
 
     def _resolve_session_reasoning_config(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        model: str = "",
+        model: str = "", route: dict | None = None,
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning`` > selected channel route > per-model reasoning overrides > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.
@@ -183,6 +183,9 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        if route and "reasoning_effort" in route:
+            from hermes_constants import parse_reasoning_effort
+            return parse_reasoning_effort(route["reasoning_effort"])
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
@@ -459,6 +462,12 @@ class GatewayConfigLoadersMixin:
             return self._fallback_model
         self._fallback_model = get_fallback_chain(cfg) or None
         return self._fallback_model
+
+    def _fallback_chain_for_route(self, route: dict) -> list | None:
+        """A selected route owns its chain (even empty); otherwise refresh global config."""
+        if "fallback_model" in route:
+            return route["fallback_model"]
+        return self._refresh_fallback_model()
 
     @staticmethod
     def _apply_fallback_chain_to_agent(agent: Any, chain: list | None) -> None:

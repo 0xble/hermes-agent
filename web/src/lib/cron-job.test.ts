@@ -19,6 +19,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     skills: [],
     provider: "",
     model: "",
+    model_preset: "",
     base_url: "",
     script: "",
     no_agent: false,
@@ -91,6 +92,17 @@ describe("buildCronJobPayload", () => {
       workdir: null,
       timezone: null,
     });
+  });
+});
+
+describe("named preset roundtrip", () => {
+  it("retains the authored name rather than a copied model/provider", () => {
+    const edited = cronJobFormFromJob({ id: "preset-job", enabled: true, model_preset: "main" });
+    const payload = buildCronJobPayload(edited);
+    expect(payload.model_preset).toBe("main");
+    expect(payload.model).toBeNull();
+    expect(payload.provider).toBeNull();
+    expect(buildCronJobPayload({ ...edited, model_preset: "" }).model_preset).toBeNull();
   });
 });
 

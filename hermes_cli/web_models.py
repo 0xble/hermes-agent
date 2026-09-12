@@ -285,6 +285,7 @@ class CronJobCreate(BaseModel):
     name: str = ""
     deliver: str = "local"
     skills: Optional[List[str]] = None
+    model_preset: Optional[str] = None
     model: Optional[str] = None
     provider: Optional[str] = None
     base_url: Optional[str] = None

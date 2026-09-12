@@ -83,19 +83,36 @@ def test_background_and_main_agent_paths_call_refresh():
     # the old _run_agent_inner closure) references the runner as
     # ``self._runner``; the background-agent site still uses bare ``self``.
     _refresh_calls = (
-        source.count("fallback_model=self._refresh_fallback_model()")
-        + source.count("fallback_model=self._runner._refresh_fallback_model()")
+        source.count("self._fallback_chain_for_route(turn_route)")
+        + source.count("runner._fallback_chain_for_route(turn_route)")
     )
-    assert _refresh_calls >= 2
+    # Main/background construction AND cache reuse select the route-owned chain
+    # or refresh global config. The helper's selection is tested below.
+    assert _refresh_calls >= 3
     # The cached-agent reuse path (the load-bearing fix for a long-lived
     # session in a running gateway) must apply the refreshed chain.
     assert (
         "self._apply_fallback_chain_to_agent(" in source
-        or "self._runner._apply_fallback_chain_to_agent(" in source
+        or "runner._apply_fallback_chain_to_agent(" in source
     )
     # The stale startup-snapshot form must not remain at create sites.
     assert "fallback_model=self._fallback_model," not in source
     assert "fallback_model=self._runner._fallback_model," not in source
+
+
+def test_route_chain_selection_refreshes_only_without_route_chain():
+    from gateway.run import GatewayRunner
+    from unittest.mock import Mock
+
+    fresh = [{"provider": "openrouter", "model": "fresh"}]
+    runner = SimpleNamespace(_refresh_fallback_model=Mock(return_value=fresh))
+    select = GatewayRunner._fallback_chain_for_route.__get__(runner)
+    assert select({}) == fresh
+    runner._refresh_fallback_model.assert_called_once_with()
+    runner._refresh_fallback_model.reset_mock()
+    assert select({"fallback_model": []}) == []
+    assert select({"fallback_model": [{"provider": "nous", "model": "route"}]}) == [{"provider": "nous", "model": "route"}]
+    runner._refresh_fallback_model.assert_not_called()
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):

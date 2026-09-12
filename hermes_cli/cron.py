@@ -610,6 +610,7 @@ def cron_doctor() -> int:
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
                    ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
                    ("model", "model"), ("provider", "model_provider"),
+                   ("model_preset", "model_preset"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
                    ("continuity", "continuity"), ("reasoning_effort", "reasoning_effort"),
                    ("timezone", "timezone"),
@@ -622,6 +623,7 @@ def _job_api_kwargs(args) -> Dict[str, Any]:
 
 
 _JOB_DETAIL_LINES = (
+    ("model_preset", "  Model preset: {} (resolved at fire time)"),
     ("script", "  Script: {}"),
     ("completion_script", "  Completion verifier: {}"),
     ("monitor_script", "  Monitor: {} (agent runs only on output change)"),
