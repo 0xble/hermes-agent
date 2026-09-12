@@ -1179,6 +1179,8 @@ def _apply_context_engine_selection(
 ) -> List[Dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
+    if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+        return api_messages
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
         return api_messages
@@ -1441,6 +1443,9 @@ def _run_conversation_turn(
     store when ``user_message`` carries API-only synthetic prefixes; timestamp / platform id are
     stored as metadata (platform id lets restart drain recovery dedup). ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged."""
+    if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+        from agent.delegation_correction import run_correction
+        return run_correction(agent, user_message, system_message, conversation_history, task_id)
     if moa_config is None:
         user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
             user_message, persist_user_message

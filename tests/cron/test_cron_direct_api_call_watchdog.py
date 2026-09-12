@@ -37,6 +37,8 @@ from agent.chat_completion_helpers import direct_api_call
 
 def _make_agent(*, stale_timeout, platform="cron"):
     agent = MagicMock()
+    # Ordinary calls have no pending disposition correction.
+    agent._delegation_disposition_correction = None
     agent.platform = platform
     agent.api_mode = "chat_completions"
     agent.provider = "openrouter"

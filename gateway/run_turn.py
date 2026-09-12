@@ -2088,6 +2088,11 @@ class GatewayTurnMixin:
                 persist_user_display_metadata={
                     "gateway_input_owner": prepared.persistence_owner,
                     **({"gateway_input_required": True} if getattr(event, "_restart_inbox_claim", None) else {}),
+                    **({"delegation_results": [{
+                        "parent_task_id": event.metadata["delegation_parent_task_id"],
+                        "thread_refs": event.metadata.get("delegation_thread_refs", []),
+                        "attempts": event.metadata.get("delegation_attempts", {}),
+                    }]} if event.internal and event.metadata.get("delegation_parent_task_id") else {}),
                 },
                 message_type=event.message_type,
                 turn_reasoning_config=getattr(event, "turn_reasoning_config", None),

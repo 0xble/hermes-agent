@@ -181,7 +181,8 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
                 entry["live_transcript"] = batch.live_paths[_idx]
     update_manifest_statuses(batch.live_deleg_id, results)
 
-    combined: Dict[str, Any] = {"results": results, "total_duration_seconds": total_duration}
+    combined: Dict[str, Any] = {"results": results, "total_duration_seconds": total_duration,
+                                "delegation_metadata": batch.delegation_metadata or {}}
     # Runtime truth about children's background processes, as prose the parent can't miss inside the JSON.
     from tools.process_registry_notifications import _process_accounting_lines
     process_notes = [line for entry in results for line in _process_accounting_lines(entry)]
@@ -192,6 +193,17 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
         combined["live_transcripts"] = unit_paths
     if batch.group is not None:
         combined["group"] = batch.group
+    return combined
+
+
+def _execute_inline(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
+    """Persist every inline terminal unit before presenting it, including fallbacks."""
+    from tools.async_delegation import persist_inline_result
+    combined = _execute_and_aggregate(batch, honor_parent_interrupt=honor_parent_interrupt)
+    uid = persist_inline_result(combined, batch.delegation_metadata or {})
+    combined["delegation_id"] = uid
+    for entry in combined["results"]:
+        entry["result_delegation_id"] = uid
     return combined
 
 _SYNC_FALLBACK_NOTES = {
@@ -210,7 +222,7 @@ _SYNC_FALLBACK_NOTES = {
 
 def _run_sync_with_note(batch: _Batch, reason: str) -> str:
     """Inline fallback: run the batch now and explain why it was not detached."""
-    result = _execute_and_aggregate(batch)
+    result = _execute_inline(batch)
     if isinstance(result, dict):
         result["note"] = _SYNC_FALLBACK_NOTES[reason]
     return json.dumps(result, ensure_ascii=False)
@@ -436,8 +448,8 @@ def _dispatch_background(batch: _Batch) -> str:
         # Later units of an admitted call share its slot and cannot be capacity-rejected; a scheduler failure runs
         # the unit inline so no task is silently dropped.
         logger.warning("delegate_task: unit %d/%d not accepted (%s); running it inline.", k + 1, len(units), dispatch.get("error"))
-        inline_results.extend(_execute_and_aggregate(unit, honor_parent_interrupt=False)["results"])
-    payload = _dispatched_payload(batch, dispatched)
+        inline_results.extend(_execute_inline(unit, honor_parent_interrupt=False)["results"])
+    payload = _dispatched_payload(batch, dispatched, batch.delegation_metadata)
     if inline_results:
         payload["inline_results"] = inline_results
     return json.dumps(payload, ensure_ascii=False)
@@ -446,4 +458,4 @@ def _run_batch(batch: _Batch, background: bool) -> str:
     """Tool result JSON: a dispatch handle (background) or the joined combined results."""
     if background:
         return _dispatch_background(batch)
-    return json.dumps(_execute_and_aggregate(batch), ensure_ascii=False)
+    return json.dumps(_execute_inline(batch), ensure_ascii=False)

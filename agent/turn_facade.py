@@ -90,6 +90,11 @@ class TurnFacadeMixin:
                 return admission.early_result
             lease = admission.lease
             conversation_history = admission.conversation_history
+            admitted_callback = getattr(self, "_delegation_on_admitted", None)
+            if callable(admitted_callback):
+                self._delegation_admission_attempted = True
+                admitted_callback()
+                self._delegation_admission_confirmed = True
 
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -132,6 +137,8 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
+                    from agent.delegation_disposition import begin_result_turn, finish_result_turn
+                    begin_result_turn(self, persist_user_display_metadata)
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
@@ -141,6 +148,7 @@ class TurnFacadeMixin:
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
                     )
+                    result = finish_result_turn(self, result, run_conversation, system_message, effective_task_id)
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.

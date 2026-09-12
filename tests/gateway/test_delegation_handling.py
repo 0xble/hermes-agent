@@ -89,13 +89,17 @@ async def test_handled_terminal_waits_for_success_and_survives_restart(tmp_path,
 async def test_confirmed_replacement_only_and_same_anchor(tmp_path, monkeypatch):
     cards, source, adapter, data, parent = await setup(tmp_path, monkeypatch)
     await cards.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "failed"})
-    await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=data["parent_task_id"],
+    claim = await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=data["parent_task_id"],
                          refs=["A"], reason="validate_replacement")
     assert not cards.cards[data["parent_task_id"]].get("handled")
     # Validation / a failed spawn cannot create a handling proof.
     new = {**data, "parent_task_id": "b" * 32, "task_label": "Retry operation",
-           "replaces": {"parent_task_id": data["parent_task_id"], "thread_ref": "A"}}
+           "replaces": {"parent_task_id": data["parent_task_id"], "thread_ref": "A",
+                        "claim_id": claim["claim_id"], "attempt": claim["attempt"]}}
     await cards.observe(source, "r", "s", 2, "subagent.start", None, new)
+    await drain(cards)
+    assert not cards.cards[data["parent_task_id"]].get("handled")
+    await cards.observe(source, "r", "s", 2, "subagent.admitted", None, new)
     await drain(cards)
     assert cards.cards[data["parent_task_id"]]["handled"] == ["A"]
     assert cards.cards[data["parent_task_id"]]["rows"]["A"]["state"] == "failed"
@@ -121,8 +125,16 @@ async def test_owner_isolation_and_grouping_ancestor(tmp_path, monkeypatch):
         await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id="b" * 32,
                              refs=["A"], reason="incorporated")
     assert cards.receipt(event, "r", 2) == {}  # root handling never cascades
+    await cards.result_turn(actor_session_id="child", turn_id="nested-turn",
+                            results=[{"parent_task_id": child["parent_task_id"], "thread_refs": ["A"]}])
     await cards.handling(source, "r", "s", 2, actor_session_id="child", parent_task_id="b" * 32,
-                         refs=["A"], reason="incorporated")
+                         refs=["A"], reason="incorporated", turn_id="nested-turn")
+    await drain(cards)
+    assert cards._projection(data["parent_task_id"])["rows"]  # no early nested acceptance
+    root_row = cards.cards[data["parent_task_id"]]["rows"]["A"]
+    root_row.update(child_session_id="child", result_turn_id="nested-turn")
+    await cards.result_turn(actor_session_id="s", turn_id="root-result", results=[{
+        "parent_task_id": data["parent_task_id"], "thread_refs": ["A"]}])
     await drain(cards)
     assert not cards._projection(data["parent_task_id"])["rows"]
 

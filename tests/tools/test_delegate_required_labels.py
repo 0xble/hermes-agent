@@ -15,7 +15,8 @@ class _Parent:
 
 def _valid_runtime(monkeypatch):
     creds = {"provider": None, "model": None, "base_url": None, "api_key": None, "api_mode": None}
-    launch = SimpleNamespace(definition=None, credentials=creds, reasoning=None)
+    launch = SimpleNamespace(definition=None, credentials=creds, reasoning=None,
+                             resume_session_id=None, resume_claim_id=None, launch_metadata=None)
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
     monkeypatch.setattr(delegate_tool, "last_delegation_config_error", lambda: None)
     monkeypatch.setattr(delegate_tool, "_resolve_delegation_credentials", lambda *_: creds)

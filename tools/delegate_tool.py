@@ -471,6 +471,10 @@ def _resume_history_is_safe(messages: Any) -> bool:
                     return False
                 pending.add(call_id.split("|", 1)[0].strip())
         elif role == "tool":
+            from tools.delegate_tool_checkpoint import unresolved_tool_result
+            content = str(message.get("content") or "")
+            if unresolved_tool_result(content):
+                return False  # cancellation receipt does not reconcile external effects
             tool_call_id = message.get("tool_call_id")
             if isinstance(tool_call_id, str) and tool_call_id.strip():
                 pending.discard(tool_call_id.split("|", 1)[0].strip())
@@ -596,7 +600,15 @@ def _run_single_child(
     _child_close_deferred = False
     try:
         heartbeat.start()
-        _safe_progress(child_progress_cb, "subagent.start", preview=goal)
+        # A resumed row stays terminal until its native lease has admitted the
+        # exact claim. A new/replacement row may display queued/running first,
+        # but that observation alone never disposes the old result.
+        if not getattr(child, "_delegation_resume_claim_id", None):
+            _safe_progress(child_progress_cb, "subagent.start", preview=goal)
+        def admitted():
+            if callable(child_progress_cb):
+                child_progress_cb("subagent.admitted")
+        child._delegation_on_admitted = admitted
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
@@ -611,40 +623,10 @@ def _run_single_child(
 
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
-        if entry.get("status") in {"completed", "budget_exhausted"}:
-            db = getattr(child, "_session_db", None)
-            named_child = getattr(child, "_delegation_named_type", None) is not None
-            if named_child:
-                entry["resume_available"] = False
-            safe_history = _resume_history_is_safe((result or {}).get("messages"))
-            if not safe_history:
-                entry["resume_blocked_reason"] = "unresolved_tool_effects"
-            if db is not None and safe_history:
-                try:
-                    launch_metadata = deepcopy(getattr(child, "_delegation_launch_metadata", None))
-                    if isinstance(launch_metadata, dict):
-                        launch_metadata = _refresh_resumable_launch_metadata(child, launch_metadata)
-                    model_config_patch = {
-                        "_delegation_completed": True,
-                        "_delegation_outcome": entry["status"],
-                        "_delegation_resume_claimed_at": None,
-                        "_delegation_active_route": {
-                            "provider": getattr(child, "provider", None),
-                            "model": getattr(child, "model", None),
-                        },
-                    }
-                    if isinstance(launch_metadata, dict):
-                        model_config_patch["_delegation_launch"] = launch_metadata
-                    db.patch_session_model_config(
-                        getattr(child, "session_id", ""), model_config_patch,
-                    )
-                    if named_child:
-                        entry["resume_available"] = True
-                except Exception as exc:
-                    logger.warning("Could not mark delegated child resumable: %s", exc, exc_info=True)
-                    entry["resume_error"] = "durable continuation marker could not be persisted"
-        run.append_sibling_write_reminder(entry)
+        from tools.delegate_tool_checkpoint import checkpoint_child_resume
         run.account_background_processes(entry)
+        checkpoint_child_resume(child, result, entry, child_task_id=run.child_task_id)
+        run.append_sibling_write_reminder(entry)
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
     except Exception as exc:
@@ -657,6 +639,14 @@ def _run_single_child(
             preview=str(exc), summary=str(exc), status="failed",
         )
     finally:
+        if not getattr(child, "_delegation_admission_attempted", False):
+            identity = getattr(child, "_progress_identity_ref", {})
+            replacement = identity.get("replaces") if isinstance(identity, dict) else None
+            if replacement and replacement.get("claim_id") and callable(child_progress_cb):
+                with _quiet("Replacement pre-admission release failed: %s"):
+                    child_progress_cb("subagent.handling", actor_session_id=identity["owner"]["session_id"],
+                                      parent_task_id=replacement["parent_task_id"], refs=[replacement["thread_ref"]],
+                                      reason="release_replacement", detail=replacement["claim_id"])
         with _quiet("Could not restore unadmitted delegated resume grant: %s"):
             _restore_unadmitted_resume_grant(child)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
@@ -706,8 +696,10 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     launch = config.get("_delegation_launch")
     if not isinstance(launch, dict) or launch.get("version") != 1:
         raise ValueError("resume_session_id is not a resumable delegated child")
+    if config.get("_delegation_user_stopped"):
+        raise ValueError("User-stopped child requires explicit authorization and reconciliation before continuation")
     if not config.get("_delegation_completed"):
-        raise ValueError("delegated child has no verified resumable checkpoint")
+        raise ValueError("delegated child has no verified resumable checkpoint; reconcile interrupted tool effects or an unresolved launch before retrying")
     role = launch.get("subagent_type")
     if not isinstance(role, str) or role not in definitions:
         raise ValueError("delegated child references an unknown configured role")
@@ -760,7 +752,11 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
         # still satisfy every persisted route/credential/override comparison.
         from dataclasses import replace
         authority_definition = replace(definitions[role], reasoning_effort=None)
-        creds, _ = resolve_named_credentials(authority_definition, defaults if defaults is not None else _load_config(), parent_agent)
+        try:
+            creds, _ = resolve_named_credentials(authority_definition, defaults if defaults is not None else _load_config(), parent_agent)
+        except ValueError as exc:
+            # A lower resolver may include configured route values in diagnostics.
+            raise ValueError("delegated child primary route can no longer be authorized exactly; mismatched fields: current_named_route") from exc
         for key in ("provider", "model", "base_url", "api_mode", "api_key"):
             if creds.get(key) is None:
                 creds[key] = getattr(parent_agent, key, None)
@@ -789,19 +785,23 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             or __import__("hashlib").sha256(str(creds.get("api_key") or "").encode()).hexdigest()
                == str(launch.get("authority_fingerprint") or "")
         )
-        if (
-            creds.get("provider") != provider
-            or (creds.get("model") or model) != model
-            or str(creds.get("api_mode") or "") != str(launch.get("api_mode") or "")
-            or normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
-               != normalize_route_base_url(str(launch.get("base_url") or ""))
-            or not authority_matches
-            or not _authority_mapping_matches(
+        # Report only fixed field names: route values, credentials and authority
+        # fingerprints must never enter tool output. Keep every original check.
+        mismatches = [field for field, matches in (
+            ("provider", creds.get("provider") == provider),
+            ("model", (creds.get("model") or model) == model),
+            ("api_mode", str(creds.get("api_mode") or "") == str(launch.get("api_mode") or "")),
+            ("base_url", normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
+             == normalize_route_base_url(str(launch.get("base_url") or ""))),
+            ("authority", authority_matches),
+            ("request_overrides", _authority_mapping_matches(
                 creds.get("request_overrides") or {}, launch.get("request_overrides") or {},
                 launch.get("request_overrides_fingerprint"),
-            )
-        ):
-            raise ValueError("delegated child primary route can no longer be authorized exactly")
+            )),
+        ) if not matches]
+        if mismatches:
+            raise ValueError("delegated child primary route can no longer be authorized exactly; "
+                             "mismatched fields: " + ", ".join(mismatches))
         reasoning = parse_reasoning_effort(effort) if effort is not None else None
         fallbacks = freeze_fallback_routes(
             definition, primary_provider=provider, primary_model=model
@@ -1082,12 +1082,33 @@ def _effective_task_labels(
     return labels, None
 
 
-def _card_handling(parent_agent, parent_task_id, refs, reason):
+def _valid_card_identity(value):
+    if not isinstance(value, dict):
+        return False
+    fields = ("parent_task_id", "thread_ref", "task_label")
+    return (all(isinstance(value.get(k), str) and value[k].strip() for k in fields)
+            and isinstance(value.get("owner"), dict)
+            and type(value.get("attempt", 0)) is int and value.get("attempt", 0) >= 0)
+
+
+def _release_replacement_claims(parent_agent, tasks):
+    for task in tasks:
+        replacement = task.get("replaces") or {}
+        if isinstance(replacement, dict) and replacement.get("claim_id"):
+            try:
+                _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]],
+                               "release_replacement", replacement["claim_id"])
+            except Exception:
+                logger.exception("Replacement claim release uncertain; preserve fence")
+
+
+def _card_handling(parent_agent, parent_task_id, refs, reason, detail=None):
     callback = getattr(parent_agent, "tool_progress_callback", None)
     if not callable(callback):
         raise ValueError("Delegation handling requires a gateway card owner")
     result = callback("subagent.handling", actor_session_id=str(parent_agent.session_id),
-                      parent_task_id=parent_task_id, refs=refs, reason=reason)
+                      parent_task_id=parent_task_id, refs=refs, reason=reason, detail=detail,
+                      turn_id=getattr(parent_agent, "_delegation_result_turn", None))
     if not isinstance(result, dict):
         raise ValueError("Delegation handling was not acknowledged")
     return result
@@ -1101,7 +1122,8 @@ def delegate_task(
     child_tool_policy: Optional[str] = None,
     completion_contract: Optional[Dict[str, Any]] = None,
     parent_task_id: Optional[str] = None, task_label: Optional[str] = None,
-    handled_refs: Optional[List[str]] = None, handling: Optional[str] = None,
+    handled_refs: Optional[List[str]] = None, handling: Optional[str] = None, defer_reason: Optional[str] = None,
+    delegation_id: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -1111,9 +1133,24 @@ def delegate_task(
         return tool_error("delegate_task requires a parent agent context.")
 
     normalized_action = (action or "").strip().lower()
+    if normalized_action == "result":
+        if not isinstance(delegation_id, str) or not delegation_id:
+            return tool_error("action=result requires an exact delegation_id")
+        from tools.async_delegation import current_delegation_owner, get_delegation_result, _completion_metadata_fields
+        try:
+            item = get_delegation_result(delegation_id, owner=current_delegation_owner(parent_agent))
+            if not item or not isinstance(item.get("result"), dict):
+                return tool_error("No recorded result for this exact delegation owner")
+            entries = item["result"].get("results")
+            if not isinstance(entries, list) or not entries:
+                return tool_error("No recorded per-task results; explicit reconciliation is required")
+            metadata = _completion_metadata_fields(item.get("delegation_metadata"), entries)
+            return json.dumps({"delegation_id": delegation_id, "results": entries, **metadata})
+        except ValueError as exc:
+            return tool_error(str(exc))
     if normalized_action == "handle":
         try:
-            return json.dumps(_card_handling(parent_agent, parent_task_id, handled_refs, handling))
+            return json.dumps(_card_handling(parent_agent, parent_task_id, handled_refs, handling, defer_reason))
         except (ValueError, TimeoutError) as exc:
             return tool_error(str(exc))
     if normalized_action in _CONTROL_ACTIONS:
@@ -1183,52 +1220,57 @@ def delegate_task(
     routing_cfg = credentials_cfg if credentials_cfg else cfg
     creds = None  # Resolve only if batch preflight encounters a legacy task.
 
-    # Capture immutable conversation ownership before child construction changes context.
+    from tools.async_delegation import current_delegation_owner
     try:
-        from gateway.session_context import get_session_env, session_context_engaged, session_is_messaging_surface
-        _session_env = lambda key: get_session_env(key, "")
-        _session_bound = session_context_engaged()
-        _messaging_session = session_is_messaging_surface()
-    except Exception:
-        _session_env = lambda key: ""
-        _session_bound = False
-        _messaging_session = False
-    from hermes_constants import get_hermes_home
-    # Gateway multiplexing binds this explicitly; never derive a profile from
-    # the ambient process home when a session-scoped profile is available.
-    _profile = _session_env("HERMES_SESSION_PROFILE")
-    if _session_bound and _messaging_session and not _profile:
-        return tool_error("Delegation metadata requires the bound session profile; refusing ambient profile ownership.")
-    _profile = _profile or str(get_hermes_home())
-    _thread_id = _session_env("HERMES_SESSION_THREAD_ID")
-    _owner = {"profile": _profile, "session_id": str(getattr(parent_agent, "session_id", "") or ""),
-              "session_key": _session_env("HERMES_SESSION_KEY"), "chat_id": _session_env("HERMES_SESSION_CHAT_ID"),
-              "thread_id": _thread_id, "topic_id": _thread_id}
+        _owner = current_delegation_owner(parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
     _card_owner = getattr(parent_agent, "_progress_identity_ref", {})
     _card_owner = _card_owner.get("card_owner") if isinstance(_card_owner, dict) else None
     if not isinstance(_card_owner, dict):
         _card_owner = _owner
-    try:
-        from tools.async_delegation import reserve_delegation_metadata
-        _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
-            task_labels=effective_labels or [])
-    except ValueError as exc:
-        return tool_error(str(exc))
-
-    for task in task_list:
-        replacement = task.get("replaces")
-        if replacement is not None:
-            if not isinstance(replacement, dict) or set(replacement) != {"parent_task_id", "thread_ref"}:
-                return tool_error("replaces must name an exact parent_task_id and thread_ref")
-            try:
-                _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]], "validate_replacement")
-            except (ValueError, TimeoutError) as exc:
-                return tool_error(str(exc))
     # HERMES-108: resolve every task's named definition BEFORE constructing ANY child. A batch with
     # one bad subagent_type must not leave a valid sibling already spawned and running.
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
+    resumes = [launch for launch in task_runtime if launch.resume_session_id]
+    if resumes:
+        identities = [(launch.launch_metadata or {}).get("card_identity") for launch in resumes]
+        if (len(resumes) != len(task_runtime) or any(not _valid_card_identity(i) for i in identities)
+                or any(t.get("replaces") is not None for t in task_list)
+                or len({i["parent_task_id"] for i in identities}) != 1
+                or any(i.get("owner") != _owner for i in identities)
+                or (parent_task_id and parent_task_id != identities[0]["parent_task_id"])):
+            _release_resume_launches(parent_agent, task_runtime)
+            return tool_error("Resume requires exact owned logical card identities from one batch; split unrelated continuations. Legacy/uncheckpointed identity requires explicit reconciliation.")
+        parent_task_id = identities[0]["parent_task_id"]
+        effective_labels = [i["task_label"] for i in identities]
+    try:
+        from tools.async_delegation import reserve_delegation_metadata
+        _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
+            task_labels=effective_labels or [],
+            **({"resume_refs": [i["thread_ref"] for i in identities]} if resumes else {}))
+    except ValueError as exc:
+        _release_resume_launches(parent_agent, task_runtime)
+        return tool_error(str(exc))
+    _metadata["attempts"] = {ref: ((task_runtime[i].launch_metadata or {}).get("card_identity", {}).get("attempt", 0) + 1
+                                 if task_runtime[i].resume_session_id else 0)
+                            for i, ref in enumerate(_metadata["thread_refs"])}
+    for task in task_list:
+        replacement = task.get("replaces")
+        if replacement is not None:
+            if not isinstance(replacement, dict) or set(replacement) != {"parent_task_id", "thread_ref"}:
+                _release_resume_launches(parent_agent, task_runtime)
+                _release_replacement_claims(parent_agent, task_list)
+                return tool_error("replaces must name an exact parent_task_id and thread_ref")
+            try:
+                claim = _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]], "validate_replacement")
+                task["replaces"] = {**replacement, "claim_id": claim["claim_id"], "attempt": claim["attempt"]}
+            except (ValueError, TimeoutError) as exc:
+                _release_resume_launches(parent_agent, task_runtime)
+                _release_replacement_claims(parent_agent, task_list)
+                return tool_error(str(exc))
     try:
         creds = dict(task_runtime[0].credentials)
 
@@ -1250,6 +1292,7 @@ def delegate_task(
             routing_cfg=routing_cfg, child_tool_policy=child_tool_policy,
         )
         if err:
+            _release_replacement_claims(parent_agent, task_list)
             return tool_error(err)
         for _i, (_, _, _child) in enumerate(children):
             _ref = getattr(_child, "_progress_identity_ref", None)
@@ -1259,9 +1302,17 @@ def delegate_task(
                             subagent_type=vars(_child).get("_delegation_named_type"),
                             native_review=(completion_contract or {}).get("kind") == "native_review_result_v1",
                             owner=_owner, card_owner=_card_owner, background=bool(background),
-                            replaces=task_list[_i].get("replaces"))
+                            replaces=task_list[_i].get("replaces"),
+                            attempt=_metadata["attempts"][_metadata["thread_refs"][_i]],
+                            resume_claim_id=task_runtime[_i].resume_claim_id)
+                launch_metadata = getattr(_child, "_delegation_launch_metadata", None)
+                if isinstance(launch_metadata, dict):
+                    launch_metadata["card_identity"] = {
+                        "parent_task_id": _ref["parent_task_id"], "thread_ref": _ref["thread_ref"],
+                        "task_label": _ref["task_label"], "owner": deepcopy(_owner), "attempt": _ref["attempt"],
+                    }
         _metadata["threads"] = [
-            {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i],
+            {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i], "task_index": i,
              "role": getattr(child, "_delegate_role", None),
              "subagent_type": vars(child).get("_delegation_named_type")}
             for i, (_, _, child) in enumerate(children)
@@ -1275,6 +1326,7 @@ def delegate_task(
         )
     except BaseException:
         _release_resume_launches(parent_agent, task_runtime)
+        _release_replacement_claims(parent_agent, task_list)
         raise
     return _run_batch(batch, background)
 
@@ -1595,7 +1647,7 @@ DELEGATE_TASK_SCHEMA = {
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
-                            "completed or budget-exhausted delegation. Continues that exact named child's durable session and "
+                            "completed, budget-exhausted, or safely checkpointed interrupted delegation. Continues that exact named child's durable session and logical row with its "
                             "frozen route; omit subagent_type or repeat the same role.",
                         ),
                         "moa_preset": _p(
@@ -1636,11 +1688,14 @@ DELEGATE_TASK_SCHEMA = {
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
                 "'handle' attests exact owned results actually incorporated, or a composed blocker report, using parent_task_id + handled_refs + handling. Arrival alone never handles a row. Nested parents can incorporate only their own children; they cannot attest root user-facing delivery. "
+                "'result' retrieves this owner's recorded results by delegation_id for deliberate presentation in this turn, including previously deferred results; retrieval never handles a row. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop", "handle"],
+                enum=["spawn", "list", "steer", "stop", "handle", "result"],
             ),
             "handled_refs": {"type": "array", "items": {"type": "string"}, "description": "For action=handle: exact terminal thread_refs under parent_task_id, after incorporating their results or preparing their blocker report. Arrival alone is not handling; never infer task success."},
-            "handling": _p("string", "For action=handle: incorporated or blocker_report. Root rows retire only after successful final delivery; blocker_report requires a delivered user-facing report.", enum=["incorporated", "blocker_report"]),
+            "handling": _p("string", "For action=handle: incorporated, blocker_report, or deferred (requires defer_reason and stays visible). Persist before the associated response; retirement requires verified delivery. Revision is recorded only by successful linked continuation, never by handle.", enum=["incorporated", "blocker_report", "deferred"]),
+            "defer_reason": _p("string", "Required for handling=deferred: short actionable reason, at most 160 characters. Keeps the result visible."),
+            "delegation_id": _p("string", "For action=result: exact durable delegation_id returned by dispatch/completion. Retrieves only this conversation owner’s recorded results, without acknowledging them."),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(
                 "string",
@@ -1683,8 +1738,8 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_task_id=args.get("parent_task_id"), task_label=args.get("task_label"),
-        handled_refs=args.get("handled_refs"), handling=args.get("handling"),
-        parent_agent=kw.get("parent_agent"),
+        handled_refs=args.get("handled_refs"), handling=args.get("handling"), defer_reason=args.get("defer_reason"),
+        parent_agent=kw.get("parent_agent"), delegation_id=args.get("delegation_id"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

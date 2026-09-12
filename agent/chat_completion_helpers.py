@@ -704,6 +704,14 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    if getattr(agent, "_delegation_disposition_correction", None) is not None:
+        from agent.delegation_correction import validate_correction_client
+        original_make_client = make_client
+        def checked_client(*args, **kwargs):
+            client = original_make_client(*args, **kwargs)
+            validate_correction_client(agent, client)
+            return client
+        make_client = checked_client
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))

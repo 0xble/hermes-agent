@@ -720,7 +720,7 @@ class SessionSessionsMixin:
         def _has_unresolved_tool_effects(conn, session_id: str) -> bool:
             pending = set()
             rows = conn.execute(
-                "SELECT role, tool_calls, tool_call_id FROM messages "
+                "SELECT role, tool_calls, tool_call_id, content FROM messages "
                 "WHERE session_id = ? AND active = 1 ORDER BY id",
                 (session_id,),
             ).fetchall()
@@ -742,6 +742,10 @@ class SessionSessionsMixin:
                             return True
                         pending.add(call_id.split("|", 1)[0].strip())
                 elif role == "tool":
+                    from tools.delegate_tool_checkpoint import unresolved_tool_result
+                    content = str(row["content"] or "")
+                    if unresolved_tool_result(content):
+                        return True
                     tool_call_id = row["tool_call_id"]
                     if isinstance(tool_call_id, str) and tool_call_id.strip():
                         pending.discard(tool_call_id.split("|", 1)[0].strip())

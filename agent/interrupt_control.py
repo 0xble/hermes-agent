@@ -120,6 +120,9 @@ class InterruptControlMixin:
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
+            if tool_interrupt_reason in {"explicit stop requested", "user interrupt"}:
+                # Survives clear_interrupt; a stop is not a continuation grant.
+                self._delegation_user_stopped = True
             _hard_event = getattr(self, "_hard_interrupt_requested", None) if hard_cancel else None
             if _hard_event is not None:
                 _hard_event.set()

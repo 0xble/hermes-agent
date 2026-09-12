@@ -37,6 +37,8 @@ from agent import chat_completion_helpers as cch
 def _make_agent():
     """A MagicMock agent wired with just enough surface for the helpers."""
     agent = MagicMock()
+    # Ordinary calls have no pending disposition correction.
+    agent._delegation_disposition_correction = None
     agent.api_mode = "chat_completions"
     agent._interrupt_requested = False
     agent.verbose_logging = False

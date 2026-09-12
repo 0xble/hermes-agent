@@ -122,7 +122,13 @@ def test_pre_admission_failure_preserves_resume_grant(tmp_path, monkeypatch, par
     db.create_session("child", source="tool", model_config={"_delegation_completed": True})
     parent._session_db = db
     credentials = delegate_tool._resolve_delegation_credentials({}, parent)
-    launch = ResolvedSubagentLaunch(None, credentials, None, resume_session_id="child")
+    from tools.async_delegation import current_delegation_owner, reserve_delegation_metadata
+    owner = current_delegation_owner(parent)
+    original = reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=["Continue task"])
+    identity = {"parent_task_id": original["parent_task_id"], "thread_ref": original["thread_refs"][0],
+                "task_label": "Continue task", "owner": owner, "attempt": 0}
+    launch = ResolvedSubagentLaunch(None, credentials, None, resume_session_id="child",
+                                   launch_metadata={"card_identity": identity})
     monkeypatch.setattr(delegate_tool, "_resolve_resume_launch", lambda *args, defaults=None: launch)
     monkeypatch.setattr(delegate_tool, "_effective_task_labels", lambda *args: (["Continue task"], None))
     task = {"goal": "Continue the previous inspection task", "task_label": "Continue task", "resume_session_id": "child"}

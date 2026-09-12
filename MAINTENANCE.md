@@ -57,6 +57,13 @@ When useful, record the removal commit subject or resolved SHA on the `Retired` 
 
 Commit subjects and resolved SHAs are optional, human-readable provenance, not manifest keys or publication requirements. Resolve a current SHA from fetched fork history only when it materially helps attribution or review; do not reconstruct or rewrite history to complete this inventory.
 
+## Explicit delegation result disposition — source candidate
+
+- **Contract:** [result disposition and continuation](docs/delegation-result-dispositions.md). Track only exact terminal attempts delivered to a processing turn; one narrow boundary correction; persist incorporated/blocker/deferred disposition before response; verified delivery retires, deferred/failed delivery remains visible.
+- **Continuation:** existing native resume grants and leases preserve durable child/session/logical row, frozen route and label. Attempt history links revision only at native admission. Unknown tool effects, uncheckpointed legacy identities, user stops, active leases and ambiguous starts fail closed instead of duplicating work.
+- **Upstream:** gateway card implementation is absent upstream (live contents lookup 404); PR search found no matching shared contract. Fork-specific; no unrelated PR update or new issue.
+- **Verification:** real temporary SQLite checkpoint/delivery tests and existing delegation/cards/owner/resume/interruption suites. Exact-candidate review is mandatory before fork merge; the user authorized the configured native availability chain, including isolated Astra fallback explicitly labeled same-provider/non-independent. Runtime promotion/restart and historical reconciliation are separately unauthorized here.
+
 ## Agent-requested native update lifecycle — source candidate
 
 - **Contract:** [agent update lifecycle](docs/agent-update-lifecycle.md): required short reason, durable direct/nested parent-topic resolution, shared native `/update` launch and progress, separate Updating/Restarting/final notices, honest recovery attempts and receipt-plus-runtime completion evidence. No synthetic chat events, inferred reasons, second restart, or extra scheduler.

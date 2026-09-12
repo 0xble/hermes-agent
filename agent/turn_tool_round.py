@@ -96,6 +96,8 @@ def run_tool_round(
     assistant_msg, duplicate_previous_interim = stage_tool_call_message(
         agent, assistant_message=assistant_message, finish_reason=finish_reason, messages=messages
     )
+    if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+        assistant_msg["display_kind"] = "hidden"
     append_message(messages, assistant_msg)
 
     # Mixed batch: error-result invalid calls and drop them from execution.
@@ -109,6 +111,8 @@ def run_tool_round(
                     tc.function.name, agent.valid_tool_names
                 ),
             })
+            if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+                messages[-1]["display_kind"] = "hidden"
         assistant_message.tool_calls = [
             tc for tc in assistant_message.tool_calls if tc.function.name in agent.valid_tool_names
         ]
@@ -149,7 +153,10 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
+    _result_start = len(messages)
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+    from agent.delegation_disposition import observe_tool_results
+    observe_tool_results(agent, assistant_message, messages[_result_start:])
 
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to
@@ -197,6 +204,10 @@ def run_tool_round(
     # calling) — cheap RPC-style calls shouldn't eat the budget.
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
         agent.iteration_budget.refund()
+
+    if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+        agent._session_messages = messages
+        return _verdict("continue")
 
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,

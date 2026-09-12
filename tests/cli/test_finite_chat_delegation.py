@@ -9,7 +9,6 @@ import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -164,7 +163,10 @@ def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
     monkeypatch.setattr(cli, "_collect_query_images", lambda q, i: (q, [i] if i else []))
     parent = _make_mock_parent()
     parent.session_id = "interactive-parent"
-    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: MagicMock())
+    # Dispatch metadata contains the child role and durable session identity.
+    # Use concrete state rather than fabricating these attributes on access.
+    child = SimpleNamespace(session_id="interactive-child", _delegate_role="leaf")
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **kw: {
         "model": "test-model", "provider": "custom", "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
@@ -184,6 +186,8 @@ def test_tty_seeded_chat_keeps_background_delegation(monkeypatch, query, image):
         assert isinstance(result, str)
         payload = json.loads(result)
         assert payload["status"] == "dispatched"
+        assert payload["child_session_ids"] == [child.session_id]
+        assert payload["delegation_metadata"]["threads"][0]["role"] == child._delegate_role
         assert len(dispatched) == 1
         assert "HERMES_SINGLE_QUERY_SESSION" not in os.environ
     finally:

@@ -78,6 +78,15 @@ _INTERNAL_TURN_ALWAYS_BLOCKED = frozenset({
 
 def _internal_turn_effect_block(agent, function_name: str, function_args: dict) -> str | None:
     """Reject new control-plane effects from synthetic continuation turns."""
+    correction = getattr(agent, "_delegation_disposition_correction", None)
+    if isinstance(correction, dict):
+        refs = function_args.get("handled_refs")
+        allowed = correction.get(function_args.get("parent_task_id"), ())
+        if (function_name == "delegate_task" and function_args.get("action") == "handle"
+                and function_args.get("handling") in {"incorporated", "blocker_report", "deferred"}
+                and isinstance(refs, list) and refs and all(r in allowed for r in refs)):
+            return None
+        return "Disposition correction may only record dispositions for the exact delivered results; no other tools or new work."
     if not bool(getattr(agent, "_current_turn_is_internal", False)):
         return None
 
@@ -1093,6 +1102,8 @@ def _commit_tool_result(
     # string-safe fallback so a rejected image result never poisons history.
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
+    if isinstance(getattr(agent, "_delegation_disposition_correction", None), dict):
+        tool_message["display_kind"] = "hidden"
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
