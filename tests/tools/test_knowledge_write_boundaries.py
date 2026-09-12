@@ -384,3 +384,99 @@ def test_execute_code_benign_chdir_keeps_unrelated_work_allowed(tmp_path, monkey
     with delegated_child_context(read_only_knowledge=True):
         for code in benign:
             assert knowledge_boundary.command_denial_reason(code, tool="execute_code", cwd=str(workspace)) is None, code
+
+
+@pytest.mark.parametrize("command", [
+    # F5: the outer tokenization never sees the nested cd, the full protected
+    # path never appears, and the destructive operand is relative to the
+    # nested cwd, not the outer one.
+    "bash -c 'cd {home}; rm -rf memories'",
+    "sh -c 'cd {home}; rm -rf memories'",
+    "zsh -c 'cd {home} && rm -rf memories'",
+    "bash -c 'cd {home}; printf x > memories/MEMORY.md'",
+    "sh -c 'cd -P -- {home}; rm -rf memories'",
+    "sh -c 'builtin cd {home}; rm -rf memories'",
+    "sh -c 'pushd {home}; rm -rf memories'",
+    "python -c \"import os; os.chdir({quoted}); open('memories/x', 'w')\"",
+    "python3 -c \"import os as o; o.chdir({quoted}); open('memories/x', 'w')\"",
+    "python -c \"import shutil, os; os.chdir({quoted}); shutil.rmtree('memories')\"",
+    # Relative nested transition from the workspace, and a double nesting.
+    "bash -c 'cd ../home; rm -rf memories'",
+    "bash -c \"sh -c 'cd {home}; rm -rf memories'\"",
+    "python -c \"import os; os.system('cd {home}; rm -rf memories')\"",
+    "python -c \"import subprocess; subprocess.run('cd {home}; rm -rf memories', shell=True)\"",
+    "python -c \"import subprocess; subprocess.run(['rm', '-rf', 'memories'], cwd={quoted})\"",
+])
+def test_nested_literal_cd_transition_is_tracked(tmp_path, monkeypatch, command):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    command = command.format(home=str(home), quoted=repr(str(home)))
+    with delegated_child_context(read_only_knowledge=True):
+        denial = knowledge_boundary.command_denial_reason(command, cwd=str(workspace))
+    assert denial is not None and "Parent-owned shared knowledge" in denial, command
+    assert knowledge_boundary.command_denial_reason(command, cwd=str(workspace)) is None
+
+
+@pytest.mark.parametrize("source", [
+    "import os; os.system('cd {home}; rm -rf memories')",
+    "import subprocess; subprocess.run('cd {home}; rm -rf memories', shell=True)",
+    "import subprocess; subprocess.run(['bash', '-c', 'cd {home}; rm -rf memories'])",
+    "import subprocess; subprocess.check_call(['rm', '-rf', 'memories'], cwd={quoted})",
+    "exec(\"import os; os.chdir({quoted}); open('memories/x', 'w')\")",
+])
+def test_execute_code_nested_literal_cd_transition_is_tracked(tmp_path, monkeypatch, source):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    code = source.format(home=str(home), quoted=repr(str(home)))
+    with delegated_child_context(read_only_knowledge=True):
+        denial = knowledge_boundary.command_denial_reason(code, tool="execute_code", cwd=str(workspace))
+    assert denial is not None and "Parent-owned shared knowledge" in denial, code
+
+
+def test_nested_literal_cd_before_terminal_dispatch(tmp_path, monkeypatch):
+    from tools import terminal_tool as terminal
+    home = tmp_path / "home"
+    protected = home / "memories"
+    protected.mkdir(parents=True)
+    (protected / "keep").write_text("original")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("reached destructive execution"))
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(
+            f"bash -c 'cd {home}; rm -rf memories'", workdir=str(workspace), task_id="nested-cd"))
+    assert "Parent-owned shared knowledge" in result["error"]
+    assert (protected / "keep").read_text() == "original"
+
+
+def test_nested_benign_cd_keeps_unrelated_work_allowed(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    workspace = tmp_path / "workspace"
+    (workspace / "memories").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    benign = [
+        # A nested cd to an unprotected directory, then the same operand name.
+        f"bash -c 'cd {elsewhere}; rm -rf memories'",
+        f"sh -c 'cd {workspace}; printf x > memories/notes.txt'",
+        # The home itself is not protected; only its shared knowledge subtrees.
+        f"bash -c 'cd {home}; printf x > ordinary.txt'",
+        "bash -c 'cd build; rm -rf memories'",
+        # Runtime-computed nested targets stay under the documented
+        # not-enforced contract rather than becoming refusals.
+        "bash -c 'cd \"$TARGET\"; rm -rf memories'",
+        "bash -c 'cd -; rm -rf memories'",
+        f"python -c \"import os; os.chdir({str(elsewhere)!r}); open('memories/x', 'w')\"",
+    ]
+    with delegated_child_context(read_only_knowledge=True):
+        for command in benign:
+            assert knowledge_boundary.command_denial_reason(command, cwd=str(workspace)) is None, command

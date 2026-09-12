@@ -22,6 +22,15 @@ _JUDGMENT_CONTRACT = "native_review_judgment_v1"
 _RESULT_CONTRACT = "native_review_result_v1"
 _JUDGMENTS = frozenset({"approve", "request_changes", "needs_human"})
 
+# Fail-closed evidence budget. Every captured byte is held in memory, base64
+# encoded, serialized into the candidate identity, and sent in the reviewer
+# prompt by the parent CLI/gateway process, so capture rejects oversized
+# evidence outright rather than truncating it or exhausting that process.
+MAX_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024
+"""Largest single untracked file (or symlink target) capture will read."""
+MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
+"""Largest tracked patch plus all untracked content one candidate may carry."""
+
 
 class ReviewCandidateStale(ValueError):
     """The repository no longer matches the candidate sent for review."""
@@ -286,11 +295,36 @@ def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
         _reject_dirty_submodules(submodule, [])
 
 
-def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
+def _evidence_bound_error(relative: str, budget: int) -> ValueError:
+    return ValueError(
+        f"Untracked review evidence {relative} exceeds the {budget}-byte review evidence bound "
+        f"(per-file limit {MAX_UNTRACKED_FILE_BYTES}, aggregate limit {MAX_EVIDENCE_BYTES})"
+    )
+
+
+def _untracked_byte_count(entry: ReviewUntrackedFileV1) -> int:
+    encoded = entry.content_base64
+    return len(encoded) * 3 // 4 - encoded.count("=")
+
+
+def _untracked_entry(
+    repo: Path, relative: str, *, budget: int | None = None,
+) -> ReviewUntrackedFileV1:
+    """Capture one untracked path, reading at most ``budget`` content bytes.
+
+    ``budget`` defaults to the per-file limit; callers tracking an aggregate
+    budget pass the smaller of the two. The size reported by fstat rejects
+    oversized files before any read, and the read itself is bounded so a file
+    that grows after that check is still rejected instead of read to EOF.
+    """
     from contextlib import ExitStack
 
     if not descriptor_capture_supported():
         raise ValueError("Safe untracked review capture is unsupported on this platform")
+    if budget is None:
+        budget = MAX_UNTRACKED_FILE_BYTES
+    if budget < 0:
+        raise _evidence_bound_error(relative, 0)
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts or not relative_path.parts:
         raise ValueError("Untracked review evidence must be repository-relative")
@@ -316,6 +350,8 @@ def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
             info = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 content = os.fsencode(os.readlink(leaf, dir_fd=parent_fd))
+                if len(content) > budget:
+                    raise _evidence_bound_error(relative, budget)
                 mode = "120000"
             elif stat.S_ISREG(info.st_mode):
                 fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
@@ -323,9 +359,18 @@ def _untracked_entry(repo: Path, relative: str) -> ReviewUntrackedFileV1:
                 opened = os.fstat(fd)
                 if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(info):
                     raise ValueError("Untracked review evidence changed while opening")
-                chunks = []
-                while chunk := os.read(fd, 1024 * 1024):
+                if opened.st_size > budget:
+                    raise _evidence_bound_error(relative, budget)
+                # Read one byte past the budget at most, so growth between the
+                # fstat check and the read is rejected without buffering the file.
+                limit = budget + 1
+                chunks: list[bytes] = []
+                total = 0
+                while total < limit and (chunk := os.read(fd, min(1024 * 1024, limit - total))):
                     chunks.append(chunk)
+                    total += len(chunk)
+                if total > budget:
+                    raise _evidence_bound_error(relative, budget)
                 content = b"".join(chunks)
                 if identity(os.fstat(fd)) != identity(info):
                     raise ValueError("Untracked review evidence changed while reading")
@@ -373,11 +418,22 @@ def capture_review_candidate(
         root, "diff", "--binary", "--no-ext-diff", "--no-textconv",
         "--ignore-submodules=none", "--submodule=short", base_commit, "--", *pathspecs,
     )
+    remaining = MAX_EVIDENCE_BYTES - len(patch_bytes)
+    if remaining < 0:
+        raise ValueError(
+            f"Tracked review evidence ({len(patch_bytes)} bytes) exceeds the "
+            f"{MAX_EVIDENCE_BYTES}-byte aggregate review evidence bound"
+        )
     untracked_raw = _git(root, "ls-files", "--others", "--exclude-standard", "-z", "--", *pathspecs)
     untracked_paths = sorted(
         item.decode("utf-8", "surrogateescape") for item in untracked_raw.split(b"\0") if item
     )
-    untracked = tuple(_untracked_entry(root, path) for path in untracked_paths)
+    entries: list[ReviewUntrackedFileV1] = []
+    for path in untracked_paths:
+        entry = _untracked_entry(root, path, budget=min(MAX_UNTRACKED_FILE_BYTES, remaining))
+        remaining -= _untracked_byte_count(entry)
+        entries.append(entry)
+    untracked = tuple(entries)
     if not patch_bytes and not untracked:
         raise ValueError("Accepted review scope contains no tracked changes or untracked files")
     try:

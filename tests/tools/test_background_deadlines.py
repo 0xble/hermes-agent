@@ -156,18 +156,11 @@ def test_successful_kill_signal_requires_confirmed_exit(registry):
         registry._signal_kill(session, session.id, False)
 
 
-@pytest.mark.parametrize("already_gone", [False, True])
-def test_unconfirmed_termination_wakes_owner_as_lost(registry, monkeypatch, already_gone):
+def test_unreachable_recovered_pid_is_retired_as_lost(registry, monkeypatch):
     session = ProcessSession(id="unreachable", command="verification", task_id="test", started_at=time.time())
     session.notify_on_complete = True
     registry._running[session.id] = session
-
-    def unavailable(*args, **kwargs):
-        if already_gone:
-            return {"status": "already_exited"}
-        raise OSError("backend unavailable")
-
-    monkeypatch.setattr(registry, "_signal_kill", unavailable)
+    monkeypatch.setattr(registry, "_signal_kill", lambda *a, **k: {"status": "already_exited"})
     registry.set_deadline(session.id, 0.01)
     assert session._completion_event.wait(3)
     result = registry.poll(session.id)
@@ -176,8 +169,125 @@ def test_unconfirmed_termination_wakes_owner_as_lost(registry, monkeypatch, alre
     assert result["exit_code"] is None
     notice = registry.completion_queue.get(timeout=2)
     assert notice["session_id"] == session.id
-    if not already_gone:
-        assert "Reconcile external effects" in notice["output"]
+
+
+def _unconfirmed_session(registry, monkeypatch, *, retry=0.05):
+    """A running session whose deadline kill keeps erroring; returns (session, attempts)."""
+    monkeypatch.setattr(module, "DEADLINE_KILL_RETRY_SECONDS", retry)
+    monkeypatch.setattr(module, "DEADLINE_KILL_RETRY_MAX_SECONDS", retry * 4)
+    session = ProcessSession(id="proc_unconfirmed", command="verification", task_id="test",
+                             owner_task_id="sa-owner", session_key="chat", started_at=time.time())
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    attempts = []
+
+    def failing_kill(*args, **kwargs):
+        attempts.append(time.monotonic())
+        raise OSError("backend unavailable")
+
+    monkeypatch.setattr(registry, "_signal_kill", failing_kill)
+    return session, attempts
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_unconfirmed_kill_keeps_process_running_and_retries(registry, monkeypatch):
+    session, attempts = _unconfirmed_session(registry, monkeypatch)
+    registry.set_deadline(session.id, 0.01)
+    assert _wait_for(lambda: len(attempts) >= 2), "deadline worker did not retry the failed kill"
+    # Not retired: still running, still recoverable, still owned, no completion fired.
+    assert not session.exited
+    assert not session._completion_event.is_set()
+    assert registry.get(session.id) is session and session.id in registry._running
+    assert registry.running_owned_by("sa-owner") == [session]
+    assert registry.has_active_for_session("chat") and registry.has_any_active()
+    assert registry.completion_queue.empty()
+    listed = {s["session_id"]: s for s in registry.list_sessions("test")}[session.id]
+    assert listed["status"] == "running" and listed["termination_unconfirmed"] is True
+    assert listed["termination_attempts"] >= 2
+    polled = registry.poll(session.id)
+    assert polled["status"] == "running" and polled["termination_unconfirmed"] is True
+    assert polled["termination_error"] == "backend unavailable"
+    assert "could not be confirmed" in polled["output_preview"]
+    assert polled["output_preview"].count("could not be confirmed") == 1
+    waited = registry.wait(session.id, timeout=1)
+    assert waited["status"] == "timeout" and waited["termination_unconfirmed"] is True
+    # The live handle is still there for explicit cleanup: a kill is attempted, not short-circuited.
+    before = len(attempts)
+    explicit = registry.kill_process(session.id)
+    assert explicit["status"] == "error" and len(attempts) == before + 1
+    # Retries are paced, not a tight loop.
+    assert _wait_for(lambda: len(attempts) >= 3)
+    assert attempts[2] - attempts[1] >= 0.09
+    assert attempts[1] - attempts[0] >= 0.04
+    checkpoint = {e["session_id"]: e for e in json.loads(module.CHECKPOINT_PATH.read_text())}
+    assert checkpoint[session.id]["termination_attempts"] >= 2
+    assert checkpoint[session.id]["termination_unconfirmed_at"] > 0
+    session._completion_event.set()  # stop the worker before fixture teardown
+
+
+def test_unconfirmed_kill_retires_on_later_confirmed_kill(registry, monkeypatch):
+    session, attempts = _unconfirmed_session(registry, monkeypatch)
+    registry.set_deadline(session.id, 0.01)
+    assert _wait_for(lambda: len(attempts) >= 1)
+    monkeypatch.setattr(registry, "_signal_kill", lambda *a, **k: None)
+    assert session._completion_event.wait(5), "confirmed kill did not finish the session"
+    result = registry.poll(session.id)
+    assert result["status"] == "exited"
+    assert result["exit_code"] == 124 and result["completion_reason"] == "timed_out"
+    assert result["termination_source"] == "terminal.timeout"
+    assert "termination_unconfirmed" not in result
+    assert session.id not in registry._running
+    notice = registry.completion_queue.get(timeout=2)
+    assert notice["session_id"] == session.id and notice["completion_reason"] == "timed_out"
+    assert "could not be confirmed" in notice["output"]
+
+
+def test_unconfirmed_kill_retires_on_observed_exit(registry, monkeypatch):
+    session, attempts = _unconfirmed_session(registry, monkeypatch, retry=0.5)
+    registry.set_deadline(session.id, 0.01)
+    assert _wait_for(lambda: len(attempts) >= 1)
+    # The observer (reader/poller) sees the exit while the worker is backing off.
+    registry._finish_exited(session, 0)
+    assert session._completion_event.wait(3)
+    assert session.exited and session.id in registry._finished
+    assert registry.completion_queue.get(timeout=2)["session_id"] == session.id
+    session._deadline_thread.join(3)
+    assert not session._deadline_thread.is_alive()
+    assert len(attempts) == 1
+
+
+def test_unconfirmed_backoff_is_bounded(registry, monkeypatch):
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda *a, **k: None)
+    session = ProcessSession(id="proc_backoff", command="x", started_at=time.time())
+    delays = [registry._record_unconfirmed_termination(session, f"err {i}") for i in range(6)]
+    assert delays == [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+    assert session.termination_attempts == 6 and session.termination_error == "err 5"
+    assert not session.exited
+
+
+def test_unconfirmed_state_survives_checkpoint_recovery(registry, monkeypatch):
+    session = ProcessSession(id="proc_recover_unconfirmed", command="test", pid=1234, host_start_time=5678,
+                             started_at=time.time() - 20, deadline_at=time.time() - 5,
+                             termination_attempts=3, termination_unconfirmed_at=time.time() - 1)
+    registry._running[session.id] = session
+    registry._write_checkpoint()
+    recovered = ProcessRegistry()
+    monkeypatch.setattr(recovered, "_host_pid_is_ours", lambda *args: True)
+    monkeypatch.setattr(recovered, "_start_deadline", Mock())
+    assert recovered.recover_from_checkpoint() == 1
+    restored = recovered.get(session.id)
+    assert restored.termination_attempts == 3 and restored.termination_unconfirmed_at > 0
+    assert not restored.exited
+    registry._running.clear()
+    recovered._running.clear()
 
 
 def test_real_recovered_deadline_rearms_without_extending(registry, monkeypatch):

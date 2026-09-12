@@ -52,6 +52,10 @@ def _checkpoint_path() -> Path:
 MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
+# A deadline kill that returns an error has not established exit. The session stays
+# running (and checkpointed) and the kill is retried with exponential backoff.
+DEADLINE_KILL_RETRY_SECONDS = 30.0
+DEADLINE_KILL_RETRY_MAX_SECONDS = 300.0
 
 # Watch-pattern rate limiting, PER SESSION: one watch-match notification per
 # WATCH_MIN_INTERVAL_SECONDS; a match inside the cooldown is dropped and counts as one
@@ -400,6 +404,9 @@ class ProcessSession:
     exit_code: Optional[int] = None             # None while running
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    termination_attempts: int = 0               # deadline kills that errored without establishing exit
+    termination_unconfirmed_at: float = 0.0     # time.time() of the latest such attempt; zero when none
+    termination_error: str = ""                 # error text of the latest unconfirmed deadline kill
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -465,7 +472,8 @@ _WATCHER_ROUTE_KEYS = ("platform", "chat_id", "user_id", "user_name", "thread_id
 # ``session_id``; ``command`` is redacted and ``owner_task_id`` defaulted on write).
 _CHECKPOINT_FIELDS = (
     "command", "pid", "pid_scope", "host_start_time", "systemd_unit", "sandbox_process_group", "cwd",
-    "started_at", "deadline_at", "task_id", "owner_task_id", "session_key",
+    "started_at", "deadline_at", "termination_attempts", "termination_unconfirmed_at",
+    "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "watch_patterns")
 _CHECKPOINT_DEFAULTS = {
@@ -1093,18 +1101,61 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     return
             # Reconcile a natural exit before classifying a deadline. A timeout
             # never retries the command or proves an external effect failed.
-            self._reconcile_local_exit(session)
-            if not session.exited:
+            # A kill that errors (sandbox group still alive after its confirmation
+            # window, backend transport failure before the signal landed) has not
+            # established exit either: keep the session running so recovery and an
+            # explicit kill still see the live handle, and retry at a bounded cadence
+            # until an exit is observed or a kill is confirmed.
+            while not session._completion_event.is_set():
+                self._reconcile_local_exit(session)
+                if session.exited:
+                    return
                 result = self.kill_process(session.id, source="terminal.timeout", consume_output=False)
-                if result.get("status") == "error":
-                    session.termination_source = "deadline_unconfirmed"
-                    session.append_output("\nDeadline expired; termination could not be confirmed. Reconcile external effects before retrying.\n")
-                    session.mark_exited(None, reason="lost", source="deadline_unconfirmed")
-                    self._move_to_finished(session)
+                if result.get("status") != "error":
+                    return
+                delay = self._record_unconfirmed_termination(session, str(result.get("error") or ""))
+                if session._completion_event.wait(delay):
+                    return
 
         thread = threading.Thread(target=expire, daemon=True, name=f"proc-deadline-{session.id}")
         session._deadline_thread = thread
         thread.start()
+
+    def _record_unconfirmed_termination(self, session: ProcessSession, error: str) -> float:
+        """Record a deadline kill that returned an error without establishing exit and
+        return the backoff before the next attempt. The session is NOT retired: it stays
+        in ``_running`` (so it is checkpointed and recoverable) and ``poll``/``list``
+        surface the unconfirmed state until a later exit or confirmed kill finishes it."""
+        with session._lock:
+            session.termination_attempts += 1
+            session.termination_unconfirmed_at = time.time()
+            session.termination_error = error
+            attempts = session.termination_attempts
+        if attempts == 1:
+            session.append_output(
+                "\nDeadline expired; termination could not be confirmed. The process may still be "
+                "running. Reconcile external effects before retrying.\n")
+        delay = min(DEADLINE_KILL_RETRY_SECONDS * (2 ** (attempts - 1)), DEADLINE_KILL_RETRY_MAX_SECONDS)
+        logger.warning(
+            "Deadline kill of %s unconfirmed (attempt %d: %s); process kept as running, retrying in %.0fs",
+            session.id, attempts, error, delay)
+        self._write_checkpoint()
+        return delay
+
+    @staticmethod
+    def _unconfirmed_fields(session: ProcessSession) -> dict:
+        """Live-session marker for a deadline kill that could not be confirmed (empty otherwise)."""
+        if session.exited or not session.termination_unconfirmed_at:
+            return {}
+        return {
+            "termination_unconfirmed": True,
+            "termination_attempts": session.termination_attempts,
+            "termination_error": session.termination_error,
+            "termination_note": (
+                "The runtime deadline expired but termination could not be confirmed; the process "
+                "is still tracked as running and the kill is retried. Kill it explicitly or check "
+                "the backend."),
+        }
 
     # ----- Reader / Poller Threads -----
 
@@ -1276,19 +1327,28 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     f"kill -0 \"$(cat {q(pid_path)} 2>/dev/null)\" 2>/dev/null; echo $?", timeout=5)
                 check_output = check.get("output", "").strip()
                 if check_output and check_output.splitlines()[-1].strip() != "0":
+                    if session._termination_in_progress:
+                        # The observer is fenced while a deadline kill publishes this
+                        # exit. Re-poll instead of dropping the observation so an
+                        # errored kill still has a watcher to retire the session.
+                        continue
                     # Exited -- read the exit code captured by the wrapper shell.
                     exit_str = env.execute(f"cat {q(exit_path)} 2>/dev/null", timeout=5).get("output", "").strip()
                     try:
                         exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
                         exit_code = -1
-                    if not session._termination_in_progress:
-                        session.exit_code = exit_code
+                    session.exit_code = exit_code
                     self._finish_exited(session, exit_code)
                     return
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
+                # Environment might be gone (sandbox reaped, etc.). While a deadline
+                # kill is in flight the failure may be the kill itself: keep observing
+                # so a kill that errors without confirming exit still has a watcher,
+                # and never overwrite an exit the kill already published.
                 if session._termination_in_progress:
+                    continue
+                if session.exited:
                     return
                 session.exited, session.exit_code = True, -1
                 session.completion_reason, session.termination_source = "lost", "backend_lost"
@@ -1669,6 +1729,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # _completion_consumed, or a status check would suppress the watcher's
             # autonomous delivery turn. See __init__.
             self._poll_observed.add(session_id)
+        else:
+            result.update(self._unconfirmed_fields(session))
         if session.detached:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -1751,7 +1813,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         result = {
             "status": "timeout", "command": session.command, "output": _output_tail(session, 1000),
             # Not a failure — models re-issued identical waits after misreading this as an error.
-            "process_running": True}
+            "process_running": True, **self._unconfirmed_fields(session)}
         base_note = (
             f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
         if session.started_at:
@@ -2032,6 +2094,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 entry["notify_on_complete"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
+            elif s.termination_unconfirmed_at:
+                entry.update(termination_unconfirmed=True, termination_attempts=s.termination_attempts)
             if s.detached:
                 entry["detached"] = True
             result.append(entry)

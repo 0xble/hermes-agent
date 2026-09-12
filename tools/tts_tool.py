@@ -336,6 +336,7 @@ def _text_to_speech_single(
     Command providers resolve BEFORE built-in dispatch, but built-in names short-circuit so
     ``tts.providers.openai.command`` can't shadow OpenAI. Plugins fire only for names that are
     neither; a None return falls through to built-in dispatch (unknown -> Edge default)."""
+    synthesized = False
     try:
         if command_provider_config is not None:
             logger.info("Generating speech with command TTS provider '%s'...", provider)
@@ -358,6 +359,7 @@ def _text_to_speech_single(
             _synthesize_builtin(provider, text, file_str, tts_config, instructions)
         if not os.path.exists(file_str) or os.path.getsize(file_str) == 0:
             return _error_json(f"TTS generation produced no output (provider: {provider})")
+        synthesized = True
 
         # Sniff once for every provider: MP3/WAV bytes in a .ogg path render as 0-second bubbles.
         file_str = _repair_ogg_container(file_str)
@@ -371,7 +373,12 @@ def _text_to_speech_single(
     except ValueError as e:
         return _tool_failure("TTS configuration error", provider, e)
     except FileNotFoundError as e:
-        return _tool_failure("TTS dependency missing", provider, e)
+        # A dependency found missing only once synthesis runs is an availability failure
+        # (preflight trusts every configured command provider, and binaries can vanish after
+        # it); a tool lost while delivering audio that already exists is not a provider outage.
+        result = json.loads(_tool_failure("TTS dependency missing", provider, e))
+        result["fallback_eligible"] = not synthesized
+        return json.dumps(result)
     except Exception as e:
         from tools.tts_tool_fallback import is_availability_failure
         result = json.loads(_tool_failure("TTS generation failed", provider, e))

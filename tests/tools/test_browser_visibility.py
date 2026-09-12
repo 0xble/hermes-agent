@@ -134,11 +134,127 @@ def test_zero_exit_reload_without_exact_termination_proof_keeps_timeout_marker(
     monkeypatch.setattr(cli.subprocess, "run", run)
     monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: before)
     monkeypatch.setattr(cli, "_process_identity_is_live", lambda *_args: after)
+    monkeypatch.setattr(cli, "_process_identity_verified_gone", lambda *_args: False)
 
     assert cli._reload_browser_exec_daemons_for_runtime(owner) is False
     assert life._read_state(identity)["pending"] == "loopback"
     if before is None or before != (41, 1.0):
         run.assert_not_called()
+
+
+@pytest.mark.parametrize("observed", [None, (42, 2.0)])
+def test_reload_clears_marker_whose_recorded_daemon_is_verifiably_dead(
+    identity, monkeypatch, observed,
+):
+    """A timed-out daemon that already exited must not leave the marker stuck forever."""
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    run = Mock(return_value=Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: observed)
+    checked = []
+    monkeypatch.setattr(
+        cli, "_process_identity_verified_gone", lambda ident: checked.append(ident) or True,
+    )
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is True
+    assert checked == [(41, 1.0)]
+    assert life._read_state(identity) == {}
+    run.assert_called_once()
+    assert daemon not in cli._browser_exec_identity_daemons
+
+
+def test_reload_keeps_marker_when_recorded_pid_is_alive_with_other_start_time(
+    identity, monkeypatch,
+):
+    """A reused PID is not termination proof: the marker must stay fail-closed."""
+    import os
+    import psutil
+
+    pid = os.getpid()
+    live_created = psutil.Process(pid).create_time()
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(pid, live_created - 1000.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    run = Mock(return_value=Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: (pid, live_created))
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is False
+    assert life._read_state(identity)["pending"] == "loopback"
+    run.assert_not_called()
+    assert cli._browser_exec_identity_daemons[daemon] == owner
+
+
+def test_reload_leaves_live_matching_daemon_marker_to_ordinary_recovery(identity, monkeypatch):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    run = Mock(return_value=Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: (41, 1.0))
+    monkeypatch.setattr(cli, "_process_identity_is_live", lambda *_args: True)
+    gone = Mock(return_value=True)
+    monkeypatch.setattr(cli, "_process_identity_verified_gone", gone)
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is False
+    gone.assert_not_called()
+    assert life._read_state(identity)["pending"] == "loopback"
+    run.assert_called_once()
+
+
+def test_process_identity_verified_gone_requires_missing_pid():
+    import os
+    import subprocess as sp
+
+    import psutil
+
+    child = sp.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert cli._process_identity_verified_gone((child.pid, 1.0)) is True
+    me = os.getpid()
+    created = psutil.Process(me).create_time()
+    assert cli._process_identity_verified_gone((me, created)) is False
+    assert cli._process_identity_verified_gone((me, created - 1000.0)) is False
+
+
+def test_dead_daemon_recovery_ignores_malformed_recorded_identity(identity, monkeypatch):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(identity, "loopback", daemon_name=daemon, runtime_owner=owner)
+    states = life.pending_daemon_recovery_state(owner, daemon)
+    gone = Mock(return_value=True)
+    monkeypatch.setattr(cli, "_process_identity_verified_gone", gone)
+
+    assert cli._clear_pending_for_gone_daemon(owner, daemon, states, None) == states
+    gone.assert_not_called()
+    assert life._read_state(identity)["pending"] == "loopback"
 
 
 def test_daemon_recovery_does_not_clear_newer_marker(identity):

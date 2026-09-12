@@ -1335,3 +1335,112 @@ def test_auth_snapshot_never_reads_spilled_uncommitted_pages(tmp_path, monkeypat
     assert bc._copy_auth_file(str(source), str(destination)) is True
     with sqlite3.connect(destination) as reader:
         assert reader.execute("SELECT count(*) FROM t WHERE v LIKE 'old-%'").fetchone()[0] == 500
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Chromium's SingletonLock symlink is POSIX-only")
+class TestSnapshotSingletonOwner:
+    """A completed durable snapshot is only reusable once the browser launched on it is
+    verifiably gone. Its SingletonLock symlink (``hostname-pid``) is Chromium's own
+    exclusivity mechanism: a live owner must be preserved, never unlinked, so two
+    browser processes can never share one credential/profile database set."""
+
+    @staticmethod
+    def _dead_pid() -> int:
+        import subprocess
+        import sys
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        assert proc.wait(timeout=30) == 0  # reaped: the pid is now verifiably dead
+        return proc.pid
+
+    def _durable_snapshot(self, tmp_path, monkeypatch, lock_target):
+        import socket
+
+        import hermes_cli.browser_connect as bc
+
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_refresh_mode", lambda: ("initial", None))
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: None)
+        dst = home / "browser-profile" / "chrome"
+        (dst / "Default").mkdir(parents=True)
+        (dst / bc._SNAPSHOT_DONE_MARKER).write_text("Default")
+        if lock_target is not None:
+            target = lock_target.replace("{host}", socket.gethostname())
+            os.symlink(target, dst / "SingletonLock")
+        (dst / "SingletonCookie").write_text("cookie")
+        # The source profile must not be needed at all on a durable reuse.
+        return dst, tmp_path / "missing-source"
+
+    def test_live_owner_preserves_lock_and_refuses_reuse(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        dst, src = self._durable_snapshot(tmp_path, monkeypatch, f"{{host}}-{os.getpid()}")
+        got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert got is None
+        assert err and "still held by a running browser" in err and str(dst) in err
+        assert os.path.islink(dst / "SingletonLock")
+        assert (dst / "SingletonCookie").exists()
+
+    def test_dead_owner_removes_lock_and_reuses(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        dst, src = self._durable_snapshot(tmp_path, monkeypatch, f"{{host}}-{self._dead_pid()}")
+        got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None and got == str(dst)
+        assert not os.path.lexists(dst / "SingletonLock")
+        assert not (dst / "SingletonCookie").exists()
+
+    def test_foreign_host_owner_is_preserved(self, tmp_path, monkeypatch):
+        """Liveness cannot be verified for another host (shared/synced home): fail closed."""
+        import hermes_cli.browser_connect as bc
+
+        dst, src = self._durable_snapshot(tmp_path, monkeypatch, f"not-{{host}}-{os.getpid()}")
+        got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert got is None and err and "still held" in err
+        assert os.path.islink(dst / "SingletonLock")
+
+    @pytest.mark.parametrize("target", [None, "garbage", "host-", "-42", "host-notapid"])
+    def test_absent_or_unparseable_lock_is_stale(self, tmp_path, monkeypatch, target):
+        import hermes_cli.browser_connect as bc
+
+        dst, src = self._durable_snapshot(tmp_path, monkeypatch, target)
+        got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None and got == str(dst)
+        assert not os.path.lexists(dst / "SingletonLock")
+
+    def test_launch_overlay_refuses_live_owner(self, tmp_path, monkeypatch):
+        """Same invariant on the per-launch overlay path: never rewrite auth DBs under a
+        browser that still owns the copy."""
+        import socket
+
+        import hermes_cli.browser_connect as bc
+
+        src = TestSnapshotRealProfile()._make_profile(tmp_path / "real")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        first, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None
+        os.symlink(f"{socket.gethostname()}-{os.getpid()}", os.path.join(first, "SingletonLock"))
+        _auth_db(src / "Default" / "Cookies", "newer-cookies")
+
+        got, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert got is None and err and "still held" in err
+        assert os.path.islink(os.path.join(first, "SingletonLock"))
+        assert _auth_db(os.path.join(first, "Default", "Cookies")) == "sqlite-cookies"
+
+    def test_owner_probe_unit(self, tmp_path):
+        import socket
+
+        import hermes_cli.browser_connect as bc
+
+        assert bc._snapshot_singleton_owner(str(tmp_path)) is None
+        live = f"{socket.gethostname()}-{os.getpid()}"
+        os.symlink(live, tmp_path / "SingletonLock")
+        assert bc._snapshot_singleton_owner(str(tmp_path)) == live
+        os.unlink(tmp_path / "SingletonLock")
+        os.symlink(f"{socket.gethostname()}-{self._dead_pid()}", tmp_path / "SingletonLock")
+        assert bc._snapshot_singleton_owner(str(tmp_path)) is None
+        os.unlink(tmp_path / "SingletonLock")
+        (tmp_path / "SingletonLock").write_text(live)  # a regular file is never a live lock
+        assert bc._snapshot_singleton_owner(str(tmp_path)) is None

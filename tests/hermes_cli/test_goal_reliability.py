@@ -379,3 +379,29 @@ def test_cli_post_turn_passes_canonical_evidence_and_silences_routine_continue(m
         cli._maybe_continue_goal_after_turn()
     printer.assert_not_called()
     assert captured["tool_evidence"][0]["tool_call_id"] == "call-cli"
+
+
+def test_judge_prompt_never_receives_credentialed_artifact_or_revision(monkeypatch):
+    manager = goals.GoalManager("credentialed-artifact")
+    manager.set("Publish the release artifact")
+    prompts = []
+    monkeypatch.setattr(goals, "_call_goal_judge_llm", lambda _call, _system, user, _timeout: prompts.append(user) or '{"verdict":"continue","reason":"more"}')
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", object())
+    evidence = goals.collect_tool_evidence(_result("upload-call", {
+        "status": "ok",
+        "url": "https://user:secret@host/path?sig=TOKEN#frag",
+        "sha": "https://user:secret@git.host/commit/deadbeef?sig=TOKEN#frag",
+    }))
+    # The evidence boundary itself must be clean, so every consumer sees sanitized values.
+    assert evidence[0]["artifact"] == "https://host/path"
+    assert evidence[0]["revision"] == "https://git.host/commit/deadbeef"
+    for value in evidence[0].values():
+        assert "secret" not in str(value)
+        assert "TOKEN" not in str(value)
+        assert "user:" not in str(value)
+    manager.evaluate_after_turn("Uploaded", tool_evidence=evidence)
+    assert "https://host/path" in prompts[0]
+    assert "secret" not in prompts[0]
+    assert "TOKEN" not in prompts[0]
+    assert "user:" not in prompts[0]
+    assert "#frag" not in prompts[0]

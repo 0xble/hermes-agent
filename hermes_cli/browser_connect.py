@@ -833,6 +833,60 @@ def _copy_profile_tree(src: str, dst: str, source_profile: str) -> None:
             len(multi.args[0]) if multi.args else 0, src, source_profile)
 
 
+def _pid_alive(pid: int) -> bool:
+    """True unless ``pid`` is verifiably gone on this host; unknown fails closed as alive."""
+    try:
+        import psutil
+    except ImportError:  # hard dep; defensive
+        if os.name == "nt":  # os.kill(pid, 0) TERMINATES on Windows; never probe with it
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:  # EPERM: exists, owned by another user
+            return True
+        return True
+    try:
+        return psutil.pid_exists(pid)
+    except Exception:
+        return True
+
+
+def _snapshot_singleton_owner(dst: str) -> str | None:
+    """Return the ``hostname-pid`` target of a LIVE Chromium ``SingletonLock`` in ``dst``.
+
+    Mirrors Chromium's own ProcessSingleton probe: on POSIX the lock is a symlink whose
+    target names the owning host and pid. An absent or unparseable lock, or a pid that
+    is verifiably gone on this host, is stale and returns None so it may be removed. A
+    matching host with a live pid, or a foreign host where liveness cannot be checked,
+    means a browser may still own the profile databases: the target is returned and
+    the caller must preserve the lock. (Windows has no symlink lock, so this is always
+    None there; concurrent launches are refused by the caller's CDP-owner checks.)
+    """
+    try:
+        target = os.readlink(os.path.join(dst, "SingletonLock"))
+    except OSError:  # absent, or a plain file: never a live POSIX lock
+        return None
+    host, sep, pid_text = target.rpartition("-")
+    if not sep or not host or not re.fullmatch(r"[0-9]+", pid_text):
+        return None
+    pid = int(pid_text)
+    if pid <= 0:
+        return None
+    if host != socket.gethostname():
+        return target
+    return target if _pid_alive(pid) else None
+
+
+def _live_snapshot_owner_error(browser: str, dst: str, owner: str) -> str:
+    return (
+        f"the '{browser}' snapshot profile at {dst} is still held by a running browser "
+        f"(SingletonLock -> {owner}). Two browser processes must never share one profile; "
+        "close that browser instance (or wait for it to exit) and retry."
+    )
+
+
 def snapshot_real_profile(
     browser: str,
     src: str | None = None,
@@ -883,6 +937,12 @@ def snapshot_real_profile(
             or durable_source_profile == durable_requested_profile
         )
         if marker_matches and os.path.isdir(os.path.join(durable_dst, "Default")):
+            # The marker only proves the seed completed, not that the browser launched
+            # on it has exited. A live SingletonLock is Chromium's exclusivity
+            # mechanism: removing it would let a second process open the same
+            # credential databases. Fail closed until the owner is verifiably gone.
+            if owner := _snapshot_singleton_owner(durable_dst):
+                return None, _live_snapshot_owner_error(browser, durable_dst, owner)
             snapshot_root = str(get_hermes_home() / "browser-profile")
             secured_paths = [snapshot_root]
             if identity is not None:
@@ -892,6 +952,8 @@ def snapshot_real_profile(
                 path for path in secured_paths if path
             ):
                 _secure_snapshot_root(secure_path)
+            # Verified stale above: clear the dead instance's leftovers so Chromium
+            # does not refuse the launch as "profile in use".
             for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
                 try:
                     os.unlink(os.path.join(durable_dst, leftover))
@@ -921,6 +983,11 @@ def snapshot_real_profile(
         identity=identity,
         source_profile=source_profile if identity is not None else "",
     )
+    # Never overlay auth DBs under a browser that still owns the copy (same guard as
+    # the durable reuse branch above): the caller's CDP re-attach checks can miss an
+    # instance whose DevToolsActivePort is gone, but its SingletonLock still tells.
+    if owner := _snapshot_singleton_owner(dst):
+        return None, _live_snapshot_owner_error(browser, dst, owner)
     # Fast lock probe BEFORE any copy: a running browser holds the cookie DB
     # deny-all (Windows), and a blocking file op on it can hang the launch for
     # minutes. On POSIX this never trips (no mandatory locking) so

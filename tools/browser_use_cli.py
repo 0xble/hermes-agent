@@ -83,6 +83,69 @@ def _process_identity_is_live(identity: tuple[int, float]) -> bool | None:
         return None
 
 
+def _recorded_daemon_identity(state: dict) -> tuple[int, float] | None:
+    """Return the PID/start-time pair a pending marker recorded, if well-formed."""
+    pid, created = state.get("daemon_pid"), state.get("daemon_created")
+    if type(pid) is not int or not 0 < pid < (1 << 31):
+        return None
+    if type(created) not in (int, float):
+        return None
+    return pid, created
+
+
+def _process_identity_verified_gone(identity: tuple[int, float]) -> bool:
+    """True only when the recorded PID no longer exists at all.
+
+    A live PID with a different start time is not proof: it may be a reused PID
+    or the same process behind clock drift, so it stays unverifiable.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        psutil.Process(identity[0])
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError, ValueError, TypeError):
+        return False
+    return False
+
+
+def _clear_pending_for_gone_daemon(
+    owner: str, name: str, recovery_states: list[dict],
+    observed_identity: tuple[int, float] | None,
+) -> list[dict]:
+    """Clear markers whose recorded daemon is verifiably gone; return the rest.
+
+    Only the marker's own generation is cleared, and only when its recorded
+    PID/start-time pair no longer exists. Markers matching the observed daemon
+    are left for the ordinary reload path; anything unverifiable stays pending.
+    """
+    from tools.browser_handoff import clear_pending_after_daemon_reload
+
+    remaining = []
+    for state in recovery_states:
+        recorded = _recorded_daemon_identity(state)
+        generation = state.get("generation")
+        if (
+            recorded is None
+            or not isinstance(generation, str)
+            or recorded == observed_identity
+            or not _process_identity_verified_gone(recorded)
+            or not clear_pending_after_daemon_reload(
+                owner, name, recorded, expected_generation=generation,
+            )
+        ):
+            remaining.append(state)
+            continue
+        logger.info(
+            "cleared timeout recovery marker for Browser Use daemon %s: "
+            "recorded process %s no longer exists", name, recorded[0],
+        )
+    return remaining
+
+
 def _browser_exec_durable_binding_dir(session: str) -> Path:
     """Return the profile-scoped immutable binding claim for ``session``."""
     from hermes_constants import get_hermes_home
@@ -293,6 +356,12 @@ def _reload_browser_exec_daemons_for_runtime(
         daemon_identity: tuple[int, float] = (0, 0.0)
         if recovery_states:
             observed_identity = _daemon_process_identity(name, env)
+            # A daemon that already exited (or was replaced) cannot be reloaded,
+            # but its marker can still be retired once its recorded PID is gone.
+            recovery_states = _clear_pending_for_gone_daemon(
+                owner, name, recovery_states, observed_identity,
+            )
+        if recovery_states:
             if observed_identity is None:
                 logger.warning(
                     "cannot prove Browser Use daemon %s identity before reload; "

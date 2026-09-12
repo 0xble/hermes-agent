@@ -53,20 +53,35 @@ _MAX_GOAL_EVIDENCE = 32
 _MAX_GOAL_EVIDENCE_EXCERPT = 800
 
 
-def _safe_evidence_metadata(value: Any, limit: int) -> str:
-    """Keep bounded provenance without credential-bearing URL components."""
-    from urllib.parse import urlsplit, urlunsplit
-    from agent.redact import redact_sensitive_text
+_URL_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>\\]+")
 
-    text = str(value)
-    if "://" in text:
+
+def _strip_url_secrets(text: str) -> str:
+    """Reduce every URL in ``text`` to scheme://host/path.
+
+    Userinfo, query strings and fragments are where signed-artifact URLs and
+    callback links carry credentials; none of them are artifact identity, so
+    the goal judge (an independently configured provider) never needs them.
+    ``redact_sensitive_text`` deliberately leaves them intact for ordinary tool
+    flows, so this boundary strips them itself.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    def reduce(match: "re.Match[str]") -> str:
         try:
-            url = urlsplit(text)
-            # Userinfo, query strings and fragments are not artifact identity.
-            text = urlunsplit((url.scheme, url.netloc.rsplit("@", 1)[-1], url.path, "", ""))
+            url = urlsplit(match.group(0))
+            return urlunsplit((url.scheme, url.netloc.rsplit("@", 1)[-1], url.path, "", ""))
         except ValueError:
             return "[redacted]"
-    return _truncate(redact_sensitive_text(text, force=True), limit)
+
+    return _URL_IN_TEXT_RE.sub(reduce, text) if "://" in text else text
+
+
+def _safe_evidence_metadata(value: Any, limit: int) -> str:
+    """Keep bounded provenance without credential-bearing URL components."""
+    from agent.redact import redact_sensitive_text
+
+    return _truncate(redact_sensitive_text(_strip_url_secrets(str(value)), force=True), limit)
 
 
 def _redacted_evidence_context(value: Any) -> str:
@@ -84,7 +99,7 @@ def _redacted_evidence_context(value: Any) -> str:
         text = json.dumps(scrub(json.loads(text)), ensure_ascii=False)
     except (ValueError, TypeError):
         pass
-    return _truncate(redact_sensitive_text(text, force=True), _MAX_GOAL_EVIDENCE_EXCERPT)
+    return _truncate(redact_sensitive_text(_strip_url_secrets(text), force=True), _MAX_GOAL_EVIDENCE_EXCERPT)
 
 
 def _decode_tool_result(content: Any) -> Optional[Dict[str, Any]]:
@@ -164,9 +179,11 @@ def collect_tool_evidence(agent_result: Any) -> List[Dict[str, Any]]:
                 negative = parsed.get("success") is not True
             if parsed.get("error") and not negative:
                 negative, outcome = True, "error"
-            artifact = next((parsed.get(k) for k in ("artifact", "path", "file", "url")
+            # Sanitize at the collection boundary so every consumer (judge prompt,
+            # outcome preparation, durable state) sees the same credential-free values.
+            artifact = next((_safe_evidence_metadata(parsed[k], 300) for k in ("artifact", "path", "file", "url")
                              if isinstance(parsed.get(k), (str, int)) and parsed.get(k)), None)
-            revision = next((parsed.get(k) for k in ("revision", "commit", "sha")
+            revision = next((_safe_evidence_metadata(parsed[k], 200) for k in ("revision", "commit", "sha")
                              if isinstance(parsed.get(k), (str, int)) and parsed.get(k)), None)
         args = call.get("arguments")
         if isinstance(args, str):

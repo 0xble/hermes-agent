@@ -143,6 +143,26 @@ def _python_test_command(targets: Sequence[str] = ()) -> tuple[str, ...]:
     return (*prefix, "scripts/run_tests.sh", *targets)
 
 
+def _npm_launcher() -> str:
+    """Resolve the npm executable for shell-free subprocess dispatch.
+
+    Node installs npm on Windows as npm.cmd. CreateProcess does not apply
+    PATHEXT to a bare ``npm``, so run_checks (shell=False) must be handed the
+    resolved launcher path; list2cmdline then preserves argument boundaries.
+    POSIX keeps the bare name so PATH lookup stays the caller's contract.
+    """
+    if sys.platform != "win32":
+        return "npm"
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if not npm:
+        raise ValueError("npm checks on Windows require npm.cmd from a Node.js installation on PATH")
+    return npm
+
+
+def _npm_command(*args: str) -> tuple[str, ...]:
+    return (_npm_launcher(), *args)
+
+
 def worktree_fingerprint(root: Path) -> str:
     """Bind index entries and tracked/nonignored worktree bytes, not stat cache.
 
@@ -250,14 +270,14 @@ def build_checks(
             checks.append(
                 Check(
                     "Desktop platform tests (hosted clean-room residual)",
-                    ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
+                    _npm_command("run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
                     remote_only=True,
                 )
             )
             checks.append(
                 Check(
                     "Desktop packaging tests (hosted clean-room residual)",
-                    ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:all"),
+                    _npm_command("run", "--prefix", "apps/desktop", "check:test:desktop:all"),
                     remote_only=True,
                 )
             )
@@ -266,11 +286,11 @@ def build_checks(
                 [
                     Check(
                         "Documentation dependencies",
-                        ("npm", "--prefix", "website", "ci"),
+                        _npm_command("--prefix", "website", "ci"),
                     ),
                     Check(
                         "Documentation site",
-                        ("npm", "--prefix", "website", "run", "build:fast"),
+                        _npm_command("--prefix", "website", "run", "build:fast"),
                     ),
                 ]
             )
@@ -318,21 +338,21 @@ def build_checks(
             ),
             Check(
                 "Desktop platform tests (hosted clean-room residual)",
-                ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
+                _npm_command("run", "--prefix", "apps/desktop", "check:test:desktop:platforms"),
                 remote_only=True,
             ),
             Check(
                 "Desktop packaging tests (hosted clean-room residual)",
-                ("npm", "run", "--prefix", "apps/desktop", "check:test:desktop:all"),
+                _npm_command("run", "--prefix", "apps/desktop", "check:test:desktop:all"),
                 remote_only=True,
             ),
             Check(
                 "Documentation dependencies",
-                ("npm", "--prefix", "website", "ci"),
+                _npm_command("--prefix", "website", "ci"),
             ),
             Check(
                 "Documentation site",
-                ("npm", "--prefix", "website", "run", "build:fast"),
+                _npm_command("--prefix", "website", "run", "build:fast"),
             ),
             Check(
                 "Rust tests",

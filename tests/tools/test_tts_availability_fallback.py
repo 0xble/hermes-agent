@@ -229,3 +229,70 @@ def test_output_path_failure_never_switches_command_provider(tmp_path, monkeypat
         registry.get_entry("text_to_speech").handler(
             {"text": "Keep the configured route.", "output_path": str(blocked_parent / "speech.wav")})
     assert fallback_text == []
+
+
+@pytest.mark.parametrize("primary", ["fixture-command", "piper"])
+@pytest.mark.parametrize("override,fallbacks,expected", [(False, ["edge"], True), (True, ["edge"], False), (False, [], False)])
+def test_synthesis_dependency_missing_only_uses_opted_in_fallback(tmp_path, monkeypatch, primary, override, fallbacks, expected):
+    config = {"tts": {"provider": primary, "fallback_providers": fallbacks,
+                      "providers": {"fixture-command": {"type": "command", "command": "printf fixture",
+                                                        "output_format": "wav"}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    def missing_dependency(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "espeak-ng")
+
+    # Preflight passes for both (every configured command provider does; Piper's package check
+    # is satisfied), so the missing binary is only discovered once synthesis actually runs.
+    monkeypatch.setattr(tts, "_generate_command_tts", missing_dependency)
+    monkeypatch.setattr(tts, "_check_piper_available", lambda: True)
+    monkeypatch.setattr(tts, "_import_piper", lambda: object())
+    monkeypatch.setattr(tts, "_generate_piper_tts", missing_dependency)
+    called = []
+
+    def edge(text, path, cfg):
+        called.append(text)
+        Path(path).write_bytes(wav_bytes())
+
+    monkeypatch.setattr(tts, "_run_edge_tts", edge)
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    args = {"text": "One complete utterance.", "output_path": str(tmp_path / "speech.wav")}
+    if override:
+        args["provider"] = primary
+    result = json.loads(registry.get_entry("text_to_speech").handler(args))
+    assert bool(result.get("success")) is expected
+    assert called == ([args["text"]] if expected else [])
+    if expected:
+        assert result["provider"] == "edge"
+        assert result["fallback_from"] == primary
+        assert result["attempted_providers"] == [primary, "edge"]
+        assert Path(result["file_path"]).read_bytes() == wav_bytes()
+    else:
+        assert "TTS dependency missing" in result["error"]
+        assert "attempted_providers" not in result
+
+
+def test_delivery_dependency_missing_after_synthesis_never_switches_provider(tmp_path, monkeypatch):
+    source = tmp_path / "source.wav"
+    source.write_bytes(wav_bytes())
+    config = {"tts": {"provider": "fixture-command", "fallback_providers": ["edge"],
+                      "providers": {"fixture-command": {"type": "command", "output_format": "wav",
+                                                        "command": f"cp {shlex.quote(str(source))} {{output_path}}"}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    def missing_delivery_tool(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+    # Synthesis succeeded and audio exists; a dependency lost during local delivery is not a
+    # provider outage, so an opted-in chain must not restart the utterance elsewhere.
+    monkeypatch.setattr(tts, "_finalize_voice_delivery", missing_delivery_tool)
+    fallback_text = []
+    monkeypatch.setattr(tts, "_run_edge_tts", lambda text, path, cfg: fallback_text.append(text))
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    result = json.loads(registry.get_entry("text_to_speech").handler(
+        {"text": "Audio exists but delivery broke.", "output_path": str(tmp_path / "speech.wav")}))
+    assert result["success"] is False
+    assert "TTS dependency missing" in result["error"]
+    assert result["fallback_eligible"] is False
+    assert fallback_text == []
+    assert "attempted_providers" not in result

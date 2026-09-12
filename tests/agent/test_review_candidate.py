@@ -587,3 +587,88 @@ def test_untracked_parent_replacement_before_open_cannot_follow_outside(candidat
     monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {replace_parent})
     with pytest.raises(ValueError, match="safely capture"):
         _untracked_entry(candidate_repo, "race-parent/new.txt")
+
+
+@requires_descriptor_capture
+def test_untracked_capture_rejects_file_over_per_file_bound(candidate_repo):
+    from agent import review_candidate as capture
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    oversized = candidate_repo / "artifact.bin"
+    oversized.write_bytes(b"\0" * (capture.MAX_UNTRACKED_FILE_BYTES + 1))
+    with pytest.raises(ValueError, match=f"exceeds the {capture.MAX_UNTRACKED_FILE_BYTES}-byte"):
+        capture_review_candidate(candidate_repo, base, ["artifact.bin"])
+
+
+@requires_descriptor_capture
+def test_untracked_capture_rejects_aggregate_over_evidence_bound(candidate_repo, monkeypatch):
+    from agent import review_candidate as capture
+    monkeypatch.setattr(capture, "MAX_UNTRACKED_FILE_BYTES", 80)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 100)
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    (candidate_repo / "a.txt").write_bytes(b"a" * 60)
+    (candidate_repo / "b.txt").write_bytes(b"b" * 60)
+    with pytest.raises(ValueError, match="b.txt exceeds the 40-byte review evidence bound"):
+        capture_review_candidate(candidate_repo, base, ["a.txt", "b.txt"])
+
+
+@requires_descriptor_capture
+def test_tracked_patch_counts_against_aggregate_evidence_bound(candidate_repo, monkeypatch):
+    from agent import review_candidate as capture
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 64)
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    (candidate_repo / "tracked.py").write_text("value = " + "9" * 200 + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Tracked review evidence .* exceeds the 64-byte aggregate"):
+        capture_review_candidate(candidate_repo, base, ["tracked.py"])
+    patch_size = len(_git(candidate_repo, "diff", "--binary", base, "--", "tracked.py").encode()) + 1
+    (candidate_repo / "new.txt").write_bytes(b"n" * 40)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", patch_size + 20)
+    with pytest.raises(ValueError, match="new.txt exceeds the 20-byte review evidence bound"):
+        capture_review_candidate(candidate_repo, base, ["tracked.py", "new.txt"])
+
+
+@requires_descriptor_capture
+def test_untracked_capture_rejects_growth_after_size_check_without_reading_to_eof(
+    candidate_repo, monkeypatch,
+):
+    from agent import review_candidate as capture
+    monkeypatch.setattr(capture, "MAX_UNTRACKED_FILE_BYTES", 64)
+    grown = candidate_repo / "grows.log"
+    grown.write_bytes(b"small")
+    real_fstat = os.fstat
+    real_read = os.read
+    grown_once = False
+    reads: list[int] = []
+
+    def fstat_then_grow(fd):
+        nonlocal grown_once
+        result = real_fstat(fd)
+        if not grown_once and result.st_size == 5:
+            grown_once = True
+            with grown.open("ab") as handle:
+                handle.write(b"x" * (64 * 1024))
+        return result
+
+    def counting_read(fd, size):
+        reads.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(os, "fstat", fstat_then_grow)
+    monkeypatch.setattr(os, "read", counting_read)
+    with pytest.raises(ValueError, match="grows.log exceeds the 64-byte review evidence bound"):
+        capture._untracked_entry(candidate_repo, "grows.log")
+    assert grown_once
+    assert sum(reads) <= 65 * len(reads) and sum(reads) < 64 * 1024
+
+
+@requires_descriptor_capture
+def test_untracked_capture_keeps_files_at_or_under_bound(candidate_repo, monkeypatch):
+    from agent import review_candidate as capture
+    monkeypatch.setattr(capture, "MAX_UNTRACKED_FILE_BYTES", 16)
+    monkeypatch.setattr(capture, "MAX_EVIDENCE_BYTES", 32)
+    base = _git(candidate_repo, "rev-parse", "HEAD")
+    (candidate_repo / "exact.txt").write_bytes(b"e" * 16)
+    (candidate_repo / "rest.txt").write_bytes(b"r" * 16)
+    candidate = capture_review_candidate(candidate_repo, base, ["exact.txt", "rest.txt"])
+    assert [entry.path for entry in candidate.untracked_files] == ["exact.txt", "rest.txt"]
+    assert base64.b64decode(candidate.untracked_files[0].content_base64) == b"e" * 16
+    assert base64.b64decode(candidate.untracked_files[1].content_base64) == b"r" * 16

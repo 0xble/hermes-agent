@@ -112,3 +112,33 @@ def test_literal_python_chdir_to_unprotected_directory_stays_allowed(execution, 
     assert (elsewhere / "notes.txt").read_text() == "ok"
     assert (home / "ordinary.txt").read_text() == "ok"
     assert not (protected / "notes.txt").exists()
+
+
+@pytest.mark.parametrize("source", [
+    "import os; os.system('cd {home}; rm -rf memories')",
+    "import subprocess; subprocess.run(['sh', '-c', 'cd {home}; printf x > memories/MEMORY.md'])",
+    "import subprocess; subprocess.run(['rm', '-rf', 'memories'], cwd={quoted})",
+])
+def test_nested_literal_cd_in_subprocess_never_runs(execution, source):
+    # F5: the nested body's cd is the transition that makes the relative
+    # operand land inside the protected root; the outer cell never spells it.
+    run, protected = execution
+    home = protected.parent
+    (protected / "keep").write_text("original")
+    code = source.format(home=str(home), quoted=repr(str(home)))
+    with delegated_child_context(read_only_knowledge=True):
+        denied = run(code)
+    assert "Parent-owned shared knowledge" in denied["error"]
+    assert (protected / "keep").read_text() == "original"
+    assert not (protected / "MEMORY.md").exists()
+
+
+def test_nested_benign_cd_in_subprocess_stays_allowed(execution, tmp_path):
+    run, protected = execution
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    with delegated_child_context(read_only_knowledge=True):
+        result = run(f"import subprocess; subprocess.run(['sh', '-c', 'cd {elsewhere}; printf ok > memories.txt'])")
+    assert result["status"] == "success", result
+    assert (elsewhere / "memories.txt").read_text() == "ok"
+    assert not (protected / "memories.txt").exists()

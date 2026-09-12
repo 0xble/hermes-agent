@@ -334,6 +334,7 @@ def test_unchanged_dirty_tree_and_ignored_cache_are_allowed(git_repo, monkeypatc
 def test_windows_python_checks_use_explicit_supported_shell(monkeypatch, profile):
     monkeypatch.setattr(MODULE.sys, "platform", "win32")
     monkeypatch.setattr(MODULE, "_windows_bash", lambda: "C:/Program Files/Git/bin/bash.exe", raising=False)
+    monkeypatch.setattr(MODULE, "_npm_launcher", lambda: "C:/Program Files/nodejs/npm.cmd")
     checks = MODULE.build_checks(ROOT, profile, ["code.py"], ["tests/with space.py"])
     check = next(c for c in checks if c.name == "Python tests")
     assert check.command[:2] == ("C:/Program Files/Git/bin/bash.exe", "scripts/run_tests.sh")
@@ -393,3 +394,61 @@ def test_explicit_shell_executes_canonical_script_and_preserves_arguments(tmp_pa
     result = MODULE.run_checks(tmp_path, [MODULE.Check("Python tests", command)], False)[0]
     assert result.status == "passed"
     assert result.stdout.splitlines() == ["tests/path with spaces.py", "-q"]
+
+
+def _npm_checks(checks):
+    return [
+        check
+        for check in checks
+        if check.name.startswith(("Desktop", "Documentation"))
+    ]
+
+
+@pytest.mark.parametrize("profile", ["full", "affected"])
+def test_windows_npm_checks_use_resolved_cmd_launcher(monkeypatch, profile):
+    launcher = "C:\\Program Files\\nodejs\\npm.cmd"
+    monkeypatch.setattr(MODULE.sys, "platform", "win32")
+    monkeypatch.setattr(MODULE, "_windows_bash", lambda: "C:/Program Files/Git/bin/bash.exe")
+    monkeypatch.setattr(
+        MODULE.shutil, "which", lambda name: launcher if name in ("npm", "npm.cmd") else None
+    )
+    checks = MODULE.build_checks(
+        ROOT, profile, ["website/docs/example.md", "apps/desktop/src/main.ts"], []
+    )
+    npm_checks = _npm_checks(checks)
+    assert len(npm_checks) == 4
+    assert all(check.command[0] == launcher for check in npm_checks)
+    assert not any("npm" in check.command for check in checks)
+    documentation = next(check for check in checks if check.name == "Documentation site")
+    assert documentation.command == (launcher, "--prefix", "website", "run", "build:fast")
+
+
+def test_windows_npm_launcher_falls_back_to_npm_cmd_and_fails_clearly(monkeypatch):
+    monkeypatch.setattr(MODULE.sys, "platform", "win32")
+    seen = []
+
+    def which(name):
+        seen.append(name)
+        return "C:\\nodejs\\npm.cmd" if name == "npm.cmd" else None
+
+    monkeypatch.setattr(MODULE.shutil, "which", which)
+    assert MODULE._npm_launcher() == "C:\\nodejs\\npm.cmd"
+    assert seen == ["npm", "npm.cmd"]
+
+    monkeypatch.setattr(MODULE.shutil, "which", lambda name: None)
+    with pytest.raises(ValueError, match="npm.cmd"):
+        MODULE._npm_launcher()
+
+
+@pytest.mark.parametrize("profile", ["full", "affected"])
+def test_posix_npm_checks_keep_bare_npm(monkeypatch, profile):
+    monkeypatch.setattr(MODULE.sys, "platform", "linux")
+    monkeypatch.setattr(
+        MODULE.shutil, "which", lambda name: "/should/not/be/used" if "npm" in name else None
+    )
+    checks = MODULE.build_checks(
+        ROOT, profile, ["website/docs/example.md", "apps/desktop/src/main.ts"], []
+    )
+    npm_checks = _npm_checks(checks)
+    assert len(npm_checks) == 4
+    assert all(check.command[0] == "npm" for check in npm_checks)
