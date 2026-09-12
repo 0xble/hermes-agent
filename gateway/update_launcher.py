@@ -140,6 +140,7 @@ def make_agent_update_handler(
         pending = {
             "platform": route["source"], "chat_id": route["chat_id"],
             "chat_type": route.get("chat_type"), "user_id": route.get("user_id"),
+            # The validated agent:<profile>: lane lets _marker_profile retain the owning bot.
             "session_key": route.get("session_key"), "thread_id": route.get("thread_id"),
             "timestamp": datetime.now(timezone.utc).isoformat(), "reason": reason,
             "parent_session_id": parent_session_id, "parent_route": route,

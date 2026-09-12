@@ -103,14 +103,47 @@ class SessionLifecycleMixin:
         return changed
 
     def suspend_session(self, session_key: str) -> bool:
-        """Mark a session suspended so it auto-resets on next access (/stop). True if it existed.
+        """Hard suspension replaces the entry on the next ordinary get_or_create_session.
 
-        Used by ``/stop`` to prevent stuck sessions from being resumed after a gateway restart (#7536).
+        /stop preserves history and uses exact linked-turn cancellation instead.
         """
         def suspend(entry):
             self._settle_restart_reset(entry)
             entry.suspended = True
         return self._update_entry(session_key, suspend)
+
+    def restart_turn_stop_owner(self, session_key: str) -> Optional[tuple[str, str]]:
+        """Snapshot the exact linked execution to cancel, never a mutable entry reference."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if (entry is None or not entry.active_turn_token or not entry.restart_inbox_link
+                    or entry.restart_inbox_link.get("mode") == "delivered"):
+                return None
+            return entry.session_id, entry.active_turn_token
+
+    def cancel_restart_turn(self, session_key: str, session_id: str, token: str) -> bool:
+        """Cancel one linked /stop execution without resetting its conversation.
+
+        Abandonment precedes required routing persistence. If that write fails, the
+        terminal inbox row and retained link allow this exact cancellation to retry.
+        """
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None or (entry.session_id, entry.active_turn_token) != (session_id, token):
+                return False
+            link = entry.restart_inbox_link
+            if not link or link.get("protocol") != 1 or link.get("turn_token") != token:
+                return False
+            self._settle_restart_reset(entry)
+            changes = dict(active_turn_token=None, active_turn_started_at=None,
+                           restart_inbox_link=None, restart_inbox_settled_at=_now().isoformat(),
+                           resume_pending=False, resume_reason=None, resume_turn_token=None,
+                           last_resume_marked_at=None)
+            candidate = {**entry.to_dict(), **changes}
+            self._save_entry(session_key, entry_data=candidate, lock_held=True, require_primary=True)
+            for name, value in changes.items():
+                setattr(entry, name, value)
+            return True
 
     def _settle_restart_reset(self, entry):
         """Explicit user boundaries cancel linked execution before replacing its only marker."""

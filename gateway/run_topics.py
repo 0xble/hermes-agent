@@ -33,6 +33,15 @@ logger = logging.getLogger("gateway.run")
 _TELEGRAM_TOPIC_ICON_HISTORY_LIMIT = 24
 _TELEGRAM_TOPIC_ICON_CHAT_CACHE_LIMIT = 256
 
+
+@dataclasses.dataclass
+class _TopicTitleRenameState:
+    """Owner-loop state for one profile's physical Telegram topic."""
+
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
+    confirmed: Optional[tuple[str, str]] = None
+    pending: Optional[tuple[object, str, str]] = None
+
 _TOPIC_RESTORE_STEPS = (
     "1. Create or open a topic. To create a new one, open All Messages and send any message there.",
     "2. Send /topic <session-id> inside that topic.",
@@ -507,34 +516,19 @@ class GatewayTopicThreadsMixin:
         if self._telegram_topic_auto_rename_disabled(source):
             return
 
-        topic_name = self._sanitize_telegram_topic_title(title)
-        key = (str(source.chat_id or ""), str(source.thread_id or ""), str(session_id or ""))
-        if key[0] and key[1]:
-            scheduled = getattr(self, "_telegram_topic_last_scheduled_titles", None)
-            if not isinstance(scheduled, dict):
-                scheduled = {}
-                self._telegram_topic_last_scheduled_titles = scheduled
-            previous = scheduled.get(key)
-            if previous == topic_name:
-                logger.debug(
-                    "Skipping duplicate Telegram topic title chat=%s thread_id=%s title=%r",
-                    source.chat_id,
-                    source.thread_id,
-                    topic_name,
-                )
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
                 return
-            scheduled[key] = topic_name
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = getattr(self, "_gateway_loop", None)
         if loop is None or loop.is_closed():
             return
         from gateway.run import safe_schedule_threadsafe
 
         copied_source = self._copy_source_for_background_rename(source)
         future = safe_schedule_threadsafe(
-            self._rename_telegram_topic_for_session_title(
+            self._run_telegram_topic_title_request(
                 copied_source,
                 session_id,
                 title,
@@ -554,6 +548,37 @@ class GatewayTopicThreadsMixin:
                 logger.debug("Telegram topic title rename failed", exc_info=True)
 
         future.add_done_callback(_log_rename_failure)
+
+    async def _run_telegram_topic_title_request(
+        self, source: SessionSource, session_id: str, title: str,
+        *, user_message: str = "", title_context: Any = None,
+    ) -> None:
+        """Reserve, serialize and settle title requests entirely on the gateway loop."""
+        states = getattr(self, "_telegram_topic_title_requests", None)
+        if states is None:
+            states = self._telegram_topic_title_requests = {}
+        key = (self._telegram_topic_profile_name(source), str(source.chat_id or ""),
+               str(source.thread_id or ""))
+        state = states.setdefault(key, _TopicTitleRenameState())
+        desired = (str(session_id or ""), self._sanitize_telegram_topic_title(title))
+        if ((state.pending is not None and state.pending[1:] == desired)
+                or (state.pending is None and state.confirmed == desired)):
+            return
+        request = (object(), *desired)
+        state.pending = request
+        try:
+            async with state.lock:
+                # A newer title can arrive while an earlier rename is awaiting its API.
+                if state.pending is not request or state.confirmed == desired:
+                    return
+                landed = await self._rename_telegram_topic_for_session_title(
+                    source, session_id, title, user_message=user_message, title_context=title_context)
+                if landed is True:
+                    state.confirmed = desired
+        finally:
+            # Identity, not title equality, fences A -> B -> A and cancellation races.
+            if state.pending is request:
+                state.pending = None
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """Return True when operator disabled per-topic auto-rename for this Telegram chat.

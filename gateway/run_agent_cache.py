@@ -383,7 +383,7 @@ class GatewayAgentCacheMixin:
         invalidation_reason: str, release_running_state: bool = True,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
-        from gateway.run import _AGENT_PENDING_SENTINEL, _reap_gateway_turn_processes, request_hard_interrupt
+        from gateway.run import _AGENT_PENDING_SENTINEL, _INTERRUPT_REASON_STOP, _reap_gateway_turn_processes, request_hard_interrupt
         if not session_key:
             return
         state = self._peek_session_state(session_key)
@@ -398,6 +398,22 @@ class GatewayAgentCacheMixin:
         # again and the closure sees a stale generation and skips — the replacement's own baseline
         # covers its cleanup, so nothing stays unreaped.
         _generation_at_interrupt = self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
+        def still_owns_stop() -> bool:
+            return (_generation_at_interrupt is None
+                    or self._is_session_run_current(session_key, _generation_at_interrupt))
+
+        store = getattr(self, "session_store", None)
+        if (interrupt_reason == _INTERRUPT_REASON_STOP and release_running_state
+                and callable(getattr(type(store), "restart_turn_stop_owner", None))):
+            owner = await self.async_session_store.restart_turn_stop_owner(session_key)
+            if not still_owns_stop():
+                return
+            if owner is not None:
+                # A hung linked turn must not keep the next user input parked.
+                # Required persistence errors propagate before running ownership is released.
+                cancelled = await self.async_session_store.cancel_restart_turn(session_key, *owner)
+                if not cancelled or not still_owns_stop():
+                    return
         if _process_task_id and _process_baseline is not None:
             threading.Thread(
                 target=_reap_gateway_turn_processes,
@@ -417,6 +433,8 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        if not still_owns_stop():
+            return
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         if state is not None:

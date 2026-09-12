@@ -2,6 +2,7 @@
 
 import sqlite3
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -45,6 +46,138 @@ def claim(state):
     orphan(path, queue_id)
     row = inbox.claim_recoverable(deliverable_targets={("telegram", "default")})[0]
     return row["event"]._restart_inbox_claim, row["event"]
+
+
+def test_hard_suspension_ordinary_route_replaces_abandoned_link(state):
+    store, entry, event, path = state
+    link, _ = claim(state)
+    store.mark_turn_active(entry.session_key, restart_claim=link)
+    assert store.suspend_session(entry.session_key)
+    assert inbox.read_rows(path)[0]["state"] == "abandoned"
+    replacement = store.get_or_create_session(event.source)
+    assert replacement.session_id != entry.session_id
+    assert replacement.restart_inbox_link is None
+    assert store.mark_turn_active(replacement.session_key)
+
+
+def test_stop_cancellation_is_exact_and_retryable_after_primary_failure(state, monkeypatch):
+    store, entry, _event, path = state
+    link, _ = claim(state)
+    token = store.mark_turn_active(entry.session_key, restart_claim=link)
+    assert store.restart_turn_stop_owner(entry.session_key) == (entry.session_id, token)
+    assert not store.cancel_restart_turn(entry.session_key, "another-session", token)
+    assert not store.cancel_restart_turn(entry.session_key, entry.session_id, "stale-token")
+    assert inbox.read_rows(path)[0]["state"] == "attempting"
+    before = entry.to_dict()
+    saver = store._db.save_gateway_routing_entry
+    monkeypatch.setattr(store._db, "save_gateway_routing_entry", MagicMock(side_effect=OSError("primary failed")))
+    mirror = MagicMock()
+    monkeypatch.setattr(store, "_persist_routing_data", mirror)
+    with pytest.raises(OSError, match="primary failed"):
+        store.cancel_restart_turn(entry.session_key, entry.session_id, token)
+    assert entry.to_dict() == before
+    mirror.assert_not_called()
+    assert inbox.read_rows(path)[0]["state"] == "abandoned"
+    with pytest.raises(RequiredInputPersistenceError):
+        store.mark_turn_active(entry.session_key)
+    monkeypatch.setattr(store._db, "save_gateway_routing_entry", saver)
+    assert store.cancel_restart_turn(entry.session_key, entry.session_id, token)
+    assert entry.active_turn_token is None and entry.restart_inbox_link is None
+    assert entry.restart_inbox_settled_at
+    persisted = store._db.load_gateway_routing_entries(scope=store._routing_scope())
+    assert json.loads(persisted[entry.session_key])["restart_inbox_link"] is None
+    next_token = store.mark_turn_active(entry.session_key)
+    assert not store.clear_turn_active(entry.session_key, token)
+    assert not store.cancel_restart_turn(entry.session_key, entry.session_id, token)
+    assert entry.active_turn_token == next_token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("primary_fails", [False, True])
+async def test_real_stop_settles_link_before_release_and_preserves_conversation(state, monkeypatch, primary_fails):
+    store, entry, event, path = state
+    link, _ = claim(state)
+    old_token = store.mark_turn_active(entry.session_key, restart_claim=link)
+    store.mark_resume_pending(entry.session_key)
+    store._db.append_message(entry.session_id, "user", "keep this history")
+    runner, _ = make_restart_runner()
+    runner.session_store = store
+    agent = MagicMock(_gateway_turn_process_task_id="", _gateway_turn_process_baseline=None)
+    runner._running_agents[entry.session_key] = agent
+    runner._evict_cached_agent = MagicMock()
+    release = runner._release_running_agent_state
+    released = []
+
+    def release_after_persistence(key, **kwargs):
+        persisted = json.loads(store._db.load_gateway_routing_entries(scope=store._routing_scope())[key])
+        assert persisted["restart_inbox_link"] is None
+        assert persisted["active_turn_token"] is None
+        assert not persisted["resume_pending"]
+        released.append(key)
+        return release(key, **kwargs)
+
+    runner._release_running_agent_state = release_after_persistence
+    if primary_fails:
+        monkeypatch.setattr(store._db, "save_gateway_routing_entry", MagicMock(side_effect=OSError("primary failed")))
+        with pytest.raises(OSError, match="primary failed"):
+            await runner._handle_stop_command(event)
+        assert released == []
+        assert runner._running_agents[entry.session_key] is agent
+        assert entry.restart_inbox_link and entry.active_turn_token == old_token
+        return
+    await runner._handle_stop_command(event)
+    assert released == [entry.session_key]
+    assert inbox.read_rows(path)[0]["state"] == "abandoned"
+    resumed = await runner.async_session_store.get_or_create_session(event.source)
+    assert resumed.session_id == entry.session_id
+    assert not resumed.suspended
+    assert store._db.get_messages(entry.session_id)[-1]["content"] == "keep this history"
+    assert await runner._mark_durable_active_turn(event, entry.session_key)
+    assert not store.clear_turn_active(entry.session_key, old_token)
+
+
+@pytest.mark.asyncio
+async def test_stop_transport_wait_cannot_release_a_replacement_turn(state):
+    from tests.gateway.restart_test_helpers import RestartTestAdapter
+    store, entry, event, _path = state
+    link, _ = claim(state)
+    store.mark_turn_active(entry.session_key, restart_claim=link)
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    class HeldAdapter(RestartTestAdapter):
+        async def interrupt_session_activity(self, *args, **kwargs):
+            entered.set()
+            await resume.wait()
+
+    runner, _ = make_restart_runner(HeldAdapter())
+    runner.session_store = store
+    old_agent = MagicMock(_gateway_turn_process_task_id="", _gateway_turn_process_baseline=None)
+    runner._running_agents[entry.session_key] = old_agent
+    runner._evict_cached_agent = MagicMock()
+    stopping = asyncio.create_task(runner._handle_stop_command(event))
+    await asyncio.wait_for(entered.wait(), 2)
+    assert entry.restart_inbox_link is None
+    # The old finalizer can release its slot while stop awaits transport cleanup.
+    runner._release_running_agent_state(entry.session_key)
+    replacement = object()
+    runner._begin_session_run_generation(entry.session_key)
+    runner._running_agents[entry.session_key] = replacement
+    new_token = store.mark_turn_active(entry.session_key)
+    resume.set()
+    await asyncio.wait_for(stopping, 2)
+    assert runner._running_agents[entry.session_key] is replacement
+    assert entry.active_turn_token == new_token
+    runner._evict_cached_agent.assert_not_called()
+
+
+@pytest.mark.parametrize("terminal", ["delivered", "abandoned"])
+def test_stop_finishes_exact_terminal_inbox_row_without_reset(state, terminal):
+    store, entry, _event, _path = state
+    link, _ = claim(state)
+    token = store.mark_turn_active(entry.session_key, restart_claim=link)
+    assert inbox.transition_link(entry.restart_inbox_link, terminal)
+    assert store.cancel_restart_turn(entry.session_key, entry.session_id, token)
+    assert entry.restart_inbox_link is None and entry.restart_inbox_settled_at
 
 
 def reconcile(state):
