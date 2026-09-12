@@ -719,6 +719,21 @@ def test_untracked_capture_keeps_files_at_or_under_bound(candidate_repo, monkeyp
     assert base64.b64decode(candidate.untracked_files[1].content_base64) == b"r" * 16
 
 
+def test_nested_submodule_inspection_never_executes_filter(submodule_repo):
+    import shlex
+    leaf = submodule_repo / "sub" / "leaf"
+    marker = leaf / "filter-ran"
+    (leaf / ".gitattributes").write_text("deep.py filter=nested\n")
+    command = shlex.quote(sys.executable) + " -c " + shlex.quote("open('filter-ran', 'w').write('ran')")
+    _git(leaf, "config", "filter.nested.clean", command)
+    (leaf / "deep.py").write_text("deep = 222\n")
+    try:
+        with pytest.raises(ValueError, match="filter|uncommitted"):
+            capture_review_candidate(submodule_repo, "HEAD", ["sub"])
+    finally:
+        assert not marker.exists()
+
+
 @pytest.mark.parametrize("driver", ["clean", "process"])
 def test_capture_never_executes_conversion_filter(candidate_repo, driver):
     base = _git(candidate_repo, "rev-parse", "HEAD")

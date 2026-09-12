@@ -1882,28 +1882,40 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
-def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _read_raw_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            if strict:
+                raise
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
+        # A tolerant cached empty mapping may represent a malformed root. Security
+        # policy reads re-open the file and must also observe current I/O errors.
+        if not strict and cached is not None and cached[:2] == cache_key:
             return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
 
         try:
             with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+                data = fast_safe_load(f)
+            if data is None or (not strict and not data):
+                data = {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
+            if strict:
+                raise
             return {}
 
         if not isinstance(data, dict):
+            if strict:
+                raise ValueError("Config root must be a mapping")
             data = {}
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
@@ -1912,10 +1924,14 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         return data if want_deepcopy else cached_copy
 
 
-def read_raw_config() -> Dict[str, Any]:
-    """Read config.yaml as-is (no defaults merged, no migration); ``{}`` if missing/unparseable.
-    Cached on (mtime_ns, size); returns a deepcopy since callers mutate before ``save_config()``."""
-    return _read_raw_config_impl(want_deepcopy=True)
+def read_raw_config(*, strict: bool = False) -> Dict[str, Any]:
+    """Read raw config with no defaults/migration; return a mutable deepcopy.
+
+    Normal reads tolerate missing/unparseable files and cache by mtime/size.
+    Security-sensitive readers use ``strict=True`` to bypass that cache and
+    reject I/O, parse, or root-shape errors. A missing file still means omission.
+    """
+    return _read_raw_config_impl(want_deepcopy=True, strict=strict)
 
 
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:

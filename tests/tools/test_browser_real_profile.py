@@ -117,14 +117,14 @@ class TestSnapshotRealProfile:
         from pathlib import Path
         src = self._make_profile(tmp_path / "real")
         monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"real_profile_refresh": "initial"}})
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda **_kwargs: {"browser": {"real_profile_refresh": "initial"}})
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
         cookies = Path(dst) / "Default" / "Cookies"
         _auth_db(cookies, "independent-snapshot-account")
         _auth_db(src / "Default" / "Cookies", "different-source-account")
 
-        def unreadable():
+        def unreadable(**_kwargs):
             raise OSError("configuration unavailable")
 
         monkeypatch.setattr("hermes_cli.config.read_raw_config", unreadable)
@@ -132,7 +132,7 @@ class TestSnapshotRealProfile:
         assert result is None and "Could not read" in err
         assert _auth_db(cookies) == "independent-snapshot-account"
         # Successfully read omission still uses the legacy refresh behavior.
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda **_kwargs: {})
         result, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None and result == dst
         assert _auth_db(cookies) == "different-source-account"

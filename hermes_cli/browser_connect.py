@@ -624,13 +624,11 @@ def _real_profile_refresh_mode() -> tuple[str | None, str | None]:
     try:
         from hermes_cli.config import read_raw_config
 
-        cfg = read_raw_config()
+        cfg = read_raw_config(strict=True)
         browser_cfg = cfg.get("browser", {})
-        raw = (
-            browser_cfg.get("real_profile_refresh", "launch")
-            if isinstance(browser_cfg, dict)
-            else "launch"
-        )
+        if not isinstance(browser_cfg, dict):
+            raise ValueError("browser configuration must be a mapping")
+        raw = browser_cfg.get("real_profile_refresh", "launch")
     except Exception as e:
         logger.debug("could not read real_profile_refresh: %s", e)
         return None, "Could not read browser.real_profile_refresh; refusing authentication refresh"

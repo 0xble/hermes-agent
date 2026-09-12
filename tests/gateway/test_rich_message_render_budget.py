@@ -47,3 +47,22 @@ def test_large_text_is_sliced_before_render_allocation(kind, field):
     result = project_rich_message({"blocks": [{"type": kind, field: NoFormattingUntilSliced("x" * 100_000)}]}, max_chars=32)
     assert result.truncated
     assert len(result.text) <= 32
+
+
+def test_structural_output_also_respects_tiny_character_budget():
+    values = CountingSequence({"type": "divider"})
+    result = project_rich_message({"blocks": values}, max_nodes=1_000_000, max_chars=8)
+    assert values.reads <= 9
+    assert result.truncated and len(result.text) <= 8
+
+
+def test_malformed_scalar_fields_are_not_stringified():
+    class NoStringification(list):
+        def __str__(self):
+            raise AssertionError("unbounded malformed container stringified")
+    value = NoStringification(["x"] * 1000)
+    result = project_rich_message({"blocks": [
+        {"type": value},
+        {"type": "mathematical_expression", "expression": value},
+    ]}, max_chars=8)
+    assert len(result.text) <= 8

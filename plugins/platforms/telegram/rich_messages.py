@@ -42,9 +42,13 @@ class _RenderState:
 
     def text(self, value: Any) -> str:
         # Slice before transformations/formatting allocate larger intermediates.
-        if value is None:
+        if not isinstance(value, (str, int, float, bool)):
             return ""
-        text = value if isinstance(value, str) else str(value)
+        try:
+            text = value if isinstance(value, str) else str(value)
+        except ValueError:  # Python rejects pathological integer conversions.
+            self.truncated = True
+            return ""
         remaining = self.max_chars - self.chars
         if len(text) > remaining:
             self.truncated = True
@@ -106,7 +110,8 @@ def _inline(value: Any, state: _RenderState, depth: int) -> str:
     if node is None:
         return ""
 
-    node_type = str(node.get("type") or "")[:64].lower()
+    raw_type = node.get("type")
+    node_type = raw_type[:64].lower() if isinstance(raw_type, str) else ""
     rendered = _inline(node.get("text"), state, depth + 1)
     if not rendered:
         rendered = _inline(node.get("children"), state, depth + 1)
@@ -262,7 +267,8 @@ def _render_table(
 def _render_block(
     block: Mapping[str, Any], state: _RenderState, depth: int
 ) -> list[str]:
-    block_type = str(block.get("type") or "unknown")[:64].lower()
+    raw_type = block.get("type")
+    block_type = raw_type[:64].lower() if isinstance(raw_type, str) else "unknown"
     state.record_block(block_type)
 
     if block_type == "divider":
@@ -417,7 +423,9 @@ def project_rich_message(
     state = _RenderState(
         max_chars=max(1, max_chars),
         max_depth=max(1, max_depth),
-        max_nodes=max(1, max_nodes),
+        # Empty/structural nodes still cost work and formatting bytes. A tiny
+        # character budget must not permit arbitrarily many such nodes.
+        max_nodes=max(1, min(max_nodes, max_chars)),
     )
     rich = _mapping(rich_message)
     lines = _render_blocks(rich.get("blocks"), state, 0) if rich else []

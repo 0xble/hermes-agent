@@ -415,7 +415,9 @@ def _reject_dirty_submodules(root: Path, pathspecs: list[str]) -> None:
             continue  # never checked out, so no worktree content can drift
         status = _git(
             submodule, *_filter_guards(submodule), "--no-optional-locks", "status", "--porcelain=v2", "-z",
-            "--ignore-submodules=none", "--untracked-files=all",
+            # Each nested worktree is inspected below with its own filter
+            # guards. Do not let this status spawn unguarded recursive checks.
+            "--ignore-submodules=dirty", "--untracked-files=all",
         )
         if status.strip(b"\0"):
             raise ValueError(
@@ -540,7 +542,7 @@ def capture_review_candidate(
     _reject_dirty_submodules(root, pathspecs)
     patch_bytes = _git(
         root, *_filter_guards(root), "diff", "--binary", "--no-ext-diff", "--no-textconv",
-        "--ignore-submodules=none", "--submodule=short", base_commit, "--", *pathspecs,
+        "--ignore-submodules=dirty", "--submodule=short", base_commit, "--", *pathspecs,
         max_stdout_bytes=MAX_EVIDENCE_BYTES,
     )
     remaining = MAX_EVIDENCE_BYTES - len(patch_bytes)
