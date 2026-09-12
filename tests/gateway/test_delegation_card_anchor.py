@@ -438,3 +438,145 @@ async def test_restart_phase_receipts_preserve_transport_and_later_topic_owner(t
     else:
         assert adapter._bot.send_message.await_count == 2
     assert len(live) <= 1
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("failure", ["reject", "429", "ambiguous"])
+@pytest.mark.parametrize("new_work", ["start", "same_row"])
+async def test_exhausted_replacement_new_work_recovers_without_bypassing_uncertainty(tmp_path, restart, failure, new_work):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    original_send = adapter._bot.send_message.side_effect
+    attempts = 0
+
+    async def reject(**kw):
+        nonlocal attempts
+        deadline = json.loads(manager.path.read_text())[data["parent_task_id"]].get("reanchor", {}).get("retry_not_before", 0)
+        assert anchor.time.time() >= deadline
+        attempts += 1
+        if failure == "ambiguous":
+            await original_send(**kw)
+            raise TimedOut("accepted but receipt lost")
+        if failure == "429":
+            raise RetryAfter(0.01)
+        raise Forbidden("definite rejection")
+
+    adapter._bot.send_message.side_effect = reject
+    for mid in range(anchor.DISPLACEMENT):
+        await inbound(adapter, 1000 + mid)
+    await drain(manager)
+    assert attempts == (1 if failure == "ambiguous" else 3)
+    if restart:
+        manager = DelegationCards(manager.runner, home=tmp_path, interval=0)
+        await manager.reconcile()
+        await drain(manager)
+    card = manager.cards[data["parent_task_id"]]
+    # Replayed starts and ordinary tool progress cannot replenish the budget.
+    await manager.observe(source, "r", "s", 1, "subagent.start", None, data)
+    await manager.observe(source, "r", "s", 1, "subagent.tool", "read_file", data)
+    await drain(manager)
+    before = attempts
+    # A real new task grants a bounded burst, not an unbounded retry loop.
+    next_data = {**data, "parent_task_id": "b" * 32, "task_label": "Later work"}
+    event = "subagent.start"
+    if new_work == "same_row":
+        await manager.observe(source, "r", "s", 1, "subagent.complete", None, data)
+        next_data = {**data, "attempt": 1, "resume_claim_id": "resume-1"}
+        event = "subagent.admitted"
+        # Failed validation and unclaimed admissions cannot grant recovery.
+        for rejected in ({**next_data, "attempt": 2},
+                         {**next_data, "thread_ref": "missing"},
+                         {**next_data, "owner": {**data["owner"], "session_id": "other"}}):
+            try:
+                await manager.observe(source, "r", "s", 1, event, None, rejected)
+            except ValueError:
+                pass
+            assert not card["reanchor"].get("new_work_pending")
+        await manager.observe(source, "r", "s", 1, event, None, data)
+        await drain(manager)
+        assert attempts == before
+    await manager.observe(source, "r", "s", 1, event, None, next_data)
+    await drain(manager)
+    assert attempts == before + (0 if failure == "ambiguous" else 3)
+    exhausted = attempts
+    await manager.observe(source, "r", "s", 1, event, None, next_data)
+    await manager.observe(source, "r", "s", 1, "subagent.tool", "read_file", next_data)
+    await drain(manager)
+    assert attempts == exhausted
+    if new_work == "same_row":
+        assert card["rows"]["A"]["attempt"] == 1
+        assert card["attempt_history"]["A"]["0"]["state"] in {"completed", "unknown"}
+    adapter._bot.send_message.side_effect = original_send
+    final_data = {**data, "parent_task_id": "c" * 32, "task_label": "Newest work"}
+    await manager.observe(source, "r", "s", 1, "subagent.start", None, final_data)
+    await drain(manager)
+    persisted = json.loads(manager.path.read_text())
+    assert len(live) == 1
+    assert adapter._bot.delete_message.await_count == 1
+    assert all(not c.get("handled") and not c.get("retired") for c in persisted.values())
+    assert all(c["owner"] == data["owner"] for c in persisted.values())
+    if failure == "ambiguous":
+        assert card["reanchor"]["state"] == "sending"
+        assert attempts == 1
+    else:
+        assert card["message_id"] in live
+        labels = ["Check anchor", "Newest work"]
+        if new_work == "start":
+            labels.append("Later work")
+        assert all(label in card["rendered"] for label in labels)
+        assert persisted[data["parent_task_id"]]["message_id"] == card["message_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["rejected", "ambiguous", "terminal"])
+@pytest.mark.parametrize("new_work", ["start", "same_row"])
+async def test_new_work_during_last_send_is_not_lost_or_allowed_to_bypass_fence(tmp_path, outcome, new_work):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    original_send = adapter._bot.send_message.side_effect
+    attempts = 0
+    next_data = {**data, "parent_task_id": "b" * 32, "task_label": "Arrived during send"}
+    event = "subagent.start"
+    if new_work == "same_row":
+        next_data = {**data, "attempt": 1, "resume_claim_id": "inflight-resume"}
+        event = "subagent.admitted"
+
+    async def send(**kw):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            if attempts == 3:
+                if new_work == "same_row":
+                    await manager.observe(source, "r", "s", 1, "subagent.complete", None, data)
+                await manager.observe(source, "r", "s", 1, event, None, next_data)
+                if outcome == "ambiguous":
+                    await original_send(**kw)
+                    raise TimedOut("accepted but lost receipt")
+                if outcome == "terminal":
+                    for task in (data, next_data):
+                        await manager.observe(source, "r", "s", 1, "subagent.complete", None,
+                                              {**task, "status": "completed"})
+            raise Forbidden("definitely not sent")
+        deadline = json.loads(manager.path.read_text())[data["parent_task_id"]]["reanchor"]["retry_not_before"]
+        assert anchor.time.time() >= deadline
+        return await original_send(**kw)
+
+    adapter._bot.send_message.side_effect = send
+    for mid in range(anchor.DISPLACEMENT):
+        await inbound(adapter, 1000 + mid)
+    await drain(manager)
+    assert adapter._bot.delete_message.await_count == 1
+    assert attempts == (4 if outcome == "rejected" else 3)
+    assert len(live) == (0 if outcome == "terminal" else 1)
+    if outcome == "rejected":
+        assert next_data["task_label"] in card["rendered"]
+    elif outcome == "ambiguous":
+        assert card["reanchor"]["state"] == "sending"
+    else:
+        assert card["message_id"] is None
+    # Reconciliation/restart alone never creates more sends or loses outcomes.
+    restored = DelegationCards(manager.runner, home=tmp_path, interval=0)
+    await restored.reconcile()
+    await drain(restored)
+    assert attempts == (4 if outcome == "rejected" else 3)
+    assert all(not c.get("handled") and not c.get("retired") for c in restored.cards.values())

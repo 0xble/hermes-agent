@@ -377,6 +377,10 @@ class DelegationCards:
             card["retired"] = False
             card["generation"] += 1
             self._bind(key)
+            anchor = self.cards[self._anchor(key)]
+            if anchoring.pending(anchor):
+                # Only the validated new attempt above grants another burst.
+                anchor["reanchor"]["new_work_pending"] = True
             card["revision"] = card.get("revision", 0) + 1
             self._save()
             self._queue(key)
@@ -441,6 +445,10 @@ class DelegationCards:
         if _handled_terminal(card):
             card["retired"] = True
         anchor = self.cards[self._anchor(key)]
+        if event_type == "subagent.start" and anchoring.pending(anchor):
+            # Only an admitted new row grants recovery, never a replay or tool tick.
+            # Keep this through an in-flight send; its outcome may still be unknown.
+            anchor["reanchor"]["new_work_pending"] = True
         anchor["revision"] = anchor.get("revision", 0) + 1
         self._save()
         self._queue(key)
@@ -450,7 +458,8 @@ class DelegationCards:
         try:
             await asyncio.sleep(max(0, self.interval - (time.monotonic() - self.last_edit.get(key, 0)),
                                     self.cards[key].get("retry_at", 0) - time.time(),
-                                    self.cards[key].get("delete_retry_at", 0) - time.time()))
+                                    self.cards[key].get("delete_retry_at", 0) - time.time(),
+                                    (self.cards[key].get("reanchor") or {}).get("retry_not_before", 0) - time.time()))
             # Replacement releases the lifecycle lock across transport, unlike
             # ordinary edits. Its durable phases fence parallel/restarted sends.
             if anchoring.pending(self.cards[key]) or anchoring.eligible(self, key):
