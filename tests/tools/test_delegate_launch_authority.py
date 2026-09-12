@@ -123,7 +123,7 @@ def test_pre_admission_failure_preserves_resume_grant(tmp_path, monkeypatch, par
     parent._session_db = db
     credentials = delegate_tool._resolve_delegation_credentials({}, parent)
     launch = ResolvedSubagentLaunch(None, credentials, None, resume_session_id="child")
-    monkeypatch.setattr(delegate_tool, "_resolve_resume_launch", lambda *args: launch)
+    monkeypatch.setattr(delegate_tool, "_resolve_resume_launch", lambda *args, defaults=None: launch)
     monkeypatch.setattr(delegate_tool, "_effective_task_labels", lambda *args: (["Continue task"], None))
     task = {"goal": "Continue the previous inspection task", "task_label": "Continue task", "resume_session_id": "child"}
     if failure in {"malformed", "value", "timeout"}:
