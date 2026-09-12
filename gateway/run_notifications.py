@@ -1051,6 +1051,7 @@ class GatewayNotificationsMixin:
                 metadata["delegation_parent_task_id"] = evt["parent_task_id"]
                 metadata["delegation_owner"] = evt.get("owner")
                 metadata["delegation_thread_refs"] = evt.get("thread_refs", [])
+                metadata["delegation_attempts"] = evt.get("attempts", {})
             if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
                 # Native review status retirement is tied to this exact durable
                 # completion, never a generic task-card batch or session guess.
@@ -1563,6 +1564,11 @@ class GatewayNotificationsMixin:
             *primary_evt.get("thread_refs", []),
             *(ref for evt, _ in siblings for ref in evt.get("thread_refs", [])),
         ]))
+        primary_evt["attempts"] = {
+            ref: max(evt.get("attempts", {}).get(ref, -1)
+                     for evt in [primary_evt, *(s for s, _ in siblings)])
+            for ref in primary_evt["thread_refs"]
+        }
         delivered = await self._deliver_completion_notification(
             consolidated, primary_evt, sibling_claims=siblings,
         )

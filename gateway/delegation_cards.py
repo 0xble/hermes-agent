@@ -106,6 +106,9 @@ def render_card(card, now=None):
             "unknown": ("Ⅱ", "Interrupted · awaiting parent"),
         }.get(state, ("Ⅱ", "Status unknown · awaiting parent"))
         lines.append(f"{prefix}{symbol} {label}{role_suffix}")
+        disposition = row.get("disposition") or {}
+        if disposition.get("reason") == "deferred":
+            activity = "Deferred · " + disposition["detail"]
         if activity is None:
             # Tool rows retain the compact icon plus canonical identifier only:
             # no previews, arguments, usage summaries, or stale terminal tool.
@@ -341,7 +344,7 @@ class DelegationCards:
             return
         card = self.cards.get(key)
         if card and (card["owner"] != card_owner
-                     or card.get("delegation_owner", card["owner"]) != owner or card.get("retired")):
+                     or card.get("delegation_owner", card["owner"]) != owner or (card.get("retired") and event_type != "subagent.admitted")):
             return
         if not card:
             if event_type != "subagent.start":
@@ -352,8 +355,40 @@ class DelegationCards:
                 started_at=time.time(), generation=0, rows={}, message_id=None,
                 rendered="", recoveries=0, send_attempts=0, retired=False)
         row = card["rows"].get(ref)
-        if row and row["state"] in _TERMINAL | {"unknown"}:
+        if event_type == "subagent.admitted" and data.get("resume_claim_id"):
+            attempt = data.get("attempt")
+            if (not row or not isinstance(attempt, int) or attempt != row.get("attempt", 0) + 1
+                    or row["state"] not in _TERMINAL | {"unknown"}
+                    or row.get("child_session_id") not in (None, data.get("child_session_id"))):
+                if row and attempt == row.get("attempt") and row.get("resume_claim_id") == data.get("resume_claim_id"):
+                    return  # exact replay of already linked admission
+                raise ValueError("Continuation admission does not match the exact prior terminal attempt")
+            from tools.async_delegation import release_result_retention
+            release_result_retention(owner=owner, parent_task_id=key,
+                                     attempts={ref: row.get("attempt", 0)})
+            old = copy.deepcopy(row)
+            old["disposition"] = {"reason": "revision_requested", "actor_session_id": owner["session_id"],
+                                  "next_attempt": attempt, "resume_claim_id": data["resume_claim_id"]}
+            card.setdefault("attempt_history", {}).setdefault(ref, {})[str(row.get("attempt", 0))] = old
+            row.update(state="running", last_tool=None, attempt=attempt, resume_claim_id=data["resume_claim_id"])
+            row.pop("disposition", None)
+            card.get("handling", {}).pop(ref, None)
+            card["handled"] = [r for r in card.get("handled", ()) if r != ref]
+            card["retired"] = False
+            card["generation"] += 1
+            self._bind(key)
+            card["revision"] = card.get("revision", 0) + 1
+            self._save()
+            self._queue(key)
             return
+        if row and data.get("attempt", 0) != row.get("attempt", 0):
+            return  # stale late tool/completion from a superseded execution
+        if row and row["state"] in _TERMINAL | {"unknown"}:
+            recovered_completion = (row["state"] == "unknown" and event_type == "subagent.complete"
+                and row.get("resume_claim_id") and row.get("resume_claim_id") == data.get("resume_claim_id")
+                and row.get("child_session_id") == data.get("child_session_id"))
+            if not recovered_completion:
+                return
         if event_type == "subagent.start":
             if row:
                 return
@@ -361,16 +396,31 @@ class DelegationCards:
                 "role": data.get("role"), "subagent_type": data.get("subagent_type"),
                 "card_parent_task_id": data.get("card_parent_task_id"),
                 "card_parent_thread_ref": data.get("card_parent_thread_ref"),
-                "state": "running", "last_tool": None}
-            replacement = data.get("replaces")
+                "state": "running", "last_tool": None, "attempt": data.get("attempt", 0),
+                "child_session_id": data.get("child_session_id")}
+            if data.get("replaces"):
+                row["replaces"] = copy.deepcopy(data["replaces"])
+            card["generation"] += 1
+            if data.get("background") is False:
+                self.turn_tasks.setdefault((session_key, generation), {}).setdefault(key, set()).add(ref)
+        elif row and event_type == "subagent.admitted":
+            replacement = row.get("replaces")
             old = self.cards.get(replacement.get("parent_task_id")) if isinstance(replacement, dict) else None
             old_ref = replacement.get("thread_ref") if isinstance(replacement, dict) else None
             if (old and old.get("delegation_owner", old["owner"]) == owner
                     and old["owner"] == card_owner and self._scope(old) == self._scope(card)
-                    and old_ref in old["rows"] and old["rows"][old_ref]["state"] in _TERMINAL | {"unknown"}):
+                    and old_ref in old["rows"] and old["rows"][old_ref]["state"] in _TERMINAL | {"unknown"}
+                    and old.get("replacement_claims", {}).get(old_ref, {}).get("id") == replacement.get("claim_id")
+                    and replacement.get("claim_id")
+                    and old["rows"][old_ref].get("attempt", 0) == replacement.get("attempt")):
+                from tools.async_delegation import release_result_retention
+                release_result_retention(owner=owner, parent_task_id=replacement["parent_task_id"],
+                                         attempts={old_ref: replacement["attempt"]})
+                old["replacement_claims"][old_ref]["launched"] = {"parent_task_id": key, "thread_ref": ref}
                 row["replaces"] = copy.deepcopy(replacement)
-                old.setdefault("handling", {})[old_ref] = {"reason": "replacement",
+                old.setdefault("handling", {})[old_ref] = {"reason": "revision_requested",
                     "replacement": {"parent_task_id": key, "thread_ref": ref}, "actor_session_id": owner.get("session_id")}
+                old["rows"][old_ref]["disposition"] = copy.deepcopy(old["handling"][old_ref])
                 old["handled"] = sorted({*old.get("handled", ()), old_ref})
                 # Bind the replacement to the existing anchor before retiring
                 # the old task, otherwise presentation.bind chooses a new bubble.
@@ -379,6 +429,7 @@ class DelegationCards:
                 self.turn_tasks.setdefault((session_key, generation), {}).setdefault(key, set()).add(ref)
         elif row and event_type == "subagent.complete":
             row["state"] = data.get("status") if data.get("status") in _TERMINAL else "completed"
+            row["result_turn_id"] = data.get("result_turn_id")
         elif row and event_type == "subagent.tool" and tool_name:
             row["last_tool"] = _tool_label(tool_name, "tool", 60)
         else:
@@ -486,7 +537,7 @@ class DelegationCards:
             self._queue(key)
 
     async def handling(self, source, session_key, session_id, generation, *,
-                       actor_session_id, parent_task_id, refs, reason):
+                       actor_session_id, parent_task_id, refs, reason, detail=None, turn_id=None):
         """Explicit parent attestation, not result arrival or prose classification.
 
         Root attestations await their final delivery. Nested incorporation has
@@ -496,7 +547,7 @@ class DelegationCards:
         if (not card or not isinstance(refs, list) or not refs
                 or not all(isinstance(ref, str) for ref in refs)
                 or len(set(refs)) != len(refs)
-                or reason not in {"incorporated", "blocker_report", "validate_replacement"}):
+                or reason not in {"incorporated", "blocker_report", "deferred", "validate_replacement", "release_replacement"}):
             raise ValueError("Expected exact task identity, refs and handling reason")
         async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
             owner = card.get("delegation_owner", card["owner"])
@@ -508,23 +559,102 @@ class DelegationCards:
                     or any(ref not in card["rows"] or card["rows"][ref]["state"] not in _TERMINAL | {"unknown"} for ref in refs)):
                 raise ValueError("Handling requires this exact parent owner's terminal rows")
             if reason == "validate_replacement":
-                return {"validated": True}
+                if len(refs) != 1 or card.get("replacement_claims", {}).get(refs[0]):
+                    raise ValueError("Replacement already reserved or launch outcome unresolved; reconcile before retrying")
+                claim_id = uuid.uuid4().hex
+                card.setdefault("replacement_claims", {})[refs[0]] = {
+                    "id": claim_id, "attempt": card["rows"][refs[0]].get("attempt", 0)}
+                self._save()
+                return {"validated": True, "claim_id": claim_id,
+                        "attempt": card["rows"][refs[0]].get("attempt", 0)}
+            if reason == "release_replacement":
+                for ref in refs:
+                    claim = card.get("replacement_claims", {}).get(ref)
+                    if claim and claim["id"] == detail:
+                        card["replacement_claims"].pop(ref)
+                self._save()
+                return {"released": True}
             if actor_session_id != session_id and reason == "blocker_report":
                 raise ValueError("A nested parent cannot attest a root user-facing delivery; incorporate its result instead")
+            if turn_id is not None:
+                presented = card.get("result_turns", {}).get(turn_id, {})
+                if any(ref not in presented or presented[ref] != card["rows"][ref].get("attempt", 0) for ref in refs):
+                    raise ValueError("Disposition requires the exact terminal attempt delivered to this processing turn; the result is absent or superseded")
+            if reason == "deferred":
+                if not isinstance(detail, str) or not detail.strip() or len(detail.strip()) > 160:
+                    raise ValueError("Deferred requires a short nonempty reason (at most 160 characters)")
+                detail = _label(detail, "")
             for ref in refs:
                 prior = card.get("handling", {}).get(ref, {})
                 card.setdefault("handling", {})[ref] = dict(
                     # A queued outbound obligation already owns this exact ID.
                     # Re-attesting the same immutable terminal ref must not revoke it.
-                    id=prior.get("id") or uuid.uuid4().hex, reason=reason, actor_session_id=actor_session_id,
+                    id=(prior.get("id") if (prior.get("reason") == reason or {prior.get("reason"), reason} <= {"incorporated", "blocker_report"}) else None) or uuid.uuid4().hex,
+                    reason=reason, detail=detail, turn_id=turn_id, actor_session_id=actor_session_id,
                     session_key=session_key, generation=generation,
                     epoch=card.get("receipt_epoch", 0))
+                card["rows"][ref]["disposition"] = copy.deepcopy(card["handling"][ref])
+            card["revision"] = card.get("revision", 0) + 1
             self._save()
+            if reason == "deferred":
+                self._queue(parent_task_id)
             proof = {parent_task_id: self._proof(card, refs)}
-        if actor_session_id != session_id and reason == "incorporated":
-            await self.delivered(proof)
         return {"recorded": True, "parent_task_id": parent_task_id, "refs": refs,
-                "awaiting_delivery": actor_session_id == session_id or reason == "blocker_report"}
+                "awaiting_delivery": reason != "deferred" and (actor_session_id == session_id or reason == "blocker_report")}
+
+    async def result_turn(self, *, actor_session_id, turn_id, results=None):
+        """Exact terminal attempts presented to this turn, never historical visibility.
+
+        The trusted runtime supplies results; model text never enters this method.
+        Persist presentation identity so recovery cannot turn a later attempt into
+        an acknowledgement of this one. Query only the supplied opaque turn id.
+        """
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValueError("Missing result-processing turn identity")
+        nested_deliveries = {}
+        for item in results or ():
+            card = self.cards.get(item.get("parent_task_id"))
+            if not card or card.get("delegation_owner", card["owner"]).get("session_id") != actor_session_id:
+                continue
+            async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
+                for ref in item.get("thread_refs") or ():
+                    row = card["rows"].get(ref)
+                    if not row or row["state"] not in _TERMINAL | {"unknown"}:
+                        continue
+                    attempt = (item.get("attempts") or {}).get(ref, 0)
+                    if attempt != row.get("attempt", 0):
+                        continue
+                    card.setdefault("result_turns", {}).setdefault(turn_id, {})[ref] = attempt
+                    child_session = row.get("child_session_id")
+                    if child_session and row["state"] == "completed":
+                        # Nested incorporation is delivered only when this exact
+                        # parent's composed result actually reaches its owner.
+                        for nested_key, nested in self.cards.items():
+                            if nested.get("delegation_owner", nested["owner"]).get("session_id") != child_session:
+                                continue
+                            refs = [r for r, intent in nested.get("handling", {}).items()
+                                    if intent.get("reason") == "incorporated"
+                                    and intent.get("actor_session_id") == child_session
+                                    and row.get("result_turn_id") is not None
+                                    and intent.get("turn_id") == row.get("result_turn_id")
+                                    and r not in nested.get("handled", ())]
+                            if refs:
+                                nested_deliveries[nested_key] = self._proof(nested, refs)
+                self._save()
+        if nested_deliveries:
+            await self.delivered(nested_deliveries)
+        missing = []
+        for key, card in self.cards.items():
+            if card.get("delegation_owner", card["owner"]).get("session_id") != actor_session_id:
+                continue
+            for ref, attempt in card.get("result_turns", {}).get(turn_id, {}).items():
+                row = card["rows"].get(ref, {})
+                prior = card.get("attempt_history", {}).get(ref, {}).get(str(attempt), {})
+                intent = (row.get("disposition") or card.get("handling", {}).get(ref, {})) if row.get("attempt", 0) == attempt else prior.get("disposition", {})
+                if not intent.get("reason"):
+                    missing.append({"parent_task_id": key, "thread_ref": ref, "attempt": attempt,
+                                    "task_label": row.get("task_label", "Task")})
+        return {"missing": missing}
 
     @staticmethod
     def _proof(card, refs):
@@ -536,7 +666,9 @@ class DelegationCards:
         receipt = {}
         for key, card in self.cards.items():
             refs = [ref for ref, intent in card.get("handling", {}).items()
-                    if ref not in card.get("handled", ())
+                    if intent.get("reason") in {"incorporated", "blocker_report"}
+                    and intent.get("actor_session_id") == card["owner"].get("session_id")
+                    and ref not in card.get("handled", ())
                     and intent.get("session_key") == session_key
                     and intent.get("generation") == generation
                     and intent.get("epoch") == card.get("receipt_epoch", 0)
@@ -559,10 +691,16 @@ class DelegationCards:
                     continue
                 refs = {ref for ref in proof.get("refs", ()) if ref in card["rows"]
                         and card["rows"][ref]["state"] in _TERMINAL | {"unknown"}
+                        and card.get("handling", {}).get(ref, {}).get("reason") in {"incorporated", "blocker_report"}
                         and proof.get("handling_ids", {}).get(ref)
                         and proof["handling_ids"][ref] == card.get("handling", {}).get(ref, {}).get("id")}
                 if not refs:
                     continue
+                from tools.async_delegation import release_result_retention
+                release_result_retention(
+                    owner=card.get("delegation_owner", card["owner"]), parent_task_id=key,
+                    attempts={ref: card["rows"][ref].get("attempt", 0) for ref in refs},
+                )
                 handled = set(card.get("handled") or []) | refs
                 card["handled"] = sorted(handled)
                 self._save()

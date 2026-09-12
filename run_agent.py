@@ -1313,7 +1313,8 @@ class AIAgent(
             background=not (getattr(self, "_delegate_depth", 0) > 0), action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
             parent_task_id=function_args.get("parent_task_id"), task_label=function_args.get("task_label"),
-            handled_refs=function_args.get("handled_refs"), handling=function_args.get("handling"),
+            handled_refs=function_args.get("handled_refs"), handling=function_args.get("handling"), defer_reason=function_args.get("defer_reason"),
+            delegation_id=function_args.get("delegation_id"),
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

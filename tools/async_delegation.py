@@ -144,7 +144,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS delegation_parent_tasks (parent_task_id TEXT PRIMARY KEY, owner_json TEXT NOT NULL)")
 
 
-def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str]) -> Dict[str, Any]:
+def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str], resume_refs: Optional[List[str]] = None) -> Dict[str, Any]:
     """Reserve never-reused display refs and validate an opaque id against exact owner.
 
     ``parent_task_id`` is intentionally an opaque correlation token, never an
@@ -157,6 +157,10 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
     parent_task_id = parent_task_id if supplied_parent_task_id else uuid.uuid4().hex
     owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
     labels = [str(x or "").strip() or "Run delegated task" for x in task_labels]
+    if resume_refs is not None and (not supplied_parent_task_id or len(resume_refs) != len(labels)
+            or len(set(resume_refs)) != len(resume_refs)
+            or any(not isinstance(ref, str) or not re.fullmatch(r"[A-Z]+", ref) for ref in resume_refs)):
+        raise ValueError("Continuation requires exact existing refs and parent task identity")
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute("SELECT owner_json FROM delegation_parent_tasks WHERE parent_task_id=?", (parent_task_id,)).fetchone()
         if supplied_parent_task_id:
@@ -164,6 +168,9 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
                 raise ValueError("parent_task_id is not a known reference for this conversation owner")
             if row[0] != owner_json:
                 raise ValueError("parent_task_id belongs to another immutable conversation owner")
+            if resume_refs is not None:
+                return {"parent_task_id": parent_task_id, "owner": owner, "owner_json": owner_json,
+                        "thread_refs": list(resume_refs), "task_labels": labels}
         else:
             conn.execute("INSERT INTO delegation_parent_tasks VALUES (?, ?)", (parent_task_id, owner_json))
         row = conn.execute("SELECT next_thread_number FROM delegation_thread_counters WHERE owner_json=?", (owner_json,)).fetchone()
@@ -365,22 +372,84 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 
 def _prune_durable_records() -> None:
-    """Bound only settled history; pending delivery obligations are never retention-pruned."""
+    """Bound settled history without discarding an unresolved card result.
+
+    Delivery acknowledgement only proves the completion notification was admitted.
+    A result remains separately retained while its exact card attempt has no
+    parent-disposition delivery receipt.
+    """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?", (cutoff,))
-        terminal_count = conn.execute(
-            """SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')
-               AND delivery_state IN ('delivered','dropped')""").fetchone()[0]
-        if terminal_count > _MAX_RETAINED_COMPLETED:
-            conn.execute("""DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
-                       AND delivery_state IN ('delivered','dropped')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                             updated_at ASC LIMIT ?
-                   )""", (terminal_count - _MAX_RETAINED_COMPLETED,))
+        rows = conn.execute("""SELECT delegation_id, task_json, result_json FROM async_delegations
+               WHERE state NOT IN ('running','finalizing','stalling') AND updated_at < ?
+                 AND (delivery_state='delivered' OR (event_json IS NULL AND result_json IS NOT NULL))""", (cutoff,)).fetchall()
+        conn.executemany("DELETE FROM async_delegations WHERE delegation_id=?", [
+            (delegation_id,) for delegation_id, task_json, result_json in rows
+            if not _has_retained_result(task_json, result_json)
+        ])
+        rows = conn.execute("""SELECT delegation_id, task_json, result_json FROM async_delegations
+               WHERE state NOT IN ('running','finalizing','stalling')
+                 AND (delivery_state IN ('delivered','dropped')
+                      OR (event_json IS NULL AND result_json IS NOT NULL))
+               ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                        updated_at ASC""").fetchall()
+        removable = [delegation_id for delegation_id, task_json, result_json in rows
+                     if not _has_retained_result(task_json, result_json)]
+        # Retained results deliberately exceed the history cap.  The cap still
+        # bounds every settled payload that has exact release evidence.
+        excess = max(0, len(rows) - _MAX_RETAINED_COMPLETED)
+        conn.executemany("DELETE FROM async_delegations WHERE delegation_id=?",
+                         [(delegation_id,) for delegation_id in removable[:excess]])
+
+
+def _retained_result_keys(task: Dict[str, Any], result: Any) -> set:
+    """Default-retain exact named attempts, even before parent presentation.
+
+    Release evidence lives on the same durable payload row. Notification ack,
+    replay expiry, cache eviction and absence of a card callback are not release.
+    """
+    metadata = task.get("delegation_metadata") or {}
+    if not metadata.get("parent_task_id") or not metadata.get("owner"):
+        return set()  # Legacy unlabelled notifications have no card obligation.
+    threads = metadata.get("threads") or []
+    entries = result.get("results") if isinstance(result, dict) else None
+    indexes = ({entry.get("task_index") for entry in entries if isinstance(entry, dict)}
+               if entries else set(task.get("task_indexes") or range(len(threads))))
+    expected = {f"{item['thread_ref']}:{metadata.get('attempts', {}).get(item['thread_ref'], 0)}"
+                for i, item in enumerate(threads)
+                if isinstance(item, dict) and item.get("thread_ref")
+                and item.get("task_index", i) in indexes}
+    return expected - set(task.get("result_released") or ())
+
+
+def _has_retained_result(task_json: Any, result_json: Any) -> bool:
+    try:
+        return bool(_retained_result_keys(json.loads(task_json or "{}"), json.loads(result_json or "{}")))
+    except (TypeError, ValueError, AttributeError):
+        return True  # Malformed lifecycle data is not release evidence.
+
+
+def release_result_retention(*, owner: Dict[str, Any], parent_task_id: str,
+                             attempts: Dict[str, int]) -> int:
+    """Called only after exact card delivery or admitted-revision validation."""
+    owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+    changed = 0
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute("""SELECT delegation_id, task_json, result_json FROM async_delegations
+               WHERE parent_task_id=? AND owner_json=?""", (parent_task_id, owner_json)).fetchall()
+        for delegation_id, task_json, result_json in rows:
+            task, result = json.loads(task_json or "{}"), json.loads(result_json or "{}")
+            released = {f"{ref}:{attempt}" for ref, attempt in attempts.items()
+                        if isinstance(ref, str) and type(attempt) is int}
+            released &= _retained_result_keys(task, result)
+            if not released:
+                continue
+            task["result_released"] = sorted(set(task.get("result_released") or ()) | released)
+            conn.execute("UPDATE async_delegations SET task_json=?, updated_at=? WHERE delegation_id=?",
+                         (json.dumps(task), time.time(), delegation_id))
+            changed += len(released)
+    _prune_durable_records()
+    return changed
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
@@ -393,6 +462,30 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
                 (event.get("status", "completed"), event.get("completed_at", now), now,
                  json.dumps(event), json.dumps(result), event["delegation_id"]))
     _run_with_busy_retry(_write)
+
+
+def persist_inline_result(result: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    """Archive a presented synchronous unit using the existing owner/result ledger.
+
+    No async dispatch or outbound event is created. Pending + NULL event means
+    this archive cannot wake a turn, claim delivery, or age-prune an obligation.
+    The caller publishes the new handle only after this transaction succeeds.
+    """
+    delegation_id = _new_delegation_id()
+    now = time.time()
+    projection = _ledger_label_projection(metadata)
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("""INSERT INTO async_delegations
+            (delegation_id, origin_session, parent_session_id, state, dispatched_at,
+             completed_at, updated_at, result_json, task_json, parent_task_id, owner_json,
+             delivery_state, event_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL)""",
+            (delegation_id, (metadata.get("owner") or {}).get("session_key", ""),
+             (metadata.get("owner") or {}).get("session_id", ""), _batch_status(result),
+             now, now, now, json.dumps(result), json.dumps({"delegation_metadata": metadata}),
+             projection["parent_task_id"], projection["owner_json"]))
+    _prune_durable_records()
+    return delegation_id
 
 
 def record_unit_child(delegation_id: str, entry: Dict[str, Any]) -> None:
@@ -473,7 +566,7 @@ def recover_abandoned_delegations() -> int:
                 "status": "unknown", "summary": None, "error": error,
                 **({"results": recovered_results} if recovered_results else {}),
                 "dispatched_at": dispatched_at, "completed_at": now,
-                **_completion_metadata_fields(task.get("delegation_metadata")),
+                **_completion_metadata_fields(task.get("delegation_metadata"), recovered_results or []),
                 **{k: task[k] for k in _ROUTING_KEYS if task.get(k)}}
             if task.get("completion_contract") is not None:
                 event["completion_contract"] = task["completion_contract"]
@@ -727,6 +820,31 @@ def _owned_durable_row(delegation_id: str, owner: Dict[str, Any]) -> Optional[Di
     return item
 
 
+def current_delegation_owner(parent_agent):
+    """Immutable owner shared by dispatch and explicit later result retrieval."""
+    try:
+        from gateway.session_context import get_session_env, session_context_engaged, session_is_messaging_surface
+        _session_env = lambda key: get_session_env(key, "")
+        _session_bound = session_context_engaged()
+        _messaging_session = session_is_messaging_surface()
+    except Exception:
+        _session_env = lambda key: ""
+        _session_bound = False
+        _messaging_session = False
+    from hermes_constants import get_hermes_home
+    # Gateway multiplexing binds this explicitly; never derive a profile from
+    # the ambient process home when a session-scoped profile is available.
+    _profile = _session_env("HERMES_SESSION_PROFILE")
+    if _session_bound and _messaging_session and not _profile:
+        raise ValueError("Delegation metadata requires the bound session profile; refusing ambient profile ownership.")
+    _profile = _profile or str(get_hermes_home())
+    _thread_id = _session_env("HERMES_SESSION_THREAD_ID")
+    _owner = {"profile": _profile, "session_id": str(getattr(parent_agent, "session_id", "") or ""),
+              "session_key": _session_env("HERMES_SESSION_KEY"), "chat_id": _session_env("HERMES_SESSION_CHAT_ID"),
+              "thread_id": _thread_id, "topic_id": _thread_id}
+    return _owner
+
+
 def get_delegation_status(delegation_id: str, *, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Owner-scoped durable status; works after in-memory cleanup or restart."""
     item = _owned_durable_row(delegation_id, owner)
@@ -877,7 +995,7 @@ def _new_delegation_id() -> str:
 
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``."""
-    completed = [(rid, r) for rid, r in _records.items() if r.get("status") != "running"]
+    completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
@@ -1080,12 +1198,21 @@ def _finalize(delegation_id: str, result: Any, status: str) -> None:
         _prune_completed_locked()
 
 
-def _completion_metadata_fields(metadata: Any) -> Dict[str, Any]:
-    """Expose safe correlation fields on completion events without goal text."""
+def _completion_metadata_fields(metadata: Any, entries=None) -> Dict[str, Any]:
+    """Correlate only results actually included in this event, not batch siblings."""
     if not isinstance(metadata, dict):
         return {}
+    if entries is not None:
+        indexes = {e.get("task_index") for e in entries if isinstance(e, dict)}
+        threads = [{**t, "task_index": t.get("task_index", i)}
+                   for i, t in enumerate(metadata.get("threads", []))
+                   if isinstance(t, dict) and t.get("task_index", i) in indexes]
+        refs = [t["thread_ref"] for t in threads]
+        metadata = {**metadata, "threads": threads, "thread_refs": refs,
+                    "task_labels": [t.get("task_label") for t in threads],
+                    "attempts": {r: metadata.get("attempts", {}).get(r, 0) for r in refs}}
     fields: Dict[str, Any] = {"delegation_metadata": metadata}
-    for key in ("parent_task_id", "owner", "background"):
+    for key in ("parent_task_id", "owner", "background", "attempts"):
         if metadata.get(key) is not None:
             fields[key] = metadata[key]
     threads = metadata.get("threads")
@@ -1132,7 +1259,7 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
         "model": record.get("model") if is_batch else (result.get("model") or record.get("model")),
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **_completion_metadata_fields(record.get("delegation_metadata")),
+        **_completion_metadata_fields(record.get("delegation_metadata"), result.get("results", []) if is_batch else None),
         **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     contract = record.get("completion_contract")
@@ -1189,6 +1316,7 @@ def push_task_failure_notice(delegation_id: str, entry: Dict[str, Any], *, n_tas
     evt = {
         "type": "async_delegation", "task_failure_notice": True, "is_batch": True, "n_tasks": n_tasks,
         "delegation_id": delegation_id, "results": [entry],
+        **_completion_metadata_fields(snapshot.get("delegation_metadata"), [entry]),
         "session_key": snapshot.get("session_key", ""),
         "origin_ui_session_id": snapshot.get("origin_ui_session_id", ""),
         "origin_session_id": snapshot.get("origin_session_id", ""),

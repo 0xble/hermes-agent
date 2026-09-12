@@ -172,6 +172,9 @@ def test_receipts_are_bounded_redacted_and_session_scoped(tmp_path, monkeypatch)
         )
         registry._running[session.id] = session
         registry._move_to_finished(session)
+        # Only observed receipts are settled history; unresolved owned effects
+        # retain their checkpoint fence independently of this bounded cache.
+        registry.read_log(session.id)
         sessions.append(session)
     from hermes_constants import get_hermes_home
     paths = list((get_hermes_home() / "logs" / "process-results").glob("*.json"))

@@ -297,7 +297,8 @@ class _ChildProgressRelay:
                          ("card_parent_thread_ref", "card_parent_thread_ref"),
                          ("task_label", "task_label"), ("role", "role"), ("owner", "owner"), ("card_owner", "card_owner"),
                          ("subagent_type", "subagent_type"), ("native_review", "native_review"),
-                         ("background", "background"), ("replaces", "replaces")):
+                         ("background", "background"), ("replaces", "replaces"),
+                         ("attempt", "attempt"), ("resume_claim_id", "resume_claim_id")):
             if self.session_ref.get(src) is not None:
                 kw[dst] = self.session_ref[src]
         kw["tool_count"] = self.tool_count
@@ -378,8 +379,10 @@ class _ChildProgressRelay:
                 self._flush()
 
     def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
-        if event_type == "subagent.handling" and self.parent_cb:
+        if event_type in {"subagent.handling", "subagent.result_turn"} and self.parent_cb:
             return self.parent_cb(event_type, **kwargs)
+        if event_type == "subagent.admitted" and self.parent_cb:
+            return self.parent_cb(event_type, **{**self._identity_kwargs(), **kwargs})
         key = _normalize_event(event_type)
         method = None if key is None else _EVENT_HANDLERS.get(key, "_on_tool_started")
         if method is not None:

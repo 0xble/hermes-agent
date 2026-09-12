@@ -796,6 +796,7 @@ class _ChildRun:
         complete_kwargs: Dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": entry["status"],
+            "result_turn_id": getattr(child, "_delegation_result_turn", None),
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
             "input_tokens": _num(getattr(child, "session_prompt_tokens", 0)),

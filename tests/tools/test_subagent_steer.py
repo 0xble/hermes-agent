@@ -187,6 +187,7 @@ class TestMissedSteerRetention:
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "test-model"
+            mock_child.session_id = "steer-child"
             mock_child.session_prompt_tokens = 0
             mock_child.session_completion_tokens = 0
             mock_child.run_conversation.return_value = {
@@ -224,6 +225,7 @@ class TestMissedSteerRetention:
         with patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.model = "test-model"
+            mock_child.session_id = "steer-child"
             mock_child.session_prompt_tokens = 0
             mock_child.session_completion_tokens = 0
             mock_child.run_conversation.return_value = {

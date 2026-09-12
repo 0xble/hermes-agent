@@ -117,6 +117,12 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if event_type == "subagent.result_turn":
+            from gateway.delegation_cards import cards_for
+            if ctx.source.platform != Platform.TELEGRAM:
+                return {"missing": []}
+            future = self._schedule(cards_for(self._runner).result_turn(**kwargs), "delegation result tracking failed")
+            return future.result(timeout=30)
         if event_type == "subagent.handling":
             from gateway.delegation_cards import cards_for
             if ctx.source.platform != Platform.TELEGRAM:
@@ -124,6 +130,12 @@ class TurnRunner:
             future = self._schedule(cards_for(self._runner).handling(
                 ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation, **kwargs),
                 "delegation handling failed")
+            return future.result(timeout=30)
+        if event_type == "subagent.admitted" and ctx.source.platform == Platform.TELEGRAM:
+            from gateway.delegation_cards import cards_for
+            future = self._schedule(cards_for(self._runner).observe(
+                ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
+                event_type, tool_name, kwargs), "delegation admission link failed")
             return future.result(timeout=30)
         if (event_type in {"subagent.start", "subagent.tool", "subagent.complete"}
                 and kwargs.get("parent_task_id") and ctx.source.platform == Platform.TELEGRAM

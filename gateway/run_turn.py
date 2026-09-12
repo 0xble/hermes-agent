@@ -2027,7 +2027,14 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
-                persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
+                persist_user_display_metadata={
+                    "gateway_input_owner": prepared.persistence_owner,
+                    **({"delegation_results": [{
+                        "parent_task_id": event.metadata["delegation_parent_task_id"],
+                        "thread_refs": event.metadata.get("delegation_thread_refs", []),
+                        "attempts": event.metadata.get("delegation_attempts", {}),
+                    }]} if event.internal and event.metadata.get("delegation_parent_task_id") else {}),
+                },
                 message_type=event.message_type,
                 turn_reasoning_config=getattr(event, "turn_reasoning_config", None),
                 goal_session_entry=session_entry,

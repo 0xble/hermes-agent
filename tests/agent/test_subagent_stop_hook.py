@@ -62,6 +62,8 @@ def _stub_child_builder(monkeypatch):
     in environments without heavyweight runtime deps installed."""
     def _fake_build_child(task_index, **kwargs):
         child = MagicMock()
+        child.session_id = f"hook-child-{task_index}"
+        child._delegate_role = kwargs.get("role")
         child._delegate_saved_tool_names = []
         child._credential_pool = None
         return child

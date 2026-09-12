@@ -421,6 +421,8 @@ class ProcessSession:
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _result_observed: bool = field(default=False, repr=False)
+    _result_persist_failed: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _deadline_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -478,6 +480,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
+        self._result_generation = 0
+        self._unresolved_checkpoint_entries = []
         self._lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -1332,10 +1336,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             if was_running:
                 # Keep the session tracked until its result is durable. A finite
                 # parent must not observe completion and exit during this write.
-                save_completed_result(session)
+                session._result_persist_failed = not save_completed_result(session)
                 self._running.pop(session.id)
             self._finished[session.id] = session
+            self._result_generation += 1
         self._write_checkpoint()
+        from tools.process_registry_results import prune_completed_results
+        prune_completed_results()
         if was_running and session.notify_on_complete:
             notification = {
                 "type": "completion",
@@ -1643,6 +1650,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _status_head(session: ProcessSession) -> dict:
         return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running"}
 
+    def _observe_completed_result(self, session: ProcessSession, *, consumed: bool) -> None:
+        """Persist exact observation separately from notification consumption."""
+        with self._lock:
+            session._result_observed = True
+            session._result_persist_failed = not save_completed_result(session)
+            if session._result_persist_failed:
+                # Failed proof publication is conservative across read/restart.
+                session._result_observed = False
+                self._finished[session.id] = session
+            (self._completion_consumed if consumed else self._poll_observed).add(session.id)
+        self._write_checkpoint()
+        from tools.process_registry_results import prune_completed_results
+        prune_completed_results()
+
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
         session = self.get(session_id)
@@ -1659,7 +1680,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
             # _completion_consumed, or a status check would suppress the watcher's
             # autonomous delivery turn. See __init__.
-            self._poll_observed.add(session_id)
+            self._observe_completed_result(session, consumed=False)
         if session.detached:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
@@ -1692,7 +1713,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._observe_completed_result(session, consumed=True)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -1725,7 +1746,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
             result = None
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._observe_completed_result(session, consumed=True)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -1789,7 +1810,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._observe_completed_result(session, consumed=True)
             return result
         try:
             if source == "terminal.timeout":
@@ -1819,7 +1840,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with session._lock:
                 output = _output_tail(session, 2000)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    # _move_to_finished persists this mark after the session lock
+                    # is released; do not acquire that lock recursively here.
+                    session._result_observed = True
+                    self._completion_consumed.add(session.id)
                 session.exited = True
                 session.exit_code = 124 if source == "terminal.timeout" else -15
                 session.completion_reason = "timed_out" if source == "terminal.timeout" else "killed"
@@ -1887,7 +1911,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     session.exit_code = None
                     output = _output_tail(session, 2000)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._observe_completed_result(session, consumed=True)
                 self._move_to_finished(session)
                 return {"status": "already_exited", "exit_code": session.exit_code, "output": output}
             self._terminate_host_pid(session.pid, session.host_start_time)
@@ -2049,13 +2073,41 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with self._lock:
             return [s for s in self._running.values() if s.owner_task_id == owner_task_id and not s.exited]
 
+    def unresolved_owned_processes(self, owner_task_ids) -> List[ProcessSession]:
+        """Atomic checkpoint barrier, including exits awaiting durable publication.
+
+        A reader sets exited before moving the session. Anything still in running
+        blocks even if polled/consumed; finished effects require observation.
+        """
+        owners = set(owner_task_ids)
+        if not owners:
+            return []
+        while True:
+            with self._lock:
+                generation = self._result_generation
+                from tools.process_registry_results import checkpoint_entry_owner
+                for entry in self._unresolved_checkpoint_entries:
+                    affected_owner = checkpoint_entry_owner(entry)
+                    if affected_owner is None or affected_owner in owners:
+                        raise ValueError("Malformed process checkpoint: unresolved owner")
+            # Never parse a profile's entire history under the registry lock.
+            retained = load_completed_results(unresolved_owners=owners)
+            with self._lock:
+                if generation != self._result_generation:
+                    # An exit could have been published AND evicted during the
+                    # scan. Retry, then take the live snapshot atomically.
+                    continue
+                retained.update(self._finished)
+                return ([s for s in self._running.values() if s.owner_task_id in owners]
+                        + [s for s in retained.values()
+                           if s.id not in self._running and s.owner_task_id in owners
+                           and (s._result_persist_failed or not s._result_observed)])
+
     def unread_completions_owned_by(self, owner_task_id: str) -> List[ProcessSession]:
         """Exited ``notify_on_complete`` processes of ``owner_task_id`` whose result nobody read (no wait/log/poll).
         A child's completion notice is suppressed in the parent, so an unread exit is otherwise lost silently."""
-        with self._lock:
-            return [s for s in self._finished.values()
-                    if s.owner_task_id == owner_task_id and s.notify_on_complete
-                    and s.id not in self._completion_consumed and s.id not in self._poll_observed]
+        return [s for s in self.unresolved_owned_processes({owner_task_id})
+                if s.exited and s.notify_on_complete]
 
     def transfer_ownership(self, session_id: str, *, from_owner: str, to_owner: str, to_task_id: str,
                            to_session_key: str, note: str = "") -> Optional[ProcessSession]:
@@ -2126,7 +2178,15 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if over_cap and (survivors := [sid for sid in self._finished if sid not in expired]):
             expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
         for sid in expired:
+            session = self._finished[sid]
+            # Evict payloads only after their unresolved fence is durable. On disk
+            # failure keep the live entry; never trade safety for a cache target.
+            if (session._result_persist_failed or (session.owner_task_id and not session._result_observed)) and not save_completed_result(session):
+                continue
             del self._finished[sid]
+            # A previously failed publication may only now be durable; owner
+            # snapshots scanning outside the lock must retry.
+            self._result_generation += 1
         # Belt-and-suspenders against module-lifetime growth: forget consumed /
         # poll-observed marks for any session no longer tracked at all.
         tracked = self._running.keys() | self._finished.keys()
@@ -2150,7 +2210,8 @@ PROCESS_SCHEMA = {
         "Poll, wait on, or kill background terminal processes (from "
         "terminal(background=true)). "
         "Completed results remain retrievable by session_id when resuming their owning conversation "
-        "(up to 7 days, newest 64 results per profile; rolling output tail). "
+        "(observed history: up to 7 days/newest 64 per profile; unresolved owned results "
+        "remain until observed; rolling output tail). "
         "poll: status + new output. log: full output, paged. wait: block "
         "until exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "

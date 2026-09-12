@@ -22,6 +22,8 @@ class _FakeNativeClient:
 
 def _make_agent(provider="moa"):
     agent = MagicMock()
+    # Ordinary calls have no pending disposition correction.
+    agent._delegation_disposition_correction = None
     agent.provider = provider
     agent.client = _FakeNativeClient()
     agent.api_mode = "chat_completions"
