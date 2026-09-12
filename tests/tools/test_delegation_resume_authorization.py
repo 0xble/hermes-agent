@@ -108,3 +108,46 @@ def test_new_genuine_stop_requires_new_authorization(tmp_path, monkeypatch):
         _resolve_resume_launch({"resume_session_id":"child"}, definitions, parent)
     assert not db.claim_delegated_resumes(["child"], claim_id="replay", reconciliations={"child": launch.resume_recovery})
     db.close()
+
+
+@pytest.mark.parametrize("status", ["timeout", "error"])
+def test_failure_without_result_never_grants_resume_while_worker_can_write(tmp_path, monkeypatch, status):
+    from tools.delegate_tool import _resolve_resume_launch
+    db, definitions, parent = stopped_fixture(tmp_path, monkeypatch)
+    db.patch_session_model_config("child", {"_delegation_user_stopped": False})
+    assert db.acquire_session_turn_lease("child", "old-worker", ttl_seconds=60)
+    child = SimpleNamespace(_session_db=db, session_id="child", _delegation_named_type="advisor")
+    entry = {"status": status}
+    checkpoint_child_resume(child, None, entry, child_task_id="old-worker")
+    assert not entry["resume_available"]
+    assert json.loads(db.get_session("child")["model_config"])["_delegation_completed"] is False
+    assert not db.claim_delegated_resumes(["child"], claim_id="no-receipt")
+    token = _resolve_resume_launch({"resume_session_id": "child", "resume_authorization": authorization()},
+                                   definitions, parent).resume_recovery
+    assert not db.claim_delegated_resumes(["child"], claim_id="live-worker", reconciliations={"child": token})
+    db.append_message("child", role="assistant", content="Late worker checkpoint")
+    db.release_session_turn_lease("child", "old-worker")
+    assert not db.claim_delegated_resumes(["child"], claim_id="stale-receipt", reconciliations={"child": token})
+    db.close()
+
+
+@pytest.mark.parametrize("producer", ["ctrl_c", "ctrl_q", "subagent"])
+def test_actual_user_stop_producers_retain_stop_provenance(monkeypatch, producer):
+    class Child(InterruptControlMixin):
+        pass
+    child = Child()
+    child.__dict__.update(vars(agent_stub()))
+    if producer == "subagent":
+        from tools import delegate_tool_registry as registry
+        monkeypatch.setitem(registry._active_subagents, "sa-stop-fixture", {"agent": child})
+        assert registry.interrupt_subagent("sa-stop-fixture")
+    else:
+        from hermes_cli.cli_tui_mixin import CLITuiMixin
+        cli = SimpleNamespace(agent=child, _agent_running=True, _last_ctrl_c_time=0,
+            _tui_cancel_voice_recording=lambda event: False,
+            _tui_cancel_foreground_ui=lambda *args, **kwargs: False,
+            _tui_clear_blocking_overlays=lambda event: False,
+            _close_model_picker=lambda: None, _close_command_palette=lambda: None)
+        getattr(CLITuiMixin, "_tui_handle_" + producer)(cli, None)
+    assert child._delegation_user_stopped
+    assert child._delegation_stop_token
