@@ -8,6 +8,9 @@ def test_model_facing_task_labels_have_adaptive_task_row_guidance_on_both_paths(
     props = definitions[0]['function']['parameters']['properties']
     for schema in (props['task_label'], props['tasks']['items']['properties']['task_label']):
         description = schema['description']
+        assert 'sentence-case' in description
+        assert 'Check API routing' in description
+        assert 'not Review Context Forks' in description
         assert '24-character total task-card row' in description
         assert 'four spaces per nesting level, hierarchical reference' in description
         assert 'display guidance, not a hard limit' in description

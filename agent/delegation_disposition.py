@@ -11,6 +11,13 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+# Shared by the tool schema, correction prompt and runtime validation error.
+DEFER_REASON_GUIDANCE = (
+    "defer_reason must be a short state label of 1-2 words (at most 160 characters), "
+    "e.g. Under review, Awaiting CI, or Review failed. "
+    "Put any longer explanation in the normal response, not the card label."
+)
+
 
 def _query(agent, results=None):
     callback = getattr(agent, "tool_progress_callback", None)
@@ -115,7 +122,7 @@ def finish_result_turn(agent, original, run_turn, system_message, task_id):
             "The previous processing turn returned an answer but omitted disposition for the exact results below. "
             "Do not redo their work or start unrelated work. Use delegate_task(action='handle') for each result: "
             "incorporated only if actually used in the answer, blocker_report only if the answer reports its blocker, "
-            "otherwise deferred with a short defer_reason. Do not auto-accept a result. "
+            f"otherwise deferred. {DEFER_REASON_GUIDANCE} Do not auto-accept a result. "
             "A revision requires an explicitly authorized successful same-session continuation, not a handle claim. "
             "The original answer is preserved for delivery; finish with no additional user-facing prose.\n"
             + json.dumps(missing, ensure_ascii=False)

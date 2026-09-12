@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from agent.delegation_disposition import DEFER_REASON_GUIDANCE
 from agent.display import get_tool_emoji
 from gateway.config import Platform
 from gateway import delegation_card_anchor as anchoring
@@ -590,9 +591,14 @@ class DelegationCards:
                 if any(ref not in presented or presented[ref] != card["rows"][ref].get("attempt", 0) for ref in refs):
                     raise ValueError("Disposition requires the exact terminal attempt delivered to this processing turn; the result is absent or superseded")
             if reason == "deferred":
-                if not isinstance(detail, str) or not detail.strip() or len(detail.strip()) > 160:
-                    raise ValueError("Deferred requires a short nonempty reason (at most 160 characters)")
-                detail = _label(detail, "")
+                if (not isinstance(detail, str) or not 1 <= len(detail.split()) <= 2
+                        or len(detail.strip()) > 160):
+                    raise ValueError(DEFER_REASON_GUIDANCE)
+                # Normalize separators before display sanitization so tabs/newlines
+                # cannot join words. Reject empty markup rather than recording it.
+                detail = _label(" ".join(detail.split()), "")
+                if not detail:
+                    raise ValueError(DEFER_REASON_GUIDANCE)
             for ref in refs:
                 prior = card.get("handling", {}).get(ref, {})
                 card.setdefault("handling", {})[ref] = dict(

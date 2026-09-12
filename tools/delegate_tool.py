@@ -52,6 +52,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     get_subagent_attribution, interrupt_subagent, is_spawn_paused, list_active_subagents, set_spawn_paused,
     steer_subagent,
 )
+from agent.delegation_disposition import DEFER_REASON_GUIDANCE
 from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
@@ -1217,6 +1218,16 @@ def delegate_task(
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
+    from tools.delegation_history import prepare_task_histories
+    try:
+        task_histories = prepare_task_histories(
+            task_list, task_runtime, parent_agent,
+            independent_review=(child_tool_policy == "inspection_only"
+                                or (completion_contract or {}).get("kind") == "native_review_result_v1"),
+        )
+    except ValueError as exc:
+        _release_resume_launches(parent_agent, task_runtime)
+        return tool_error(str(exc))
     resumes = [launch for launch in task_runtime if launch.resume_session_id]
     if resumes:
         identities = [(launch.launch_metadata or {}).get("card_identity") for launch in resumes]
@@ -1277,6 +1288,13 @@ def delegate_task(
         _release_replacement_claims(parent_agent, task_list)
         return tool_error(err)
     for _i, (_, _, _child) in enumerate(children):
+        _mode, _history = task_histories[_i]
+        _child._delegation_context_mode = _mode
+        if _history is not None:
+            _child._delegation_fork_history = _history
+        _launch = getattr(_child, "_delegation_launch_metadata", None)
+        if isinstance(_launch, dict):
+            _launch["context_mode"] = _mode
         _ref = getattr(_child, "_progress_identity_ref", None)
         if isinstance(_ref, dict):
             _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
@@ -1296,7 +1314,8 @@ def delegate_task(
     _metadata["threads"] = [
         {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i], "task_index": i,
          "role": getattr(child, "_delegate_role", None),
-         "subagent_type": vars(child).get("_delegation_named_type")}
+         "subagent_type": vars(child).get("_delegation_named_type"),
+         "context_mode": child._delegation_context_mode}
         for i, (_, _, child) in enumerate(children)
     ]
     _metadata["background"] = bool(background)
@@ -1484,7 +1503,7 @@ _DESCRIPTION_HEAD = (
     "- Durable work that must survive this session -> cronjob or terminal(background=True, notify=True); /stop, /new, "
     "or process exit discards running subagents.\n\n"
     "RULES:\n"
-    "- Children know nothing of this conversation: pass everything needed via 'context', including any required "
+    "- Fresh children have no history; forks are reference only. Brief via 'context', including required "
     "output language, tone, or style (e.g. \"respond in Chinese\").\n"
     "- Child summaries are SELF-REPORTS, not verified facts: a child claiming \"uploaded successfully\" or "
     "\"file written\" may be wrong. For external side effects (uploads, remote writes, publishing), require a "
@@ -1577,7 +1596,8 @@ def _build_subagent_type_description(roles: list) -> str:
     for role in roles:
         pinned = "fixed" if role["pinned"] else "inherited"
         lines.append(
-            f"- {role['name']} -> {role['model']} / {role['reasoning_effort']} effort ({pinned}): {role['description']}")
+            f"- {role['name']} -> {role['model']} / {role['reasoning_effort']} effort ({pinned}), "
+            f"context default={role.get('context_mode', 'fresh')}: {role['description']}")
     lines.append(
         "Omit subagent_type for ordinary delegation on the global delegation.model / "
         "delegation.reasoning_effort defaults. A named role's settings override those defaults; "
@@ -1587,6 +1607,8 @@ def _build_subagent_type_description(roles: list) -> str:
 
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
+
+_TASK_LABEL_GUIDANCE = 'Use a concise, verb-first, privacy-safe sentence-case display label (preserve proper nouns/acronyms: Review context forks; Check API routing; not Review Context Forks); never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit.'
 
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
@@ -1612,16 +1634,24 @@ DELEGATE_TASK_SCHEMA = {
                     "properties": {
                         "goal": _p(
                             "string",
-                            "What this subagent should accomplish. Be specific and self-contained — it knows "
-                            "nothing about your conversation history.",
+                            "What this subagent should accomplish. Specify scope, constraints and acceptance criteria. "
+                            "History (if forked) is reference only, not task authority.",
                         ),
                         "context": _p(
                             "string",
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
+                        "context_mode": _p("string",
+                            "Conversation context, separate from model inheritance: fresh uses only your brief; "
+                            "fork snapshots the current visible parent window once as reference, never permissions. "
+                            "Defaults come from the named role (owner: fork; others/unnamed: fresh). Use fresh for "
+                            "independent work/review; fork for task takeover or accumulated discussion. "
+                            "Native reviews force fresh. Omit on resume: it retains its own history. "
+                            "Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief instead.",
+                            enum=["fresh", "fork"]),
                         "replaces": {"type": "object", "properties": {"parent_task_id": {"type": "string"}, "thread_ref": {"type": "string"}}, "required": ["parent_task_id", "thread_ref"], "additionalProperties": False, "description": "Explicit recovery of this parent-owned terminal thread; retire it only after this replacement actually starts. Failed spawn leaves it visible."},
-                        "task_label": _p("string", "Required for a new delegation: use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+                        "task_label": _p("string", "Required for a new delegation. " + _TASK_LABEL_GUIDANCE),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1660,7 +1690,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. Use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. " + _TASK_LABEL_GUIDANCE),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -1677,7 +1707,7 @@ DELEGATE_TASK_SCHEMA = {
             ),
             "handled_refs": {"type": "array", "items": {"type": "string"}, "description": "For action=handle: exact terminal thread_refs under parent_task_id, after incorporating their results or preparing their blocker report. Arrival alone is not handling; never infer task success."},
             "handling": _p("string", "For action=handle: incorporated, blocker_report, or deferred (requires defer_reason and stays visible). Persist before the associated response; retirement requires verified delivery. Revision is recorded only by successful linked continuation, never by handle.", enum=["incorporated", "blocker_report", "deferred"]),
-            "defer_reason": _p("string", "Required for handling=deferred: short actionable reason, at most 160 characters. Keeps the result visible."),
+            "defer_reason": _p("string", f"Required for handling=deferred. {DEFER_REASON_GUIDANCE} Keeps the result visible."),
             "delegation_id": _p("string", "For action=result: exact durable delegation_id returned by dispatch/completion. Retrieves only this conversation owner’s recorded results, without acknowledging them."),
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(

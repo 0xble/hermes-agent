@@ -6,7 +6,7 @@ description: "Spawn isolated child agents for parallel workstreams with delegate
 
 # Subagent Delegation
 
-The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets a fresh conversation and works independently — only its final summary enters the parent's context.
+The `delegate_task` tool spawns child AIAgent instances with isolated context, inherited tool access, and their own terminal sessions. Each child gets its own conversation and works independently — only its final summary enters the parent's context. Context can start fresh or fork a one-time reference snapshot; this is separate from model inheritance.
 
 Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
@@ -30,6 +30,54 @@ Setting background process notifications to `off` still drains pattern-watch eve
 Background terminal processes belong to the agent that starts them. Closing a child during delegation teardown terminates its remaining processes, including work started in earlier turns, without stopping processes owned by the parent or sibling agents. Sharing a terminal environment does not transfer process ownership.
 
 A child should wait for its builds, tests, and other bounded background commands before returning its final summary. Start a CI watcher or server in the parent session if it must continue after the child finishes; returning a process ID does not transfer ownership to the parent.
+
+## Conversation context (`context_mode`)
+
+Each task may set `context_mode: "fresh"` or `"fork"`. The named role's
+`delegation.subagents.<name>.context_mode` supplies the overridable default.
+Without that setting, `owner` defaults to `fork`; other roles and unnamed children
+start `fresh`. This does not change model, provider, effort, fallback, tools or
+approval policy. `inherit_parent` still controls **capability routing**, not history.
+
+- **Fork for continuity:** an owner taking over the current task; an advisor asked
+  about accumulated discussion; a designer continuing evolving design decisions.
+- **Fresh for independence:** independent workstreams (including owners), workers,
+  explorers, council participants and reviewers. Supply a sufficient neutral brief.
+- Native review and inspection-only delegation **force fresh**, even if a role or
+  task requests fork. Ordinary independent reviews should explicitly select fresh.
+- A same-child `resume_session_id` retains that child's own history and frozen
+  route. Omit `context_mode` on resume; specifying either mode is rejected. Send
+  later user corrections through explicit steering or the continuation goal.
+
+```python
+delegate_task(tasks=[{
+    "goal": "Continue the current investigation within its accepted scope",
+    "task_label": "Continue investigation",
+    "subagent_type": "owner",
+    "context_mode": "fork",
+    "context": "Own this task only; return evidence and unresolved issues."
+}])
+```
+
+Fork copies the current **outbound, model-visible window**, after context selection
+and compaction, once before dispatch. It never loads archived turns or uses a fixed
+message-count cap. The in-flight delegation call and its entire open tool round are
+not in that window. Each sibling receives an isolated copy. The child sees portable
+text and completed tool-call/result groups as **quoted reference data**, not replayed
+actions: parent system/developer instructions, reasoning signatures and native replay
+payloads are not inherited. Its assigned scope and child instructions remain the
+authority; past user requests do not authorize unrelated work.
+
+There is no silent degradation to fresh or hidden truncation. An unavailable window,
+invalid tool group, opaque native compaction checkpoint, or non-text media refuses
+the fork with an explicit error. Use fresh with a task-relevant summary and artifact
+references in those cases. A fork covers the current window, not an earlier full
+transcript; for unrelated or overly broad context, prefer a focused fresh brief.
+Normal child context limits/compression still apply after admission.
+
+The effective mode is returned per thread in
+`delegation_metadata.threads[].context_mode` (`fresh`, `fork`, or `resume`) and
+recorded in launch metadata. Role descriptions advertise configured defaults.
 
 ## Single Task
 

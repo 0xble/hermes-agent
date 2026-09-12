@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import contextvars
+from copy import deepcopy
 import json
 import threading
 import time
@@ -675,8 +676,15 @@ class _ChildRun:
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                goal = self.goal
+                fork_history = deepcopy(vars(child).get("_delegation_fork_history"))
+                if fork_history is not None:
+                    # A fork is new child input, not already-persisted resume history.
+                    # Store its quoted reference alongside the assignment so same-child
+                    # resume retains it through the ordinary turn persistence path.
+                    goal = "\n\n".join(row["content"] for row in fork_history) + "\n\n" + goal
                 return child.run_conversation(
-                    user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    user_message=goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)

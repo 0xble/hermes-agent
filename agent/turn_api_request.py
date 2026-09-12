@@ -169,6 +169,9 @@ def build_api_request(
         effective_task_id=effective_task_id, turn_id=turn_id,
     )
 
+    from tools.delegation_history import capture_visible_window
+    capture_visible_window(agent, api_kwargs, api_messages)
+
     if env_var_enabled("HERMES_DUMP_REQUESTS"):
         agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
