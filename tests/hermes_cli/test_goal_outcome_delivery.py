@@ -116,7 +116,8 @@ def test_cli_settle_commits_normal_stop_reply(outcome, failure):
 
 
 @pytest.mark.parametrize("streamed", [False, True])
-@pytest.mark.parametrize("failure", [None, "nonempty", "empty", "exception", "auth", "setup"])
+@pytest.mark.parametrize("failure", [None, "nonempty", "empty", "exception", "auth", "setup",
+                                     "exception_secret", "auth_secret", "setup_secret"])
 def test_gateway_seals_and_persists_the_prepared_reply(outcome, streamed, failure, monkeypatch):
     from gateway.run_turn_runner import TurnRunner
     from gateway.turn_context import TurnContext
@@ -125,9 +126,12 @@ def test_gateway_seals_and_persists_the_prepared_reply(outcome, streamed, failur
     manager, agent, messages, calls = outcome
     agent.model = "test"
     agent.tools = []
+    secret = "sk-test-credential-1234567890abcdefghijklmnopqrstuvwxyz"
+    error = f"provider unavailable, Authorization: Bearer {secret}" if str(failure).endswith("_secret") else "provider unavailable"
+    failure_kind = str(failure).removesuffix("_secret")
     def run(*a, **kw):
-        if failure == "exception":
-            raise RuntimeError("provider unavailable")
+        if failure_kind == "exception":
+            raise RuntimeError(error)
         return {"messages": messages, "final_response": "" if failure == "empty" else "Drafted notes.",
                 "completed": not bool(failure), "failed": bool(failure),
                 "error": "provider unavailable" if failure else None}
@@ -155,23 +159,31 @@ def test_gateway_seals_and_persists_the_prepared_reply(outcome, streamed, failur
     runner._is_telegram_topic_lane.return_value = False
     runner._is_discord_auto_thread_lane.return_value = False
     runner._is_relay_discord_channel_lane.return_value = False
-    ctx = TurnContext(source=SessionSource(platform=Platform.LOCAL, chat_id="test", user_id="test"),
+    ctx = TurnContext(source=SessionSource(platform=Platform.TELEGRAM, chat_id="test", user_id="test"),
         message="Publish release notes", history=messages[:2], session_id=agent.session_id,
         session_key="route", user_config={}, AIAgent=lambda **kw: agent,
         resolve_display_setting=lambda *a: False, _run_still_current=lambda: True,
         _hooks_ref=SimpleNamespace(loaded_hooks=False))
     turn = TurnRunner(runner, ctx)
-    if failure == "auth":
-        runner._resolve_session_agent_runtime.side_effect = RuntimeError("authentication unavailable")
-    if failure == "setup":
-        monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: (_ for _ in ()).throw(RuntimeError("setup failed")))
+    if failure_kind == "auth":
+        runner._resolve_session_agent_runtime.side_effect = RuntimeError(error)
+    if failure_kind == "setup":
+        monkeypatch.setattr(turn, "_combined_ephemeral_prompt", lambda: (_ for _ in ()).throw(RuntimeError(error)))
     sealed = []
     consumer = SimpleNamespace(finish=lambda text=None: sealed.append(text)) if streamed else None
     monkeypatch.setattr(turn, "_setup_stream_consumer", lambda *a: (consumer, None, None, None, False))
     result = turn.run_sync()
     assert "resume after review" in result["final_response"]
     assert agent._session_db.get_messages(agent.session_id)[-1]["content"] == result["final_response"]
-    if streamed and failure in {"auth", "setup"}:
+    if str(failure).endswith("_secret"):
+        import json
+        assert secret not in json.dumps(result)
+        assert secret not in json.dumps(agent._session_db.get_messages(agent.session_id))
+        assert secret not in json.dumps(calls)
+        assert secret not in json.dumps(sealed)
+        assert "provider unavailable" in result["final_response"]
+        assert goals.GoalManager(agent.session_id).state.status == "paused"
+    if streamed and failure_kind in {"auth", "setup"}:
         assert sealed == []  # failure precedes stream creation; ordinary final send owns it
     elif streamed:
         assert sealed == [result["final_response"]]

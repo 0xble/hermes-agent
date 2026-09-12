@@ -217,3 +217,53 @@ async def test_gateway_releases_failed_restart_claim_and_continues_dispatching()
         deliverable_targets={("telegram", "default")}
     )
     assert [row["queue_id"] for row in reclaimed] == [failed_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failed_first', [False, True])
+async def test_profile_claim_failure_does_not_strand_healthy_live_owner(tmp_path, monkeypatch, failed_first):
+    runner, adapter = make_restart_runner()
+    home = inbox._db_path().parent
+    other = tmp_path / 'other-profile'
+    other.mkdir()
+    primary_id = inbox.record_event('primary-session', _event(), adapter_profile='default')
+    _orphan(primary_id)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(inbox, '_db_path', lambda: other / 'state.db')
+        event = _event(message_id='other-input')
+        event.source.profile = 'other'
+        secondary_id = inbox.record_event('secondary-session', event, adapter_profile='other')
+        _orphan(secondary_id)
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {'other': {Platform.TELEGRAM: adapter}}
+    monkeypatch.setattr('gateway.run._multiplex_profile_homes', lambda config: [('other', other)])
+    real_reconcile = runner._reconcile_restart_recovery
+
+    def ordered_reconcile():
+        assert real_reconcile()
+        paths = [str((home / 'state.db').resolve()), str((other / 'state.db').resolve())]
+        if failed_first:
+            paths.reverse()
+        runner._restart_inbox_blocked = {p: runner._restart_inbox_blocked[p] for p in paths}
+        return True
+
+    runner._reconcile_restart_recovery = ordered_reconcile
+    real_claim = inbox.claim_recoverable
+    failing = True
+
+    def claim(**kwargs):
+        if failing and str(kwargs['db_path']) == str((other / 'state.db').resolve()):
+            raise sqlite3.OperationalError('profile database temporarily locked')
+        return real_claim(**kwargs)
+
+    monkeypatch.setattr(inbox, 'claim_recoverable', claim)
+    adapter.handle_message = AsyncMock()
+    assert await runner._drain_restart_inbox() == 1
+    first = next(row for row in inbox.read_rows(home / 'state.db') if row['queue_id'] == primary_id)
+    assert first['state'] == 'delivered'
+    second = next(row for row in inbox.read_rows(other / 'state.db') if row['queue_id'] == secondary_id)
+    assert second['state'] == 'pending'
+    failing = False
+    assert await runner._drain_restart_inbox() == 1
+    assert await runner._drain_restart_inbox() == 0
+    assert [c.args[0].message_id for c in adapter.handle_message.await_args_list] == ['msg-1', 'other-input']

@@ -378,7 +378,8 @@ class DelegationCards:
             if data.get("background") is False:
                 self.turn_tasks.setdefault((session_key, generation), {}).setdefault(key, set()).add(ref)
         elif row and event_type == "subagent.complete":
-            row["state"] = data.get("status") if data.get("status") in _TERMINAL else "completed"
+            status = data.get("status", "completed")  # legacy completion events omitted status
+            row["state"] = status if isinstance(status, str) and status in _TERMINAL | {"unknown"} else "unknown"
         elif row and event_type == "subagent.tool" and tool_name:
             row["last_tool"] = _tool_label(tool_name, "tool", 60)
         else:

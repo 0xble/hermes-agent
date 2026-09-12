@@ -185,3 +185,62 @@ async def test_real_telegram_rename_failure_is_retryable_and_success_is_confirme
         await asyncio.wrap_future(futures[-1])
     assert adapter._bot.edit_forum_topic.await_count == 2
     assert next(iter(runner._telegram_topic_title_requests.values())).confirmed == ("session", "Title")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('same_title,outcome', [(False, True), (False, False), (False, None), (True, True), (True, False)])
+async def test_manual_title_joins_background_order_and_awaits_wire_result(tmp_path, monkeypatch, same_title, outcome):
+    from unittest.mock import MagicMock
+    from hermes_state import AsyncSessionDB, SessionDB
+    from gateway.platforms.event import MessageEvent
+
+    runner, source = runner_and_source()
+    runner._gateway_loop = asyncio.get_running_loop()
+    db = SessionDB(db_path=tmp_path / 'state.db')
+    db.create_session('session', 'telegram')
+    runner._session_db = AsyncSessionDB(db)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SimpleNamespace(session_id='session')
+    entered, release = asyncio.Event(), asyncio.Event()
+    wire = []
+
+    async def select_icon(adapter, src, title, *args):
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        return None
+
+    async def rename_topic(chat_id, thread_id, name, **kwargs):
+        wire.append(name)
+        if outcome is False:
+            raise OSError('rename refused')
+
+    # Actual gateway rename helper uses the fake adapter only at its transport boundary.
+    class Adapter:
+        rename_dm_topic = staticmethod(rename_topic)
+
+    runner._adapter_for_source = lambda src: Adapter()
+    runner._select_telegram_topic_icon_id = select_icon
+    runner._telegram_topic_auto_rename_disabled = lambda src: outcome is None and release.is_set()
+    runner._telegram_topic_extra = lambda *args: {}
+    futures = capture_futures(monkeypatch)
+    runner._schedule_telegram_topic_title_rename(source, 'session', 'Auto')
+    await asyncio.wait_for(entered.wait(), 2)
+    manual = 'Auto' if same_title else 'Manual'
+    command = asyncio.create_task(runner._handle_title_command(MessageEvent(source=source, text='/title ' + manual)))
+    for _ in range(2000):
+        state = next(iter(runner._telegram_topic_title_requests.values()))
+        if state.pending and state.pending[2] == manual and db.get_session_title('session') == manual:
+            break
+        await asyncio.sleep(.001)
+    assert not command.done()
+    release.set()
+    response = await asyncio.wait_for(command, 2)
+    await asyncio.wrap_future(futures[0])
+    assert db.get_session_title('session') == manual
+    assert ('topic name was not changed' in response) is (outcome is False)
+    if outcome is True:
+        assert wire[-1] == manual
+        assert next(iter(runner._telegram_topic_title_requests.values())).confirmed == ('session', manual)
+        assert wire == (['Auto'] if same_title else ['Auto', 'Manual'])
+    db.close()

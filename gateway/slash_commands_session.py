@@ -840,10 +840,14 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         # Mirror the title onto the Telegram forum topic name (auto titles already do this).
         topic_rename_failed = False
-        rename_now = getattr(self, "_rename_telegram_topic_for_session_title", None)
+        rename_now = getattr(self, "_run_telegram_topic_title_request", None)
+        rename_kwargs = {"wait_for_result": True}
+        if not callable(rename_now):
+            rename_now = getattr(self, "_rename_telegram_topic_for_session_title", None)
+            rename_kwargs = {}
         if is_telegram_topic and callable(rename_now):
             try:
-                rename_call = rename_now(source, session_id, sanitized)
+                rename_call = rename_now(source, session_id, sanitized, **rename_kwargs)
                 rename_landed = (
                     await rename_call if inspect.isawaitable(rename_call) else rename_call)
                 # None is an intentional no-op (operator-managed topic renames disabled),

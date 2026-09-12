@@ -128,10 +128,16 @@ class GatewayStartupMixin:
                 if isinstance(tasks, dict):
                     busy_keys.update(key for key, task in tasks.items() if task and not task.done())
             for path, excluded in self._restart_inbox_blocked.items():
-                batch = await asyncio.to_thread(
-                    claim_recoverable, deliverable_targets=targets, db_path=path,
-                    excluded_queue_ids=excluded, excluded_session_keys=busy_keys,
-                )
+                try:
+                    batch = await asyncio.to_thread(
+                        claim_recoverable, deliverable_targets=targets, db_path=path,
+                        excluded_queue_ids=excluded, excluded_session_keys=busy_keys,
+                    )
+                except Exception:
+                    # Other profile transactions already committed live-owner claims. Dispatch
+                    # those batches even when this database is temporarily unavailable.
+                    logger.exception("Could not claim restart-drain inbox at %s", path)
+                    continue
                 claimed.extend(batch)
                 busy_keys.update(row["session_key"] for row in batch)
         except Exception:

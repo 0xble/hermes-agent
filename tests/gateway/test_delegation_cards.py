@@ -332,7 +332,9 @@ def test_render_card_preserves_full_explicit_label_without_card_truncation():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state, display", [("completed", "Awaiting parent"), ("failed", "Failed"), ("interrupted", "Interrupted")])
+@pytest.mark.parametrize("state, display", [("completed", "Awaiting parent"), ("failed", "Failed"),
+    ("interrupted", "Interrupted"), ("unknown", "Interrupted"), ("future_status", "Interrupted"),
+    (None, "Interrupted"), ({"unexpected": "value"}, "Interrupted")])
 async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, display):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),

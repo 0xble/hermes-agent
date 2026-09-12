@@ -275,19 +275,19 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
 def _create_session_for_key(task_id: str, force_local: bool,
                             identity: Optional[str] = None) -> Dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local.
+    A selected private sidecar always stays isolated. Otherwise: CDP override > cloud > local.
 
-    A named identity is a LOCAL real-profile concept: an operator CDP override or a cloud provider
+    Outside sidecars, a named identity is a LOCAL real-profile concept: a CDP override or cloud provider
     would silently drive some other browser, so both fail closed rather than ignoring the pin.
     """
+    if force_local:
+        return _bt._create_local_session(task_id, allow_real_profile=False)
     cdp_override = _bt._get_cdp_override()
     if identity and cdp_override:
         raise RuntimeError("named browser identities are incompatible with browser.cdp_url or "
                            "BROWSER_CDP_URL; remove the override or omit identity")
-    if cdp_override and not force_local:
+    if cdp_override:
         return _create_cdp_session(task_id, cdp_override)
-    if force_local:
-        return _bt._create_local_session(task_id, allow_real_profile=False)
     provider = _bt._get_cloud_provider()
     if identity and provider is not None:
         raise RuntimeError("named browser identities require the local real-profile backend; "
@@ -331,6 +331,8 @@ def _get_session_info(task_id: Optional[str] = None, identity: Optional[str] = N
     # Private-URL sidecars never receive a real browser profile and therefore must not create or
     # recover a named identity claim.
     force_local = _bt._is_local_sidecar_key(task_id)
+    if force_local:
+        identity = None
 
     requested_identity_key = _resolve_identity_key(identity) if identity else None
 
@@ -403,9 +405,9 @@ def _get_session_info(task_id: Optional[str] = None, identity: Optional[str] = N
     # A follow-up command may be the first browser action for a task, so resolve the configured
     # default here too: creation must be stamped with the same immutable identity metadata as
     # browser_navigate. Existing sessions above keep their already-bound identity instead.
-    if identity is None and recycled_identity:
+    if not force_local and identity is None and recycled_identity:
         identity, requested_identity_key = recycled_identity, recycled_identity_key
-    if identity is None:
+    if identity is None and not force_local:
         from hermes_cli.browser_identity import (BrowserIdentityError, browser_identity_scope_key,
                                                  resolve_browser_identity)
         try:

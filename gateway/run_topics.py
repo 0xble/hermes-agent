@@ -551,9 +551,9 @@ class GatewayTopicThreadsMixin:
 
     async def _run_telegram_topic_title_request(
         self, source: SessionSource, session_id: str, title: str,
-        *, user_message: str = "", title_context: Any = None,
-    ) -> None:
-        """Reserve, serialize and settle title requests entirely on the gateway loop."""
+        *, user_message: str = "", title_context: Any = None, wait_for_result: bool = False,
+    ) -> Optional[bool]:
+        """Serialize title requests; explicit callers await a confirmed transport outcome."""
         states = getattr(self, "_telegram_topic_title_requests", None)
         if states is None:
             states = self._telegram_topic_title_requests = {}
@@ -561,20 +561,29 @@ class GatewayTopicThreadsMixin:
                str(source.thread_id or ""))
         state = states.setdefault(key, _TopicTitleRenameState())
         desired = (str(session_id or ""), self._sanitize_telegram_topic_title(title))
-        if ((state.pending is not None and state.pending[1:] == desired)
-                or (state.pending is None and state.confirmed == desired)):
-            return
+        if state.pending is None and state.confirmed == desired:
+            return True
+        if not wait_for_result and state.pending is not None and state.pending[1:] == desired:
+            return None
         request = (object(), *desired)
         state.pending = request
         try:
             async with state.lock:
                 # A newer title can arrive while an earlier rename is awaiting its API.
-                if state.pending is not request or state.confirmed == desired:
-                    return
+                if state.confirmed == desired:
+                    return True
+                if state.pending is not request:
+                    return False
+                rename_kwargs = {}
+                if user_message:
+                    rename_kwargs["user_message"] = user_message
+                if title_context is not None:
+                    rename_kwargs["title_context"] = title_context
                 landed = await self._rename_telegram_topic_for_session_title(
-                    source, session_id, title, user_message=user_message, title_context=title_context)
+                    source, session_id, title, **rename_kwargs)
                 if landed is True:
                     state.confirmed = desired
+                return landed
         finally:
             # Identity, not title equality, fences A -> B -> A and cancellation races.
             if state.pending is request:

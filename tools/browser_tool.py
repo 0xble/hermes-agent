@@ -1016,6 +1016,25 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
         logger.debug("Auto-snapshot after navigate failed: %s", e)
 
 
+def _resolve_navigation_identity(session_key: str, identity: Optional[str]):
+    """An omitted identity resumes this task's cookie jar, before consulting defaults."""
+    from hermes_cli.browser_identity import resolve_browser_identity
+
+    if _is_local_sidecar_key(session_key):
+        return None  # private sidecars never consume real-profile identity configuration
+    if _is_camofox_mode():
+        return None if identity is None else resolve_browser_identity(identity)
+    if identity is None:
+        binding = _read_browser_identity_binding(session_key)
+        if binding is not None:
+            identity = binding[0]
+        else:
+            with _cleanup_lock:
+                existing = _active_sessions.get(session_key) or {}
+                identity = existing.get("browser_identity")
+    return resolve_browser_identity(identity)
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None, identity: Optional[str] = None) -> str:
     """Navigate to ``url``; JSON with title, compact snapshot and, on first nav, stealth features.
     Hybrid routing decides BEFORE the safety checks whether this URL goes to a local sidecar
@@ -1025,13 +1044,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None, identity: Optional
     configured local real-profile identity for the rest of its life. Resolution runs BEFORE any
     session work so a strict-mode omission or an incompatible backend fails closed rather than
     opening a browser on the wrong cookie jar."""
-    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
-
+    url, safety_error = _secret_url_error_normalized(url)
+    if safety_error is not None:
+        return json.dumps(safety_error)
+    effective_task_id = task_id or "default"
+    nav_session_key = _navigation_session_key(effective_task_id, url)
+    auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
     try:
-        # Follow-up Camofox navigations deliberately omit identity: the durable
-        # Camofox binding is the authority after the first navigation.
-        resolved_identity = None if (_is_camofox_mode() and identity is None) else resolve_browser_identity(identity)
-    except BrowserIdentityError as exc:
+        resolved_identity = _resolve_navigation_identity(nav_session_key, identity)
+    except (ValueError, RuntimeError) as exc:
         return _dumps(_err(str(exc)))
     if resolved_identity is not None and not _is_camofox_mode():
         if not _use_real_profile():
@@ -1047,14 +1068,6 @@ def browser_navigate(url: str, task_id: Optional[str] = None, identity: Optional
                 return _dumps(_err("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars"))
         except Exception as exc:
             return _dumps(_err(str(exc)))
-
-    url, safety_error = _secret_url_error_normalized(url)
-    if safety_error is not None:
-        return json.dumps(safety_error)
-
-    effective_task_id = task_id or "default"
-    nav_session_key = _navigation_session_key(effective_task_id, url)
-    auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
 
     safety_error = _url_policy_error(url, auto_local=auto_local_this_nav)
     if safety_error is not None:
@@ -1682,15 +1695,16 @@ def _browser_navigate_handler(args: dict, kw: dict):
             return _dumps(_err("Camofox requires an explicit configured browser identity"))
         return browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"),
                                 identity=args.get("identity"))
-    from hermes_cli.browser_identity import BrowserIdentityError, resolve_browser_identity
-
+    url, safety_error = _secret_url_error_normalized(args.get("url", ""))
+    if safety_error is not None:
+        return _dumps(safety_error)
+    session_key = _navigation_session_key(kw.get("task_id") or "default", url)
     try:
-        identity = resolve_browser_identity(args.get("identity"))
-    except BrowserIdentityError as exc:
+        identity = _resolve_navigation_identity(session_key, args.get("identity"))
+    except (ValueError, RuntimeError) as exc:
         return _dumps(_err(str(exc)))
-    if identity is not None:
-        return browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id"),
-                                identity=args.get("identity"))
+    if identity is not None or _is_local_sidecar_key(session_key):
+        return browser_navigate(url=url, task_id=kw.get("task_id"), identity=args.get("identity"))
     return routed_browser_handler(
         "browser_navigate", args,
         fallback=lambda: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),

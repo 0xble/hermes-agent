@@ -2195,8 +2195,11 @@ class TurnRunner:
             messages = list(ctx.history or []) + [{"role": "user", "content": ctx.message}]
         if agent is None:
             agent = SimpleNamespace(session_id=sid, _session_db=_get_session_db(), _session_messages=messages)
-        result = {"final_response": f"⚠️ {prefix}: {exc}", "messages": messages,
-                  "failed": True, "error": str(exc), "turn_exit_reason": "exception",
+        from gateway.run import _redact_gateway_user_facing_secrets
+        # Goal preparation can persist, stream and classify this text before outer reply shaping.
+        safe_error = _redact_gateway_user_facing_secrets(str(exc))
+        result = {"final_response": f"⚠️ {prefix}: {safe_error}", "messages": messages,
+                  "failed": True, "error": safe_error, "turn_exit_reason": "exception",
                   "completed": False, "api_calls": 0, "tools": [], "session_id": sid}
         prepare_goal_turn(GoalManager(sid), agent, result, is_current=ctx._run_still_current)
         ctx.result_holder[0] = result
