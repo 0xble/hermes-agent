@@ -1608,6 +1608,8 @@ def _build_subagent_type_description(roles: list) -> str:
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
+_TASK_LABEL_GUIDANCE = 'Use a concise, verb-first, privacy-safe sentence-case display label (preserve proper nouns/acronyms: Review context forks; Check API routing; not Review Context Forks); never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit.'
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     # description / tasks.description are placeholders: the real text is built per get_definitions() call by
@@ -1649,7 +1651,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief instead.",
                             enum=["fresh", "fork"]),
                         "replaces": {"type": "object", "properties": {"parent_task_id": {"type": "string"}, "thread_ref": {"type": "string"}}, "required": ["parent_task_id", "thread_ref"], "additionalProperties": False, "description": "Explicit recovery of this parent-owned terminal thread; retire it only after this replacement actually starts. Failed spawn leaves it visible."},
-                        "task_label": _p("string", "Required for a new delegation: use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+                        "task_label": _p("string", "Required for a new delegation. " + _TASK_LABEL_GUIDANCE),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1688,7 +1690,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. Use a concise, verb-first, privacy-safe display label; never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit."),
+            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. " + _TASK_LABEL_GUIDANCE),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
