@@ -107,6 +107,29 @@ delegation:
         history = db.get_messages_as_conversation(child_id)
         assert ("REDACTED_ACCEPTED_CORRECTION" in repr(history)) == (expected == "fork")
         assert (FORK_REFERENCE.splitlines()[0] in repr(history)) == (expected == "fork")
+        if not review:
+            db.patch_session_model_config(child_id, {"_delegation_completed": False,
+                "_delegation_user_stopped": True, "_delegation_outcome": "interrupted"})
+            monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+                "provider": "openai-compat", "model": "child-model-after-switch",
+                "api_key": "test-key", "base_url": "http://fixture.invalid/v1", "api_mode": "chat_completions"})
+            continuation = {"resume_session_id": child_id, "goal": "Continue the verified work",
+                "resume_authorization": {"authorization": "User explicitly requested Resume.",
+                    "reconciliation": "Verified the durable transcript and no external effects remain pending."}}
+            recovered = json.loads(registry.dispatch("delegate_task", {"tasks": [continuation]}, parent_agent=parent))
+            assert "error" not in recovered, recovered
+            assert recovered["results"][0]["child_session_id"] == child_id
+            assert recovered["results"][0]["status"] == "completed", recovered
+            assert recovered["delegation_metadata"]["thread_refs"] == payload["delegation_metadata"]["thread_refs"]
+            recovery_wire = repr(requests[-1]["messages"])
+            assert "User explicitly requested Resume." in recovery_wire
+            assert "no external effects remain pending" in recovery_wire
+            assert ("REDACTED_ACCEPTED_CORRECTION" in recovery_wire) == (expected == "fork")
+            assert "in-flight" not in recovery_wire
+            persisted = json.loads(db.get_session(child_id)["model_config"])
+            assert persisted["_delegation_resume_authorizations"][-1]["was_user_stopped"]
+            assert not persisted["_delegation_user_stopped"]
+            history = db.get_messages_as_conversation(child_id)
         db.close()
         resumed = AIAgent(session_db=session_db, session_id=child_id, api_key="test-key",
             base_url="http://fixture.invalid/v1", provider="openai-compat", api_mode="chat_completions",

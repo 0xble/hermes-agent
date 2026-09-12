@@ -1,5 +1,16 @@
 # Maintained Hermes fork
 
+## Delegated interruption and renewed authorization
+
+Internal cancellation, timeout, stall and error paths carry non-user-stop provenance.
+`resume_authorization` is an owning-parent, one-attempt authorization/reconciliation
+receipt, guarded by exact durable state, tool history, frozen routing and turn leases.
+Never clear stop flags out of band. Regression: `tests/tools/test_delegation_resume_authorization.py`
+and the stopped variants of `test_delegation_same_row_resume.py`.
+Retire when upstream provides these complete semantics. Reverting source retains
+authorization audit; legacy runtimes will again reject stopped children. Activation
+requires a separately authorized runtime promotion.
+
 This repository tracks `NousResearch/hermes-agent` while carrying a small set of Brian-owned patches. Official upstream remains authoritative for all unmodified Hermes code. Fork `main` is the last candidate that passed fork verification; runtime promotion is a separate operation.
 
 ## Delegation context modes — source candidate

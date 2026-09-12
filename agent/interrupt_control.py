@@ -111,18 +111,21 @@ class InterruptControlMixin:
 
         # Tool cancellation attribution stays separate from _interrupt_message, which may carry the user's
         # full next message.
-        tool_interrupt_reason = (
-            (tool_reason or "explicit stop requested") if hard_cancel
-            else ("user sent a new message" if message else "user interrupt")
+        tool_interrupt_reason = tool_reason or (
+            "explicit stop requested" if hard_cancel
+            else "user sent a new message" if message else "agent interrupted"
         )
 
         def _publish_interrupt_state() -> None:
             self._interrupt_requested = True
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
-            if tool_interrupt_reason in {"explicit stop requested", "user interrupt"}:
+            self._delegation_interrupt_reason = tool_interrupt_reason
+            if tool_interrupt_reason == "explicit stop requested":
                 # Survives clear_interrupt; a stop is not a continuation grant.
                 self._delegation_user_stopped = True
+                import uuid
+                self._delegation_stop_token = uuid.uuid4().hex
             _hard_event = getattr(self, "_hard_interrupt_requested", None) if hard_cancel else None
             if _hard_event is not None:
                 _hard_event.set()
