@@ -814,8 +814,7 @@ class TurnRunner:
         await self._roll_progress_overflow_if_needed(st)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             try:
-                await self._edit_progress_message(
-                    st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                await self._flush_progress_edit(st)
             except Exception:
                 logger.debug("progress boundary seal failed (%s)", source, exc_info=True)
         self._reset_progress_bubble(st)
@@ -873,6 +872,10 @@ class TurnRunner:
     async def _flush_progress_edit(self, st) -> None:
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             with suppress(Exception):
+                # A transient split failure leaves the full buffer intact. Retry the
+                # split, not an oversized edit; persistent failure stays bounded here.
+                if await self._roll_progress_overflow_if_needed(st) or not st.can_edit:
+                    return
                 await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
 
     async def _drain_progress_on_cancel(self, st) -> None:

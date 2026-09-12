@@ -170,6 +170,66 @@ async def test_normal_progress_and_retracted_preview_keep_the_same_anchor():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["cancel", "durable"])
+@pytest.mark.parametrize("failure", ["once", "persistent", "flood", "permanent"])
+async def test_transient_overflow_finalization_retries_split_not_oversized_edit(
+    monkeypatch, boundary, failure
+):
+    monkeypatch.setattr("gateway.run_turn_runner._PROGRESS_EDIT_INTERVAL", 0)
+    adapter = ReceiptAdapter()
+    ctx, runner = _runner(adapter)
+    st = runner._progress_edit_state(adapter)
+    st._PROGRESS_TEXT_LIMIT = 30
+    runner._runner._progress_edit_retry_deadlines = {}
+    st.progress_lines.append("initial")
+    await runner._progress_send_or_edit(st, "initial")
+    original_id = st.progress_msg_id
+    # The live loop can absorb the entire queued batch before cancellation interrupts
+    # its edit wait. No queued event remains to trigger another overflow attempt.
+    lines = ["initial", "first overflow line", "second overflow line"]
+    st.progress_lines[:] = lines
+    attempts = []
+
+    async def transient_edit(chat_id, message_id, content, **kwargs):
+        attempts.append((message_id, content))
+        if failure in {"persistent", "flood"} or len(attempts) == 1:
+            return SendResult(
+                success=False, error="temporary network failure", retryable=True,
+                retry_after=60 if failure == "flood" else None,
+            )
+        if failure == "permanent":
+            return SendResult(success=False, error="permission revoked")
+        return await ReceiptAdapter.edit_message(adapter, chat_id, message_id, content)
+
+    adapter.edit_message = transient_edit
+    if boundary == "cancel":
+        await runner._drain_progress_on_cancel(st)
+    else:
+        await runner._route_content_boundary(
+            st, DurableContentBoundary(boundary_id="content", source=DurableContentSource.STREAM_FINALIZED)
+        )
+
+    assert ctx.progress_queue.empty()
+    # No busy retry on a persistent outage and no API attempt inside a flood wait.
+    assert len(attempts) == (1 if failure == "flood" else 2)
+    assert {message_id for message_id, _ in attempts} == {original_id}
+    assert all(len(text) <= st._PROGRESS_TEXT_LIMIT for _, text in attempts + adapter.sent)
+    assert st.can_edit is (failure != "permanent")
+    if failure != "once":
+        assert adapter.edits == []
+        assert adapter.sent == [(original_id, "initial")]
+        if boundary == "cancel":
+            assert st.progress_msg_id == original_id
+            assert st.progress_lines == lines
+    else:
+        assert adapter.edits == [(original_id, "initial\nfirst overflow line")]
+        assert [text for _, text in adapter.sent] == ["initial", "second overflow line"]
+        if boundary == "cancel":
+            assert st.progress_msg_id == adapter.sent[-1][0]
+            assert st.progress_lines == ["second overflow line"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["none", "retract", "durable", "send_only", "overflow", "edit_failure"])
 async def test_queued_progress_batches_preserve_lines_dedup_and_typed_order(monkeypatch, boundary):
     monkeypatch.setattr("gateway.run_turn_runner._PROGRESS_EDIT_INTERVAL", 0)
