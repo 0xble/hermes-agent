@@ -37,10 +37,10 @@ def test_renamed_file_without_source_path_fails_closed() -> None:
         extract_complete_file_list(payload)
 
 
-def test_compare_file_cap_fails_closed() -> None:
-    payload = _compare_payload([f"docs/{index}.md" for index in range(300)])
-    with pytest.raises(ValueError, match="300-file cap"):
-        extract_complete_file_list(payload)
+@pytest.mark.parametrize("count", [300, 301])
+def test_compare_file_cap_selects_conservative_all_lanes(count: int) -> None:
+    payload = _compare_payload([f"docs/{index}.md" for index in range(count)])
+    assert extract_complete_file_list(payload) == []
 
 
 @pytest.mark.parametrize(
