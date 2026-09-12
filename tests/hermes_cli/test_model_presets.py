@@ -23,6 +23,72 @@ def routes():
     }}
 
 
+@pytest.mark.parametrize("field,value", [("default", "edited/model"), ("reasoning_effort", "high")])
+@pytest.mark.parametrize("strip_defaults", [True, False])
+def test_main_preset_save_keeps_new_inline_route_edits(tmp_path, monkeypatch, field, value, strip_defaults):
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {"model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}},
+           "model": {"model_preset": "plain"}}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear()
+    c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    loaded = c.load_config()
+    loaded["model"][field] = value
+    c.save_config(loaded, strip_defaults=strip_defaults)
+    saved = yaml.safe_load(path.read_text())
+    assert "model_preset" not in saved["model"]
+    assert saved["model"][field] == value
+    c._RAW_CONFIG_CACHE.clear()
+    c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert c.load_config()["model"][field] == value
+
+
+@pytest.mark.parametrize("field,value", [("model", "edited/model"), ("reasoning_effort", "high")])
+def test_main_preset_preservation_keeps_conflicting_inline_fields(field, value):
+    from hermes_cli.model_presets import preserve_model_preset_references
+
+    raw = {"model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}},
+           "model": {"model_preset": "plain"}}
+    expanded = expand_model_presets(raw)
+    expanded["model"][field] = value
+    restored = preserve_model_preset_references(expanded, raw)
+    assert restored == expanded
+    assert expand_model_presets(restored) == expanded
+
+
+@pytest.mark.parametrize("empty", [None, ""])
+@pytest.mark.parametrize("site", ["main", "delegation", "role", "auxiliary", "fallback", "moa", "nested_fallback"])
+def test_empty_reasoning_defaults_do_not_break_restored_preset(site, empty):
+    from hermes_cli.model_presets import preserve_model_preset_references
+
+    reference = {"model_preset": "plain"}
+    raw = {"model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}}}
+    structures = {
+        "main": ({"model": reference}, ("model",)),
+        "delegation": ({"delegation": reference}, ("delegation",)),
+        "role": ({"delegation": {"subagents": {"reader": reference}}}, ("delegation", "subagents", "reader")),
+        "auxiliary": ({"auxiliary": {"vision": reference}}, ("auxiliary", "vision")),
+        "fallback": ({"fallback_providers": [reference]}, ("fallback_providers", 0)),
+        "moa": ({"moa": {"aggregator": reference}}, ("moa", "aggregator")),
+        "nested_fallback": ({"moa": {"aggregator": {"provider": "openrouter", "model": "test/other", "fallback_models": [reference]}}}, ("moa", "aggregator", "fallback_models", 0)),
+    }
+    structure, keys = structures[site]
+    raw.update(structure)
+    expanded = expand_model_presets(raw)
+    target = expanded
+    for key in keys:
+        target = target[key]
+    target["reasoning_effort"] = empty
+    if site == "main":
+        target["model"] = empty
+    restored = preserve_model_preset_references(expanded, raw)
+    assert restored == raw
+    assert expand_model_presets(restored) == expand_model_presets(raw)
+
+
 @pytest.mark.parametrize("effort", [None, "none", "high"])
 def test_main_preset_reasoning_survives_unrelated_save(effort):
     from hermes_cli.model_presets import preserve_model_preset_references

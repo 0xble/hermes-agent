@@ -321,9 +321,10 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
     expected_model = expanded_authored.get("model")
     if isinstance(raw_model, dict) and "model_preset" in raw_model and isinstance(expected_model, dict):
         actual_model = result.get("model")
+        main_inline_fields = _MAIN_FORBIDDEN_REFERENCE_FIELDS | {"model", "reasoning_effort"}
         unsafe_model_fields = any(
             key in actual_model and key not in raw_model and actual_model[key] not in (None, "", {}, [])
-            for key in _MAIN_FORBIDDEN_REFERENCE_FIELDS
+            for key in main_inline_fields
         ) if isinstance(actual_model, dict) else True
         preset = _definitions(authored)[raw_model["model_preset"].strip()]
         reasoning_unchanged = (
@@ -341,7 +342,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             restored_model = deepcopy(actual_model)
             restored_model.pop("provider", None)
             restored_model.pop("default", None)
-            for key in _MAIN_FORBIDDEN_REFERENCE_FIELDS:
+            for key in main_inline_fields:
                 if key not in raw_model and restored_model.get(key) in (None, "", {}, []):
                     restored_model.pop(key, None)
             restored_model["model_preset"] = raw_model["model_preset"]
@@ -365,11 +366,10 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
         if isinstance(raw_site, dict) and "model_preset" in raw_site and same_route(actual_site, expected_site, fallback_key):
             assert isinstance(actual_site, dict)
             # Keep edits to unrelated site settings (timeouts, concurrency, MoA enabled),
-            # but remove only fields injected by expansion before restoring the reference.
+            # but remove exclusive inline keys, including unauthored empty defaults.
             restored = deepcopy(actual_site)
             for route_key in ("provider", "model", "reasoning_effort"):
-                if isinstance(expected_site, dict) and route_key in expected_site:
-                    restored.pop(route_key, None)
+                restored.pop(route_key, None)
             if fallback_key and isinstance(expected_site, dict) and fallback_key in expected_site:
                 restored.pop(fallback_key, None)
             # strip_defaults=False exposes empty provider-owned defaults which would otherwise
@@ -420,8 +420,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             return actual_slot
         restored = deepcopy(actual_slot)
         for route_key in ("provider", "model", "reasoning_effort"):
-            if isinstance(expected_slot, dict) and route_key in expected_slot:
-                restored.pop(route_key, None)
+            restored.pop(route_key, None)
         if isinstance(expected_slot, dict) and "fallback_models" in expected_slot:
             restored.pop("fallback_models", None)
         for route_key in _EMPTY_DEFAULT_ROUTE_FIELDS:
