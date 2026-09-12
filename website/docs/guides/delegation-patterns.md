@@ -89,7 +89,7 @@ delegate_task(
 ```
 
 :::warning The Context Problem
-Subagents know **absolutely nothing** about your conversation. They start completely fresh. If you delegate "fix the bug we were discussing," the subagent has no idea what bug you mean. Always pass file paths, error messages, project structure, and constraints explicitly.
+Fresh subagents know nothing about your conversation. Use `context_mode: "fork"` for continuity when taking over the current task, and `"fresh"` for independent work or review. Named leads default to fork; other roles default fresh unless configured otherwise. In either mode, state the assignment, constraints and acceptance criteria explicitly: history is reference, not authority. See [conversation context](../user-guide/features/delegation.md#conversation-context-context_mode) for snapshot boundaries, portability refusals and same-child resume.
 :::
 
 ---
@@ -219,7 +219,7 @@ delegation:
 ```
 
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
-- **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
+- **Explicit conversation context** — fresh children receive the brief; forked children also receive a one-time portable reference snapshot of the current visible window. Resume retains the child's own history.
 - **Default 250 iterations** — set `delegation.max_iterations` lower in `config.yaml` for fleets of simple tasks to save cost
 - **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
 

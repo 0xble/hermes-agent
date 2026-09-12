@@ -2,6 +2,13 @@
 
 This repository tracks `NousResearch/hermes-agent` while carrying a small set of Brian-owned patches. Official upstream remains authoritative for all unmodified Hermes code. Fork `main` is the last candidate that passed fork verification; runtime promotion is a separate operation.
 
+## Delegation context modes — source candidate
+
+- **Contract:** [conversation context](website/docs/user-guide/features/delegation.md#conversation-context-context_mode): overridable fresh/fork independent of capability routing; named lead defaults fork, other roles fresh; native reviews force fresh; same-child resume retains own history. One current outbound-window snapshot, sibling isolation, no archive resurrection/count cap/silent fallback, reference-only portable text and completed tool groups; no parent hierarchy/native replay/permission inheritance. Unsupported media or opaque native checkpoints refuse explicitly.
+- **Origin/prior art:** user-approved local role/default policy. Upstream proposal [#91252](https://github.com/NousResearch/hermes-agent/pull/91252) inspected while open at `7e60ebc5d495efa1fba8c25201727c54792ca3cb`; no code adopted. Its transcript-based capped history/fresh fallback does not meet this contract. Retire when released upstream satisfies the complete boundaries, not merely when fork syntax exists.
+- **Verify:** `tests/tools/test_delegation_context_forks.py`, `tests/agent/test_delegation_context_fork_real_loop.py`, existing custom-role, config-schema, review-policy and real SQLite resume suites through `scripts/run_tests.sh`. HTTP tests use a deterministic local SDK transport, not a paid provider.
+- **Rollback/activation:** revert the scoped source change; remove configured context_mode fields before running an older parser. No persisted history rewrite. Landing does not activate an existing gateway; update/restart remains parent-owned and outside this source task.
+
 ## Named cron route follow-up (2026-09-12, active)
 
 - **Stable subject:** `feat(cron): follow named model presets at fire time`.

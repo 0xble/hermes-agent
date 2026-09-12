@@ -37,6 +37,7 @@ class SubagentDefinition:
     model: str | None = None
     reasoning_effort: str | None = None
     inherit_parent: bool = False
+    context_mode: str = "fresh"
     moa_presets: tuple[str, ...] | None = None
     fallbacks: tuple[FallbackDefinition, ...] | None = None
 
@@ -160,7 +161,7 @@ class ResolvedSubagentLaunch:
     resume_credential_id: str | None = None
 
 
-_FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort", "inherit_parent", "moa_presets", "fallbacks"})
+_FIELDS = frozenset({"description", "instructions", "provider", "model", "reasoning_effort", "inherit_parent", "moa_presets", "fallbacks", "context_mode"})
 # Public aliases for the configuration system, which validates
 # ``delegation.subagents.<name>.<field>`` without importing the runtime.
 SUBAGENT_FIELDS = _FIELDS
@@ -262,6 +263,10 @@ def parse_definitions(config: Mapping) -> dict[str, SubagentDefinition]:
         if effort is not None and effort not in EFFORT_LADDER:
             raise ValueError(f"{where}.reasoning_effort is invalid: {effort!r}")
         normalized = dict(fields)
+        context_mode = fields.get("context_mode", "fork" if name == "lead" else "fresh")
+        if context_mode not in ("fresh", "fork"):
+            raise ValueError(f"{where}.context_mode must be fresh or fork")
+        normalized["context_mode"] = context_mode
         if "moa_presets" in normalized:
             normalized["moa_presets"] = tuple(normalized["moa_presets"])
         if "fallbacks" in normalized:
@@ -295,6 +300,7 @@ def advertised_settings(definition: SubagentDefinition, defaults: Mapping) -> di
     effort = definition.reasoning_effort or (None if definition.inherit_parent else defaults.get("reasoning_effort") or None)
     return {
         "name": definition.name,
+        "context_mode": definition.context_mode,
         "description": definition.description,
         "model": model or "inherits the parent model",
         "provider": provider or "inherits the parent provider",

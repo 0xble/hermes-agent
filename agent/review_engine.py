@@ -199,8 +199,10 @@ def start_review(
     when there is nothing to review or the dispatch is rejected/errored."""
     if parent_agent is None:
         raise ValueError("No active agent — send a message first.")
-    snapshot = snapshot_recent_messages(messages)
-    if not snapshot:
+    # Independent candidate review receives captured evidence and a neutral brief,
+    # never the implementer's conversation. Manual /review still reviews the conversation itself.
+    snapshot = [] if candidate is not None else snapshot_recent_messages(messages)
+    if not snapshot and candidate is None:
         raise ValueError("Nothing to review yet — the conversation is empty.")
     goal, context = build_review_task(snapshot, user_prompt, collect_parent_loaded_skills(parent_agent, messages))
     credentials_cfg = _load_review_credentials_cfg()

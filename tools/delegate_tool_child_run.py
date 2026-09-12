@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import contextvars
+from copy import deepcopy
 import json
 import threading
 import time
@@ -677,6 +678,8 @@ class _ChildRun:
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    **({"conversation_history": deepcopy(child._delegation_fork_history)}
+                       if vars(child).get("_delegation_fork_history") is not None else {}),
                 )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)

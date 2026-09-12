@@ -3209,7 +3209,7 @@ def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) ->
 # stay identical.
 _SUBAGENT_FIELDS = frozenset({
     "description", "instructions", "provider", "model", "reasoning_effort",
-    "inherit_parent", "moa_presets", "fallbacks",
+    "inherit_parent", "moa_presets", "fallbacks", "context_mode",
 })
 _SUBAGENT_FALLBACK_FIELDS = frozenset({"provider", "model", "reasoning_effort"})
 _SUBAGENT_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*\Z")
