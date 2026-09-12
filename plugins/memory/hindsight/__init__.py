@@ -1137,12 +1137,12 @@ class HindsightMemoryProvider(MemoryProvider):
             "max_tokens": self._recall_max_tokens,
         }
         optional: dict = {}
-        optional_defaults = {
-            "include_entities": self._explicit_recall_include_entities if explicit else False,
+        optional_values = {
+            "include_entities": args.get("include_entities", self._explicit_recall_include_entities if explicit else False),
             "max_entity_tokens": _bounded_int(args.get("max_entity_tokens"), default=500, minimum=1, maximum=2000),
-            "include_chunks": False,
+            "include_chunks": args.get("include_chunks", False),
             "max_chunk_tokens": _bounded_int(args.get("max_chunk_tokens"), default=8192, minimum=1, maximum=8192),
-            "include_source_facts": False,
+            "include_source_facts": args.get("include_source_facts", False),
             "max_source_facts_tokens": _bounded_int(args.get("max_source_facts_tokens"), default=4096, minimum=1, maximum=8192),
         }
         if self._recall_tags or args.get("tags"):
@@ -1150,9 +1150,9 @@ class HindsightMemoryProvider(MemoryProvider):
             optional["tags_match"] = args.get("tags_match") or self._recall_tags_match
         if args.get("tag_groups"):
             optional["tag_groups"] = args["tag_groups"]
-        for key, default in optional_defaults.items():
-            if args.get(key, default):
-                optional[key] = args.get(key, default)
+        for key, value in optional_values.items():
+            if value:
+                optional[key] = value
         filters = {key: optional.pop(key) for key in ("tags", "tags_match", "tag_groups") if key in optional}
         unsupported_filters = [key for key in filters if not _supports_kwarg(client, "arecall", key)]
         if unsupported_filters:

@@ -287,6 +287,30 @@ class TestExplicitRecallDefaults:
         assert p._format_recall_response(SimpleNamespace(results=[]), args) == ("", 0)
 
 
+@pytest.mark.parametrize("field,default,maximum", [
+    ("max_entity_tokens", 500, 2000),
+    ("max_chunk_tokens", 8192, 8192),
+    ("max_source_facts_tokens", 4096, 8192),
+])
+@pytest.mark.parametrize("raw", [-5, 0, 99999999, "invalid", "42", None])
+def test_recall_token_limits_normalized_at_client_boundary(provider, field, default, maximum, raw):
+    result = json.loads(provider.handle_tool_call("hindsight_recall", {
+        "query": "bounded recall", field: raw, "include_entities": True,
+        "include_chunks": False, "include_source_facts": False,
+        "tags": ["scope:test"], "tags_match": "all",
+    }))
+    assert "error" not in result
+    kwargs = provider._client.arecall.call_args.kwargs
+    expected = default if raw in (None, "invalid") else max(1, min(maximum, int(raw)))
+    assert type(kwargs[field]) is int
+    assert kwargs[field] == expected
+    assert kwargs["include_entities"] is True
+    assert "include_chunks" not in kwargs
+    assert "include_source_facts" not in kwargs
+    assert kwargs["tags"] == ["scope:test"]
+    assert kwargs["tags_match"] == "all"
+
+
 class TestSchemas:
     def test_retain_schema_has_content(self):
         assert RETAIN_SCHEMA["name"] == "hindsight_retain"

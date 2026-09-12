@@ -251,7 +251,7 @@ async def test_adapter_status_cache_serialization_and_invalidation():
     release.set()
     await pending
     assert str(fresh.message_id) not in a._status_message_ids.values()
-    a._status_message_ids = {("123456", f"old-{i}", "101"): str(i) for i in range(2000)}
+    a._status_message_ids = {("123456", f"old-{i}", "101", ""): str(i) for i in range(2000)}
     latest = await a.send_or_update_status(
         "123456", "new-owner", "bounded", metadata={"thread_id": "101"}
     )

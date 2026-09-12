@@ -397,6 +397,61 @@ def test_edit_checklist_forwards_connection_and_returns_message_id(monkeypatch):
     assert kwargs["message_id"] == 77
 
 
+@pytest.mark.parametrize("error_text,success", [
+    ("Message is not modified", True),
+    ("Bad Request: checklist cannot be edited", False),
+])
+def test_checklist_idempotent_edit_retains_normalized_identity(monkeypatch, error_text, success):
+    from telegram.error import BadRequest
+
+    _install_checklist_types(monkeypatch)
+    adapter = _adapter()
+    adapter._bot = SimpleNamespace(edit_message_checklist=AsyncMock(side_effect=BadRequest(error_text)))
+    result = asyncio.run(adapter.edit_checklist(
+        "123", "0077", "Launch", [{"id": 1, "text": "Venue"}],
+        business_connection_id="biz-A",
+    ))
+    assert result.success is success
+    assert result.retryable is False
+    if success:
+        assert result.message_id == "77"
+    else:
+        assert result.error
+        assert result.message_id is None
+    assert adapter._bot.edit_message_checklist.await_count == 1
+    assert adapter._bot.edit_message_checklist.await_args.kwargs["message_id"] == 77
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_deleted", [False, True])
+async def test_business_status_routes_and_delete_invalidation_are_isolated(already_deleted):
+    adapter = _adapter()
+    # Only timing is accelerated; all sends, edits and deletes still pass the shared gate.
+    adapter._send_cooldown_seconds = 0
+    adapter._edit_min_interval_seconds = 0
+    adapter._bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+        edit_message_text=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+        delete_message=AsyncMock(side_effect=ValueError("Message to delete not found") if already_deleted else None),
+    )
+    for connection in ("biz-A", "biz-B", None):
+        metadata = {"thread_id": "9", "telegram_business_connection_id": connection}
+        assert (await adapter.send_or_update_status("123", "owner", "starting", metadata=metadata)).success
+        metadata = {"thread_id": 9, "telegram_business_connection_id": f" {connection} " if connection else " "}
+        assert (await adapter.send_or_update_status(123, "owner", "updated", metadata=metadata)).success
+    assert [call.kwargs.get("business_connection_id") for call in adapter._bot.send_message.await_args_list] == ["biz-A", "biz-B", None]
+    assert [call.kwargs.get("business_connection_id") for call in adapter._bot.edit_message_text.await_args_list] == ["biz-A", "biz-B", None]
+    assert len(adapter._status_message_ids) == 3
+    assert await adapter.delete_message("123", "77")
+    assert len(adapter._status_message_ids) == 2
+    for connection in ("biz-A", "biz-B", None):
+        assert (await adapter.send_or_update_status("123", "owner", "after delete", metadata={
+            "thread_id": 9, "telegram_business_connection_id": connection,
+        })).success
+    assert adapter._bot.send_message.await_count == 4
+    assert adapter._bot.edit_message_text.await_count == 5
+
+
 def test_checklist_transport_retryability_never_authorizes_ambiguous_resend():
     adapter = _adapter()
     transport_error = RuntimeError("temporary network error")

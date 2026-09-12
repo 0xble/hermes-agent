@@ -2638,8 +2638,9 @@ class GatewayTurnMixin:
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
-        if turn_reasoning_config and turn_reasoning_config.get("enabled") is not False:
-            effort = turn_reasoning_config.get("effort")
+        if turn_reasoning_config:
+            # Omission inherits the remote default; explicit off must survive the proxy.
+            effort = "none" if turn_reasoning_config.get("enabled") is False else turn_reasoning_config.get("effort")
             if effort:
                 body["model_options"] = {"reasoning_effort": effort}
 

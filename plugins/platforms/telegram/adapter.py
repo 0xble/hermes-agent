@@ -1979,6 +1979,8 @@ class TelegramAdapter(BasePlatformAdapter):
         except _TelegramSendCooldownExceeded as error:
             return self._send_cooldown_failure(error)
         except Exception as error:
+            if "message is not modified" in str(error).lower():
+                return SendResult(success=True, message_id=str(normalized_message_id))
             return self._checklist_transport_failure(error, ambiguous_send=False)
         returned_id = getattr(message, "message_id", normalized_message_id)
         return SendResult(success=True, message_id=str(returned_id))
@@ -4519,18 +4521,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send a status message, or edit the previous one with the same ``(chat_id, status_key)``; if the
-        edit fails (deleted, too old, …) the cached id is dropped and a fresh message is sent.
+        """Send or edit a status within one chat/thread/Business connection and status key.
+        If the edit fails (deleted, too old, …), drop the cached id and send fresh.
 
         Issue #30045: progress/status callbacks (context-pressure, lifecycle, compression, etc.) used to
         append a fresh bubble on every call. With this method, the first call sends and the message id is
-        remembered; subsequent calls with the same (chat_id, status_key) edit that same message in place.
+        remembered; subsequent calls with the same scoped key edit that same message in place.
         """
         import weakref
         if not hasattr(self, "_status_locks"):
             self._status_locks = weakref.WeakValueDictionary()
         key = (str(normalize_telegram_chat_id(chat_id)), str(status_key),
-               str(self._metadata_thread_id(metadata) or ""))
+               str(self._metadata_thread_id(metadata) or ""),
+               self._business_connection_kwargs(metadata).get("business_connection_id", ""))
         lock = self._status_locks.setdefault(key, asyncio.Lock())
         async with lock:
             return await self._send_locked_status(key, chat_id, content, metadata)
@@ -4554,7 +4557,9 @@ class TelegramAdapter(BasePlatformAdapter):
     def _forget_status_message_id(self, chat_id, message_id):
         chat = str(normalize_telegram_chat_id(chat_id))
         for key, mid in list(self._status_message_ids.items()):
-            if str(normalize_telegram_chat_id(key[0])) == chat and str(mid) == str(message_id):
+            # deleteMessage acts as the ordinary bot, not a Business connection.
+            # Identical chat/message numbers in another connection are not its receipt.
+            if not key[3] and str(normalize_telegram_chat_id(key[0])) == chat and str(mid) == str(message_id):
                 self._status_message_ids.pop(key, None)
 
     async def _edit_text(self, chat_id: str, message_id: str, text: str, parse_mode: Any = None,

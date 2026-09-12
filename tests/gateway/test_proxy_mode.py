@@ -289,6 +289,33 @@ class TestRunAgentViaProxy:
         assert messages[0]["content"] == "hello"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override,expected", [
+    (None, None),
+    ({"enabled": False}, {"enabled": False}),
+    ({"enabled": True, "effort": "high"}, {"enabled": True, "effort": "high"}),
+])
+async def test_proxy_reasoning_override_round_trips_to_remote_parser(monkeypatch, tmp_path, override, expected):
+    from gateway.platforms.api_server import _request_reasoning_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://proxy.invalid")
+    monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+    session = _FakeSession(_FakeSSEResponse(sse_chunks=[
+        'data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n',
+    ]))
+    with patch("gateway.run._load_gateway_config", return_value={}), _patch_aiohttp(session):
+        result = await _make_runner()._run_agent_via_proxy(
+            "hello", "", [], _make_source(), "reasoning-test",
+            turn_reasoning_config=override,
+        )
+    assert result["final_response"] == "done"
+    assert session.captured_json is not None
+    assert _request_reasoning_config(session.captured_json.get("model_options")) == expected
+    if override is None:
+        assert "model_options" not in session.captured_json
+
+
 class TestEnvVarRegistration:
     """Verify GATEWAY_PROXY_URL and GATEWAY_PROXY_KEY are registered."""
 
