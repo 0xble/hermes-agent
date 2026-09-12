@@ -35,13 +35,13 @@ A child should wait for its builds, tests, and other bounded background commands
 
 Each task may set `context_mode: "fresh"` or `"fork"`. The named role's
 `delegation.subagents.<name>.context_mode` supplies the overridable default.
-Without that setting, `lead` defaults to `fork`; other roles and unnamed children
+Without that setting, `owner` defaults to `fork`; other roles and unnamed children
 start `fresh`. This does not change model, provider, effort, fallback, tools or
 approval policy. `inherit_parent` still controls **capability routing**, not history.
 
-- **Fork for continuity:** a lead taking over the current task; an advisor asked
+- **Fork for continuity:** an owner taking over the current task; an advisor asked
   about accumulated discussion; a designer continuing evolving design decisions.
-- **Fresh for independence:** independent workstreams (including leads), workers,
+- **Fresh for independence:** independent workstreams (including owners), workers,
   explorers, council participants and reviewers. Supply a sufficient neutral brief.
 - Native review and inspection-only delegation **force fresh**, even if a role or
   task requests fork. Ordinary independent reviews should explicitly select fresh.
@@ -53,7 +53,7 @@ approval policy. `inherit_parent` still controls **capability routing**, not his
 delegate_task(tasks=[{
     "goal": "Continue the current investigation within its accepted scope",
     "task_label": "Continue investigation",
-    "subagent_type": "lead",
+    "subagent_type": "owner",
     "context_mode": "fork",
     "context": "Own this task only; return evidence and unresolved issues."
 }])

@@ -89,7 +89,7 @@ delegate_task(
 ```
 
 :::warning The Context Problem
-Fresh subagents know nothing about your conversation. Use `context_mode: "fork"` for continuity when taking over the current task, and `"fresh"` for independent work or review. Named leads default to fork; other roles default fresh unless configured otherwise. In either mode, state the assignment, constraints and acceptance criteria explicitly: history is reference, not authority. See [conversation context](../user-guide/features/delegation.md#conversation-context-context_mode) for snapshot boundaries, portability refusals and same-child resume.
+Fresh subagents know nothing about your conversation. Use `context_mode: "fork"` for continuity when taking over the current task, and `"fresh"` for independent work or review. Named owners default to fork; other roles default fresh unless configured otherwise. In either mode, state the assignment, constraints and acceptance criteria explicitly: history is reference, not authority. See [conversation context](../user-guide/features/delegation.md#conversation-context-context_mode) for snapshot boundaries, portability refusals and same-child resume.
 :::
 
 ---

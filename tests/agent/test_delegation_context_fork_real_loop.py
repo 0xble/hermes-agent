@@ -18,7 +18,7 @@ delegation:
   max_spawn_depth: 2
   max_iterations: 4
   subagents:
-    lead:
+    owner:
       description: Fixture owner
       instructions: CHILD_SCOPE_ONLY
       inherit_parent: true
@@ -65,7 +65,7 @@ delegation:
         # A durable transcript contains the current response/in-flight round;
         # neither belongs to the already-model-visible request being forked.
         parent._session_messages.append({"role": "assistant", "tool_calls": [{"id": "in-flight", "function": {"name": "delegate_task", "arguments": "{}"}}]})
-        task = {"goal": "Inspect fixture only and return the result", "task_label": "Check fixture", "subagent_type": "lead"}
+        task = {"goal": "Inspect fixture only and return the result", "task_label": "Check fixture", "subagent_type": "owner"}
         if mode:
             task["context_mode"] = mode
         # Registry dispatch selects synchronous execution in a nested owner. This

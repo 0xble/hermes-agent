@@ -263,7 +263,7 @@ def parse_definitions(config: Mapping) -> dict[str, SubagentDefinition]:
         if effort is not None and effort not in EFFORT_LADDER:
             raise ValueError(f"{where}.reasoning_effort is invalid: {effort!r}")
         normalized = dict(fields)
-        context_mode = fields.get("context_mode", "fork" if name == "lead" else "fresh")
+        context_mode = fields.get("context_mode", "fork" if name == "owner" else "fresh")
         if context_mode not in ("fresh", "fork"):
             raise ValueError(f"{where}.context_mode must be fresh or fork")
         normalized["context_mode"] = context_mode

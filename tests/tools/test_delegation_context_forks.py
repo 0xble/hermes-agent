@@ -16,7 +16,7 @@ def definitions(**overrides):
     } for name, fields in overrides.items()}})
 
 
-@pytest.mark.parametrize("role,expected", [("lead", "fork"), ("worker", "fresh"),
+@pytest.mark.parametrize("role,expected", [("owner", "fork"), ("worker", "fresh"),
     ("explorer", "fresh"), ("advisor", "fresh"), ("council", "fresh"), ("designer", "fresh")])
 def test_role_defaults_and_overrides_do_not_change_model_inheritance(role, expected):
     d = definitions(**{role: {"inherit_parent": True}})[role]
@@ -36,11 +36,11 @@ def test_bad_context_mode_is_not_silently_fresh(bad):
     with pytest.raises(ValueError, match="context_mode"):
         resolve_context_mode({"context_mode": bad})
     with pytest.raises(ValueError):
-        definitions(lead={"context_mode": bad})
+        definitions(owner={"context_mode": bad})
 
 
 def test_resume_never_reforks_even_when_role_default_changes():
-    d = definitions(lead={"context_mode": "fork"})["lead"]
+    d = definitions(owner={"context_mode": "fork"})["owner"]
     assert resolve_context_mode({"resume_session_id": "own-child"}, d) == "resume"
     for mode in ("fresh", "fork"):
         with pytest.raises(ValueError, match="own history"):
@@ -68,7 +68,7 @@ def test_snapshot_is_one_time_current_window_and_sibling_isolated():
     visible = window()
     capture_visible_window(parent, {"messages": visible}, [])
     visible.append({"role": "assistant", "tool_calls": [{"id": "in-flight", "function": {"name": "delegate_task"}}]})
-    d = definitions(lead={})["lead"]
+    d = definitions(owner={})["owner"]
     launches = [ResolvedSubagentLaunch(d, {}, None)] * 2
     prepared = prepare_task_histories([{}, {}], launches, parent)
     text = prepared[0][1][0]["content"]
@@ -129,7 +129,7 @@ def test_schema_advertises_configurable_context_separate_from_model(monkeypatch)
     from tools import delegate_tool
     from tools.registry import registry
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: {"subagents": {
-        "lead": {"description": "fixture", "instructions": "fixture", "inherit_parent": True},
+        "owner": {"description": "fixture", "instructions": "fixture", "inherit_parent": True},
         "advisor": {"description": "fixture", "instructions": "fixture", "context_mode": "fork"}}})
     schema = registry.get_definitions({"delegate_task"}, quiet=True)[0]["function"]
     props = schema["parameters"]["properties"]["tasks"]["items"]["properties"]
@@ -142,11 +142,11 @@ def test_real_registry_dispatch_validates_whole_batch_before_children(monkeypatc
     from tools import delegate_tool as dt
     from tools.registry import registry
     parent = SimpleNamespace(_delegate_depth=0, session_id="parent", _delegation_visible_window=window())
-    config = {"subagents": {"lead": {"description": "fixture", "instructions": "fixture", "inherit_parent": True}}}
+    config = {"subagents": {"owner": {"description": "fixture", "instructions": "fixture", "inherit_parent": True}}}
     monkeypatch.setattr(dt, "_load_config", lambda: config)
     monkeypatch.setattr(dt, "last_delegation_config_error", lambda: None)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *_: {})
-    d = parse_definitions(config)["lead"]
+    d = parse_definitions(config)["owner"]
     # Routing is not under test here: the actual registry handler owns validation,
     # snapshot selection and batch atomicity. Never invoke a paid route.
     monkeypatch.setattr(dt, "_preflight_task_runtime", lambda *args: ([ResolvedSubagentLaunch(d, {}, None)] * 2, None))

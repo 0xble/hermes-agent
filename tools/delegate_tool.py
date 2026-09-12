@@ -1642,7 +1642,7 @@ DELEGATE_TASK_SCHEMA = {
                         "context_mode": _p("string",
                             "Conversation context, separate from model inheritance: fresh uses only your brief; "
                             "fork snapshots the current visible parent window once as reference, never permissions. "
-                            "Defaults come from the named role (lead: fork; others/unnamed: fresh). Use fresh for "
+                            "Defaults come from the named role (owner: fork; others/unnamed: fresh). Use fresh for "
                             "independent work/review; fork for task takeover or accumulated discussion. "
                             "Native reviews force fresh. Omit on resume: it retains its own history. "
                             "Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief instead.",
