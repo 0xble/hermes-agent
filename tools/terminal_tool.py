@@ -898,7 +898,7 @@ _PROMOTED_NOTE = (
 
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
-    background: bool, _host_local: bool,
+    background: bool, _host_local: bool, allow_yield: bool = True,
 ) -> _ExecPlan:
     """Resolve backend, env-cache key, image, cwd and timeout for one call.
 
@@ -961,6 +961,8 @@ def _plan_execution(
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise _Rejected(tool_error("timeout must be a positive finite number of seconds."))
     promoted = None
+    if not allow_yield and background:
+        raise _Rejected(_error_json("Synchronous execution cannot start a background process.", status="error"))
     if not background:
         # An over-cap foreground timeout is a bounded job the caller wants to wait for (test suites,
         # builds). Refusing it only bought a mechanical retry: 454 refusals in one run, every one
@@ -973,6 +975,10 @@ def _plan_execution(
         if guidance:
             raise _Rejected(_error_json(guidance, status="error"))
         if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+            if not allow_yield:
+                raise _Rejected(_error_json(
+                    f"Synchronous execution requires an explicit timeout at or below {FOREGROUND_MAX_TIMEOUT}s.",
+                    status="error"))
             promoted = timeout
 
     return _ExecPlan(
@@ -1199,7 +1205,8 @@ def terminal_tool(
     is hard rate-limited (1 notification / 15s / process) and auto-disabled
     after repeated strikes or a lifetime cap, promoting to notify_on_complete —
     use it only for rare one-shot signals on long-lived processes.
-    ``_allow_yield=False`` keeps internal verifiers synchronous and timeout-bounded.
+    ``_allow_yield=False`` keeps internal verifiers synchronous and timeout-bounded,
+    rejecting background requests and explicit timeouts above the foreground cap.
     ``_host_local`` forces the local backend for Hermes-owned control-plane
     children (kept in a separate env cache from the configured backend).
     """
@@ -1220,6 +1227,7 @@ def terminal_tool(
 
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
+            allow_yield=_allow_yield,
         )
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 

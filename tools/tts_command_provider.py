@@ -306,6 +306,21 @@ def _configured_command_tts_output_path(path: Path, config: Dict[str, Any]) -> P
     return path.with_suffix(f".{_get_command_tts_output_format(config)}")
 
 
+class TTSCommandDependencyUnavailable(RuntimeError):
+    """A supported shell reported that the configured synthesis command is missing."""
+
+
+def _missing_synthesis_command(exc: subprocess.CalledProcessError) -> bool:
+    # Do not parse arbitrary shell templates, or classify bare 127 and generic
+    # filesystem errors as provider outages. Only known POSIX shell diagnostics
+    # paired with command-not-found status qualify. Other shells fail normally.
+    return exc.returncode == 127 and isinstance(exc.stderr, str) and re.search(
+        r"(?m)^(?:/[^\n:]+/)?(?:sh|bash|dash):\s*(?:(?:line\s+)?\d+:\s*)?"
+        r"[^\n:]+:\s*(?:(?:command\s+)?not found|No such file or directory)\s*$",
+        exc.stderr,
+    ) is not None
+
+
 def _generate_command_tts(
     text: str, output_path: str, provider_name: str, config: Dict[str, Any], tts_config: Dict[str, Any],
 ) -> str:
@@ -334,6 +349,10 @@ def _generate_command_tts(
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(f"TTS provider '{provider_name}' timed out after {timeout:g}s") from exc
         except subprocess.CalledProcessError as exc:
+            if _missing_synthesis_command(exc):
+                raise TTSCommandDependencyUnavailable(
+                    f"TTS provider '{provider_name}' could not find its synthesis command"
+                ) from exc
             raise RuntimeError(
                 f"TTS provider '{provider_name}' exited with code {exc.returncode}: {command_failure_detail(exc)}"
             ) from exc

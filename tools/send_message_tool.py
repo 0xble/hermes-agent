@@ -555,7 +555,7 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
             return {"error": f"Adapter send failed: {_bounded_send_error(last_result.error)}",
                     "_text_message_id": None, "_media_delivered": 0}
         text_message_id = last_result.message_id
-    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
     total = len(media_files)
     batched_indices = set()
     if len(media_files) > 1 and not force_document:
@@ -585,23 +585,27 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
                 except Exception as exc:
                     return {"error": f"Adapter media send failed after 0/{total} files: {_bounded_send_error(exc)}",
                             "_text_message_id": text_message_id, "_media_delivered": 0}
-                failed = next((r for r in (results or [])
-                               if r is not None and not getattr(r, "success", True)), None)
-                if failed is not None:
-                    successful = [r for r in (results or [])
-                                  if r is not None and getattr(r, "success", False)]
-                    delivered += len(successful)
-                    # Report the delivered prefix by id: a partially delivered album has already put
-                    # those files on screen, so a caller that retries the whole batch would duplicate them.
+                # Adapters may return one aggregate SendResult, or one receipt per
+                # submitted image. A short/unknown list is never a complete album.
+                aggregate = isinstance(results, SendResult)
+                receipts = [results] if aggregate else (list(results) if isinstance(results, (list, tuple)) else [])
+                successful = [r for r in receipts if getattr(r, "success", None) is True]
+                complete = (len(successful) == 1 if aggregate else
+                            len(receipts) == total and len(successful) == total)
+                if not complete:
+                    delivered = len(successful) if not aggregate and len(receipts) <= total else 0
+                    failed = next((r for r in receipts if getattr(r, "success", None) is False), None)
+                    error = getattr(failed, "error", None) or "incomplete or invalid album delivery receipts"
+                    # Preserve confirmed IDs for reconciliation, without retrying
+                    # an ambiguous batch or substituting the text send's success.
                     return {"error": f"Adapter media send failed after {delivered}/{total} files: "
-                                     f"{_bounded_send_error(failed.error or 'image delivery failed')}",
+                                     f"{_bounded_send_error(error)}",
                             "_text_message_id": text_message_id, "_media_delivered": delivered,
                             "_media_message_ids": [r.message_id for r in successful
                                                    if getattr(r, "message_id", None)]}
                 batched_indices = {index for index, _path in images}
                 delivered += len(images)
-                if results:
-                    last_result = results[-1]
+                last_result = receipts[-1]
                 caption = None
     for index, descriptor in enumerate(media_files):
         if index in batched_indices:

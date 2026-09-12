@@ -280,7 +280,7 @@ def test_failed_runtime_readback_still_runs_catch_up(monkeypatch, tmp_path):
     assert calls == ["repair", "resume", "failed"]
 
 
-def test_pinned_prepare_discards_machine_dirt_before_dirty_check(monkeypatch, tmp_path):
+def test_pinned_prepare_preserves_original_worktree_before_dirty_check(monkeypatch, tmp_path):
     import hermes_cli.update_cmd as update_cmd
 
     calls = []
@@ -291,7 +291,35 @@ def test_pinned_prepare_discards_machine_dirt_before_dirty_check(monkeypatch, tm
     monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *args: calls.append("eol"))
     (tmp_path / ".git").mkdir()
     assert update_cmd._prepare_git_command(pinned_revision=True) == (False, ["git"], False)
-    assert calls == ["lockfile", "eol"]
+    assert calls == []
+
+
+@pytest.mark.parametrize("invalid_revision", [False, True])
+def test_pinned_preparation_rejection_preserves_real_lockfile_and_config(monkeypatch, tmp_path, invalid_revision):
+    import hermes_cli.update_cmd as update_cmd
+
+    _seed, checkout, first = _repo(tmp_path)
+    _git(["config", "user.email", "test@example.com"], checkout)
+    _git(["config", "user.name", "Test"], checkout)
+    lockfile = checkout / "package-lock.json"
+    lockfile.write_text('{"version":1}\n')
+    _git(["add", "package-lock.json"], checkout)
+    _git(["commit", "-m", "tracked lockfile"], checkout)
+    lockfile.write_text('{"version":2}\n')
+    _git(["config", "core.autocrlf", "true"], checkout)
+    before = (lockfile.read_bytes(), _git(["status", "--porcelain"], checkout).stdout,
+              _git(["rev-parse", "HEAD"], checkout).stdout, (checkout / ".git/config").read_bytes())
+    monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(PROJECT_ROOT=checkout))
+    monkeypatch.setattr(update_cmd, "_base_git_cmd", lambda: ["git"])
+    monkeypatch.setattr(update_cmd, "_ensure_non_trampoline_git", lambda command: command)
+    _, command, _ = update_cmd._prepare_git_command(pinned_revision=True)
+    with pytest.raises(ValueError if invalid_revision else RuntimeError,
+                       match="exact 40-character" if invalid_revision else "dirty"):
+        update_revision.prepare_revision_target(_git_run, command, checkout,
+                                                "main" if invalid_revision else first)
+    after = (lockfile.read_bytes(), _git(["status", "--porcelain"], checkout).stdout,
+             _git(["rev-parse", "HEAD"], checkout).stdout, (checkout / ".git/config").read_bytes())
+    assert after == before
 
 
 def test_finish_already_up_to_date_verifies_runtime_after_catchup(monkeypatch, tmp_path):

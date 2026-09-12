@@ -6,6 +6,7 @@ from urllib.parse import unquote, urlparse
 import pytest
 
 from tools.send_message_tool import _send_live_adapter_media
+from gateway.platforms.base import SendResult
 
 
 class Adapter:
@@ -57,3 +58,38 @@ async def test_relative_image_album_uses_local_escaped_file_uris(tmp_path, monke
         assert Path(unquote(parsed.path)) == path.resolve()
     assert [caption for _uri, caption in adapter.sent] == [None, '']
     assert adapter.text == ['caption']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,complete,confirmed", [
+    ("none", False, 0), ("empty", False, 0), ("short", False, 1),
+    ("null_item", False, 1), ("missing_success", False, 1),
+    ("extra", False, 0), ("complete", True, 2),
+    ("aggregate", True, 2), ("aggregate_failure", False, 0),
+])
+async def test_album_requires_complete_receipts_without_resending(tmp_path, kind, complete, confirmed):
+    first = SendResult(success=True, message_id="first")
+    second = SendResult(success=True, message_id="second")
+    receipts = {"none": None, "empty": [], "short": [first],
+                "null_item": [first, None], "missing_success": [first, SimpleNamespace(message_id="unknown")],
+                "extra": [first, second, first], "complete": [first, second],
+                "aggregate": SendResult(success=True, message_id="album"),
+                "aggregate_failure": SendResult(success=False, error="unconfirmed album")}
+
+    class AlbumAdapter(Adapter):
+        async def send_multiple_images(self, **kwargs):
+            self.sent.append("album-attempt")
+            return receipts[kind]
+
+    files = [tmp_path / "one.png", tmp_path / "two.png"]
+    for path in files:
+        path.touch()
+    adapter = AlbumAdapter()
+    result = await _send_live_adapter_media(adapter, "chat", "separate text", [(str(p), False) for p in files])
+    assert bool(result.get("success")) is complete
+    assert result["_media_delivered"] == confirmed
+    assert adapter.sent == ["album-attempt"]
+    assert adapter.text == ["separate text"]
+    if not complete:
+        assert result.get("error")
+        assert result["_text_message_id"] == "text"

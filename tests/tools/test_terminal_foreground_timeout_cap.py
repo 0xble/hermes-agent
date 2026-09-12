@@ -5,6 +5,7 @@ process with notify_on_complete (never refused: in one 1,393-agent run 454 refus
 re-sent lower/split/background, 251 of them test suites).
 """
 import json
+import pytest
 from unittest.mock import patch, MagicMock
 
 
@@ -30,6 +31,30 @@ def _make_env_config(**overrides):
 
 class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
+
+    @pytest.mark.parametrize("background,timeout", [(False, 9999), (True, 5)])
+    def test_no_yield_rejects_background_before_environment_acquisition(self, monkeypatch, background, timeout):
+        from tools.terminal_tool import terminal_tool
+
+        acquire = MagicMock(side_effect=AssertionError("must reject before environment acquisition"))
+        monkeypatch.setattr("tools.terminal_tool._get_env_config", _make_env_config)
+        monkeypatch.setattr("tools.terminal_tool._acquire_env", acquire)
+        result = json.loads(terminal_tool("printf verifier", timeout=timeout,
+                                         background=background, _allow_yield=False))
+        assert "synchronous" in result.get("error", "").lower()
+        acquire.assert_not_called()
+
+    def test_no_yield_returns_final_exit_status(self, tmp_path, monkeypatch):
+        from tools.terminal_tool import terminal_tool
+
+        monkeypatch.setattr("tools.terminal_tool._get_env_config", lambda: _make_env_config(cwd=str(tmp_path)))
+        monkeypatch.setattr("tools.terminal_tool._start_cleanup_thread", lambda: None)
+        monkeypatch.setattr("tools.terminal_tool._check_all_guards", lambda *args, **kwargs: {"approved": True})
+        result = json.loads(terminal_tool("printf synchronous-verifier; exit 7", timeout=5,
+                                         task_id="synchronous-verifier-test", _allow_yield=False))
+        assert result["exit_code"] == 7
+        assert "synchronous-verifier" in result["output"]
+        assert "session_id" not in result
 
     def test_foreground_timeout_above_max_is_promoted_to_tracked_background(self, tmp_path, monkeypatch):
         """Real local backend, real registry: the command runs (once), the result is a background

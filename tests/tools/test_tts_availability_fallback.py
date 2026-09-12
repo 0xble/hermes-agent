@@ -1,6 +1,7 @@
 """Availability-only whole-utterance fallback through the registered TTS tool."""
 import io
 import json
+import shlex
 import threading
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,3 +130,76 @@ def test_missing_primary_and_explicit_override_respect_chain(tmp_path, monkeypat
     if success:
         assert result["provider"] == "edge"
         assert result["attempted_providers"] == ["elevenlabs", "edge"]
+
+
+@pytest.mark.parametrize("command,override,should_fallback", [
+    ("hermes_missing_synthesis_fixture_01a09205 {output_path}", False, True),
+    ("VOICE=fixture hermes_missing_synthesis_fixture_01a09205 {output_path}", False, True),
+    ("./hermes_missing_synthesis_fixture_01a09205 {output_path}", False, True),
+    ("hermes_missing_synthesis_fixture_01a09205 {output_path}", True, False),
+    ("exit 127", False, False),
+    ("printf 'not found' >&2; exit 127", False, False),
+    ("printf 'invalid input' >&2; exit 2", False, False),
+    ("printf 'no output file'", False, False),
+    ("hermes_missing_synthesis_fixture_01a09205 | cat", False, False),
+])
+def test_real_command_dependency_failure_respects_fallback_boundary(tmp_path, monkeypatch, command, override, should_fallback):
+    config = {"tts": {"provider": "fixture-command", "fallback_providers": ["edge"],
+                      "providers": {"fixture-command": {"type": "command", "command": command,
+                                                        "output_format": "wav"}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    fallback_text = []
+    def edge(text, path, cfg):
+        fallback_text.append(text)
+        Path(path).write_bytes(wav_bytes())
+    monkeypatch.setattr(tts, "_run_edge_tts", edge)
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    args = {"text": "Full fallback utterance.", "output_path": str(tmp_path / "speech.wav")}
+    if override:
+        args["provider"] = "fixture-command"
+    result = json.loads(registry.get_entry("text_to_speech").handler(args))
+    assert bool(result.get("success")) is should_fallback
+    assert fallback_text == ([args["text"]] if should_fallback else [])
+    if should_fallback:
+        assert result["attempted_providers"] == ["fixture-command", "edge"]
+        assert Path(result["file_path"]).read_bytes() == wav_bytes()
+
+
+def test_command_fallback_discards_partial_chunks_and_restarts_whole_utterance(tmp_path, monkeypatch):
+    marker = shlex.quote(str(tmp_path / "first-generated"))
+    source = tmp_path / "source.wav"
+    source.write_bytes(wav_bytes())
+    command = (f"if [ -e {marker} ]; then hermes_missing_synthesis_fixture_01a09205; "
+               f"else printf generated > {marker}; cp {shlex.quote(str(source))} {{output_path}}; fi")
+    config = {"tts": {"provider": "fixture-command", "fallback_providers": ["edge"],
+                      "providers": {"fixture-command": {"type": "command", "command": command,
+                                                        "output_format": "wav", "max_text_length": 12}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    fallback_text = []
+    def edge(text, path, cfg):
+        fallback_text.append(text)
+        Path(path).write_bytes(wav_bytes())
+    monkeypatch.setattr(tts, "_run_edge_tts", edge)
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    text = "First part. Second part. Third part."
+    result = json.loads(registry.get_entry("text_to_speech").handler(
+        {"text": text, "output_path": str(tmp_path / "speech.wav")}))
+    assert result["success"] is True
+    assert fallback_text == [text]
+    assert result["fallback_from"] == "fixture-command"
+    assert not list(tmp_path.glob("speech.chunk*"))
+
+
+def test_output_path_failure_never_switches_command_provider(tmp_path, monkeypatch):
+    config = {"tts": {"provider": "fixture-command", "fallback_providers": ["edge"],
+                      "providers": {"fixture-command": {"type": "command", "command": "printf fixture"}}}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("existing file")
+    fallback_text = []
+    monkeypatch.setattr(tts, "_run_edge_tts", lambda *args: fallback_text.append(args))
+    monkeypatch.setattr(tts, "_import_edge_tts", lambda: object())
+    with pytest.raises(OSError):
+        registry.get_entry("text_to_speech").handler(
+            {"text": "Keep the configured route.", "output_path": str(blocked_parent / "speech.wav")})
+    assert fallback_text == []

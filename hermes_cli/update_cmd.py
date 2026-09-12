@@ -1029,8 +1029,8 @@ def _begin_update_receipt_and_plan(args):
 def _prepare_git_command(*, pinned_revision: bool = False) -> tuple[bool, list, bool]:
     """Return ``(use_zip_update, git_cmd, is_fork)``.
 
-    The immutable-revision path still discards machine-made lockfile/EOL churn, then
-    returns before stash/branch/ZIP logic so it can never bind a moving tip.
+    The immutable-revision path returns without checkout cleanup. Its subsequent
+    validation must inspect the original source state before any mutation or backup.
     """
     git_dir = _m().PROJECT_ROOT / ".git"
     use_zip_update = not git_dir.exists()
@@ -1047,13 +1047,12 @@ def _prepare_git_command(*, pinned_revision: bool = False) -> tuple[bool, list, 
     if sys.platform == "win32" and git_dir.exists() and not pinned_revision:
         _git_run(git_cmd, ["config", "windows.appendAtomically", "false"])
     git_cmd = _ensure_non_trampoline_git(git_cmd)
-    # npm lockfile rewrites and line-ending churn are machine-made dirt. Discard them
-    # before any dirty-tree check, including the pinned path, so retries are not refused
-    # for files the updater itself rewrites.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
     if pinned_revision:
         return False, git_cmd, False
+    # Ordinary branch updates retain managed lockfile/EOL cleanup. Pinned updates
+    # must refuse the original dirty state, including these files.
+    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
     is_fork = _is_fork(origin_url)
