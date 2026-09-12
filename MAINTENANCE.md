@@ -417,6 +417,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Upstream PR:** None after checked 2026-09-07. No public contribution authorized.
 - **Regression:** `scripts/run_tests.sh tests/gateway/test_queue_command.py tests/gateway/test_moa_one_shot_restore.py tests/gateway/test_queue_consumption.py tests/hermes_cli/test_busy_policy_invariants.py -q`. Exercise actual adapter and runner busy dispatch, FIFO preservation, metadata, no active-model mutation, and idle one-shot restoration.
 - **Rollback:** Revert `feat(gateway): queue MoA requests during active turns`, removing its busy handler and registration, restoring the rejection entry, and removing only its dedicated tests/documentation.
+- **Upstream adoption (2026-09-12):** upstream `549a6fb359c` retired the fork's per-event `_restore_moa_one_shot` and moved `/moa` onto the shared `/model --once` snapshot (`_claim_one_turn_restore` → `_restore_pending_one_turn_model_override`), which restores a copy of the prior override. The private restore code is gone; the queue/busy handler and FIFO dispatch remain fork-owned. The regression tests now assert equality against the restored override and a cleared snapshot through upstream's finalizer path.
 - **Retirement:** Remove this private implementation when released upstream accepts busy MoA requests without interrupting active work, preserves FIFO and message context, and restores the model after each queued one-shot turn.
 
 ### HERMES-129: Explicit session model controls

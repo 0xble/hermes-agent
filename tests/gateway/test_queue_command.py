@@ -199,8 +199,11 @@ async def test_busy_moa_fifo_then_idle_dispatch_restores_each_turn(monkeypatch):
             assert (handled, reply) == (False, None)
             assert runner._session_state(sk).conversation.model_override["provider"] == "moa"
             assert not event.text.startswith("/moa")
-            runner._restore_moa_one_shot(event, sk)
-            assert runner._session_state(sk).conversation.model_override is prior
+            # Upstream owns the one-shot restore: /moa arms the shared /model --once snapshot
+            # and the turn finalizer settles it from a copy, so equality rather than identity.
+            runner._restore_pending_one_turn_model_override(sk)
+            assert runner._session_state(sk).conversation.model_override == prior
+            assert runner._session_state(sk).conversation.one_turn_restore is None
     assert texts == ["first", "/moa second", "/moa third", "fourth"]
     assert runner._queue_depth(sk, adapter=adapter) == 0
 
@@ -306,7 +309,8 @@ async def test_moa_real_dispatch_chain_restores_before_ordinary_followup(monkeyp
         event = adapter.get_pending_message(sk)
         assert event is not None
         assert await runner._handle_message(event) == "done"
-        assert runner._session_state(sk).conversation.model_override is prior
+        assert runner._session_state(sk).conversation.model_override == prior
+        assert runner._session_state(sk).conversation.one_turn_restore is None
     assert seen == [("first", "moa"), ("ordinary", "openrouter"), ("second", "moa")]
 
 
