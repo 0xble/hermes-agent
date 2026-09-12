@@ -412,12 +412,15 @@ async def test_automatic_transition_policy_preserves_default(outcome, monkeypatc
     result = {"messages": messages, "final_response": "Published.", "completed": True}
     prepare_goal_turn(manager, agent, result)
     assert result["_goal_decision"]["verdict"] == "done"
+    expected_notice = result["_goal_decision"]["message"]
+    assert expected_notice
     class Runner(GatewayGoalsMixin):
         def __init__(self): self.notices = []
         async def _post_turn_manager(self, *a): return manager
         async def _run_in_executor_with_context(self, fn): return fn()
-        async def _defer_goal_status_notice_after_delivery(self, source, text): self.notices.append(text)
+        # The continuation hook now runs at the successful delivery receipt.
+        async def _send_goal_status_notice(self, source, message): self.notices.append(message)
     runner = Runner()
     await runner._post_turn_goal_continuation(session_entry=SimpleNamespace(session_id=agent.session_id),
         source=SimpleNamespace(), final_response=result["final_response"], agent_result=result)
-    assert bool(runner.notices) is (configured is not False)
+    assert runner.notices == ([] if configured is False else [expected_notice])

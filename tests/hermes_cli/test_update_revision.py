@@ -303,12 +303,14 @@ def test_pinned_preparation_rejection_preserves_real_lockfile_and_config(monkeyp
     _git(["config", "user.name", "Test"], checkout)
     lockfile = checkout / "package-lock.json"
     lockfile.write_text('{"version":1}\n')
-    _git(["add", "package-lock.json"], checkout)
+    # This fixture requires a tracked lockfile even if the user's global excludes ignore it.
+    _git(["add", "-f", "package-lock.json"], checkout)
     _git(["commit", "-m", "tracked lockfile"], checkout)
     lockfile.write_text('{"version":2}\n')
     _git(["config", "core.autocrlf", "true"], checkout)
     before = (lockfile.read_bytes(), _git(["status", "--porcelain"], checkout).stdout,
               _git(["rev-parse", "HEAD"], checkout).stdout, (checkout / ".git/config").read_bytes())
+    assert before[1] == " M package-lock.json\n"
     monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(PROJECT_ROOT=checkout))
     monkeypatch.setattr(update_cmd, "_base_git_cmd", lambda: ["git"])
     monkeypatch.setattr(update_cmd, "_ensure_non_trampoline_git", lambda command: command)
