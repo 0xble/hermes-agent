@@ -24,6 +24,16 @@ delegation:
       inherit_parent: true
 """)
     from run_agent import AIAgent
+    from hermes_state import SessionDB
+    import agent.turn_api_request as request_phase
+    original_hook = request_phase._fire_pre_api_request_hook
+
+    def redact_hook(agent, api_kwargs, api_messages, *args, **kwargs):
+        original_hook(agent, api_kwargs, api_messages, *args, **kwargs)
+        for row in api_kwargs.get("messages", []):
+            if row.get("content") == "CURRENT_ACCEPTED_CORRECTION":
+                row["content"] = "REDACTED_ACCEPTED_CORRECTION"
+    monkeypatch.setattr(request_phase, "_fire_pre_api_request_hook", redact_hook)
     from tools import delegate_tool as dt
     from tools.delegation_history import FORK_REFERENCE
     from tools.registry import registry
@@ -51,7 +61,8 @@ delegation:
         return client
 
     monkeypatch.setattr(AIAgent, "_create_openai_client", create)
-    parent = AIAgent(api_key="test-key", base_url="http://fixture.invalid/v1", provider="openai-compat",
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    parent = AIAgent(session_db=session_db, api_key="test-key", base_url="http://fixture.invalid/v1", provider="openai-compat",
         api_mode="chat_completions", model="test-model", quiet_mode=True, skip_memory=True,
         skip_context_files=True, save_trajectories=False, max_iterations=4, session_id="fork-parent",
         enabled_toolsets=["file", "skills"], ephemeral_system_prompt="PARENT_ONLY_DIRECTIVE")
@@ -89,11 +100,30 @@ delegation:
         assert "CHILD_SCOPE_ONLY" in system
         assert "PARENT_ONLY_DIRECTIVE" not in texts
         assert "in-flight" not in texts
-        assert ("CURRENT_ACCEPTED_CORRECTION" in texts) == (expected == "fork")
+        assert "CURRENT_ACCEPTED_CORRECTION" not in texts
+        assert ("REDACTED_ACCEPTED_CORRECTION" in texts) == (expected == "fork")
+        child_id = payload["results"][0]["child_session_id"]
+        db = SessionDB(db_path=tmp_path / "state.db")
+        history = db.get_messages_as_conversation(child_id)
+        assert ("REDACTED_ACCEPTED_CORRECTION" in repr(history)) == (expected == "fork")
+        assert (FORK_REFERENCE.splitlines()[0] in repr(history)) == (expected == "fork")
+        db.close()
+        resumed = AIAgent(session_db=session_db, session_id=child_id, api_key="test-key",
+            base_url="http://fixture.invalid/v1", provider="openai-compat", api_mode="chat_completions",
+            model="child-model-after-switch", quiet_mode=True, skip_memory=True, skip_context_files=True,
+            save_trajectories=False, max_iterations=4, enabled_toolsets=["file"])
+        try:
+            resumed.run_conversation("Continue own task", conversation_history=history)
+            resumed_texts = repr(requests[-1]["messages"])
+            assert ("REDACTED_ACCEPTED_CORRECTION" in resumed_texts) == (expected == "fork")
+            assert "CURRENT_ACCEPTED_CORRECTION" not in resumed_texts
+        finally:
+            resumed.close()
         assert (FORK_REFERENCE.splitlines()[0] in texts) == (expected == "fork")
         assert parent._delegation_visible_window == captured
         assert "review_changes" not in {t["function"]["name"] for t in child_wire.get("tools", [])}
     finally:
         parent.close()
+        session_db.close()
         for client in clients:
             client.close()

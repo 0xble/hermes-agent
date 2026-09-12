@@ -161,9 +161,6 @@ def build_api_request(
         _original_api_kwargs = dict(api_kwargs)
         _llm_middleware_trace = []
 
-    from tools.delegation_history import capture_visible_window
-    capture_visible_window(agent, api_kwargs, api_messages)
-
     _fire_pre_api_request_hook(
         agent, api_kwargs, api_messages, _llm_middleware_trace, messages=messages,
         original_user_message=original_user_message, approx_tokens=approx_tokens,
@@ -171,6 +168,9 @@ def build_api_request(
         api_request_id=api_request_id, api_start_time=api_start_time,
         effective_task_id=effective_task_id, turn_id=turn_id,
     )
+
+    from tools.delegation_history import capture_visible_window
+    capture_visible_window(agent, api_kwargs, api_messages)
 
     if env_var_enabled("HERMES_DUMP_REQUESTS"):
         agent._dump_api_request_debug(api_kwargs, reason="preflight")
