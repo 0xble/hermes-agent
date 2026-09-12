@@ -558,6 +558,74 @@ def pinning_support_error(provider: str | None, api_mode: str | None) -> str | N
     return None
 
 
+def _validate_physical_auth(client, kwargs, *, digest: str, pinned: bool, overrides: str) -> None:
+    """Check SDK-merged authentication without invoking dynamic credential sources."""
+    from collections.abc import Mapping
+    import httpx
+    from openai import Omit as OpenAIOmit
+    from anthropic import Omit as AnthropicOmit
+
+    auth_names = {"authorization", "x-api-key", "api-key", "chatgpt-account-id"}
+    error = "named subagent SDK client credential changed or cannot be verified"
+    http_client = getattr(client, "_client", None)
+    hooks = getattr(http_client, "event_hooks", None)
+    if (callable(getattr(client, "_api_key_provider", None))
+            or callable(getattr(client, "_azure_ad_token_provider", None))
+            or (isinstance(hooks, dict) and hooks.get("request"))
+            or (isinstance(http_client, (httpx.Client, httpx.AsyncClient)) and http_client.auth is not None)):
+        raise ValueError(error)
+
+    def headers(value):
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            raise ValueError(error)
+        return dict(value)
+
+    def auth_only(value):
+        selected = {}
+        for name, value in value.items():
+            name = str(name).lower()
+            if name not in auth_names or isinstance(value, (OpenAIOmit, AnthropicOmit)):
+                continue
+            if name in selected or not isinstance(value, str):
+                raise ValueError(error)
+            selected[name] = value
+        return selected
+
+    frozen = auth_only(headers(json.loads(overrides).get("extra_headers")))
+    request_headers = headers(kwargs.get("extra_headers"))
+    request_auth = auth_only(request_headers)
+    if request_auth != frozen:
+        raise ValueError(error)
+    defaults = getattr(client, "default_headers", None)
+    if not isinstance(defaults, Mapping):
+        # Minimal clients used by local routes still carry a static credential.
+        defaults = {}
+        key = getattr(client, "api_key", None)
+        token = getattr(client, "auth_token", None)
+        if isinstance(key, str) and key:
+            defaults["Authorization"] = "Bearer " + key
+        if isinstance(token, str) and token:
+            defaults["Authorization"] = "Bearer " + token
+    effective = auth_only({**defaults, **request_headers})
+    if any(effective.get(name) != value for name, value in frozen.items()):
+        raise ValueError(error)
+    if pinned and not effective:
+        raise ValueError(error)
+    for name, value in effective.items():
+        if frozen.get(name) == value:
+            continue
+        credential = value[7:] if name == "authorization" and value.startswith("Bearer ") else value
+        if hashlib.sha256(credential.encode()).hexdigest() == digest:
+            continue
+        # Preserve the SDK placeholder for a genuinely keyless local route only.
+        if (not pinned and not frozen and not getattr(client, "auth_token", None)
+                and name == "authorization" and value == "Bearer " + str(getattr(client, "api_key", ""))):
+            continue
+        raise ValueError(error)
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimePin:
     """Nonsecret launch configuration retained for the child's full lifetime."""
@@ -644,7 +712,7 @@ class RuntimePin:
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned route changed")
         return fallback.base_url
 
-    def validate_request(self, child, kwargs, *, client=None):
+    def validate_request(self, child, kwargs, *, client=None, final_request=None):
         """Assert the pinned route/model/effort/credential for one request.
 
         Called twice by design: once while kwargs are built, and once at the
@@ -652,6 +720,8 @@ class RuntimePin:
         call is the one that matters — middleware, fallback chains and client
         replacement all run in between (item 4).
         """
+        if final_request is None:
+            final_request = client is not None
         current = (child.provider, child.model, child.base_url, child.api_mode)
         expected = (self.provider, self.model, self.base_url, self.api_mode)
         digest = hashlib.sha256(str(child.api_key or "").encode()).hexdigest()
@@ -703,21 +773,25 @@ class RuntimePin:
         if client is None:
             client = getattr(child, "client", None)
         if client is not None:
-            if fallback is None:
-                self._validate_client(client)
+            from hermes_cli.route_identity import normalize_route_base_url
+            if active_provider == "openai-codex":
+                active_pin = self if fallback is None else replace(
+                    self, provider=fallback.provider, base_url=fallback.base_url,
+                    _credential_digest=fallback.credential_digest,
+                )
+                active_pin._validate_client(client)
             else:
-                self._validate_fallback_client(client, fallback)
-
-    @staticmethod
-    def _validate_fallback_client(client, route: ResolvedRoute) -> None:
-        from hermes_cli.route_identity import normalize_route_base_url
-        if (
-            normalize_route_base_url(str(getattr(client, "base_url", "") or ""))
-            != normalize_route_base_url(route.base_url)
-            or hashlib.sha256(str(getattr(client, "api_key", "") or "").encode()).hexdigest()
-            != route.credential_digest
-        ):
-            raise ValueError("named subagent fallback client changed after launch")
+                if fallback is None:
+                    self._validate_client_route(client)
+                elif (normalize_route_base_url(str(getattr(client, "base_url", "") or ""))
+                      != normalize_route_base_url(fallback.base_url)):
+                    raise ValueError("named subagent fallback client route changed after launch")
+                auth_kwargs = kwargs if final_request else json.loads(expected_overrides)
+                _validate_physical_auth(
+                    client, auth_kwargs, digest=expected_digest,
+                    pinned=self._pinned_credential if fallback is None else bool(fallback.api_key),
+                    overrides=expected_overrides,
+                )
 
     def _validate_request_effort(self, kwargs, extra, expected_effort=None, api_mode=None) -> None:
         """Compare effort only where the request actually states one.
@@ -778,13 +852,10 @@ class RuntimePin:
         if self.provider == "openai-codex":
             self._compare_credential(str(api_key or ""))
             return
-        if not isinstance(api_key, str) or not api_key or not self._pinned_credential:
-            # Nothing meaningful to compare: a header-auth transport, or a
-            # keyless provider whose SDK supplies a placeholder. Comparing that
-            # against the digest of "" would kill every request on those
-            # routes. The route check above still holds.
-            return
-        self._compare_credential(api_key)
+        _validate_physical_auth(
+            client, json.loads(self.request_overrides_json), digest=self._credential_digest,
+            pinned=self._pinned_credential, overrides=self.request_overrides_json,
+        )
 
     def _validate_client_route(self, client) -> None:
         base_url = getattr(client, "base_url", None)

@@ -79,7 +79,8 @@ def restart_service(key: str, allowed_users: set[str]) -> None:
     tabs = camofox_api("GET", "/tabs", key).get("tabs", [])
     active_users = {str(tab.get("userId")) for tab in tabs if isinstance(tab, dict) and tab.get("userId")}
     unsafe = active_users - allowed_users
-    assert not unsafe, f"refusing to restart Camofox with non-test active users: {sorted(unsafe)}"
+    if unsafe:
+        raise RuntimeError(f"refusing to restart Camofox with non-test active users: {sorted(unsafe)}")
     # launchctl is macOS-only, so os.getuid() is reachable wherever this line runs.
     subprocess.run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=True, timeout=30)  # windows-footgun: ok
     deadline = time.monotonic() + 60
@@ -101,6 +102,40 @@ def resume_followup(task_id: str, label: str, page: str) -> None:
     state = page_state(handle_function_call, task_id)
     assert label in state["cookie"] and state["local"] == label, state
     print(json.dumps({"success": True, "restart_followup": True, "task": task_id}))
+
+
+def cleanup_synthetic_state(key: str, home: Path, task_ids, created_users: set[str], server) -> None:
+    """Attempt each known synthetic identity, retaining recovery evidence on failure."""
+    from tools.browser_camofox_state import read_camofox_binding
+
+    unresolved = []
+    unreadable_tasks = []
+    users = set(created_users)
+    try:
+        # A failed first navigation may have committed its binding before returning.
+        for task_id in task_ids:
+            try:
+                binding = read_camofox_binding(task_id)
+                if binding:
+                    users.add(binding["user_id"])
+            except Exception:
+                unreadable_tasks.append(task_id)
+        for user_id in sorted(users):
+            try:
+                camofox_api("DELETE", f"/sessions/{user_id}/storage_state", key)
+            except Exception:
+                unresolved.append(user_id)
+    finally:
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+    if unresolved or unreadable_tasks:
+        receipt = home / "cleanup-recovery.json"
+        receipt.write_text(json.dumps({"success": False, "unresolved_user_ids": unresolved,
+                                      "unreadable_task_ids": unreadable_tasks}, indent=2) + "\n", encoding="utf-8")
+        raise RuntimeError(f"Synthetic Camofox cleanup incomplete; recovery receipt retained at {receipt}")
+    shutil.rmtree(home)
 
 
 def main() -> None:
@@ -193,19 +228,11 @@ def main() -> None:
         assert not missing.get("success") and "identity" in missing.get("error", ""), missing
         assert not unknown.get("success") and "identity" in unknown.get("error", "").lower(), unknown
         assert not warm.get("success") and "CAMOFOX_USER_ID" in warm.get("error", ""), warm
-        print(json.dumps({"success": True, "identity_isolation": True, "sibling_survival": True,
-                          "interpreter_restart": True, "service_restart": args.restart_service}))
     finally:
         os.environ.pop("CAMOFOX_USER_ID", None)
-        try:
-            # Persistence plugin reset also destroys any live synthetic session and removes disk state.
-            for user_id in created_users:
-                camofox_api("DELETE", f"/sessions/{user_id}/storage_state", key)
-        except Exception:
-            pass
-        server.shutdown()
-        server.server_close()
-        shutil.rmtree(home, ignore_errors=True)
+        cleanup_synthetic_state(key, home, [*task.values(), sibling_task], created_users, server)
+    print(json.dumps({"success": True, "identity_isolation": True, "sibling_survival": True,
+                      "interpreter_restart": True, "service_restart": args.restart_service}))
 
 
 if __name__ == "__main__":

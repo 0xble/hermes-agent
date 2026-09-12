@@ -270,6 +270,7 @@ def _named_session_from_binding(task_id: str, binding: Dict[str, str], camofox_c
     actual = {key: binding[key] for key in expected}
     if actual != expected:
         raise CamofoxIdentityError("Camofox task binding no longer matches configured identity; start a new task")
+    claim_camofox_binding(task_id, resolved)
     return {"user_id": binding["user_id"], "tab_id": None, "session_key": binding["session_key"],
             "managed": True, "adopt_existing_tab": True, "named": True, "alias": binding["alias"]}
 

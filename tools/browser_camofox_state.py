@@ -91,40 +91,45 @@ def reject_non_camofox_binding(task_id: Optional[str]) -> None:
 
 def claim_camofox_binding(task_id: Optional[str], identity: Dict[str, str]) -> Dict[str, str]:
     """Atomically bind a task to Camofox plus one identity across process restarts."""
-    existing = read_camofox_binding(task_id)
-    expected = {"backend": "camofox", **{key: identity[key] for key in ("alias", "identity_key", "user_id", "session_key")}}
-    if existing is not None:
-        if existing != expected:
-            raise CamofoxIdentityError("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars")
-        return existing
-    claim = _binding_dir(task_id or "default")
-    root = claim.parent
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(root, 0o700)
-    except OSError:
-        pass
-    temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        temporary.mkdir(mode=0o700)
-        for key, value in expected.items():
-            (temporary / key).write_text(value + "\n", encoding="utf-8")
+    from hermes_cli.browser_identity import BrowserIdentityProcessLock
+
+    digest = hashlib.sha256((task_id or "default").encode()).hexdigest()
+    with BrowserIdentityProcessLock(digest, task_binding=True):
+        reject_non_camofox_binding(task_id)
+        existing = read_camofox_binding(task_id)
+        expected = {"backend": "camofox", **{key: identity[key] for key in ("alias", "identity_key", "user_id", "session_key")}}
+        if existing is not None:
+            if existing != expected:
+                raise CamofoxIdentityError("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars")
+            return existing
+        claim = _binding_dir(task_id or "default")
+        root = claim.parent
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            temporary.rename(claim)
-        except FileExistsError:
-            pass
+            os.chmod(root, 0o700)
         except OSError:
-            # A populated competing claim can produce ENOTEMPTY, not EEXIST.
-            # Its existence permits only the strict winner verification below.
-            if not claim.exists():
-                raise
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-    verified = read_camofox_binding(task_id)
-    if verified != expected:
-        raise CamofoxIdentityError("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars")
-    return expected
+            pass
+        temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            temporary.mkdir(mode=0o700)
+            for key, value in expected.items():
+                (temporary / key).write_text(value + "\n", encoding="utf-8")
+            try:
+                temporary.rename(claim)
+            except FileExistsError:
+                pass
+            except OSError:
+                # A populated competing claim can produce ENOTEMPTY, not EEXIST.
+                # Its existence permits only the strict winner verification below.
+                if not claim.exists():
+                    raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+        verified = read_camofox_binding(task_id)
+        if verified != expected:
+            raise CamofoxIdentityError("browser task is already bound to another backend or identity; start a new task instead of switching cookie jars")
+        return expected
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

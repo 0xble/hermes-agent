@@ -356,28 +356,38 @@ def test_native_review_notification_invalidates_stale_candidate(candidate_repo):
     assert "candidate changed" in text.lower()
 
 
-def test_candidate_identity_preserves_distinct_non_utf8_tracked_patch_bytes(candidate_repo, monkeypatch):
-    from agent import review_candidate
+def test_capture_rejects_real_legacy_encoded_source_before_dispatch(candidate_repo, monkeypatch):
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
+    path = candidate_repo / "legacy.py"
+    path.write_bytes(b"# coding: latin-1\nvalue = 'before'\n")
+    _git(candidate_repo, "add", "legacy.py")
+    _git(candidate_repo, "commit", "-qm", "legacy fixture")
+    content = b"# coding: latin-1\nvalue = '\xe9'\n"
+    compile(content, str(path), "exec")
+    path.write_bytes(content)
+    index = (candidate_repo / ".git" / "index").read_bytes()
+    monkeypatch.setattr("agent.review_engine.start_review", lambda **k: pytest.fail("dispatched lossy evidence"))
+    parent = SimpleNamespace()
+    with pytest.raises(ValueError, match="UTF-8"):
+        INLINE_TOOL_EXECUTORS["review_current_work"](parent, {
+            "repository": str(candidate_repo), "base_revision": "HEAD", "accepted_scope": ["legacy.py"],
+        }, InlineToolContext("test", messages=[]))
+    assert not getattr(parent, "_review_yield_requested", False)
+    assert path.read_bytes() == content
+    assert (candidate_repo / ".git" / "index").read_bytes() == index
 
-    path = candidate_repo / "invalid-utf8.txt"
-    path.write_bytes(b"value=base\n")
-    _git(candidate_repo, "add", "invalid-utf8.txt")
-    _git(candidate_repo, "commit", "-m", "add invalid utf8 fixture")
-    base = _git(candidate_repo, "rev-parse", "HEAD")
-    patch = {"bytes": b"@@ -1 +1 @@\n-value=base\n+value=\x80\n"}
-    real_git = review_candidate._git
-    monkeypatch.setattr(
-        review_candidate, "_git",
-        lambda repo, *args: patch["bytes"] if args and args[0] == "diff" else real_git(repo, *args),
-    )
 
-    first = review_candidate.capture_review_candidate(candidate_repo, base, ["invalid-utf8.txt"])
-    patch["bytes"] = b"@@ -1 +1 @@\n-value=base\n+value=\x81\n"
-    second = review_candidate.capture_review_candidate(candidate_repo, base, ["invalid-utf8.txt"])
-
-    assert first.tracked_patch == second.tracked_patch
-    assert first.candidate_id != second.candidate_id
-    assert first.tracked_patch_sha256 != second.tracked_patch_sha256
+def test_valid_replacement_character_and_binary_patch_roundtrip(candidate_repo):
+    path = candidate_repo / "binary.dat"
+    path.write_bytes(b"before\0\x80")
+    _git(candidate_repo, "add", "binary.dat")
+    _git(candidate_repo, "commit", "-qm", "binary fixture")
+    path.write_bytes(b"after\0\x81")
+    (candidate_repo / "tracked.py").write_text("value = '�'\n", encoding="utf-8")
+    candidate = capture_review_candidate(candidate_repo, "HEAD", ["tracked.py", "binary.dat"])
+    assert "GIT binary patch" in candidate.tracked_patch
+    assert "�" in candidate.tracked_patch
+    assert ReviewCandidateV1.from_payload(json.loads(candidate.to_json())) == candidate
 
 
 def test_capture_and_freshness_never_execute_textconv(candidate_repo, tmp_path):

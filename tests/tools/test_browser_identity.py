@@ -945,8 +945,11 @@ class TestNamedRealProfileProcesses:
             lambda root: swept_roots.append(root),
         )
 
-        bt._close_all_real_profile_runtimes()
+        bt._real_profile_headed_modes[key_b] = True
+        from tools.browser_tool_real_profile import _cleanup_real_profile_state
+        _cleanup_real_profile_state()
 
+        assert bt._real_profile_headed_modes[key_b] is True
         assert closed == [session_a]
         assert swept_roots == []
         assert key_a not in bt._real_profile_cdp_cache

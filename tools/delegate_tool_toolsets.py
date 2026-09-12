@@ -69,6 +69,7 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
 def _resolve_child_toolsets(
     parent_agent, toolsets: Optional[List[str]], effective_role: str, *,
     inherit_mcp_toolsets: bool = True,
+    resumed_snapshot: bool = False,
 ) -> tuple[List[str], List[str]]:
     """``(enabled_toolsets, disabled_toolsets)`` for a child. Children never gain tools the parent lacks: explicit
     ``toolsets`` are intersected with the parent's (composite-expanded) set, else the parent's enabled set is
@@ -88,7 +89,10 @@ def _resolve_child_toolsets(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if resumed_snapshot:
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [name for name in (toolsets or []) if name in expanded_parent]
+    elif toolsets:
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
         if inherit_mcp_toolsets and _get_inherit_mcp_toolsets():
@@ -100,13 +104,16 @@ def _resolve_child_toolsets(
         child_toolsets = parent_enabled
     else:
         child_toolsets = sorted(parent_toolsets) or DEFAULT_TOOLSETS
+    saved_delegation = resumed_snapshot and effective_role == "orchestrator" and "delegation" in child_toolsets
     child_toolsets = _strip_blocked_tools(child_toolsets)
+    if saved_delegation:
+        child_toolsets.append("delegation")
 
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []
     )
-    if effective_role == "orchestrator":
+    if effective_role == "orchestrator" and not resumed_snapshot:
         inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
         if "delegation" not in child_toolsets:
             child_toolsets.append("delegation")

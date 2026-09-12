@@ -424,6 +424,9 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
                 restored.pop(route_key, None)
         if isinstance(expected_slot, dict) and "fallback_models" in expected_slot:
             restored.pop("fallback_models", None)
+        for route_key in _EMPTY_DEFAULT_ROUTE_FIELDS:
+            if route_key not in raw_slot and restored.get(route_key) in (None, "", {}, []):
+                restored.pop(route_key, None)
         restored["model_preset"] = raw_slot["model_preset"]
         if raw_slot.get("fallback_models") == []:
             restored["fallback_models"] = []

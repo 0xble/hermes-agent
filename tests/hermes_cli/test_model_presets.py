@@ -335,3 +335,34 @@ def test_inline_moa_nested_fallback_references_survive_unrelated_save():
     restored = preserve_model_preset_references(expanded, raw)
     assert restored["moa"]["aggregator"]["fallback_models"] == [{"model_preset": "fast"}]
     assert expand_model_presets(restored)["moa"] == expanded["moa"]
+
+
+@pytest.mark.parametrize("site", ["fallback_providers", "fallback_model"])
+@pytest.mark.parametrize("as_list", [False, True])
+@pytest.mark.parametrize("strip_defaults", [False, True])
+@pytest.mark.parametrize("value", ["", None, {}, "meaningful"])
+def test_fallback_preset_roundtrip_handles_injected_route_defaults(tmp_path, monkeypatch, site, as_list, strip_defaults, value):
+    from hermes_cli import config as c
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {**routes(), site: [{"model_preset": "fast"}] if as_list else {"model_preset": "fast"}}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear()
+    c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    loaded = c.load_config()
+    entry = loaded[site][0] if as_list else loaded[site]
+    entry["api_key"] = value
+    entry["base_url"] = ""
+    loaded["display"]["show_thinking"] = False
+    c.save_config(loaded, strip_defaults=strip_defaults)
+    saved = yaml.safe_load(path.read_text())
+    entry = saved[site][0] if as_list else saved[site]
+    assert ("model_preset" in entry) == (value != "meaningful")
+    c._RAW_CONFIG_CACHE.clear()
+    c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    reloaded = c.load_config()
+    entry = reloaded[site][0] if as_list else reloaded[site]
+    expected = expand_model_presets(raw)[site]
+    assert entry["model"] == (expected[0] if as_list else expected)["model"]
+    if value == "meaningful":
+        assert entry["api_key"] == value

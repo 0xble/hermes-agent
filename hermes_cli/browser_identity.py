@@ -51,7 +51,7 @@ def browser_identity_scope_key(runtime_key: str) -> str:
 class BrowserIdentityProcessLock:
     """Owner-only, bounded cross-process lock for snapshot mutation and launch."""
 
-    def __init__(self, runtime_key: str, *, timeout: float = 30.0) -> None:
+    def __init__(self, runtime_key: str, *, timeout: float = 30.0, task_binding: bool = False) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", runtime_key):
             raise BrowserIdentityError("invalid browser identity runtime lock key")
         if timeout < 0:
@@ -61,7 +61,8 @@ class BrowserIdentityProcessLock:
         from hermes_constants import get_hermes_home
 
         self.path = (
-            get_hermes_home() / "browser-profile" / "locks" / f"{runtime_key}.lock"
+            (get_hermes_home() / "browser-task-locks" if task_binding else
+             get_hermes_home() / "browser-profile" / "locks") / f"{runtime_key}.lock"
         )
         self.timeout = timeout
         self._handle = None

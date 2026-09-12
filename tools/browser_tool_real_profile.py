@@ -319,8 +319,6 @@ def _cleanup_real_profile_state() -> None:
         cleanup_real_profile_snapshots()
     except Exception as e:
         _bt.logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
-    _bt._real_profile_cdp_cache.clear()
-    _bt._real_profile_headed_modes.clear()
 
 
 def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optional[bool] = None) -> tuple:

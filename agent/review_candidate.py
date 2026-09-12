@@ -300,12 +300,16 @@ def capture_review_candidate(
     untracked = tuple(_untracked_entry(root, path) for path in untracked_paths)
     if not patch_bytes and not untracked:
         raise ValueError("Accepted review scope contains no tracked changes or untracked files")
+    try:
+        tracked_patch = patch_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Tracked review evidence must be losslessly representable as UTF-8") from exc
     provisional = ReviewCandidateV1(
         repository=str(root),
         base_commit=base_commit,
         head_commit=head_commit,
         accepted_scope=scope,
-        tracked_patch=patch_bytes.decode("utf-8", "replace"),
+        tracked_patch=tracked_patch,
         untracked_files=untracked,
         candidate_id="",
         tracked_patch_sha256=hashlib.sha256(patch_bytes).hexdigest(),

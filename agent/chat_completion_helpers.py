@@ -1994,7 +1994,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                     else:
                         request_probe["reasoning_effort"] = configured_effort
                 named_pin.validate_request(
-                    agent, request_probe,
+                    agent, request_probe, final_request=False,
                     client=(getattr(agent, "_anthropic_client", None)
                             if fb_api_mode == "anthropic_messages" else fb_client),
                 )

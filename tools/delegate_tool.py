@@ -244,12 +244,13 @@ def _build_child_agent(
     # the advertised and executable surface to the exact inspection allow-list.
     # Asking _resolve_child_toolsets for the synthetic review-inspection toolset
     # would be intersected away unless the parent explicitly enabled that name.
-    requested_toolsets = None if inspection_only else toolsets
+    requested_toolsets = None if inspection_only and not resume_session_id else toolsets
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(
         parent_agent,
         requested_toolsets,
         effective_role,
         inherit_mcp_toolsets=not inspection_only,
+        resumed_snapshot=bool(resume_session_id),
     )
 
     child_prompt = _build_child_system_prompt(

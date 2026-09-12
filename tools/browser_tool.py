@@ -469,42 +469,50 @@ def _claim_browser_identity_binding(task_id: str, alias: str, owner: str) -> Non
     The claim is a directory rename, so two processes racing the same task cannot both win, and a
     task can never be re-pointed at another cookie jar.
     """
-    import shutil
+    import hashlib
+    from hermes_cli.browser_identity import BrowserIdentityProcessLock
+    from tools.browser_camofox_state import read_camofox_binding
 
-    claim = _browser_identity_binding_dir(task_id)
-    existing = _read_browser_identity_binding(task_id)
-    if existing is not None:
-        if existing != (alias, owner):
+    digest = hashlib.sha256((task_id or "default").encode()).hexdigest()
+    with BrowserIdentityProcessLock(digest, task_binding=True):
+        if read_camofox_binding(task_id) is not None:
+            raise RuntimeError("browser task is already bound to another backend; start a new task")
+        import shutil
+
+        claim = _browser_identity_binding_dir(task_id)
+        existing = _read_browser_identity_binding(task_id)
+        if existing is not None:
+            if existing != (alias, owner):
+                raise RuntimeError("browser task is already bound to another identity; start a new task "
+                                   "instead of switching cookie jars")
+            return
+
+        root = claim.parent
+        root.mkdir(parents=True, exist_ok=True)
+        try:
+            from hermes_cli.config import _secure_dir
+            _secure_dir(root)
+        except Exception:
+            logger.debug("Could not harden browser identity binding directory", exc_info=True)
+        temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            temporary.mkdir()
+            (temporary / "alias").write_text(alias + "\n", encoding="utf-8")
+            (temporary / "owner").write_text(owner + "\n", encoding="utf-8")
+            try:
+                temporary.rename(claim)
+            except FileExistsError:
+                pass
+            except OSError:
+                if not claim.exists():
+                    raise
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+
+        if _read_browser_identity_binding(task_id) != (alias, owner):
             raise RuntimeError("browser task is already bound to another identity; start a new task "
                                "instead of switching cookie jars")
-        return
-
-    root = claim.parent
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        from hermes_cli.config import _secure_dir
-        _secure_dir(root)
-    except Exception:
-        logger.debug("Could not harden browser identity binding directory", exc_info=True)
-    temporary = root / f".{claim.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    try:
-        temporary.mkdir()
-        (temporary / "alias").write_text(alias + "\n", encoding="utf-8")
-        (temporary / "owner").write_text(owner + "\n", encoding="utf-8")
-        try:
-            temporary.rename(claim)
-        except FileExistsError:
-            pass
-        except OSError:
-            if not claim.exists():
-                raise
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary, ignore_errors=True)
-
-    if _read_browser_identity_binding(task_id) != (alias, owner):
-        raise RuntimeError("browser task is already bound to another identity; start a new task "
-                           "instead of switching cookie jars")
 
 
 

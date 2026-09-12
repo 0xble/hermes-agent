@@ -14,6 +14,8 @@ from tests.run_agent.test_run_agent_codex_responses import (
 @pytest.fixture
 def make_child(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import model_tools
+    actual_tool_definitions = model_tools.get_tool_definitions
     _patch_agent_bootstrap(monkeypatch)
     import run_agent
     monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0)
@@ -33,6 +35,7 @@ def make_child(monkeypatch, tmp_path):
         child._delegation_runtime_pin = RuntimePin.from_child(child, definition, child.reasoning_config)
         children.append(child)
         return child
+    make.actual_tool_definitions = actual_tool_definitions
     yield make
     for child in children:
         child.close()
@@ -282,3 +285,47 @@ def test_transient_retry_keeps_model_route_and_effort(make_child, monkeypatch):
     assert len(requests) == 2
     assert all(r["model"] == child.model and r["reasoning"]["effort"] == "medium" for r in requests)
     assert requests[0]["instructions"] == requests[1]["instructions"]
+
+
+@pytest.mark.parametrize("saved", [[], ["web"], ["web", "file"], ["delegation"]])
+@pytest.mark.parametrize("inspection", [False, True])
+def test_resumed_builder_only_intersects_saved_toolsets(make_child, monkeypatch, saved, inspection):
+    from tools import delegate_tool as delegate
+    from agent.review_policy import INSPECTION_TOOL_NAMES
+    parent = make_child("high", "gpt-6-astra")
+    monkeypatch.setattr("model_tools.get_tool_definitions", make_child.actual_tool_definitions)
+    parent.enabled_toolsets = ["web", "terminal", "delegation", "mcp-new"]
+    parent.disabled_toolsets = ["web", "delegation"]
+    parent.valid_tool_names = set(INSPECTION_TOOL_NAMES)
+    monkeypatch.setattr(delegate, "_get_orchestrator_enabled", lambda: True)
+    monkeypatch.setattr(delegate, "_get_max_spawn_depth", lambda: 3)
+    definition = parse_definitions({"subagents": {"fixture": {
+        "description": "Fixture", "instructions": "Inspect.", "provider": "openai-codex",
+        "model": "gpt-5.6-luna", "reasoning_effort": "medium",
+    }}})["fixture"]
+    child = delegate._build_child_agent(
+        task_index=0, goal="Inspect", context=None, toolsets=saved,
+        model="gpt-5.6-luna", max_iterations=1, task_count=1, parent_agent=parent,
+        subagent_definition=definition, resolved_reasoning={"enabled": True, "effort": "medium"},
+        resume_session_id="synthetic-resume", resume_launch_metadata={"enabled_toolsets": saved},
+        child_tool_policy="inspection_only" if inspection else None,
+    )
+    try:
+        assert set(child.enabled_toolsets) <= set(saved)
+        assert "file" not in child.enabled_toolsets
+        assert "mcp-new" not in child.enabled_toolsets
+        assert {"web", "delegation"} <= set(child.disabled_toolsets)
+        if not saved:
+            assert child.enabled_toolsets == []
+            assert not child.valid_tool_names
+    finally:
+        child.close()
+
+
+def test_fresh_toolset_resolution_still_inherits_mcp_and_grants_orchestration(monkeypatch):
+    from tools import delegate_tool_toolsets as toolsets
+    monkeypatch.setattr(toolsets, "_get_inherit_mcp_toolsets", lambda: True)
+    parent = SimpleNamespace(enabled_toolsets=["web", "mcp-new"], disabled_toolsets=["delegation"])
+    enabled, disabled = toolsets._resolve_child_toolsets(parent, ["web"], "orchestrator")
+    assert {"web", "mcp-new", "delegation"} <= set(enabled)
+    assert "delegation" not in disabled
