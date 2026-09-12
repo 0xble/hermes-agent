@@ -291,6 +291,74 @@ def _assistant_calls(messages: Iterable[dict[str, Any]]) -> Iterable[tuple[str, 
             yield name, _json_args(function.get("arguments")), results.get(call_id, "")
 
 
+def _failed_source_result(value: dict[str, Any]) -> bool:
+    return bool(
+        value.get("error") or value.get("blocked_by_policy")
+        or ("success" in value and value["success"] is not True)
+        or ("status" in value and value["status"] not in ("ok", "success", "completed"))
+        or value.get("content_returned") is False or value.get("dedup")
+    )
+
+
+def _source_payloads(name: str, args: dict[str, Any], result: str) -> Iterable[tuple[str, str, str]]:
+    """Yield (source text, public origin, private identity) from known envelopes.
+
+    Bare text and unknown plugin shapes cannot prove extraction success. Never
+    reopen a truncated page's cache file under the tool-source retention opt-in.
+    """
+    try:
+        envelope = json.loads(result)
+    except (TypeError, ValueError):
+        return
+    if not isinstance(envelope, dict) or _failed_source_result(envelope):
+        return
+    kind = _TEXT_SOURCE_TOOLS[name]
+    if kind == "webpage":
+        pages = envelope.get("results")
+        if not isinstance(pages, list):
+            return
+        for page in pages:
+            if not isinstance(page, dict) or _failed_source_result(page):
+                continue
+            content, url = page.get("content"), page.get("url")
+            if not isinstance(content, str) or not isinstance(url, str):
+                continue
+            try:
+                parsed = urlsplit(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                    continue
+            except ValueError:
+                continue
+            # The native producer strips its structured truncation flag and
+            # inserts this exact footer. Do not mislabel a head/tail window.
+            if page.get("truncated") or "──────── [TRUNCATED] ────────" in content:
+                continue
+            source = {"url": url}
+            yield content, _url_value(source), _url_identity_value(source)
+        return
+    if kind == "file_extraction":
+        content = envelope.get("content")
+        if (not isinstance(content, str) or envelope.get("truncated") is not False
+                or type(envelope.get("total_lines")) is not int
+                or type(envelope.get("file_size")) is not int
+                or envelope["total_lines"] < 0 or envelope["file_size"] < 0
+                or envelope.get("is_binary") or envelope.get("is_image")
+                or type(args.get("offset", 1)) is not int or args.get("offset", 1) != 1):
+            return
+        origin = _path_value(args)
+        if origin:
+            yield content, origin, origin
+        return
+    # This is the native STT result contract. Transcript aliases must carry
+    # that explicit success evidence, not just enough characters of output.
+    content = envelope.get("transcript")
+    if envelope.get("success") is not True or not isinstance(content, str) or envelope.get("truncated"):
+        return
+    origin = _url_value(args) or _path_value(args)
+    if origin:
+        yield content, origin, _url_identity_value(args) or origin
+
+
 def _verified_file_write(result: str, content: str) -> bool:
     """Require the native write acknowledgment, bound to the proposed bytes."""
     try:
@@ -525,31 +593,29 @@ def discover_source_candidates(
             source_type = _TEXT_SOURCE_TOOLS[name]
             if source_type == "file_extraction" and not retain_file_extractions:
                 continue
-            origin = _url_value(args) or _path_value(args) or name
-            identity_origin = _url_identity_value(args) or origin
-            if source_type == "webpage":
-                source_id = f"webpage-{_sha256_text(identity_origin)[:32]}"
-                context = (
-                    "Webpage content retrieved and substantively used in the completed turn. "
-                    "External source that may become stale; preserve retrieval provenance."
+            for content, origin, identity_origin in _source_payloads(name, args, result):
+                source_id = f"{source_type}-{_sha256_text(identity_origin)[:32]}"
+                if source_type == "webpage":
+                    context = (
+                        "Webpage content retrieved and substantively used in the completed turn. "
+                        "External source that may become stale; preserve retrieval provenance."
+                    )
+                else:
+                    context = (
+                        f"Complete {source_type} extraction used in the completed turn. "
+                        "Preserve attribution and uncertainty; distinguish source evidence from Hermes analysis."
+                    )
+                candidate = _candidate_text(
+                    source_type=source_type,
+                    source_id=source_id,
+                    content=content,
+                    origin=origin,
+                    context=context,
+                    session_id=session_id,
+                    tags=(f"source:{source_type}",),
                 )
-            else:
-                source_id = f"{source_type}-{_sha256_text(identity_origin or name)[:32]}"
-                context = (
-                    f"Complete {source_type} extraction used in the completed turn. "
-                    "Preserve attribution and uncertainty; distinguish source evidence from Hermes analysis."
-                )
-            candidate = _candidate_text(
-                source_type=source_type,
-                source_id=source_id,
-                content=result,
-                origin=origin,
-                context=context,
-                session_id=session_id,
-                tags=(f"source:{source_type}",),
-            )
-            if candidate:
-                candidates.append(candidate)
+                if candidate:
+                    candidates.append(candidate)
 
         if name in {"write_file", "file_write"}:
             path = _path_value(args)

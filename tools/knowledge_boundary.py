@@ -74,7 +74,18 @@ def _real(path: Path | str) -> str:
 
 
 def _within(candidate: str, root: str) -> bool:
-    return candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
+    if candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep):
+        return True
+    # realpath does not canonicalize casing on POSIX. Existing directory
+    # identity also covers nonexistent descendants beneath a case alias,
+    # without conflating distinct names on a case-sensitive filesystem.
+    for ancestor in (Path(candidate), *Path(candidate).parents):
+        try:
+            if os.path.samefile(ancestor, root):
+                return True
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+    return False
 
 
 def is_protected_path(path: Path | str) -> bool:
@@ -197,28 +208,46 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
     if not _read_only_context() or not isinstance(command, str) or not command:
         return None
     try:
+        from tools.knowledge_command_paths import literal_paths, shell_tokens
+
         root = _command_roots(command)
+        references, destructive = literal_paths(command, python_source=tool == "execute_code")
+        bases = {Path(cwd)} if cwd is not None else set()
         if root is None and cwd is not None:
-            import shlex
-            # Literal paths and literal cd transitions only. Runtime-computed
-            # paths remain outside this reference guard's documented contract.
-            tokens = list(shlex.shlex(command, posix=True, punctuation_chars=";&|<>()"))
-            bases = {Path(cwd)}
+            # Literal cd transitions only. Runtime-computed paths remain
+            # outside this lexical boundary's documented contract.
+            tokens = shell_tokens(command) if tool != "execute_code" else []
             root = _relative_command_root(command, cwd)
             for index, token in enumerate(tokens):
-                if root is not None:
-                    break
                 if token == "cd" and index + 1 < len(tokens):
                     target = tokens[index + 1]
                     if "$" not in target and "`" not in target:
                         bases.update((base / os.path.expanduser(target)).resolve() for base in tuple(bases))
                         if len(bases) > 64:
                             return _UNEVALUATED
-                if not token or token.startswith("-") or any(ch in token for ch in "$`\n"):
+            for base in bases:
+                root = root or _relative_command_root(command, base)
+        for token in references:
+            if root is not None:
+                break
+            if not token or token.startswith("-") or any(ch in token for ch in "$`\n"):
+                continue
+            expanded = Path(os.path.expanduser(token))
+            paths = [expanded] if expanded.is_absolute() else [base / expanded for base in bases]
+            for path in paths:
+                root = _protected_root_for(path)
+                if root is not None:
+                    break
+        if root is None:
+            for token in destructive:
+                if not token or any(ch in token for ch in "$`\n"):
                     continue
-                for base in tuple(bases):
-                    root = (_relative_command_root(command, base)
-                            or _protected_root_for(base / os.path.expanduser(token)))
+                expanded = Path(os.path.expanduser(token))
+                paths = [expanded] if expanded.is_absolute() else [base / expanded for base in bases]
+                for path in paths:
+                    target = _real(path)
+                    root = next((_real(protected) for protected in protected_roots()
+                                 if _within(_real(protected), target)), None)
                     if root is not None:
                         break
                 if root is not None:
@@ -275,5 +304,6 @@ def boundary_report() -> dict:
             "writes made outside Hermes's tool surface",
             "background-thread cwd changes racing a local kernel cell's cwd snapshot",
             "remote filesystem aliases without an authoritative host-root mapping",
+            "alternate casing of a protected root that does not yet exist (no filesystem identity)",
         ],
     }

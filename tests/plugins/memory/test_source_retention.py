@@ -17,6 +17,14 @@ from plugins.memory.hindsight.source_retention import (
 
 
 def _tool_turn(name, arguments, result, call_id="call-1"):
+    # Source-success fixtures use the native producer envelopes, not bare text.
+    if name == "web_extract":
+        result = json.dumps({"results": [{"url": arguments["url"], "content": result, "error": None}]})
+    elif name in {"youtube_transcript", "speech_to_text"}:
+        result = json.dumps({"success": True, "transcript": result})
+    elif name == "read_file":
+        result = json.dumps({"content": result, "total_lines": 1,
+                             "file_size": len(result.encode()), "truncated": False})
     return [
         {"role": "user", "content": "Use the source for the answer."},
         {

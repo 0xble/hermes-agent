@@ -178,3 +178,153 @@ def test_literal_cd_then_quoted_interpreter_reference_is_denied(tmp_path, monkey
     with delegated_child_context(read_only_knowledge=True):
         result = json.loads(terminal.terminal_tool(command, workdir=str(workspace), task_id="cd-interpreter"))
     assert "Parent-owned shared knowledge" in result["error"]
+
+
+@pytest.mark.parametrize("command", [
+    "printf x > cache/link/MEMORY.md",
+    "printf x > 'cache/link/MEMORY.md'",
+    "printf x > cache/link#alias/MEMORY.md",
+    "cd cache; printf x > link/MEMORY.md",
+    'python -c "open(\'cache/link/MEMORY.md\',\'w\').write(\'x\')"',
+])
+def test_literal_symlink_target_refused_before_terminal_dispatch(tmp_path, monkeypatch, command):
+    from tools import terminal_tool as terminal
+    home = tmp_path / "home"
+    protected = home / "memories"
+    protected.mkdir(parents=True)
+    target = protected / "MEMORY.md"
+    target.write_text("original")
+    workspace = tmp_path / "work"
+    (workspace / "cache").mkdir(parents=True)
+    try:
+        (workspace / "cache" / "link").symlink_to(protected, target_is_directory=True)
+        (workspace / "cache" / "link#alias").symlink_to(protected, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Never execute even a disposable mutation in a red regression.
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("reached execution"))
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(command, workdir=str(workspace), task_id="alias-check"))
+    assert "Parent-owned shared knowledge" in result["error"]
+    assert target.read_text() == "original"
+
+
+@pytest.mark.parametrize("source", [
+    "rm -rf {home}", "/bin/rm --recursive --force -- {home}",
+    "echo ready; rm -r {home}", "mv {home} displaced",
+    'python -c "import shutil; shutil.rmtree({quoted})"',
+])
+def test_destructive_ancestor_refused_before_terminal_dispatch(tmp_path, monkeypatch, source):
+    import shlex
+    from tools import terminal_tool as terminal
+    home = tmp_path / "home"
+    protected = home / "memories"
+    protected.mkdir(parents=True)
+    (protected / "keep").write_text("original")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("reached destructive execution"))
+    command = source.format(home=shlex.quote(str(home)), quoted=repr(str(home)))
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(command, workdir=str(tmp_path), task_id="ancestor-check"))
+    assert "Parent-owned shared knowledge" in result["error"]
+    assert (protected / "keep").read_text() == "original"
+
+
+@pytest.mark.parametrize("source", [
+    "import shutil; shutil.rmtree({home})",
+    "from shutil import rmtree as wipe; wipe(path={home})",
+    "import os; os.rename({home}, 'displaced')",
+    "from pathlib import Path; Path({home}).rename('displaced')",
+    "shell-literal",
+])
+def test_execute_code_destructive_literal_ancestor_never_spawns(tmp_path, monkeypatch, source):
+    from tools import code_execution_tool as execute
+    home = tmp_path / "home"
+    protected = home / "memories"
+    protected.mkdir(parents=True)
+    (protected / "keep").write_text("original")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("tools.code_kernel.execute_in_session_kernel", lambda *a, **k: pytest.fail("spawned code"))
+    code = source.format(home=repr(str(home)))
+    if source == "shell-literal":
+        code = f"import os; os.system({('rm -rf ' + str(home))!r})"
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(execute.execute_code(code, task_id="ancestor-code"))
+    assert "Parent-owned shared knowledge" in result["error"]
+    assert (protected / "keep").read_text() == "original"
+
+
+def test_ancestor_inspection_and_unrelated_mutations_stay_allowed(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    commands = [f"ls {home}", f"cd {home}; printf x > ordinary.txt", f"echo 'rm -rf {home}'", f"ls {home} # note; rm -rf {home}",
+                f"rm -rf {home}/unrelated", f"mv {home}/ordinary.txt {home}/other.txt"]
+    with delegated_child_context(read_only_knowledge=True):
+        for command in commands:
+            assert knowledge_boundary.command_denial_reason(command, cwd=str(tmp_path)) is None, command
+    assert knowledge_boundary.command_denial_reason(f"rm -rf {home}", cwd=str(tmp_path)) is None
+
+
+@pytest.mark.parametrize("operation", ["write", "patch"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_case_alias_existing_root_protects_existing_and_future_descendants(tmp_path, monkeypatch, operation, existing):
+    home = tmp_path / "home"
+    root = home / "memories"
+    root.mkdir(parents=True)
+    alias = home / "MEMORIES"
+    if not alias.exists() or not alias.samefile(root):
+        pytest.skip("fixture filesystem is case-sensitive")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    target = root / "nested" / "new.txt"
+    if existing:
+        target.parent.mkdir()
+        target.write_text("original")
+    path = alias / "nested" / "new.txt"
+    with delegated_child_context(read_only_knowledge=True):
+        if operation == "write":
+            result = file_tools.write_file_tool(str(path), "bad", task_id="case-alias")
+        elif existing:
+            result = file_tools.patch_tool(path=str(path), old_string="original", new_string="bad", task_id="case-alias")
+        else:
+            result = file_tools.patch_tool(mode="patch", patch=f"*** Begin Patch\n*** Add File: {path}\n+bad\n*** End Patch", task_id="case-alias")
+    assert "Parent-owned shared knowledge" in json.loads(result)["error"]
+    assert target.read_text() == "original" if existing else not target.exists()
+
+
+def test_distinct_case_sensitive_directory_is_not_protected(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    root = home / "memories"
+    root.mkdir(parents=True)
+    sibling = home / "MEMORIES"
+    if sibling.exists():
+        pytest.skip("fixture filesystem is case-insensitive")
+    sibling.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(file_tools.write_file_tool(str(sibling / "new.txt"), "allowed", task_id="case-distinct"))
+    assert not result.get("error")
+    assert (sibling / "new.txt").read_text() == "allowed"
+
+
+@pytest.mark.parametrize("source", [
+    "import subprocess; subprocess.run(['rm', '-rf', {home}])",
+    "import shutil as files; files.move(src={home}, dst='elsewhere')",
+    "from os import replace as move; move({home}, 'elsewhere')",
+])
+def test_known_literal_python_destructive_wrappers_are_denied(tmp_path, monkeypatch, source):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with delegated_child_context(read_only_knowledge=True):
+        assert knowledge_boundary.command_denial_reason(source.format(home=repr(str(home))), tool="execute_code", cwd=str(tmp_path))
+
+
+def test_shell_target_directory_move_preserves_unrelated_sibling_work(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with delegated_child_context(read_only_knowledge=True):
+        assert knowledge_boundary.command_denial_reason(f"mv -t {home} {tmp_path}/ordinary.txt", cwd=str(tmp_path)) is None
+        assert knowledge_boundary.command_denial_reason(f"mv -t elsewhere {home}", cwd=str(tmp_path))

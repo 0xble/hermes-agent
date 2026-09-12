@@ -49,12 +49,13 @@ def test_real_disposable_bank_source_retention(tmp_path, monkeypatch):
                         "id": "canary-call",
                         "function": {
                             "name": "web_extract",
-                            "arguments": json.dumps({"url": "https://canary.example/source"}),
+                            "arguments": json.dumps({"urls": ["https://canary.example/source"]}),
                         },
                     }
                 ],
             },
-            {"role": "tool", "tool_call_id": "canary-call", "content": web_text},
+            {"role": "tool", "tool_call_id": "canary-call", "content": json.dumps({"results": [
+                {"url": "https://canary.example/source", "content": web_text, "error": None}]})},
         ]
         candidates = discover_source_candidates(
             messages,
