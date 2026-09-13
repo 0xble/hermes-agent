@@ -311,9 +311,15 @@ def test_reversion_waits_for_pending_evidence_before_fresh_observation(successor
     assert len(server.calls) == 2
     assert "0" in p._pending_retain_ops
     server.statuses["0"] = "completed"
-    assert p._wait_for_retains_drained(30)
-    # Recovery never replays stored payloads. A new source observation can now
-    # revert a successful successor, but a failed successor is no supersession.
+    drained = p._wait_for_retains_drained(30)
+    if successor == "completed":
+        # The fresh observation was kept in memory until prior writes finished.
+        assert not drained and len(server.calls) == 3
+        server.statuses["2"] = "completed"
+        server.hash = old.content_hash
+        assert p._wait_for_retains_drained(30)
+    else:
+        assert drained
     p._retain_source_candidates([old], p._bank_id)
     assert len(server.calls) == (3 if successor == "completed" else 2)
 
@@ -343,3 +349,63 @@ def test_discovered_repeated_version_remains_last_through_retention_and_restart(
     assert recovered._wait_for_retains_drained(30)
     assert recovered._source_ledger[earlier.automatic_key]['status'] == 'completed'
     assert recovered._source_ledger[updated.automatic_key]['status'] == 'superseded'
+
+
+@pytest.mark.parametrize("finish_order", [(0, 1), (1, 0)])
+@pytest.mark.parametrize("latest", ["reversion", "successor"])
+def test_pending_reversion_keeps_fresh_observation_until_async_writes_settle(finish_order, latest):
+    class ApplyingServer(Server):
+        def finish(self, operation):
+            self.statuses[str(operation)] = "completed"
+            self.hash = self.calls[operation]["items"][0]["metadata"]["content_hash"]
+
+    old, new = versions()
+    server = ApplyingServer()
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    p._retain_source_candidates([new], p._bank_id)
+    # This is a fresh user-led turn's source discovery, not journal recovery.
+    messages = [{"role": "user", "content": "Recheck the source now."},
+        {"role": "assistant", "tool_calls": [{"id": "fresh", "type": "function",
+         "function": {"name": "web_extract", "arguments": json.dumps({"url": "https://example.com/source"})}}]},
+        {"role": "tool", "tool_call_id": "fresh", "content": json.dumps({"results": [
+            {"url": "https://example.com/source", "content": old.content, "error": None}]})}]
+    p._retain_source_candidates(discover_source_candidates(messages, retain_tool_sources=True), p._bank_id)
+    if latest == "successor":
+        p._retain_source_candidates([new], p._bank_id)
+    assert len(server.calls) == 2  # pending operations are never duplicated
+    assert not p._wait_for_retains_drained(10)
+    for operation in finish_order:
+        server.finish(operation)
+    drained = p._wait_for_retains_drained(30)
+    requires_write = latest == "reversion" or finish_order == (1, 0)
+    if requires_write:
+        assert len(server.calls) == 3  # latest fresh observation survives without rereading
+        assert not drained
+        server.finish(2)
+        assert p._wait_for_retains_drained(30)
+    else:
+        assert len(server.calls) == 2 and drained
+    assert server.hash == (old.content_hash if latest == "reversion" else new.content_hash)
+    assert p._wait_for_retains_drained(30)
+    assert len(server.calls) == (3 if requires_write else 2)
+    # Recovery has operation references only, never a replayable deferred payload.
+    recovered = provider(server)
+    assert recovered._wait_for_retains_drained(30)
+    assert len(server.calls) == (3 if requires_write else 2)
+
+
+def test_deferred_fresh_payload_is_never_reconstructed_on_restart():
+    old, new = versions()
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old, new], p._bank_id)
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == 2
+    assert all(not entry["candidate"].content and not entry["candidate"].file_path
+               for entry in p._source_journal.load().values())
+    recovered = provider(server)
+    server.statuses.update({"0": "completed", "1": "completed"})
+    server.hash = new.content_hash
+    assert recovered._wait_for_retains_drained(30)
+    assert len(server.calls) == 2  # lost in-memory desire requires fresh observation

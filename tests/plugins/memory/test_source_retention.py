@@ -257,6 +257,9 @@ def _provider_for_source_tests():
     provider = object.__new__(HindsightMemoryProvider)
     provider._source_retain_keys = set()
     provider._source_retain_keys_lock = threading.Lock()
+    provider._source_submission_lock = threading.RLock()
+    provider._source_terminal_ops = set()
+    provider._deferred_source_candidates = {}
     provider._pending_retain_ops = set()
     provider._pending_retain_ops_lock = threading.Lock()
     provider._source_ledger = {}
