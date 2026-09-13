@@ -166,13 +166,15 @@ def test_full_marks_windows_native_work_as_remote_on_non_windows() -> None:
     assert "apps/desktop::check:test:desktop:all" in javascript.command
 
 
-def test_json_dry_run_binds_receipt_to_exact_head() -> None:
+@pytest.mark.parametrize("profile", ["smoke", "full"])
+def test_json_dry_run_binds_receipt_to_exact_head(profile) -> None:
     completed = subprocess.run(
         [
             sys.executable,
             str(PATH),
             "--profile",
-            "smoke",
+            profile,
+            "--allow-dirty",
             "--base",
             "HEAD",
             "--dry-run",
@@ -186,13 +188,35 @@ def test_json_dry_run_binds_receipt_to_exact_head() -> None:
         errors="replace",
     )
     payload = json.loads(completed.stdout)
-    assert payload["status"] == "passed"
+    assert payload["status"] == "planned"
+    assert payload["dry_run"] is True
     assert len(payload["head"]) == 40
     assert len(payload["base"]) == 40
     assert payload["results"]
     assert payload["duration_seconds"] >= 0
     assert "worktree_dirty_after" in payload
     assert {result["status"] for result in payload["results"]} <= {"planned", "remote_only"}
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_human_receipt_distinguishes_planning_from_execution(git_repo, monkeypatch, capsys, dry_run):
+    root, _ = git_repo
+    # Exercise the real runner and receipt boundary without invoking the full CI matrix.
+    monkeypatch.setattr(MODULE, "build_checks", lambda *args: [
+        MODULE.Check("fixture", (sys.executable, "-c", "print('executed')")),
+    ])
+    args = ["--profile", "smoke", "--repo-root", str(root)]
+    if dry_run:
+        args.append("--dry-run")
+    assert MODULE.main(args) == 0
+    output = capsys.readouterr().out
+    if dry_run:
+        assert "local CI planned" in output
+        assert "--dry-run" in output
+        assert "local CI passed" not in output
+    else:
+        assert "local CI passed" in output
+        assert "--dry-run" not in output
 
 
 def test_full_without_base_does_not_embed_the_tracked_file_inventory() -> None:
@@ -271,8 +295,9 @@ def test_type_change_selects_python_and_reaches_compile(git_repo):
     assert "code.py" in MODULE.changed_files(root, base, "HEAD")
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize("mutation", ["dirty", "untracked", "index", "hidden", "mode", "delete", "create", "symlink"])
-def test_mutation_receipt_binds_contents_and_index(git_repo, monkeypatch, capsys, mutation):
+def test_mutation_receipt_binds_contents_and_index(git_repo, monkeypatch, capsys, mutation, dry_run):
     import os
     root, git = git_repo
     source = root / "code.py"
@@ -312,9 +337,11 @@ def test_mutation_receipt_binds_contents_and_index(git_repo, monkeypatch, capsys
             (root / "link").symlink_to("after")
         return []
     monkeypatch.setattr(MODULE, "run_checks", mutate)
-    assert MODULE.main(["--profile", "fast", "--repo-root", str(root), "--json"]) == 1
+    args = ["--profile", "fast", "--repo-root", str(root), "--json"]
+    assert MODULE.main(args + (["--dry-run"] if dry_run else [])) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "failed"
+    assert payload["dry_run"] is dry_run
     assert any(r["name"] == "Worktree mutation guard" for r in payload["results"])
 
 

@@ -2418,9 +2418,11 @@ def save_config(
         managed = managed_scope.load_managed_config()
         if _raw_for_paths:
             from hermes_cli.model_presets import preserve_model_preset_references
-            namespace = _model_preset_namespace(_expand_env_vars(_raw_for_paths), _expand_env_vars(managed))
+            env_resolved_authored = _expand_env_vars(_raw_for_paths)
+            namespace = _model_preset_namespace(env_resolved_authored, _expand_env_vars(managed))
             normalized = preserve_model_preset_references(
-                normalized, _raw_for_paths, definitions=namespace.get("model_presets", {}))
+                normalized, _raw_for_paths, definitions=namespace.get("model_presets", {}),
+                env_resolved_authored=env_resolved_authored)
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))

@@ -451,7 +451,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--python-test", action="append", default=[])
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--json", action="store_true", dest="as_json")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="emit a planned receipt without executing checks (exit 0 is not a passing CI gate)",
+    )
     parser.add_argument("--allow-dirty", action="store_true")
     args = parser.parse_args(argv)
 
@@ -495,6 +498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     failed = any(result.status == "failed" for result in results)
     payload = {
         "profile": args.profile,
+        "dry_run": args.dry_run,
         "base": base_sha,
         "head": head_sha,
         "worktree_dirty": dirty,
@@ -502,7 +506,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "changed_files": paths,
         "results": [asdict(result) for result in results],
         "duration_seconds": round(time.monotonic() - started, 3),
-        "status": "failed" if failed else "passed",
+        # Exit 0 makes a valid plan useful to callers, but only executed checks
+        # can produce a passed receipt for an execution gate.
+        "status": "failed" if failed else "planned" if args.dry_run else "passed",
     }
     if args.as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -511,7 +517,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         remote = [result.name for result in results if result.status == "remote_only"]
         if remote:
             print(f"remote-only residuals: {', '.join(remote)}")
-        print(f"local CI {payload['status']}: {args.profile} at {head_sha[:12]}")
+        mode = " (--dry-run; checks not executed)" if args.dry_run else ""
+        print(f"local CI {payload['status']}{mode}: {args.profile} at {head_sha[:12]}")
     return 1 if failed else 0
 
 

@@ -250,6 +250,72 @@ def test_managed_preset_reference_survives_real_save_and_later_managed_edit(
     assert reloaded["auxiliary"]["vision"]["model"] == "later-managed-model"
 
 
+@pytest.mark.parametrize("strip_defaults", [True, False])
+@pytest.mark.parametrize("edit_route", [True, False])
+@pytest.mark.parametrize("managed_definition", [True, False])
+@pytest.mark.parametrize("selector", ["${FIXTURE_ROUTE}", "${env:FIXTURE_ROUTE}"])
+def test_env_selector_roundtrip_preserves_authorship(
+    tmp_path, monkeypatch, strip_defaults, edit_route, managed_definition, selector,
+):
+    from hermes_cli import config as c
+
+    home, managed = tmp_path / "home", tmp_path / "managed"
+    home.mkdir(); managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    # Expansion is one pass: the result is a literal preset name, not another lookup.
+    monkeypatch.setenv("FIXTURE_ROUTE", "${LITERAL_NAME}")
+    monkeypatch.setenv("LITERAL_NAME", "must-not-expand-twice")
+    monkeypatch.setenv("FIXTURE_MODEL", "fixture-model")
+    monkeypatch.setenv("FIXTURE_SECRET", "fixture-secret-not-for-yaml")
+    ref = {"model_preset": selector}
+    definition = {"provider": "openai", "model": "${FIXTURE_MODEL}"}
+    raw = {
+        "model_presets": {"${LITERAL_NAME}": definition},
+        "model": copy.deepcopy(ref),
+        "delegation": {**ref, "subagents": {"helper": copy.deepcopy(ref)}},
+        "auxiliary": {"vision": copy.deepcopy(ref)},
+        "fallback_providers": [copy.deepcopy(ref)],
+        "custom_providers": [{"name": "fixture", "api_key": "${FIXTURE_SECRET}"}],
+    }
+    if managed_definition:
+        (managed / "config.yaml").write_text(yaml.safe_dump({
+            "model_presets": {"${LITERAL_NAME}": {**definition, "model": "managed-model"}},
+        }))
+    path = home / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    loaded = c.load_config()
+    expected = "managed-model" if managed_definition else "fixture-model"
+    assert loaded["model"]["default"] == expected
+    sites = [loaded["model"], loaded["delegation"],
+             loaded["delegation"]["subagents"]["helper"],
+             loaded["auxiliary"]["vision"], loaded["fallback_providers"][0]]
+    loaded["display"]["show_thinking"] = False
+    if edit_route:
+        for site in sites:
+            site["default" if site is loaded["model"] else "model"] = "intentional-edit"
+    c.save_config(loaded, strip_defaults=strip_defaults)
+    saved = yaml.safe_load(path.read_text())
+    saved_sites = [saved["model"], saved["delegation"],
+                   saved["delegation"]["subagents"]["helper"],
+                   saved["auxiliary"]["vision"], saved["fallback_providers"][0]]
+    for site in saved_sites:
+        if edit_route:
+            assert "model_preset" not in site
+        else:
+            assert site["model_preset"] == ref["model_preset"]
+    assert "fixture-secret-not-for-yaml" not in path.read_text()
+    assert saved["custom_providers"][0]["api_key"] == "${FIXTURE_SECRET}"
+    monkeypatch.setenv("FIXTURE_MODEL", "later-model")
+    reloaded = c.load_config()
+    expected = "intentional-edit" if edit_route else "managed-model" if managed_definition else "later-model"
+    assert reloaded["model"]["default"] == expected
+    assert reloaded["delegation"]["model"] == expected
+    assert reloaded["delegation"]["subagents"]["helper"]["model"] == expected
+    assert reloaded["auxiliary"]["vision"]["model"] == expected
+    assert reloaded["fallback_providers"][0]["model"] == expected
+
+
 def test_managed_only_presets_do_not_create_authored_shells_in_empty_user_config(tmp_path, monkeypatch):
     from hermes_cli import config as c
 

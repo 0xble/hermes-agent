@@ -380,11 +380,14 @@ def expand_model_presets(config: Any) -> dict[str, Any]:
 
 def preserve_model_preset_references(
     config: dict[str, Any], authored: Any, *, definitions: dict[str, Any] | None = None,
+    env_resolved_authored: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Put unchanged named-route references back before a config write.
 
     ``load_config`` returns runtime-ready inline routes.  An unrelated config edit must not
     turn those routes into permanently flattened YAML, but an edited route must remain edited.
+    ``env_resolved_authored`` is the one-pass environment view used for comparisons;
+    ``authored`` remains the unexpanded source of references restored to disk.
     """
     if not isinstance(authored, dict):
         return config
@@ -392,7 +395,12 @@ def preserve_model_preset_references(
     namespace = authored.get("model_presets") if definitions is None else definitions
     if not namespace:
         return config
-    resolved_authored = {**authored, "model_presets": namespace}
+    # Resolve against the loader's one-pass environment view, but restore only raw
+    # authored references. Never expand the already-resolved definition namespace again.
+    resolved_authored = {
+        **(authored if env_resolved_authored is None else env_resolved_authored),
+        "model_presets": namespace,
+    }
     expanded_authored = expand_model_presets(resolved_authored)
     result = deepcopy(config)
 
@@ -416,7 +424,7 @@ def preserve_model_preset_references(
             key in actual_model and key not in raw_model and actual_model[key] not in (None, "", {}, [])
             for key in main_inline_fields
         ) if isinstance(actual_model, dict) else True
-        preset = _definitions(resolved_authored)[raw_model["model_preset"].strip()]
+        preset = _definitions(resolved_authored)[resolved_authored["model"]["model_preset"].strip()]
         reasoning_unchanged = (
             "reasoning_effort" not in preset
             or (result.get("agent") or {}).get("reasoning_effort")
