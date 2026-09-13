@@ -1022,3 +1022,27 @@ def test_captured_shell_stops_descendants_and_closes_input(cron_env, monkeypatch
         worker.join(timeout=10)
         if child_pid is not None and child_alive():
             psutil.Process(child_pid).kill()
+
+
+def test_captured_utf8_verifier_ignores_subprocess_stdin_encoding(cron_env, monkeypatch):
+    from cron.scheduler_script import _run_job_script
+
+    script = cron_env / "scripts" / "unicode_verifier.py"
+    script.write_text('raise RuntimeError("live script must not run")\n', encoding="utf-8")
+    snapshot = '''import json, sys
+value = "café 日次 🎉"
+expected = "caf\\u00e9 \\u65e5\\u6b21 \\U0001f389"
+print(json.dumps({"value": value, "stdin_encoding": sys.stdin.encoding}))
+raise SystemExit(0 if value == expected else 1)
+'''.encode("utf-8")
+    real_popen = subprocess.Popen
+
+    def encoded_stdin_popen(argv, **kwargs):
+        # Set a real redirected stream encoding, independently of the host OS.
+        kwargs["env"] = {**kwargs["env"], "PYTHONIOENCODING": "cp1252"}
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", encoded_stdin_popen)
+    ok, output = _run_job_script(str(script), script_snapshot=snapshot, timeout_seconds=5)
+    assert ok, output
+    assert json.loads(output) == {"value": "café 日次 🎉", "stdin_encoding": "cp1252"}

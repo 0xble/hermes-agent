@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
-from agent.context_compressor import _DB_PERSISTED_MARKER
+from agent.context_compressor import _DB_PERSISTED_MARKER, is_user_originated_turn
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
@@ -154,7 +154,7 @@ def _collapse_verification_candidates(messages, final_response, agent) -> bool:
     turn_start_index = max(
         (
             index for index, message in enumerate(messages)
-            if isinstance(message, dict) and message.get("role") == "user"
+            if is_user_originated_turn(message)
         ),
         default=-1,
     )
