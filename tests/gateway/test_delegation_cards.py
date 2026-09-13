@@ -71,7 +71,11 @@ def test_render_card_shows_lightning_only_for_observed_tool_activity():
 
 
 @pytest.mark.asyncio
-async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
+@pytest.mark.parametrize("chat_id,thread_id,business", [
+    ("42", None, None), ("42", None, "fixture-bc"),
+    ("42", "8", None), ("-10042", "9", None),
+])
+async def test_telegram_card_send_and_edit_keep_plain_bold_entities(chat_id, thread_id, business):
     """Cards use the normal MarkdownV2 formatter without quote entities on both operations."""
     from gateway.config import PlatformConfig
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -81,7 +85,8 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=7))
     adapter._bot.send_chat_action = AsyncMock()
-    source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, thread_id=thread_id,
+                           business_connection_id=business)
     content = render_card({"rows": {
         "root": dict(thread_ref="A", task_label="Repair receipt", subagent_type="worker", state="queued"),
         "child": dict(thread_ref="A.1", card_parent_identity="root", task_label="Verify card edit",
@@ -92,11 +97,19 @@ async def test_telegram_card_send_and_edit_keep_plain_bold_entities():
     }})
 
     sent = await adapter.send_delegation_card(source, content)
-    edited = await adapter.edit_message("42", "7", content, finalize=True)
+    assert sent.success and sent.message_id is not None
+    edited = await adapter.edit_message(chat_id, sent.message_id, content, finalize=True,
+        metadata={"telegram_business_connection_id": business})
 
     assert sent.success and edited.success
     send_kwargs = adapter._bot.send_message.call_args.kwargs
     edit_kwargs = adapter._bot.edit_message_text.call_args.kwargs
+    assert send_kwargs.get("business_connection_id") == business
+    assert edit_kwargs.get("business_connection_id") == business
+    assert send_kwargs.get("message_thread_id") == (int(thread_id) if thread_id else None)
+    assert not send_kwargs.get("reply_to_message_id")
+    assert send_kwargs["disable_notification"] is True
+    assert edit_kwargs["message_id"] == int(sent.message_id)
     assert send_kwargs["parse_mode"] == edit_kwargs["parse_mode"]
     sent_lines = send_kwargs["text"].splitlines()
     assert sent_lines[0] == "🧵 *Delegating tasks*"

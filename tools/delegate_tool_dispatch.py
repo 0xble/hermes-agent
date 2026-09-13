@@ -197,10 +197,23 @@ def _execute_and_aggregate(batch: _Batch, *, honor_parent_interrupt: bool = True
 
 
 def _execute_inline(batch: _Batch, *, honor_parent_interrupt: bool = True) -> dict:
-    """Persist every inline terminal unit before presenting it, including fallbacks."""
+    """Archive inline terminal units without losing already-executed work on storage failure."""
     from tools.async_delegation import persist_inline_result
     combined = _execute_and_aggregate(batch, honor_parent_interrupt=honor_parent_interrupt)
-    uid = persist_inline_result(combined, batch.delegation_metadata or {})
+    try:
+        uid = persist_inline_result(combined, batch.delegation_metadata or {})
+    except Exception:
+        logger.warning("Completed inline delegation could not be archived", exc_info=True)
+        archival = {
+            "status": "failed", "handle_available": False,
+            "note": "The child work already ran; its results are included. Archival failed, so no "
+                    "durable result handle is available. Do not rerun the work to recover the archive.",
+        }
+        combined["result_archival"] = archival
+        # Split background dispatches retain only each fallback entry, not the unit wrapper.
+        for entry in combined["results"]:
+            entry["result_archival"] = archival
+        return combined
     combined["delegation_id"] = uid
     for entry in combined["results"]:
         entry["result_delegation_id"] = uid

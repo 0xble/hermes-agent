@@ -531,7 +531,11 @@ def persist_inline_result(result: Dict[str, Any], metadata: Dict[str, Any]) -> s
              (metadata.get("owner") or {}).get("session_id", ""), _batch_status(result),
              now, now, now, json.dumps(result), json.dumps({"delegation_metadata": metadata}),
              projection["parent_task_id"], projection["owner_json"]))
-    _prune_durable_records()
+    # The archive is committed. A housekeeping failure must not hide its valid handle.
+    try:
+        _prune_durable_records()
+    except Exception:
+        logger.warning("Inline delegation %s archived; pruning deferred", delegation_id, exc_info=True)
     return delegation_id
 
 

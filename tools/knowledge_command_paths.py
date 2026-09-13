@@ -136,11 +136,21 @@ def _shell_paths(tokens: list[str], depth: int) -> tuple[list[str], list[str], l
         elif options and token.startswith("-"):
             if token == "--recursive" or (not token.startswith("--") and any(c in token[1:] for c in "rR")):
                 recursive = True
-            if name == "mv" and token in {"-t", "--target-directory", "-S", "--suffix"}:
-                target_directory |= token in {"-t", "--target-directory"}
-                index += 1
-            elif name == "mv" and token.startswith("--target-directory="):
-                target_directory = True
+            if name == "mv":
+                if token in {"--target-directory", "--suffix"}:
+                    target_directory |= token == "--target-directory"
+                    index += 1
+                elif token.startswith("--target-directory="):
+                    target_directory = True
+                elif not token.startswith("--"):
+                    # GNU short options cluster. -t and -S consume the remaining
+                    # token (or the next argv), so letters in their values are not flags.
+                    for position, option in enumerate(token[1:], start=1):
+                        if option in {"t", "S"}:
+                            target_directory |= option == "t"
+                            if position == len(token) - 1:
+                                index += 1
+                            break
         else:
             operands.append(token)
     if name == "rmdir" or (name == "rm" and recursive):

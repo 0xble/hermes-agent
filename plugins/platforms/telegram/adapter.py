@@ -4398,7 +4398,8 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_delegation_card(self, source, content: str) -> SendResult:
         """One thread-strict, non-notifying card. Never retry an ambiguous send."""
         from telegram.error import BadRequest, RetryAfter, Forbidden
-        metadata = {"thread_id": source.thread_id, "notify": False}
+        metadata = {"thread_id": source.thread_id, "notify": False,
+                    "telegram_business_connection_id": source.business_connection_id}
         thread_kwargs = self._thread_kwargs_for_send(
             source.chat_id, source.thread_id, metadata, reply_to_message_id=None,
             reply_to_mode="off")
