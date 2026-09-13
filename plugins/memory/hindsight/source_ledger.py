@@ -48,6 +48,10 @@ class SourceJournal:
                 pending = set(entry.get("pending_operation_ids", []))
                 previous_known = set(previous.get("operation_ids", []))
                 previous_pending = set(previous.get("pending_operation_ids", []))
+                if not accepted and entry.get("sequence", 0) < previous.get("sequence", 0):
+                    # Old completion/supersession proves nothing about a newer
+                    # acceptance of the same hash. Merge only operation evidence.
+                    entry = dict(previous, candidate=candidate)
                 # Concurrent provider instances can accept the same hash. An
                 # update may retire only IDs it actually observed as terminal.
                 entry["operation_ids"] = sorted(known | previous_known)
@@ -111,6 +115,9 @@ def save_source_entry(provider, candidate, *, accepted=False, **changes):
     if entry.get("status") != "superseded":
         entry.pop("superseded_by", None)
     if accepted:
+        previous = provider._source_ledger.get(candidate.automatic_key, {})
+        entry["operation_ids"] = sorted(set(previous.get("operation_ids", []))
+                                        | set(entry.get("operation_ids", [])))
         entry["sequence"] = max((e.get("sequence", 0) for e in provider._source_ledger.values()), default=0) + 1
     # Memory remains evidence if the local journal write fails. Never turn an
     # accepted remote operation into a retryable failed submission on disk error.

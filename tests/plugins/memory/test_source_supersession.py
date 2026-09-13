@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from plugins.memory import load_memory_provider
 from plugins.memory.hindsight import HindsightMemoryProvider
 from plugins.memory.hindsight.source_retention import discover_source_candidates
 
@@ -63,7 +64,8 @@ class Server:
 
 
 def provider(server):
-    result = HindsightMemoryProvider()
+    result = load_memory_provider("hindsight", register_skills=False)
+    assert isinstance(result, HindsightMemoryProvider)
     result._bank_id = "source-test"
     result._observation_scopes = []
     result._run_hindsight_operation = lambda operation: operation(server)
@@ -173,7 +175,8 @@ def test_superseded_source_settles_without_verifying_stale_hash(old_status, rest
                                  pending_operation_ids=["concurrent"]), accepted=True)
     preserved = journal.save(stale)
     assert preserved["pending_operation_ids"] == ["concurrent"]
-    journal.save(dict(preserved, pending_operation_ids=[]))
+    assert preserved["status"] == "accepted"  # stale completion cannot settle a new acceptance
+    journal.save(dict(preserved, status="completed", pending_operation_ids=[]))
     terminal = journal.save(accepted)
     assert not terminal["pending_operation_ids"]
     assert terminal["status"] == "completed"
@@ -237,3 +240,79 @@ def test_unsettled_source_evidence_survives_timeout_and_restart(scenario, monkey
         assert p._source_ledger[old.automatic_key]["status"] == "completed"
         assert "superseded_by" not in p._source_ledger[old.automatic_key]
     assert len(server.calls) == 2
+
+
+@pytest.mark.parametrize("old_settlement", ["completed", "superseded"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_fresh_source_reversion_preserves_history_and_replay_dedup(old_settlement, restart):
+    old, new = versions()
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    if old_settlement == "completed":
+        server.statuses["0"] = "completed"
+        server.hash = old.content_hash
+        assert p._wait_for_retains_drained(30)
+        p._retain_source_candidates([old], p._bank_id)
+        assert len(server.calls) == 1
+    p._retain_source_candidates([new], p._bank_id)
+    server.statuses.update({"0": "completed", "1": "completed"})
+    server.hash = new.content_hash
+    assert p._wait_for_retains_drained(30)
+    historical = p._source_journal.load()[old.automatic_key]
+    assert historical["status"] == old_settlement
+    previous_sequence = p._source_ledger[new.automatic_key]["sequence"]
+    if restart:
+        p = provider(server)
+    p._retain_source_candidates([new], p._bank_id)
+    p._retain_source_candidates([old, new], p._bank_id)
+    assert len(server.calls) == 2
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == 3
+    assert old.automatic_key not in p._source_retain_verified
+    entry = p._source_journal.load()[old.automatic_key]
+    assert entry["sequence"] > previous_sequence
+    assert entry["operation_ids"] == ["0", "2"]
+    assert entry["pending_operation_ids"] == ["2"]
+    assert "superseded_by" not in entry
+    # A stale instance's terminal snapshot is not evidence about this acceptance.
+    p._source_journal.save(historical)
+    persisted = p._source_journal.load()[old.automatic_key]
+    assert persisted["status"] == "accepted"
+    assert "superseded_by" not in persisted
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == 3  # the new acceptance is still pending
+    server.statuses["2"] = "completed"
+    server.hash = old.content_hash
+    assert p._wait_for_retains_drained(30)
+    p = provider(server)
+    assert p._wait_for_retains_drained(30)
+    p._retain_source_candidates([old], p._bank_id)
+    p._retain_source_candidates([new, old], p._bank_id)
+    assert len(server.calls) == 3
+    assert all(call["document_id"] == old.source_id for call in server.calls)
+    assert p._source_ledger[old.automatic_key]["operation_ids"] == ["0", "2"]
+
+
+@pytest.mark.parametrize("successor", ["completed", "failed", "submit_failed"])
+def test_reversion_waits_for_pending_evidence_before_fresh_observation(successor):
+    old, new = versions()
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    if successor == "submit_failed":
+        server.reject_hash = new.content_hash
+    p._retain_source_candidates([new], p._bank_id)
+    server.statuses["1"] = "failed" if successor == "failed" else "completed"
+    server.hash = new.content_hash if successor == "completed" else old.content_hash
+    assert not p._wait_for_retains_drained(10)
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == 2
+    assert "0" in p._pending_retain_ops
+    server.statuses["0"] = "completed"
+    assert p._wait_for_retains_drained(30)
+    # Recovery never replays stored payloads. A new source observation can now
+    # revert a successful successor, but a failed successor is no supersession.
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == (3 if successor == "completed" else 2)

@@ -1373,15 +1373,28 @@ class HindsightMemoryProvider(MemoryProvider):
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         return self._run_hindsight_operation(lambda client: client.aretain_batch(**kwargs))
 
-    def _source_candidate_already_submitted(self, candidate: SourceCandidate) -> bool:
+    def _source_candidate_already_submitted(self, candidate: SourceCandidate, *,
+                                             allow_reversion: bool = True) -> bool:
         key = candidate.automatic_key
         with self._source_retain_keys_lock:
-            entry = self._source_ledger.get(key)
-            if entry and (entry.get("pending_operation_ids") or
-                          entry["status"] in {"queued", "accepted", "completed", "superseded"}):
+            entry = self._source_ledger.get(key, {})
+            if entry.get("pending_operation_ids") or entry.get("status") in {"queued", "accepted"}:
+                # Reconcile existing operations first; never replay a stored
+                # payload on recovery. A later fresh observation can retry.
                 return True
+            if entry.get("status") in {"completed", "superseded"}:
+                later = any(e["candidate"].source_id == candidate.source_id
+                            and e.get("sequence", 0) > entry.get("sequence", 0)
+                            and e["status"] in {"accepted", "completed", "superseded"}
+                            for e in self._source_ledger.values())
+                if not allow_reversion or not later:
+                    return True
             self._source_retain_keys.add(key)
-            self._source_ledger[key] = {"candidate": candidate, "status": "queued"}
+            self._source_retain_verified.discard(key)
+            # Keep historical operation references until the new acceptance is
+            # journaled; a disk error must not erase their in-memory evidence.
+            self._source_ledger[key] = dict(entry, candidate=candidate, status="queued")
+            self._source_ledger[key].pop("superseded_by", None)
         return False
 
     def _source_candidate_failed(self, candidate: SourceCandidate) -> None:
@@ -1390,10 +1403,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._source_retain_keys.discard(candidate.automatic_key)
             save_source_entry(self, candidate, status="failed")
 
-    def _retain_source_candidate(self, candidate: SourceCandidate, bank_id: str) -> None:
+    def _retain_source_candidate(self, candidate: SourceCandidate, bank_id: str, *,
+                                 allow_reversion: bool = True) -> None:
         """Submit one automatically discovered source and track its durability."""
         restore_source_ledger(self, bank_id)
-        if self._source_candidate_already_submitted(candidate):
+        if self._source_candidate_already_submitted(candidate, allow_reversion=allow_reversion):
             logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
             return
         try:
@@ -1430,9 +1444,13 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _retain_source_candidates(self, candidates: list[SourceCandidate], bank_id: str) -> None:
         """Fail soft per candidate: one bad source must not drop the rest of the batch."""
-        for candidate in candidates:
+        # Earlier observations may introduce unseen versions, but cannot revive
+        # historical hashes ahead of the batch's last observation of that source.
+        latest = {candidate.source_id: index for index, candidate in enumerate(candidates)}
+        for index, candidate in enumerate(candidates):
             try:
-                self._retain_source_candidate(candidate, bank_id)
+                self._retain_source_candidate(candidate, bank_id,
+                                              allow_reversion=index == latest[candidate.source_id])
             except Exception as exc:
                 logger.warning("Hindsight source retain failed: type=%s, id=%s, error=%s",
                                candidate.source_type, candidate.source_id, exc, exc_info=True)
