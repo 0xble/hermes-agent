@@ -617,18 +617,21 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
         media_path = descriptor[0] if isinstance(descriptor, (list, tuple)) and descriptor else None
         if not isinstance(media_path, str) or not media_path:
             return {"error": f"Adapter media send failed: invalid media descriptor {index + 1}/{total}",
-                    "_text_message_id": text_message_id, "_media_delivered": delivered}
+                    "_text_message_id": text_message_id, "_media_delivered": delivered,
+                    "_media_message_ids": list(media_message_ids)}
         is_voice = len(descriptor) > 1 and bool(descriptor[1])
         if not os.path.exists(media_path):
             return {"error": f"Adapter media send failed: media file {index + 1}/{total} was not found",
-                    "_text_message_id": text_message_id, "_media_delivered": delivered}
+                    "_text_message_id": text_message_id, "_media_delivered": delivered,
+                    "_media_message_ids": list(media_message_ids)}
         ext = os.path.splitext(media_path)[1].lower()
         method_name, media_kind = _adapter_media_method(ext, is_voice or ext in _AUDIO_EXTS, force_document)
         adapter_method = getattr(type(adapter), method_name, None)
         if adapter_method is None or adapter_method is getattr(BasePlatformAdapter, method_name):
             return {"error": (f"Live adapter does not implement native {media_kind} delivery; "
                               f"media file {index + 1}/{total} was not sent"),
-                    "_text_message_id": text_message_id, "_media_delivered": delivered}
+                    "_text_message_id": text_message_id, "_media_delivered": delivered,
+                    "_media_message_ids": list(media_message_ids)}
         try:
             last_result = await getattr(adapter, method_name)(
                 chat_id, media_path, caption=caption if index == 0 else None, reply_to=thread_id, metadata=metadata)

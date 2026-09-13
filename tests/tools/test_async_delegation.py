@@ -1287,12 +1287,16 @@ def test_persist_failure_after_checkpoint_does_not_enqueue(tmp_path, monkeypatch
     assert payload["result"] == {"summary": "exact parked result"}
 
 
-def test_retry_exhaustion_parks_result_until_one_explicit_bounded_recovery(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retained_card", [False, True])
+def test_retry_exhaustion_parks_result_until_one_explicit_bounded_recovery(tmp_path, monkeypatch, retained_card):
     """A bad destination cannot erase a completed result or spin forever after restart."""
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
     event = {"type": "async_delegation", "delegation_id": "recover-me", "session_key": "unavailable",
              "status": "completed", "summary": "unchanged result", "dispatched_at": 1.0, "completed_at": 2.0}
-    ad._persist_dispatch({"delegation_id": "recover-me", "session_key": "unavailable", "dispatched_at": 1.0})
+    metadata = {"parent_task_id": "a" * 32, "owner": {"session_id": "parent"},
+                "threads": [{"thread_ref": "A", "task_label": "Task A"}]}
+    ad._persist_dispatch({"delegation_id": "recover-me", "session_key": "unavailable", "dispatched_at": 1.0,
+                          **({"delegation_metadata": metadata} if retained_card else {})})
     ad._persist_completion(event, {"summary": "unchanged result"})
 
     for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):

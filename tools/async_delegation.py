@@ -726,7 +726,7 @@ def restore_undelivered_completions(target_queue) -> int:
                 continue
             age_basis = completed_at or dispatched_at
             if attempts >= _MAX_DELIVERY_ATTEMPTS or (
-                    delivery_state == 'pending' and age_basis
+                    delivery_state == 'pending' and not recovery_attempts and age_basis
                     and now - age_basis > _MAX_COMPLETION_REPLAY_AGE_S
                     and _has_retained_result(task_json, result_json)):
                 conn.execute("""UPDATE async_delegations SET delivery_state='pending_recovery',

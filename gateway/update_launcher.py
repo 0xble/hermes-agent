@@ -13,6 +13,10 @@ _UPDATE_HANDOFF = "Update accepted. End this turn now; the native updater owns c
 _MAX_PARENT_DEPTH = 32
 
 
+class UpdateChildNotStarted(RuntimeError):
+    """The native process-creation boundary proved no updater was started."""
+
+
 def validate_agent_update_reason(reason: object) -> str:
     """Return a bounded single-paragraph reason before any IPC or state mutation."""
     if not isinstance(reason, str):
@@ -68,9 +72,21 @@ def launch_native_update(
                 marker.flush()
                 os.fsync(marker.fileno())
             os.replace(staging_path, pending_path)
-            # Publication is the uncertainty fence, including interruption before
-            # spawn or an exception after a child may have started. Never retract it.
-            spawn(hermes_cmd, output_path, exit_code_path)
+            published = pending_path.stat()
+            # Publication is the uncertainty fence. Only a classified failure at
+            # the actual process-creation boundary can retract our exact marker.
+            try:
+                spawn(hermes_cmd, output_path, exit_code_path)
+            except UpdateChildNotStarted:
+                if not claimed_path.exists():
+                    try:
+                        current = pending_path.stat()
+                        if ((current.st_dev, current.st_ino) == (published.st_dev, published.st_ino)
+                                and pending_path.read_bytes() == encoded):
+                            pending_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
         finally:
             _release_file_lock(lock)
     return {"started": True, "pending": False}

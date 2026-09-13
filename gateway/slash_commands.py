@@ -169,6 +169,17 @@ def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
         return argv, None
 
 
+def _popen_detached_update(*args, **kwargs):
+    """Classify only definite exec failures, never errors after a returned child."""
+    import subprocess
+    from gateway.update_launcher import UpdateChildNotStarted
+
+    try:
+        return subprocess.Popen(*args, **kwargs)
+    except (FileNotFoundError, PermissionError) as exc:
+        raise UpdateChildNotStarted(str(exc)) from exc
+
+
 def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
     Under systemd the spawn is first placed in a transient user scope (see
@@ -183,7 +194,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     import subprocess
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
-        subprocess.Popen(
+        _popen_detached_update(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
              sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
@@ -201,12 +212,12 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
     scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
     if scoped_env is not None:
-        subprocess.Popen(
+        _popen_detached_update(
             scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=scoped_env,
         )
     else:
-        subprocess.Popen(
+        _popen_detached_update(
             scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )

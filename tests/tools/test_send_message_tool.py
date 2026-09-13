@@ -1971,6 +1971,25 @@ class TestPartialDeliveryReceipts:
         assert result["delivered_media_message_ids"] == ["m-img"]
         assert "media_delivered" not in result
 
+    @pytest.mark.parametrize("failure", ["invalid", "missing", "unsupported"])
+    def test_validation_after_media_send_preserves_receipt(self, monkeypatch, tmp_path, failure):
+        good = tmp_path / "chart.png"
+        good.write_bytes(b"fixture")
+        bad = tmp_path / "report.pdf"
+        if failure == "unsupported":
+            bad.write_bytes(b"fixture")
+
+        class MediaAdapter:
+            async def send_image_file(self, chat_id, path, **kw):
+                return SimpleNamespace(success=True, message_id="confirmed-image", error=None)
+
+        descriptor = () if failure == "invalid" else (str(bad), False)
+        result = self._send_live(monkeypatch, MediaAdapter(), "", [(str(good), False), descriptor])
+        assert "error" in result
+        assert result["media_partial_count"] == 1
+        assert result["delivered_media_message_ids"] == ["confirmed-image"]
+        assert not result.get("success")
+
     def test_partial_failure_without_confirmed_media_ids_omits_field(self, monkeypatch, tmp_path):
         """Text landed, first media failed: nothing to reconcile, so the
         reconciliation field is absent rather than an empty list. Two files

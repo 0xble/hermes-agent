@@ -555,10 +555,13 @@ __all__ = [
 
 def latest_user_task_from_messages(messages: Optional[list]) -> Optional[str]:
     """Return the latest user-authored text from active request messages."""
+    from agent.context_compressor import user_originated_turn_view
+
     for message in reversed(messages or []):
-        if not isinstance(message, dict) or message.get("role") != "user":
+        live_user = user_originated_turn_view(message)
+        if live_user is None:
             continue
-        content = message.get("content")
+        content = live_user.get("content")
         if isinstance(content, str):
             text = content.strip()
             return text or None

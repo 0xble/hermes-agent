@@ -121,3 +121,76 @@ def test_unresolved_publication_is_never_reclaimed_on_restart(tmp_path, monkeypa
     }
     spawn.assert_not_called()
     assert {p.name: p.read_bytes() for p in tmp_path.glob(".update*")} == before
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError])
+def test_real_launch_boundary_releases_definite_child_failure(tmp_path, monkeypatch, failure):
+    import subprocess
+    from gateway.slash_commands import _spawn_detached_update
+    from gateway.update_launcher import UpdateChildNotStarted
+
+    def fail_popen(*args, **kwargs):
+        raise failure("fixture executable unavailable")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    with pytest.raises(UpdateChildNotStarted):
+        launch_native_update(home=tmp_path, hermes_cmd=["fixture"], pending={"reason": "first"},
+                             spawn=_spawn_detached_update)
+    assert not (tmp_path / ".update_pending.json").exists()
+    calls = []
+    result = launch_native_update(home=tmp_path, hermes_cmd=["fixture"], pending={"reason": "retry"},
+                                 spawn=lambda *args: calls.append(args))
+    assert result["started"] and len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError, PermissionError, RuntimeError])
+def test_unclassified_spawn_error_keeps_uncertainty_fence(tmp_path, failure):
+    def spawn(*args):
+        raise failure("not known to originate at Popen")
+
+    with pytest.raises(failure):
+        launch_native_update(home=tmp_path, hermes_cmd=["fixture"], pending={"reason": "first"}, spawn=spawn)
+    assert (tmp_path / ".update_pending.json").exists()
+
+
+@pytest.mark.parametrize("replacement", ["claimed", "different_inode", "changed_content"])
+def test_definite_failure_never_releases_another_marker(tmp_path, monkeypatch, replacement):
+    from gateway.slash_commands import _spawn_detached_update
+    from gateway.update_launcher import UpdateChildNotStarted
+
+    marker = tmp_path / ".update_pending.json"
+    claimed = tmp_path / ".update_pending.claimed.json"
+    preserved = {}
+
+    def fail_popen(*args, **kwargs):
+        if replacement == "claimed":
+            marker.rename(claimed)
+        elif replacement == "different_inode":
+            # Identical bytes are insufficient evidence of marker ownership.
+            other = tmp_path / "replacement"
+            other.write_bytes(marker.read_bytes())
+            other.replace(marker)
+        else:
+            marker.write_text('{"reason":"another owner"}')
+        preserved.update({p.name: p.read_bytes() for p in (marker, claimed) if p.exists()})
+        raise FileNotFoundError("fixture executable unavailable")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+    with pytest.raises(UpdateChildNotStarted):
+        launch_native_update(home=tmp_path, hermes_cmd=["fixture"], pending={"reason": "first"},
+                             spawn=_spawn_detached_update)
+    assert {p.name: p.read_bytes() for p in (marker, claimed) if p.exists()} == preserved
+
+
+def test_missing_executable_releases_admission_at_real_popen(tmp_path):
+    from gateway.slash_commands import _popen_detached_update
+    from gateway.update_launcher import UpdateChildNotStarted
+
+    # Exercise real OS process creation with no update command or executable.
+    def spawn(*args):
+        _popen_detached_update([str(tmp_path / "absent-executable")])
+
+    with pytest.raises(UpdateChildNotStarted) as failure:
+        launch_native_update(home=tmp_path, hermes_cmd=["fixture"], pending={"reason": "first"}, spawn=spawn)
+    assert isinstance(failure.value.__cause__, FileNotFoundError)
+    assert not (tmp_path / ".update_pending.json").exists()
