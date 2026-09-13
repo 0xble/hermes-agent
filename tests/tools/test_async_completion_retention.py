@@ -93,3 +93,36 @@ def test_exhaustion_pruning_preserves_uncertain_or_recoverable_work(tmp_path, mo
         assert ad.get_delegation_result('protected', owner=metadata['owner'])['result'] == {'summary': 'protected'}
     if protection == 'unused_recovery':
         assert ad.recover_completion_delivery('protected')
+
+
+def test_pruner_locks_eligibility_snapshot_against_second_connection(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setattr(ad, '_db_path', lambda: tmp_path / 'async.db')
+    monkeypatch.setattr(ad, '_MAX_DELIVERY_ATTEMPTS', 1)
+    exhausted('contended', time.time())
+    original = ad._has_retained_result
+    checked = []
+    contender = sqlite3.connect(tmp_path / 'async.db', timeout=0)
+    def race(task, result):
+        if not checked:
+            try:
+                contender.execute("UPDATE async_delegations SET owner_json=? WHERE delegation_id=?",
+                                  ('{"owner":"new"}', 'contended'))
+                contender.commit()
+            except sqlite3.OperationalError as exc:
+                contender.rollback()
+                checked.append(str(exc))
+            else:
+                checked.append('concurrent metadata update committed')
+        return original(task, result)
+    monkeypatch.setattr(ad, '_has_retained_result', race)
+    try:
+        ad._prune_durable_records()
+        assert checked == ['database is locked']
+        # The claim is transaction-scoped, not a leaked cross-process lock.
+        contender.execute("UPDATE async_delegations SET owner_json=? WHERE delegation_id=?",
+                          ('{"owner":"after"}', 'contended'))
+        contender.commit()
+        assert contender.execute("SELECT owner_json FROM async_delegations WHERE delegation_id='contended'").fetchone() == ('{"owner":"after"}',)
+    finally:
+        contender.close()

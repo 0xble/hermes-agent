@@ -367,6 +367,9 @@ def _prune_durable_records() -> None:
     """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
+        # SELECT alone does not begin sqlite3's implicit write transaction.
+        # Fence competing claims/metadata changes before deciding eligibility.
+        conn.execute("BEGIN IMMEDIATE")
         exhausted = conn.execute("""SELECT delegation_id, task_json, result_json, event_json,
                         parent_task_id, thread_number, task_label, owner_json
                FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled')
