@@ -116,14 +116,21 @@ def test_failure_without_result_never_grants_resume_while_worker_can_write(tmp_p
     db, definitions, parent = stopped_fixture(tmp_path, monkeypatch)
     db.patch_session_model_config("child", {"_delegation_user_stopped": False})
     assert db.acquire_session_turn_lease("child", "old-worker", ttl_seconds=60)
-    child = SimpleNamespace(_session_db=db, session_id="child", _delegation_named_type="advisor")
+    metadata = json.loads(db.get_session("child")["model_config"])["_delegation_launch"]
+    # A real admitted child has its frozen runtime identity before execution.
+    # The interrupted checkpoint must preserve it while the worker lease fences resume.
+    child = SimpleNamespace(_session_db=db, session_id="child", _delegation_named_type="advisor",
+                            provider=metadata["provider"], model=metadata["model"],
+                            _delegation_launch_metadata=metadata)
     entry = {"status": status}
     checkpoint_child_resume(child, None, entry, child_task_id="old-worker")
     assert not entry["resume_available"]
     assert json.loads(db.get_session("child")["model_config"])["_delegation_completed"] is False
     assert not db.claim_delegated_resumes(["child"], claim_id="no-receipt")
-    token = _resolve_resume_launch({"resume_session_id": "child", "resume_authorization": authorization()},
-                                   definitions, parent).resume_recovery
+    launch = _resolve_resume_launch({"resume_session_id": "child", "resume_authorization": authorization()},
+                                    definitions, parent)
+    assert (launch.credentials["provider"], launch.credentials["model"]) == (child.provider, child.model)
+    token = launch.resume_recovery
     assert not db.claim_delegated_resumes(["child"], claim_id="live-worker", reconciliations={"child": token})
     db.append_message("child", role="assistant", content="Late worker checkpoint")
     db.release_session_turn_lease("child", "old-worker")
