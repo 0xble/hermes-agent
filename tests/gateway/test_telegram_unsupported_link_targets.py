@@ -72,7 +72,7 @@ class TestLegacyMarkdownV2LinkDegrade:
 
     def test_numeric_link_inside_multi_backtick_code_stays_literal(self):
         text = "``x ` y [3](https://example.com/source)``"
-        assert self._adapter().format_message(text) == text
+        assert self._adapter().format_message(text) == r"`x \` y [3](https://example.com/source)`"
 
     def test_numeric_link_inside_multiline_code_stays_literal(self):
         text = "`line one\n[3](https://example.com/source)\nline three`"

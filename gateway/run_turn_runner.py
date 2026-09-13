@@ -667,6 +667,8 @@ class TurnRunner:
             return False
         st.recovered_stale_anchor_ids.add(stale_anchor_id)
         replacement = await self._send_progress_text(st, text)
+        if st.cancel_saw_ambiguous_send:
+            return True
         replacement_id = getattr(replacement, "message_id", None)
         # The stale snapshot gets one replacement attempt, never a line-by-line
         # replay on the next tick or cancellation. Later updates remain eligible.
@@ -700,6 +702,10 @@ class TurnRunner:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
+        if st.cancel_saw_ambiguous_send:
+            # This turn may already have a visible bubble with a lost receipt. A
+            # suppressed send is not acceptance and must never retire its lines.
+            return SendResult(success=False, error="progress_send_ambiguous", retryable=False)
         ctx = self._ctx
         receipt = asyncio.create_task(st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
@@ -712,6 +718,7 @@ class TurnRunner:
             # a missing message id.
             result = await asyncio.shield(receipt)
         except asyncio.CancelledError:
+            st.cancel_saw_ambiguous_send = True
             self._retain_progress_send_receipt(st, receipt)
             raise
         except Exception:
@@ -724,6 +731,7 @@ class TurnRunner:
                 st.pending_send_receipt = None
         if result is None:
             st.cancel_saw_ambiguous_send = True
+            return SendResult(success=False, error="progress_send_ambiguous", retryable=False)
         self._track_progress_result(result, st.adapter)
         return result
 
@@ -775,6 +783,8 @@ class TurnRunner:
         Returns True when it delivered/split the buffer or a transient edit failure left it
         intact for retry — either way the caller skips the normal send/edit path this tick.
         """
+        if st.cancel_saw_ambiguous_send:
+            return True
         if not st.progress_lines or not st.can_edit:
             return False
         groups = self._split_progress_groups(st, st.progress_lines)
@@ -800,6 +810,8 @@ class TurnRunner:
             groups = groups[1:]
         for group in groups:
             result = await self._send_progress_text(st, self._progress_text(group))
+            if st.cancel_saw_ambiguous_send:
+                return True
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
         # The newest continuation is the only mutable bubble: keep just its lines so later

@@ -452,7 +452,7 @@ _EXPLICIT_NUMERIC_CITATION_RE = re.compile(r'\[\[(\d+)\]\(([^()]*(?:\([^()]*\)[^
 _SUPPORTED_LINK_TARGET_RE = re.compile(r'(?i)^(?:https?://|tg://)\S+$')
 # Regions where link syntax is literal content: inline code spans (any backtick run, multi-line included),
 # every rich structural region, and indented code blocks.
-_INLINE_CODE_SPAN_RE = re.compile(r'(?P<inline_code_ticks>`+)(?!`)[\s\S]+?(?P=inline_code_ticks)(?!`)')
+_INLINE_CODE_SPAN_RE = re.compile(r'(?<!`)(?P<inline_code_ticks>`+)(?!`)[\s\S]+?(?<!`)(?P=inline_code_ticks)(?!`)')
 _LINK_SCRUB_PROTECT_RE = re.compile(
     _INLINE_CODE_SPAN_RE.pattern
     + r'|'
@@ -6181,13 +6181,13 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             _is_dm_topic = self._dm_topic_fallback(metadata)
             message_thread_id = self._message_thread_id_for_typing(self._metadata_thread_id(metadata))
-            await self._run_send_call(chat_id, _send_action, include_thread=True, _reserve_gap=False)
+            await self._run_send_call(chat_id, _send_action, include_thread=True, _reserve_gap=False, _expendable=True)
         except Exception as e:
             # DM topic lanes: Telegram may reject message_thread_id — retry without it so the indicator at
             # least appears in the main DM view.
             if _is_dm_topic and message_thread_id is not None:
                 try:
-                    await self._run_send_call(chat_id, _send_action, include_thread=False, _reserve_gap=False)
+                    await self._run_send_call(chat_id, _send_action, include_thread=False, _reserve_gap=False, _expendable=True)
                     return
                 except Exception as fallback_exc:
                     if self._is_transient_typing_error(fallback_exc):
@@ -6244,9 +6244,21 @@ class TelegramAdapter(BasePlatformAdapter):
             body = raw[open_end:][:-3].replace('\\', '\\\\').replace('`', '\\`')
             return _ph(raw[:open_end] + body + '```')
 
-        text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', _protect_fenced, text)
-        # 2) Protect inline code (`...` or a matching multi-backtick span); escape \ per MarkdownV2 spec.
-        text = _INLINE_CODE_SPAN_RE.sub(lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
+        # A backtick run in prose is an inline delimiter, not a fenced block.
+        text = re.sub(r'^ {0,3}```[^`\n]*\n[\s\S]*?^ {0,3}```(?!`)', _protect_fenced, text, flags=re.MULTILINE)
+        # 2) CommonMark permits longer inline delimiters; Telegram CODE uses one
+        # backtick and escapes literal backticks/backslashes inside the body.
+        def _protect_inline(m):
+            ticks = m.group('inline_code_ticks')
+            body = m.group(0)[len(ticks):-len(ticks)]
+            if len(ticks) > 1:
+                body = re.sub(r'\r\n?|\n', ' ', body)
+                if body.startswith(' ') and body.endswith(' ') and body.strip(' '):
+                    body = body[1:-1]
+            body = body.replace('\\', '\\\\').replace('`', '\\`')
+            return _ph('`' + body + '`')
+
+        text = _INLINE_CODE_SPAN_RE.sub(_protect_inline, text)
         # 3) Explicit citations and links: escape display text; inside the URL only ')' and '\\' need escaping. Targets Telegram
         # cannot render (schemeless destinations, @session: references) degrade to the escaped display text
         # so the raw bracket syntax is never exposed (#97497).
