@@ -926,8 +926,10 @@ def _resolve_real_profile_cdp(
     # single identity-routing seam both browser lanes share.
     try:
         from tools.browser_tool import _get_cdp_override_raw, _get_cloud_provider, _real_profile_cdp
-    except Exception as e:  # pragma: no cover — stubbed browser_tool in tests
+    except Exception as e:
         logger.debug("real-profile backend resolution unavailable: %s", e)
+        if identity is not None:
+            return "Could not initialize real-profile backend routing for the named browser identity"
         return None
 
     try:
@@ -1198,6 +1200,11 @@ def _browser_exec(
     )
     if rp_err:
         return tool_error(rp_err)
+    if resolved_identity is not None and (
+        not env.get(_REAL_PROFILE_SENTINEL) or not _has_cdp_env(env)
+    ):
+        return tool_error("Named browser identities require a verified real-profile browser route; "
+                          "Hermes will not fall back to another browser")
     if headed is not None and not env.get(_REAL_PROFILE_SENTINEL):
         return tool_error(
             "headed can only control a Hermes-managed local real-profile browser. "

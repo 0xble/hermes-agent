@@ -394,7 +394,9 @@ class TestBrowserUseIdentityRouting:
             lambda: _browser_cfg(),
         )
         monkeypatch.setattr(
-            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+            bu, "_resolve_real_profile_cdp", lambda env, **kwargs: env.update(
+                {"BU_CDP_URL": "http://127.0.0.1:9229", bu._REAL_PROFILE_SENTINEL: "1"}
+            )
         )
         monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
 
@@ -422,7 +424,9 @@ class TestBrowserUseIdentityRouting:
             lambda: _browser_cfg(),
         )
         monkeypatch.setattr(
-            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+            bu, "_resolve_real_profile_cdp", lambda env, **kwargs: env.update(
+                {"BU_CDP_URL": "http://127.0.0.1:9229", bu._REAL_PROFILE_SENTINEL: "1"}
+            )
         )
         monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
 
@@ -451,7 +455,9 @@ class TestBrowserUseIdentityRouting:
             lambda: _browser_cfg(),
         )
         monkeypatch.setattr(
-            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+            bu, "_resolve_real_profile_cdp", lambda env, **kwargs: env.update(
+                {"BU_CDP_URL": "http://127.0.0.1:9229", bu._REAL_PROFILE_SENTINEL: "1"}
+            )
         )
         routed_sessions = []
 
@@ -494,7 +500,9 @@ class TestBrowserUseIdentityRouting:
             lambda: cfg,
         )
         monkeypatch.setattr(
-            bu, "_resolve_real_profile_cdp", lambda *args, **kwargs: None
+            bu, "_resolve_real_profile_cdp", lambda env, **kwargs: env.update(
+                {"BU_CDP_URL": "http://127.0.0.1:9229", bu._REAL_PROFILE_SENTINEL: "1"}
+            )
         )
         monkeypatch.setattr(bu, "_resolve_backend_cdp", lambda *args, **kwargs: None)
 

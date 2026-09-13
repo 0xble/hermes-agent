@@ -17,7 +17,7 @@ def identity(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_real_profile_consented", lambda: True)
     monkeypatch.setattr("hermes_cli.browser_identity.resolve_browser_identity", lambda name: value if name else None)
     monkeypatch.setattr("hermes_cli.browser_identity.configured_identity_aliases", lambda cfg: ("work",))
-    monkeypatch.setattr(cli, "_has_cdp_env", lambda env: False)
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
     monkeypatch.setattr("tools.browser_tool._get_cdp_override_raw", lambda: None)
     return value
 
