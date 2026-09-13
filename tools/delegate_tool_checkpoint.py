@@ -88,6 +88,19 @@ def is_unadmitted_resume(child):
         child, "_delegation_resume_admitted", False)
 
 
+def _checkpoint_route_patch(child):
+    """Freeze execution identity even when unresolved effects prohibit resuming."""
+    from tools.delegate_tool import _refresh_resumable_launch_metadata
+
+    patch = {"_delegation_active_route": {
+        "provider": getattr(child, "provider", None), "model": getattr(child, "model", None),
+    }}
+    launch = deepcopy(getattr(child, "_delegation_launch_metadata", None))
+    if isinstance(launch, dict):
+        patch["_delegation_launch"] = _refresh_resumable_launch_metadata(child, launch)
+    return patch
+
+
 def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
     # Both exception and structured early-result paths arrive here. Neither may
     # clear the exact claim/rollback snapshot or publish the predecessor's history
@@ -95,7 +108,7 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
     if is_unadmitted_resume(child):
         entry["resume_available"] = False
         return
-    from tools.delegate_tool import _resume_history_is_safe, _refresh_resumable_launch_metadata
+    from tools.delegate_tool import _resume_history_is_safe
     outcome = "error" if entry.get("status") == "failed" else entry.get("status")
     if outcome in {"completed", "budget_exhausted", "interrupted", "error", "timeout"}:
         db = getattr(child, "_session_db", None)
@@ -130,6 +143,7 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
             if db is not None:
                 try:
                     db.patch_session_model_config(child.session_id, {
+                        **_checkpoint_route_patch(child),
                         "_delegation_completed": False, "_delegation_outcome": outcome,
                         "_delegation_process_owner_task_ids": owners,
                         "_delegation_user_stopped": getattr(child, "_delegation_user_stopped", False) is True,
@@ -144,10 +158,8 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
                     entry["resume_error"] = "durable continuation blocker could not be persisted"
         if db is not None and safe_history:
             try:
-                launch_metadata = deepcopy(getattr(child, "_delegation_launch_metadata", None))
-                if isinstance(launch_metadata, dict):
-                    launch_metadata = _refresh_resumable_launch_metadata(child, launch_metadata)
                 model_config_patch = {
+                    **_checkpoint_route_patch(child),
                     "_delegation_completed": True,
                     "_delegation_user_stopped": False,
                     "_delegation_resume_blocked_reason": None,
@@ -157,13 +169,7 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
                     "_delegation_resume_recovery_previous": None,
                     "_delegation_interrupt_reason": getattr(child, "_delegation_interrupt_reason", None),
                     "_delegation_stop_token": getattr(child, "_delegation_stop_token", None),
-                    "_delegation_active_route": {
-                        "provider": getattr(child, "provider", None),
-                        "model": getattr(child, "model", None),
-                    },
                 }
-                if isinstance(launch_metadata, dict):
-                    model_config_patch["_delegation_launch"] = launch_metadata
                 db.patch_session_model_config(
                     getattr(child, "session_id", ""), model_config_patch,
                 )
