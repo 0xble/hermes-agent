@@ -1019,10 +1019,8 @@ class TurnRunner:
             self._drain_progress_queue()
             return
         st = self._progress_edit_state(adapter)
-        # Outer guard: the idle wait below lives in an ``except queue.Empty`` handler, and a
-        # CancelledError raised inside an except clause is NOT caught by its sibling handlers.
-        # Without this the turn-final boundary drain is skipped whenever the cancel lands while
-        # the queue happens to be empty — which is most of the time.
+        # Backoff awaits inside exception handlers can themselves be cancelled; sibling
+        # handlers do not catch those cancellations. Keep the turn-final drain outside too.
         try:
             await self._progress_loop(st)
         except asyncio.CancelledError:
@@ -1033,6 +1031,27 @@ class TurnRunner:
                     asyncio.ensure_future(self._drain_progress_on_cancel(st)))
             return
 
+    async def _retry_idle_progress(self, st) -> None:
+        """Retry only the unacknowledged buffer, using the live chat gate and turn fences."""
+        ctx = self._ctx
+        if (not ctx._run_still_current() or self._agent_interrupted()
+                or st.pending_provisional_boundary_id is not None
+                or st.cancel_saw_ambiguous_send
+                or st.retired_progress_lines >= len(st.progress_lines)):
+            return
+        now = time.monotonic()
+        deadlines = self._edit_retry_deadlines()
+        if (deadlines is not None and deadlines.get(st.edit_clock_key, 0.0) > now
+                or self._edit_gate_elapsed(st, now) < _PROGRESS_EDIT_INTERVAL):
+            return
+        # Use the same overflow/receipt machinery as event-driven delivery. An accepted
+        # no-ID send retires its lines; a retryable split keeps its full buffer dirty.
+        if not await self._roll_progress_overflow_if_needed(st):
+            if not await self._progress_send_or_edit(st, None):
+                return
+        st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
+        await self._progress_restore_typing(st)
+
     async def _progress_loop(self, st) -> None:
         ctx = self._ctx
         while True:
@@ -1040,7 +1059,15 @@ class TurnRunner:
                 if not ctx._run_still_current():
                     self._drain_progress_queue()
                     return
-                raw = self._next_progress_item(st)
+                try:
+                    raw = self._next_progress_item(st)
+                except queue.Empty:
+                    await asyncio.sleep(0.3)
+                    # Events arriving during the idle wait (especially content boundaries)
+                    # take precedence over retrying an older buffered bubble.
+                    if not st.replay_progress_events and ctx.progress_queue.empty():
+                        await self._retry_idle_progress(st)
+                    continue
                 # Drain silently when interrupted: events queued in the window between tool parse
                 # and interrupt processing should not render as bubbles.
                 if self._agent_interrupted():

@@ -1062,6 +1062,9 @@ def aggregate_moa_context(
         )
         return _slot_label({**candidate, **route_info}), _extract_text(response)
     agg_label, synthesis = run_slot_chain(aggregator, synthesize)
+    # A successful but empty response is not permission to switch physical routes.
+    # Preserve the usable references from the already privacy-filtered per-call copy.
+    guidance = synthesis.strip() or joined
 
     return (
         "[Mixture of Agents context — use this as private guidance for the "
@@ -1069,7 +1072,7 @@ def aggregate_moa_context(
         "finish normally.]\n"
         f"Aggregator: {agg_label}\n"
         f"References: {', '.join(label for label, _, _ in reference_outputs)}\n\n"
-        f"{synthesis.strip()}"
+        f"{guidance}"
     )
 
 
