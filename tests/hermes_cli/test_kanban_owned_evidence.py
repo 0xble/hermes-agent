@@ -118,6 +118,42 @@ def test_launch_to_judge_uses_only_owned_executed_outcomes(worker, monkeypatch, 
     assert [item["negative"] for item in w.seen[-1]] == [True, False]
 
 
+@pytest.mark.parametrize("surface", ["goal", "kanban"])
+@pytest.mark.parametrize("status,positive,negative", [
+    ("https://fixture-user:fixture-pass@example.invalid/callback?callback_secret=fixture-query#fixture-fragment", False, False),
+    ("success", True, False), ("failed", False, True),
+])
+def test_status_metadata_is_credential_free_at_judge_boundary(worker, surface, status, positive, negative):
+    from hermes_cli.kanban_evidence import bind_worker_session, collect_kanban_evidence
+    from hermes_cli.kanban import _goal_mode_handoff_rejection
+    w = worker
+    assert bind_worker_session(w.agent)
+    w.db.create_session(w.agent.session_id, source="kanban")
+    manager = w.goals.GoalManager(w.agent.session_id)
+    manager.set("verify artifact")
+    w.db.append_messages_batch(w.agent.session_id, [
+        {"role": "tool", "tool_name": "callback", "tool_call_id": "owned-status",
+         "content": json.dumps({"status": status})},
+    ])
+    evidence = collect_kanban_evidence(w.task.id)
+    assert evidence[0]["positive"] is positive and evidence[0]["negative"] is negative
+    for secret in ("fixture-user", "fixture-pass", "fixture-query", "fixture-fragment"):
+        assert secret not in json.dumps(evidence)
+    if surface == "goal":
+        manager.evaluate_after_turn("reported progress", tool_evidence=evidence)
+    else:
+        _goal_mode_handoff_rejection(w.task, "reported progress")
+    assert w.seen[-1]
+    for item in w.seen[-1]:
+        assert item["tool_call_id"] == "owned-status"
+        assert item["positive"] is positive and item["negative"] is negative
+    serialized = json.dumps(w.seen[-1])
+    for secret in ("fixture-user", "fixture-pass", "fixture-query", "fixture-fragment"):
+        assert secret not in serialized
+    if status.startswith("https:"):
+        assert w.seen[-1][0]["outcome"] == "https://example.invalid/callback"
+
+
 @pytest.mark.parametrize("boundary", ["manual", "claim", "child", "profile", "rebind", "retry", "superseded", "migration",
                                       "historical", "reset", "branch", "compacted", "bounded"])
 def test_binding_fences_and_absence_are_not_claimed_evidence(worker, monkeypatch, boundary):

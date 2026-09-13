@@ -78,7 +78,20 @@ def prepare_goal_turn(manager, agent, result, *, is_current=lambda: True):
     else:
         return  # emptiness alone does not prove failure
     from hermes_cli.goals_evaluation import decision_is_current
-    if not decision or not current() or not decision_is_current(decision):
+    if not decision or not current():
+        return
+    if decision.get("status") == "evaluation_failed":
+        # No persisted decision exists to validate or classify. Deliver the factual
+        # failure through the normal final-response path without minting authority
+        # or a delivery receipt, and latch it so post-delivery hooks cannot rejudge.
+        from agent.turn_finalizer import synchronize_terminal_response
+        explanation = decision["stop_explanation"]
+        prepared = f"{text.rstrip()}\n\n{explanation}" if text.strip() else explanation
+        result["_goal_decision"] = decision
+        result["_goal_outcome_prepared"] = True
+        synchronize_terminal_response(agent, result, prepared)
+        return
+    if not decision_is_current(decision):
         return
     # Freeze lifecycle BEFORE the output-only classifier, then recheck authority.
     prepared = manager.prepare_goal_outcome(decision, text, tool_evidence=evidence)

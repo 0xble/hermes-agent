@@ -199,7 +199,7 @@ def collect_tool_evidence(agent_result: Any) -> List[Dict[str, Any]]:
         raw = str(msg.get("content") or "")
         evidence.append({
             "tool": tool, "tool_call_id": call_id, "subject": subject,
-            "outcome": outcome, "negative": negative,
+            "outcome": _safe_evidence_metadata(outcome, 100), "negative": negative,
             "positive": (
                 (isinstance(outcome, str) and outcome == "exit_code=0")
                 or (isinstance(outcome, str) and outcome.lower() in {"success", "completed", "passed", "ok"})

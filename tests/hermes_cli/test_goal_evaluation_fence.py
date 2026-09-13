@@ -147,14 +147,66 @@ def test_local_unsaved_gate_edit_preserved_when_storage_unchanged(manager, monke
     assert goals.load_goal(manager.session_id).gates[0].max_retries == 7
 
 
-def test_unavailable_storage_cannot_authorize_automatic_evaluation(manager, monkeypatch):
+@pytest.mark.parametrize("fault", ["missing_db", "snapshot", "commit"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_storage_failure_is_visible_without_continuation_or_persisted_pause(manager, monkeypatch, fault, failed):
+    from hermes_cli.goal_outcomes import consume_goal_decision, prepared_continuation_is_current
     before = goals.load_goal(manager.session_id).to_json()
-    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("done", "done", False, None, False))
+    db = goals._get_session_db()
+    assert db is not None
+    db.create_session(manager.session_id, source="cli")
+    messages = [{"role": "user", "content": "work"}, {"role": "assistant", "content": "Progress."}]
+    db.replace_messages(manager.session_id, messages)
+    agent = SimpleNamespace(session_id=manager.session_id, _session_db=db,
+                            _session_messages=messages, _interrupt_requested=False)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more work", False, None, False))
+    monkeypatch.setattr(goals, "count_active_delegations", lambda *a: 0)
+    monkeypatch.setattr(goals, "gather_background_processes", lambda **kw: [])
+    monkeypatch.setattr(goals.GoalManager, "prepare_goal_outcome",
+                        lambda *a, **kw: pytest.fail("infrastructure failures must not call a classifier"))
+    def unavailable(*a, **kw):
+        raise OSError("fixture storage failure")
+    result = {"final_response": "Progress.", "messages": messages, "failed": failed}
     with monkeypatch.context() as m:
-        m.setattr(goals, "_get_session_db", lambda: None)
-        assert manager.evaluate_after_turn("done") == {}
-        assert manager.unexpected_stop("failed turn") == {}
+        if fault == "missing_db":
+            m.setattr(goals, "_get_session_db", lambda: None)
+        elif fault == "snapshot":
+            m.setattr(db, "get_meta_values", unavailable)
+        else:
+            # Fail inside the real SessionDB CAS transaction, not a fake CAS result.
+            db._write_sql("CREATE TRIGGER reject_goal_commit BEFORE INSERT ON state_meta "
+                          "BEGIN SELECT RAISE(ABORT, 'fixture storage failure'); END")
+        prepare_goal_turn(manager, agent, result)
+        decision = consume_goal_decision(result)
+        assert decision is not None
+        assert decision["status"] == "evaluation_failed"
+        assert not decision["should_continue"] and not decision["continuation_prompt"]
+        assert not prepared_continuation_is_current(decision)
+        assert "_goal_authority" not in decision
+        assert "Goal evaluation unavailable" in result["final_response"]
+        assert "No durable pause is confirmed" in result["final_response"]
+        assert "Progress." in result["final_response"]
+        assert "Goal paused" not in result["final_response"]
+        assert not result.get("already_sent")
+        assert result["_goal_outcome_prepared"]
+        assert db.get_messages(manager.session_id)[-1]["content"] == result["final_response"]
+        prepare_goal_turn(manager, agent, result)
+        assert consume_goal_decision(result) == {}
     assert goals.load_goal(manager.session_id).to_json() == before
+
+
+@pytest.mark.parametrize("invalidate", ["owner", "revision"])
+def test_commit_failure_after_authority_revocation_remains_silent(manager, monkeypatch, invalidate):
+    current = [True]
+    def unavailable(*a, **kw):
+        if invalidate == "owner":
+            current[0] = False
+        else:
+            goals.advance_goal_control_revision(manager.session_id)
+        raise OSError("fixture commit failed after revocation")
+    monkeypatch.setattr(goals._get_session_db(), "compare_and_set_meta", unavailable)
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **kw: ("continue", "more", False, None, False))
+    assert manager.evaluate_after_turn("working", is_current=lambda: current[0]) == {}
 
 
 def test_classifier_cannot_borrow_replacement_goal_authority(manager, monkeypatch):
@@ -314,7 +366,9 @@ def test_failed_commit_never_exposes_draft_as_live_state(manager, monkeypatch):
     def unavailable(*args, **kwargs):
         raise OSError("storage unavailable")
     monkeypatch.setattr(goals._get_session_db(), "compare_and_set_meta", unavailable)
-    assert manager.evaluate_after_turn("done") == {}
+    decision = manager.evaluate_after_turn("done")
+    assert decision["status"] == "evaluation_failed"
+    assert not decision["should_continue"] and "_goal_authority" not in decision
     assert goals.load_goal(manager.session_id).to_json() == baseline
     assert manager.state.status == "active" and manager.state.turns_used == 0
 

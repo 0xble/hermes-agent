@@ -33,12 +33,29 @@ def evaluate_draft(
 ) -> dict:
     if not is_current():
         return {}
-    db = goals._get_session_db()
-    if db is None:
-        return {}
     if expected_revision is None:
         expected_revision = goals.get_goal_control_revision(manager.session_id)
     cache_key = goals._goal_control_cache_key(manager.session_id)
+
+    def unavailable(stage):
+        # This is a report, never persistence or continuation authority. A revoked
+        # turn still stays silent even if its outstanding database operation fails.
+        if (not is_current() or goals._MODEL_GOAL_CONTROL_REVISIONS.get(
+                cache_key, expected_revision) != expected_revision):
+            return {}
+        explanation = (
+            f"Goal evaluation unavailable: {stage}. "
+            "Completion has not been verified and automatic continuation was not authorized. "
+            "No durable pause is confirmed; the stored goal may still be active. "
+            "Next: restore goal storage, check /goal status, then explicitly direct further work."
+        )
+        decision = goals._decision("evaluation_failed", False, None, "error", stage, explanation)
+        decision["stop_explanation"] = explanation
+        return decision
+
+    db = goals._get_session_db()
+    if db is None:
+        return unavailable("goal storage unavailable")
     key = goals._meta_key(manager.session_id)
     revision_key = goals._goal_control_revision_key(manager.session_id)
     try:
@@ -57,8 +74,8 @@ def evaluate_draft(
             return {}
         draft = _GoalDraft(manager, state)
     except Exception as exc:
-        goals.logger.warning("Goal evaluation snapshot unavailable: %s", exc)
-        return {}
+        goals.logger.warning("Goal evaluation snapshot unavailable: %s", type(exc).__name__)
+        return unavailable("goal snapshot could not be read")
 
     decision = evaluate(draft)
     accepted_raw = draft._state.to_json() if draft.changed else raw
@@ -71,8 +88,8 @@ def evaluate_draft(
         committed = db.compare_and_set_meta(
             baseline, {key: accepted_raw} if draft.changed else {}, is_current=commit_is_current)
     except Exception as exc:
-        goals.logger.warning("Goal evaluation commit unavailable: %s", exc)
-        return {}
+        goals.logger.warning("Goal evaluation commit unavailable: %s", type(exc).__name__)
+        return unavailable("goal evaluation could not be committed")
     # The live manager may already contain a later user control. Refresh against its own
     # accepted baseline instead of assigning the draft and erasing those local changes.
     manager.refresh()
