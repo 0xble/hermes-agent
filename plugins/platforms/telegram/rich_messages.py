@@ -20,6 +20,7 @@ class RichMessageProjection:
     block_count: int
     block_types: tuple[str, ...]
     truncated: bool
+    mentioned_user_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -32,6 +33,7 @@ class _RenderState:
     block_count: int = 0
     block_types: list[str] = field(default_factory=list)
     truncated: bool = False
+    mentioned_user_ids: set[int] = field(default_factory=set)
 
     def enter(self, depth: int) -> bool:
         if depth > self.max_depth or self.nodes >= self.max_nodes or self.chars >= self.max_chars:
@@ -128,6 +130,9 @@ def _inline(value: Any, state: _RenderState, depth: int) -> str:
         )
     if node_type == "text_mention":
         user = _mapping(node.get("user"))
+        raw_id = user.get("id") if user else None
+        if rendered and type(raw_id) is int and raw_id > 0:
+            state.mentioned_user_ids.add(raw_id)
         user_id = state.text(user.get("id")) if user and user.get("id") is not None else None
         return (
             f"[{rendered}](tg://user?id={user_id})"
@@ -445,4 +450,5 @@ def project_rich_message(
         block_count=state.block_count,
         block_types=tuple(state.block_types),
         truncated=state.truncated,
+        mentioned_user_ids=tuple(sorted(state.mentioned_user_ids)),
     )

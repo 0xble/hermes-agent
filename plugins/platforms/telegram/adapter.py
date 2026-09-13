@@ -6658,6 +6658,11 @@ class TelegramAdapter(BasePlatformAdapter):
         bot_username = self._current_bot_username()
         bot_id = getattr(self._bot, "id", None)
         expected = f"@{bot_username}" if bot_username else None
+        # Keep server-typed IDs through rich projection. A rendered tg:// link
+        # alone is not identity evidence and must never grant mention routing.
+        rich_payload, _ = self._inbound_rich_message_payload(message)
+        if rich_payload is not None and bot_id in project_rich_message(rich_payload).mentioned_user_ids:
+            return True
         # Server-side MessageEntity values are authoritative: raw substrings like "foo@hermes_bot.example"
         # or handles inside URLs/code are not mentions.
         for source_text, entities in self._entity_sources(message):
@@ -7074,7 +7079,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not bot_username:
             return False
         mentioned_bot_usernames = self._extract_bot_mention_usernames(message, bot_username)
-        excludes_self = bool(mentioned_bot_usernames) and bot_username not in mentioned_bot_usernames
+        excludes_self = bool(mentioned_bot_usernames) and not self._message_mentions_bot(message)
         if excludes_self:
             # Either truly for another bot, or our handle is stale after a rename — re-check out of band.
             self._schedule_bot_identity_recheck()
