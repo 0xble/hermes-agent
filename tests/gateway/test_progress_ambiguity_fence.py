@@ -73,7 +73,8 @@ async def test_ambiguous_receipt_fences_event_overflow_idle_and_boundary(monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["rejected", "no_id"])
-async def test_known_rejection_and_accepted_no_id_do_not_latch_ambiguity(mode):
+async def test_known_rejection_and_accepted_no_id_do_not_latch_ambiguity(monkeypatch, mode):
+    monkeypatch.setattr("gateway.run_turn_runner._PROGRESS_EDIT_INTERVAL", 0)
     adapter = ReceiptAdapter("no_id")
     ctx, runner = _runner(adapter)
     st = runner._progress_edit_state(adapter)

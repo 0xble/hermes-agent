@@ -13,6 +13,13 @@ from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 
 
+@pytest.fixture(autouse=True)
+def _receipt_test_cadence(monkeypatch):
+    # Receipt ownership is independent of pacing, covered with a controlled clock
+    # in test_progress_send_rate.py. Keep cleanup probes on their receipt boundary.
+    monkeypatch.setattr("gateway.run_turn_runner._PROGRESS_EDIT_INTERVAL", 0)
+
+
 class ReceiptAdapter:
     """Real TurnRunner boundary with a controllable transport receipt."""
 

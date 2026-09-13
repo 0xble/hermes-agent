@@ -275,7 +275,7 @@ class StaleReplacementFailureProgressCaptureAdapter(
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         self.send_attempts += 1
         if self.send_attempts == 2:
-            return SendResult(success=False, error="temporary replacement send failure")
+            return SendResult(success=False, error="permanent replacement send refusal")
         return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
 
 
@@ -633,7 +633,7 @@ async def test_stale_progress_replacement_failure_is_bounded(monkeypatch, tmp_pa
 
     assert result["final_response"] == "done"
     assert isinstance(adapter, StaleReplacementFailureProgressCaptureAdapter)
-    assert adapter.send_attempts == 4
+    assert adapter.send_attempts == 2  # a permanent send refusal ends this turn's progress lane
     assert len(adapter.edits) == 1
     assert adapter.edits[0]["message_id"] == "progress-1"
 
@@ -1314,7 +1314,7 @@ async def _run_with_agent(
     # assertions count. The production rate itself is pinned by
     # tests/gateway/test_progress_edit_shared_clock_integration.py.
     import gateway.run_turn_runner as _run_turn_runner
-    monkeypatch.setattr(_run_turn_runner, "_PROGRESS_EDIT_INTERVAL", 1.5)
+    monkeypatch.setattr(_run_turn_runner, "_PROGRESS_EDIT_INTERVAL", 0.0)
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)

@@ -25,7 +25,7 @@ from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import strip_stale_dangerous_confirmations
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import SendResult, classify_send_error
 from gateway.progress_events import (
     DurableContentBoundary, ProvisionalContentBoundary, RetractedContentBoundary,
 )
@@ -343,6 +343,10 @@ class TurnRunner:
     class _TaskCardState:
         """Task-card rail state for ``_send_native_task_card_progress``."""
         adapter: Any
+        edit_clock_key: str = ""
+        last_edit_ts: float = 0.0
+        retry_deadline: float = 0.0
+        progress_send_failed_permanently: bool = False
         tasks: Dict[str, Dict[str, str]] = dataclasses.field(default_factory=dict)
         task_order: List[str] = dataclasses.field(default_factory=list)
         fallback_msg_id: Optional[str] = None
@@ -526,6 +530,8 @@ class TurnRunner:
         # Shared-throttle state: the chat-scoped clock key plus this session's own last edit.
         edit_clock_key: str = ""
         last_edit_ts: float = 0.0
+        retry_deadline: float = 0.0
+        progress_send_failed_permanently: bool = False
         # Preview lifecycle: while a boundary is provisional, tool updates are deferred rather
         # than rendered, so a preview that is later retracted cannot split accumulated progress.
         pending_provisional_boundary_id: Any = None
@@ -600,6 +606,7 @@ class TurnRunner:
 
     def _defer_progress_edits(self, st, now: float, retry_after: float) -> None:
         """A flood rejection names its own wait: park the whole chat until it elapses."""
+        st.retry_deadline = max(getattr(st, "retry_deadline", 0.0), now + retry_after)
         deadlines = self._edit_retry_deadlines()
         if deadlines is None:
             return
@@ -609,7 +616,7 @@ class TurnRunner:
                 deadlines.pop(key, None)
 
     def _note_edit_retry_after(self, st, result) -> float:
-        """Record a server-named retry_after from a failed edit; returns it (0.0 when absent)."""
+        """Record a server-named retry_after from a failed progress operation."""
         try:
             retry_after = float(getattr(result, "retry_after", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -619,23 +626,34 @@ class TurnRunner:
             return retry_after
         return 0.0
 
-    async def _edit_progress_message(self, st, message_id: str, content: str):
-        ctx = self._ctx
+    async def _claim_progress_transport_slot(self, st, *, wait_for_cadence=True) -> float:
+        """Claim chat cadence before transport I/O, or return a server flood wait."""
+        if not st.edit_clock_key:
+            source = self._ctx.source
+            st.edit_clock_key = "%s:%s" % (getattr(source.platform, "value", source.platform), source.chat_id)
         deadlines = self._edit_retry_deadlines()
         while True:
             now = time.monotonic()
-            deadline = deadlines.get(st.edit_clock_key, 0.0) if deadlines is not None else 0.0
+            deadline = max(getattr(st, "retry_deadline", 0.0),
+                           deadlines.get(st.edit_clock_key, 0.0) if deadlines is not None else 0.0)
             if deadline > now:
-                return SendResult(
-                    success=False, error="progress_edit_flood_control_deferred",
-                    retryable=True, retry_after=deadline - now)
+                return deadline - now
             remaining = _PROGRESS_EDIT_INTERVAL - self._edit_gate_elapsed(st, now)
             if remaining <= 0:
                 # Claim BEFORE the API await so another session in this chat cannot observe a
                 # stale slot and edit concurrently.
                 st.last_edit_ts = self._stamp_edit_clock(st, now)
-                break
+                return 0.0
+            if not wait_for_cadence:
+                return remaining
             await asyncio.sleep(remaining)
+
+    async def _edit_progress_message(self, st, message_id: str, content: str):
+        ctx = self._ctx
+        retry_after = await self._claim_progress_transport_slot(st)
+        if retry_after:
+            return SendResult(success=False, error="progress_edit_flood_control_deferred",
+                              retryable=True, retry_after=retry_after)
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
@@ -671,6 +689,11 @@ class TurnRunner:
         st.recovered_stale_anchor_ids.add(stale_anchor_id)
         replacement = await self._send_progress_text(st, text)
         if st.cancel_saw_ambiguous_send:
+            return True
+        if not replacement.success and not st.progress_send_failed_permanently:
+            # The anchor is proven gone. Retry the send directly, or every new
+            # stale edit would consume the cadence slot needed by its replacement.
+            st.progress_msg_id = None
             return True
         replacement_id = getattr(replacement, "message_id", None)
         # The stale snapshot gets one replacement attempt, never a line-by-line
@@ -709,6 +732,12 @@ class TurnRunner:
             # This turn may already have a visible bubble with a lost receipt. A
             # suppressed send is not acceptance and must never retire its lines.
             return SendResult(success=False, error="progress_send_ambiguous", retryable=False)
+        if st.progress_send_failed_permanently:
+            return SendResult(success=False, error="progress_send_permanently_refused", retryable=False)
+        retry_after = await self._claim_progress_transport_slot(st, wait_for_cadence=False)
+        if retry_after:
+            return SendResult(success=False, error="progress_send_cadence_deferred",
+                              retryable=True, retry_after=retry_after)
         ctx = self._ctx
         receipt = asyncio.create_task(st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
@@ -736,6 +765,13 @@ class TurnRunner:
             st.cancel_saw_ambiguous_send = True
             return SendResult(success=False, error="progress_send_ambiguous", retryable=False)
         self._track_progress_result(result, st.adapter)
+        if not result.success:
+            retry_after = self._note_edit_retry_after(st, result)
+            error_kind = getattr(result, "error_kind", None) or classify_send_error(
+                None, getattr(result, "error", "") or "")
+            if (not retry_after and not getattr(result, "retryable", False)
+                    and error_kind not in {"transient", "rate_limited"}):
+                st.progress_send_failed_permanently = True
         return result
 
     def _retain_progress_send_receipt(self, st, receipt) -> None:
@@ -804,16 +840,23 @@ class TurnRunner:
                     if not await self._replace_stale_progress_anchor(st, first_text):
                         st.can_edit = False
                         return False
-                    if not st.can_edit:
+                    if not st.can_edit or st.progress_msg_id is None:
                         return True
                 else:
                     st.can_edit = False
                     # Fall back to the existing non-edit behavior.
                     return False
             groups = groups[1:]
-        for group in groups:
+        for index, group in enumerate(groups):
             result = await self._send_progress_text(st, self._progress_text(group))
             if st.cancel_saw_ambiguous_send:
+                return True
+            if not result.success:
+                # Earlier groups were acknowledged; keep exactly the refused suffix
+                # for a permitted retry, without reusing an earlier group's anchor.
+                st.progress_lines = [line for pending in groups[index:] for line in pending]
+                st.progress_msg_id = None
+                st.retired_progress_lines = 0
                 return True
             if result.success and result.message_id:
                 st.progress_msg_id = result.message_id
@@ -1015,7 +1058,7 @@ class TurnRunner:
             st.retired_progress_lines = len(st.progress_lines)
             st.progress_msg_id = result.message_id
             st.can_edit = bool(result.message_id)
-        return True
+        return bool(result.success)
 
     async def send_progress_messages(self):
         ctx = self._ctx
@@ -1051,6 +1094,7 @@ class TurnRunner:
         if (not ctx._run_still_current() or self._agent_interrupted()
                 or st.pending_provisional_boundary_id is not None
                 or st.cancel_saw_ambiguous_send
+                or st.progress_send_failed_permanently
                 or st.retired_progress_lines >= len(st.progress_lines)):
             return
         now = time.monotonic()
