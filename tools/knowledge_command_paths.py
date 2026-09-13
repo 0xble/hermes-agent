@@ -26,22 +26,24 @@ import re
 import shlex
 
 
-_GLOB_MASKS = {chr(0xE000 + index): char for index, char in enumerate("*?[]!^-~")}
+_GLOB_MASKS = {chr(0xE000 + index): char for index, char in enumerate("*?[]!^-~;&|()\n<>")}
 
 
 class ShellWord(str):
-    """Decoded shell word plus quote-aware pathname pattern; argv stays plain str."""
+    """Decoded shell token with lexical control and pathname-pattern provenance."""
 
     glob_pattern: str | None
+    control: bool
 
-    def __new__(cls, value: str, pattern: str | None):
+    def __new__(cls, value: str, pattern: str | None, *, control: bool = False):
         word = super().__new__(cls, value)
         word.glob_pattern = pattern
+        word.control = control
         return word
 
 
 def _quoted_glob_mask(segment: str) -> tuple[str, dict[str, str]]:
-    # Preserve shlex's word/quote parsing, masking only quoted/escaped pattern
+    # Preserve shlex's word/quote parsing, masking quoted/escaped pattern and control
     # syntax before it discards that provenance (including concatenated quotes).
     if any(0xE000 <= ord(char) <= 0xE0FF for char in segment):
         raise ValueError("reserved shell scan characters")
@@ -77,7 +79,8 @@ def shell_tokens(command: str) -> list[str]:
         lexer.whitespace_split, lexer.commenters = True, ""
         for token in lexer:
             value = "".join(masks.get(char, char) for char in token)
-            tokens.append(ShellWord(value, token if glob.has_magic(token) else None))
+            tokens.append(ShellWord(value, token if glob.has_magic(token) else None,
+                                    control=bool(token) and set(token) <= set(";&|()\n")))
         tokens.append(";")
     return tokens
 
@@ -161,7 +164,8 @@ def literal_paths(
     references, destructive, transitions = [], [], []
     segment = []
     for token in [*shell_tokens(command), ";"]:
-        if token and set(token) <= set(";&|()\n"):
+        if (token.control if isinstance(token, ShellWord) else
+                bool(token) and set(token) <= set(";&|()\n")):
             if segment:
                 refs, targets, moves = _shell_paths(segment, _depth)
                 references.extend(refs)
@@ -354,15 +358,23 @@ def _python_paths(source: str, depth: int) -> tuple[list[str], list[str], list[s
             targets.extend(more_targets)
             moves.extend(more_moves)
         elif name in subprocess_calls:
-            if isinstance(first, (ast.List, ast.Tuple)) and all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in first.elts):
-                more_refs, more_targets, more_moves = _shell_paths([item.value for item in first.elts], depth + 1)
-                refs.extend(more_refs)
-                targets.extend(more_targets)
-                moves.extend(more_moves)
-            elif isinstance(first, ast.Constant) and isinstance(first.value, str) and any(
-                    kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in node.keywords):
-                more_refs, more_targets, more_moves = literal_paths(first.value, _depth=depth + 1)
-                refs.extend(more_refs)
-                targets.extend(more_targets)
-                moves.extend(more_moves)
+            shell = any(kw.arg == "shell" and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True for kw in node.keywords)
+            argv = ([item.value for item in first.elts] if isinstance(first, (ast.List, ast.Tuple))
+                    and all(isinstance(item, ast.Constant) and isinstance(item.value, str)
+                            for item in first.elts) else None)
+            source = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+            if shell and argv is not None and os.name == "posix":
+                # POSIX passes only argv[0] to /bin/sh -c; remaining values are
+                # shell positional parameters, not additional command words.
+                source = argv[0] if argv else None
+            if shell and source is not None:
+                more_refs, more_targets, more_moves = literal_paths(source, _depth=depth + 1)
+            elif argv is not None:
+                more_refs, more_targets, more_moves = _shell_paths(argv, depth + 1)
+            else:
+                continue
+            refs.extend(more_refs)
+            targets.extend(more_targets)
+            moves.extend(more_moves)
     return refs, targets, moves
