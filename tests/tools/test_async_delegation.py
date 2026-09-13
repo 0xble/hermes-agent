@@ -1337,3 +1337,114 @@ def test_pending_recovery_survives_retention_and_projects_nested_card_label(tmp_
         row = conn.execute("SELECT parent_task_id, thread_number, task_label, owner_json, delivery_state "
                            "FROM async_delegations WHERE delegation_id='labelled'").fetchone()
     assert row == ("a" * 32, 2, "Task B", '{"owner":"exact"}', "pending_recovery")
+
+
+def _persist_presentable_completion(tmp_path, monkeypatch, metadata=None):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    now = time.time()
+    record = {"delegation_id": "deleg_present", "session_key": "route",
+              "parent_session_id": "parent", "dispatched_at": now - 1}
+    if metadata:
+        record["delegation_metadata"] = metadata
+    ad._persist_dispatch(record)
+    event = {"type": "async_delegation", "delegation_id": "deleg_present",
+             "session_key": "route", "parent_session_id": "parent",
+             "status": "completed", "summary": "durable result",
+             "dispatched_at": now - 1, "completed_at": now}
+    ad._persist_completion(event, {"summary": "durable result"})
+
+
+def test_gateway_admission_waits_for_durable_presentation_and_is_nonclaimable(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    assert ad.get_durable_delegation("deleg_present")["delivery_state"] == "admitted"
+    assert not ad.claim_completion_delivery("deleg_present", "competing")
+
+
+def test_presentation_before_admission_ack_wins_the_race(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert not ad.mark_completion_presented("deleg_present")
+    _write_presentation_receipt()
+    assert ad.mark_completion_presented("deleg_present")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    assert ad.get_durable_delegation("deleg_present")["delivery_state"] == "delivered"
+
+
+def test_restart_requeues_even_old_admitted_completion(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET completed_at=1, dispatched_at=1 WHERE delegation_id='deleg_present'")
+    restarted = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted) == 1
+    assert restarted.get_nowait()["delegation_id"] == "deleg_present"
+    assert ad.get_durable_delegation("deleg_present")["delivery_state"] == "pending"
+
+
+def test_restart_settles_admitted_completion_from_exact_persisted_user_row(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    with ad._transaction() as conn:
+        conn.execute("""CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, display_metadata TEXT)""")
+        conn.execute("INSERT INTO messages VALUES (1, 'parent', 'user', ?)", (
+            json.dumps({"delegation_deliveries": [{"delegation_id": "deleg_present", "owner": None}]}),
+        ))
+    restarted = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted) == 0
+    assert restarted.empty()
+    assert ad.get_durable_delegation("deleg_present")["delivery_state"] == "delivered"
+
+
+def test_labelled_presentation_requires_exact_owner(tmp_path, monkeypatch):
+    owner = {"session_id": "parent", "session_key": "route"}
+    metadata = {"parent_task_id": "a" * 32, "owner": owner,
+                "owner_json": json.dumps(owner, sort_keys=True, separators=(",", ":")),
+                "threads": [{"thread_ref": "A", "task_index": 0}], "attempts": {"A": 1}}
+    _persist_presentable_completion(tmp_path, monkeypatch, metadata)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    assert not ad.mark_completion_presented("deleg_present")
+    assert not ad.mark_completion_presented("deleg_present", {"session_id": "foreign", "session_key": "route"})
+    assert not ad.mark_completion_presented("deleg_present", owner)
+    _write_presentation_receipt(owner)
+    assert ad.mark_completion_presented("deleg_present", owner)
+
+
+def _write_presentation_receipt(owner=None):
+    with ad._transaction() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, display_metadata TEXT)")
+        conn.execute("INSERT INTO messages VALUES (1, 'parent', 'user', ?)", (
+            json.dumps({"delegation_deliveries": [{"delegation_id": "deleg_present", "owner": owner}]}),))
+
+
+def test_repeated_admission_recovery_is_bounded_and_retained(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    for i in range(ad._MAX_DELIVERY_ATTEMPTS):
+        assert ad.claim_completion_delivery("deleg_present", str(i))
+        assert ad.admit_completion_delivery("deleg_present", str(i))
+        restored = queue.Queue()
+        assert ad.restore_undelivered_completions(restored) == int(i + 1 < ad._MAX_DELIVERY_ATTEMPTS)
+    assert ad.get_durable_delegation("deleg_present")["delivery_state"] == "pending_recovery"
+    assert ad.get_durable_delegation("deleg_present")["result"]["summary"] == "durable result"
+
+
+
+def test_canonical_compression_presentation_excludes_explicit_fork(tmp_path, monkeypatch):
+    _persist_presentable_completion(tmp_path, monkeypatch)
+    assert ad.claim_completion_delivery("deleg_present", "gateway")
+    assert ad.admit_completion_delivery("deleg_present", "gateway")
+    with ad._transaction() as conn:
+        conn.execute("CREATE TABLE messages(id INTEGER, session_id TEXT, role TEXT, display_metadata TEXT, timestamp REAL)")
+        conn.execute("CREATE TABLE sessions(id TEXT, parent_session_id TEXT, model_config TEXT, source TEXT, end_reason TEXT, ended_at REAL, started_at REAL, last_activity_at REAL)")
+        conn.execute("INSERT INTO sessions VALUES ('parent',NULL,'{}','telegram','compression',2,1,2)")
+        conn.execute("INSERT INTO sessions VALUES ('tip','parent',?, 'telegram',NULL,NULL,3,3)", (json.dumps({"_branched_from": "parent"}),))
+        conn.execute("INSERT INTO messages VALUES (1,'tip','user',?,3)", (json.dumps({"delegation_deliveries": [{"delegation_id": "deleg_present", "owner": None}]}),))
+    assert not ad.mark_completion_presented("deleg_present")
+    with ad._transaction() as conn:
+        conn.execute("UPDATE sessions SET model_config='{}' WHERE id='tip'")
+    assert ad.mark_completion_presented("deleg_present")

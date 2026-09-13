@@ -150,6 +150,8 @@ def _record_update_step(step: str, ok: bool, detail: str = "") -> None:
 def _git_run(git_cmd, args, cwd=None, *, check=False, network=False):
     """Run git capturing utf-8 text (default cwd: checkout); ``network=True`` disables the
     terminal prompt so an HTTP 401 fails fast instead of hanging."""
+    from hermes_cli.update_compatibility import guarded_git_args
+    args = guarded_git_args(git_cmd, _m().PROJECT_ROOT if cwd is None else cwd, args)
     return subprocess.run(
         git_cmd + args, cwd=_m().PROJECT_ROOT if cwd is None else cwd, capture_output=True,
         text=True, encoding="utf-8", errors="replace", check=check,

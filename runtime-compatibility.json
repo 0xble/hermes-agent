@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "capabilities": [
+    "delegation-admitted-v1",
+    "managed-downgrade-floor-v1"
+  ]
+}

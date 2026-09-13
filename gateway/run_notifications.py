@@ -36,6 +36,7 @@ _DURABLE_CLAIM_OPS = {
     "release": ("release_completion_delivery", "Could not release durable completion claim"),
     "defer": ("defer_completion_delivery", "Could not defer unadmitted completion claim"),
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
+    "admit": ("admit_completion_delivery", "Could not record durable completion admission"),
 }
 
 
@@ -1056,6 +1057,9 @@ class GatewayNotificationsMixin:
                 # Native review status retirement is tied to this exact durable
                 # completion, never a generic task-card batch or session guess.
                 metadata["delegation_id"] = evt["delegation_id"]
+                metadata["delegation_deliveries"] = list(evt.get("delegation_deliveries") or [{
+                    "delegation_id": evt["delegation_id"], "owner": evt.get("owner"),
+                }])
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
@@ -1326,7 +1330,13 @@ class GatewayNotificationsMixin:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
                 identity_claimed = True
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            delivery_events = [evt, *(event for event, _claim_id in sibling_claims)]
+            delivery_receipts = [{
+                "delegation_id": event.get("delegation_id"), "owner": event.get("owner"),
+            } for event in delivery_events if event.get("delegation_id")]
+            injection_evt = {**evt, "delegation_deliveries": delivery_receipts}
+            injection_result = await self._inject_watch_notification(
+                synth_text, injection_evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -1341,7 +1351,14 @@ class GatewayNotificationsMixin:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused else "release"
+            # Push adapters acknowledge only a volatile queue slot. The API self-post
+            # path returns after its full request/turn persistence, so preserve that
+            # established non-push completion contract rather than inventing an
+            # unroutable admitted replay with no MessageEvent metadata bridge.
+            operation = (
+                "complete" if accepted and _raw_process_event_session_id(evt)
+                else "admit" if accepted else "defer" if refused else "release"
+            )
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:

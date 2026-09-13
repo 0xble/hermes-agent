@@ -28,9 +28,11 @@ _STASH_LEFT_IN_PLACE = "  The stash was left in place. You can remove it manuall
 
 def _git_quiet(git_cmd: list[str], args: list[str], cwd: Path, **kwargs):
     """``subprocess.run`` of a git command with captured output; None when git cannot run."""
+    from hermes_cli.update_compatibility import guarded_git_args, RuntimeCompatibilityError
     try:
+        args = guarded_git_args(git_cmd, cwd, args)
         return subprocess.run(git_cmd + args, cwd=cwd, capture_output=True, **kwargs)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, RuntimeCompatibilityError):
         return None
 
 
@@ -43,7 +45,8 @@ def _git_paths_z(git_cmd: list[str], args: list[str], cwd: Path):
 
 
 def _reset_hard(git_cmd: list[str], cwd: Path) -> None:
-    subprocess.run(git_cmd + ["reset", "--hard", "HEAD"], cwd=cwd, capture_output=True)
+    from hermes_cli.update_cmd import _git_run
+    _git_run(git_cmd, ["reset", "--hard", "HEAD"], cwd)
 
 
 def _print_nonempty(text: str, prefix: str = "") -> None:
@@ -327,6 +330,9 @@ def _restore_stashed_changes(
         print("  The stash was not restored because its cleanup baseline is unknown.")
         print(f"  Restore manually with: git stash apply {stash_ref}")
         return False
+    from hermes_cli.update_compatibility import guarded_git_args
+    # Refuse unverified overlays before even importing source for validation.
+    guarded_git_args(git_cmd, cwd, ["stash", "apply", stash_ref])
     clean_import_failures = _critical_module_import_failures(cwd, report_runtime_errors=True)
     if not _apply_stash(git_cmd, cwd, stash_ref):
         return False

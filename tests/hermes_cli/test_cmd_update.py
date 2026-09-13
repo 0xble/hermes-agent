@@ -18,6 +18,10 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="d" * 40, stderr="")
+        if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+            return subprocess.CompletedProcess(cmd, 0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -718,6 +722,10 @@ class TestCmdUpdateBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="d" * 40, stderr="")
+            if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
@@ -759,7 +767,8 @@ class TestCmdUpdateBranchFlag:
 
         # the ff-only merge must target origin/bb/gui
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
-        assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
+        assert any("d" * 40 in c for c in merge_cmds), merge_cmds
+        assert any("origin/bb/gui^{commit}" in c for c in commands), commands
 
 
     @patch("shutil.which", return_value=None)
@@ -815,6 +824,10 @@ class TestCmdUpdateCheckBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+                return subprocess.CompletedProcess(cmd, 0, stdout="d" * 40, stderr="")
+            if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
 
 
             if "fetch" in joined and "origin" in joined:
@@ -1083,10 +1096,12 @@ class TestNodeRuntimeNpmResolution:
         packaged_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
         packaged_exe.parent.mkdir(parents=True)
         packaged_exe.write_bytes(b"desktop")
+        (project_root / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
 
         def write_source_zip(_url, destination):
             with zipfile.ZipFile(destination, "w") as archive:
                 archive.writestr("hermes-agent-main/apps/desktop/package.json", "{}")
+                archive.writestr("hermes-agent-main/runtime-compatibility.json", '{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}')
 
         def fail_git_fetch(command, **_kwargs):
             if "fetch" in command:

@@ -1,4 +1,4 @@
-"""Real adapter admission is the completion acknowledgement boundary."""
+"""Real adapter admission is distinct from canonical completion presentation."""
 import asyncio
 import logging
 import time
@@ -17,9 +17,30 @@ from tools import async_delegation as delegation
 def pending(key, name):
     evt = {"type": "async_delegation", "session_key": key, "delegation_id": name,
            "summary": name, "status": "completed", "dispatched_at": time.time()}
-    delegation._persist_dispatch(evt)
+    delegation._persist_dispatch({**evt, "parent_session_id": "admission-parent"})
     delegation._persist_completion(evt, {"status": "completed", "summary": name})
     return evt
+
+
+def _persist_and_settle(event, completions):
+    from gateway.delegation_delivery_receipt import mark_persisted_delegation_presentations
+
+    deliveries = event.metadata["delegation_deliveries"]
+    assert {item["delegation_id"] for item in deliveries} == {item["delegation_id"] for item in completions}
+    for item in completions:
+        assert not delegation.mark_completion_presented(item["delegation_id"])
+    db = SessionDB(delegation._db_path())
+    try:
+        db.create_session("admission-parent", "discord")
+        metadata = {"delegation_deliveries": deliveries}
+        row_id = db.append_message("admission-parent", "user", event.text, display_metadata=metadata)
+        messages = [{"role": "user", "_row_id": row_id, "display_metadata": metadata}]
+        assert mark_persisted_delegation_presentations(messages, deliveries) == len(completions)
+        assert mark_persisted_delegation_presentations(messages, deliveries) == 0
+        for item in completions:
+            assert delegation.get_durable_delegation(item["delegation_id"])["delivery_state"] == "delivered"
+    finally:
+        db.close()
 
 
 async def drain(adapter):
@@ -36,10 +57,12 @@ async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_pa
     key = build_session_key(source)
     events = [pending(key, f"admission-{i}") for i in range(2)]
     received = []
+    received_events = []
     release, started = asyncio.Event(), asyncio.Event()
 
     async def handler(event):
         received.append(event.text)
+        received_events.append(event)
         started.set()
         await release.wait()
         if key not in adapter._pending_messages:
@@ -75,16 +98,22 @@ async def test_completion_ack_requires_admission_and_replay_never_repeats(tmp_pa
         runner._BUSY_QUEUE_MAX_PENDING = 4
         assert await runner._deliver_async_delegation_group(events) is True
         assert await runner._deliver_async_delegation_group(events) is None
+        for event in events:
+            row = delegation.get_durable_delegation(event["delegation_id"])
+            assert (row["delivery_state"], row["delivery_attempts"]) == ("admitted", 1)
+            assert not delegation.claim_completion_delivery(event["delegation_id"], "competing")
         release.set()
         await drain(adapter)
         assert received[:2] == ["human-active", "human-pending"]
         assert len(received) == 3 and all(event["summary"] in received[-1] for event in events)
         for event in events:
-            assert delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "delivered"
+            assert delegation.get_durable_delegation(event["delegation_id"])["delivery_state"] == "admitted"
+        _persist_and_settle(received_events[-1], events)
         idle = pending(key, "idle-admitted")
         assert await runner._deliver_async_delegation_group([idle]) is True
         await drain(adapter)
         assert len(received) == 4 and "idle-admitted" in received[-1]
+        _persist_and_settle(received_events[-1], [idle])
     finally:
         release.set()
         await drain(adapter)
@@ -118,5 +147,6 @@ async def test_unavailable_raw_route_is_quiet_without_hiding_invalid_routes(tmp_
         rows = db.get_messages(evt["session_key"])
         assert len(rows) == 1 and rows[0]["display_kind"] == "async_delegation_complete"
         assert not api._background_tasks and not caplog.records
+        assert delegation.get_durable_delegation(evt["delegation_id"])["delivery_state"] == "delivered"
     finally:
         db.close()

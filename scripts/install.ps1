@@ -2131,7 +2131,31 @@ function Install-SystemPackages {
 # Installation
 # ============================================================================
 
+function Assert-BootstrapMayMutateInstall {
+    # Presence is the capability boundary. Do not parse the marker here: an
+    # unreadable file, directory, or dangling link must fail closed rather than
+    # being mistaken for an unguarded legacy install.
+    $marker = Join-Path $InstallDir "runtime-compatibility.json"
+    $markerPresent = $false
+    try {
+        $null = Get-Item -LiteralPath $marker -Force -ErrorAction Stop
+        $markerPresent = $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $markerPresent = $false
+    } catch {
+        $markerPresent = $true
+    }
+
+    if ($markerPresent) {
+        Write-Err "Existing managed Hermes runtime detected at $InstallDir."
+        Write-Err "The bootstrap installer cannot update an install containing runtime-compatibility.json."
+        Write-Info "Use the guarded updater instead: hermes update"
+        throw "Refusing bootstrap mutation of a guarded Hermes runtime"
+    }
+}
+
 function Install-Repository {
+    Assert-BootstrapMayMutateInstall
     Write-Info "Installing to $InstallDir..."
 
     $didUpdate = $false
@@ -4944,6 +4968,7 @@ function Invoke-PostInstallMode {
 }
 
 function Main {
+    Assert-BootstrapMayMutateInstall
     Write-Banner
     Invoke-AllStages
     if (-not $Json) {

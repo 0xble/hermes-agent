@@ -241,6 +241,21 @@ log_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+# Bootstrap installers may create a new managed runtime, but once the runtime
+# advertises its compatibility contract only the guarded updater may replace
+# its source. Check marker presence without reading it: an unreadable marker is
+# still a marker, and must fail closed rather than looking like a legacy install.
+refuse_guarded_runtime_bootstrap_update() {
+    local marker="$INSTALL_DIR/runtime-compatibility.json"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+        log_error "Existing managed Hermes runtime detected at $INSTALL_DIR."
+        log_error "The bootstrap installer cannot update an install containing runtime-compatibility.json."
+        log_info "Use the guarded updater instead: hermes update"
+        return 1
+    fi
+    return 0
+}
+
 json_escape() {
     # Enough for short installer status strings; avoids requiring jq during
     # pre-install bootstrap.
@@ -3711,6 +3726,7 @@ run_stage_body() {
         repository)
             detect_os
             resolve_install_layout
+            refuse_guarded_runtime_bootstrap_update || return
             check_git
             clone_repo
             ;;
@@ -3843,6 +3859,7 @@ main() {
 
     detect_os
     resolve_install_layout
+    refuse_guarded_runtime_bootstrap_update || return
     install_uv
     check_python
     check_git

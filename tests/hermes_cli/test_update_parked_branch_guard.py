@@ -59,6 +59,8 @@ def repo_pair(tmp_path):
     _git(origin, "config", "user.name", "Test")
     (origin / "a.txt").write_text("one\n")
     _git(origin, "add", "a.txt")
+    (origin / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    _git(origin, "add", "runtime-compatibility.json")
     _git(origin, "commit", "-qm", "c1")
 
     clone = tmp_path / "clone"
@@ -380,7 +382,7 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     )
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
 
-    with pytest.raises(_StopFlow):
+    with pytest.raises(RuntimeError, match="non-fast-forward composition"):
         hermes_main.cmd_update(args)
 
     out = capsys.readouterr().out
@@ -391,10 +393,10 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
         _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         == "old-feature"
     )
-    # origin/main's code actually arrived (b.txt lands with c3)...
-    assert (repo_pair / "b.txt").exists()
-    assert (repo_pair / "a.txt").read_text() == "two\n"
-    # ...and the branch's own commit survived it.
+    # Unverified composition was refused before altering either branch.
+    assert not (repo_pair / "b.txt").exists()
+    assert (repo_pair / "a.txt").read_text(encoding="utf-8") == "one\n"
+    # The branch's own commit remains intact.
     assert (repo_pair / "feature.txt").read_text() == "unmerged work\n"
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
@@ -488,7 +490,7 @@ def test_unmerged_branch_still_updates_in_place_without_the_flag(
         switch_branch=False,
     )
 
-    with pytest.raises(_StopFlow):
+    with pytest.raises(RuntimeError, match="non-fast-forward composition"):
         hermes_main.cmd_update(args)
 
     out = capsys.readouterr().out
@@ -552,6 +554,8 @@ def test_update_up_to_date_path_does_not_repark_merged_branch(
     _git(origin, "config", "user.name", "Test")
     (origin / "a.txt").write_text("one\n")
     _git(origin, "add", "a.txt")
+    (origin / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    _git(origin, "add", "runtime-compatibility.json")
     _git(origin, "commit", "-qm", "c1")
 
     clone = tmp_path / "clone"

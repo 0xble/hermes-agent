@@ -65,6 +65,13 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
+    # Delegation completion payloads already live in the async ledger. Serialising
+    # them through this generic spool strips their internal identity and can replay a
+    # duplicate ordinary user turn after the ledger independently recovers admission.
+    metadata = getattr(value, "metadata", None)
+    if (getattr(value, "internal", False) is True and isinstance(metadata, dict)
+            and metadata.get("delegation_deliveries")):
+        return False
     try:
         serialised = _serialise_value(value)
         if serialised is None:

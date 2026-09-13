@@ -2020,6 +2020,11 @@ class GatewayTurnMixin:
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
+            from gateway.delegation_delivery_receipt import (
+                delivery_metadata_for_event, mark_persisted_delegation_presentations,
+            )
+            delegation_delivery_metadata = delivery_metadata_for_event(
+                event, prepared.persistence_owner)
             agent_result = await self._run_agent(
                 goal_user_text=goal_user_text,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=source,
@@ -2030,19 +2035,17 @@ class GatewayTurnMixin:
                 persist_user_message=prepared.persist_user_message,
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
-                persist_user_display_metadata={
-                    "gateway_input_owner": prepared.persistence_owner,
-                    **({"delegation_results": [{
-                        "parent_task_id": event.metadata["delegation_parent_task_id"],
-                        "thread_refs": event.metadata.get("delegation_thread_refs", []),
-                        "attempts": event.metadata.get("delegation_attempts", {}),
-                    }]} if event.internal and event.metadata.get("delegation_parent_task_id") else {}),
-                },
+                persist_user_display_metadata=delegation_delivery_metadata,
                 message_type=event.message_type,
                 turn_reasoning_config=getattr(event, "turn_reasoning_config", None),
                 goal_session_entry=session_entry,
                 goal_post_turn_state=goal_post_turn_state,
             )
+            if isinstance(agent_result, dict):
+                mark_persisted_delegation_presentations(
+                    agent_result.get("messages") or [],
+                    delegation_delivery_metadata.get("delegation_deliveries"),
+                )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3647,6 +3650,13 @@ class GatewayTurnMixin:
         # guard will consult. Fail-safe in helper.
         await self._refresh_agent_cache_message_count(session_key, session_id)
 
+        queued_persist_metadata = None
+        queued_persist_kind = None
+        if pending_event is not None:
+            from gateway.delegation_delivery_receipt import delivery_metadata_for_event
+            queued_persist_kind = "internal_notification" if getattr(pending_event, "internal", False) else None
+            queued_persist_metadata = delivery_metadata_for_event(
+                pending_event, getattr(pending_event, "metadata", {}).get("gateway_input_owner"))
         followup_result = await self._run_agent(
             goal_user_text=(
                 self._goal_authority_text_for_event(pending_event, typed_text=next_goal_typed_text)
@@ -3657,6 +3667,8 @@ class GatewayTurnMixin:
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, inbound_message_id=next_inbound_id,
             channel_prompt=next_channel_prompt, message_type=next_message_type,
+            persist_user_display_kind=queued_persist_kind,
+            persist_user_display_metadata=queued_persist_metadata,
             # A mid-turn reconnect makes the follow-up's own adapter a different object; keep
             # the callback owner stable so the caller can still pop this chain's callbacks.
             _post_delivery_adapter=getattr(turn_ctx, "_post_delivery_owner", None) or adapter,
@@ -3667,6 +3679,12 @@ class GatewayTurnMixin:
             goal_session_entry=goal_session_entry,
             goal_post_turn_state=goal_post_turn_state,
         )
+        if isinstance(followup_result, dict) and queued_persist_metadata:
+            from gateway.delegation_delivery_receipt import mark_persisted_delegation_presentations
+            mark_persisted_delegation_presentations(
+                followup_result.get("messages") or [],
+                queued_persist_metadata.get("delegation_deliveries"),
+            )
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal

@@ -131,7 +131,11 @@ class TurnFacadeMixin:
                     if lease is not None:
                         lease.start()
                     from agent.delegation_disposition import begin_result_turn, finish_result_turn
-                    begin_result_turn(self, persist_user_display_metadata)
+                    followthrough = begin_result_turn(self, persist_user_display_metadata, include_deferred=isinstance(user_message, str))
+                    if followthrough and isinstance(user_message, str):
+                        user_message += followthrough
+                        if isinstance(persist_user_message, str):
+                            persist_user_message += followthrough
                     result = run_conversation(
                         self, user_message, system_message, conversation_history, effective_task_id,
                         stream_callback, persist_user_message,
