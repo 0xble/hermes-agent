@@ -1330,8 +1330,14 @@ def delegate_task(
                 _release_resume_launches(parent_agent, task_runtime)
                 _release_replacement_claims(parent_agent, task_list)
                 return tool_error("replaces must name an exact parent_task_id and thread_ref")
+            # The caller owns the identity before a callback can persist and lose
+            # its reply. It is internal-only (the public replaces shape above is
+            # exact), and cleanup can cancel even a not-yet-committed validation.
+            claim_id = uuid.uuid4().hex
+            task["replaces"] = {**replacement, "claim_id": claim_id}
             try:
-                claim = _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]], "validate_replacement")
+                claim = _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]],
+                                       "validate_replacement", claim_id)
                 task["replaces"] = {**replacement, "claim_id": claim["claim_id"], "attempt": claim["attempt"]}
             except (ValueError, TimeoutError) as exc:
                 _release_resume_launches(parent_agent, task_runtime)

@@ -579,19 +579,32 @@ class DelegationCards:
                     or any(ref not in card["rows"] or card["rows"][ref]["state"] not in _TERMINAL | {"unknown"} for ref in refs)):
                 raise ValueError("Handling requires this exact parent owner's terminal rows")
             if reason == "validate_replacement":
-                if len(refs) != 1 or card.get("replacement_claims", {}).get(refs[0]):
+                if len(refs) != 1 or (detail is not None and (not isinstance(detail, str) or not detail)):
+                    raise ValueError("Replacement requires one ref and a caller reservation identity")
+                ref = refs[0]
+                attempt = card["rows"][ref].get("attempt", 0)
+                if detail in card.get("replacement_cancellations", {}).get(ref, []):
+                    raise ValueError("Replacement validation was cancelled before launch")
+                if card.get("replacement_claims", {}).get(ref):
                     raise ValueError("Replacement already reserved or launch outcome unresolved; reconcile before retrying")
-                claim_id = uuid.uuid4().hex
-                card.setdefault("replacement_claims", {})[refs[0]] = {
-                    "id": claim_id, "attempt": card["rows"][refs[0]].get("attempt", 0)}
+                claim_id = detail or uuid.uuid4().hex
+                card.setdefault("replacement_claims", {})[ref] = {"id": claim_id, "attempt": attempt}
                 self._save()
-                return {"validated": True, "claim_id": claim_id,
-                        "attempt": card["rows"][refs[0]].get("attempt", 0)}
+                return {"validated": True, "claim_id": claim_id, "attempt": attempt}
             if reason == "release_replacement":
+                if not isinstance(detail, str) or not detail:
+                    raise ValueError("Replacement release requires the exact caller reservation identity")
                 for ref in refs:
                     claim = card.get("replacement_claims", {}).get(ref)
                     if claim and claim["id"] == detail:
+                        if claim.get("launched"):
+                            continue
                         card["replacement_claims"].pop(ref)
+                    # Cancellation must also precede a validation callback that
+                    # timed out while still queued. Never let it resurrect later.
+                    cancelled = card.setdefault("replacement_cancellations", {}).setdefault(ref, [])
+                    if detail not in cancelled:
+                        cancelled.append(detail)
                 self._save()
                 return {"released": True}
             if actor_session_id != session_id and reason == "blocker_report":
