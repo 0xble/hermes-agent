@@ -25,11 +25,33 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hermes_state import SessionDB
 
 from agent.turn_context import build_turn_context
 
 from tests.agent.test_compression_concurrent_fork import _build_agent_with_db
+
+
+@pytest.fixture
+def db(tmp_path: Path, monkeypatch):
+    """Keep every test agent inside the lifetime of its borrowed database."""
+    agents = []
+    build = _build_agent_with_db
+
+    def tracked_build(*args, **kwargs):
+        agent = build(*args, **kwargs)
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(f"{__name__}._build_agent_with_db", tracked_build)
+    with SessionDB(db_path=tmp_path / "state.db") as database:
+        try:
+            yield database
+        finally:
+            for agent in reversed(agents):
+                agent.close()
 
 
 def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
@@ -63,7 +85,10 @@ def _run_prologue(agent, history, user_message="hello again",
     coverage in ``test_turn_context.py``). ``rough_tokens`` pins the estimate
     that the idle floor is compared against.
     """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+    # Title generation is unrelated to idle guard behavior and starts an
+    # auxiliary worker that could outlive this test's agent/database.
+    with patch("agent.title_generator.maybe_auto_title"), \
+         patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
          patch("agent.turn_context._should_run_preflight_estimate",
                return_value=False), \
          patch("agent.turn_context.estimate_request_tokens_rough",
@@ -94,9 +119,8 @@ def _history(n: int = 20) -> list:
 
 
 
-def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
+def test_idle_compaction_status_emitted_by_default(db: SessionDB) -> None:
     """Control: the default engine keeps the 💤 idle-resume status line."""
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_LOUD"
     db.create_session(sid, source="cli")
     agent = _prep_idle_agent(db, sid)
@@ -115,7 +139,7 @@ def test_idle_compaction_status_emitted_by_default(tmp_path: Path) -> None:
     ), f"expected idle status line, got: {events}"
 
 
-def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None:
+def test_idle_compaction_defers_to_held_compression_lock(db: SessionDB) -> None:
     """An idle-triggered compress racing another path must sit the round out.
 
     The per-session lock landed after the idle-compaction PR: when another
@@ -124,7 +148,6 @@ def test_idle_compaction_defers_to_held_compression_lock(tmp_path: Path) -> None
     block must treat that skip as a strict no-op: no compressor call, no
     rotation, no flush re-baseline, anchor untouched.
     """
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_LOCKED"
     db.create_session(sid, source="cli")
     assert db.try_acquire_compression_lock(sid, "external_holder") is True
@@ -176,7 +199,7 @@ def _pin_compress_seam(agent):
     return seam
 
 
-def test_idle_compaction_skips_a_transcript_that_has_not_grown(tmp_path: Path) -> None:
+def test_idle_compaction_skips_a_transcript_that_has_not_grown(db: SessionDB) -> None:
     """The reported loop: re-compacting a session the last pass just produced.
 
     ``last_compression_rough_tokens`` records what the previous pass actually
@@ -184,7 +207,6 @@ def test_idle_compaction_skips_a_transcript_that_has_not_grown(tmp_path: Path) -
     old predicate re-fired a full multi-minute summary on every idle resume
     even though the transcript had not grown at all (#97239).
     """
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_RECOMPACT"
     db.create_session(sid, source="cli")
     agent = _prep_recompaction_agent(db, sid)
@@ -200,9 +222,8 @@ def test_idle_compaction_skips_a_transcript_that_has_not_grown(tmp_path: Path) -
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
 
 
-def test_idle_compaction_fires_again_once_the_transcript_grows(tmp_path: Path) -> None:
+def test_idle_compaction_fires_again_once_the_transcript_grows(db: SessionDB) -> None:
     """The raised floor is a deferral, not an off switch."""
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_REGROWN"
     db.create_session(sid, source="cli")
     agent = _prep_recompaction_agent(db, sid)
@@ -216,14 +237,13 @@ def test_idle_compaction_fires_again_once_the_transcript_grows(tmp_path: Path) -
 
 
 def test_idle_compaction_ignores_a_non_int_last_compaction_reading(
-    tmp_path: Path,
+    db: SessionDB,
 ) -> None:
     """Compressor doubles expose a Mock here — it must not raise the floor.
 
     An unset/derived attribute falls back to 0, which restores the original
     ``tokens > floor_tokens`` semantics exactly.
     """
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_MOCKREAD"
     db.create_session(sid, source="cli")
     agent = _prep_recompaction_agent(db, sid)
@@ -238,7 +258,7 @@ def test_idle_compaction_ignores_a_non_int_last_compaction_reading(
     seam.assert_called_once()
 
 
-def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
+def test_idle_compaction_respects_anti_thrash_breaker(db: SessionDB) -> None:
     """A tripped ineffective-compression breaker must block the idle trigger.
 
     The breaker lives in ``ContextCompressor._automatic_compression_blocked``
@@ -248,7 +268,6 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     """
     from agent.context_compressor import ContextCompressor
 
-    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "IDLE_THRASH"
     db.create_session(sid, source="cli")
     agent = _prep_idle_agent(db, sid)
