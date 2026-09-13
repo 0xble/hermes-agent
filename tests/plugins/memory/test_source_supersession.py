@@ -73,6 +73,23 @@ def provider(server):
     return result
 
 
+def accept_preexisting_versions(p, candidates):
+    """Seed real accepted-operation tracking from a previous/concurrent producer.
+
+    Recovery must still reconcile overlapping historical operations even though
+    the current fresh-source producer serializes its own submissions.
+    """
+    for candidate in candidates:
+        item = p._build_retain_kwargs(candidate.content, context=candidate.context,
+                                     metadata=candidate.metadata, tags=list(candidate.tags))
+        try:
+            response = p._retain_batch(item, bank_id=p._bank_id,
+                                       document_id=candidate.source_id, retain_async=True)
+            p._track_retain_ops(response, p._bank_id, source_candidates=[candidate])
+        except RuntimeError:
+            p._source_candidate_failed(candidate)
+
+
 @pytest.mark.parametrize("journal_state", ["absent", "empty", "pending"])
 def test_read_only_prefetch_never_recovers_or_settles_source_journal(journal_state):
     import asyncio
@@ -88,7 +105,7 @@ def test_read_only_prefetch_never_recovers_or_settles_source_journal(journal_sta
         SourceJournal(parent._api_url, parent._bank_id)
     elif journal_state == "pending":
         old, new = versions()
-        parent._retain_source_candidates([old, new], parent._bank_id)
+        accept_preexisting_versions(parent, [old, new])
         server.statuses.update({"0": "completed", "1": "completed"})
         server.hash = new.content_hash
     if path.exists():
@@ -135,12 +152,20 @@ def test_superseded_source_settles_without_verifying_stale_hash(old_status, rest
     assert old.source_id == new.source_id and old.automatic_key != new.automatic_key
     server = Server()
     p = provider(server)
-    p._retain_source_candidates([old, new], p._bank_id)
+    accept_preexisting_versions(p, [old, new])
     assert len(server.calls) == 2
     server.statuses.update({"0": old_status, "1": "completed"})
     server.hash = new.content_hash
     if restart:
         p = provider(server)
+    if old_status == "gone":
+        from plugins.memory.hindsight.source_ledger import restore_source_ledger
+        restore_source_ledger(p, p._bank_id)
+        server.statuses["0"] = "completed"
+        # Completion is known, but mismatched readback remains unresolved until
+        # the newer operation is verified. Its subsequent eviction is safe.
+        assert not p._is_retain_op_complete(p._bank_id, "0")
+        server.statuses["0"] = "gone"
     assert p._wait_for_retains_drained(30)
     assert p._source_ledger[old.automatic_key]["status"] == "superseded"
     assert p._source_ledger[old.automatic_key]["superseded_by"] == new.automatic_key
@@ -197,7 +222,7 @@ def test_unsettled_source_evidence_survives_timeout_and_restart(scenario, monkey
     if scenario.startswith("new_child_"):
         server.child = scenario.removeprefix("new_child_")
     p = provider(server)
-    p._retain_source_candidates([old, new], p._bank_id)
+    accept_preexisting_versions(p, [old, new])
     server.statuses.update({"0": "completed", "1": "completed"})
     server.hash = new.content_hash
     if scenario == "journal_write_failed":
@@ -255,7 +280,7 @@ def test_fresh_source_reversion_preserves_history_and_replay_dedup(old_settlemen
         assert p._wait_for_retains_drained(30)
         p._retain_source_candidates([old], p._bank_id)
         assert len(server.calls) == 1
-    p._retain_source_candidates([new], p._bank_id)
+    accept_preexisting_versions(p, [new])
     server.statuses.update({"0": "completed", "1": "completed"})
     server.hash = new.content_hash
     assert p._wait_for_retains_drained(30)
@@ -302,7 +327,7 @@ def test_reversion_waits_for_pending_evidence_before_fresh_observation(successor
     p._retain_source_candidates([old], p._bank_id)
     if successor == "submit_failed":
         server.reject_hash = new.content_hash
-    p._retain_source_candidates([new], p._bank_id)
+    accept_preexisting_versions(p, [new])
     server.statuses["1"] = "failed" if successor == "failed" else "completed"
     server.hash = new.content_hash if successor == "completed" else old.content_hash
     assert not p._wait_for_retains_drained(10)
@@ -340,15 +365,19 @@ def test_discovered_repeated_version_remains_last_through_retention_and_restart(
     server = Server()
     p = provider(server)
     p._retain_source_candidates(discovered, p._bank_id)
+    assert len(server.calls) == 1
+    server.statuses['0'] = 'completed'
+    server.hash = updated.content_hash
+    assert not p._wait_for_retains_drained(30)
     assert server.calls[-1]['items'][0]['metadata']['content_hash'] == earlier.content_hash
     assert {call['items'][0]['content'] for call in server.calls} == {earlier.content, updated.content}
-    server.statuses = {key: 'completed' for key in server.statuses}
+    server.statuses['1'] = 'completed'
     server.hash = earlier.content_hash
     assert p._wait_for_retains_drained(30)
     recovered = provider(server)
     assert recovered._wait_for_retains_drained(30)
     assert recovered._source_ledger[earlier.automatic_key]['status'] == 'completed'
-    assert recovered._source_ledger[updated.automatic_key]['status'] == 'superseded'
+    assert recovered._source_ledger[updated.automatic_key]['status'] == 'completed'
 
 
 @pytest.mark.parametrize("finish_order", [(0, 1), (1, 0)])
@@ -363,7 +392,7 @@ def test_pending_reversion_keeps_fresh_observation_until_async_writes_settle(fin
     server = ApplyingServer()
     p = provider(server)
     p._retain_source_candidates([old], p._bank_id)
-    p._retain_source_candidates([new], p._bank_id)
+    accept_preexisting_versions(p, [new])
     # This is a fresh user-led turn's source discovery, not journal recovery.
     messages = [{"role": "user", "content": "Recheck the source now."},
         {"role": "assistant", "tool_calls": [{"id": "fresh", "type": "function",
@@ -399,7 +428,7 @@ def test_deferred_fresh_payload_is_never_reconstructed_on_restart():
     old, new = versions()
     server = Server()
     p = provider(server)
-    p._retain_source_candidates([old, new], p._bank_id)
+    accept_preexisting_versions(p, [old, new])
     p._retain_source_candidates([old], p._bank_id)
     assert len(server.calls) == 2
     assert all(not entry["candidate"].content and not entry["candidate"].file_path
@@ -416,7 +445,7 @@ def test_deferred_reversion_requires_terminal_status_not_missing_status(prior_st
     old, new = versions()
     server = Server()
     p = provider(server)
-    p._retain_source_candidates([old, new], p._bank_id)
+    accept_preexisting_versions(p, [old, new])
     p._retain_source_candidates([old], p._bank_id)
     server.statuses.update({'0': prior_status, '1': 'completed'})
     server.hash = 'unverified-remote-content'
@@ -432,3 +461,59 @@ def test_deferred_reversion_requires_terminal_status_not_missing_status(prior_st
     assert p._wait_for_retains_drained(30)
     assert not p._source_terminal_ops  # only live unresolved refs retain terminal evidence
     assert len(server.calls) == 3
+
+
+@pytest.mark.parametrize('prior_status', ['completed', 'failed', 'gone'])
+@pytest.mark.parametrize('repeat_old', [False, True])
+@pytest.mark.parametrize('poll_between_observations', [False, True])
+def test_fresh_versions_serialize_and_keep_intermediate_source_history(repeat_old, poll_between_observations, prior_status):
+    old, new = versions('https://example.com/serialized')
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    if poll_between_observations:
+        assert not p._wait_for_retains_drained(10)
+    p._retain_source_candidates([new], p._bank_id)
+    if repeat_old:
+        p._retain_source_candidates([old], p._bank_id)
+    # B cannot finish before A: it has not yet been submitted.
+    assert len(server.calls) == 1
+    if prior_status == 'gone':
+        server.statuses['0'] = 'gone'
+        server.hash = old.content_hash  # exact content is not proof the missing writer stopped
+        assert not p._wait_for_retains_drained(30)
+        assert len(server.calls) == 1
+    expected = [old, new, old] if repeat_old else [old, new]
+    for index, candidate in enumerate(expected):
+        assert server.calls[index]['items'][0]['metadata']['content_hash'] == candidate.content_hash
+        failed = prior_status == 'failed' and index == 0
+        server.statuses[str(index)] = 'failed' if failed else 'completed'
+        server.hash = 'no-source-yet' if failed else candidate.content_hash
+        drained = p._wait_for_retains_drained(30)
+        assert drained is (index == len(expected) - 1)
+        assert len(server.calls) == min(index + 2, len(expected))
+    assert server.hash == expected[-1].content_hash
+    assert {call['items'][0]['content'] for call in server.calls} == {old.content, new.content}
+    assert p._wait_for_retains_drained(30) and len(server.calls) == len(expected)
+
+
+@pytest.mark.parametrize('failure', ['submission', 'operation'])
+def test_serialized_successor_failure_is_not_an_automatic_retry_loop(failure):
+    old, new = versions('https://example.com/serialized-failure')
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old, new], p._bank_id)
+    assert len(server.calls) == 1
+    if failure == 'submission':
+        server.reject_hash = new.content_hash
+    server.statuses['0'] = 'completed'
+    server.hash = old.content_hash
+    drained = p._wait_for_retains_drained(30)
+    assert len(server.calls) == 2
+    if failure == 'operation':
+        assert not drained
+        server.statuses['1'] = 'failed'
+    assert p._wait_for_retains_drained(30)
+    assert p._wait_for_retains_drained(30)
+    assert p._source_ledger[new.automatic_key]['status'] == 'failed'
+    assert server.hash == old.content_hash and len(server.calls) == 2

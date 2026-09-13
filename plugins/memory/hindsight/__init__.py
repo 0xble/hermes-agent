@@ -460,7 +460,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._source_terminal_ops: set[str] = set()
         # Fresh observations only. Never persisted or reconstructed from journal
         # references, so process exit intentionally loses deferred source bytes.
-        self._deferred_source_candidates: dict[str, tuple[SourceCandidate, str]] = {}
+        self._deferred_source_candidates: dict[str, list[tuple[SourceCandidate, str]]] = {}
         self._source_ledger: dict[tuple[str, str], dict[str, Any]] = {}
         self._source_retain_ops: dict[str, SourceCandidate] = {}
         self._source_retain_verified: set[tuple[str, str]] = set()
@@ -779,6 +779,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
             )
         except NotFoundException:
+            # Readback proves current content, not that an absent operation can
+            # never write again. Keep source evidence pending unless a terminal
+            # status was positively observed in this lifecycle.
+            if candidate is not None and op_id not in self._source_terminal_ops:
+                return False
             if (settled := _settle_if_source()):
                 finish()
             return settled
@@ -1402,25 +1407,32 @@ class HindsightMemoryProvider(MemoryProvider):
         return later, blocked
 
     def _flush_deferred_source_candidates(self) -> None:
-        # The writer and drain thread share one submission owner. Readback can
-        # reconcile independently, but newer observations cannot race a flush.
+        # Serialize source versions, preserving unseen intermediate evidence and
+        # ordering repeated versions by their latest fresh observation.
         with self._source_submission_lock:
-            for source_id, (candidate, bank_id) in list(self._deferred_source_candidates.items()):
-                with self._source_retain_keys_lock:
-                    _, blocked = self._source_reversion_state(candidate)
-                if blocked:
-                    continue
-                self._deferred_source_candidates.pop(source_id, None)
-                try:
+            for source_id in list(self._deferred_source_candidates):
+                queued = self._deferred_source_candidates[source_id]
+                while queued:
+                    candidate, bank_id = queued[0]
                     with self._source_retain_keys_lock:
+                        later, blocked = self._source_reversion_state(candidate)
                         pending = any(e["candidate"].source_id == source_id and e.get("pending_operation_ids")
                                       for e in self._source_ledger.values())
-                    if (not pending and self._verify_source_candidate(bank_id, candidate)
-                            and self._source_ledger[candidate.automatic_key].get("status") == "completed"):
-                        continue
-                    self._retain_source_candidate(candidate, bank_id, _fresh_deferred=True)
-                except Exception as exc:
-                    logger.warning("Hindsight deferred fresh source failed: %s", exc)
+                    if blocked:
+                        break
+                    latest = len(queued) == 1
+                    queued.pop(0)
+                    try:
+                        if (latest and (not pending or not later)
+                                and self._verify_source_candidate(bank_id, candidate)
+                                and self._source_ledger[candidate.automatic_key].get("status") == "completed"):
+                            continue
+                        self._retain_source_candidate(candidate, bank_id,
+                            allow_reversion=latest, _fresh_deferred=True)
+                    except Exception as exc:
+                        logger.warning("Hindsight deferred fresh source failed: %s", exc)
+                if not queued:
+                    self._deferred_source_candidates.pop(source_id, None)
 
     def _source_candidate_already_submitted(self, candidate: SourceCandidate, *,
                                              allow_reversion: bool = True, fresh_deferred: bool = False) -> bool:
@@ -1458,17 +1470,22 @@ class HindsightMemoryProvider(MemoryProvider):
         """Submit one automatically discovered source and track its durability."""
         with self._source_submission_lock:
             restore_source_ledger(self, bank_id)
-            if allow_reversion:
-                # Every latest observation supersedes an older deferred desire,
-                # even when this candidate is already accepted/verified.
-                previous_desire = self._deferred_source_candidates.pop(candidate.source_id, None)
+            if not _fresh_deferred:
                 with self._source_retain_keys_lock:
-                    later, blocked = self._source_reversion_state(candidate)
-                if (later or previous_desire is not None) and blocked:
-                    self._deferred_source_candidates[candidate.source_id] = (candidate, bank_id)
+                    _, blocked = self._source_reversion_state(candidate)
+                queued = self._deferred_source_candidates.get(candidate.source_id)
+                if blocked or queued:
+                    # Keep distinct unsubmitted versions, with the last observed
+                    # duplicate at the tail. Nothing can overwrite a later version
+                    # by completing late because submissions are serialized.
+                    queued = [item for item in (queued or [])
+                              if item[0].automatic_key != candidate.automatic_key]
+                    queued.append((candidate, bank_id))
+                    self._deferred_source_candidates[candidate.source_id] = queued
                     return
             if self._source_candidate_already_submitted(
-                    candidate, allow_reversion=allow_reversion, fresh_deferred=_fresh_deferred):
+                    candidate, allow_reversion=allow_reversion,
+                    fresh_deferred=_fresh_deferred and allow_reversion):
                 logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
                 return
             try:
@@ -1508,13 +1525,14 @@ class HindsightMemoryProvider(MemoryProvider):
         # Earlier observations may introduce unseen versions, but cannot revive
         # historical hashes ahead of the batch's last observation of that source.
         latest = {candidate.source_id: index for index, candidate in enumerate(candidates)}
-        for index, candidate in enumerate(candidates):
-            try:
-                self._retain_source_candidate(candidate, bank_id,
-                                              allow_reversion=index == latest[candidate.source_id])
-            except Exception as exc:
-                logger.warning("Hindsight source retain failed: type=%s, id=%s, error=%s",
-                               candidate.source_type, candidate.source_id, exc, exc_info=True)
+        with self._source_submission_lock:
+            for index, candidate in enumerate(candidates):
+                try:
+                    self._retain_source_candidate(candidate, bank_id,
+                                                  allow_reversion=index == latest[candidate.source_id])
+                except Exception as exc:
+                    logger.warning("Hindsight source retain failed: type=%s, id=%s, error=%s",
+                                   candidate.source_type, candidate.source_id, exc, exc_info=True)
 
     def _make_turn_retain_job(self, turns: list[str], *, document_id: str, update_mode: str | None,
                               label: str, track_ops: bool = True) -> Callable[[], None]:
