@@ -19,33 +19,52 @@ DEFER_REASON_GUIDANCE = (
 )
 
 
-def _query(agent, results=None):
+def _query(agent, results=None, *, include_deferred=False):
     callback = getattr(agent, "tool_progress_callback", None)
     if not callable(callback):
         return {"missing": []}
     from tools.async_delegation import current_delegation_owner
     answer = callback("subagent.result_turn", actor_session_id=str(agent.session_id),
                       actor_owner=current_delegation_owner(agent),
-                      turn_id=agent._delegation_result_turn, results=results)
+                      turn_id=agent._delegation_result_turn, results=results,
+                      **({"include_deferred": True} if include_deferred else {}))
+    # Display-only callbacks on CLI surfaces have no lifecycle ledger. Gateway
+    # lifecycle relays return a mapping; wrappers must preserve that return value.
     return answer if isinstance(answer, dict) else {"missing": []}
 
 
-def begin_result_turn(agent, metadata=None):
+def begin_result_turn(agent, metadata=None, *, include_deferred=True):
     agent._delegation_result_turn = uuid.uuid4().hex
     agent._delegation_result_tracking_error = False
+    agent._delegation_followthrough_done = False
     results = (metadata or {}).get("delegation_results")
     if results:
         try:
-            _query(agent, results)
+            answer = _query(agent, results, include_deferred=include_deferred)
+            if include_deferred:
+                agent._delegation_followthrough_done = True
+            return _followthrough(agent, answer)
         except Exception:
             agent._delegation_result_tracking_error = True
             logger.exception("Could not persist this turn's delegation result delivery")
+    return ""
+
+
+def _followthrough(agent, answer):
+    if answer.get("deferred"):
+        from agent.delegation_followthrough import retrieve_deferred_context
+        content, presentations = retrieve_deferred_context(agent, answer["deferred"])
+        if presentations:
+            _query(agent, presentations)
+        return content
+    return ""
 
 
 def observe_tool_results(agent, assistant_message, messages):
     if not isinstance(getattr(agent, "_delegation_result_turn", None), str):
         return
     calls = {tc.id for tc in assistant_message.tool_calls if tc.function.name == "delegate_task"}
+    followthrough = ""
     for message in messages:
         if message.get("role") != "tool" or message.get("tool_call_id") not in calls:
             continue
@@ -69,11 +88,16 @@ def observe_tool_results(agent, assistant_message, messages):
                   if isinstance(t, dict) and t.get("task_index", i) in indices]
                  if isinstance(threads, list) else [ref for i, ref in enumerate(refs) if i in indices])
         try:
-            _query(agent, [{"parent_task_id": metadata["parent_task_id"], "thread_refs": exact,
-                            "attempts": metadata.get("attempts", {})}])
+            include = not getattr(agent, "_delegation_followthrough_done", False) and not getattr(agent, "_review_yield_requested", False)
+            answer = _query(agent, [{"parent_task_id": metadata["parent_task_id"], "thread_refs": exact,
+                            "attempts": metadata.get("attempts", {})}], include_deferred=include)
+            if include:
+                agent._delegation_followthrough_done = True
+                followthrough = _followthrough(agent, answer)
         except Exception:
             agent._delegation_result_tracking_error = True
             logger.exception("Could not persist exact delegate tool result presentation")
+    return followthrough
 
 
 @contextmanager

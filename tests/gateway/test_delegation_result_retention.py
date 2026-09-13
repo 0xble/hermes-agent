@@ -92,6 +92,16 @@ async def test_deferred_result_survives_notification_ack_and_pruning_until_exact
         parent = SimpleNamespace(session_id="s")
         payload = json.loads(await asyncio.to_thread(delegate_task, action="result", delegation_id=uid, parent_agent=parent))
         assert payload["results"][0]["summary"] == "payload"
+        from agent.delegation_followthrough import retrieve_deferred_context
+        wanted = [{"parent_task_id": parent_task_id, "thread_ref": "A", "attempt": 0}]
+        context, presentations = await asyncio.to_thread(retrieve_deferred_context, parent, wanted)
+        assert "payload" in context and uid in context
+        assert presentations == [{"parent_task_id": parent_task_id, "thread_refs": ["A"], "attempts": {"A": 0}}]
+        assert await asyncio.to_thread(retrieve_deferred_context, parent,
+            [{**wanted[0], "attempt": 1}]) == ("", [])
+        assert await asyncio.to_thread(retrieve_deferred_context,
+            SimpleNamespace(session_id="foreign"), wanted) == ("", [])
+        assert not restored.cards[parent_task_id].get("handled")
         await restored.handling(source, "r", "s", 3, actor_session_id="s", parent_task_id=parent_task_id,
                                refs=["A"], reason="incorporated", turn_id="arrival")
         await restored.delivered({parent_task_id: restored._proof(restored.cards[parent_task_id], ["A"])})

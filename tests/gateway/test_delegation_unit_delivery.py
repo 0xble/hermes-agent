@@ -123,7 +123,9 @@ async def test_deferred_result_retrieved_by_exact_owner_in_later_ordinary_turn(t
         tool = SimpleNamespace(id="retrieve", function=SimpleNamespace(name="delegate_task"))
         await asyncio.to_thread(observe_tool_results, parent, SimpleNamespace(tool_calls=[tool]), [{"role": "tool", "tool_call_id": "retrieve", "content": result}])
         missing = await cards.result_turn(actor_session_id="s", turn_id="later-user-turn")
-        assert not missing["missing"]  # prior deliberate deferral is not erased by reading
+        assert [item["thread_ref"] for item in missing["missing"]] == ["B"]
+        # Reading does not erase the old deferral, but a new explicit disposition is required.
+        assert cards.cards[data["parent_task_id"]]["handling"]["B"]["reason"] == "deferred"
         assert cards.cards[data["parent_task_id"]]["result_turns"]["later-user-turn"] == {"B": 1}
         accepted = json.loads(await asyncio.to_thread(delegate_task, action="handle", parent_task_id=data["parent_task_id"], handled_refs=["B"], handling="incorporated", parent_agent=parent))
         assert accepted["recorded"] and accepted["awaiting_delivery"]
@@ -210,5 +212,38 @@ async def test_inline_terminal_results_remain_retrievable_after_deferral(tmp_pat
         assert ad.get_durable_delegation(uid)["event"] is None
     finally:
         clear_session_vars(tokens)
+        await drain(cards)
+        ad._reset_for_tests()
+
+
+
+@pytest.mark.asyncio
+async def test_new_completion_reopens_owned_deferred_payload_without_acceptance(tmp_path, monkeypatch):
+    from agent.delegation_disposition import begin_result_turn, _query
+    from gateway.session_context import set_session_vars, clear_session_vars
+    cards, source, data, parent, gates, handles = await units(tmp_path, monkeypatch)
+    tokens = set_session_vars(platform="telegram", profile="default", chat_id="42", session_key="r", session_id="s")
+    try:
+        for gate in gates:
+            gate.set()
+        events = [await asyncio.to_thread(process_registry.completion_queue.get, timeout=5) for _ in gates]
+        old = next(e for e in events if e["thread_refs"] == ["B"])
+        new = next(e for e in events if e["thread_refs"] == ["A"])
+        await cards.result_turn(actor_session_id="s", turn_id="old", results=[old])
+        await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=data["parent_task_id"], refs=["B"], reason="deferred", detail="Need approval", turn_id="old")
+        content = await asyncio.to_thread(begin_result_turn, parent, {"delegation_results": [new]})
+        assert "Verified result 1" in content
+        assert old["delegation_id"] in content
+        missing = (await asyncio.to_thread(_query, parent))["missing"]
+        assert {item["thread_ref"] for item in missing} == {"A", "B"}
+        assert cards.cards[data["parent_task_id"]]["handling"]["B"]["reason"] == "deferred"
+        assert not cards.cards[data["parent_task_id"]].get("handled")
+        await cards.handling(source, "r", "s", 3, actor_session_id="s", parent_task_id=data["parent_task_id"], refs=["B"], reason="deferred", detail="Need approval", turn_id=parent._delegation_result_turn)
+        assert {item["thread_ref"] for item in (await asyncio.to_thread(_query, parent))["missing"]} == {"A"}
+        assert not cards.cards[data["parent_task_id"]].get("handled")
+    finally:
+        clear_session_vars(tokens)
+        for gate in gates:
+            gate.set()
         await drain(cards)
         ad._reset_for_tests()

@@ -156,7 +156,16 @@ def run_tool_round(
     _result_start = len(messages)
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from agent.delegation_disposition import observe_tool_results
-    observe_tool_results(agent, assistant_message, messages[_result_start:])
+    followthrough = observe_tool_results(agent, assistant_message, messages[_result_start:])
+    if followthrough:
+        append_message(messages, {"role": "user", "content": followthrough,
+                                  "display_kind": "hidden"})
+        try:
+            if agent._flush_messages_to_session_db(messages, conversation_history) is False:
+                agent._incremental_persistence_failed = True
+        except Exception:
+            agent._incremental_persistence_failed = True
+            logger.exception("Deferred result follow-through persistence failed")
 
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to

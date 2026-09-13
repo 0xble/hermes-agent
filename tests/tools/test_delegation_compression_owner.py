@@ -33,7 +33,8 @@ def test_original_ledger_owner_survives_only_proven_compression(owners, mutation
     db, original, current = owners
     metadata = async_delegation.reserve_delegation_metadata(parent_task_id=None, owner=original, task_labels=["Inspect"])
     result = {"results": [{"task_index": 0, "status": "completed", "summary": "Fixture result"}]}
-    delegation_id = async_delegation.persist_inline_result(result, metadata)
+    delegation_id = async_delegation.persist_inline_result(result, {**metadata,
+        "threads": [{"thread_ref": "A", "task_index": 0, "task_label": "Inspect"}]})
     if mutation in ("foreign", "sibling"):
         current["session_id"] = mutation
     elif mutation == "noncompression":
@@ -58,6 +59,12 @@ def test_original_ledger_owner_survives_only_proven_compression(owners, mutation
         assert payload["owner"] == original
         assert async_delegation.get_delegation_status(delegation_id, owner=current, session_db=db)
         assert len(async_delegation.list_durable_delegations(owner=current, session_db=db)) == 1
+        from agent.delegation_followthrough import retrieve_deferred_context
+        context, presentations = retrieve_deferred_context(parent, [{
+            "parent_task_id": metadata["parent_task_id"], "thread_ref": "A", "attempt": 0}])
+        assert "Fixture result" in context
+        assert presentations == [{"parent_task_id": metadata["parent_task_id"],
+                                 "thread_refs": ["A"], "attempts": {"A": 0}}]
     stored = async_delegation.get_delegation_result(delegation_id, owner=original)
     assert stored is not None
     assert stored["delegation_metadata"]["owner"] == original
@@ -107,6 +114,18 @@ async def test_card_admission_result_handling_preserve_original_owner(owners, tm
                                 {**data, "attempt": 1, "resume_claim_id": "claim"})
             assert cards.cards[key] == before
     else:
+        await cards.handling(source, "fixture", actor, 2, actor_session_id=actor, actor_owner=current,
+                             parent_task_id=key, refs=["A"], reason="deferred", detail="Under review", turn_id="turn")
+        for event in ("subagent.start", "subagent.complete"):
+            await cards.observe(source, "fixture", "root", 1, event, None,
+                                {**data, "thread_ref": "B", "child_session_id": "child-b", "status": "completed"})
+        offered = await cards.result_turn(actor_session_id=actor, actor_owner=current, turn_id="next",
+            results=[{"parent_task_id": key, "thread_refs": ["B"]}], include_deferred=True)
+        assert [item["thread_ref"] for item in offered.get("deferred", [])] == ["A"]
+        # A locator is not presentation authority, even across a proven compression.
+        with pytest.raises(ValueError, match="absent or superseded"):
+            await cards.handling(source, "fixture", actor, 2, actor_session_id=actor, actor_owner=current,
+                                 parent_task_id=key, refs=["A"], reason="incorporated", turn_id="next")
         answer = await cards.handling(source, "fixture", actor, 2, actor_session_id=actor, actor_owner=current,
                                       parent_task_id=key, refs=["A"], reason="incorporated", turn_id="turn")
         assert answer["awaiting_delivery"]

@@ -42,6 +42,18 @@ def test_flush_writes_string_pending_to_file(tmp_path, monkeypatch):
     assert "telegram" not in files[0].name
 
 
+def test_flush_skips_durable_internal_delegation_event(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    event = MagicMock()
+    event.internal = True
+    event.metadata = {"delegation_deliveries": [{"delegation_id": "deleg_a"}]}
+    event.text = "durable result"
+
+    assert flush_pending_to_file({"session_key": event}, reason="shutdown") == 0
+    assert list(flush_dir.glob("*.json")) == []
+
+
 def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     flush_dir = _make_flush_dir(tmp_path)
     monkeypatch.setattr(

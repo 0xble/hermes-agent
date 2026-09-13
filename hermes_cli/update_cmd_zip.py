@@ -286,6 +286,11 @@ def _download_and_swap_zip(branch: str, zip_url: str) -> None:
         extracted = _extracted_root(tmp_dir, branch)
         entries = [i for i in os.listdir(extracted) if i not in _ZIP_PRESERVED_TOP_LEVEL]
         project_root = str(_m().PROJECT_ROOT)
+        from hermes_cli.update_compatibility import require_directory
+        # Both sides must recover admitted results: any partial swap/rollback
+        # retains compatible readers, including a previously partial activation.
+        require_directory(extracted)
+        require_directory(project_root)
         _require_staging_space(extracted, entries, project_root)
         staged = _stage_entries(extracted, entries, project_root)
         try:

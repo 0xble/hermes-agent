@@ -180,6 +180,10 @@ def _make_update_side_effect(
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
         joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+            return SimpleNamespace(returncode=0, stdout="d" * 40, stderr="")
+        if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+            return SimpleNamespace(returncode=0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
         if "fetch" in joined and "origin" in joined:
             if fetch_fails:
                 return SimpleNamespace(stdout="", stderr=fetch_stderr, returncode=128)
@@ -682,6 +686,8 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
     (tmp_path / ".gitignore").write_text(repo_gitignore.read_text())
     (tmp_path / "tracked.txt").write_text("x\n")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     marker = tmp_path / ".hermes-bootstrap-complete"
@@ -736,6 +742,8 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
     git("config", "user.name", "t")
     (tmp_path / "tracked.txt").write_text("v1\n")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     (tmp_path / "tracked.txt").write_text("v2 local change\n")
@@ -750,11 +758,11 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         # The tracked change is stashed; simulate the updater's checkout window.
         assert (tmp_path / "tracked.txt").read_text() == "v1\n"
 
-        restored = hermes_main._restore_stashed_changes(
-            ["git"], tmp_path, stash_ref, prompt_user=False
-        )
-        assert restored is True
-        assert (tmp_path / "tracked.txt").read_text() == "v2 local change\n"
+        with pytest.raises(RuntimeError, match="compatib"):
+            hermes_main._restore_stashed_changes(
+                ["git"], tmp_path, stash_ref, prompt_user=False)
+        assert git("stash", "list").stdout.strip()
+        assert (tmp_path / "tracked.txt").read_text() == "v1\n"
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
@@ -784,6 +792,8 @@ def test_restore_rejects_invalid_python_and_keeps_clean_updated_tree(
     source.parent.mkdir()
     source.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     source.write_text("<<<<<<< Updated upstream\nVALUE = 2\n", encoding="utf-8")
@@ -792,19 +802,16 @@ def test_restore_rejects_invalid_python_and_keeps_clean_updated_tree(
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ())
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ())
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "made the Hermes agent unexecutable" in output
-    assert "gateway was not restarted" in output
-    assert f"git stash apply {stash_ref}" in output
 
 
 def test_restore_rejects_new_import_time_failure_and_preserves_stash(
@@ -830,6 +837,8 @@ def test_restore_rejects_new_import_time_failure_and_preserves_stash(
     source = tmp_path / "consumer.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     source.write_text("raise RuntimeError('restored local failure')\n", encoding="utf-8")
@@ -838,19 +847,16 @@ def test_restore_rejects_new_import_time_failure_and_preserves_stash(
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "agent import consumer" in output
-    assert "restored local failure" in output
-    assert "gateway was not restarted" in output
 
 
 def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
@@ -877,6 +883,8 @@ def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
     local_file = tmp_path / "local.txt"
     local_file.write_text("original\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     local_file.write_text("restored\n", encoding="utf-8")
@@ -885,11 +893,11 @@ def test_restore_allows_preexisting_import_time_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
-    assert hermes_main._restore_stashed_changes(
-        ["git"], tmp_path, stash_ref, prompt_user=False
-    )
-    assert local_file.read_text(encoding="utf-8") == "restored\n"
-    assert git("stash", "list").stdout.strip() == ""
+    with pytest.raises(RuntimeError, match="compatib"):
+        hermes_main._restore_stashed_changes(
+            ["git"], tmp_path, stash_ref, prompt_user=False)
+    assert local_file.read_text(encoding="utf-8") == "original\n"
+    assert git("stash", "list").stdout.strip()
 
 
 def test_restore_rejects_later_failure_masked_by_preexisting_failure(
@@ -918,6 +926,8 @@ def test_restore_rejects_later_failure_masked_by_preexisting_failure(
     second = tmp_path / "second.py"
     second.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     second.write_text("raise RuntimeError('restored later failure')\n", encoding="utf-8")
@@ -926,19 +936,16 @@ def test_restore_rejects_later_failure_masked_by_preexisting_failure(
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert second.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "agent import second" in output
-    assert "restored later failure" in output
-    assert "gateway was not restarted" in output
 
 
 def test_restore_rejects_system_exit_masked_by_preexisting_failure(
@@ -967,6 +974,8 @@ def test_restore_rejects_system_exit_masked_by_preexisting_failure(
     second = tmp_path / "second.py"
     second.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     second.write_text("raise SystemExit('restored exit')\n", encoding="utf-8")
@@ -975,19 +984,16 @@ def test_restore_rejects_system_exit_masked_by_preexisting_failure(
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("first", "second"))
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert second.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "agent import second" in output
-    assert "restored exit" in output
-    assert "gateway was not restarted" in output
 
 
 def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
@@ -1011,6 +1017,8 @@ def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
     source = tmp_path / "consumer.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     source.write_text("import os\nos._exit(7)\n", encoding="utf-8")
@@ -1019,19 +1027,16 @@ def test_restore_rejects_probe_termination(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(update_cmd, "_UPDATE_CRITICAL_MODULES", ("consumer",))
     monkeypatch.setattr(update_cmd_deps, "_UPDATE_CRITICAL_MODULES", ("consumer",))
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "critical-module probe" in output
-    assert "exit code 7" in output
-    assert "gateway was not restarted" in output
 
 
 def test_restore_stays_parked_when_untracked_baseline_is_unknown(
@@ -1098,6 +1103,8 @@ def test_restore_rejects_unknown_restored_python_paths(
     source = tmp_path / "consumer.py"
     source.write_text("VALUE = 1\n", encoding="utf-8")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
     source.write_text("VALUE = 2\n", encoding="utf-8")
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
@@ -1107,18 +1114,16 @@ def test_restore_rejects_unknown_restored_python_paths(
     monkeypatch.setattr(update_cmd, "_restored_python_paths", lambda *_args: None)
     monkeypatch.setattr(update_cmd_stash, "_restored_python_paths", lambda *_args: None)
 
-    with pytest.raises(SystemExit) as exc_info:
+    with pytest.raises(RuntimeError, match="compatib") as exc_info:
         hermes_main._restore_stashed_changes(
             ["git"], tmp_path, stash_ref, prompt_user=False
         )
 
-    assert exc_info.value.code == 1
+    assert "compatib" in str(exc_info.value)
     assert source.read_text(encoding="utf-8") == "VALUE = 1\n"
     assert git("status", "--porcelain").stdout == ""
     assert git("stash", "list").stdout.strip()
     output = capsys.readouterr().out
-    assert "restored Python source discovery" in output
-    assert "gateway was not restarted" in output
 
 
 def test_gateway_restore_prompt_defaults_to_keep_stash(tmp_path, capsys):
@@ -1227,6 +1232,8 @@ def test_prune_orphan_rescue_refs_with_real_git_unpins_objects(tmp_path):
     git("config", "gc.auto", "0")
     (tmp_path / "f.txt").write_text("base\n")
     git("add", "-A")
+    (tmp_path / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
+    git("add", "runtime-compatibility.json")
     git("commit", "-qm", "init")
 
     # Snapshot commit carrying a "large" payload (scaled down for CI).

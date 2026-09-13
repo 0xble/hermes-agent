@@ -75,6 +75,12 @@ When useful, record the removal commit subject or resolved SHA on the `Retired` 
 
 Commit subjects and resolved SHAs are optional, human-readable provenance, not manifest keys or publication requirements. Resolve a current SHA from fetched fork history only when it materially helps attribution or review; do not reconstruct or rewrite history to complete this inventory.
 
+## Deferred follow-through and durable presentation — source candidate
+
+- **Contract:** [follow-through](docs/delegation-followthrough.md). Logging preserves callback receipts; a new same-owner completion re-presents a bounded page of exact retained deferred results for explicit disposition. Admission is non-claimable but not delivery; durable user-row receipts and restart replay close the volatile-queue loss window.
+- **Verification:** real logging/relay/card and temp-SQLite result retrieval, exact-owner/attempt rejection, re-deferral, canonical presentation, queued input metadata, restart/race/replay-budget tests. Exact candidate native review required before landing. No live state cleanup or independent-completions default changes.
+- **Retirement/rollback:** fork PR166 introduced return-valued callback semantics into an upstream logging wrapper. Retire when upstream satisfies these complete contracts; no matching released fix found. Managed updates enforce the admitted-reader and guard-continuity capability floor, even with zero admitted rows. This avoids count/writer races across served stores. Unverified merges and stash overlays require a reviewed compatible revision. Manual Git and legacy installers are outside this boundary; see the contract for scope. Never fabricate ledger clearance. Source landing and runtime activation remain separate.
+
 ## Explicit delegation result disposition — source candidate
 
 - **Contract:** [result disposition and continuation](docs/delegation-result-dispositions.md). Track only exact terminal attempts delivered to a processing turn; one narrow boundary correction; persist incorporated/blocker/deferred disposition before response; verified delivery retires, deferred/failed delivery remains visible.

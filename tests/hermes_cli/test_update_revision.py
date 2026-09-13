@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,10 @@ def _repo(tmp_path: Path) -> tuple[Path, Path, str]:
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text('READY = True\n')
     (seed / "pyproject.toml").write_text("[project]\nname = 'pin-test'\n")
+    (seed / "runtime-compatibility.json").write_text(json.dumps({
+        "schema": 1,
+        "capabilities": ["delegation-admitted-v1", "managed-downgrade-floor-v1"],
+    }))
     _git(["add", "."], seed)
     _git(["commit", "-m", "first"], seed)
     _git(["push", "origin", "HEAD:main"], seed)

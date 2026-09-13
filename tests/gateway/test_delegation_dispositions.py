@@ -212,3 +212,37 @@ def test_correction_tool_guard_and_terminal_tool_result_provenance():
                     {"results": [{"task_index": 1}], "delegation_metadata": {"parent_task_id": "key", "thread_refs": ["A", "B"]}}]:
         observe_tool_results(agent, call, [{"role": "tool", "tool_call_id": "call", "content": json.dumps(payload)}])
     assert len(recorded) == 1 and recorded[0]["results"][0]["thread_refs"] == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_logged_nested_receipts_and_deferred_followthrough(tmp_path, monkeypatch):
+    from tools.delegation_live_log import LiveTranscriptWriter, wrap_progress_callback
+    cards, source, _, data, _ = await setup(tmp_path, monkeypatch)
+    await terminal(cards, source, data)
+    key = data["parent_task_id"]
+    loop = asyncio.get_running_loop()
+    def relay(event, tool=None, preview=None, args=None, **kw):
+        operation = cards.result_turn(**kw) if event == "subagent.result_turn" else cards.handling(source, "r", "s", 2, **kw)
+        return asyncio.run_coroutine_threadsafe(operation, loop).result(timeout=5)
+    agent = SimpleNamespace(session_id="s", tool_progress_callback=wrap_progress_callback(relay, LiveTranscriptWriter("deleg_receipts", 0, "fixture")))
+    await asyncio.to_thread(begin_result_turn, agent, {"delegation_results": [{"parent_task_id": key, "thread_refs": ["A"]}]})
+    from agent.delegation_disposition import _query
+    assert (await asyncio.to_thread(_query, agent))["missing"][0]["thread_ref"] == "A"
+    first = agent._delegation_result_turn
+    receipt = await asyncio.to_thread(agent.tool_progress_callback, "subagent.handling", actor_session_id="s", parent_task_id=key, refs=["A"], reason="deferred", detail="Under review", turn_id=first)
+    assert receipt["recorded"]
+    # Plain turns do not scan or reopen historical authority.
+    assert await cards.result_turn(actor_session_id="s", turn_id="plain") == {"missing": []}
+    await terminal(cards, source, data, ref="B")
+    second = await cards.result_turn(actor_session_id="s", turn_id="next", results=[{"parent_task_id": key, "thread_refs": ["B"]}], include_deferred=True)
+    assert second["deferred"] == [{"parent_task_id": key, "thread_ref": "A", "attempt": 0, "task_label": data["task_label"], "detail": "Under review"}]
+    # Merely offering follow-through is NOT presentation or handling authority.
+    with pytest.raises(ValueError, match="absent or superseded"):
+        await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=key, refs=["A"], reason="incorporated", turn_id="next")
+    assert "deferred" not in await cards.result_turn(actor_session_id="other", turn_id="foreign", results=[{"parent_task_id": key, "thread_refs": ["B"]}], include_deferred=True)
+    # Deliberate owned result retrieval re-presents the exact attempt, requiring a fresh decision.
+    replay = await cards.result_turn(actor_session_id="s", turn_id="next", results=[{"parent_task_id": key, "thread_refs": ["A"]}])
+    assert {x["thread_ref"] for x in replay["missing"]} == {"A", "B"}
+    await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=key, refs=["A"], reason="deferred", detail="User approval", turn_id="next")
+    assert {x["thread_ref"] for x in (await cards.result_turn(actor_session_id="s", turn_id="next"))["missing"]} == {"B"}
+    assert not cards.cards[key].get("handled")

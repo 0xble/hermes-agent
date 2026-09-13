@@ -250,6 +250,54 @@ async def test_a_chained_queued_turn_carries_its_own_inbound_id():
     assert runner._run_agent.await_args.kwargs["event_message_id"] is None
 
 
+@pytest.mark.asyncio
+async def test_a_queued_internal_delegation_keeps_presentation_metadata():
+    from gateway.run import GatewayRunner
+
+    GatewayRunner, runner, turn_ctx, pending_event = _chain_runner_and_ctx({
+        "final_response": "done",
+        "messages": [{
+            "role": "user", "content": "result", "_row_id": 22,
+            "display_metadata": {"delegation_deliveries": [
+                {"delegation_id": "deleg_a", "owner": {"session_id": "sid"}},
+            ]},
+        }],
+    })
+    pending_event.internal = True
+    pending_event.metadata = {
+        "delegation_parent_task_id": "p" * 32,
+        "delegation_thread_refs": ["A"], "delegation_attempts": {"A": 1},
+        "delegation_deliveries": [
+            {"delegation_id": "deleg_a", "owner": {"session_id": "sid"}},
+        ],
+    }
+
+    await GatewayRunner._run_agent_queued_followup(
+        runner, turn_ctx, adapter=None, pending="result", pending_event=pending_event,
+        response="resp", result={"interrupted": True, "messages": []}, stream_task=None,
+    )
+
+    kwargs = runner._run_agent.await_args.kwargs
+    assert kwargs["persist_user_display_kind"] == "internal_notification"
+    assert kwargs["persist_user_display_metadata"]["delegation_deliveries"] == pending_event.metadata["delegation_deliveries"]
+
+
+def test_presentation_receipt_requires_a_persisted_matching_user_row(monkeypatch):
+    from gateway.delegation_delivery_receipt import mark_persisted_delegation_presentations
+
+    owner = {"session_id": "parent", "session_key": "route"}
+    deliveries = [{"delegation_id": "deleg_a", "owner": owner}]
+    mark = MagicMock(return_value=True)
+    monkeypatch.setattr("tools.async_delegation.mark_completion_presented", mark)
+    messages = [{"role": "user", "content": "result",
+                 "display_metadata": {"delegation_deliveries": deliveries}}]
+    assert mark_persisted_delegation_presentations(messages, deliveries) == 0
+    mark.assert_not_called()
+    messages[0]["_row_id"] = 17
+    assert mark_persisted_delegation_presentations(messages, deliveries) == 1
+    mark.assert_called_once_with("deleg_a", owner)
+
+
 # ---------------------------------------------------------------------------
 # A chain's terminal reply must not overwrite an earlier turn's row.
 # ---------------------------------------------------------------------------

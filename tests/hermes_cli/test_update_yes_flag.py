@@ -17,6 +17,12 @@ import pytest
 from hermes_cli.main import cmd_update
 
 
+_COMPATIBILITY_MANIFEST = (
+    '{"schema":1,"capabilities":'
+    '["delegation-admitted-v1","managed-downgrade-floor-v1"]}'
+)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_update(isolated_update_runtime, monkeypatch):
     """Keep prompt tests off real uv, gateways and the macOS TCC anchor.
@@ -42,15 +48,31 @@ def _make_run_side_effect(
 ):
     """Minimal subprocess.run side_effect for the update flow."""
 
+    pre_sha = "a" * 40
+    post_sha = "b" * 40
+    head_calls = 0
+
     def side_effect(cmd, **kwargs):
+        nonlocal head_calls
         joined = " ".join(str(c) for c in cmd)
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
         if "rev-parse" in joined and "--verify" in joined:
+            if joined.endswith("^{commit}"):
+                sha = post_sha if "origin/main" in joined or " main^{commit}" in joined else pre_sha
+                return subprocess.CompletedProcess(
+                    cmd, 0 if verify_ok else 128, stdout=f"{sha}\n", stderr=""
+                )
             return subprocess.CompletedProcess(
                 cmd, 0 if verify_ok else 128, stdout="", stderr=""
             )
+        if " show " in f" {joined} " and joined.endswith(":runtime-compatibility.json"):
+            return subprocess.CompletedProcess(cmd, 0, stdout=_COMPATIBILITY_MANIFEST, stderr="")
+        if joined.endswith("rev-parse HEAD"):
+            head_calls += 1
+            sha = pre_sha if head_calls == 1 else post_sha
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{sha}\n", stderr="")
         if "rev-list" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=f"{commit_count}\n", stderr=""

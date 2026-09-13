@@ -212,7 +212,7 @@ def wrap_progress_callback(inner_cb, writer: LiveTranscriptWriter):
         with _best_effort("observe"):
             writer.observe(event_type, tool_name, preview, args, **kwargs)
         if inner_cb is not None:
-            inner_cb(event_type, tool_name, preview, args, **kwargs)
+            return inner_cb(event_type, tool_name, preview, args, **kwargs)
 
     def _flush():
         with _best_effort("flush"):

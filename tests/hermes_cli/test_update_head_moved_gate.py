@@ -25,6 +25,10 @@ def _make_head_moved_side_effect(pre_sha="abc123", post_sha="def456"):
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+            return SimpleNamespace(returncode=0, stdout="d" * 40, stderr="")
+        if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+            return SimpleNamespace(returncode=0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -53,6 +57,10 @@ def _make_head_pinned_side_effect(sha="abc123"):
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+        if "rev-parse" in cmd and "--verify" in cmd and str(cmd[-1]).endswith("^{commit}"):
+            return SimpleNamespace(returncode=0, stdout="d" * 40, stderr="")
+        if "show" in cmd and str(cmd[-1]).endswith(":runtime-compatibility.json"):
+            return SimpleNamespace(returncode=0, stdout='{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', stderr="")
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(returncode=0, stdout="HEAD\n", stderr="")

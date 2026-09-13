@@ -644,6 +644,48 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+def _persisted_presentation_exists(
+    conn: sqlite3.Connection, delegation_id: str, parent_session_id: str,
+    expected_owner: Any,
+) -> bool:
+    """Read back an exact durable user-row receipt when the transcript table exists."""
+    if not parent_session_id:
+        return False
+    sessions = [parent_session_id]
+    try:
+        from hermes_state_compression import _CHAIN_STEP_SQL
+        for _ in range(100):
+            child = conn.execute(_CHAIN_STEP_SQL, (sessions[-1],)).fetchone()
+            if not child or child[0] in sessions:
+                break
+            sessions.append(child[0])
+    except sqlite3.OperationalError:
+        pass  # Minimal/legacy stores have no compression-chain schema.
+    try:
+        rows = conn.execute(
+            "SELECT display_metadata FROM messages WHERE session_id IN ("
+            + ",".join("?" for _ in sessions) + ") AND role='user' "
+            "AND json_valid(display_metadata) AND EXISTS (SELECT 1 FROM "
+            "json_each(display_metadata, '$.delegation_deliveries') d "
+            "WHERE json_extract(d.value, '$.delegation_id')=?)",
+            (*sessions, delegation_id),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    for (payload,) in rows:
+        try:
+            metadata = json.loads(payload) if isinstance(payload, str) else payload
+        except (TypeError, ValueError):
+            continue
+        deliveries = metadata.get("delegation_deliveries") if isinstance(metadata, dict) else None
+        for delivery in deliveries or ():
+            if not isinstance(delivery, dict) or str(delivery.get("delegation_id") or "") != delegation_id:
+                continue
+            if expected_owner is None or delivery.get("owner") == expected_owner:
+                return True
+    return False
+
+
 def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
     Restored events are stamped ``restored=True`` in memory only: they came from a PREVIOUS
@@ -662,13 +704,38 @@ def restore_undelivered_completions(target_queue) -> int:
     recover_abandoned_delegations()
     now, restored = time.time(), 0
     with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at, delivery_recovery_attempts
+        rows = conn.execute("""SELECT delegation_id, event_json, completed_at, dispatched_at,
+                                      delivery_recovery_attempts, delivery_state, parent_session_id, delivery_attempts, task_json, result_json
                FROM async_delegations
-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+               WHERE state != 'running' AND delivery_state IN ('pending','admitted')
+                 AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id""").fetchall()
-        for delegation_id, payload, completed_at, dispatched_at, recovery_attempts in rows:
+        for (delegation_id, payload, completed_at, dispatched_at, recovery_attempts,
+             delivery_state, parent_session_id, attempts, task_json, result_json) in rows:
+            try:
+                persisted_event = json.loads(payload)
+            except (TypeError, ValueError):
+                persisted_event = None
+            expected_owner = persisted_event.get("owner") if isinstance(persisted_event, dict) else None
+            if delivery_state == 'admitted' and _persisted_presentation_exists(
+                    conn, delegation_id, parent_session_id or "", expected_owner):
+                conn.execute("""UPDATE async_delegations SET delivery_state='delivered',
+                              delivered_at=?, delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='admitted'""",
+                    (now, now, delegation_id))
+                continue
             age_basis = completed_at or dispatched_at
-            if not recovery_attempts and age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+            if attempts >= _MAX_DELIVERY_ATTEMPTS or (
+                    delivery_state == 'pending' and age_basis
+                    and now - age_basis > _MAX_COMPLETION_REPLAY_AGE_S
+                    and _has_retained_result(task_json, result_json)):
+                conn.execute("""UPDATE async_delegations SET delivery_state='pending_recovery',
+                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND delivery_state IN ('pending','admitted')""",
+                    (now, delegation_id))
+                continue
+            if (delivery_state == 'pending' and not recovery_attempts and age_basis
+                    and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S):
                 # This state is *only* ordinary pending. Retry-exhausted rows use
                 # pending_recovery and are never selected or erased by this cap.
                 conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
@@ -678,7 +745,14 @@ def restore_undelivered_completions(target_queue) -> int:
                                "(retry-exhausted obligations are retained separately).",
                                delegation_id, (now - age_basis) / 3600.0)
                 continue
-            evt = json.loads(payload)
+            if delivery_state == 'admitted':
+                # Gateway admission is a volatile queue receipt, not durable parent-turn
+                # presentation. A new process cannot inherit that admission, so make the
+                # same exact-owner event claimable again before publishing it.
+                conn.execute("""UPDATE async_delegations SET delivery_state='pending',
+                              delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='admitted'""", (now, delegation_id))
+            evt = persisted_event if isinstance(persisted_event, dict) else json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
@@ -744,6 +818,51 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     return _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+
+
+def admit_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Record gateway admission without claiming durable parent-turn presentation.
+
+    ``admitted`` is deliberately non-claimable in this process. Restart recovery
+    requeues it because the volatile gateway slot may have disappeared. A durable
+    presentation may race ahead of this acknowledgement; that already-settled row
+    makes admission idempotently successful.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        changed = conn.execute("""UPDATE async_delegations SET delivery_state='admitted',
+                      updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""", (now, delegation_id, claim_id)).rowcount
+        if changed == 1:
+            return True
+        row = conn.execute("SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+                           (delegation_id,)).fetchone()
+        return bool(row and row[0] == 'delivered')
+
+
+def mark_completion_presented(delegation_id: str, owner: Optional[Dict[str, Any]] = None) -> bool:
+    """Settle an admitted completion only from durable presentation evidence.
+
+    Labelled/card-backed delegations require their immutable exact owner. Legacy
+    unlabelled completions remain compatible with non-gateway consumers.
+    """
+    item = get_durable_delegation(delegation_id)
+    if item is None:
+        return False
+    metadata = item.get("delegation_metadata")
+    if isinstance(metadata, dict) and (metadata.get("owner") or metadata.get("owner_json")):
+        if not isinstance(owner, dict) or _owned_durable_row(delegation_id, owner) is None:
+            return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        if not _persisted_presentation_exists(conn, delegation_id, item.get("parent_session_id") or "", owner):
+            return False
+        return conn.execute("""UPDATE async_delegations SET delivery_state='delivered',
+                      delivered_at=?, updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state IN ('pending','admitted')""",
+            (now, now, delegation_id)).rowcount == 1
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:

@@ -195,7 +195,9 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 ):
     isolated = queue.Queue()
     monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
-    isolated.put(_async_event())
+    event = _async_event()
+    _persist_pending_completion(event)
+    isolated.put(event)
 
     adapter = SimpleNamespace(
         handle_message=AdmittingHandler(side_effect=[RuntimeError("temporary"), None])
@@ -205,18 +207,48 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 
     from tools import async_delegation
 
+    admit = async_delegation.admit_completion_delivery
     acknowledgements = []
     monkeypatch.setattr(
         async_delegation,
-        "complete_completion_delivery",
-        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
-        raising=False,
+        "admit_completion_delivery",
+        lambda delegation_id, claim_id: acknowledgements.append(delegation_id) or admit(delegation_id, claim_id),
     )
 
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
     assert acknowledgements == ["deleg_duplicate"]
+    _assert_admitted_then_presented(adapter.handle_message.await_args.args[0], [event], attempts=2)
+
+
+def _assert_admitted_then_presented(message, events, *, attempts):
+    """Real SQLite settlement needs a canonical row, never just adapter admission."""
+    from gateway.delegation_delivery_receipt import mark_persisted_delegation_presentations
+    from hermes_state import SessionDB
+    from tools import async_delegation as ad
+
+    deliveries = message.metadata["delegation_deliveries"]
+    assert {item["delegation_id"] for item in deliveries} == {event["delegation_id"] for event in events}
+    for event in events:
+        row = ad.get_durable_delegation(event["delegation_id"])
+        assert (row["delivery_state"], row["delivery_attempts"]) == ("admitted", attempts)
+        assert not ad.claim_completion_delivery(event["delegation_id"], "competing")
+        assert not ad.mark_completion_presented(event["delegation_id"], event.get("owner"))
+    db = SessionDB(ad._db_path())
+    try:
+        session = events[0].get("parent_session_id") or "completion-parent"
+        db.create_session(session, "telegram")
+        metadata = {"delegation_deliveries": deliveries}
+        row_id = db.append_message(session, "user", message.text, display_metadata=metadata)
+        rows = [{"role": "user", "_row_id": row_id, "display_metadata": metadata}]
+        assert mark_persisted_delegation_presentations(rows, deliveries) == len(events)
+        assert mark_persisted_delegation_presentations(rows, deliveries) == 0
+        for event in events:
+            row = ad.get_durable_delegation(event["delegation_id"])
+            assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered", attempts)
+    finally:
+        db.close()
 
 
 def _persist_pending_completion(event):
@@ -226,7 +258,7 @@ def _persist_pending_completion(event):
         "delegation_id": event["delegation_id"],
         "session_key": event["session_key"],
         "origin_ui_session_id": "",
-        "parent_session_id": event.get("parent_session_id"),
+        "parent_session_id": event.get("parent_session_id") or "completion-parent",
         "dispatched_at": event["dispatched_at"],
     })
     async_delegation._persist_completion(event, {
@@ -786,8 +818,8 @@ def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
 ):
     """Three same-session async completions in one drain -> one synthetic turn.
 
-    All three durable delegation rows must be honestly acknowledged only
-    after the single consolidated injection was accepted by the adapter.
+    All three durable rows are admitted after the consolidated injection;
+    only a canonical presentation may settle them as delivered.
     """
     from tools import async_delegation
 
@@ -812,7 +844,8 @@ def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
     for event in events:
         row = async_delegation.get_durable_delegation(event["delegation_id"])
         assert row is not None
-        assert row["delivery_state"] == "delivered"
+        assert row["delivery_state"] == "admitted"
+    _assert_admitted_then_presented(adapter.handle_message.await_args.args[0], events, attempts=1)
     assert isolated.empty()
 
 
@@ -880,12 +913,13 @@ def test_failed_coalesced_async_batch_releases_claims_and_retries(
 
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
-    # First tick fails as one batch, second tick delivers the same batch.
+    # First tick fails as one batch, second tick admits the same batch.
     assert adapter.handle_message.await_count == 2
     for event in events:
         row = async_delegation.get_durable_delegation(event["delegation_id"])
         assert row is not None
-        assert row["delivery_state"] == "delivered"
+        assert row["delivery_state"] == "admitted"
+    _assert_admitted_then_presented(adapter.handle_message.await_args.args[0], events, attempts=2)
     assert isolated.empty()
 
 
@@ -960,7 +994,7 @@ def test_unavailable_delivery_preserves_budget_across_restarts(tmp_path, unavail
         assert asyncio.run(runner._deliver_async_delegation_group(events)) is True
         for event in events:
             row = async_delegation.get_durable_delegation(event["delegation_id"])
-            assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered", 1)
+            assert (row["delivery_state"], row["delivery_attempts"]) == ("delivered" if raw else "admitted", 1)
         if raw:
             rows = db.get_messages("opaque-client-session")
             assert len(rows) == 1
@@ -968,6 +1002,7 @@ def test_unavailable_delivery_preserves_budget_across_restarts(tmp_path, unavail
             adapter.handle_message.assert_not_awaited()
         else:
             adapter.handle_message.assert_awaited_once()
+            _assert_admitted_then_presented(adapter.handle_message.await_args.args[0], events, attempts=1)
     finally:
         db.close()
 

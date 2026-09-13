@@ -31,6 +31,7 @@ def _build_normal_zip(zip_path: str) -> None:
     """Write a regular ZIP with a normal file member (no symlink)."""
     with zipfile.ZipFile(zip_path, "w") as zf:
         zf.writestr("hermes-agent-main/README.md", "ok\n")
+        zf.writestr("hermes-agent-main/runtime-compatibility.json", '{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}')
 
 
 def test_update_via_zip_rejects_symlink_member(tmp_path, monkeypatch):
@@ -44,6 +45,7 @@ def test_update_via_zip_rejects_symlink_member(tmp_path, monkeypatch):
 
     fake_root = tmp_path / "install_dir"
     fake_root.mkdir()
+    (fake_root / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
 
     from hermes_cli import main as hermes_main
     from hermes_cli.update_cmd import _update_via_zip
@@ -104,6 +106,7 @@ def test_update_via_zip_accepts_normal_member(tmp_path, monkeypatch, capsys):
     # tmp tree. The function only reads PROJECT_ROOT to derive dst paths.
     fake_root = tmp_path / "install_dir"
     fake_root.mkdir()
+    (fake_root / "runtime-compatibility.json").write_text('{"schema":1,"capabilities":["delegation-admitted-v1","managed-downgrade-floor-v1"]}', encoding="utf-8")
 
     from hermes_cli import main as hermes_main
 
