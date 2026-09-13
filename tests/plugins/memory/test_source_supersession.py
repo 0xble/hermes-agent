@@ -316,3 +316,30 @@ def test_reversion_waits_for_pending_evidence_before_fresh_observation(successor
     # revert a successful successor, but a failed successor is no supersession.
     p._retain_source_candidates([old], p._bank_id)
     assert len(server.calls) == (3 if successor == "completed" else 2)
+
+
+def test_discovered_repeated_version_remains_last_through_retention_and_restart():
+    url = 'https://example.com/reverting-source'
+    earlier, updated = versions(url)
+    messages = [{'role': 'user', 'content': 'Read these source observations.'}]
+    for index, candidate in enumerate([earlier, updated, earlier]):
+        call_id = f'extract-{index}'
+        messages.extend([
+            {'role': 'assistant', 'tool_calls': [{'id': call_id, 'type': 'function',
+             'function': {'name': 'web_extract', 'arguments': json.dumps({'url': url})}}]},
+            {'role': 'tool', 'tool_call_id': call_id, 'content': json.dumps({'results': [
+                {'url': url, 'content': candidate.content, 'error': None}]})},
+        ])
+    discovered = discover_source_candidates(messages, retain_tool_sources=True)
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates(discovered, p._bank_id)
+    assert server.calls[-1]['items'][0]['metadata']['content_hash'] == earlier.content_hash
+    assert {call['items'][0]['content'] for call in server.calls} == {earlier.content, updated.content}
+    server.statuses = {key: 'completed' for key in server.statuses}
+    server.hash = earlier.content_hash
+    assert p._wait_for_retains_drained(30)
+    recovered = provider(server)
+    assert recovered._wait_for_retains_drained(30)
+    assert recovered._source_ledger[earlier.automatic_key]['status'] == 'completed'
+    assert recovered._source_ledger[updated.automatic_key]['status'] == 'superseded'

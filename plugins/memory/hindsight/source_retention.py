@@ -43,7 +43,7 @@ _SECRET_PATH_RE = re.compile(
 )
 _SECRET_CONTENT_RE = re.compile(
     r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)\s*[:=]\s*\S{12,})",
+    r"(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)[\"']?\s*[:=]\s*\S{12,})",
     re.IGNORECASE,
 )
 _EPHEMERAL_PATH_RE = re.compile(
@@ -501,6 +501,12 @@ def discover_source_candidates(
     if not messages:
         return []
     messages = list(messages)
+    from agent.context_compressor import user_originated_turn_view
+
+    # Reuse the turn-authority projection: synthetic followthrough is not a
+    # fresh user boundary or user-supplied evidence. Composite handoffs expose
+    # only their live human payload, never the historical scaffold.
+    user_views = [user_originated_turn_view(message) for message in messages]
     trusted_roots = tuple(
         Path(root).expanduser().resolve()
         for root in (attachment_roots or _attachment_cache_roots())
@@ -510,10 +516,16 @@ def discover_source_candidates(
     # re-submitted on every later turn or after a long session append.
     last_user_index = next(
         (index for index in range(len(messages) - 1, -1, -1)
-         if isinstance(messages[index], dict) and messages[index].get("role") == "user"),
+         if user_views[index] is not None),
         0,
     )
-    messages = messages[last_user_index:]
+    messages = [
+        user_views[index] if user_views[index] is not None else message
+        for index, message in enumerate(messages)
+        if index >= last_user_index
+        and (not isinstance(message, dict) or message.get("role") != "user"
+             or user_views[index] is not None)
+    ]
     candidates: list[SourceCandidate] = []
 
     # Raw file bytes cross a stronger trust boundary than text already present
@@ -638,12 +650,15 @@ def discover_source_candidates(
 
     unique: list[SourceCandidate] = []
     seen: set[tuple[str, str]] = set()
-    for candidate in candidates:
+    # Keep each version's last observation. First-occurrence dedup turns
+    # A, B, A into A, B and incorrectly publishes B as the current source.
+    # Retain distinct versions as evidence, ordered by their final observation.
+    for candidate in reversed(candidates):
         if candidate.automatic_key in seen:
             continue
         seen.add(candidate.automatic_key)
         unique.append(candidate)
-    return unique
+    return list(reversed(unique))
 
 
 __all__ = ["SourceCandidate", "discover_source_candidates"]

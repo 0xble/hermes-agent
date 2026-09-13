@@ -465,3 +465,39 @@ def test_pasted_source_context_does_not_invent_human_identity():
     assert "Brian" not in candidate.context
     assert "user" in candidate.context
     assert candidate.content == pasted
+
+
+@pytest.mark.parametrize('channel', ['paste', 'file'])
+@pytest.mark.parametrize('quote', ['"', "'", ''])
+@pytest.mark.parametrize('key', ['api_key', 'access_token', 'client_secret', 'password'])
+def test_credential_assignments_are_excluded_from_source_discovery(channel, quote, key):
+    def discover(field):
+        content = 'Source: configuration reference\n' + ('Public descriptive source material.\n' * 80)
+        content += f'{quote}{field}{quote}: {quote}synthetic-secret-value-12345{quote}\n'
+        if quote == '"':
+            content = json.dumps({'source': 'https://example.com/reference',
+                'sections': ['Public descriptive source material. ' * 10] * 8,
+                field: 'synthetic-secret-value-12345'}, indent=2)
+        messages = ([{'role': 'user', 'content': content}] if channel == 'paste' else
+                    _tool_turn('read_file', {'path': '/Documents/reference.json'}, content))
+        return discover_source_candidates(messages, retain_tool_sources=True,
+                                          retain_file_extractions=True)
+    assert discover('description')  # ordinary quoted metadata remains eligible
+    assert discover(key) == []
+
+
+@pytest.mark.parametrize('kind', ['hidden', 'continuation'])
+def test_synthetic_user_sources_do_not_displace_genuine_turn(kind, tmp_path):
+    source = 'Retrieved reference paragraph. ' * 80
+    messages = _tool_turn('web_extract', {'url': 'https://example.com/reference'}, source)
+    synthetic = 'Source: synthetic context\n' + ('Synthetic followthrough context.\n' * 90)
+    attachment = tmp_path / 'reference.pdf'
+    attachment.write_bytes(b'synthetic attachment')
+    messages.append({'role': 'user', 'display_kind': kind, 'content': [
+        {'type': 'text', 'text': synthetic}, {'type': 'file', 'path': str(attachment)}]})
+    candidates = discover_source_candidates(messages, retain_tool_sources=True,
+                    retain_attachments=True, attachment_roots=[tmp_path])
+    assert [(c.source_type, c.content) for c in candidates] == [('webpage', source.strip())]
+    messages.append({'role': 'user', 'content': 'A new genuine request.'})
+    assert discover_source_candidates(messages, retain_tool_sources=True,
+                    retain_attachments=True, attachment_roots=[tmp_path]) == []
