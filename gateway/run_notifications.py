@@ -728,8 +728,10 @@ class GatewayNotificationsMixin:
             return False
 
     async def _send_update_notification(self, *, timed_out: bool = False) -> bool:
-        """One final send path for live watchers and startup; retain state on send failure."""
-        from gateway.update_notifications import final_outcome, notice, read_pending, request_identity
+        """Return True only after terminal delivery releases admission, never for expiry."""
+        from gateway.update_notifications import (
+            final_outcome, notice, process_completed, read_pending, request_identity, save_pending,
+        )
         if getattr(self, "_update_final_send_active", False):
             return False
         self._update_final_send_active = True
@@ -742,8 +744,11 @@ class GatewayNotificationsMixin:
             _, pending = current
             request = request_identity(pending)
             outcome = final_outcome(paths.pending.parent, pending)
+            unresolved = outcome is None and not process_completed(paths.pending.parent, pending)
             if outcome is None:
                 if not timed_out:
+                    return False
+                if unresolved and pending.get("timeout_notified"):
                     return False
                 outcome = (False, "Update finalization could not be verified before the notification deadline. Runtime state is unknown. Inspect the update output before retrying.")
             success, detail = outcome
@@ -767,6 +772,14 @@ class GatewayNotificationsMixin:
                 return False
             current = read_pending(paths.pending.parent)
             if current is None or request_identity(current[1]) != request:
+                return False
+            if unresolved:
+                # The bounded watcher may stop, but the detached writer still owns
+                # admission and every update file. Persist only the notice ACK so
+                # restart recovery neither replays it nor mistakes it for completion.
+                marker, pending = current
+                pending["timeout_notified"] = True
+                save_pending(marker, pending)
                 return False
             self._clear_update_markers(paths, target.session_key)
             (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)

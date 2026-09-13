@@ -22,7 +22,7 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
 
 def request_identity(pending: dict) -> str:
     """Stable across pending-to-claimed moves and delivery checkpoints."""
-    progress = {"output_offset", "output_batch", "updating_notified", "restarting_notified"}
+    progress = {"output_offset", "output_batch", "updating_notified", "restarting_notified", "timeout_notified"}
     request = {key: value for key, value in pending.items() if key not in progress}
     return hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
 
@@ -44,6 +44,16 @@ def _timestamp(value: str) -> float:
     if parsed.tzinfo is None:
         parsed = parsed.astimezone()
     return parsed.timestamp()
+
+
+def process_completed(home: Path, pending: dict) -> bool:
+    """A notification deadline cannot stand in for the wrapper's termination proof."""
+    name = ".update_process_exit_code" if pending.get("notification_version") == 2 else ".update_exit_code"
+    try:
+        int((home / name).read_text(encoding="utf-8").strip())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def final_outcome(home: Path, pending: dict) -> tuple[bool, str] | None:
