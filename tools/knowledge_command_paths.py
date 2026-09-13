@@ -8,13 +8,61 @@ Literal cwd transitions (shell ``cd``, Python ``os.chdir``, a literal
 nesting level, so a ``bash -c 'cd <home>; rm -rf memories'`` body widens the
 bases its own relative operands resolve against. Runtime-computed targets
 (``$X``, backticks, ``os.getcwd()``) stay outside this lexical contract.
+
+Destructive shell operands also retain quote-aware *, ? and bracket patterns.
+Expansion is bounded against the current host filesystem, with component/dotfile
+rules and symlinks. Uncertain bracket syntax and exceeded bounds fail closed.
+Shell options/extensions (dotglob, globstar, extglob, locale-specific ranges)
+are not evaluated. Remote namespace differences and filesystem races remain
+outside this literal scan; it is not a shell sandbox.
 """
 from __future__ import annotations
 
 import ast
+import fnmatch
+import glob
 import os
 import re
 import shlex
+
+
+_GLOB_MASKS = {chr(0xE000 + index): char for index, char in enumerate("*?[]!^-~")}
+
+
+class ShellWord(str):
+    """Decoded shell word plus quote-aware pathname pattern; argv stays plain str."""
+
+    glob_pattern: str | None
+
+    def __new__(cls, value: str, pattern: str | None):
+        word = super().__new__(cls, value)
+        word.glob_pattern = pattern
+        return word
+
+
+def _quoted_glob_mask(segment: str) -> tuple[str, dict[str, str]]:
+    # Preserve shlex's word/quote parsing, masking only quoted/escaped pattern
+    # syntax before it discards that provenance (including concatenated quotes).
+    if any(0xE000 <= ord(char) <= 0xE0FF for char in segment):
+        raise ValueError("reserved shell scan characters")
+    masks = {char: mask for mask, char in _GLOB_MASKS.items()}
+    output, quote, escaped = [], "", False
+    for char in segment:
+        if escaped:
+            if char == "\n":
+                output.pop()  # shell line continuation, not a pathname newline
+            else:
+                output.append(masks.get(char, char))
+            escaped = False
+        elif char == "\\" and quote != "'":
+            output.append(char)
+            escaped = True
+        elif char in "\"'" and (not quote or quote == char):
+            quote = "" if quote else char
+            output.append(char)
+        else:
+            output.append(masks.get(char, char) if quote else char)
+    return "".join(output), {mask: char for char, mask in masks.items()}
 
 
 def shell_tokens(command: str) -> list[str]:
@@ -24,11 +72,76 @@ def shell_tokens(command: str) -> list[str]:
 
     tokens = []
     for segment in _iter_top_level_shell_segments(command):
-        lexer = shlex.shlex(segment, posix=True, punctuation_chars=";&|<>()")
+        masked, masks = _quoted_glob_mask(segment)
+        lexer = shlex.shlex(masked, posix=True, punctuation_chars=";&|<>()")
         lexer.whitespace_split, lexer.commenters = True, ""
-        tokens.extend(lexer)
+        for token in lexer:
+            value = "".join(masks.get(char, char) for char in token)
+            tokens.append(ShellWord(value, token if glob.has_magic(token) else None))
         tokens.append(";")
     return tokens
+
+
+def destructive_glob_paths(token: str, bases) -> list[str]:
+    """Expand only scanner-proven shell patterns, component-wise and bounded.
+
+    Do not realpath/normpath before expansion: missing/*/.. is not its parent.
+    Directory scanning follows existing symlinks; final containment is the
+    caller's realpath policy. No recursive globstar, code or variable evaluation.
+    """
+    pattern = getattr(token, "glob_pattern", None)
+    if pattern is None:
+        return []
+    # Validate only destructive patterns, not unrelated regex/read arguments.
+    # Python fnmatch cannot safely interpret shell quoting inside classes or
+    # POSIX named/collating classes. Unsupported cases fail closed.
+    for bracket in re.findall(r"\[[^]]*\]", pattern):
+        if (any(char in _GLOB_MASKS for char in bracket)
+                or any(mark in bracket[1:] for mark in ("[:", "[.", "[="))):
+            raise ValueError("unsupported shell bracket pattern")
+    # Expand an unquoted tilde before restoring quoted characters. Escape home
+    # metacharacters: tilde expansion does not introduce new pattern syntax.
+    if pattern.startswith("~"):
+        home, separator, rest = pattern.partition(os.sep)
+        pattern = glob.escape(os.path.expanduser(home)) + separator + rest
+    pattern = "".join(glob.escape(_GLOB_MASKS[char]) if char in _GLOB_MASKS else char for char in pattern)
+    pattern = pattern.replace("[^", "[!")
+    paths = [os.sep] if os.path.isabs(pattern) else [str(base) for base in bases]
+    components = pattern.split(os.sep)
+    if len(components) > 128:
+        raise ValueError("glob component bound exceeded")
+    budget = 4096
+    for index, component in enumerate(components):
+        if not component:
+            continue
+        matches = []
+        for parent in paths:
+            if glob.has_magic(component):
+                try:
+                    with os.scandir(parent) as entries:
+                        for entry in entries:
+                            budget -= 1
+                            if budget < 0:
+                                raise ValueError("glob scan bound exceeded")
+                            if entry.name.startswith(".") and not component.startswith("."):
+                                continue
+                            if fnmatch.fnmatchcase(entry.name, component):
+                                matches.append(entry.path)
+                    # Some shell versions include . and .. in explicit .*
+                    # expansion. Include them conservatively, never for *.
+                    for dot in (".", ".."):
+                        if component.startswith(".") and fnmatch.fnmatchcase(dot, component):
+                            matches.append(os.path.join(parent, dot))
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+            else:
+                candidate = os.path.join(parent, component)
+                if os.path.lexists(candidate):
+                    matches.append(candidate)
+        if len(matches) > 4096:
+            raise ValueError("glob match bound exceeded")
+        paths = [path for path in matches if index == len(components) - 1 or os.path.isdir(path)]
+    return paths
 
 
 def literal_paths(

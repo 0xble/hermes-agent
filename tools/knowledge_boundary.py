@@ -212,7 +212,7 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
     if not _read_only_context() or not isinstance(command, str) or not command:
         return None
     try:
-        from tools.knowledge_command_paths import literal_paths
+        from tools.knowledge_command_paths import destructive_glob_paths, literal_paths
 
         root = _command_roots(command)
         references, destructive, transitions = literal_paths(command, python_source=tool == "execute_code")
@@ -255,6 +255,7 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
                     continue
                 expanded = Path(os.path.expanduser(token))
                 paths = [expanded] if expanded.is_absolute() else [base / expanded for base in bases]
+                paths.extend(Path(path) for path in destructive_glob_paths(token, bases))
                 for path in paths:
                     target = _real(path)
                     root = next((_real(protected) for protected in protected_roots()
