@@ -8,6 +8,8 @@ from pathlib import Path
 
 
 def read_pending(home: Path) -> tuple[Path, dict] | None:
+    # Claimed files survive from the historical notifier ownership protocol.
+    # Current native updater/notifier code does not move these marker paths.
     for name in (".update_pending.claimed.json", ".update_pending.json"):
         path = home / name
         try:

@@ -36,8 +36,9 @@ def launch_native_update(
 ) -> dict[str, Any]:
     """Persist one pending route and detach exactly one native updater.
 
-    A claimed marker is still an active admission marker: it is the pending file
-    after the updater atomically takes ownership.  Do not overwrite its reason.
+    A legacy claimed marker remains authoritative for admission. Current native
+    launch and notification paths do not rename pending markers to claimed.
+    Do not overwrite either marker's reason.
     """
     from gateway.status import _release_file_lock, _try_acquire_file_lock
 
