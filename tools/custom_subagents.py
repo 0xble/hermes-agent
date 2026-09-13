@@ -59,6 +59,8 @@ class ResolvedRoute:
     request_overrides_json: str = "{}"
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
     credential_pool_entry_id: str | None = None
+    # Config authority (e.g. custom:first), distinct from normalized wire provider.
+    requested_provider: str | None = None
 
     def native_entry(self) -> dict:
         entry = {
@@ -83,6 +85,8 @@ class ResolvedRoute:
                 json.loads(self.request_overrides_json)
             ),
         }
+        if self.requested_provider is not None:
+            metadata["requested_provider"] = self.requested_provider
         if self.credential_pool_entry_id:
             metadata["credential_pool_entry_id"] = self.credential_pool_entry_id
         return metadata
@@ -483,7 +487,7 @@ def _freeze_fallback_runtime(runtime, route, label):
         str(api_key), hashlib.sha256(str(api_key).encode()).hexdigest(),
         json.dumps(overrides or {}, sort_keys=True,
                    separators=(",", ":"), default=str),
-        pool, credential_id,
+        pool, credential_id, requested_provider=route.provider,
     )
 
 

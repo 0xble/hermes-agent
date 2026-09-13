@@ -801,9 +801,10 @@ class SessionSessionsMixin:
             for session_id, config in configs:
                 recovery = (reconciliations or {}).get(session_id)
                 if recovery is not None:
+                    # Preserve absence as well as values for exact failed-admission rollback.
                     config["_delegation_resume_recovery_previous"] = {
-                        key: config.get(key) for key in ("_delegation_completed", "_delegation_user_stopped",
-                                                        "_delegation_resume_blocked_reason")}
+                        key: config[key] for key in ("_delegation_completed", "_delegation_user_stopped",
+                                                    "_delegation_resume_blocked_reason") if key in config}
                     config.setdefault("_delegation_resume_authorizations", []).append({
                         "claim_id": claimed_at, "at": now, "parent_session_root": recovery["parent_session_root"],
                         "authorization": recovery["authorization"], "reconciliation": recovery["reconciliation"],
@@ -865,6 +866,9 @@ class SessionSessionsMixin:
             for session_id, config in configs:
                 previous = config.pop("_delegation_resume_recovery_previous", None)
                 if previous is not None:
+                    for key in ("_delegation_completed", "_delegation_user_stopped",
+                                "_delegation_resume_blocked_reason"):
+                        config.pop(key, None)
                     config.update(previous)
                 else:
                     config["_delegation_completed"] = True

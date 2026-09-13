@@ -123,7 +123,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     reconcile_state_schema(conn)
 
 
-def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str], resume_refs: Optional[List[str]] = None) -> Dict[str, Any]:
+def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str], resume_refs: Optional[List[str]] = None, session_db=None) -> Dict[str, Any]:
     """Reserve never-reused display refs and validate an opaque id against exact owner.
 
     ``parent_task_id`` is intentionally an opaque correlation token, never an
@@ -146,7 +146,11 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
             if row is None:
                 raise ValueError("parent_task_id is not a known reference for this conversation owner")
             if row[0] != owner_json:
-                raise ValueError("parent_task_id belongs to another immutable conversation owner")
+                from tools.delegation_owner import delegation_owner_matches
+                original = json.loads(row[0])
+                if not delegation_owner_matches(original, owner, session_db):
+                    raise ValueError("parent_task_id belongs to another immutable conversation owner")
+                owner, owner_json = original, row[0]
             if resume_refs is not None:
                 return {"parent_task_id": parent_task_id, "owner": owner, "owner_json": owner_json,
                         "thread_refs": list(resume_refs), "task_labels": labels}
@@ -859,7 +863,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "delegation_metadata": (json.loads(row[11] or "{}").get("delegation_metadata"))}
 
 
-def _owned_durable_row(delegation_id: str, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _owned_durable_row(delegation_id: str, owner: Dict[str, Any], session_db=None) -> Optional[Dict[str, Any]]:
     """Return one ledger row only after exact immutable-owner verification."""
     item = get_durable_delegation(delegation_id)
     metadata = item and item.get("delegation_metadata")
@@ -867,7 +871,13 @@ def _owned_durable_row(delegation_id: str, owner: Dict[str, Any]) -> Optional[Di
         return None
     expected = json.dumps(owner, sort_keys=True, separators=(",", ":"))
     if metadata.get("owner_json") != expected:
-        return None
+        from tools.delegation_owner import delegation_owner_matches
+        try:
+            original = json.loads(metadata.get("owner_json") or "null")
+        except (TypeError, ValueError):
+            return None
+        if not delegation_owner_matches(original, owner, session_db):
+            return None
     return item
 
 
@@ -896,23 +906,23 @@ def current_delegation_owner(parent_agent):
     return _owner
 
 
-def get_delegation_status(delegation_id: str, *, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def get_delegation_status(delegation_id: str, *, owner: Dict[str, Any], session_db=None) -> Optional[Dict[str, Any]]:
     """Owner-scoped durable status; works after in-memory cleanup or restart."""
-    item = _owned_durable_row(delegation_id, owner)
+    item = _owned_durable_row(delegation_id, owner, session_db)
     if item is None:
         return None
     return {key: item.get(key) for key in ("delegation_id", "state", "dispatched_at", "completed_at", "delivery_state", "delegation_metadata")}
 
 
-def get_delegation_result(delegation_id: str, *, owner: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def get_delegation_result(delegation_id: str, *, owner: Dict[str, Any], session_db=None) -> Optional[Dict[str, Any]]:
     """Owner-scoped terminal result; live records deliberately expose no result."""
-    item = _owned_durable_row(delegation_id, owner)
+    item = _owned_durable_row(delegation_id, owner, session_db)
     if item is None:
         return None
     return {key: item.get(key) for key in ("delegation_id", "state", "result", "event", "completed_at", "delegation_metadata")}
 
 
-def list_durable_delegations(*, owner: Dict[str, Any], parent_task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_durable_delegations(*, owner: Dict[str, Any], parent_task_id: Optional[str] = None, session_db=None) -> List[Dict[str, Any]]:
     """List only durable work for one exact owner, optionally one opaque parent token."""
     expected = json.dumps(owner, sort_keys=True, separators=(",", ":"))
     with _DB_LOCK, _transaction() as conn:
@@ -924,8 +934,16 @@ def list_durable_delegations(*, owner: Dict[str, Any], parent_task_id: Optional[
             metadata = json.loads(task_json or "{}").get("delegation_metadata")
         except (TypeError, ValueError):
             continue
-        if not isinstance(metadata, dict) or metadata.get("owner_json") != expected:
+        if not isinstance(metadata, dict):
             continue
+        if metadata.get("owner_json") != expected:
+            from tools.delegation_owner import delegation_owner_matches
+            try:
+                original = json.loads(metadata.get("owner_json") or "null")
+            except (TypeError, ValueError):
+                continue
+            if not delegation_owner_matches(original, owner, session_db):
+                continue
         if parent_task_id is not None and metadata.get("parent_task_id") != parent_task_id:
             continue
         entries.append({"delegation_id": delegation_id, "state": state, "dispatched_at": dispatched_at,

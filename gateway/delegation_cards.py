@@ -224,6 +224,26 @@ class DelegationCards:
     def _scope(card):
         return presentation.scope(card["owner"], card["source"])
 
+    def _owner_matches(self, original, current):
+        from tools.delegation_owner import delegation_owner_matches
+        if original == current:
+            return True
+        store = getattr(self.runner, "session_store", None)
+        resolve_db = getattr(store, "_db_for_key", None)
+        db = resolve_db(original.get("session_key")) if callable(resolve_db) else None
+        return delegation_owner_matches(original, current, db)
+
+    def _actor_matches(self, card, session_id, owner):
+        original = card.get("delegation_owner", card["owner"])
+        # Preserve exact-session callbacks. Crossing a compression boundary
+        # additionally requires the complete trusted owner scope.
+        if original.get("session_id") == session_id:
+            return True
+        if owner is None:
+            return False
+        return (isinstance(owner, dict) and owner.get("session_id") == session_id
+                and self._owner_matches(original, owner))
+
     def _anchor(self, key):
         return self.cards[key].get("presentation_key", key)
 
@@ -334,7 +354,7 @@ class DelegationCards:
                 or not re.fullmatch(r"[a-f0-9]{32}", key)
                 or not isinstance(ref, str) or not re.fullmatch(r"[A-Z]+", ref)
                 or not isinstance(owner, dict) or not isinstance(card_owner, dict)
-                or str(card_owner.get("session_id", "")) != str(session_id)
+                or not self._owner_matches(card_owner, {**card_owner, "session_id": str(session_id)})
                 or str(card_owner.get("session_key", "")) != str(session_key)
                 or str(card_owner.get("chat_id", "")) != str(source.chat_id)
                 or str(card_owner.get("thread_id", "")) != str(source.thread_id or "")
@@ -557,7 +577,7 @@ class DelegationCards:
             self._queue(key)
 
     async def handling(self, source, session_key, session_id, generation, *,
-                       actor_session_id, parent_task_id, refs, reason, detail=None, turn_id=None):
+                       actor_session_id, parent_task_id, refs, reason, detail=None, turn_id=None, actor_owner=None):
         """Explicit parent attestation, not result arrival or prose classification.
 
         Root attestations await their final delivery. Nested incorporation has
@@ -571,13 +591,17 @@ class DelegationCards:
             raise ValueError("Expected exact task identity, refs and handling reason")
         async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
             owner = card.get("delegation_owner", card["owner"])
-            if (owner.get("session_id") != actor_session_id
-                    or card["owner"].get("session_id") != session_id
+            if (not self._actor_matches(card, actor_session_id, actor_owner)
+                    or not self._owner_matches(card["owner"], {**card["owner"], "session_id": session_id})
                     or card["owner"].get("session_key") != session_key
                     or str(card["source"]["chat_id"]) != str(source.chat_id)
                     or str(card["source"].get("thread_id") or "") != str(source.thread_id or "")
                     or any(ref not in card["rows"] or card["rows"][ref]["state"] not in _TERMINAL | {"unknown"} for ref in refs)):
                 raise ValueError("Handling requires this exact parent owner's terminal rows")
+            # Record the immutable identities; compression grants authority,
+            # not a new owner or a nested parent's root-delivery privilege.
+            actor_session_id = owner["session_id"]
+            session_id = card["owner"]["session_id"]
             if reason == "validate_replacement":
                 if len(refs) != 1 or (detail is not None and (not isinstance(detail, str) or not detail)):
                     raise ValueError("Replacement requires one ref and a caller reservation identity")
@@ -640,7 +664,7 @@ class DelegationCards:
         return {"recorded": True, "parent_task_id": parent_task_id, "refs": refs,
                 "awaiting_delivery": reason != "deferred" and (actor_session_id == session_id or reason == "blocker_report")}
 
-    async def result_turn(self, *, actor_session_id, turn_id, results=None):
+    async def result_turn(self, *, actor_session_id, turn_id, results=None, actor_owner=None):
         """Exact terminal attempts presented to this turn, never historical visibility.
 
         The trusted runtime supplies results; model text never enters this method.
@@ -652,7 +676,7 @@ class DelegationCards:
         nested_deliveries = {}
         for item in results or ():
             card = self.cards.get(item.get("parent_task_id"))
-            if not card or card.get("delegation_owner", card["owner"]).get("session_id") != actor_session_id:
+            if not card or not self._actor_matches(card, actor_session_id, actor_owner):
                 continue
             async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
                 for ref in item.get("thread_refs") or ():
@@ -683,7 +707,7 @@ class DelegationCards:
             await self.delivered(nested_deliveries)
         missing = []
         for key, card in self.cards.items():
-            if card.get("delegation_owner", card["owner"]).get("session_id") != actor_session_id:
+            if not self._actor_matches(card, actor_session_id, actor_owner):
                 continue
             for ref, attempt in card.get("result_turns", {}).get(turn_id, {}).items():
                 row = card["rows"].get(ref, {})

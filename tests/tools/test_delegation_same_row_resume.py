@@ -52,9 +52,11 @@ def test_resume_authority_resolution_errors_do_not_expose_values(monkeypatch):
     assert "PRIVATE" not in str(error.value)
 
 
+@pytest.mark.parametrize("compressed", [False, True, "foreign", "sibling", "noncompression",
+    "profile", "session_key", "chat_id", "thread_id", "topic_id", "admission_failure"])
 @pytest.mark.parametrize("corrupt", [False, True])
 @pytest.mark.parametrize("stopped", [False, True])
-def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped):
+def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped, compressed):
     from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, _, _ = _resume_fixture(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -80,6 +82,20 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     db = SessionDB(db_path=tmp_path / "state.db")
     parent = SimpleNamespace(session_id="root", _session_db=db, _delegate_depth=0,
         _delegation_visible_window=[{"role": "user", "content": "NEW_PARENT_CONTEXT_NOT_FOR_RESUME"}])
+    if compressed:
+        db.end_session("root", "reset" if compressed == "noncompression" else "compression")
+        db.create_session("parent-tip", source="cli", parent_session_id="root")
+        parent.session_id = "parent-tip"
+        if compressed == "foreign":
+            db.create_session("foreign", source="cli")
+            parent.session_id = "foreign"
+        elif compressed == "sibling":
+            db.create_session("sibling", source="cli", parent_session_id="root")
+            parent.session_id = "sibling"
+        elif compressed in ("profile", "session_key", "chat_id", "thread_id", "topic_id"):
+            identity["owner"] = {**owner, compressed: "foreign-scope"}
+            metadata["card_identity"] = identity
+            db.patch_session_model_config("child", {"_delegation_launch": metadata})
     cfg = {"subagents": {"advisor": {"description": "Advise", "instructions": "Analyze", "provider": "fixture", "model": "m", "reasoning_effort": "high"}}}
     monkeypatch.setattr(delegate_tool, "_load_config", lambda: cfg)
     monkeypatch.setattr(delegate_tool, "last_delegation_config_error", lambda: None)
@@ -90,6 +106,8 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     built = []
 
     def build(tasks, *args, task_runtime, **kwargs):
+        if compressed == "admission_failure":
+            raise RuntimeError("fixture construction failed before admission")
         launch = task_runtime[0]
         assert launch.resume_session_id == "child"
         assert launch.workspace_path == str(tmp_path)
@@ -104,9 +122,21 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     task = {"goal": "Continue safely", "task_label": "Recover renamed", "resume_session_id": "child"}
     if stopped:
         task["resume_authorization"] = {"authorization": "User asked to resume.", "reconciliation": "Verified effects and processes."}
-    payload = json.loads(delegate_tool.delegate_task(tasks=[task], parent_agent=parent, background=False))
-    if corrupt:
-        assert "Legacy/uncheckpointed identity" in payload["error"]
+    before = json.loads(db.get_session("child")["model_config"])
+    if compressed == "admission_failure" and not corrupt:
+        with pytest.raises(RuntimeError, match="before admission"):
+            delegate_tool.delegate_task(tasks=[task], parent_agent=parent, background=False)
+        payload = {"error": "fixture construction failed before admission"}
+    else:
+        payload = json.loads(delegate_tool.delegate_task(tasks=[task], parent_agent=parent, background=False))
+    if corrupt or compressed not in (False, True):
+        assert "error" in payload
+        after = json.loads(db.get_session("child")["model_config"])
+        # Recovery may append its audit journal, but every original checkpoint
+        # field and sticky stop must be restored, with no surviving claim.
+        after.pop("_delegation_resume_authorizations", None)
+        before.pop("_delegation_resume_authorizations", None)
+        assert after == before
         assert not built
         if stopped:
             assert json.loads(db.get_session("child")["model_config"])["_delegation_user_stopped"]
@@ -119,6 +149,10 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     assert payload["thread_refs"] == ["A"]
     assert payload["task_labels"] == ["Refine layering skill"]
     assert payload["attempts"] == {"A": 1}
+    assert payload["owner"] == owner
+    assert built[0]._progress_identity_ref["owner"] == owner
+    assert built[0]._progress_identity_ref["card_owner"] == owner
+    assert built[0]._delegation_launch_metadata["card_identity"]["owner"] == owner
     assert built[0]._progress_identity_ref["session_id"] == "child"
     assert built[0]._delegation_context_mode == "resume"
     assert not hasattr(built[0], "_delegation_fork_history")

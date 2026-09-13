@@ -23,7 +23,9 @@ def _query(agent, results=None):
     callback = getattr(agent, "tool_progress_callback", None)
     if not callable(callback):
         return {"missing": []}
+    from tools.async_delegation import current_delegation_owner
     answer = callback("subagent.result_turn", actor_session_id=str(agent.session_id),
+                      actor_owner=current_delegation_owner(agent),
                       turn_id=agent._delegation_result_turn, results=results)
     return answer if isinstance(answer, dict) else {"missing": []}
 

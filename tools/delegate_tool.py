@@ -538,8 +538,15 @@ def _restore_fallback_authority(routes, expected, normalize_route_base_url):
         api_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None)
         entry_provider = str(getattr(entry, "provider", None) or route.provider)
         entry_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or route.base_url
+        # A named custom pool keeps its config selector, not the wire label
+        # "custom". Accept only the canonical selector/endpoint-bound account.
+        provider_matches = entry_provider == route.provider
+        if route.provider == "custom" and str(route.requested_provider or "").startswith("custom:"):
+            from agent.credential_pool import credential_pool_matches_provider
+            provider_matches = credential_pool_matches_provider(
+                entry_provider, route.requested_provider, base_url=route.base_url)
         if (
-            entry is None or not api_key or entry_provider != route.provider
+            entry is None or not api_key or not provider_matches
             or normalize_route_base_url(str(entry_base)) != normalize_route_base_url(route.base_url)
         ):
             raise ValueError("delegated child fallback stable credential can no longer be authorized")
@@ -573,6 +580,8 @@ def _fallback_metadata_matches(routes, expected, *, refreshed_accounts=frozenset
             current["authority_fingerprint"] = stored.get("authority_fingerprint")
         if "request_overrides_fingerprint" not in stored:
             current.pop("request_overrides_fingerprint", None)
+        if "requested_provider" not in stored:
+            current.pop("requested_provider", None)
         if "credential_pool_entry_id" not in stored:
             current.pop("credential_pool_entry_id", None)
         if current != stored:
@@ -756,7 +765,7 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
         instructions=str(launch.get("instructions") or ""), provider=requested_provider,
         model=model, reasoning_effort=effort,
         fallbacks=tuple(FallbackDefinition(
-            provider=str(item.get("provider") or ""), model=str(item.get("model") or ""),
+            provider=str(item.get("requested_provider") or item.get("provider") or ""), model=str(item.get("model") or ""),
             reasoning_effort=item.get("reasoning_effort"),
         ) for item in launch.get("fallbacks") or [] if isinstance(item, dict)),
     )
@@ -1162,7 +1171,9 @@ def _card_handling(parent_agent, parent_task_id, refs, reason, detail=None):
     callback = getattr(parent_agent, "tool_progress_callback", None)
     if not callable(callback):
         raise ValueError("Delegation handling requires a gateway card owner")
+    from tools.async_delegation import current_delegation_owner
     result = callback("subagent.handling", actor_session_id=str(parent_agent.session_id),
+                      actor_owner=current_delegation_owner(parent_agent),
                       parent_task_id=parent_task_id, refs=refs, reason=reason, detail=detail,
                       turn_id=getattr(parent_agent, "_delegation_result_turn", None))
     if not isinstance(result, dict):
@@ -1194,7 +1205,8 @@ def delegate_task(
             return tool_error("action=result requires an exact delegation_id")
         from tools.async_delegation import current_delegation_owner, get_delegation_result, _completion_metadata_fields
         try:
-            item = get_delegation_result(delegation_id, owner=current_delegation_owner(parent_agent))
+            item = get_delegation_result(delegation_id, owner=current_delegation_owner(parent_agent),
+                                         session_db=getattr(parent_agent, "_session_db", None))
             if not item or not isinstance(item.get("result"), dict):
                 return tool_error("No recorded result for this exact delegation owner")
             entries = item["result"].get("results")
@@ -1277,6 +1289,7 @@ def delegate_task(
     creds = None  # Resolve only if batch preflight encounters a legacy task.
 
     from tools.async_delegation import current_delegation_owner
+    from tools.delegation_owner import delegation_owner_matches
     try:
         _owner = current_delegation_owner(parent_agent)
     except ValueError as exc:
@@ -1306,20 +1319,29 @@ def delegate_task(
         if (len(resumes) != len(task_runtime) or any(not _valid_card_identity(i) for i in identities)
                 or any(t.get("replaces") is not None for t in task_list)
                 or len({i["parent_task_id"] for i in identities}) != 1
-                or any(i.get("owner") != _owner for i in identities)
+                or any(i.get("owner") != identities[0].get("owner") for i in identities)
+                or any(not delegation_owner_matches(i.get("owner"), _owner,
+                           getattr(parent_agent, "_session_db", None)) for i in identities)
                 or (parent_task_id and parent_task_id != identities[0]["parent_task_id"])):
             _release_resume_launches(parent_agent, task_runtime)
             return tool_error("Resume requires exact owned logical card identities from one batch; split unrelated continuations. Legacy/uncheckpointed identity requires explicit reconciliation.")
+        # The requesting tip gains authority, never ownership of the old row.
+        if _card_owner == _owner:
+            _card_owner = deepcopy(identities[0]["owner"])
+        _owner = deepcopy(identities[0]["owner"])
         parent_task_id = identities[0]["parent_task_id"]
         effective_labels = [i["task_label"] for i in identities]
     try:
         from tools.async_delegation import reserve_delegation_metadata
         _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
-            task_labels=effective_labels or [],
+            task_labels=effective_labels or [], session_db=getattr(parent_agent, "_session_db", None),
             **({"resume_refs": [i["thread_ref"] for i in identities]} if resumes else {}))
     except ValueError as exc:
         _release_resume_launches(parent_agent, task_runtime)
         return tool_error(str(exc))
+    if _card_owner == _owner:
+        _card_owner = deepcopy(_metadata["owner"])
+    _owner = deepcopy(_metadata["owner"])
     _metadata["attempts"] = {ref: ((task_runtime[i].launch_metadata or {}).get("card_identity", {}).get("attempt", 0) + 1
                                  if task_runtime[i].resume_session_id else 0)
                             for i, ref in enumerate(_metadata["thread_refs"])}
