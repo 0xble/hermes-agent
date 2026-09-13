@@ -1358,6 +1358,7 @@ class GatewaySlashCommandsMixin(
         # ``profile``: the update watcher (possibly the NEXT gateway process) must answer through the
         # requester's own profile bot, not the default profile's adapter for the same platform.
         pending.update({k: v for k, v in (("thread_id", src.thread_id), ("message_id", event.message_id),
+                                          ("business_connection_id", getattr(src, "business_connection_id", None)),
                                           ("profile", getattr(src, "profile", None))) if v})
         try:
             launch = launch_native_update(

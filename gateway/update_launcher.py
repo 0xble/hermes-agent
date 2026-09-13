@@ -118,6 +118,18 @@ def _route_from_session_lineage(db: Any, session_id: str) -> tuple[str, dict[str
                 for key in ("source", "chat_id", "chat_type", "user_id", "session_key", "thread_id")
                 if row.get(key) not in (None, "")
             }
+            # Rich routing is persisted in origin_json, not flat session columns.
+            # Accept a Business discriminator only from this same chat origin.
+            try:
+                origin = json.loads(row.get("origin_json") or "{}")
+            except (TypeError, ValueError):
+                origin = {}
+            if (isinstance(origin, dict) and source == "telegram"
+                    and origin.get("platform") == source
+                    and str(origin.get("chat_id")) == str(chat_id)
+                    and isinstance(origin.get("business_connection_id"), str)
+                    and origin["business_connection_id"].strip()):
+                route["business_connection_id"] = origin["business_connection_id"].strip()
             return current, route
         current = str(row.get("parent_session_id") or "").strip()
     return None
@@ -167,6 +179,7 @@ def make_agent_update_handler(
             "chat_type": route.get("chat_type"), "user_id": route.get("user_id"),
             # The validated agent:<profile>: lane lets _marker_profile retain the owning bot.
             "session_key": route.get("session_key"), "thread_id": route.get("thread_id"),
+            "business_connection_id": route.get("business_connection_id"),
             "timestamp": datetime.now(timezone.utc).isoformat(), "reason": reason,
             "parent_session_id": parent_session_id, "parent_route": route,
         }

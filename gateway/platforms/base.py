@@ -113,9 +113,11 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
     if scope_id:
         metadata["slack_team_id"] = str(scope_id)
+    if platform == "telegram" and getattr(source, "business_connection_id", None):
+        metadata["telegram_business_connection_id"] = str(source.business_connection_id)
     if not metadata:
         return None
-    if platform == "telegram" and getattr(source, "chat_type", None) == "dm":
+    if platform == "telegram" and thread_id is not None and getattr(source, "chat_type", None) == "dm":
         metadata["telegram_dm_topic_reply_fallback"] = True
         if str(thread_id) not in {"", "1"}:
             metadata["direct_messages_topic_id"] = str(thread_id)
@@ -3969,6 +3971,7 @@ class BasePlatformAdapter(ABC):
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                business_connection_id=getattr(source, "business_connection_id", None),
                 content=text_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 obligation_kind="agent_final",

@@ -30,7 +30,7 @@ def test_cli_invalid_reason_returns_nonzero_without_ipc(monkeypatch, capsys):
     assert "--reason" in capsys.readouterr().out
 
 
-def _real_store_with_routes(tmp_path, profile=None):
+def _real_store_with_routes(tmp_path, profile=None, business_connection_id=None):
     """Create a persisted messaging parent and two real delegated descendants."""
     token = set_hermes_home_override(tmp_path)
     if profile:
@@ -40,7 +40,7 @@ def _real_store_with_routes(tmp_path, profile=None):
     try:
         store = SessionStore(tmp_path / "sessions", GatewayConfig(multiplex_profiles=bool(profile)))
         direct = store.get_or_create_session(
-            SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="private", user_id="u", thread_id="t", profile=profile)
+            SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="private", user_id="u", thread_id="t", profile=profile, business_connection_id=business_connection_id)
         )
         db = store._db_for_key(direct.session_key)
         store._test_route_db = db
@@ -58,7 +58,8 @@ def _real_store_with_routes(tmp_path, profile=None):
 @pytest.mark.skipif(sys.platform == "win32", reason="real unix socket transport")
 @pytest.mark.parametrize("profile", (None, "work"))
 @pytest.mark.parametrize("route_kind", ("direct", "nested"))
-def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watcher(tmp_path, route_kind, profile, monkeypatch):
+@pytest.mark.parametrize("business_connection_id", (None, "business-fixture"))
+def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watcher(tmp_path, route_kind, profile, monkeypatch, business_connection_id):
     """The real unpinned DB resolver finds named lineage before socket handoff."""
     from gateway.run import _start_gateway_start_control_socket
 
@@ -67,7 +68,7 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("hermes_cli.profiles._get_default_hermes_home", lambda: tmp_path)
-    store, direct_id, nested_id = _real_store_with_routes(tmp_path, profile=profile)
+    store, direct_id, nested_id = _real_store_with_routes(tmp_path, profile=profile, business_connection_id=business_connection_id)
     watched = asyncio.Event()
     watch_threads = []
     main_thread = threading.get_ident()
@@ -130,7 +131,9 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
     assert marker["parent_route"] == {
         "source": "telegram", "chat_id": "42", "chat_type": "private", "user_id": "u",
         "session_key": marker["parent_route"]["session_key"], "thread_id": "t",
+        **({"business_connection_id": business_connection_id} if business_connection_id else {}),
     }
+    assert marker.get("business_connection_id") == business_connection_id
     from gateway.run_notifications import GatewayNotificationsMixin
     default_adapter, named_adapter = object(), object()
     class TargetRunner(GatewayNotificationsMixin):

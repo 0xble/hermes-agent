@@ -543,6 +543,9 @@ class GatewayStartupMixin:
             if row.get("needs_marker"):
                 content = row.get("marker", RECOVERED_MARKER) + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            if row["platform"] == "telegram" and row.get("business_connection_id"):
+                metadata = dict(metadata or {})
+                metadata["telegram_business_connection_id"] = row["business_connection_id"]
             # Snapshot BEFORE the send: only a generation that advanced DURING this attempt
             # proves the send path recovered while we were on it.
             recovery_generation = getattr(adapter, "_send_path_recovery_generation", 0)

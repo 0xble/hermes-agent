@@ -485,10 +485,14 @@ class GatewayNotificationsMixin:
 
     def _pending_marker_metadata(self, platform, chat_id, data: dict, adapter):
         """Thread metadata for a persisted update/restart marker (thread_id/chat_type/message_id keys)."""
-        return self._thread_metadata_for_target(
+        metadata = self._thread_metadata_for_target(
             platform, chat_id, data.get("thread_id"), chat_type=data.get("chat_type"),
             reply_to_message_id=data.get("message_id"), adapter=adapter,
         )
+        if platform == Platform.TELEGRAM and data.get("business_connection_id"):
+            metadata = dict(metadata or {})
+            metadata["telegram_business_connection_id"] = str(data["business_connection_id"])
+        return metadata
 
     async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float) -> None:
         loop = asyncio.get_running_loop()

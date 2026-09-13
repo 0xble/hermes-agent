@@ -126,10 +126,12 @@ def test_new_request_initializes_output_before_any_watcher_can_resolve_it(tmp_pa
     assert all("stale conversation" not in message for message in messages)
 
 
-def pending(home, *, reason=True):
+def pending(home, *, reason=True, business_connection_id=None):
     data = {"platform": "telegram", "chat_id": "42", "thread_id": "77", "chat_type": "dm",
             "session_key": "agent:main:telegram:dm:42:thread:77",
             "timestamp": datetime.now(timezone.utc).isoformat()}
+    if business_connection_id:
+        data["business_connection_id"] = business_connection_id
     if reason:
         data["reason"] = "Activating the delegation-label fix."
     launch_native_update(home=home, hermes_cmd=["hermes"], pending=data, spawn=Mock())
@@ -222,8 +224,9 @@ async def test_shutdown_reason_does_not_cross_conversation_boundaries(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["result", "exception"])
-async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tmp_path, failure):
-    data = pending(tmp_path)
+@pytest.mark.parametrize("business_connection_id", [None, "business-fixture"])
+async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tmp_path, failure, business_connection_id):
+    data = pending(tmp_path, business_connection_id=business_connection_id)
     reason = data["reason"]
     output = tmp_path / ".update_output.txt"
     output.write_text("native progress before restart\n")
@@ -268,6 +271,8 @@ async def test_reason_progress_and_final_survive_restart_and_delivery_failure(tm
     assert "recovery will be attempted" in phases[1]
     assert sum("native progress before restart" in m for m in messages) == 1
     assert all(str(c.kwargs["metadata"]["thread_id"]) == "77" for c in adapter.send.call_args_list)
+    assert all(c.kwargs["metadata"].get("telegram_business_connection_id") == business_connection_id
+               for c in adapter.send.call_args_list)
 
 
 @pytest.mark.parametrize("case", ["pre_restart", "missing", "stale", "partial", "unknown", "pending_restart", "malformed", "failed", "success", "legacy"])

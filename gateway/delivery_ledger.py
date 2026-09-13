@@ -208,6 +208,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     for column, ddl in (("adapter_profile", "adapter_profile TEXT"),
                         ("obligation_kind", "obligation_kind TEXT NOT NULL DEFAULT 'legacy'"),
                         ("turn_token", "turn_token TEXT"),
+                        ("business_connection_id", "business_connection_id TEXT"),
                         ("delegation_receipt", "delegation_receipt TEXT"),
                         ("goal_receipt", "goal_receipt TEXT"),
                         ("goal_receipt_consumed", "goal_receipt_consumed INTEGER NOT NULL DEFAULT 0")):
@@ -300,7 +301,8 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
                       obligation_kind: str = "agent_final", turn_token: Optional[str] = None,
                       delegation_receipt: Optional[dict] = None,
-                      goal_receipt: Optional[dict] = None) -> None:
+                      goal_receipt: Optional[dict] = None,
+                      business_connection_id: Optional[str] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -318,12 +320,13 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile,
-                obligation_kind, turn_token, delegation_receipt, goal_receipt)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                obligation_kind, turn_token, delegation_receipt, goal_receipt, business_connection_id)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
              obligation_kind, turn_token, json.dumps(delegation_receipt) if delegation_receipt else None,
-             json.dumps(goal_receipt) if goal_receipt else None))
+             json.dumps(goal_receipt) if goal_receipt else None,
+             str(business_connection_id) if business_connection_id else None))
     _prune()
 
 
@@ -409,7 +412,8 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
                  obligation_kind: Optional[str] = None, turn_token: Optional[str] = None,
-                 last_error: Optional[str] = None, delegation_receipt: Optional[str] = None) -> Dict[str, Any]:
+                 last_error: Optional[str] = None, delegation_receipt: Optional[str] = None,
+                 business_connection_id: Optional[str] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
@@ -425,7 +429,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}),
             "attempts": attempts + 1, "obligation_kind": obligation_kind, "turn_token": turn_token,
-            "delegation_receipt": delegation_receipt}
+            "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id}
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
@@ -454,13 +458,13 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile,
-                      obligation_kind, turn_token, last_error, updated_at, delegation_receipt
+                      obligation_kind, turn_token, last_error, updated_at, delegation_receipt, business_connection_id
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, obligation_kind, turn_token,
-             last_error, updated_at, delegation_receipt) in rows:
+             last_error, updated_at, delegation_receipt, business_connection_id) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -488,7 +492,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error),
                         "obligation_kind": obligation_kind, "turn_token": turn_token,
-                        "delegation_receipt": delegation_receipt})
+                        "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id})
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
             # resend is seen as 'attempting' with no error by the next boot and gets the marker.
@@ -507,7 +511,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                 claimed.append(_claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts,
                                             adapter_profile or "default", needs_marker=state != "pending",
                                             flood=flood_row, obligation_kind=obligation_kind,
-                                            turn_token=turn_token, delegation_receipt=delegation_receipt))
+                                            turn_token=turn_token, delegation_receipt=delegation_receipt,
+                                            business_connection_id=business_connection_id))
     return claimed
 
 
@@ -533,12 +538,12 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile,
-                      obligation_kind, turn_token, updated_at, delegation_receipt
+                      obligation_kind, turn_token, updated_at, delegation_receipt, business_connection_id
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, obligation_kind, turn_token,
-             updated_at, delegation_receipt) in rows:
+             updated_at, delegation_receipt, business_connection_id) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
                     or not _runtime_retryable(last_error)):
@@ -567,7 +572,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                 claimed.append(_claimed_row(oid, session_key, row_platform, chat_id, thread_id, content,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
                                             flood=is_flood_error(last_error), last_error=last_error,
-                                            obligation_kind=obligation_kind, turn_token=turn_token, delegation_receipt=delegation_receipt))
+                                            obligation_kind=obligation_kind, turn_token=turn_token, delegation_receipt=delegation_receipt,
+                                            business_connection_id=business_connection_id))
     return claimed
 
 
