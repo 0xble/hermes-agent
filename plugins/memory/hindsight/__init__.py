@@ -35,6 +35,9 @@ from tools.registry import tool_error
 from .source_retention import (
     SourceCandidate, discover_source_candidates, read_verified_source_file,
 )
+from .source_ledger import (
+    finish_source_operation, restore_source_ledger, save_source_entry, supersede_source,
+)
 
 from .embedded import (
     _RETRIABLE_CONNECTION_MARKERS, _build_embedded_profile_env,
@@ -697,26 +700,33 @@ class HindsightMemoryProvider(MemoryProvider):
         ids = [str(op) for op in raw_ids if op]
         candidate = source_candidates[0] if source_candidates else None
         if candidate is not None:
-            self._source_ledger[candidate.automatic_key] = {
-                "candidate": candidate, "status": "accepted", "operation_ids": ids,
-            }
+            restore_source_ledger(self, bank_id)
+            with self._source_retain_keys_lock:
+                # Track in memory before persisting: a disk error after remote
+                # acceptance must not erase the operation or permit resubmission.
+                for op_id in ids:
+                    self._source_retain_ops[op_id] = candidate
+                with self._pending_retain_ops_lock:
+                    self._pending_retain_ops.update(ids)
+                    self._retain_ops_bank_id = bank_id
+                save_source_entry(self, candidate, accepted=True, status="accepted",
+                                  operation_ids=ids, pending_operation_ids=ids)
+                for op_id in self._source_ledger[candidate.automatic_key]["pending_operation_ids"]:
+                    self._source_retain_ops[op_id] = candidate
+                with self._pending_retain_ops_lock:
+                    self._pending_retain_ops.update(self._source_retain_ops)
         if not ids:
             if candidate is not None and not self._verify_source_candidate(bank_id, candidate):
                 raise ValueError("Hindsight source retention could not be verified without an operation ID")
             return
+        if candidate is not None:
+            return
         self._retain_ops_bank_id = bank_id
         with self._pending_retain_ops_lock:
             self._pending_retain_ops.update(ids)
-        # A batch response may not preserve one child operation ID per source.
-        # Mapping every caller-visible id to the first candidate still buys a
-        # document existence check; the content hash and stable document ID
-        # remain the deduplication authority.
-        for op_id in ids:
-            if candidate is not None:
-                self._source_retain_ops[op_id] = candidate
 
     def _verify_source_candidate(self, bank_id: str, candidate: SourceCandidate) -> bool:
-        """Confirm a source document exists (and matches) after its retain completes."""
+        """Settle terminal source work with exact readback or explicit supersession."""
         try:
             document = self._run_hindsight_operation(
                 lambda client: client.documents.get_document(bank_id=bank_id, document_id=candidate.source_id))
@@ -731,10 +741,16 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata = getattr(document, "document_metadata", None) or {}
         stored_hash = str(metadata.get("content_hash") or "") if isinstance(metadata, dict) else ""
         if not stored_hash or stored_hash != candidate.content_hash:
+            if stored_hash and supersede_source(self, candidate, stored_hash):
+                return True
             logger.warning("Hindsight source readback hash mismatch for %s", candidate.source_id)
             return False
-        self._source_retain_verified.add(candidate.automatic_key)
-        self._source_ledger[candidate.automatic_key] = {"candidate": candidate, "status": "completed"}
+        with self._source_retain_keys_lock:
+            # One failed child operation cannot be erased by a sibling's readback.
+            entry = self._source_ledger.get(candidate.automatic_key, {})
+            status = "failed" if entry.get("status") == "failed" else "completed"
+            save_source_entry(self, candidate, status=status)
+            self._source_retain_verified.add(candidate.automatic_key)
         logger.debug("Hindsight source readback verified: %s", candidate.source_id)
         return True
 
@@ -743,31 +759,31 @@ class HindsightMemoryProvider(MemoryProvider):
         so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
         from hindsight_client_api.exceptions import NotFoundException
 
-        # A source op is only "done" once its document reads back: the server
-        # reporting completion is not proof the document is durable.
+        # Server completion alone is not durability. Source work must match its
+        # hash or explicitly settle against a readback-verified newer version.
         candidate = self._source_retain_ops.get(op_id)
-        _verify_if_source = lambda: True if candidate is None else self._verify_source_candidate(bank_id, candidate)  # noqa: E731
+        _settle_if_source = lambda: True if candidate is None else self._verify_source_candidate(bank_id, candidate)  # noqa: E731
 
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
             )
         except NotFoundException:
-            if (verified := _verify_if_source()):
-                self._source_retain_ops.pop(op_id, None)
-            return verified
+            if (settled := _settle_if_source()):
+                finish_source_operation(self, op_id)
+            return settled
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
             return False
         status = str(getattr(resp, "status", "") or "").lower()
         if status == "completed":
-            if (verified := _verify_if_source()):
-                self._source_retain_ops.pop(op_id, None)
-            return verified
+            if (settled := _settle_if_source()):
+                finish_source_operation(self, op_id)
+            return settled
         if status == "failed":
-            self._source_retain_ops.pop(op_id, None)
             if candidate is not None:
                 self._source_candidate_failed(candidate)
+                finish_source_operation(self, op_id)
             return True
         return False
 
@@ -778,6 +794,7 @@ class HindsightMemoryProvider(MemoryProvider):
         ``queue.join()`` so a wedged write can't hang the prefetch; (2) the
         server-side async ops complete (async retain returns on acceptance, not
         durability). False on timeout/shutdown."""
+        restore_source_ledger(self, self._bank_id, recover_only=True)
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
         while self._retain_queue.unfinished_tasks > 0:
@@ -792,10 +809,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _wait_for_server_retain_ops(self, _expired: Callable[[], bool], timeout: float) -> bool:
         """Poll tracked async retain ops until complete or *_expired()* (deadline
-        predicate). Ops still pending at the deadline are DROPPED: keeping them
-        would let a permanently failing status endpoint burn the full timeout on
-        EVERY later prefetch (a per-turn latency penalty via prefetch()'s bounded
-        join). Trades a possibly-stale recall for liveness; WARNING once per prefetch."""
+        predicate). Transcript ops may be dropped at timeout for prefetch liveness;
+        source evidence stays pending until verified, failed, or superseded."""
         while True:
             with self._pending_retain_ops_lock:
                 bank_id = self._retain_ops_bank_id or self._bank_id
@@ -812,17 +827,19 @@ class HindsightMemoryProvider(MemoryProvider):
                     break
                 if self._is_retain_op_complete(bank_id, op_id):
                     done.add(op_id)
+            dropped: set[str] = set()
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
                 if not self._pending_retain_ops:
                     return True
-                dropped = len(self._pending_retain_ops) if _expired() else 0
-                if dropped:
-                    self._pending_retain_ops.clear()
-            if dropped:
+                timed_out = _expired()
+                if timed_out:
+                    dropped = self._pending_retain_ops.difference(self._source_retain_ops)
+                    self._pending_retain_ops.difference_update(dropped)
+            if timed_out:
                 logger.warning("Prefetch: server retain visibility timed out after %.1fs; "
-                               "dropping %d unresolved op(s) so later prefetches stay "
-                               "bounded (recall may miss the just-completed turn)", timeout, dropped)
+                               "dropping %d transcript op(s), preserving unresolved source evidence",
+                               timeout, len(dropped))
                 return False
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
 
@@ -1356,7 +1373,8 @@ class HindsightMemoryProvider(MemoryProvider):
         key = candidate.automatic_key
         with self._source_retain_keys_lock:
             entry = self._source_ledger.get(key)
-            if entry and entry["status"] in {"queued", "accepted", "completed"}:
+            if entry and (entry.get("pending_operation_ids") or
+                          entry["status"] in {"queued", "accepted", "completed", "superseded"}):
                 return True
             self._source_retain_keys.add(key)
             self._source_ledger[key] = {"candidate": candidate, "status": "queued"}
@@ -1366,10 +1384,11 @@ class HindsightMemoryProvider(MemoryProvider):
         """Release the dedup key so a transient failure stays retryable."""
         with self._source_retain_keys_lock:
             self._source_retain_keys.discard(candidate.automatic_key)
-            self._source_ledger[candidate.automatic_key] = {"candidate": candidate, "status": "failed"}
+            save_source_entry(self, candidate, status="failed")
 
     def _retain_source_candidate(self, candidate: SourceCandidate, bank_id: str) -> None:
         """Submit one automatically discovered source and track its durability."""
+        restore_source_ledger(self, bank_id)
         if self._source_candidate_already_submitted(candidate):
             logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
             return
@@ -1398,7 +1417,11 @@ class HindsightMemoryProvider(MemoryProvider):
                         candidate.source_type, candidate.source_id, candidate.source_shape,
                         candidate.content_hash[:16])
         except Exception:
-            self._source_candidate_failed(candidate)
+            # A failed readback without operation IDs remains retryable. An
+            # accepted operation with IDs must keep its evidence on local errors.
+            entry = self._source_ledger.get(candidate.automatic_key, {})
+            if not entry.get("pending_operation_ids"):
+                self._source_candidate_failed(candidate)
             raise
 
     def _retain_source_candidates(self, candidates: list[SourceCandidate], bank_id: str) -> None:
