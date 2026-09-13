@@ -2104,6 +2104,17 @@ class GatewayTurnMixin:
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
+            if (agent_result.get("execution_not_started") is True
+                    and prepared.persistence_owner
+                    and agent_result.get("not_started_input_owner") == prepared.persistence_owner
+                    and session_entry.restart_inbox_link):
+                # Keep the exact durable claim/token for canonical reconciliation.
+                # Do not fabricate ingestion or deliver this input because the
+                # overload notice was sent. A queued successor owns its own receipt.
+                event._restart_input_admission_failed = True
+                await self._hmwa_stop_typing_for_turn(event, source)
+                return agent_result["final_response"]
+
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
             # message's id or it collides with an earlier turn's row carrying the same text. Reply
@@ -4197,6 +4208,10 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if response.get("execution_not_started") is True:
+                # Leave queued inputs for their normal drain; replacing this
+                # result with a successor's result would erase admission proof.
+                return response
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?

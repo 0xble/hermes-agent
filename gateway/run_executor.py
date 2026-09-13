@@ -110,6 +110,13 @@ def start_turn_work(runner, turn_ctx, worker, run_sync):
 async def run_turn_work(runner, turn_ctx, worker, run_sync):
     from gateway.run import _interim_metadata
 
+    not_started = False
+
+    def rejected():
+        nonlocal not_started
+        not_started = True
+        worker.worker_done.set()
+
     async def queued():
         adapter = runner._adapter_for_source(turn_ctx.source)
         if adapter:
@@ -121,13 +128,20 @@ async def run_turn_work(runner, turn_ctx, worker, run_sync):
 
     try:
         return await runner._run_in_executor_with_context(
-            run_sync, _on_queued=queued, _on_not_started=worker.worker_done.set,
+            run_sync, _on_queued=queued, _on_not_started=rejected,
         )
     except GatewayCapacityError as exc:
         worker.worker_done.set()
         return {
             "final_response": str(exc), "messages": [], "failed": True,
             "api_calls": 0, "history_offset": 0, "response_previewed": False,
+            # A worker may itself raise this exception. Only the executor's
+            # admission receipt proves that this exact input was never started.
+            "execution_not_started": not_started,
+            "not_started_input_owner": (
+                (turn_ctx.persist_user_display_metadata or {}).get("gateway_input_owner")
+                if not_started else None
+            ),
         }
     except RuntimeError:
         # Executor shutdown may reject before a future exists. A worker-raised
