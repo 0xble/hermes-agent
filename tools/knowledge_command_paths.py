@@ -230,8 +230,9 @@ def _python_paths(source: str, depth: int) -> tuple[list[str], list[str], list[s
                 operand = node.func.value
         if operand is not None and (target := path(operand)) is not None:
             targets.append(target)
+        command_keyword = "cmd" if name == "os.popen" else "args" if name in subprocess_calls else None
         first = node.args[0] if node.args else next(
-            (kw.value for kw in node.keywords if kw.arg == "args"), None)
+            (kw.value for kw in node.keywords if command_keyword is not None and kw.arg == command_keyword), None)
         if first is None:
             continue
         if name in {"os.system", "os.popen", "exec", "eval"} and isinstance(first, ast.Constant) and isinstance(first.value, str):

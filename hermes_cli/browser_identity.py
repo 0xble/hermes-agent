@@ -148,7 +148,7 @@ def read_browser_identity_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import read_raw_config
 
-        config = read_raw_config()
+        config = read_raw_config(strict=True)
     except Exception as exc:
         raise BrowserIdentityError(
             f"could not read browser identity configuration: {exc}"
