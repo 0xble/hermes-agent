@@ -1185,18 +1185,19 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to = (metadata or {}).get("telegram_reply_to_message_id")
         return int(reply_to) if reply_to is not None else None
 
-    # Sentinel separating "still disconnected after the wait" from a real return value (including None)
-    # a delegated call might produce.
+    # Reconnection control must be distinct from every delegated result,
+    # including durable cleanup's None (no request issued).
     _RECONNECT_FAILED = object()
+    _RECONNECTED = object()
 
-    async def _await_reconnection_or_delegate(self, method: str, *args, **kwargs):
+    async def _await_reconnection_or_delegate(self, method: str, *args, **kwargs) -> Any:
         """Retry *method* on a live replacement adapter, or wait the way ``send()`` does.
 
         HERMES-076: every ``send_*``/``edit_message`` call used to fail immediately with
         ``retryable=False`` when ``self._bot`` was None instead of tolerating a transient 10-20s blip, so
         the reply sat in the delivery ledger until the next gateway boot.
 
-        Returns the delegated call's result if delegation happened, ``None`` if this instance itself
+        Returns the delegated call's result if delegation happened, ``_RECONNECTED`` if this instance
         reconnected (the caller proceeds on ``self._bot``), or ``_RECONNECT_FAILED`` if still disconnected."""
         live = self._replacement_telegram_adapter()
         if live is not None:
@@ -1208,7 +1209,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return await getattr(live, method)(*args, **kwargs)
         if not self._bot:
             return self._RECONNECT_FAILED
-        return None
+        return self._RECONNECTED
 
     async def _reconnect_guarded(self, method: str, *args, **kwargs) -> Optional[SendResult]:
         """The SendResult a disconnected call site must return, or ``None`` to proceed on ``self._bot``."""
@@ -1217,7 +1218,7 @@ class TelegramAdapter(BasePlatformAdapter):
         outcome = await self._await_reconnection_or_delegate(method, *args, **kwargs)
         if outcome is self._RECONNECT_FAILED:
             return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
-        return outcome
+        return None if outcome is self._RECONNECTED else outcome
 
     @staticmethod
     def _dm_topic_fallback(metadata: Optional[Dict[str, Any]]) -> bool:
@@ -4523,7 +4524,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send or edit a status within one chat/thread/Business connection and status key.
-        If the edit fails (deleted, too old, …), drop the cached id and send fresh.
+        Only a non-retryable missing-message edit permits dropping the receipt and sending fresh.
 
         Issue #30045: progress/status callbacks (context-pressure, lifecycle, compression, etc.) used to
         append a fresh bubble on every call. With this method, the first call sends and the message id is
@@ -4546,6 +4547,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if result.success:
                 if result.message_id and self._status_message_ids.get(key) == cached_id:
                     self._status_message_ids[key] = str(result.message_id)
+                return result
+            # A failed edit does not imply absence: retain the acknowledged ID
+            # across flood deferrals, transport uncertainty and permission errors.
+            missing = not result.retryable and any(marker in (result.error or "").lower()
+                for marker in ("message to edit not found", "message_id_invalid"))
+            if not missing:
                 return result
             self._status_message_ids.pop(key, None)
         result = await self.send(chat_id, content, metadata=metadata)
@@ -4837,11 +4844,11 @@ class TelegramAdapter(BasePlatformAdapter):
         — the caller leaves the preview in place and logs at debug level.
         """
         if not self._bot:
-            outcome = await self._await_reconnection_or_delegate("delete_message", chat_id, message_id)
+            outcome = await self._await_reconnection_or_delegate("_delete_status_message", chat_id, message_id)
             if outcome is self._RECONNECT_FAILED:
                 return False
-            if outcome is not None:
-                return bool(outcome)
+            if outcome is not self._RECONNECTED:
+                return outcome
         try:
             # Cleanup spends the shared budget too: activity-driven reanchoring
             # must not create an unmetered delete lane beside sends and typing.
@@ -4925,7 +4932,7 @@ class TelegramAdapter(BasePlatformAdapter):
             outcome = await self._await_reconnection_or_delegate("_send_message_with_thread_fallback", **kwargs)
             if outcome is self._RECONNECT_FAILED:
                 raise RuntimeError("Not connected")
-            if outcome is not None:
+            if outcome is not self._RECONNECTED:
                 return outcome
         message_thread_id = kwargs.get("message_thread_id")
         chat_id = kwargs.get("chat_id")

@@ -3,7 +3,7 @@
 The status-update path must:
   1. Send a fresh message on the first call for a (chat_id, status_key) pair.
   2. Edit that same message on subsequent calls with the same key.
-  3. Fall back to sending fresh when the cached message edit fails.
+  3. Fall back to sending fresh only when the cached message is definitely absent.
   4. Keep distinct keys independent (no cross-talk).
 """
 
