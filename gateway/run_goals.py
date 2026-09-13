@@ -273,12 +273,39 @@ class GatewayGoalsMixin:
         if (adapter is None or not session_key
                 or not callable(getattr(adapter, "register_post_delivery_callback", None))):
             return
+        # Persist only the prepared decision, never the transcript/tool results.
+        # Legacy unprepared hooks remain in-process; recovery must not rejudge.
+        decision = agent_result.get("_goal_decision") if isinstance(agent_result, dict) else None
+        if (isinstance(decision, dict) and isinstance(decision.get("_goal_authority"), dict)
+                and decision["_goal_authority"].get("session_id") == getattr(session_entry, "session_id", None)
+                and callable(getattr(source, "to_dict", None)) and getattr(session_entry, "session_id", None)):
+            import copy
+            state["receipt"] = {
+                "session_id": session_entry.session_id, "source": source.to_dict(),
+                "session_key": session_key, "same_session_pending": bool(same_session_pending),
+                "result": {key: bool(agent_result[key]) for key in (
+                    "_goal_outcome_prepared", "interrupted", "failed", "error") if key in agent_result},
+            }
+            state["receipt"]["result"]["_goal_decision"] = {
+                key: copy.deepcopy(decision[key]) for key in (
+                    "should_continue", "continuation_prompt", "message", "status", "transition",
+                    "verdict", "reason", "_goal_authority")
+                if key in decision}
         evidence = self._tool_evidence_for_goal(agent_result)
 
         async def delivered():
             from gateway.status_delivery import final_delivery_succeeded
-            if (not final_delivery_succeeded.get() or state.get("handled")
-                    or state.get("discarded")):
+            if state.get("discarded"):
+                if state.get("obligation_id"):
+                    from gateway.delivery_ledger import discard_goal_receipt
+                    await asyncio.to_thread(discard_goal_receipt, state["obligation_id"])
+                return
+            if not final_delivery_succeeded.get() or state.get("handled"):
+                return
+            if state.get("obligation_id") and state.get("receipt"):
+                await self._consume_delivered_goal_receipt(state["obligation_id"])
+                agent_result["_goal_decision_consumed"] = True
+                state["handled"] = True
                 return
             await self._post_turn_goal_continuation(
                 session_entry=session_entry, source=source,
@@ -290,6 +317,31 @@ class GatewayGoalsMixin:
             state["handled"] = True
 
         adapter.register_post_delivery_callback(session_key, delivered, generation=generation)
+
+    async def _consume_delivered_goal_receipt(self, obligation_id: str) -> None:
+        from gateway.delivery_ledger import claim_delivered_goal_receipt
+        from gateway.session import SessionSource
+        from types import SimpleNamespace
+        receipt = await asyncio.to_thread(claim_delivered_goal_receipt, obligation_id)
+        if not receipt:
+            return
+        source = SessionSource.from_dict(receipt["source"])
+        # The persisted decision's authority is checked by consume_goal_decision.
+        # Never reconstruct a legacy decision from reply text after recovery.
+        with self._profile_scope_for_source(source):
+            from hermes_cli.goals_evaluation import decision_is_current
+            decision = receipt["result"].get("_goal_decision") or {}
+            authority = decision.get("_goal_authority") or {}
+            if (authority.get("session_id") != receipt["session_id"]
+                    or not decision_is_current(decision)):
+                return
+            await self._post_turn_goal_continuation(
+                session_entry=SimpleNamespace(session_id=receipt["session_id"]), source=source,
+                session_key=receipt["session_key"], final_response="",
+                enqueue_continuation=not receipt["same_session_pending"],
+                emit_status_notice=not receipt["same_session_pending"],
+                agent_result=receipt["result"],
+            )
 
     async def _post_turn_goal_continuation(
         self, *, session_entry: Any, source: Any, final_response: str,

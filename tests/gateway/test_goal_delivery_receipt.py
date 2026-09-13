@@ -84,7 +84,9 @@ async def test_receipt_gates_consumption_retry_and_fifo(receipt_context, lane, p
     user = MessageEvent(text="user follow-up", source=source)
     adapter._pending_messages["route"] = user
     if lane == "normal":
-        await adapter._fire_post_delivery_callback("route", asyncio.Event(), 7, delivery_succeeded=False)
+        # Failed normal sends recover through the durable-ledger test below.
+        # Leave this receipt pending until the successful final-send boundary.
+        pass
     else:
         # The real queued-delivery owner must not fire its callback on a failed
         # send. Only the transport/final-send boundary is fake.
@@ -105,9 +107,6 @@ async def test_receipt_gates_consumption_retry_and_fifo(receipt_context, lane, p
     assert not runner._overflow_queue("route")
 
     if lane == "normal":
-        # A retried successful receipt can reuse the unconsumed decision. This
-        # does not introduce an automatic retry queue for failed deliveries.
-        adapter.register_post_delivery_callback("route", callback, generation=7)
         await adapter._fire_post_delivery_callback("route", asyncio.Event(), 7)
     else:
         assert await runner._run_agent_deliver_first_response(
@@ -215,3 +214,105 @@ async def test_recursive_delivery_owns_only_its_goal_decision(monkeypatch, tmp_p
     assert state["delivery"]["handled"]
     assert set(cleanup) == ({"predecessor"} if depth_limited else {"predecessor", "successor"})
     assert not network_attempts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stale', ['current', 'replaced', 'discarded'])
+async def test_failed_final_recovers_prepared_goal_via_ledger(receipt_context, monkeypatch, stale):
+    from gateway import delivery_ledger as ledger
+    from gateway.platforms.base import SendResult
+
+    runner, adapter, mgr, judge = receipt_context
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='12345', chat_type='dm')
+    result = {'final_response': 'Partial progress.',
+              '_goal_decision': mgr.evaluate_after_turn('Partial progress.')}
+    assert result['_goal_decision']['should_continue']
+    state = {}
+    runner._schedule_goal_after_delivery(adapter=adapter, session_key='route', generation=7,
+        session_entry=SimpleNamespace(session_id=mgr.session_id), source=source,
+        agent_result=result, state=state)
+    cleanup = []
+    adapter.register_post_delivery_callback('route', lambda: cleanup.append('clean'), generation=7)
+    adapter.typed_command_prefix = '!'
+    adapter.gateway_runner = runner
+    monkeypatch.setattr(ledger, 'ledger_enabled', lambda: True)
+    event = MessageEvent(text='Work on goal', source=source, message_id='receipt-input')
+    event._goal_post_turn_state = {'delivery': state}
+    oid = await adapter._record_delivery_obligation(event, 'route', result['final_response'], adapter, False)
+    assert oid
+    await adapter._finalize_delivery_obligation(oid, SendResult(success=False, error='offline'), event, adapter)
+    if stale == 'discarded':
+        state['discarded'] = True
+    await adapter._fire_post_delivery_callback('route', asyncio.Event(), 7, delivery_succeeded=False)
+    assert cleanup == ['clean']
+    assert not result.get('_goal_decision_consumed') and not runner._overflow_queue('route')
+    assert not adapter._post_delivery_callbacks_by_generation
+    if stale == 'replaced':
+        mgr.set('A replacement goal', max_turns=10)
+    # Recover through the real SQLite sweep and sender, without re-registering
+    # callbacks or retaining the original event/decision state.
+    monkeypatch.setattr(ledger, '_owner_alive', lambda *_: False)
+    claimed = ledger.sweep_recoverable()
+    assert len(claimed) == 1
+    runner._obligation_adapter = AsyncMock(return_value=adapter)
+    runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id='delivered'))
+    adapter._pending_messages['route'] = MessageEvent(text='User next', source=source)
+    assert await runner._redeliver_claimed_obligations(claimed) == 1
+    assert len(runner._overflow_queue('route') or []) == (1 if stale == 'current' else 0)
+    assert judge.call_count == 1
+    # The exact obligation cannot replenish consumed authority by re-recording.
+    assert await adapter._record_delivery_obligation(event, 'route', result['final_response'], adapter, False) == oid
+    assert ledger.claim_delivered_goal_receipt(oid) is None
+    await runner._consume_delivered_goal_receipt(oid)
+    assert len(runner._overflow_queue('route') or []) == (1 if stale == 'current' else 0)
+    assert ledger.sweep_recoverable() == []
+
+
+@pytest.mark.asyncio
+async def test_normal_durable_receipt_consumes_in_originating_profile(receipt_context, monkeypatch, tmp_path):
+    from gateway import delivery_ledger as ledger
+    from gateway import run as gateway_run
+    from gateway.platforms.base import SendResult
+    from hermes_cli import goals
+    from hermes_constants import get_hermes_home
+
+    runner, adapter, ambient_manager, judge = receipt_context
+    profile_home = tmp_path / 'routed-profile'
+    profile_home.mkdir()
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda _source: profile_home
+    monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', lambda _home: {})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='12345', chat_type='dm')
+    with runner._profile_scope_for_source(source):
+        mgr = goals.GoalManager(ambient_manager.session_id)
+        mgr.set('Finish the routed profile task', max_turns=10)
+        result = {'final_response': 'Profile progress.',
+                  '_goal_decision': mgr.evaluate_after_turn('Profile progress.')}
+    state = {}
+    runner._schedule_goal_after_delivery(adapter=adapter, session_key='route', generation=7,
+        session_entry=SimpleNamespace(session_id=mgr.session_id), source=source,
+        agent_result=result, state=state)
+    callback = adapter._post_delivery_callbacks_by_generation[('route', 7)]
+    adapter.typed_command_prefix = '!'
+    adapter.gateway_runner = runner
+    monkeypatch.setattr(ledger, 'ledger_enabled', lambda: True)
+    event = MessageEvent(text='Work', source=source, message_id='profile-final')
+    event._goal_post_turn_state = {'delivery': state}
+    oid = await adapter._record_delivery_obligation(event, 'route', result['final_response'], adapter, False)
+    assert oid and ledger.claim_delivered_goal_receipt(oid) is None
+    observed_homes = []
+    enqueue = runner._enqueue_fifo
+    def capture(*args, **kwargs):
+        observed_homes.append(get_hermes_home())
+        return enqueue(*args, **kwargs)
+    runner._enqueue_fifo = capture
+    adapter._pending_messages['route'] = MessageEvent(text='User next', source=source)
+    await adapter._finalize_delivery_obligation(oid, SendResult(success=True, message_id='sent'), event, adapter)
+    await adapter._fire_post_delivery_callback('route', asyncio.Event(), 7)
+    assert state['handled'] and result['_goal_decision_consumed']
+    assert observed_homes == [profile_home]
+    assert 'routed profile task' in runner._overflow_queue('route')[0].text
+    await callback()
+    await runner._consume_delivered_goal_receipt(oid)
+    assert observed_homes == [profile_home] and judge.call_count == 1

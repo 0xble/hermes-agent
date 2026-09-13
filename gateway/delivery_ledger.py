@@ -208,7 +208,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     for column, ddl in (("adapter_profile", "adapter_profile TEXT"),
                         ("obligation_kind", "obligation_kind TEXT NOT NULL DEFAULT 'legacy'"),
                         ("turn_token", "turn_token TEXT"),
-                        ("delegation_receipt", "delegation_receipt TEXT")):
+                        ("delegation_receipt", "delegation_receipt TEXT"),
+                        ("goal_receipt", "goal_receipt TEXT"),
+                        ("goal_receipt_consumed", "goal_receipt_consumed INTEGER NOT NULL DEFAULT 0")):
         if column in columns:
             continue
         try:
@@ -297,21 +299,60 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
                       obligation_kind: str = "agent_final", turn_token: Optional[str] = None,
-                      delegation_receipt: Optional[dict] = None) -> None:
+                      delegation_receipt: Optional[dict] = None,
+                      goal_receipt: Optional[dict] = None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
+        conn.commit()  # finish schema initialization before cross-process arbitration
+        conn.execute("BEGIN IMMEDIATE")
+        # A repeated goal final must not reset its delivery/decision claim. Keep
+        # the legacy re-record behavior for ordinary obligations.
+        if conn.execute(
+            "SELECT 1 FROM delivery_obligations WHERE obligation_id=? "
+            "AND (goal_receipt IS NOT NULL OR goal_receipt_consumed=1)",
+            (obligation_id,)).fetchone():
+            return
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile,
-                obligation_kind, turn_token, delegation_receipt)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                obligation_kind, turn_token, delegation_receipt, goal_receipt)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
-             obligation_kind, turn_token, json.dumps(delegation_receipt) if delegation_receipt else None))
+             obligation_kind, turn_token, json.dumps(delegation_receipt) if delegation_receipt else None,
+             json.dumps(goal_receipt) if goal_receipt else None))
     _prune()
+
+
+def claim_delivered_goal_receipt(obligation_id: str) -> Optional[dict]:
+    """Consume only an acknowledged final's prepared decision, once across owners.
+
+    Claim precedes in-memory FIFO admission. A crash after claim can lose that
+    admission; this is not a durable exactly-once continuation queue.
+    """
+    with _DB_LOCK, _transaction() as conn:
+        conn.commit()  # finish best-effort schema initialization before claiming
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT goal_receipt FROM delivery_obligations "
+            "WHERE obligation_id=? AND state='delivered' AND goal_receipt IS NOT NULL",
+            (obligation_id,)).fetchone()
+        if row is None:
+            return None
+        receipt = json.loads(row[0])
+        conn.execute("UPDATE delivery_obligations SET goal_receipt=NULL, goal_receipt_consumed=1 WHERE obligation_id=?",
+                     (obligation_id,))
+        return receipt
+
+
+def discard_goal_receipt(obligation_id: str) -> None:
+    """Revoke a discarded response's authority without changing its send state."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute("UPDATE delivery_obligations SET goal_receipt=NULL, goal_receipt_consumed=1 "
+                     "WHERE obligation_id=? AND goal_receipt IS NOT NULL", (obligation_id,))
 
 
 def delivered_delegation_receipts() -> list[dict]:
@@ -360,7 +401,8 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
+               WHERE obligation_id=? AND NOT (state='delivered'
+                 AND (goal_receipt IS NOT NULL OR goal_receipt_consumed=1))""",
             (state, time.time(), error[:500] if error else None, obligation_id))
 
 

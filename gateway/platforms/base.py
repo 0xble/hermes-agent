@@ -3964,6 +3964,7 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
+            goal_state = (getattr(event, "_goal_post_turn_state", {}) or {}).get("delivery", {})
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
@@ -3972,7 +3973,9 @@ class BasePlatformAdapter(ABC):
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 obligation_kind="agent_final",
                 turn_token=getattr(event, "_gateway_active_turn_token", None),
-                delegation_receipt=getattr(event, "_delegation_card_receipt", None))
+                delegation_receipt=getattr(event, "_delegation_card_receipt", None),
+                goal_receipt=goal_state.get("receipt") if not goal_state.get("discarded") else None)
+            goal_state["obligation_id"] = obligation_id
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:

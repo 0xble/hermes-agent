@@ -266,7 +266,8 @@ async def test_completed_gateway_response_is_goal_judged_once(monkeypatch, tmp_p
     )
 
     runner._post_turn_goal_continuation.assert_not_awaited()
-    assert goal_post_turn_state == {"delivery": {"scheduled": True}}
+    assert goal_post_turn_state["delivery"]["scheduled"]
+    assert not goal_post_turn_state["delivery"].get("handled")
 
     # _handle_message_with_agent returns only text (or None after streaming),
     # so the event is the sole bridge that can carry the inner hook's marker

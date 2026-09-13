@@ -558,6 +558,7 @@ class GatewayStartupMixin:
                         import json
                         from gateway.delegation_cards import cards_for
                         await cards_for(self).delivered(json.loads(row["delegation_receipt"]))
+                    await self._consume_delivered_goal_receipt(row["obligation_id"])
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
