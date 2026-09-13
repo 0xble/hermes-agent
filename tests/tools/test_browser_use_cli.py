@@ -64,6 +64,14 @@ def _fake_supervisor_registry(monkeypatch):
     return attached
 
 
+def _write_config(tmp_path, monkeypatch, config):
+    """Exercise both ordinary and strict readers against an isolated config file."""
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
+
+
 def _fake_cli(tmp_path, body):
     """Write an executable fake browser-use CLI and return its path."""
     script = tmp_path / "browser-use"
@@ -272,7 +280,7 @@ class TestVaultSupervisorAttach:
                                                                _fake_supervisor_registry, _fake_managed_chromium):
         """browser_vault_fill injects secrets only over the supervisor's CDP WebSocket. Without this attach the
         default (Browser Use) backend had no supervisor at all and every fill failed with supervisor_required."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {"browser": {"backend": "browser-use"}})
+        _write_config(tmp_path, monkeypatch, {"browser": {"backend": "browser-use"}})
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho ok\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
@@ -406,7 +414,7 @@ class TestLegacyCloudMigration:
         assert bu_cli.is_browser_use_cli_mode() is False
 
     def test_migrated_config_gets_bu_autospawn(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: self._LEGACY)
+        _write_config(tmp_path, monkeypatch, self._LEGACY)
         monkeypatch.setenv("BROWSER_USE_API_KEY", "bu-key")
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:$BU_AUTOSPAWN"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
@@ -414,10 +422,7 @@ class TestLegacyCloudMigration:
         assert "autospawn:1" in result["output"]
 
     def test_explicit_backend_does_not_set_bu_autospawn(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
-            lambda: {"browser": {"backend": "browser-use"}},
-        )
+        _write_config(tmp_path, monkeypatch, {"browser": {"backend": "browser-use"}})
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "autospawn:[$BU_AUTOSPAWN]"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         result = json.loads(bu_cli.browser_exec("print(1)"))
@@ -1427,7 +1432,7 @@ class TestTimeoutProcessGroupKill:
         """A grandchild that outlives the direct child and holds the inherited stdout
         pipe must not keep browser_exec blocked past the timeout (it wedged permanently
         before the group kill)."""
-        monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: {})
+        _write_config(tmp_path, monkeypatch, {})
         pid_file = tmp_path / "grandchild.pid"
         cli = _fake_cli(tmp_path, (
             "cat > /dev/null\n"
