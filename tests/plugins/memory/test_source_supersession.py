@@ -728,3 +728,46 @@ def test_refresh_keeps_unjournaled_acceptance_reconcilable(monkeypatch):
     assert not p._wait_for_retains_drained(30)
     assert '2' in p._source_journal.load()[old.automatic_key]['terminal_operation_ids']
     assert len(server.calls) == 3
+
+
+@pytest.mark.parametrize('failure_phase', ['refresh', 'dedup'])
+@pytest.mark.parametrize('previously_completed', [False, True])
+def test_pre_request_admission_failure_releases_real_reservation(monkeypatch, failure_phase, previously_completed):
+    import sqlite3
+    import plugins.memory.hindsight as hindsight
+    from plugins.memory.hindsight.source_ledger import restore_source_ledger
+
+    old, _ = versions('https://example.com/admission-failure')
+    server = Server()
+    p = provider(server)
+    restore_source_ledger(p, p._bank_id)
+    if previously_completed:
+        p._retain_source_candidates([old], p._bank_id)
+        server.statuses['0'] = 'completed'
+        server.hash = old.content_hash
+        assert p._wait_for_retains_drained(30)
+    previous_calls = len(server.calls)
+    original_restore = hindsight.restore_source_ledger
+    original_dedup = p._source_candidate_already_submitted
+    def fail_refresh(provider, bank_id, **kwargs):
+        if provider._source_journal.unresolved_submission(old.source_id):
+            raise sqlite3.OperationalError('database is locked after reserve')
+        return original_restore(provider, bank_id, **kwargs)
+    def fail_dedup(*args, **kwargs):
+        assert p._source_journal.unresolved_submission(old.source_id)
+        raise RuntimeError('dedup failed after reserve')
+    if failure_phase == 'refresh':
+        monkeypatch.setattr(hindsight, 'restore_source_ledger', fail_refresh)
+    else:
+        monkeypatch.setattr(p, '_source_candidate_already_submitted', fail_dedup)
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == previous_calls
+    assert not p._source_journal.unresolved_submission(old.source_id)
+    if previously_completed:
+        assert p._source_ledger[old.automatic_key]['status'] == 'completed'
+    monkeypatch.setattr(hindsight, 'restore_source_ledger', original_restore)
+    monkeypatch.setattr(p, '_source_candidate_already_submitted', original_dedup)
+    # A later fresh observation can progress: the failure never reached the SDK.
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(server.calls) == 1
+    assert server.calls[0]['items'][0]['content'] == old.content

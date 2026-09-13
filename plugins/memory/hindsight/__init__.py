@@ -1516,18 +1516,20 @@ class HindsightMemoryProvider(MemoryProvider):
                     queued[:] = [item for item in queued if item[0].automatic_key != candidate.automatic_key]
                     queued.append((candidate, bank_id))
                 return False
-            # Admission owns this source now. Refresh after claiming so a rival
-            # completion between our initial snapshot and claim cannot fool dedup.
-            restore_source_ledger(self, bank_id, refresh=True)
-            if self._source_candidate_already_submitted(
-                    candidate, allow_reversion=allow_reversion,
-                    fresh_deferred=_fresh_deferred and allow_reversion):
-                logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
-                self._source_journal.release(candidate, token)
-                return True
             requested = False
+            prepared = False
             submission_context = _SOURCE_SUBMISSION.set(True)
             try:
+                # Admission owns this source now. Refresh after claiming so a rival
+                # completion between our initial snapshot and claim cannot fool dedup.
+                restore_source_ledger(self, bank_id, refresh=True)
+                if self._source_candidate_already_submitted(
+                        candidate, allow_reversion=allow_reversion,
+                        fresh_deferred=_fresh_deferred and allow_reversion):
+                    logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
+                    self._source_journal.release(candidate, token)
+                    return True
+                prepared = True
                 if candidate.file_path:
                     file_metadata = {"context": candidate.context, "document_id": candidate.source_id,
                                      "tags": list(candidate.tags), "metadata": candidate.metadata}
@@ -1570,7 +1572,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 # Unknown acceptance stays reserved even if the diagnostic ledger
                 # marks failure. Never replay it merely because readback failed.
                 entry = self._source_ledger.get(candidate.automatic_key, {})
-                if not entry.get("pending_operation_ids"):
+                if prepared and not entry.get("pending_operation_ids"):
                     self._source_candidate_failed(candidate)
                 raise
             finally:
