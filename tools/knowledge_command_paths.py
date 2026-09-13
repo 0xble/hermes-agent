@@ -198,9 +198,14 @@ def _python_paths(source: str, depth: int) -> tuple[list[str], list[str], list[s
     targets, moves = [], []
     destructive = {"shutil.rmtree", "shutil.move", "os.rename", "os.replace", "os.rmdir"}
     subprocess_calls = {"subprocess.run", "subprocess.call", "subprocess.check_call", "subprocess.check_output", "subprocess.Popen"}
-    for node in nodes:
-        if not isinstance(node, ast.Call):
-            continue
+    # ast.walk is breadth-first: a top-level relative chdir would precede an
+    # earlier absolute chdir inside an if/with/try body. Preserve lexical source
+    # order before the caller conservatively widens its possible cwd bases.
+    # This is bounded literal analysis, not evaluation of branches, loops or
+    # function invocation order; references still resolve against all bases.
+    calls = sorted((node for node in nodes if isinstance(node, ast.Call)),
+                   key=lambda node: (node.lineno, node.col_offset))
+    for node in calls:
         name = qualified(node.func)
         operand = None
         if name == "os.chdir":

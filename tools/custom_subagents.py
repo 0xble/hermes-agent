@@ -893,6 +893,10 @@ class RuntimePin:
     def _validate_client_route(self, client) -> None:
         base_url = getattr(client, "base_url", None)
         if base_url is None:
+            if self.base_url:
+                raise ValueError(
+                    f"subagent_type {self.subagent_type!r}: SDK client route is unavailable"
+                )
             return
         if self.provider == "openai-codex":
             changed = str(base_url).rstrip("/") != self.base_url.rstrip("/")

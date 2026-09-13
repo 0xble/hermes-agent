@@ -71,6 +71,61 @@ def provider(server):
     return result
 
 
+@pytest.mark.parametrize("journal_state", ["absent", "empty", "pending"])
+def test_read_only_prefetch_never_recovers_or_settles_source_journal(journal_state):
+    import asyncio
+    import inspect
+    from agent.delegation_context import delegated_child_context
+    from hermes_constants import get_hermes_home
+    from plugins.memory.hindsight.source_ledger import SourceJournal
+
+    server = Server()
+    parent = provider(server)
+    path = get_hermes_home() / "memories" / "hindsight-source-operations.sqlite"
+    if journal_state == "empty":
+        SourceJournal(parent._api_url, parent._bank_id)
+    elif journal_state == "pending":
+        old, new = versions()
+        parent._retain_source_candidates([old, new], parent._bank_id)
+        server.statuses.update({"0": "completed", "1": "completed"})
+        server.hash = new.content_hash
+    if path.exists():
+        path.chmod(0o640)  # opening the writer journal would also change mode
+
+    def snapshot():
+        return {str(p.relative_to(path.parent)): (p.read_bytes(), p.stat().st_mode,
+                p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                for p in path.parent.glob("*") if p.is_file()}
+
+    before = snapshot()
+    observed = []
+    async def arecall(**kwargs):
+        observed.append(kwargs["query"])
+        return SimpleNamespace(results=[SimpleNamespace(text="fixture recall")])
+    server.arecall = arecall
+    child = provider(server)
+    child._read_only = True
+    def operation(call):
+        result = call(server)
+        return asyncio.run(result) if inspect.isawaitable(result) else result
+    child._run_hindsight_operation = operation
+    with delegated_child_context(read_only_knowledge=True):
+        child.queue_prefetch("source query")
+        child._prefetch_thread.join(timeout=5)
+        assert not child._prefetch_thread.is_alive()
+        result = child.prefetch("source query")
+    assert observed == ["source query"] and "fixture recall" in result
+    assert snapshot() == before
+    assert not child._source_ledger and not child._source_retain_ops
+    assert not child._pending_retain_ops and getattr(child, "_source_journal", None) is None
+    # Recovery and settlement still belong to the writable parent lifecycle.
+    if journal_state == "pending":
+        writable = provider(server)
+        assert writable._wait_for_retains_drained(30)
+        assert writable._source_ledger[old.automatic_key]["status"] == "superseded"
+        assert writable._source_ledger[new.automatic_key]["status"] == "completed"
+
+
 @pytest.mark.parametrize("old_status", ["completed", "gone"])
 @pytest.mark.parametrize("restart", [False, True])
 def test_superseded_source_settles_without_verifying_stale_hash(old_status, restart):

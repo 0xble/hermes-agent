@@ -461,6 +461,30 @@ def test_nested_literal_cd_before_terminal_dispatch(tmp_path, monkeypatch):
     assert (protected / "keep").read_text() == "original"
 
 
+def test_python_c_nested_absolute_then_relative_chdir_is_denied_before_dispatch(tmp_path, monkeypatch):
+    import shlex
+    import sys
+    from tools import terminal_tool as terminal
+
+    home = tmp_path / "home"
+    protected = home / "memories"
+    protected.mkdir(parents=True)
+    target = protected / "keep"
+    target.write_text("original")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(terminal, "_acquire_env", lambda *a: pytest.fail("reached destructive execution"))
+    source = (f"import os, shutil\nif True:\n    os.chdir({str(tmp_path)!r})\n"
+              "os.chdir('home')\nshutil.rmtree('memories')")
+    with delegated_child_context(read_only_knowledge=True):
+        result = json.loads(terminal.terminal_tool(
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}",
+            workdir=str(workspace), task_id="nested-python-cd"))
+    assert "Parent-owned shared knowledge" in result["error"]
+    assert target.read_text() == "original"
+
+
 def test_nested_benign_cd_keeps_unrelated_work_allowed(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "memories").mkdir(parents=True)

@@ -133,6 +133,25 @@ def test_nested_literal_cd_in_subprocess_never_runs(execution, source):
     assert not (protected / "MEMORY.md").exists()
 
 
+@pytest.mark.parametrize("block", [
+    "if True:\n    os.chdir({base})\n",
+    "from contextlib import nullcontext\nwith nullcontext():\n    os.chdir({base})\n",
+    "try:\n    os.chdir({base})\nfinally:\n    pass\n",
+])
+def test_nested_absolute_then_relative_chdir_is_denied_before_cell_runs(execution, block):
+    run, protected = execution
+    home = protected.parent
+    target = protected / "notes.txt"
+    target.write_text("original")
+    source = ("import os\n" + block.format(base=repr(str(home.parent)))
+              + f"os.chdir({home.name!r})\nopen('memories/notes.txt', 'w').write('changed')")
+    with delegated_child_context(read_only_knowledge=True):
+        denied = run(source)
+    assert target.read_text() == "original"
+    assert "Parent-owned shared knowledge" in denied["error"]
+    assert run("print('kernel survived')")["status"] == "success"
+
+
 def test_nested_benign_cd_in_subprocess_stays_allowed(execution, tmp_path):
     run, protected = execution
     elsewhere = tmp_path / "elsewhere"

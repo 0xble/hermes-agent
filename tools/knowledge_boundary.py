@@ -220,8 +220,10 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
         if root is None:
             # Every literal transition (shell ``cd``, Python ``os.chdir``, a
             # literal subprocess ``cwd=``) at ANY nesting level widens the set
-            # of directories a later relative operand may resolve against
-            # (order-insensitive union). A ``bash -c 'cd <home>; rm -rf
+            # of directories a later relative operand may resolve against.
+            # Moves arrive in lexical source order; retain prior bases as well
+            # rather than claiming to evaluate branches or function calls.
+            # A ``bash -c 'cd <home>; rm -rf
             # memories'`` body therefore resolves against <home>, not only the
             # outer cwd. An absolute target counts even without a known
             # starting cwd. Runtime-computed targets (``$X``, backticks,

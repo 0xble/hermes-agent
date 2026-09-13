@@ -794,6 +794,10 @@ class HindsightMemoryProvider(MemoryProvider):
         ``queue.join()`` so a wedged write can't hang the prefetch; (2) the
         server-side async ops complete (async retain returns on acceptance, not
         durability). False on timeout/shutdown."""
+        if self._read_only:
+            # Recall-only children do not own the parent's recovery/settlement
+            # lifecycle: even opening its writer journal can create/chmod it.
+            return True
         restore_source_ledger(self, self._bank_id, recover_only=True)
         deadline = None if timeout <= 0 else time.monotonic() + timeout
         expired = lambda: deadline is not None and time.monotonic() >= deadline  # noqa: E731
