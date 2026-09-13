@@ -2149,6 +2149,11 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent._cached_system_prompt = "sys"
+    # Commit admission rebuilds the prompt before archiving. Host/git discovery
+    # is unrelated to this fence test and can exceed its event deadline under
+    # suite load. Keep the real compression/commit path, but supply a fixed
+    # rebuilt prompt (distinct from the cached bytes, so no prefix re-probe).
+    agent._build_system_prompt = MagicMock(return_value="rebuilt sys")
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     commit_started = threading.Event()
     allow_commit = threading.Event()
@@ -2172,9 +2177,6 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
         ),
         daemon=True,
     )
-    compression.start()
-    assert commit_started.wait(timeout=2)
-
     stop = threading.Thread(
         target=lambda: (
             agent.hard_interrupt("stop after commit admission"),
@@ -2182,11 +2184,18 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
         ),
         daemon=True,
     )
-    stop.start()
-    assert not stop_returned.wait(timeout=0.1)
-    allow_commit.set()
-    compression.join(timeout=5)
-    stop.join(timeout=5)
+    compression.start()
+    try:
+        assert commit_started.wait(timeout=2)
+        stop.start()
+        assert not stop_returned.wait(timeout=0.1)
+    finally:
+        # Even a failed rendezvous must release the real DB worker before the
+        # test's fixtures disappear or another compression test starts.
+        allow_commit.set()
+        compression.join(timeout=5)
+        if stop.ident is not None:
+            stop.join(timeout=5)
 
     assert not compression.is_alive()
     assert not stop.is_alive()
