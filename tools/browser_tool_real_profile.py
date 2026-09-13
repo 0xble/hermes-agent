@@ -434,13 +434,6 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
             _bt._stop_real_profile_browser(cache_key)
         _bt._real_profile_cdp_cache.pop(cache_key, None)
         _bt._real_profile_headed_modes.pop(cache_key, None)
-        if identity is not None:
-            # Browser Use daemons retain their original CDP attachment; stop them before
-            # relaunching this identity on a new endpoint.
-            if not _bt._reload_browser_use_runtime(scoped_runtime_key):
-                return None, ("could not stop the identity's stale Browser Use session; refusing to "
-                              "relaunch it on a different CDP endpoint")
-
         existing = _bt._agent_browser_get_cdp(session_name)
         existing_owned = (
             _bt._cdp_owned_by_data_dir(existing, copy_dir) if identity is not None and existing
@@ -503,6 +496,13 @@ def _real_profile_cdp(requested_identity: Optional[str] = None, *, headed: Optio
             _bt._real_profile_browser_processes[cache_key] = (None, copy_dir)
             _bt._track_real_profile_session(cache_key, session_name)
             return recovered, None
+
+        if identity is not None:
+            # Only a replacement endpoint invalidates Browser Use's attachment.
+            # Empty process-local caches after restart do not imply a stale daemon.
+            if not _bt._reload_browser_use_runtime(scoped_runtime_key):
+                return None, ("could not stop the identity's stale Browser Use session; refusing to "
+                              "relaunch it on a different CDP endpoint")
 
         # No live browser owns the dir now — safe to (re)snapshot + overlay.
         snap_dir, err = snapshot_real_profile(

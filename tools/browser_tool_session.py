@@ -349,6 +349,11 @@ def _get_session_info(task_id: Optional[str] = None, identity: Optional[str] = N
     force_local = _bt._is_local_sidecar_key(task_id)
     if force_local:
         identity = None
+    else:
+        from tools.browser_camofox_state import read_camofox_binding
+        if read_camofox_binding(task_id) is not None:
+            raise RuntimeError("browser task is already bound to another backend; start a new task "
+                               "instead of switching cookie jars")
 
     requested_identity_key = _resolve_identity_key(identity) if identity else None
 

@@ -284,6 +284,8 @@ class TestRealProfileCdpLaunch:
         monkeypatch.setattr(bt_real_profile, "_surviving_chrome_cdp", lambda _path: None)
         monkeypatch.setattr(bt_real_profile, "_owned_profile_cdp", lambda _path: endpoint if live_runtime == "recovered" else None)
         monkeypatch.setattr(bt_real_profile, "_attach_agent_browser_to_cdp", lambda *_args: None)
+        monkeypatch.setattr(bt, "_reload_browser_use_runtime", lambda _key: pytest.fail(
+            "recovering an unchanged endpoint must not interrupt its Browser Use daemon"))
 
         cdp, err = bt_real_profile._real_profile_cdp("work")
 

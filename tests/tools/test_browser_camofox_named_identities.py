@@ -65,6 +65,26 @@ def _identities():
     }
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_local_session_entry_refuses_persisted_camofox_task(tmp_path, monkeypatch, cached):
+    from tools import browser_tool as bt, browser_tool_session as session
+    from tools import browser_camofox_state as state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    task = "persisted-camofox-task"
+    identity = dict(alias="personal", identity_key="key", user_id="user", session_key="session")
+    state.claim_camofox_binding(task, identity)
+    monkeypatch.setattr(bt, "_active_sessions", {task: {"session_id": "local"}} if cached else {})
+    monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr(bt, "_update_session_activity", lambda _task: None)
+    monkeypatch.setattr(bt, "_read_browser_identity_binding", lambda _task: None)
+    monkeypatch.setattr(bt, "_browser_session_backend", lambda _task: MagicMock(ensure_healthy=lambda: True))
+    monkeypatch.setattr(session, "_create_session_for_key", lambda *_a, **_k: pytest.fail("must not create a different backend"))
+    with pytest.raises(RuntimeError, match="bound to another backend"):
+        session._get_session_info(task)
+    assert state.read_camofox_binding(task) == {"backend": "camofox", **identity}
+
+
 def _response(data):
     response = MagicMock()
     response.json.return_value = data
