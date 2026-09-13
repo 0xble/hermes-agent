@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -32,6 +33,23 @@ def tmp_outbound(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("cron.outbound.OUTBOUND_FILE", tmp_path / "cron" / "outbound.db")
     return tmp_path
+
+
+@pytest.fixture
+def standalone_telegram(tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+
+    home = tmp_path / ".hermes"
+    secondary = home / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    bot = SimpleNamespace(send_message=AsyncMock(
+        return_value=SimpleNamespace(message_id="standalone")))
+    monkeypatch.setattr("tools.send_message_senders._telegram_bot", lambda _token: bot)
+    with _profile_runtime_scope(secondary, {}):
+        yield bot.send_message
 
 
 class TestJobOptIn:
@@ -431,117 +449,77 @@ class TestSendGate:
         }
         runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
 
-    def test_profile_bound_standalone_send_uses_matching_active_profile(self, monkeypatch):
-        from gateway.config import Platform
+    def test_profile_bound_standalone_send_uses_matching_active_profile(self, standalone_telegram):
+        from gateway.config import Platform, PlatformConfig
         from tools.send_message_tool import _send_to_platform
-
-        sender = AsyncMock(return_value={"success": True, "message_id": "standalone"})
-        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
-        monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
-        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
 
         result = asyncio.run(_send_to_platform(
-            Platform.TELEGRAM,
-            SimpleNamespace(),
-            "2027045491",
-            "hello",
-            profile="default",
+            Platform.TELEGRAM, PlatformConfig(token="synthetic-token"),
+            "2027045491", "hello", profile="secondary",
         ))
 
-        assert result == {"success": True, "message_id": "standalone"}
-        sender.assert_awaited_once()
+        assert result == {"success": True, "platform": "telegram",
+                          "chat_id": "2027045491", "message_id": "standalone"}
+        standalone_telegram.assert_awaited_once()
+        assert standalone_telegram.await_args.kwargs["text"] == "hello"
 
-    def test_profile_bound_send_preserves_platform_chunking(self, monkeypatch):
-        from gateway.config import Platform
+    def test_profile_bound_send_preserves_platform_chunking(self, standalone_telegram):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import utf16_len
         from tools.send_message_tool import _send_to_platform
 
-        sender = AsyncMock(
-            side_effect=lambda *_args, **kwargs: {
-                "success": True,
-                "message_id": str(len(kwargs.get("message", ""))),
-            }
-        )
-        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
-        monkeypatch.setattr(
-            "gateway.platform_registry.platform_registry.get", lambda _name: entry
-        )
-        monkeypatch.setattr(
-            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
-        )
-
-        result = asyncio.run(
-            _send_to_platform(
-                Platform.TELEGRAM,
-                SimpleNamespace(),
-                "2027045491",
-                "x" * 5000,
-                profile="default",
-            )
-        )
+        message = "x" * 5000
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM, PlatformConfig(token="synthetic-token"),
+            "2027045491", message, profile="secondary",
+        ))
 
         assert result["success"] is True
-        assert sender.await_count == 2
-        assert all(len(call.args[2]) <= 4096 for call in sender.await_args_list)
+        assert standalone_telegram.await_count == 2
+        chunks = [call.kwargs["text"] for call in standalone_telegram.await_args_list]
+        assert all(utf16_len(chunk) <= 4096 for chunk in chunks)
+        assert chunks[0].endswith("(1/2)")
+        assert chunks[1].endswith("(2/2)")
+        assert sum(chunk.count("x") for chunk in chunks) == len(message)
 
-    def test_profile_bound_chunk_failure_preserves_partial_delivery(self, monkeypatch):
-        from gateway.config import Platform
+    @pytest.mark.parametrize("accepted", [0, 1, 2])
+    def test_profile_bound_chunk_failure_preserves_partial_delivery(self, standalone_telegram, accepted):
+        from gateway.config import Platform, PlatformConfig
         from tools.send_message_tool import _send_to_platform
 
-        sender = AsyncMock(
-            side_effect=[
-                {"success": True, "message_id": "first-chunk"},
-                {"error": "gateway stopped", "delivery_stage": "pre_send"},
-            ]
-        )
-        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
-        monkeypatch.setattr(
-            "gateway.platform_registry.platform_registry.get", lambda _name: entry
-        )
-        monkeypatch.setattr(
-            "hermes_cli.profiles.get_active_profile_name", lambda: "default"
-        )
-
-        result = asyncio.run(
-            _send_to_platform(
-                Platform.TELEGRAM,
-                SimpleNamespace(),
-                "2027045491",
-                "x" * 5000,
-                profile="default",
-            )
-        )
-
-        assert result == {
-            "error": "gateway stopped",
-            "delivery_stage": "partial_send",
-            "message_id": "first-chunk",
-            "chunk_partial_count": 1,
-        }
-        assert sender.await_count == 2
-
-    def test_profile_bound_standalone_send_rejects_profile_mismatch(self, monkeypatch):
-        from gateway.config import Platform
-        from tools.send_message_tool import _send_to_platform
-
-        sender = AsyncMock(return_value={"success": True, "message_id": "wrong"})
-        entry = SimpleNamespace(standalone_sender_fn=sender, send_message_handler=None)
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
-        monkeypatch.setattr("gateway.platform_registry.platform_registry.get", lambda _name: entry)
-        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "secondary")
-
+        standalone_telegram.side_effect = [
+            *(SimpleNamespace(message_id=f"chunk-{i}") for i in range(accepted)),
+            RuntimeError("transport stopped"),
+        ]
         result = asyncio.run(_send_to_platform(
-            Platform.TELEGRAM,
-            SimpleNamespace(),
-            "2027045491",
-            "hello",
-            profile="default",
+            Platform.TELEGRAM, PlatformConfig(token="synthetic-token"),
+            "2027045491", "x" * 12000, profile="secondary",
         ))
 
-        assert "refusing cross-profile send" in result["error"]
-        sender.assert_not_awaited()
+        expected = {"error": "Telegram send failed: transport stopped"}
+        if accepted:
+            expected.update(delivery_stage="partial_send",
+                            message_id=f"chunk-{accepted - 1}", chunk_partial_count=accepted)
+        assert result == expected
+        receipt = classify_send_result(result)
+        assert receipt["status"] == "ambiguous"
+        assert receipt["transport_message_id"] == expected.get("message_id")
+        # Accepted prefixes are neither retried nor followed by a later chunk.
+        assert standalone_telegram.await_count == accepted + 1
+
+    def test_profile_bound_standalone_send_rejects_profile_mismatch(self, standalone_telegram):
+        from gateway.config import Platform, PlatformConfig
+        from tools.send_message_tool import _send_to_platform
+
+        result = asyncio.run(_send_to_platform(
+            Platform.TELEGRAM, PlatformConfig(token="synthetic-token"),
+            "2027045491", "hello", profile="default",
+        ))
+
+        assert result == {
+            "error": "Cannot honor trusted profile 'default' for standalone platform 'telegram'"
+        }
+        standalone_telegram.assert_not_awaited()
 
     def test_live_transport_runs_on_gateway_owned_event_loop(self, monkeypatch):
         from gateway.config import Platform
