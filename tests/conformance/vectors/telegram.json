@@ -2,7 +2,7 @@
   "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_conformance_vectors.py; the native renderers are the oracle (executable spec).",
   "oracle": {
     "repo": "NousResearch/hermes-agent",
-    "commit": "85e71f74a7335897c85ee6852f15d936fb986658",
+    "commit": "84a0584f9c3477f44dfef0b977a2de1cff660bfc",
     "generator": "scripts/generate_conformance_vectors.py",
     "generator_version": 1
   },
@@ -224,7 +224,7 @@
       "category": "scar",
       "expect": "semantic",
       "input": "`C:\\Users\\ben\\file.txt` and ```\npath = \"a\\\\b\"\n```",
-      "native_output": "`C:\\\\Users\\\\ben\\\\file.txt` and ```\npath = \"a\\\\\\\\b\"\n```"
+      "native_output": "`C:\\\\Users\\\\ben\\\\file.txt` and `path = \"a\\\\\\\\b\"`"
     },
     {
       "id": "backtick-in-fence",
@@ -319,7 +319,7 @@
       "category": "adversarial",
       "expect": "semantic",
       "input": "```\na\n```\nmid\n```\nb\n```\nend ```inline``` tail",
-      "native_output": "```\na\n```\nmid\n```\nb\n```\nend ```inline``` tail"
+      "native_output": "```\na\n```\nmid\n```\nb\n```\nend `inline` tail"
     }
   ]
 }

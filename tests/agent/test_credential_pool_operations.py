@@ -68,3 +68,23 @@ def test_priority_honors_anthropic_manual_first():
     pool._entries[1] = replace(pool._entries[1], source="env:ANTHROPIC_API_KEY")
     assert pool.move_entry("row1", 0).priority == 1
     assert [e.id for e in pool.entries()] == ["row0", "row1"]
+
+
+@pytest.mark.parametrize("hint,duplicate,expected", [
+    (None, False, None), ("unknown", False, None),
+    ("fixture-1", False, "row1"), ("fixture-1", True, None),
+])
+def test_stale_refresh_id_requires_unique_request_key(monkeypatch, hint, duplicate, expected):
+    pool = _pool()
+    if duplicate:
+        pool._entries[0].access_token = "fixture-1"
+    refreshed = []
+
+    def refresh(entry, **kwargs):
+        refreshed.append(entry.id)
+        return entry
+
+    monkeypatch.setattr(pool, "_refresh_entry", refresh)
+    result = pool.try_refresh_matching(credential_id="missing", api_key_hint=hint)
+    assert getattr(result, "id", None) == expected
+    assert refreshed == ([expected] if expected else [])

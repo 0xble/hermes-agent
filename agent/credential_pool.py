@@ -2276,7 +2276,13 @@ class CredentialPool(CredentialPoolAdminMixin):
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id) if credential_id else None
             if credential_id and entry is None:
-                return None
+                # The dispatched ID can disappear after a pool reload. Only an
+                # unambiguous failed-request key may recover that identity; a
+                # missing explicit CLI target must never select another account.
+                matches = [e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint]
+                if len(matches) != 1:
+                    return None
+                entry = matches[0]
             if not hasattr(self, "_refresh_failures"):
                 self._refresh_failures = {}
             if entry is not None:

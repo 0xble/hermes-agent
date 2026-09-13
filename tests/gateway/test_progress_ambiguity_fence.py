@@ -95,3 +95,21 @@ async def test_known_rejection_and_accepted_no_id_do_not_latch_ambiguity(mode):
         "first-tool", "first-tool\nsecond-tool" if mode == "rejected" else "second-tool"]
     await runner._drain_progress_on_cancel(st)
     assert len(adapter.sent) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+async def test_task_card_fallback_retains_ambiguous_send_fence(mode):
+    adapter = ReceiptAdapter(mode)
+    ctx, runner = _runner(adapter)
+    st = runner._TaskCardState(adapter)
+    for index in range(2):
+        st.apply_event({"type": "tool.started", "tool_call_id": str(index),
+                        "tool_name": "web_search", "args": {"query": "fixture"}})
+        try:
+            await runner._task_card_send_or_edit_fallback(st)
+        except RuntimeError:
+            assert mode == "raise"
+    assert len(adapter.sent) == 1
+    assert st.fallback_msg_id is None
+    assert ctx._cleanup_msg_ids == []

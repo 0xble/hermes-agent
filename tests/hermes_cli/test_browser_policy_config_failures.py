@@ -31,3 +31,12 @@ def test_browser_policy_successful_omission_and_initial_remain_supported(tmp_pat
     assert browser_connect._real_profile_refresh_mode() == ("launch", None)
     path.write_text("browser:\n  real_profile_refresh: initial\n")
     assert browser_connect._real_profile_refresh_mode() == ("initial", None)
+
+
+def test_supported_refresh_mode_roundtrips_through_config_cli(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config, "get_config_path", lambda: path)
+    config.set_config_value("browser.real_profile_refresh", "initial")
+    output = capsys.readouterr()
+    assert "not a recognized config key" not in (output.out + output.err).lower()
+    assert browser_connect._real_profile_refresh_mode() == ("initial", None)

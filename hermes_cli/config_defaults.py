@@ -411,6 +411,9 @@ DEFAULT_CONFIG = {
         # Firefox etc. fails closed. Also gates the browser_exec `local` argument (real-profile
         # local session even under a cloud backend). Desktop Settings -> Browser.
         "use_real_profile": False,
+        # "initial" seeds once and preserves managed authentication on relaunch.
+        # "launch" refreshes the source profile's authentication each launch.
+        "real_profile_refresh": "launch",
         # Windows only: a running Chrome/Edge/Brave locks its cookie DB, so the profile can't be
         # copied. When on, a locked profile still blocks and the agent ASKS first; on approval it
         # runs `hermes browser close-profile` (kills that profile's browser tree, unsaved tabs lost)
