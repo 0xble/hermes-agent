@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _close_child, _detach_child, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
@@ -335,124 +335,129 @@ def _build_child_agent(
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
             raise
-    child._print_fn = getattr(parent_agent, "_print_fn", None)
-    from agent.review_policy import remove_parent_only_review_tools
-    remove_parent_only_review_tools(child)
-    if child_tool_policy is not None:
-        from agent.review_policy import apply_review_tool_policy
-        apply_review_tool_policy(child, child_tool_policy)
-    _apply_child_cache_ttl(child)
     if child_session_db is not None:
-        child._owns_session_db = True  # released by the child's close(), never by the parent
-    # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
-    # reference), and no parent teardown can close it out from under a background child (#81267).
-    child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
-    child._progress_identity_ref = child_session_ref
-    child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
-    child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
-    _apply_child_compression_cap(child, delegation_cfg)
-    # Ownership chain for action=list/steer/stop; weakref so a finished parent
-    # can be collected while a detached child record lingers in the registry.
+        child._owns_session_db = True  # close() owns this reference from allocation onward
     try:
-        child._delegate_parent_ref = weakref.ref(parent_agent)
-    except TypeError:
-        child._delegate_parent_ref = None  # non-weakref-able test doubles
-    # Sidebar marker: subagent sessions stay out of session pickers even when a
-    # parent delete orphans them (mirrors /branch's ``_branched_from``).
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
-    # Shared pool lets children rotate credentials on rate limits.
-    if subagent_definition is not None:
-        from tools.custom_subagents import (
-            RuntimePin, _authority_mapping_fingerprint, _nonsecret_mapping,
-            inherited_credential_pool, nonsecret_route_url,
-        )
-        child._delegation_named_type = subagent_definition.name
-        if child.provider == "moa":
-            child._moa_preset_snapshot = moa_snapshot
-            from agent.moa_loop import build_moa_facade
-            child.client = build_moa_facade(child, child.model)
-        child_pool = resume_credential_pool or inherited_credential_pool(child, parent_agent, delegation_cfg)
-        child._credential_pool = child_pool
-        if child.provider != "moa":
-            child._delegation_fallback_routes = tuple(resolved_fallback_routes)
-            child._fallback_chain = [route.native_entry() for route in resolved_fallback_routes]
-            child._fallback_index = 0
-            child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
-        if getattr(child, "_session_init_model_config", None) is not None and not resume_session_id:
-            parent_root = parent_sid
-            if child_session_db is not None and parent_sid:
-                with _quiet(None):
-                    parent_root = child_session_db.get_compression_lineage(parent_sid)[0]
-            launch = {
-                "version": 1,
-                "subagent_type": subagent_definition.name,
-                "description": subagent_definition.description,
-                "instructions": subagent_definition.instructions,
-                "parent_session_root": parent_root,
-                "provider": "custom" if child.provider.startswith("custom:") else child.provider,
-                # A named custom selector (``custom:name``) resolves to the
-                # shared ``custom`` transport.  Persist both identities so a
-                # resume can re-authorize the selected route without comparing
-                # the selector to the transport family.
-                "requested_provider": subagent_definition.provider or child.provider,
-                "model": child.model,
-                "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
-                "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
-                "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
-                "request_overrides": _nonsecret_mapping(json.loads(getattr(
-                    getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
-                ))),
-                "request_overrides_fingerprint": _authority_mapping_fingerprint(json.loads(getattr(
-                    getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
-                ))),
-                "fallbacks": [route.metadata() for route in resolved_fallback_routes],
-                "fallback_source": ("parent" if subagent_definition.inherit_parent
-                                    and subagent_definition.fallbacks is None else "role"),
-                "enabled_toolsets": list(child_toolsets or []),
-                # Display metadata is deliberately caller-authored, never derived
-                # from the private child goal.  It lets a later named resume keep
-                # the same card label without asking the model to repeat it.
-                "task_label": task_label,
-            }
-            if moa_snapshot is not None:
-                launch["moa"] = moa_snapshot.metadata()
-            if child_pool is not None and callable(getattr(child_pool, "entry_id_for_api_key", None)):
-                credential_id = child_pool.entry_id_for_api_key(getattr(child, "api_key", None))
-                if credential_id:
-                    launch["credential_pool_entry_id"] = credential_id
-            child._session_init_model_config["_delegation_launch"] = launch
-            setattr(child, "_delegation_launch_metadata", launch)
-        if resume_session_id:
-            if not isinstance(resume_launch_metadata, dict):
-                raise ValueError("resumed delegated child is missing validated launch metadata")
-            _seed_resumed_launch_metadata(child, resume_launch_metadata)
-            child._delegation_resume_needs_reload = True
-            child._delegation_resume_fail_if_busy = True
-            setattr(child, "_delegation_resume_claim_id", resume_claim_id)
-            setattr(child, "_delegation_resume_admitted", False)
-            credential_id = resume_credential_id or resume_launch_metadata.get("credential_pool_entry_id")
-            if credential_id:
-                setattr(child, "_delegation_resume_credential_id", credential_id)
-            setattr(child, "_delegation_resume_workspace_path", resume_workspace_path)
-    else:
-        child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
-        if child_pool is not None:
+        child._print_fn = getattr(parent_agent, "_print_fn", None)
+        from agent.review_policy import remove_parent_only_review_tools
+        remove_parent_only_review_tools(child)
+        if child_tool_policy is not None:
+            from agent.review_policy import apply_review_tool_policy
+            apply_review_tool_policy(child, child_tool_policy)
+        _apply_child_cache_ttl(child)
+        # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a
+        # reference), and no parent teardown can close it out from under a background child (#81267).
+        child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+        child._progress_identity_ref = child_session_ref
+        child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+        child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+        _apply_child_compression_cap(child, delegation_cfg)
+        # Ownership chain for action=list/steer/stop; weakref so a finished parent
+        # can be collected while a detached child record lingers in the registry.
+        try:
+            child._delegate_parent_ref = weakref.ref(parent_agent)
+        except TypeError:
+            child._delegate_parent_ref = None  # non-weakref-able test doubles
+        # Sidebar marker: subagent sessions stay out of session pickers even when a
+        # parent delete orphans them (mirrors /branch's ``_branched_from``).
+        if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
+            child._session_init_model_config["_delegate_from"] = parent_sid
+        # Shared pool lets children rotate credentials on rate limits.
+        if subagent_definition is not None:
+            from tools.custom_subagents import (
+                RuntimePin, _authority_mapping_fingerprint, _nonsecret_mapping,
+                inherited_credential_pool, nonsecret_route_url,
+            )
+            child._delegation_named_type = subagent_definition.name
+            if child.provider == "moa":
+                child._moa_preset_snapshot = moa_snapshot
+                from agent.moa_loop import build_moa_facade
+                child.client = build_moa_facade(child, child.model)
+            child_pool = resume_credential_pool or inherited_credential_pool(child, parent_agent, delegation_cfg)
             child._credential_pool = child_pool
+            if child.provider != "moa":
+                child._delegation_fallback_routes = tuple(resolved_fallback_routes)
+                child._fallback_chain = [route.native_entry() for route in resolved_fallback_routes]
+                child._fallback_index = 0
+                child._delegation_runtime_pin = RuntimePin.from_child(child, subagent_definition, resolved_reasoning)
+            if getattr(child, "_session_init_model_config", None) is not None and not resume_session_id:
+                parent_root = parent_sid
+                if child_session_db is not None and parent_sid:
+                    with _quiet(None):
+                        parent_root = child_session_db.get_compression_lineage(parent_sid)[0]
+                launch = {
+                    "version": 1,
+                    "subagent_type": subagent_definition.name,
+                    "description": subagent_definition.description,
+                    "instructions": subagent_definition.instructions,
+                    "parent_session_root": parent_root,
+                    "provider": "custom" if child.provider.startswith("custom:") else child.provider,
+                    # A named custom selector (``custom:name``) resolves to the
+                    # shared ``custom`` transport.  Persist both identities so a
+                    # resume can re-authorize the selected route without comparing
+                    # the selector to the transport family.
+                    "requested_provider": subagent_definition.provider or child.provider,
+                    "model": child.model,
+                    "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
+                    "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
+                    "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
+                    "request_overrides": _nonsecret_mapping(json.loads(getattr(
+                        getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
+                    ))),
+                    "request_overrides_fingerprint": _authority_mapping_fingerprint(json.loads(getattr(
+                        getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
+                    ))),
+                    "fallbacks": [route.metadata() for route in resolved_fallback_routes],
+                    "fallback_source": ("parent" if subagent_definition.inherit_parent
+                                        and subagent_definition.fallbacks is None else "role"),
+                    "enabled_toolsets": list(child_toolsets or []),
+                    # Display metadata is deliberately caller-authored, never derived
+                    # from the private child goal.  It lets a later named resume keep
+                    # the same card label without asking the model to repeat it.
+                    "task_label": task_label,
+                }
+                if moa_snapshot is not None:
+                    launch["moa"] = moa_snapshot.metadata()
+                if child_pool is not None and callable(getattr(child_pool, "entry_id_for_api_key", None)):
+                    credential_id = child_pool.entry_id_for_api_key(getattr(child, "api_key", None))
+                    if credential_id:
+                        launch["credential_pool_entry_id"] = credential_id
+                child._session_init_model_config["_delegation_launch"] = launch
+                setattr(child, "_delegation_launch_metadata", launch)
+            if resume_session_id:
+                if not isinstance(resume_launch_metadata, dict):
+                    raise ValueError("resumed delegated child is missing validated launch metadata")
+                _seed_resumed_launch_metadata(child, resume_launch_metadata)
+                child._delegation_resume_needs_reload = True
+                child._delegation_resume_fail_if_busy = True
+                setattr(child, "_delegation_resume_claim_id", resume_claim_id)
+                setattr(child, "_delegation_resume_admitted", False)
+                credential_id = resume_credential_id or resume_launch_metadata.get("credential_pool_entry_id")
+                if credential_id:
+                    setattr(child, "_delegation_resume_credential_id", credential_id)
+                setattr(child, "_delegation_resume_workspace_path", resume_workspace_path)
+        else:
+            child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
+            if child_pool is not None:
+                child._credential_pool = child_pool
 
-    _attach_child(parent_agent, child)  # interrupt propagation
-    # spawn_requested now — the child may queue for seconds when the pool is
-    # saturated — then the subagent_start lifecycle hook.
-    _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
-    with _quiet("subagent_start hook invocation failed", exc_info=True):
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "subagent_start", parent_session_id=parent_sid,
-            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "", parent_subagent_id=parent_subagent_id,
-            child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
-            child_role=effective_role, child_goal=goal,
-        )
-    return child
+        _attach_child(parent_agent, child)  # interrupt propagation
+        # spawn_requested now — the child may queue for seconds when the pool is
+        # saturated — then the subagent_start lifecycle hook.
+        _safe_progress(child_progress_cb, "subagent.spawn_requested", preview=goal)
+        with _quiet("subagent_start hook invocation failed", exc_info=True):
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "subagent_start", parent_session_id=parent_sid,
+                parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "", parent_subagent_id=parent_subagent_id,
+                child_session_id=getattr(child, "session_id", None), child_subagent_id=subagent_id,
+                child_role=effective_role, child_goal=goal,
+            )
+        return child
+    except BaseException:
+        _detach_child(parent_agent, child)
+        _close_child(child, "Failed to close rejected child after construction")
+        raise
 
 def _resume_history_is_safe(messages: Any) -> bool:
     """True when every persisted tool request has a matching result.
@@ -1047,22 +1052,22 @@ def _build_children(
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
     children = []
-    for i, t in enumerate(task_list):
-        _task_schema = task_schemas[i] if i < len(task_schemas) else None
-        _child_context = t.get("context")
-        if t.get("resume_authorization"):
-            receipt = t["resume_authorization"]
-            _child_context = ((_child_context or "") + "\n\nParent continuation receipt:\n"
-                + receipt["authorization"] + "\nReconciliation: " + receipt["reconciliation"]
-                + "\nContinue from the verified state; do not blindly repeat prior external actions.")
-        if _task_schema is not None:
-            _child_context = append_output_contract(_child_context, _task_schema)
-        _launch = task_runtime[i] if task_runtime and i < len(task_runtime) else None
-        _definition = _launch.definition if _launch else None
-        _task_creds = _launch.credentials if _launch else creds
-        _reasoning = _launch.reasoning if _launch else None
-        _task_overrides = _creds_overrides(_task_creds)
-        try:
+    try:
+        for i, t in enumerate(task_list):
+            _task_schema = task_schemas[i] if i < len(task_schemas) else None
+            _child_context = t.get("context")
+            if t.get("resume_authorization"):
+                receipt = t["resume_authorization"]
+                _child_context = ((_child_context or "") + "\n\nParent continuation receipt:\n"
+                    + receipt["authorization"] + "\nReconciliation: " + receipt["reconciliation"]
+                    + "\nContinue from the verified state; do not blindly repeat prior external actions.")
+            if _task_schema is not None:
+                _child_context = append_output_contract(_child_context, _task_schema)
+            _launch = task_runtime[i] if task_runtime and i < len(task_runtime) else None
+            _definition = _launch.definition if _launch else None
+            _task_creds = _launch.credentials if _launch else creds
+            _reasoning = _launch.reasoning if _launch else None
+            _task_overrides = _creds_overrides(_task_creds)
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=list(_launch.enabled_toolsets) if _launch and _launch.enabled_toolsets is not None else None,
@@ -1082,28 +1087,30 @@ def _build_children(
                 child_tool_policy=child_tool_policy,
                 **_task_overrides,
             )
-        except ValueError as exc:
-            _release_resume_launches(parent_agent, task_runtime or [])
+            children.append((i, t, child))
+            if _task_schema is not None:
+                with _quiet("Could not attach output schema to child %d", i):
+                    child._delegate_output_schema = _task_schema
+            # Tee progress events into the live transcript (wrapper keeps the
+            # _flush contract and swallows writer failures).
+            _writer = live_writers[i] if i < len(live_writers) else None
+            if _writer is not None:
+                child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
+                child._live_transcript_path = str(_writer.path)
+            if live_deleg_id:
+                setattr(child, "_delegation_id", live_deleg_id)
+                _ident_ref = getattr(child, "_progress_identity_ref", None)
+                if isinstance(_ident_ref, dict):
+                    _ident_ref["delegation_id"] = live_deleg_id
+        return children, None
+    except BaseException as exc:
+        for _, _, child in children:
+            _detach_child(parent_agent, child)
+            _close_child(child, "Failed to close child after batch construction failed")
+        _release_resume_launches(parent_agent, task_runtime or [])
+        if isinstance(exc, ValueError):
             return [], str(exc)
-        except BaseException:
-            _release_resume_launches(parent_agent, task_runtime or [])
-            raise
-        if _task_schema is not None:
-            with _quiet("Could not attach output schema to child %d", i):
-                child._delegate_output_schema = _task_schema
-        # Tee progress events into the live transcript (wrapper keeps the
-        # _flush contract and swallows writer failures).
-        _writer = live_writers[i] if i < len(live_writers) else None
-        if _writer is not None:
-            child.tool_progress_callback = wrap_progress_callback(getattr(child, "tool_progress_callback", None), _writer)
-            child._live_transcript_path = str(_writer.path)
-        if live_deleg_id:
-            setattr(child, "_delegation_id", live_deleg_id)
-            _ident_ref = getattr(child, "_progress_identity_ref", None)
-            if isinstance(_ident_ref, dict):
-                _ident_ref["delegation_id"] = live_deleg_id
-        children.append((i, t, child))
-    return children, None
+        raise
 
 
 def _historical_resume_task_label(task: Dict[str, Any], parent_agent) -> Optional[str]:
@@ -1374,6 +1381,7 @@ def delegate_task(
                 _release_resume_launches(parent_agent, task_runtime)
                 _release_replacement_claims(parent_agent, task_list)
                 return tool_error(str(exc))
+    children = []
     try:
         creds = dict(task_runtime[0].credentials)
 
@@ -1436,8 +1444,14 @@ def delegate_task(
             delegation_metadata=_metadata,
         )
     except BaseException:
-        _release_resume_launches(parent_agent, task_runtime)
-        _release_replacement_claims(parent_agent, task_list)
+        try:
+            _release_resume_launches(parent_agent, task_runtime)
+            _release_replacement_claims(parent_agent, task_list)
+        finally:
+            # Ownership passes to the runner only after batch setup succeeds.
+            for _, _, child in children:
+                _detach_child(parent_agent, child)
+                _close_child(child, "Failed to close child before batch handoff")
         raise
     return _run_batch(batch, background)
 
