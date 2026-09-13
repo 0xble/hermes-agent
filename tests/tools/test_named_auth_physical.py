@@ -214,3 +214,36 @@ def test_frozen_request_override_cannot_hide_conflicting_sdk_defaults():
             enforce_delegation_pin(child, {"model": "m", **override}, client=client)
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("spelling", ["authorization", "Authorization"])
+@pytest.mark.parametrize("value", ["synthetic-frozen", "explicit-frozen"])
+def test_fallback_factory_preserves_frozen_request_auth(monkeypatch, spelling, value):
+    from tools.custom_subagent_fallbacks import frozen_fallback_client
+    calls = []
+    def response(request):
+        calls.append(request)
+        return httpx.Response(200, json={"id": "chat", "choices": [], "model": "m", "object": "chat.completion", "created": 0})
+    transport = httpx.Client(transport=httpx.MockTransport(response))
+    monkeypatch.setattr("agent.auxiliary_client._openai_http_client_kwargs", lambda _: {"http_client": transport})
+    overrides = {"extra_headers": {spelling: "Bearer " + value}}
+    child = fixture(None, fallback=True, overrides=overrides)
+    pin = child._delegation_runtime_pin
+    client = child.client = frozen_fallback_client(pin, pin.fallback_routes[0].native_entry())
+    def request():
+        return {"model": "m", "messages": [{"role": "user", "content": "x"}], **overrides}
+    try:
+        kwargs = request()
+        enforce_delegation_pin(child, kwargs, client=client)
+        client.chat.completions.create(**kwargs)
+        assert len(calls) == 1
+        assert [v.decode() for k, v in calls[0].headers.raw if k.lower() == b"authorization"] == ["Bearer " + value]
+        with pytest.raises(ValueError):
+            enforce_delegation_pin(child, {"model": "m"}, client=client)
+        for defaults in ({"Authorization": "Bearer foreign"}, {"authorization": "Bearer foreign"}):
+            client._custom_headers = defaults
+            with pytest.raises(ValueError):
+                enforce_delegation_pin(child, request(), client=client)
+        assert len(calls) == 1
+    finally:
+        client.close()

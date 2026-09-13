@@ -811,8 +811,13 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
                 raise ValueError("delegated child stable credential identity is no longer authorized")
             entry_provider = str(getattr(entry, "provider", "") or provider)
             entry_base = getattr(entry, "runtime_base_url", None) or creds.get("base_url")
+            provider_matches = entry_provider == provider
+            if provider == "custom" and requested_provider.startswith("custom:"):
+                from agent.credential_pool import credential_pool_matches_provider
+                provider_matches = credential_pool_matches_provider(
+                    entry_provider, requested_provider, base_url=entry_base)
             if (
-                entry_provider != provider
+                not provider_matches
                 or normalize_route_base_url(nonsecret_route_url(str(entry_base or "")))
                    != normalize_route_base_url(str(launch.get("base_url") or ""))
             ):

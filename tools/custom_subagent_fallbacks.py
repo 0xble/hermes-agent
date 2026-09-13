@@ -17,7 +17,13 @@ def frozen_fallback_client(pin, entry):
         # Native installation only needs these attributes; do not allocate an
         # unused OpenAI/httpx client for an Anthropic route.
         return SimpleNamespace(api_key=route.api_key, base_url=route.base_url)
-    headers = json.loads(route.request_overrides_json).get("extra_headers", {})
+    # Frozen Authorization stays per-request, as on the primary route. The SDK
+    # merges defaults case-sensitively: installing lowercase authorization here
+    # would coexist (and conflict) with its generated Authorization default.
+    # RuntimePin still verifies defaults and normalizes the actual request.
+    headers = {name: value for name, value in
+               json.loads(route.request_overrides_json).get("extra_headers", {}).items()
+               if name.lower() != "authorization"}
     if route.api_mode == "codex_responses":
         headers = {**headers, **codex_cloudflare_headers(route.api_key, base_url=route.base_url)}
     return _create_openai_client(api_key=route.api_key, base_url=route.base_url,
