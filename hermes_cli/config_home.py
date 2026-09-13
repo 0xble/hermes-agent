@@ -39,6 +39,8 @@ def _ensure_directory(path: Path, *, create: bool, secure: bool, boundary: Path 
             if not link.is_dir():
                 raise FileNotFoundError(f"Directory link is unavailable: {link}")
         if create:
+            # mkdir also refuses dangling ancestor links outside the permission
+            # boundary. It cannot create a missing target through such a link.
             path.mkdir(parents=True, exist_ok=True)
         elif not path.is_dir():
             raise FileNotFoundError(f"Required directory does not exist: {path}")

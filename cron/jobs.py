@@ -3201,6 +3201,8 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         return False
     raw_next_run_dt = datetime.fromisoformat(next_run)
     effective_tz = _effective_cron_timezone(job.get("timezone"))
+    # Legacy offset-free values represent system-local wall time, matching
+    # _ensure_aware. astimezone preserves that instant before applying the job zone.
     d = _DueJob(job, scan, next_run, raw_next_run_dt, raw_next_run_dt.astimezone(effective_tz))
     kind = d.kind
     recurring = kind in {"cron", "interval"}
