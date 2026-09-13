@@ -342,3 +342,25 @@ def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
     assert (workspace / "target.py").read_text() == "WORKSPACE_PATCHED\n"
     # The decoy (backend cwd) was left untouched.
     assert (decoy / "target.py").read_text() == "DECOY_ORIGINAL\n"
+
+
+def test_explicit_empty_session_cwd_isolates_relative_file_read(_isolated_cwd, monkeypatch):
+    import json
+    from agent.runtime_cwd import _SESSION_CWD, set_session_cwd
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    concurrent_cron, launch_dir = _isolated_cwd
+    monkeypatch.setenv("TERMINAL_CWD", str(concurrent_cron))
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    env = LocalEnvironment(cwd=str(concurrent_cron))
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": ShellFileOperations(env))
+    token = set_session_cwd("")
+    try:
+        result = json.loads(ft.read_file_tool("target.py", task_id="fresh-isolated-session"))
+        assert not result.get("error"), result
+        assert "DECOY_ORIGINAL" in result["content"]
+        assert "WORKSPACE_ORIGINAL" not in result["content"]
+        assert ftp._resolve_path_for_task("target.py", "fresh-isolated-session") == launch_dir / "target.py"
+    finally:
+        _SESSION_CWD.reset(token)

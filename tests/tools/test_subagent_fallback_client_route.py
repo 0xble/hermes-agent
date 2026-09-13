@@ -99,3 +99,56 @@ def test_fallback_client_without_inspectable_url_is_refused():
     client = SimpleNamespace(api_key=child.api_key)
     with pytest.raises(ValueError, match="route"):
         pin.validate_request(child, {"model": child.model}, client=client, final_request=True)
+
+
+@pytest.mark.parametrize("extra_body", [False, True])
+@pytest.mark.parametrize("model, effort", [
+    ("claude-opus-4-7", "high"),
+    ("claude-opus-4-7", "xhigh"),
+    ("claude-opus-4-6", "xhigh"),
+    ("claude-opus-4-7", "minimal"),
+])
+def test_native_anthropic_final_effort_is_pinned(extra_body, model, effort):
+    from dataclasses import replace
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    pin, child = pin_and_child()
+    route = replace(pin.fallback_routes[0], model=model, reasoning_effort=effort)
+    pin = replace(pin, fallback_routes=(route,))
+    child.model = model
+    request = build_anthropic_kwargs(tools=None, max_tokens=32000, model=model, messages=[{"role": "user", "content": "fixture"}],
+                                     reasoning_config={"enabled": True, "effort": effort})
+    if extra_body:
+        request["extra_body"] = {"output_config": dict(request["output_config"])}
+        # The explicit body override is authoritative even with a conflicting
+        # top-level spelling, matching the physical SDK body merge.
+        current = request["output_config"]["effort"]
+        request["output_config"]["effort"] = "low" if current != "low" else "high"
+    client = build_anthropic_client(child.api_key, child.base_url)
+    try:
+        pin.validate_request(child, request, client=client, final_request=True)
+        target = request["extra_body"] if extra_body else request
+        current = target["output_config"]["effort"]
+        target["output_config"]["effort"] = "low" if current != "low" else "high"
+        with pytest.raises(ValueError, match="reasoning changed"):
+            pin.validate_request(child, request, client=client, final_request=True)
+    finally:
+        client.close()
+
+
+def test_native_anthropic_budget_only_remains_effort_exempt():
+    from dataclasses import replace
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    pin, child = pin_and_child()
+    route = replace(pin.fallback_routes[0], model="claude-sonnet-4-0", reasoning_effort="high")
+    pin = replace(pin, fallback_routes=(route,))
+    child.model = route.model
+    request = build_anthropic_kwargs(tools=None, max_tokens=32000, model=child.model, messages=[{"role": "user", "content": "fixture"}],
+                                     reasoning_config={"enabled": True, "effort": "high"})
+    assert "budget_tokens" in request["thinking"] and "output_config" not in request
+    client = build_anthropic_client(child.api_key, child.base_url)
+    try:
+        pin.validate_request(child, request, client=client, final_request=True)
+    finally:
+        client.close()

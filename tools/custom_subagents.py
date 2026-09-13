@@ -798,6 +798,7 @@ class RuntimePin:
             self._validate_request_effort(
                 kwargs, extra, active_effort,
                 api_mode=fallback.api_mode if fallback else self.api_mode,
+                model=active_model,
             )
         if (fallback.provider if fallback else self.provider) == "openai-codex":
             # Codex subscription auth rides in headers, so a per-request header
@@ -830,7 +831,7 @@ class RuntimePin:
                     overrides=expected_overrides,
                 )
 
-    def _validate_request_effort(self, kwargs, extra, expected_effort=None, api_mode=None) -> None:
+    def _validate_request_effort(self, kwargs, extra, expected_effort=None, api_mode=None, model=None) -> None:
         """Compare effort only where the request actually states one.
 
         Codex always carries ``reasoning.effort``, so an absent or different
@@ -839,6 +840,8 @@ class RuntimePin:
         Every other wire is checked only when the request carries an effort
         value to compare — read from ``reasoning.effort``, ``extra_body``, or a
         top-level ``reasoning_effort``, since providers spell it differently.
+        Native Anthropic ``output_config.effort`` is compared with the adapter's
+        representation of the pinned effort, including model-specific mappings.
         A payload that expresses reasoning some other way (a token budget, an
         exclude flag) states no effort at all, and treating that silence as a
         contradiction would abort every request the child makes from the final
@@ -852,6 +855,22 @@ class RuntimePin:
                     f"subagent_type {self.subagent_type!r}: pinned request reasoning changed"
                 )
             return
+        if (api_mode or self.api_mode) == "anthropic_messages":
+            # Native adaptive effort is a transport representation, not always
+            # the configured spelling (e.g. 4.6 maps xhigh to max).
+            for source in (extra, kwargs):
+                output = source.get("output_config")
+                if isinstance(output, dict) and output.get("effort") is not None:
+                    from agent.anthropic_adapter import _thinking_kwargs
+                    expected = expected_effort or self.reasoning_effort
+                    native = _thinking_kwargs({"effort": expected}, model or self.model, 0)
+                    expected_native = native.get("output_config", {}).get("effort", expected)
+                    if output["effort"] != expected_native:
+                        raise ValueError(
+                            f"subagent_type {self.subagent_type!r}: pinned request reasoning changed"
+                        )
+                    # extra_body overrides the top-level output_config on wire.
+                    break
         stated = self._stated_effort(kwargs, extra)
         if stated is not None and stated != (expected_effort or self.reasoning_effort):
             raise ValueError(
@@ -860,7 +879,7 @@ class RuntimePin:
 
     @staticmethod
     def _stated_effort(kwargs, extra) -> str | None:
-        """The effort this request actually names, in any known spelling."""
+        """The effort this request names in generic reasoning fields."""
         for source in (extra, kwargs):
             reasoning = source.get("reasoning")
             if isinstance(reasoning, dict) and reasoning.get("effort") is not None:

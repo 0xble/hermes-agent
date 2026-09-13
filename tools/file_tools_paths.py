@@ -139,8 +139,9 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
 
         scoped = resolve_tool_cwd()
     except Exception:
-        scoped = ""
-    return scoped or _configured_terminal_cwd()
+        return _configured_terminal_cwd()
+    # An explicit empty session scope excludes the process-wide cwd too.
+    return scoped or None
 
 
 def _host_text(text: str, container_paths: bool) -> str:
