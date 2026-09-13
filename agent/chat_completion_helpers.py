@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (FailoverReason, PROVIDER_STREAM_NON_JSON_ERROR_CODE)
-from agent.errors import EmptyStreamError
+from agent.errors import EmptyStreamError, NamedFallbackInstallationError
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -2047,6 +2047,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
             return True
         except Exception as e:
+            if getattr(agent, "_delegation_runtime_pin", None) is not None:
+                # Installation may already have replaced part of the runtime.
+                # Do not resume the original provider's retry/sleep path with
+                # that mixed state, or silently skip a failed authority check.
+                raise NamedFallbackInstallationError(
+                    "named subagent fallback installation failed"
+                ) from e
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)

@@ -390,7 +390,13 @@ def _build_child_agent(
                 "description": subagent_definition.description,
                 "instructions": subagent_definition.instructions,
                 "parent_session_root": parent_root,
-                "provider": child.provider, "model": child.model,
+                "provider": "custom" if child.provider.startswith("custom:") else child.provider,
+                # A named custom selector (``custom:name``) resolves to the
+                # shared ``custom`` transport.  Persist both identities so a
+                # resume can re-authorize the selected route without comparing
+                # the selector to the transport family.
+                "requested_provider": subagent_definition.provider or child.provider,
+                "model": child.model,
                 "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
                 "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
                 "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
@@ -491,7 +497,15 @@ def _refresh_resumable_launch_metadata(child, launch_metadata: dict) -> dict:
     if not isinstance(credential_id, str) or not credential_id:
         return updated
     active = (getattr(child, "provider", None), getattr(child, "model", None))
-    if active == (updated.get("provider"), updated.get("model")):
+    # A custom selector and its stored transport describe the same primary
+    # only when the selector is the one authorized by this launch.
+    requested = updated.get("requested_provider") or updated.get("provider")
+    primary_provider = updated.get("provider")
+    if isinstance(requested, str) and requested.startswith("custom:"):
+        primary_provider = "custom"
+        if active[0] == requested:
+            active = ("custom", active[1])
+    if active == (primary_provider, updated.get("model")):
         updated["credential_pool_entry_id"] = credential_id
         updated["authority_fingerprint"] = __import__("hashlib").sha256(
             str(getattr(child, "api_key", "") or "").encode()
@@ -726,11 +740,20 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     from tools.delegate_tool_checkpoint import prepare_resume_recovery
     resume_recovery = prepare_resume_recovery(task, db, tip, config, parent_root)
 
-    provider, model = str(launch.get("provider") or ""), str(launch.get("model") or "")
+    stored_provider = str(launch.get("provider") or "")
+    requested_provider = str(launch.get("requested_provider") or stored_provider)
+    # Backward compatibility: historical records put ``custom:name`` in
+    # provider even though the resolved transport was ``custom``.
+    provider = (
+        "custom"
+        if "requested_provider" not in launch and stored_provider.startswith("custom:")
+        else stored_provider
+    )
+    model = str(launch.get("model") or "")
     effort = launch.get("reasoning_effort")
     definition = SubagentDefinition(
         name=role, description=str(launch.get("description") or ""),
-        instructions=str(launch.get("instructions") or ""), provider=provider,
+        instructions=str(launch.get("instructions") or ""), provider=requested_provider,
         model=model, reasoning_effort=effort,
         fallbacks=tuple(FallbackDefinition(
             provider=str(item.get("provider") or ""), model=str(item.get("model") or ""),
@@ -766,6 +789,10 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
         for key in ("provider", "model", "base_url", "api_mode", "api_key"):
             if creds.get(key) is None:
                 creds[key] = getattr(parent_agent, key, None)
+        # The trusted named resolver retains its selector; the persisted route
+        # compares physical transport. Normalize only the exact frozen selector.
+        if requested_provider.startswith("custom:") and creds.get("provider") == requested_provider:
+            creds = {**creds, "provider": "custom"}
         stable_credential_id = launch.get("credential_pool_entry_id")
         if stable_credential_id is not None:
             pool = _resolve_child_credential_pool(provider, parent_agent, creds.get("base_url"))
@@ -830,6 +857,8 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
         resume_credential_id = stable_credential_id
         active = config.get("_delegation_active_route") or {"provider": provider, "model": model}
         active_id = (active.get("provider"), active.get("model")) if isinstance(active, dict) else (None, None)
+        if provider == "custom" and active_id == (requested_provider, model):
+            active_id = (provider, model)
         if active_id != (provider, model):
             active_index = next((index for index, route in enumerate(fallbacks)
                                  if (route.provider, route.model) == active_id), None)

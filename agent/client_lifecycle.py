@@ -864,6 +864,10 @@ class ClientLifecycleMixin:
         return ok
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
+        # Like Codex, a named child retains its launch credential even when the
+        # ambient OAuth store refreshes. Only a newly authorized launch may adopt it.
+        if getattr(self, "_delegation_runtime_pin", None) is not None:
+            return False
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
         if (

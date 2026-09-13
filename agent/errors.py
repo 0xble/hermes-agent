@@ -1,3 +1,7 @@
+class NamedFallbackInstallationError(ValueError):
+    """A pinned subagent fallback failed after runtime installation began."""
+
+
 class SSLConfigurationError(Exception):
     """Raised when SSL/TLS certificate bundle configuration fails."""
 

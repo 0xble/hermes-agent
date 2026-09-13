@@ -15,6 +15,7 @@ import ssl
 import time
 from typing import Any, Dict, Optional
 
+from agent.errors import NamedFallbackInstallationError
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.credential_pool import recover_transient_credential
 from agent.turn_overflow import recover_from_overflow
@@ -59,6 +60,9 @@ def handle_api_error(
     """Recover from ``api_error`` in the original order. Every fallback activation must leave
     the retry loop with ``restart_with_rebuilt_messages`` armed (``"break"``) so the pre-API
     preflight re-runs against the fallback's context window (#84733)."""
+    if isinstance(api_error, NamedFallbackInstallationError):
+        raise api_error
+
     _provider_overflow_recovery_pending = False
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ApiErrorVerdict:
