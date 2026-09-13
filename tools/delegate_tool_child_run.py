@@ -341,7 +341,15 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
+    def settled(_done):
+        from tools.delegate_tool import _restore_unadmitted_resume_grant
+        # Only now is a negative admission marker final. Restore the exact claim
+        # before close can dispose the database; admitted workers stay fail-closed.
+        with _quiet("Could not restore timed-out unadmitted resume grant: %s"):
+            _restore_unadmitted_resume_grant(child)
+        _close_child(child, "Failed to close timed-out child after worker exit")
+
+    child_future.add_done_callback(settled)
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773

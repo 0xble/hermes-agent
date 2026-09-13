@@ -82,7 +82,19 @@ def _signature(messages):
              m.get("tool_call_id") or None) for m in messages if m.get("role") != "system"]
 
 
+def is_unadmitted_resume(child):
+    """A claimed predecessor is not this attempt's checkpoint until native admission."""
+    return bool(getattr(child, "_delegation_resume_claim_id", None)) and not getattr(
+        child, "_delegation_resume_admitted", False)
+
+
 def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
+    # Both exception and structured early-result paths arrive here. Neither may
+    # clear the exact claim/rollback snapshot or publish the predecessor's history
+    # as a newly completed segment when the native lease never admitted this run.
+    if is_unadmitted_resume(child):
+        entry["resume_available"] = False
+        return
     from tools.delegate_tool import _resume_history_is_safe, _refresh_resumable_launch_metadata
     outcome = "error" if entry.get("status") == "failed" else entry.get("status")
     if outcome in {"completed", "budget_exhausted", "interrupted", "error", "timeout"}:

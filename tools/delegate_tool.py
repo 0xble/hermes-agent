@@ -676,8 +676,11 @@ def _run_single_child(
                     child_progress_cb("subagent.handling", actor_session_id=identity["owner"]["session_id"],
                                       parent_task_id=replacement["parent_task_id"], refs=[replacement["thread_ref"]],
                                       reason="release_replacement", detail=replacement["claim_id"])
-        with _quiet("Could not restore unadmitted delegated resume grant: %s"):
-            _restore_unadmitted_resume_grant(child)
+        # A pending timeout worker can still acquire admission. Its done-callback
+        # owns compensation; restoring here would make a live claim retryable.
+        if not _child_close_deferred:
+            with _quiet("Could not restore unadmitted delegated resume grant: %s"):
+                _restore_unadmitted_resume_grant(child)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
@@ -1019,9 +1022,10 @@ def _release_resume_launches(parent_agent, launches: List[Any]) -> bool:
 
 def _restore_unadmitted_resume_grant(child) -> bool:
     """Restore one exact claim only when the native turn lease never admitted it."""
-    claim_id = getattr(child, "_delegation_resume_claim_id", None)
-    if not claim_id or getattr(child, "_delegation_resume_admitted", False):
+    from tools.delegate_tool_checkpoint import is_unadmitted_resume
+    if not is_unadmitted_resume(child):
         return False
+    claim_id = getattr(child, "_delegation_resume_claim_id", None)
     release = getattr(getattr(child, "_session_db", None), "release_delegated_resumes", None)
     session_id = getattr(child, "session_id", None)
     return bool(callable(release) and session_id and release([session_id], claim_id=claim_id))
