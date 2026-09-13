@@ -1101,10 +1101,10 @@ def stop_snapshot_browser_processes(snapshot_root: str) -> int:
     """
     import psutil
 
-    root = os.path.realpath(snapshot_root)
+    root = _normalized_host_path(snapshot_root)
     executables = {
         os.path.normcase(os.path.realpath(path))
-        for browser in _CHROMIUM_BROWSERS
+        for browser in _BROWSER_BY_KEY
         if (path := chromium_executable(browser))
     }
     if not executables:
@@ -1114,19 +1114,21 @@ def stop_snapshot_browser_processes(snapshot_root: str) -> int:
     for proc in psutil.process_iter(["cmdline"]):
         try:
             cmdline = proc.info.get("cmdline") or []
-            if not cmdline or any(arg.startswith("--type=") for arg in cmdline):
+            if not cmdline or not all(isinstance(arg, str) for arg in cmdline):
                 continue
-            if "--remote-debugging-port=0" not in cmdline:
+            switches = cmdline[1:]
+            if "--" in switches:
+                switches = switches[:switches.index("--")]
+            if any(arg.startswith("--type=") for arg in switches):
                 continue
-            if "--profile-directory=Default" not in cmdline:
+            if "--remote-debugging-port=0" not in switches:
                 continue
-            data_arg = next(
-                (arg for arg in cmdline if arg.startswith("--user-data-dir=")),
-                None,
-            )
-            if data_arg is None:
+            if "--profile-directory=Default" not in switches:
                 continue
-            data_dir = os.path.realpath(data_arg.split("=", 1)[1])
+            data_dir = _user_data_dir_argument(cmdline)
+            if data_dir is None:
+                continue
+            data_dir = _normalized_host_path(data_dir)
             try:
                 if os.path.commonpath([root, data_dir]) != root:
                     continue
