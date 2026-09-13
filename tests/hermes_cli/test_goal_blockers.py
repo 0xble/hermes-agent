@@ -86,7 +86,9 @@ def test_kanban_handoffs_and_worker_report_same_resumption_context(monkeypatch):
     monkeypatch.setattr("agent.auxiliary_client.get_text_auxiliary_client", lambda *a, **kw: (object(), "judge"))
     monkeypatch.setattr("agent.auxiliary_client.call_llm", lambda **kw: SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=response))]))
-    task = SimpleNamespace(title="Publish", body="Verify endpoint access", goal_mode=True)
+    # A manual task has identity but no dispatched attempt; it cannot donate worker evidence.
+    task = SimpleNamespace(id="t1", current_run_id=None, title="Publish",
+                           body="Verify endpoint access", goal_mode=True)
     verdict, notice = _goal_mode_handoff_rejection(task, "403; all local work complete")
     assert verdict == "blocked" and blocker["resume_when"] in notice
     for tool in ("kanban_complete", "kanban_request_review"):

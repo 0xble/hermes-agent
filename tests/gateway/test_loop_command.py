@@ -59,6 +59,18 @@ def _make_runner():
     return runner
 
 
+def _attach_receipt_adapter(runner):
+    from tests.gateway.test_goal_exactly_once import _receipt_adapter
+
+    adapter = _receipt_adapter()
+    active = asyncio.Event()
+    setattr(active, "_hermes_run_generation", 7)
+    adapter._active_sessions = {"loop-receipt": active}
+    runner._adapter_for_source = lambda _source: adapter
+    runner._session_key_for_source = lambda _source: "loop-receipt"
+    return adapter, active
+
+
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(
         text=text,
@@ -223,23 +235,33 @@ async def test_empty_agent_result_releases_inflight_loop_tick(loop_env):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("goal_fields", [{"failed": True}, {"_goal_decision": {"should_continue": True}}])
-async def test_empty_failed_result_still_runs_goal_lifecycle(loop_env, goal_fields):
-    """Failure bookkeeping must not disappear merely because delivery has no text."""
+async def test_empty_failed_result_defers_goal_lifecycle_to_receipt(loop_env, goal_fields):
+    """Keep the empty failure envelope, but never consume it before delivery."""
     runner = _make_runner()
+    adapter, active = _attach_receipt_adapter(runner)
     runner._post_turn_goal_continuation = AsyncMock()
+    result = {"final_response": "", **goal_fields}
+    event = _make_event("wakeup")
 
     await GatewayRunner._run_post_turn_hooks(
-        runner,
-        agent_result={"final_response": "", **goal_fields},
-        source=_make_event("wakeup").source,
-        is_internal=True,
+        runner, agent_result=result, source=event.source, is_internal=True, event=event,
     )
 
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    state = getattr(event, "_goal_post_turn_state")["delivery"]
+    assert state["scheduled"] and not state.get("handled")
+    await adapter._fire_post_delivery_callback("loop-receipt", active, 7, delivery_succeeded=True)
+    runner._post_turn_goal_continuation.assert_awaited_once()
+    call = runner._post_turn_goal_continuation.await_args
+    assert call is not None and call.kwargs["agent_result"] is result
+    assert state["handled"]
+    await adapter._fire_post_delivery_callback("loop-receipt", active, 7, delivery_succeeded=True)
     runner._post_turn_goal_continuation.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog):
+@pytest.mark.parametrize("failure_stage", ["registration", "receipt"])
+async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog, failure_stage):
     runner = _make_runner()
     await GatewayRunner._handle_loop_command(runner, _make_event("/loop 5m poll CI"))
 
@@ -247,7 +269,10 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
     mgr.state.next_due_at = time.time() - 1
     assert mgr.fire_tick() is not None
 
+    adapter, active = _attach_receipt_adapter(runner)
     runner._post_turn_goal_continuation = AsyncMock(side_effect=RuntimeError("judge failed"))
+    if failure_stage == "registration":
+        adapter.register_post_delivery_callback = Mock(side_effect=RuntimeError("registration failed"))
     with caplog.at_level(logging.DEBUG, logger="gateway.run"):
         await GatewayRunner._run_post_turn_hooks(
             runner,
@@ -258,7 +283,15 @@ async def test_goal_hook_failure_does_not_block_loop_completion(loop_env, caplog
 
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.awaiting_response is False
-    assert "goal continuation hook failed: judge failed" in caplog.text
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    if failure_stage == "registration":
+        assert "goal continuation hook failed: registration failed" in caplog.text
+    else:
+        # The real receipt owner contains callback failures after the loop tick is released.
+        await adapter._fire_post_delivery_callback("loop-receipt", active, 7, delivery_succeeded=True)
+        runner._post_turn_goal_continuation.assert_awaited_once()
+        reloaded = loops.load_loop("sid-gateway-loop")
+        assert reloaded is not None and reloaded.awaiting_response is False
 
 
 @pytest.mark.asyncio
