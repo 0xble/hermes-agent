@@ -159,3 +159,43 @@ def test_malformed_batches_and_unknown_policy_fail_closed(tmp_path, monkeypatch)
     finally:
         reset_current_write_origin(token)
     assert result["staged"] and store.memory_entries == ["old fact"]
+
+
+def test_history_cli_skips_malformed_records_and_preserves_valid_undo(tmp_path, monkeypatch, capsys):
+    import pytest
+    import sys
+    from tools import memory_history as history
+
+    store = _configure(tmp_path, monkeypatch, 'automatic')
+    transaction = history.HistoryTransaction('memory', [])
+    valid_id = transaction.prepare(store._path_for('memory'), 'old fact', ['new fact'])
+    assert store.replace('memory', 'old fact', 'new fact')['success']
+    bad_values = [{}, None, 1, 'scalar', [],
+                  {**transaction.record, 'target': 'unknown'},
+                  {**transaction.record, 'created_at': 'not a timestamp'},
+                  {**transaction.record, 'before': ['not text']},
+                  {**transaction.record, 'before_sha256': 'mismatched digest'}]
+    paths = []
+    for index, value in enumerate(bad_values, 1):
+        bad_id = f'{index:032x}'
+        if isinstance(value, dict) and value:
+            value = {**value, 'id': bad_id}
+        path = history._history_dir() / f'{bad_id}.json'
+        path.write_text(json.dumps(value))
+        paths.append((bad_id, path, path.read_bytes()))
+    monkeypatch.setattr(sys, 'argv', ['memory_history', 'list'])
+    history.main()
+    rows = json.loads(capsys.readouterr().out)
+    assert [row['id'] for row in rows] == [valid_id]
+    assert rows[0]['status'] == 'applied'  # interrupted valid record still recovers
+    for bad_id, path, original in paths:
+        monkeypatch.setattr(sys, 'argv', ['memory_history', 'rollback', bad_id])
+        with pytest.raises(SystemExit) as exited:
+            history.main()
+        assert exited.value.code == 1
+        assert not json.loads(capsys.readouterr().out)['success']
+        assert path.read_bytes() == original
+    monkeypatch.setattr(sys, 'argv', ['memory_history', 'rollback', valid_id])
+    history.main()
+    assert json.loads(capsys.readouterr().out)['success']
+    assert store._read_raw_checked(store._path_for('memory')) == ('old fact', True)

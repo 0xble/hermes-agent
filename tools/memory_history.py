@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 import uuid
@@ -41,8 +42,20 @@ def _write_record(record: Dict[str, Any]) -> None:
 
 def _read_record(record_id: str) -> Dict[str, Any] | None:
     try:
-        return json.loads(_path(record_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+        record = json.loads(_path(record_id).read_text(encoding="utf-8"))
+        if not isinstance(record, dict) or record.get("id") != record_id:
+            return None
+        if record.get("target") not in {"memory", "user"}:
+            return None
+        if not all(isinstance(record.get(key), str) for key in ("before", "after", "status")):
+            return None
+        if any(record.get(f"{key}_sha256") != _fingerprint(record[key]) for key in ("before", "after")):
+            return None
+        created = record.get("created_at", 0)
+        if type(created) not in (int, float) or not math.isfinite(created):
+            return None
+        return record
+    except (OSError, ValueError, TypeError, OverflowError):
         return None
 
 
@@ -77,10 +90,13 @@ class HistoryTransaction:
         _write_record(self.record)
 
 
-def _recover(record: Dict[str, Any]) -> Dict[str, Any]:
+def _recover(record: Dict[str, Any]) -> Dict[str, Any] | None:
     from tools.memory_tool_store import MemoryStore
     with MemoryStore._file_lock(MemoryStore._path_for(record["target"])):
-        return _recover_locked(_read_record(record["id"]) or record)
+        current = _read_record(record["id"])
+        if current is None or current["target"] != record["target"]:
+            return None
+        return _recover_locked(current)
 
 
 def _recover_locked(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -115,7 +131,9 @@ def list_history() -> List[Dict[str, Any]]:
     records = []
     for path in _history_dir().glob("*.json") if _history_dir().exists() else ():
         try:
-            records.append(_recover(json.loads(path.read_text(encoding="utf-8"))))
+            record = _read_record(path.stem)
+            if record is not None and (recovered := _recover(record)) is not None:
+                records.append(recovered)
         except (OSError, ValueError, TypeError):
             continue
     return sorted(records, key=lambda row: row.get("created_at", 0), reverse=True)
