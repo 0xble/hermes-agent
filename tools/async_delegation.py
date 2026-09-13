@@ -51,8 +51,9 @@ _MAX_DURABLE_PENDING = 1000
 _MAX_DELIVERY_ATTEMPTS = 8
 _MAX_DELIVERY_RECOVERIES = 1
 # A pending (never-exhausted) replay may still be stale enough to be unsafe as
-# a fresh parent turn. ``pending_recovery`` is explicitly exempt: it is a
-# durable obligation awaiting an availability-triggered retry, never an age cap.
+# a fresh parent turn. Recoverable/card-backed ``pending_recovery`` obligations
+# remain exempt. Fully exhausted, proven-unlabelled notifications enter ordinary
+# settled history through _prune_durable_records, never a fabricated delivery.
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 _completion_publish_lock = threading.RLock()
@@ -360,13 +361,43 @@ def _prune_durable_records() -> None:
 
     Delivery acknowledgement only proves the completion notification was admitted.
     A result remains separately retained while its exact card attempt has no
-    parent-disposition delivery receipt.
+    parent-disposition delivery receipt. Unlabelled notifications with no recovery
+    budget left settle as dropped. Outstanding recoverable obligations remain
+    intentionally uncapped here; notification failure is not proof of delivery.
     """
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
+        exhausted = conn.execute("""SELECT delegation_id, task_json, result_json, event_json,
+                        parent_task_id, thread_number, task_label, owner_json
+               FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled')
+                 AND delivery_state='pending_recovery' AND delivery_claim IS NULL
+                 AND delivery_attempts>=? AND delivery_recovery_attempts>=?""",
+            (_MAX_DELIVERY_ATTEMPTS, _MAX_DELIVERY_RECOVERIES)).fetchall()
+        for uid, task_json, result_json, event_json, *projection in exhausted:
+            if any(value not in (None, "") for value in projection):
+                continue
+            if _has_retained_result(task_json, result_json):
+                continue
+            try:
+                task, result, event = json.loads(task_json), json.loads(result_json), json.loads(event_json)
+            except (TypeError, ValueError):
+                continue
+            if not all(isinstance(payload, dict) for payload in (task, result, event)):
+                continue
+            entries = result.get("results", [])
+            if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+                continue
+            # Absence of release proof is not permission to prune named work.
+            # Legacy rows must be unlabelled in both payloads and SQL projection.
+            if any(payload.get(key) not in (None, {}, "") for payload in (task, event, result, *entries)
+                   for key in ("delegation_metadata", "parent_task_id", "thread_number",
+                               "task_label", "task_labels", "thread_ref", "thread_refs",
+                               "owner", "owner_json", "threads")):
+                continue
+            conn.execute("UPDATE async_delegations SET delivery_state='dropped' WHERE delegation_id=?", (uid,))
         rows = conn.execute("""SELECT delegation_id, task_json, result_json FROM async_delegations
                WHERE state NOT IN ('running','finalizing','stalling') AND updated_at < ?
-                 AND (delivery_state='delivered' OR (event_json IS NULL AND result_json IS NOT NULL))""", (cutoff,)).fetchall()
+                 AND (delivery_state IN ('delivered','dropped') OR (event_json IS NULL AND result_json IS NOT NULL))""", (cutoff,)).fetchall()
         conn.executemany("DELETE FROM async_delegations WHERE delegation_id=?", [
             (delegation_id,) for delegation_id, task_json, result_json in rows
             if not _has_retained_result(task_json, result_json)
