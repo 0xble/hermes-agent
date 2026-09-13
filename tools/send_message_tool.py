@@ -1100,23 +1100,38 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 return await _send_custom_request(entry, args, chat_id, platform_name, pconfig)
         except Exception as exc:
             return {"error": f"Custom handler profile resolution failed: {type(exc).__name__}"}
-        # Ordinary profile sends retain the live adapter trust boundary.
-        from gateway.platforms.base import BasePlatformAdapter
-        max_len = _platform_max_length(platform)
-        chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
-        return await _send_chunks(
-            chunks,
-            lambda chunk, is_last: _via_adapter_route(
-                platform,
-                pconfig,
-                chat_id,
-                chunk,
-                media_files if is_last else [],
-                thread_id,
-                force_document,
-                profile,
-            ),
-        )
+        try:
+            import sys
+            # A live runner registers in this module. Do not import the entire
+            # gateway just to discover that a standalone caller has none.
+            gateway_module = sys.modules.get("gateway.run")
+            runner = gateway_module._gateway_runner_ref() if gateway_module is not None else None
+        except Exception as exc:
+            return {"error": f"Trusted profile gateway lookup failed: {type(exc).__name__}"}
+        if runner is None:
+            if not profile_matches_home(str(profile).strip()):
+                return {"error": f"Cannot honor trusted profile '{profile}' for standalone platform '{platform_name}'"}
+            # This process is already scoped to the requested profile. Preserve
+            # its native standalone transports rather than requiring a plugin
+            # sender for built-ins such as Weixin, Signal and Telegram.
+        else:
+            # Ordinary profile sends retain the live adapter trust boundary.
+            from gateway.platforms.base import BasePlatformAdapter
+            max_len = _platform_max_length(platform)
+            chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
+            return await _send_chunks(
+                chunks,
+                lambda chunk, is_last: _via_adapter_route(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    chunk,
+                    media_files if is_last else [],
+                    thread_id,
+                    force_document,
+                    profile,
+                ),
+            )
 
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)

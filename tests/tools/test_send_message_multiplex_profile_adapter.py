@@ -45,3 +45,49 @@ def test_profile_without_adapter_fails_closed_never_default_bot(mux_runner):
     with _profile_runtime_scope(home / "profiles" / "nobot", {}):
         _, adapter = _live_adapter(Platform.SLACK)
     assert adapter is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['matching', 'not_loaded', 'wrong_profile', 'live_missing', 'lookup_error'])
+async def test_trusted_standalone_native_sender_preserves_profile_and_receipt(tmp_path, monkeypatch, mode):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import gateway.run as gateway_run
+    from gateway.platforms import weixin
+    from gateway.config import PlatformConfig
+    from tools.send_message_tool import _send_to_platform
+
+    home = tmp_path / '.hermes'
+    secondary = home / 'profiles' / 'sec'
+    secondary.mkdir(parents=True)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    native = AsyncMock(return_value={'success': True, 'message_id': 'native-receipt'})
+    monkeypatch.setattr(weixin, 'send_weixin_direct', native)
+    default_adapter = SimpleNamespace(send=AsyncMock())
+    if mode == 'live_missing':
+        runner = SimpleNamespace(_active_profile_name=lambda: 'default',
+            adapters={Platform.WEIXIN: default_adapter}, _profile_adapters={})
+        monkeypatch.setattr(gateway_run, '_gateway_runner_ref', lambda: runner)
+    elif mode == 'not_loaded':
+        import sys
+        monkeypatch.delitem(sys.modules, 'gateway.run')
+    elif mode == 'lookup_error':
+        def unavailable():
+            raise RuntimeError('cannot inspect runner')
+        monkeypatch.setattr(gateway_run, '_gateway_runner_ref', unavailable)
+    else:
+        monkeypatch.setattr(gateway_run, '_gateway_runner_ref', lambda: None)
+    config = PlatformConfig(enabled=True, token='synthetic-secondary-token', extra={'base_url': 'https://example.invalid'})
+    with _profile_runtime_scope(secondary, {}):
+        result = await _send_to_platform(Platform.WEIXIN, config, 'chat', 'body',
+            media_files=[('/synthetic/document.pdf', False)],
+            profile='default' if mode == 'wrong_profile' else 'sec')
+    if mode in {'matching', 'not_loaded'}:
+        assert result == {'success': True, 'message_id': 'native-receipt'}
+        native.assert_awaited_once_with(extra=config.extra, token=config.token,
+            chat_id='chat', message='body', media_files=[('/synthetic/document.pdf', False)])
+    else:
+        assert result.get('error')
+        native.assert_not_awaited()
+    default_adapter.send.assert_not_awaited()
