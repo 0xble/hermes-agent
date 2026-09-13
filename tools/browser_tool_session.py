@@ -275,7 +275,7 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> Dict[str, Any]:
 def _reject_identity_incompatible_backend(identity: Optional[str]) -> None:
     """Fail closed when a named identity is requested but the configured backend cannot honour it.
 
-    Pure configuration gate (no network I/O, nothing created): ``_get_session_info`` runs it BEFORE
+    Configuration and consent gate (no network I/O, nothing created): ``_get_session_info`` runs it BEFORE
     committing the durable identity claim so a refused request never binds the task, and
     ``_create_session_for_key`` runs it again so the routing contract holds for any caller.
     """
@@ -287,6 +287,10 @@ def _reject_identity_incompatible_backend(identity: Optional[str]) -> None:
     if _bt._get_cloud_provider() is not None:
         raise RuntimeError("named browser identities require the local real-profile backend; "
                            "cloud providers cannot use local Chromium identities")
+    if not _bt._use_real_profile():
+        _bt._cleanup_real_profile_state()
+        raise RuntimeError("named browser identities require browser.use_real_profile: true; "
+                           "Hermes will not fall back to a signed-out browser")
 
 
 def _create_session_for_key(task_id: str, force_local: bool,

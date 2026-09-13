@@ -622,9 +622,9 @@ _REAL_PROFILE_REFRESH_MODES = frozenset({"launch", "initial"})
 def _real_profile_refresh_mode() -> tuple[str | None, str | None]:
     """Return the configured source refresh mode, failing closed if invalid."""
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import load_config_readonly_strict
 
-        cfg = read_raw_config(strict=True)
+        cfg = load_config_readonly_strict()
         browser_cfg = cfg.get("browser", {})
         if not isinstance(browser_cfg, dict):
             raise ValueError("browser configuration must be a mapping")
