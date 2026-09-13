@@ -2206,6 +2206,14 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     return lkg_copy
 
 
+def _model_preset_namespace(user: Dict[str, Any], managed: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared effective definition namespace; callers expand each layer's env first."""
+    return _deep_merge(
+        {k: user[k] for k in ("model_presets",) if k in user},
+        {k: managed[k] for k in ("model_presets",) if k in managed},
+    )
+
+
 def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) -> Tuple[Dict[str, Any], Any]:
     """Expand authored routes and merge defaults/user/managed; return merged config and raw managed.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
@@ -2226,10 +2234,7 @@ def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) ->
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
     managed_expanded = _expand_env_vars(managed_normalized)
-    namespace = _deep_merge(
-        {k: expanded[k] for k in ("model_presets",) if k in expanded},
-        {k: managed_expanded[k] for k in ("model_presets",) if k in managed_expanded},
-    )
+    namespace = _model_preset_namespace(expanded, managed_expanded)
     user_routes = expand_model_presets({**expanded, **namespace})
     managed_routes = expand_model_presets({**managed_expanded, **namespace})
     defaults_and_user = _canonicalize_config(_merge_config_layer(
@@ -2410,12 +2415,26 @@ def save_config(
 
         current_normalized = _canonicalize_config(config)
         normalized = current_normalized
+        managed = managed_scope.load_managed_config()
         if _raw_for_paths:
             from hermes_cli.model_presets import preserve_model_preset_references
-            normalized = preserve_model_preset_references(normalized, _raw_for_paths)
+            namespace = _model_preset_namespace(_expand_env_vars(_raw_for_paths), _expand_env_vars(managed))
+            normalized = preserve_model_preset_references(
+                normalized, _raw_for_paths, definitions=namespace.get("model_presets", {}))
             normalized = _preserve_env_ref_templates(
                 normalized, _canonicalize_config(_raw_for_paths),
                 _LAST_EXPANDED_CONFIG_BY_PATH.get(str(config_path)))
+
+        # Managed leaf stripping leaves empty containers. Do not author a
+        # managed-only definition merely because the loaded view included it.
+        saved_presets = normalized.get("model_presets")
+        if isinstance(saved_presets, dict):
+            raw_presets = _raw_for_paths.get("model_presets") or {}
+            for name in managed.get("model_presets") or {}:
+                if name not in raw_presets and saved_presets.get(name) == {}:
+                    saved_presets.pop(name)
+            if not saved_presets and "model_presets" not in _raw_for_paths:
+                normalized.pop("model_presets", None)
 
         if strip_defaults:
             # ``_strip_default_values`` always preserves ``_config_version`` itself.

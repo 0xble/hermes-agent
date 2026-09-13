@@ -23,6 +23,7 @@ def test_native_wrapper_records_real_process_exit_only_after_termination(tmp_pat
     output = tmp_path / ".update_output.txt"
     pre_restart_exit = tmp_path / ".update_exit_code"
     final_exit = tmp_path / ".update_process_exit_code"
+    output.write_text("already observed progress\n", encoding="utf-8")
     script = "print('real detached process output', flush=True); raise SystemExit(7)"
     with patch("gateway.slash_commands._systemd_scope_wrap_if_supervised", side_effect=lambda argv: (argv, None)):
         _spawn_detached_update([sys.executable, "-c", script], output, pre_restart_exit)
@@ -30,8 +31,90 @@ def test_native_wrapper_records_real_process_exit_only_after_termination(tmp_pat
     while not final_exit.exists() and time.monotonic() < deadline:
         time.sleep(.01)
     assert final_exit.read_text() == "7"
-    assert "real detached process output" in output.read_text()
+    assert output.read_text() == "already observed progress\nreal detached process output\n"
     assert not pre_restart_exit.exists()
+
+
+def test_windows_helper_appends_without_truncating_observed_output(tmp_path):
+    from gateway.slash_commands import _WINDOWS_UPDATE_HELPER
+
+    output, exit_code = tmp_path / "output", tmp_path / "exit"
+    output.write_bytes(b"already observed\n")
+
+    def child(cmd, *, stdout, **kwargs):
+        stdout.write(b"child progress\n")
+        return SimpleNamespace(wait=lambda **kwargs: 7)
+
+    # Execute the portable helper body, never a Windows process on another OS.
+    with patch.object(sys, "argv", ["helper", str(output), str(exit_code), "fixture"]), \
+         patch("subprocess.Popen", side_effect=child):
+        exec(compile(_WINDOWS_UPDATE_HELPER, "<windows-update-helper>", "exec"), {})
+    assert output.read_bytes() == b"already observed\nchild progress\n"
+    assert exit_code.read_text() == "7"
+
+
+@pytest.mark.parametrize("existing_marker", [None, ".update_pending.json", ".update_pending.claimed.json"])
+def test_new_request_initializes_output_before_any_watcher_can_resolve_it(tmp_path, monkeypatch, existing_marker):
+    from gateway import update_launcher
+    from gateway.update_notifications import request_identity
+
+    if existing_marker:
+        files = {existing_marker: b'{"reason": "existing"}', ".update_output.txt": b"acknowledged bytes\n",
+                 ".update_exit_code": b"0", ".update_process_exit_code": b"7"}
+        for name, content in files.items():
+            (tmp_path / name).write_bytes(content)
+        spawn = Mock()
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn) == {
+            "started": False, "pending": True,
+        }
+        spawn.assert_not_called()
+        assert {name: (tmp_path / name).read_bytes() for name in files} == files
+        return
+
+    output = tmp_path / ".update_output.txt"
+    output.write_text("stale conversation output\n", encoding="utf-8")
+    runner = _make_runner()
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    real_fsync = update_launcher.os.fsync
+    observations = []
+
+    def observe_publication(fd):
+        real_fsync(fd)
+        # A startup watcher is independent of the explicitly scheduled watcher.
+        target = runner._resolve_update_target(runner._update_paths())
+        if target is not None:
+            observations.append(output.read_bytes())
+            assert output.read_bytes() == b""
+
+    monkeypatch.setattr(update_launcher.os, "fsync", observe_publication)
+
+    def delayed_child(cmd, output, exit_code):
+        async def scenario():
+            paths = runner._update_paths()
+            target = runner._resolve_update_target(paths)
+            marker = read_pending(tmp_path)
+            assert target is not None and marker is not None
+            request = request_identity(marker[1])
+            assert await runner._drain_update_output(target, paths, request)
+            adapter.send.assert_not_called()
+            with output.open("ab") as stream:
+                stream.write(b"new progress\n")
+            assert await runner._drain_update_output(target, paths, request)
+            finalize_update(tmp_path)
+            assert await runner._send_update_notification()
+            assert read_pending(tmp_path) is None
+        asyncio.run(scenario())
+
+    with patch("gateway.run._hermes_home", tmp_path):
+        result = launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={
+            "platform": "telegram", "chat_id": "42", "timestamp": datetime.now(timezone.utc).isoformat(),
+        }, spawn=delayed_child)
+    assert result["started"]
+    assert observations
+    messages = [call.args[1] for call in adapter.send.call_args_list]
+    assert any("new progress" in message for message in messages)
+    assert all("stale conversation" not in message for message in messages)
 
 
 def pending(home, *, reason=True):

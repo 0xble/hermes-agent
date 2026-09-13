@@ -378,15 +378,22 @@ def expand_model_presets(config: Any) -> dict[str, Any]:
     return expanded
 
 
-def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> dict[str, Any]:
+def preserve_model_preset_references(
+    config: dict[str, Any], authored: Any, *, definitions: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Put unchanged named-route references back before a config write.
 
     ``load_config`` returns runtime-ready inline routes.  An unrelated config edit must not
     turn those routes into permanently flattened YAML, but an edited route must remain edited.
     """
-    if not isinstance(authored, dict) or not authored.get("model_presets"):
+    if not isinstance(authored, dict):
         return config
-    expanded_authored = expand_model_presets(authored)
+    # Definitions may be administrator-owned, but only raw user sites are authored.
+    namespace = authored.get("model_presets") if definitions is None else definitions
+    if not namespace:
+        return config
+    resolved_authored = {**authored, "model_presets": namespace}
+    expanded_authored = expand_model_presets(resolved_authored)
     result = deepcopy(config)
 
     def same_route(actual: Any, expected: Any, fallback_key: str | None = None) -> bool:
@@ -409,7 +416,7 @@ def preserve_model_preset_references(config: dict[str, Any], authored: Any) -> d
             key in actual_model and key not in raw_model and actual_model[key] not in (None, "", {}, [])
             for key in main_inline_fields
         ) if isinstance(actual_model, dict) else True
-        preset = _definitions(authored)[raw_model["model_preset"].strip()]
+        preset = _definitions(resolved_authored)[raw_model["model_preset"].strip()]
         reasoning_unchanged = (
             "reasoning_effort" not in preset
             or (result.get("agent") or {}).get("reasoning_effort")

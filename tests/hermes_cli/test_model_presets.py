@@ -208,6 +208,67 @@ def test_save_preserves_named_role_and_moa_fallback_references():
     }]
 
 
+@pytest.mark.parametrize("user_definition", [False, True])
+@pytest.mark.parametrize("edit_route", [False, True])
+@pytest.mark.parametrize("strip_defaults", [False, True])
+def test_managed_preset_reference_survives_real_save_and_later_managed_edit(
+    tmp_path, monkeypatch, user_definition, edit_route, strip_defaults,
+):
+    from hermes_cli import config as c
+
+    home, managed = tmp_path / "home", tmp_path / "managed"
+    home.mkdir(); managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setenv("FIXTURE_MANAGED_MODEL", "fixture-B")
+    raw = {"model": {"model_preset": "B"}, "auxiliary": {"vision": {"model_preset": "B"}}}
+    if user_definition:
+        raw["model_presets"] = {"A": {"provider": "openai", "model": "fixture-A"}}
+    path = home / "config.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    managed_path = managed / "config.yaml"
+    managed_raw = {"model_presets": {"B": {"provider": "openai", "model": "${FIXTURE_MANAGED_MODEL}"}}}
+    managed_path.write_text(yaml.safe_dump(managed_raw), encoding="utf-8")
+    loaded = c.load_config()
+    assert loaded["model"]["default"] == "fixture-B"
+    loaded["display"]["show_thinking"] = False
+    if edit_route:
+        loaded["model"]["default"] = "intentional-edit"
+    c.save_config(loaded, strip_defaults=strip_defaults)
+    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert saved.get("model_presets", {}) == raw.get("model_presets", {})
+    assert saved["auxiliary"]["vision"]["model_preset"] == "B"
+    if edit_route:
+        assert "model_preset" not in saved["model"]
+        assert saved["model"]["default"] == "intentional-edit"
+    else:
+        assert saved["model"] == {"model_preset": "B"}
+    managed_raw["model_presets"]["B"]["model"] = "later-managed-model"
+    managed_path.write_text(yaml.safe_dump(managed_raw), encoding="utf-8")
+    reloaded = c.load_config()
+    assert reloaded["model"]["default"] == ("intentional-edit" if edit_route else "later-managed-model")
+    assert reloaded["auxiliary"]["vision"]["model"] == "later-managed-model"
+
+
+def test_managed_only_presets_do_not_create_authored_shells_in_empty_user_config(tmp_path, monkeypatch):
+    from hermes_cli import config as c
+
+    home, managed = tmp_path / "home", tmp_path / "managed"
+    home.mkdir(); managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    path = home / "config.yaml"
+    path.write_text("{}", encoding="utf-8")
+    (managed / "config.yaml").write_text(yaml.safe_dump({
+        "model_presets": {"B": {"provider": "openai", "model": "fixture-B"}},
+        "model": {"model_preset": "B"},
+    }), encoding="utf-8")
+    loaded = c.load_config()
+    loaded["display"]["show_thinking"] = False
+    c.save_config(loaded)
+    assert "model_presets" not in yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
 def test_real_config_loader_expands_and_save_keeps_authored_reference(tmp_path, monkeypatch):
     from hermes_cli import config as config_mod
     home = tmp_path / "hermes-home"; home.mkdir()

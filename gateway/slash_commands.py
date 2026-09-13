@@ -76,7 +76,7 @@ _WINDOWS_UPDATE_HELPER = """
 import os, subprocess, sys
 output_path, exit_code_path, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
 env = dict(os.environ, PYTHONUNBUFFERED="1")
-with open(output_path, "wb") as f:
+with open(output_path, "ab") as f:
     rc = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT, env=env).wait(timeout=3600)
 with open(exit_code_path, "w", encoding="utf-8") as f:
     f.write(str(rc))
@@ -191,7 +191,7 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
     update_cmd = (
         f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
-        f" > {shlex.quote(str(output_path))} 2>&1; "
+        f" >> {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
         f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path.parent / '.update_process_exit_code'))}")

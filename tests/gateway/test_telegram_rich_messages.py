@@ -235,6 +235,36 @@ async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unit", ["$10 and $20. ", "#89 remains open.\n\n", "[[1](https://example.com/source)] "])
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_rich_budget_uses_complete_rendered_payload(unit, oversized):
+    from plugins.platforms.telegram.adapter import _rich_normalize_linebreaks
+
+    # This test exercises rendering/routing, not elapsed-time pacing.
+    adapter = _make_adapter({"rich_messages": "always", "send_cooldown_seconds": 0})
+    content = unit * 100 + "sentinel "
+    if oversized:
+        # Linebreak-only budgeting fits, but currency/hash/citation rendering expands it.
+        content += "x" * (adapter.RICH_MESSAGE_MAX_CHARS - len(_rich_normalize_linebreaks(content)) - 8)
+    else:
+        content += "x" * (adapter.RICH_MESSAGE_MAX_CHARS - len(adapter._rich_message_payload(content)["markdown"]))
+    rendered = adapter._rich_message_payload(content)["markdown"]
+    assert len(_rich_normalize_linebreaks(content)) <= adapter.RICH_MESSAGE_MAX_CHARS
+    assert (len(rendered) > adapter.RICH_MESSAGE_MAX_CHARS) == oversized
+    result = await adapter.send("12345", content, metadata={"thread_id": "77"})
+    assert result.success
+    assert adapter._bot is not None
+    if oversized:
+        adapter._bot.do_api_request.assert_not_called()
+        assert adapter._bot.send_message.await_count > 1
+        assert all(call.kwargs.get("message_thread_id") == 77 for call in adapter._bot.send_message.call_args_list)
+    else:
+        assert adapter._bot.do_api_request.await_count == 1
+        assert _rich_api_kwargs(adapter)["rich_message"]["markdown"] == rendered
+        adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_oversized_content_skips_rich_and_chunks():
     adapter = _make_adapter()
     # > 32,768 characters -> rich pre-check fails, legacy chunking takes over.

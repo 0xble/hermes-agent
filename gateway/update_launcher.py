@@ -50,16 +50,21 @@ def launch_native_update(
         return {"started": False, "pending": True}
     try:
         with os.fdopen(fd, "wb") as marker:
+            # A prior updater may have claimed between the first check and our O_EXCL.
+            # Keep this exclusive marker empty (unresolvable by startup watchers)
+            # until all request-owned files are initialized.
+            if claimed_path.exists():
+                marker.close()  # Windows cannot unlink an open marker.
+                pending_path.unlink(missing_ok=True)
+                return {"started": False, "pending": True}
+            with output_path.open("wb") as output:
+                output.flush()
+                os.fsync(output.fileno())
+            exit_code_path.unlink(missing_ok=True)
+            (home / ".update_process_exit_code").unlink(missing_ok=True)
             marker.write(encoded)
             marker.flush()
             os.fsync(marker.fileno())
-        # A prior updater may have claimed between the first check and our O_EXCL.
-        # Remove only our new pending marker; preserve the claimed request verbatim.
-        if claimed_path.exists():
-            pending_path.unlink(missing_ok=True)
-            return {"started": False, "pending": True}
-        exit_code_path.unlink(missing_ok=True)
-        (home / ".update_process_exit_code").unlink(missing_ok=True)
         spawn(hermes_cmd, output_path, exit_code_path)
     except Exception:
         pending_path.unlink(missing_ok=True)

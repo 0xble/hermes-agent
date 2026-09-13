@@ -1996,10 +1996,10 @@ class TelegramAdapter(BasePlatformAdapter):
     # RAW agent markdown so tables, task lists, <details>, math render natively; legacy MarkdownV2 send()
     # is the fallback. Streaming edits stay on the MarkdownV2 edit path.
     def _content_fits_rich_limits(self, content: str) -> bool:
-        """Pre-check the 32,768-char cap against the *normalized* payload — paragraph materialization and
-        hard breaks expand the source, so count the Markdown shape actually sent. Other rich limits (500
-        blocks, 16 nesting levels, 20 table columns, …) surface as BadRequest (permanent)."""
-        return len(_rich_normalize_linebreaks(content)) <= self.RICH_MESSAGE_MAX_CHARS
+        """Check the cap against the complete markdown actually sent, including currency,
+        hash/citation escaping and linebreaks. Other rich limits (500 blocks, 16 nesting
+        levels, 20 table columns, …) surface as BadRequest (permanent)."""
+        return len(self._rich_message_payload(content)["markdown"]) <= self.RICH_MESSAGE_MAX_CHARS
 
     def _bot_supports_rich(self) -> bool:
         """True when ``do_api_request`` is an *async* callable (real Bot or AsyncMock); plain MagicMock
