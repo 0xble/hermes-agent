@@ -74,6 +74,65 @@ def test_interrupted_resume_freezes_route_owner_and_context(tmp_path, monkeypatc
     db.close()
 
 
+@pytest.mark.parametrize("boundary", ["safe", "dangling", "process", "stopped"])
+def test_failed_builder_checkpoint_and_same_child_recovery(tmp_path, monkeypatch, boundary):
+    from tools.delegate_tool_child_run import _build_result_entry, _SchemaOutcome
+    from tools.delegate_tool import _resolve_resume_launch
+    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tools import process_registry as pr
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = pr.ProcessRegistry()
+    monkeypatch.setattr(pr, "process_registry", registry)
+    metadata, definitions, _ = _resume_fixture(monkeypatch)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="cli")
+    db.create_session("child", source="tool", model_config={"_delegation_launch": metadata,
+        "_delegate_from": "root", "_delegation_completed": True, "_delegation_outcome": "completed"})
+    messages = [{"role": "user", "content": "Work"}]
+    db.append_message("child", role="user", content="Work")
+    if boundary == "dangling":
+        calls = [{"id": "write", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]
+        messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+        db.append_message("child", role="assistant", content="", tool_calls=calls)
+    if boundary == "process":
+        registry._running["proc_pending"] = pr.ProcessSession(id="proc_pending", command="effect",
+            owner_task_id="child-run", parent_session_id="child")
+    child = SimpleNamespace(_session_db=db, session_id="child", _delegation_named_type="advisor",
+        provider="fixture", model="m", _delegation_user_stopped=boundary == "stopped",
+        _process_owner_task_ids={"child-run"})
+    result = {"failed": True, "error": "provider rejected", "messages": messages}
+    entry = _build_result_entry(child, result, 0, 0, _SchemaOutcome(None, None, [], 0))
+    try:
+        assert entry["status"] == "failed"
+        checkpoint_child_resume(child, result, entry, child_task_id="child-run")
+        assert entry["status"] == "failed"
+        assert entry["resume_available"] is (boundary == "safe")
+        config = json.loads(db.get_session("child")["model_config"])
+        assert config["_delegation_outcome"] == "error"
+        assert config["_delegation_completed"] is (boundary == "safe")
+        parent = SimpleNamespace(session_id="root", _session_db=db)
+        task = {"resume_session_id": "child"}
+        if boundary != "safe":
+            with pytest.raises(ValueError, match="resume_authorization"):
+                _resolve_resume_launch(task, definitions, parent)
+            assert not db.claim_delegated_resumes(["child"], claim_id="unapproved")
+            task["resume_authorization"] = {"authorization": "Resume exact child",
+                "reconciliation": "Checked prior effects"}
+        if boundary in {"dangling", "process"}:
+            with pytest.raises(ValueError, match="tool effects|process"):
+                _resolve_resume_launch(task, definitions, parent)
+        else:
+            launch = _resolve_resume_launch(task, definitions, parent)
+            assert launch.resume_session_id == "child"
+            assert db.claim_delegated_resumes(["child"], claim_id="approved",
+                reconciliations={"child": launch.resume_recovery} if launch.resume_recovery else None)
+    finally:
+        db.close()
+
+
 def test_active_lease_blocks_duplicate_interrupted_resume(tmp_path):
     db = SessionDB(db_path=tmp_path / "active.db")
     db.create_session("child", source="tool", model_config={"_delegation_completed": True})

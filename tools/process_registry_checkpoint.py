@@ -18,6 +18,8 @@ class ProcessCheckpointMixin:
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
         from tools.process_registry_results import completed_result_record
 
+        if getattr(self, "_checkpoint_read_failed", False):
+            return  # Preserve unreadable source bytes until explicit repair/recovery.
         try:
             with self._lock:
                 entries = []
@@ -60,10 +62,15 @@ class ProcessCheckpointMixin:
             return 0
         try:
             entries = json.loads(_checkpoint_path().read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, ValueError):
+            self._checkpoint_read_failed = True
+            self._unresolved_checkpoint_entries = [None]  # Unknown ownership blocks all resumes.
             return 0
         if not isinstance(entries, list):
-            return 0  # Unparseable container is left untouched.
+            self._checkpoint_read_failed = True
+            self._unresolved_checkpoint_entries = [entries]
+            return 0  # Unparseable container is left untouched, including later writes.
+        self._checkpoint_read_failed = False
         recovered = 0
         self._unresolved_checkpoint_entries = []
         for entry in entries:
@@ -95,6 +102,32 @@ class ProcessCheckpointMixin:
             self._start_deadline(session)
         return recovered
 
+    def _retain_lost_checkpoint_entry(self, entry, reason):
+        """Losing a handle is not proof that its external effects were observed.
+
+        Reuse completed receipts and their write-failure fallback, but explicitly
+        represent UNKNOWN rather than a fabricated exit. No PID, watcher, scope,
+        or notification is restored. Exact newer observation proof wins.
+        """
+        from tools.process_registry import ProcessSession
+        from tools.process_registry_results import completed_result_record, restore_checkpoint_result
+
+        session = ProcessSession(
+            id=entry["session_id"], command=entry.get("command", "unknown"),
+            cwd=entry.get("cwd", ""), task_id=entry.get("task_id", ""),
+            owner_task_id=entry.get("owner_task_id") or entry.get("task_id", ""),
+            session_key=entry.get("session_key", ""), parent_session_id=entry.get("parent_session_id"),
+            started_at=entry.get("started_at", 0), exited=True, completion_reason="lost",
+            termination_source="checkpoint_recovery",
+            output_buffer=(f"Process {entry['session_id']} outcome is UNKNOWN: {reason}. "
+                           "No exit status or output receipt survived. Verify external effects; "
+                           "reading this receipt acknowledges uncertainty, not success. "
+                           "Use explicit resume_authorization with reconciliation to continue the child."))
+        session = restore_checkpoint_result(completed_result_record(session))
+        with self._lock:
+            self._finished[session.id] = session
+            self._result_generation += 1
+
     def _recover_live_checkpoint_entry(self, entry) -> bool:
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _CHECKPOINT_DEFAULTS,
@@ -103,6 +136,7 @@ class ProcessCheckpointMixin:
 
         pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
         if not pid:
+            self._retain_lost_checkpoint_entry(entry, "missing PID")
             return False
         # A multiplexed process registry adopts each live session only once.
         with self._lock:
@@ -112,6 +146,7 @@ class ProcessCheckpointMixin:
             logger.info(
                 "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                 entry.get("command", "unknown")[:60], pid, pid_scope)
+            self._retain_lost_checkpoint_entry(entry, "sandbox handle unavailable")
             return False
         # Alive AND the same process: across a restart the kernel may have
         # recycled the PID onto a stranger, and adopting it would let a later
@@ -130,6 +165,8 @@ class ProcessCheckpointMixin:
                     "retaining checkpoint entry for the next startup",
                     systemd_unit, pid)
                 self._unresolved_checkpoint_entries.append(entry)
+            else:
+                self._retain_lost_checkpoint_entry(entry, "process identity lost; exit/output unavailable")
             return False
         fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
         fields.update(

@@ -1155,7 +1155,7 @@ class TestCheckpoint:
         stop_unit.assert_called_once_with(entry["systemd_unit"])
         assert json.loads(checkpoint.read_text()) == [entry]
 
-    def test_recover_dead_wrapper_drops_reaped_systemd_scope(
+    def test_recover_reaped_scope_without_owner_preserves_uncertainty(
         self, registry, tmp_path, monkeypatch
     ):
         checkpoint = tmp_path / "procs.json"
@@ -1177,7 +1177,9 @@ class TestCheckpoint:
             assert registry.recover_from_checkpoint() == 0
 
         stop_unit.assert_called_once_with(entry["systemd_unit"])
-        assert json.loads(checkpoint.read_text()) == []
+        assert json.loads(checkpoint.read_text()) == [entry]
+        with pytest.raises(ValueError, match="owner"):
+            registry.unresolved_owned_processes({"any-owner"})
 
 
     def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
@@ -1194,10 +1196,12 @@ class TestCheckpoint:
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
-            assert registry.get("proc_remote") is None
-
+            receipt = registry.get("proc_remote")
+            assert receipt.exited and receipt.pid is None and receipt.process is None
+            assert receipt.completion_reason == "lost" and receipt.exit_code is None
+            assert registry.unresolved_owned_processes({"t1"}) == [receipt]
             data = json.loads(checkpoint.read_text())
-            assert data == []
+            assert data[0]["completed_result"]["result_observed"] is False
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline

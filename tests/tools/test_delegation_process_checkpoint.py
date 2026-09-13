@@ -501,6 +501,119 @@ def test_publication_and_observation_never_scan_history_under_registry_lock(tmp_
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("lost_case", ["sandbox", "dead", "recycled", "reaped", "missing_pid"])
+@pytest.mark.parametrize("write_failure", [False, True])
+def test_lost_process_owner_fence_survives_restart_and_same_child_resume(tmp_path, monkeypatch, lost_case, write_failure):
+    from tools import process_registry as pr
+    from tools import process_registry_results as receipts
+    from tools.delegate_tool import _resolve_resume_launch
+    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from gateway.session_context import scoped_current_session_id
+    import utils
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    producer = pr.ProcessRegistry()
+    session = pr.ProcessSession(id="proc_lost", command="external effect", task_id="container",
+        owner_task_id="child-run", parent_session_id="child", pid=12345,
+        pid_scope="sandbox" if lost_case == "sandbox" else "host", host_start_time=1,
+        systemd_unit="fixture.scope" if lost_case == "reaped" else "", started_at=2)
+    producer._running[session.id] = session
+    producer._write_checkpoint()
+    if lost_case == "missing_pid":
+        entries = json.loads(pr.CHECKPOINT_PATH.read_text())
+        entries[0]["pid"] = None
+        pr.CHECKPOINT_PATH.write_text(json.dumps(entries))
+    monkeypatch.setattr(pr.ProcessRegistry, "_host_pid_is_ours", lambda *a: False)
+    monkeypatch.setattr(pr.ProcessRegistry, "_is_host_pid_alive", lambda *a: lost_case == "recycled")
+    stops = []
+    monkeypatch.setattr(pr, "_stop_systemd_unit", lambda unit: stops.append(unit) or True)
+    metadata, definitions, _ = _resume_fixture(monkeypatch)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="cli")
+    db.create_session("child", source="tool", model_config={"_delegation_launch": metadata,
+        "_delegation_completed": True, "_delegate_from": "root"})
+    messages = [{"role": "user", "content": "Work"}]
+    db.append_message("child", role="user", content="Work")
+    child = SimpleNamespace(_session_db=db, session_id="child", _delegation_named_type="advisor",
+        provider="fixture", model="m", _process_owner_task_ids={"child-run"})
+    parent = SimpleNamespace(session_id="root", _session_db=db)
+    task = {"resume_session_id": "child", "resume_authorization": {
+        "authorization": "Resume this exact child", "reconciliation": "Verified effects before continuation"}}
+    def fail_write(*a, **kw):
+        raise OSError("injected disk failure")
+    try:
+        for attempt in range(2):
+            registry = pr.ProcessRegistry()
+            monkeypatch.setattr(pr, "process_registry", registry)
+            with monkeypatch.context() as fault:
+                if write_failure:
+                    fault.setattr(utils, "atomic_json_write", fail_write)
+                    fault.setattr(receipts, "atomic_json_write", fail_write)
+                assert registry.recover_from_checkpoint() == 0
+            pending = registry.unresolved_owned_processes({"child-run"})
+            assert [s.id for s in pending] == [session.id]
+            assert pending[0].exit_code is None and pending[0].completion_reason == "lost"
+            assert pending[0].pid is None and pending[0].process is None
+            assert registry.unresolved_owned_processes({"other-run"}) == []
+            assert not registry.has_any_active()
+            assert registry.completion_queue.empty() and registry.pending_watchers == []
+            entry = {"status": "interrupted"}
+            checkpoint_child_resume(child, {"messages": messages}, entry, child_task_id="child-run")
+            assert entry["resume_available"] is False
+            with pytest.raises(ValueError, match="process"):
+                _resolve_resume_launch(task, definitions, parent)
+            assert not db.claim_delegated_resumes(["child"], claim_id="blocked")
+        assert stops == (["fixture.scope"] * (2 if write_failure else 1) if lost_case == "reaped" else [])
+        stale_checkpoint = pr.CHECKPOINT_PATH.read_text()
+        # Observation of the exact unknown receipt does not assert success. The
+        # parent still supplies explicit reconciliation before same-child resume.
+        # A failed observation publication cannot clear the fence.
+        with monkeypatch.context() as fault:
+            fault.setattr(receipts, "atomic_json_write", fail_write)
+            with scoped_current_session_id("child"):
+                registry.read_log(session.id)
+        assert registry.unresolved_owned_processes({"child-run"})
+        with monkeypatch.context() as fault:
+            fault.setattr(utils, "atomic_json_write", fail_write)
+            with scoped_current_session_id("child"):
+                result = registry.read_log(session.id)
+                assert "UNKNOWN" in result["output"] and session.id in result["output"]
+        # Leave a stale LIVE or fallback checkpoint next to newer observation.
+        pr.CHECKPOINT_PATH.write_text(stale_checkpoint)
+        registry = pr.ProcessRegistry()
+        monkeypatch.setattr(pr, "process_registry", registry)
+        assert registry.recover_from_checkpoint() == 0
+        assert registry.unresolved_owned_processes({"child-run"}) == []
+        with pytest.raises(ValueError, match="resume_authorization"):
+            _resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
+        launch = _resolve_resume_launch(task, definitions, parent)
+        assert launch.resume_session_id == "child"
+        assert db.claim_delegated_resumes(["child"], claim_id="reconciled",
+            reconciliations={"child": launch.resume_recovery})
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("raw", ["{", "null", "{}", "[null]", '[{"session_id":"proc_lost","pid":null}]'])
+def test_unreadable_lost_checkpoint_cannot_clear_owner_fence(tmp_path, monkeypatch, raw):
+    from tools import process_registry as pr
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    pr.CHECKPOINT_PATH.write_text(raw)
+    for _ in range(2):
+        registry = pr.ProcessRegistry()
+        assert registry.recover_from_checkpoint() == 0
+        registry._write_checkpoint()
+        with pytest.raises(ValueError, match="owner"):
+            registry.unresolved_owned_processes({"child-run"})
+        assert pr.CHECKPOINT_PATH.read_text() == raw or json.loads(pr.CHECKPOINT_PATH.read_text()) == json.loads(raw)
+        assert registry.completion_queue.empty() and registry.pending_watchers == []
+
+
 @pytest.mark.parametrize("failure_at", ["completion", "observation"])
 def test_failed_receipt_successful_checkpoint_recovers_exact_unresolved_effect(tmp_path, monkeypatch, failure_at):
     from tools import process_registry as pr

@@ -44,7 +44,14 @@ def prepare_resume_recovery(task, db, session_id, config, parent_root):
     if config.get("_delegation_resume_blocked_reason") in {
         "unreconciled_background_processes", "background_process_registry_unavailable"
     }:
-        raise ValueError("Reconcile background process receipts through process tools before continuation")
+        # A persisted blocker cannot be cleared by prose alone. Recheck its
+        # exact spawning owners after process tools durably observed receipts.
+        from tools.process_registry import process_registry
+        owners = config.get("_delegation_process_owner_task_ids")
+        if (not isinstance(owners, list) or not owners
+                or any(not isinstance(owner, str) or not owner for owner in owners)
+                or process_registry.unresolved_owned_processes(owners)):
+            raise ValueError("Reconcile background process receipts through process tools before continuation")
     if not config.get("_delegation_completed") and config.get("_delegation_outcome") not in {
         "interrupted", "error", "timeout", "budget_exhausted", "completed"
     }:
@@ -77,18 +84,19 @@ def _signature(messages):
 
 def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
     from tools.delegate_tool import _resume_history_is_safe, _refresh_resumable_launch_metadata
-    if entry.get("status") in {"completed", "budget_exhausted", "interrupted", "error", "timeout"}:
+    outcome = "error" if entry.get("status") == "failed" else entry.get("status")
+    if outcome in {"completed", "budget_exhausted", "interrupted", "error", "timeout"}:
         db = getattr(child, "_session_db", None)
         named_child = getattr(child, "_delegation_named_type", None) is not None
         if named_child:
             entry["resume_available"] = False
         safe_history = _resume_history_is_safe((result or {}).get("messages"))
+        owners = set(getattr(child, "_process_owner_task_ids", ()) or ())
+        owners.update((child_task_id, getattr(child, "_current_task_id", None), getattr(child, "_subagent_id", None)))
+        owners = sorted(owner for owner in owners if isinstance(owner, str) and owner)
         try:
             from tools.process_registry import process_registry
-            owners = set(getattr(child, "_process_owner_task_ids", ()) or ())
-            owners.update((child_task_id, getattr(child, "_current_task_id", None), getattr(child, "_subagent_id", None)))
-            if process_registry.unresolved_owned_processes(
-                    owner for owner in owners if isinstance(owner, str) and owner):
+            if process_registry.unresolved_owned_processes(owners):
                 safe_history = False
                 entry["resume_blocked_reason"] = "unreconciled_background_processes"
         except Exception:
@@ -110,7 +118,8 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
             if db is not None:
                 try:
                     db.patch_session_model_config(child.session_id, {
-                        "_delegation_completed": False, "_delegation_outcome": entry["status"],
+                        "_delegation_completed": False, "_delegation_outcome": outcome,
+                        "_delegation_process_owner_task_ids": owners,
                         "_delegation_user_stopped": getattr(child, "_delegation_user_stopped", False) is True,
                         "_delegation_interrupt_reason": getattr(child, "_delegation_interrupt_reason", None),
                         "_delegation_stop_token": getattr(child, "_delegation_stop_token", None),
@@ -130,7 +139,8 @@ def checkpoint_child_resume(child, result, entry, *, child_task_id=None):
                     "_delegation_completed": True,
                     "_delegation_user_stopped": False,
                     "_delegation_resume_blocked_reason": None,
-                    "_delegation_outcome": entry["status"],
+                    "_delegation_outcome": outcome,
+                    "_delegation_process_owner_task_ids": owners,
                     "_delegation_resume_claimed_at": None,
                     "_delegation_resume_recovery_previous": None,
                     "_delegation_interrupt_reason": getattr(child, "_delegation_interrupt_reason", None),
