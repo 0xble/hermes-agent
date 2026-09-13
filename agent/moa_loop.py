@@ -172,7 +172,7 @@ def _nonsecret_moa_value(value: Any) -> Any:
 
 def _moa_runtime_identity(runtime: dict[str, Any]) -> dict[str, Any]:
     """Durable nonsecret identity for one frozen physical MoA slot."""
-    from tools.custom_subagents import _authority_mapping_fingerprint, nonsecret_route_url
+    from tools.custom_subagents import _authority_mapping_fingerprint, _nonsecret_request_overrides, nonsecret_route_url
     request_overrides = copy.deepcopy(runtime.get("request_overrides") or {})
     return {
         "provider": str(runtime.get("provider") or ""),
@@ -182,7 +182,7 @@ def _moa_runtime_identity(runtime: dict[str, Any]) -> dict[str, Any]:
         "authority_fingerprint": hashlib.sha256(
             str(runtime.get("api_key") or "").encode()
         ).hexdigest(),
-        "request_overrides": _nonsecret_moa_value(request_overrides),
+        "request_overrides": _nonsecret_request_overrides(request_overrides),
         "request_overrides_fingerprint": _authority_mapping_fingerprint(request_overrides),
     }
 
@@ -233,10 +233,20 @@ def restore_moa_preset(metadata: dict[str, Any]) -> FrozenMoaPreset:
         comparable_stored = dict(stored_identity) if isinstance(stored_identity, dict) else {}
         comparable_current.pop("request_overrides_fingerprint", None)
         comparable_stored.pop("request_overrides_fingerprint", None)
+        comparable_current.pop("request_overrides", None)
+        comparable_stored.pop("request_overrides", None)
         if not authority_matches or comparable_current != comparable_stored:
             raise ValueError(f"delegated MoA session slot {index} no longer matches its frozen authority")
         _freeze_moa_slot_runtime(slot, runtime)
-    return FrozenMoaPreset(name, preset, options, public_fingerprint)
+    # The old snapshot was verified before reauthorization. Publish its newly
+    # sanitized view with a matching digest for the next resume.
+    restored = FrozenMoaPreset(name, preset, options, public_fingerprint)
+    public = restored.metadata()["preset_snapshot"]
+    fingerprint = hashlib.sha256(json.dumps(
+        {"preset": public, "options": options}, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode()).hexdigest()[:16]
+    return replace(restored, fingerprint=fingerprint)
 
 
 def snapshot_moa_preset(preset_name: str) -> FrozenMoaPreset:

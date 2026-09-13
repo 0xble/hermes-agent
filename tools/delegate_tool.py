@@ -365,7 +365,7 @@ def _build_child_agent(
         # Shared pool lets children rotate credentials on rate limits.
         if subagent_definition is not None:
             from tools.custom_subagents import (
-                RuntimePin, _authority_mapping_fingerprint, _nonsecret_mapping,
+                RuntimePin, _authority_mapping_fingerprint, _nonsecret_request_overrides,
                 inherited_credential_pool, nonsecret_route_url,
             )
             child._delegation_named_type = subagent_definition.name
@@ -401,7 +401,7 @@ def _build_child_agent(
                     "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
                     "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
                     "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
-                    "request_overrides": _nonsecret_mapping(json.loads(getattr(
+                    "request_overrides": _nonsecret_request_overrides(json.loads(getattr(
                         getattr(child, "_delegation_runtime_pin", None), "request_overrides_json", "{}"
                     ))),
                     "request_overrides_fingerprint": _authority_mapping_fingerprint(json.loads(getattr(
@@ -579,6 +579,11 @@ def _fallback_metadata_matches(routes, expected, *, refreshed_accounts=frozenset
         ):
             return False
         current = route.metadata()
+        # Full authority was checked above. Public projections can become stricter
+        # without changing which request this historical launch authorized.
+        stored = dict(stored)
+        current.pop("request_overrides", None)
+        stored.pop("request_overrides", None)
         if index in refreshed_accounts:
             # Only restoration's positive stable-account authorization permits
             # a new token digest. All other route/override/account fields match.
@@ -899,6 +904,18 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
                 fallbacks=tuple(FallbackDefinition(route.provider, route.model, route.reasoning_effort)
                                 for route in fallbacks),
             )
+    from tools.custom_subagents import _authority_mapping_fingerprint, _nonsecret_request_overrides
+    launch = deepcopy(launch)
+    for route_metadata in [launch, *(launch.get("fallbacks") or [])]:
+        prior_overrides = route_metadata.get("request_overrides") or {}
+        public_overrides = _nonsecret_request_overrides(prior_overrides)
+        if prior_overrides != public_overrides and not route_metadata.get("request_overrides_fingerprint"):
+            # Fingerprint-free legacy rows were accepted only by exact raw
+            # equality above. Retain that proof before discarding private values.
+            route_metadata["request_overrides_fingerprint"] = _authority_mapping_fingerprint(prior_overrides)
+        route_metadata["request_overrides"] = public_overrides
+    if snapshot is not None:
+        launch["moa"] = snapshot.metadata()
     return ResolvedSubagentLaunch(
         definition, creds, reasoning, fallbacks, snapshot, tip,
         tuple(str(x) for x in launch.get("enabled_toolsets") or ()),

@@ -56,7 +56,7 @@ class ResolvedRoute:
     reasoning_effort: str | None
     api_key: str | None = field(default=None, repr=False, compare=False)
     credential_digest: str = field(default="", repr=False)
-    request_overrides_json: str = "{}"
+    request_overrides_json: str = field(default="{}", repr=False)
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
     credential_pool_entry_id: str | None = None
     # Config authority (e.g. custom:first), distinct from normalized wire provider.
@@ -80,7 +80,7 @@ class ResolvedRoute:
             "base_url": nonsecret_route_url(self.base_url), "api_mode": self.api_mode,
             "reasoning_effort": self.reasoning_effort,
             "authority_fingerprint": self.credential_digest,
-            "request_overrides": _nonsecret_mapping(json.loads(self.request_overrides_json)),
+            "request_overrides": _nonsecret_request_overrides(json.loads(self.request_overrides_json)),
             "request_overrides_fingerprint": _authority_mapping_fingerprint(
                 json.loads(self.request_overrides_json)
             ),
@@ -129,11 +129,25 @@ def _mapping_key_is_secret(key, value) -> bool:
 
 def _nonsecret_mapping(value):
     if isinstance(value, dict):
-        return {key: _nonsecret_mapping(item) for key, item in value.items()
+        return {key: (_nonsecret_request_overrides(item) if key == "request_overrides"
+                      else _nonsecret_mapping(item)) for key, item in value.items()
                 if not _mapping_key_is_secret(key, item)}
     if isinstance(value, list):
         return [_nonsecret_mapping(item) for item in value]
     return value
+
+
+def _nonsecret_request_overrides(value) -> dict:
+    """Persist only known numeric limits, never arbitrary provider payloads.
+
+    Free-form body/query/header values can authenticate under any name. Complete
+    authority is retained separately by the fingerprint, not by this public view.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items()
+            if key in _NONSECRET_TOKEN_LIMIT_KEYS
+            and isinstance(item, int) and not isinstance(item, bool) and item >= 0}
 
 
 def _authority_mapping_fingerprint(value) -> str:
@@ -678,7 +692,7 @@ class RuntimePin:
     _pinned_credential: bool = field(default=False, repr=False)
     _credential_pool: CredentialPool | None = field(default=None, repr=False, compare=False)
     fallback_routes: tuple[ResolvedRoute, ...] = ()
-    request_overrides_json: str = "{}"
+    request_overrides_json: str = field(default="{}", repr=False)
 
     @classmethod
     def from_child(cls, child, definition, reasoning):

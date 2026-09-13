@@ -164,6 +164,9 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
         "authorization": "PRIMARY-AUTH-SENTINEL",
         "nested": {"access_token": "PRIMARY-NESTED-SENTINEL", "safe": "value"},
         "extra_headers": {"X-Api-Key": "PRIMARY-HEADER-SENTINEL"},
+        "extra_query": {"key": "PRIMARY-QUERY-SENTINEL"},
+        "extra_body": {"password": "PRIMARY-BODY-SENTINEL", "opaque": ["PRIMARY-OPAQUE-SENTINEL"]},
+        "vendor_option": "PRIMARY-UNKNOWN-SENTINEL",
     }
     definition = parse_definitions({"subagents": {"advisor": {
         "description": "Advise", "instructions": "Analyze", "provider": "fixture", "model": "m",
@@ -198,13 +201,15 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     launch = child._delegation_launch_metadata
     assert launch["base_url"] == endpoint
     durable = json.dumps(launch)
-    assert launch["request_overrides"] == {"max_output_tokens": 321, "nested": {"safe": "value"}}
+    assert launch["request_overrides"] == {"max_output_tokens": 321}
     assert all(sentinel not in durable for sentinel in (
         "PRIMARY-API-SENTINEL", "PRIMARY-AUTH-SENTINEL", "PRIMARY-NESTED-SENTINEL",
-        "PRIMARY-HEADER-SENTINEL",
+        "PRIMARY-HEADER-SENTINEL", "PRIMARY-QUERY-SENTINEL", "PRIMARY-BODY-SENTINEL",
+        "PRIMARY-OPAQUE-SENTINEL", "PRIMARY-UNKNOWN-SENTINEL",
     ))
 
     pin = child._delegation_runtime_pin
+    assert "SENTINEL" not in repr(pin)
     assert "PRIMARY-AUTH-SENTINEL" in pin.request_overrides_json
     pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
         api_key="PRIMARY-API-SENTINEL", base_url=endpoint,
@@ -231,6 +236,17 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     })
     resumed = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, {"advisor": definition}, resume_parent)
     assert resumed.credentials["request_overrides"] == raw_overrides
+    # A legacy row may contain the entire raw mapping without a digest. Exact
+    # reauthorization must precede migration to a credential-free durable view.
+    launch["request_overrides"] = raw_overrides
+    launch.pop("request_overrides_fingerprint")
+    resumed = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, {"advisor": definition}, resume_parent)
+    assert "SENTINEL" not in json.dumps(resumed.launch_metadata)
+    assert resumed.credentials["request_overrides"] == raw_overrides
+    launch = dict(resumed.launch_metadata)
+    assert delegate_tool._resolve_resume_launch(
+        {"resume_session_id": "child"}, {"advisor": definition}, resume_parent,
+    ).credentials["request_overrides"] == raw_overrides
 
 
 def test_real_constructor_named_moa_child_has_no_parent_fallback_chain(monkeypatch):
@@ -982,3 +998,76 @@ def test_resume_reauthorizes_unchanged_trusted_owner_overrides(monkeypatch, owne
         defaults["request_overrides"] = {"max_tokens": 322}
     with pytest.raises(ValueError, match="primary route can no longer be authorized exactly"):
         delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent, defaults=defaults)
+
+
+@pytest.mark.parametrize("mutation", [None, "query", "body", "missing_fingerprint"])
+def test_fallback_override_projection_preserves_exact_resume_authority(mutation):
+    from dataclasses import replace
+    from tools.custom_subagents import ResolvedRoute
+    from tools.delegate_tool import _fallback_metadata_matches
+
+    overrides = {"max_tokens": 42, "extra_query": {"key": "QUERY-SENTINEL"},
+                 "extra_body": {"opaque": ["BODY-SENTINEL"]}}
+    route = ResolvedRoute("fixture", "m", "https://fixture/v1", "chat_completions", None,
+                          "runtime-key", "digest", json.dumps(overrides))
+    public = route.metadata()
+    assert public["request_overrides"] == {"max_tokens": 42}
+    assert "SENTINEL" not in json.dumps(public)
+    assert "SENTINEL" not in repr(route)
+    assert route.native_entry()["request_overrides"] == overrides
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    wire = ChatCompletionsTransport().build_kwargs(
+        "m", [{"role": "user", "content": "probe"}],
+        request_overrides=route.native_entry()["request_overrides"],
+    )
+    assert wire["extra_query"] == overrides["extra_query"]
+    assert wire["extra_body"] == overrides["extra_body"]
+    # Older public projections retained arbitrary payload values. Only the full
+    # authority digest permits compatibility across that projection change.
+    historical = {**public, "request_overrides": overrides}
+    if mutation == "missing_fingerprint":
+        historical = dict(public)
+        historical.pop("request_overrides_fingerprint")
+    elif mutation:
+        changed = json.loads(route.request_overrides_json)
+        changed[f"extra_{mutation}"] = {"opaque": "CHANGED-SENTINEL"}
+        route = replace(route, request_overrides_json=json.dumps(changed))
+    assert _fallback_metadata_matches((route,), [historical]) is (mutation is None)
+
+
+@pytest.mark.parametrize("mutation", [None, "query", "body", "missing_fingerprint"])
+def test_moa_override_projection_reauthorizes_and_rewrites_legacy_snapshot(monkeypatch, mutation):
+    from agent import moa_loop
+
+    overrides = {"max_tokens": 42, "extra_query": {"key": "QUERY-SENTINEL"},
+                 "extra_body": {"secret": "BODY-SENTINEL"}}
+    preset = {"reference_models": [{"provider": "p", "model": "ref"}],
+              "aggregator": {"provider": "p", "model": "agg", "request_overrides": overrides}}
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda _: (preset, {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda *, requested, target_model: {
+        "provider": requested, "model": target_model, "base_url": "https://fixture/v1",
+        "api_key": "runtime-key", "api_mode": "chat_completions", "request_overrides": overrides})
+    snapshot = moa_loop.snapshot_moa_preset("fixture")
+    metadata = snapshot.metadata()
+    assert "SENTINEL" not in json.dumps(metadata)
+    assert snapshot.preset["aggregator"]["_frozen_runtime"]["request_overrides"] == overrides
+    historical = json.loads(json.dumps(metadata))
+    for slot in moa_loop.physical_slots(historical["preset_snapshot"]):
+        if mutation == "missing_fingerprint":
+            slot["runtime_identity"].pop("request_overrides_fingerprint")
+        else:
+            slot["runtime_identity"]["request_overrides"] = json.loads(json.dumps(overrides))
+    historical["preset_fingerprint"] = hashlib.sha256(json.dumps(
+        {"preset": historical["preset_snapshot"], "options": historical["options"]},
+        sort_keys=True, separators=(",", ":"), default=str,
+    ).encode()).hexdigest()[:16]
+    if mutation in ("query", "body"):
+        overrides[f"extra_{mutation}"] = {"opaque": "CHANGED-SENTINEL"}
+    if mutation:
+        with pytest.raises(ValueError, match="frozen authority"):
+            moa_loop.restore_moa_preset(historical)
+    else:
+        restored = moa_loop.restore_moa_preset(historical)
+        assert "SENTINEL" not in json.dumps(restored.metadata())
+        assert restored.preset["aggregator"]["_frozen_runtime"]["request_overrides"] == overrides
+        assert moa_loop.restore_moa_preset(restored.metadata()).metadata() == restored.metadata()
