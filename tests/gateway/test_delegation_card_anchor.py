@@ -17,7 +17,7 @@ from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 
 from gateway import delegation_card_anchor as anchor
 from gateway.config import Platform, PlatformConfig
-from gateway.delegation_cards import DelegationCards
+from gateway.delegation_cards import DelegationCards, render_card
 from gateway.session import SessionSource
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -630,3 +630,50 @@ async def test_new_work_during_last_send_is_not_lost_or_allowed_to_bypass_fence(
     await drain(restored)
     assert attempts == (4 if outcome == "rejected" else 3)
     assert all(not c.get("handled") and not c.get("retired") for c in restored.cards.values())
+
+
+@pytest.mark.asyncio
+async def test_member_resume_after_replacement_render_reconciles_without_another_event(tmp_path):
+    manager, adapter, source, data, card, live, calls = await fixture(tmp_path)
+    anchor_key = data["parent_task_id"]
+    member_data = {**data, "parent_task_id": "b" * 32, "task_label": "Resumable member", "child_session_id": "member-child"}
+    member_key = member_data["parent_task_id"]
+    for event in ("subagent.start", "subagent.complete"):
+        await manager.observe(source, "r", "s", 1, event, None, member_data)
+        await drain(manager)
+    assert manager._anchor(member_key) == anchor_key
+    assert manager.cards[member_key]["rows"]["A"]["state"] == "completed"
+    edits_before = adapter._bot.edit_message_text.await_count
+    original_send = adapter._bot.send_message.side_effect
+    rendered, release = asyncio.Event(), asyncio.Event()
+    payloads = []
+
+    async def blocked_send(**kw):
+        # Bot API receives text only after anchoring.latest() has rendered it.
+        payloads.append(kw["text"])
+        rendered.set()
+        await release.wait()
+        return await original_send(**kw)
+
+    adapter._bot.send_message.side_effect = blocked_send
+    try:
+        for mid in range(anchor.DISPLACEMENT):
+            await inbound(adapter, 1000 + mid)
+        assert anchor.eligible(manager, anchor_key) or anchor.pending(card), (manager.displacement, card)
+        await asyncio.wait_for(rendered.wait(), 10)
+        stale_render = card["reanchor"]["rendered"]
+        await manager.observe(source, "r", "s", 2, "subagent.admitted", None,
+                              {**member_data, "attempt": 1, "resume_claim_id": "resumed-during-send"})
+        assert manager.cards[member_key]["rows"]["A"]["state"] == "running"
+        expected = render_card(manager._projection(anchor_key))
+        assert expected != stale_render
+    finally:
+        release.set()
+        await drain(manager)
+    # Successful receipt adoption advances the anchor revision, so the pending
+    # flush edits fresh state without a tool tick, reconcile call or second event.
+    assert len(payloads) == 1
+    assert len(live) == 1
+    assert card["rendered"] == expected
+    assert adapter._bot.edit_message_text.await_count == edits_before + 1
+    assert manager.cards[member_key]["attempt_history"]["A"]["0"]["state"] == "completed"
