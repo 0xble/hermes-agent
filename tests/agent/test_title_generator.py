@@ -879,6 +879,39 @@ class TestAutoTitleSession:
 
         assert generate.call_args.kwargs.get("avoid_titles") in (None, [])
 
+    @pytest.mark.parametrize("source", ["derived", "user"])
+    @pytest.mark.parametrize("content, expected", [
+        ("Investigating authentication configuration inconsistencies requires examining multiple environmental variables and carefully reviewing deployment documentation before proceeding", None),
+        ("a b c d e f g h i j k l m n o p q r s t", None),
+        ("```json", None),
+        ('{"title": "projectx deployment checks"}', "Canonical Project deployment checks"),
+    ])
+    def test_full_title_validation_precedes_alias_and_limit_persistence(
+        self, tmp_path, source, content, expected
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
+        original = "Check deployment settings"
+        if source == "user":
+            db.set_session_title("sess-1", original)
+        else:
+            db.set_auto_title("sess-1", original, source=source)
+        response = MagicMock()
+        response.choices[0].message.content = content
+        config = {"auxiliary": {"title_generation": {
+            "name_aliases": {"projectx": "Canonical Project"},
+            "max_words": 5, "max_characters": 45,
+        }}}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", return_value=response),
+        ):
+            auto_title_session(db, "sess-1", "Check projectx deployment settings")
+        upgraded = expected is not None and source == "derived"
+        assert db.get_session_title("sess-1") == (expected if upgraded else original)
+        assert db.get_session_title_source("sess-1") == ("llm" if upgraded else source)
+        db.close()
+
     def test_malformed_model_title_preserves_derived_title_and_source(self, tmp_path):
         db = SessionDB(tmp_path / "state.db")
         db.create_session(session_id="sess-1", source="cli")

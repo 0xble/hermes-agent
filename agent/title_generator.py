@@ -593,10 +593,10 @@ def _truncate_title(title: str, max_characters: int) -> str:
 
 def _clean_title(
     text: str,
-    max_characters: int = 80,
+    max_characters: Optional[int] = 80,
     max_words: Optional[int] = None,
 ) -> Optional[str]:
-    """Normalize and hard-limit a model-produced title."""
+    """Normalize a model-produced title, optionally enforcing presentation limits."""
     title = " ".join((text or "").split())
     title = title.strip("\"'").strip()
     if title.lower().startswith("title:"):
@@ -617,7 +617,7 @@ def _clean_title(
         words = title.split()
         if len(words) > max_words:
             title = " ".join(words[:max_words]).rstrip(" ,.;:—-")
-    if len(title) > max_characters:
+    if max_characters is not None and len(title) > max_characters:
         title = _truncate_title(title, max_characters)
     return title or None
 
@@ -721,13 +721,9 @@ def generate_title(
                 f"(finish_reason={finish_reason})"
             )
         content = choice.message.content or ""
-        # Normalize model chatter first, then apply aliases, then enforce the
-        # configured limits exactly once so ellipsis handling is stable.
-        title = _clean_title(
-            _extract_title_text(content),
-            100,
-            None,
-        )
+        # Extract and normalize without shortening: presentation limits must not
+        # turn an answer into an apparently usable title before validation.
+        title = _clean_title(_extract_title_text(content), max_characters=None)
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
         # with many words is a model that ignored the task and answered
         # the user's message instead. Reject it rather than storing an
@@ -738,6 +734,8 @@ def generate_title(
                 len(title.split()), _MAX_TITLE_WORDS,
             )
             title = None
+        if title is None:
+            return None  # Aliases must not revive rejected output as LLM authority.
         canonical_name = _canonical_name_for_message(
             summarized_user_message, preferences.name_aliases
         )
@@ -771,8 +769,6 @@ def generate_title(
                         break
             if title and not replaced and canonical_name.casefold() not in title.casefold():
                 title = f"{canonical_name} {title}"
-            elif not title:
-                title = canonical_name
         final_title = _clean_title(
             title or "",
             preferences.max_characters or _MAX_PERSISTED_TITLE_CHARS,

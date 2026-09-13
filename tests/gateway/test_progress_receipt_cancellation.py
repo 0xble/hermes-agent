@@ -32,14 +32,21 @@ class ReceiptAdapter:
         self.next_id += 1
         message_id = f"progress-{self.next_id}"
         self.sent.append((message_id, content))
-        if self.mode == "raise":
+        if self.mode in {"raise", "missing"}:
+            self.accepted.set()
+            if self.mode == "missing":
+                return None
             raise RuntimeError("transport failed before receipt")
         if self.mode in {"pending", "pending_raise"}:
             self.accepted.set()
             await self.release.wait()
         if self.mode == "pending_raise":
             raise RuntimeError("transport failed after accepted send")
-        return SendResult(success=True, message_id=message_id)
+        return SendResult(
+            success=True,
+            message_id=None if self.mode in {"no_id", "duplicate", "not_modified"} else message_id,
+            error=self.mode if self.mode in {"duplicate", "not_modified"} else None,
+        )
 
     async def edit_message(self, chat_id, message_id, content, **kwargs):
         self.edits.append((message_id, content))
@@ -62,6 +69,54 @@ def _runner(adapter, *, cleanup=True):
     )
     gateway = SimpleNamespace(_adapter_for_source=lambda source: adapter)
     return ctx, TurnRunner(gateway, ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["success", "no_id", "duplicate", "not_modified", "pending", "pending_raise", "raise", "missing"])
+@pytest.mark.parametrize("queued_suffix", [False, True])
+async def test_public_separate_progress_cancel_sends_only_unsent_suffix(monkeypatch, mode, queued_suffix):
+    adapter = ReceiptAdapter(mode)
+    ctx, runner = _runner(adapter)
+    ctx.progress_grouping = "separate"
+    rendered = asyncio.Event()
+    hold = asyncio.Event()
+    async def after_render(st):
+        if len(adapter.sent) == 2:
+            rendered.set()
+            await hold.wait()
+    monkeypatch.setattr(runner, "_progress_restore_typing", after_render)
+    for text in ["first tool", "second tool"]:
+        ctx.progress_queue.put(text)
+    task = asyncio.create_task(runner.send_progress_messages())
+    try:
+        await asyncio.wait_for(
+            adapter.accepted.wait() if mode not in {"success", "no_id", "duplicate", "not_modified"} else rendered.wait(), 5
+        )
+        if queued_suffix:
+            ctx.progress_queue.put("unsent tool")
+        task.cancel()
+        await asyncio.wait_for(task, 5)
+        expected = ["first tool"] if mode not in {"success", "no_id", "duplicate", "not_modified"} else [
+            "first tool", "second tool", *(["unsent tool"] if queued_suffix else [])
+        ]
+        assert [text for _, text in adapter.sent] == expected
+        assert adapter.edits == []
+    finally:
+        adapter.release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_public_progress_without_edit_support_is_still_skipped():
+    adapter = SimpleNamespace(send=pytest.fail)
+    ctx, runner = _runner(adapter)
+    ctx.progress_grouping = "separate"
+    ctx.progress_queue.put("tool started")
+    await runner.send_progress_messages()
+    assert ctx.progress_queue.empty()
 
 
 async def _cancel_after_first_send(ctx, runner, adapter):

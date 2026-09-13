@@ -535,6 +535,11 @@ class TurnRunner:
         pending_send_receipt: Any = None
         retained_send_receipt: Any = None
         cancel_saw_ambiguous_send: bool = False
+        # Delivery is independent of editability and receipt IDs. Keep the buffer
+        # for dedup; only its unretired suffix is eligible for send-only delivery.
+        # Accepted sends retire lines, as does an intentionally abandoned stale
+        # replacement (whose existing retry policy is one attempt).
+        retired_progress_lines: int = 0
         # Anchors already replaced once. A second failure on the same id is not a stale
         # anchor, so it falls through to disabling edits instead of looping on sends.
         recovered_stale_anchor_ids: set = dataclasses.field(default_factory=set)
@@ -663,6 +668,10 @@ class TurnRunner:
         st.recovered_stale_anchor_ids.add(stale_anchor_id)
         replacement = await self._send_progress_text(st, text)
         replacement_id = getattr(replacement, "message_id", None)
+        # The stale snapshot gets one replacement attempt, never a line-by-line
+        # replay on the next tick or cancellation. Later updates remain eligible.
+        if text == self._progress_text(st.progress_lines):
+            st.retired_progress_lines = len(st.progress_lines)
         if getattr(replacement, "success", False) and replacement_id:
             st.progress_msg_id = str(replacement_id)
             logger.info("[%s] Replaced stale progress message %s with %s; edits remain enabled",
@@ -708,10 +717,13 @@ class TurnRunner:
         except Exception:
             if st.pending_send_receipt is receipt:
                 st.pending_send_receipt = None
+            st.cancel_saw_ambiguous_send = True
             raise
         else:
             if st.pending_send_receipt is receipt:
                 st.pending_send_receipt = None
+        if result is None:
+            st.cancel_saw_ambiguous_send = True
         self._track_progress_result(result, st.adapter)
         return result
 
@@ -793,6 +805,7 @@ class TurnRunner:
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
         st.progress_lines = groups[-1]
+        st.retired_progress_lines = len(st.progress_lines) if result.success else 0
         return True
 
     _CONTENT_BOUNDARY_TYPES = (
@@ -807,6 +820,7 @@ class TurnRunner:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         st.progress_msg_id, st.progress_lines = None, []
+        st.retired_progress_lines = 0
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     async def _seal_progress_boundary(self, st, source: str) -> None:
@@ -864,6 +878,8 @@ class TurnRunner:
             _, base_msg, count = raw
             if not st.progress_lines:
                 return base_msg
+            st.retired_progress_lines = min(
+                st.retired_progress_lines, len(st.progress_lines) - 1)
             st.progress_lines[-1] = f"{base_msg} (×{count + 1})"
             return st.progress_lines[-1]
         st.progress_lines.append(raw)
@@ -905,6 +921,12 @@ class TurnRunner:
                     continue
                 self._progress_absorb(st, raw)
                 await self._roll_progress_overflow_if_needed(st)
+        # Send-only receipts can be acknowledged without ever yielding an anchor.
+        # Conversely, an old ID does not mean newly drained lines were delivered.
+        if not st.can_edit:
+            with suppress(Exception):
+                await self._send_unacknowledged_progress(st)
+            return
         # Lines with no anchor: a boundary sealed the previous bubble and the replayed tool
         # output has nowhere to land yet. Without this the drained lines are silently lost.
         if st.progress_lines and st.progress_msg_id is None and not st.cancel_saw_ambiguous_send:
@@ -915,10 +937,6 @@ class TurnRunner:
                     if result.success:
                         st.progress_msg_id = result.message_id
                         st.can_edit = bool(st.progress_msg_id)
-                else:
-                    for line in st.progress_lines:
-                        await self._send_progress_text(st, line)
-                    st.progress_lines.clear()
         # Final edit with all remaining tools (only if editing works)
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
@@ -930,7 +948,19 @@ class TurnRunner:
         if ctx._run_still_current():
             await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
 
-    async def _progress_send_or_edit(self, st, msg, *, fallback_lines=None) -> bool:
+    async def _send_unacknowledged_progress(self, st) -> bool:
+        """Retire each send-only line on acceptance, even without a message ID."""
+        if st.cancel_saw_ambiguous_send:
+            return False
+        while st.retired_progress_lines < len(st.progress_lines):
+            line = st.progress_lines[st.retired_progress_lines]
+            result = await self._send_progress_text(st, line)
+            if not result.success:
+                return False
+            st.retired_progress_lines += 1
+        return True
+
+    async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
 
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
@@ -940,6 +970,7 @@ class TurnRunner:
             full_text = "\n".join(st.progress_lines)
             result = await self._edit_progress_message(st, st.progress_msg_id, full_text)
             if result.success:
+                st.retired_progress_lines = len(st.progress_lines)
                 return True
             if getattr(result, "retryable", False):
                 logger.debug("[%s] Transient edit failure — keeping can_edit=True", st.adapter.name)
@@ -961,17 +992,15 @@ class TurnRunner:
             st.can_edit = False
             # Unknown permanent failures (permission revoked, unsupported edits) keep the
             # legacy send-only fallback; a verified stale anchor was replaced above.
-            for line in fallback_lines if fallback_lines is not None else [msg]:
-                await self._send_progress_text(st, line)
-            return True
-        if not st.can_edit and fallback_lines is not None:
-            for line in fallback_lines:
-                await self._send_progress_text(st, line)
-            return True
-        # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
-        if result.success and result.message_id:
+            return await self._send_unacknowledged_progress(st)
+        if not st.can_edit:
+            return await self._send_unacknowledged_progress(st)
+        # First tool: send all accumulated text as a new message.
+        result = await self._send_progress_text(st, "\n".join(st.progress_lines))
+        if result.success:
+            st.retired_progress_lines = len(st.progress_lines)
             st.progress_msg_id = result.message_id
+            st.can_edit = bool(result.message_id)
         return True
 
     async def send_progress_messages(self):
@@ -1025,11 +1054,7 @@ class TurnRunner:
                     # replay these into the SAME bubble instead of fragmenting it.
                     st.deferred_progress_events.append(raw)
                     continue
-                batch_start = len(st.progress_lines)
-                if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                    batch_start = max(0, batch_start - 1)
                 msg = self._progress_absorb(st, raw)
-                fallback_lines = None
                 if st.can_edit and st.progress_msg_id is not None:
                     # Fold queued ordinary updates into this edit, but replay the
                     # first content boundary before consuming anything beyond it.
@@ -1042,9 +1067,6 @@ class TurnRunner:
                             st.replay_progress_events.appendleft(queued)
                             break
                         msg = self._progress_absorb(st, queued)
-                    # A permanent edit failure can switch transport after batching.
-                    # Preserve each newly absorbed line for that send-only fallback.
-                    fallback_lines = st.progress_lines[batch_start:]
                 if not await self._roll_progress_overflow_if_needed(st):
                     if not ctx._run_still_current():
                         return
@@ -1056,7 +1078,7 @@ class TurnRunner:
                             st.edit_clock_key, 0.0
                         ) > time.monotonic():
                             continue  # chat parked by a server-named flood wait
-                    if not await self._progress_send_or_edit(st, msg, fallback_lines=fallback_lines):
+                    if not await self._progress_send_or_edit(st, msg):
                         continue
                 st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
                 await self._progress_restore_typing(st)
