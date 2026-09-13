@@ -2020,3 +2020,30 @@ def test_supported_recall_preserves_configured_filters(provider, monkeypatch):
     provider._compatible_recall("query", explicit=True)
     assert calls[0]["tags"] == ["private"]
     assert calls[0]["tags_match"] == "all"
+
+
+@pytest.mark.parametrize("expansion", [None, "entities", "chunks", "source_facts"])
+def test_baseline_retry_omits_expansion_budgets_on_actual_sdk_wire(provider, monkeypatch, expansion):
+    import asyncio
+    Hindsight = pytest.importorskip("hindsight_client").Hindsight
+    calls = []
+
+    class Transport:
+        async def recall_memories(self, bank_id, request, **kwargs):
+            wire = request.to_dict()
+            calls.append(wire)
+            if any(wire.get("include", {}).values()):
+                raise ValueError("422 unknown field in include expansion")
+            return SimpleNamespace(results=[])
+
+    client = object.__new__(Hindsight)
+    client._memory_api = Transport()
+    client._timeout = 5
+    provider._recall_tags = ["private"]
+    provider._recall_tags_match = "all_strict"
+    monkeypatch.setattr(provider, "_run_hindsight_operation", lambda op: asyncio.run(op(client)))
+    provider._compatible_recall("synthetic query", {} if expansion is None else {"include_" + expansion: True})
+    assert len(calls) == (1 if expansion is None else 2)
+    assert not any(calls[-1].get("include", {}).values())
+    assert all(c["tags"] == ["private"] and c["tags_match"] == "all_strict" for c in calls)
+    assert all(not any(k.startswith("max_") and k != "max_tokens" for k in c) for c in calls)

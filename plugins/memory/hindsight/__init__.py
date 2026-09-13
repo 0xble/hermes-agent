@@ -1202,6 +1202,8 @@ class HindsightMemoryProvider(MemoryProvider):
         supported = {key: value for key, value in optional.items() if _supports_kwarg(client, "arecall", key)}
         if (omitted := set(optional) - set(supported)):
             logger.warning("Hindsight recall optional fields unavailable in installed client: %s", sorted(omitted))
+        # The pinned SDK nests token budgets inside enabled include blocks.
+        # Removing the flags removes those wire fields, including SDK defaults.
         retryable = {"include_provenance", "include_entities", "include_chunks", "include_source_facts"}
         return {**required, **supported}, {k: v for k, v in supported.items() if k in retryable}
 
