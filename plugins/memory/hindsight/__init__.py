@@ -55,6 +55,7 @@ from .settings import (
 )
 
 logger = logging.getLogger(__name__)
+_SOURCE_SUBMISSION = contextvars.ContextVar("hindsight_source_submission", default=False)
 
 # Keep in sync with pyproject.toml, tools/lazy_deps.py ("memory.hindsight"),
 # plugin.yaml, and uv.lock. Hermes intentionally exact-pins managed SDKs so
@@ -644,7 +645,8 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._run_sync(operation(self._get_client()))
         except Exception as exc:
             text = f"{type(exc).__name__}: {exc}".lower()
-            if self._mode != "local_embedded" or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS):
+            if (_SOURCE_SUBMISSION.get() or self._mode != "local_embedded"
+                    or not any(m in text for m in _RETRIABLE_CONNECTION_MARKERS)):
                 raise
             logger.info("Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s", exc)
             self._client = None
@@ -697,7 +699,8 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
     def _track_retain_ops(self, retain_response, bank_id: str, *,
-                          source_candidates: list[SourceCandidate] | None = None) -> None:
+                          source_candidates: list[SourceCandidate] | None = None,
+                          submission_token: str | None = None) -> None:
         """Record the async ``operation_id``/``operation_ids`` of an aretain_batch reply
         (pending until recall-visible). Source replies without IDs still require
         document/hash readback before their deduplication claim is completed."""
@@ -715,7 +718,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     self._pending_retain_ops.update(ids)
                     self._retain_ops_bank_id = bank_id
                 save_source_entry(self, candidate, accepted=True, status="accepted",
-                                  operation_ids=ids, pending_operation_ids=ids)
+                                  operation_ids=ids, pending_operation_ids=ids, submission_token=submission_token)
                 for op_id in self._source_ledger[candidate.automatic_key]["pending_operation_ids"]:
                     self._source_retain_ops[op_id] = candidate
                 with self._pending_retain_ops_lock:
@@ -781,7 +784,7 @@ class HindsightMemoryProvider(MemoryProvider):
         except NotFoundException:
             # Readback proves current content, not that an absent operation can
             # never write again. Keep source evidence pending unless a terminal
-            # status was positively observed in this lifecycle.
+            # status was positively observed here or preserved in the journal.
             if candidate is not None and op_id not in self._source_terminal_ops:
                 return False
             if (settled := _settle_if_source()):
@@ -794,12 +797,20 @@ class HindsightMemoryProvider(MemoryProvider):
         if status == "completed":
             if candidate is not None:
                 self._source_terminal_ops.add(op_id)
+                with self._source_retain_keys_lock:
+                    entry = self._source_ledger.get(candidate.automatic_key, {})
+                    save_source_entry(self, candidate, terminal_operation_ids=sorted(
+                        set(entry.get("terminal_operation_ids", [])) | {op_id}))
             if (settled := _settle_if_source()):
                 finish()
             return settled
         if status in {"failed", "cancelled"}:
             if candidate is not None:
                 self._source_terminal_ops.add(op_id)
+                with self._source_retain_keys_lock:
+                    entry = self._source_ledger.get(candidate.automatic_key, {})
+                    save_source_entry(self, candidate, terminal_operation_ids=sorted(
+                        set(entry.get("terminal_operation_ids", [])) | {op_id}))
                 self._source_candidate_failed(candidate)
                 finish()
             return True
@@ -833,14 +844,16 @@ class HindsightMemoryProvider(MemoryProvider):
         """Poll tracked async retain ops until complete or *_expired()* (deadline
         predicate). Transcript ops may be dropped at timeout for prefetch liveness;
         source evidence stays pending until verified, failed, or superseded."""
+        failed_sources: set[str] = set()
         while True:
             if not self._shutting_down.is_set() and not _expired():
-                self._flush_deferred_source_candidates()
+                self._flush_deferred_source_candidates(failed_sources)
             with self._pending_retain_ops_lock:
                 bank_id = self._retain_ops_bank_id or self._bank_id
                 pending = list(self._pending_retain_ops)
             if not pending:
-                return not self._deferred_source_candidates
+                journal = getattr(self, "_source_journal", None)
+                return not self._deferred_source_candidates and not (journal and journal.unresolved_submission())
             if self._shutting_down.is_set():
                 return False
             done: set[str] = set()
@@ -855,7 +868,8 @@ class HindsightMemoryProvider(MemoryProvider):
             with self._pending_retain_ops_lock:
                 self._pending_retain_ops.difference_update(done)
                 if not self._pending_retain_ops and not self._deferred_source_candidates:
-                    return True
+                    journal = getattr(self, "_source_journal", None)
+                    return not (journal and journal.unresolved_submission())
                 timed_out = _expired()
                 if timed_out:
                     dropped = self._pending_retain_ops.difference(self._source_retain_ops)
@@ -1408,13 +1422,19 @@ class HindsightMemoryProvider(MemoryProvider):
                       for e in siblings)
         return later, blocked
 
-    def _flush_deferred_source_candidates(self) -> None:
+    def _flush_deferred_source_candidates(self, failed_sources: set[str] | None = None) -> None:
         # Serialize source versions, preserving unseen intermediate evidence and
         # ordering repeated versions by their latest fresh observation.
+        failed_sources = failed_sources if failed_sources is not None else set()
         with self._source_submission_lock:
+            restore_source_ledger(self, self._bank_id, recover_only=True, refresh=True)
             for source_id in list(self._deferred_source_candidates):
+                if source_id in failed_sources:
+                    continue
                 queued = self._deferred_source_candidates[source_id]
                 while queued:
+                    if self._source_journal.unresolved_submission(source_id):
+                        break
                     candidate, bank_id = queued[0]
                     with self._source_retain_keys_lock:
                         later, blocked = self._source_reversion_state(candidate)
@@ -1423,16 +1443,20 @@ class HindsightMemoryProvider(MemoryProvider):
                     if blocked:
                         break
                     latest = len(queued) == 1
-                    queued.pop(0)
                     try:
                         if (latest and (not pending or not later)
                                 and self._verify_source_candidate(bank_id, candidate)
                                 and self._source_ledger[candidate.automatic_key].get("status") == "completed"):
+                            queued.pop(0)
                             continue
-                        self._retain_source_candidate(candidate, bank_id,
-                            allow_reversion=latest, _fresh_deferred=True)
+                        if not self._retain_source_candidate(candidate, bank_id,
+                                allow_reversion=latest, _fresh_deferred=True):
+                            break
+                        queued.pop(0)
                     except Exception as exc:
                         logger.warning("Hindsight deferred fresh source failed: %s", exc)
+                        failed_sources.add(source_id)
+                        break
                 if not queued:
                     self._deferred_source_candidates.pop(source_id, None)
 
@@ -1468,10 +1492,10 @@ class HindsightMemoryProvider(MemoryProvider):
             save_source_entry(self, candidate, status="failed")
 
     def _retain_source_candidate(self, candidate: SourceCandidate, bank_id: str, *,
-                                 allow_reversion: bool = True, _fresh_deferred: bool = False) -> None:
+                                 allow_reversion: bool = True, _fresh_deferred: bool = False) -> bool:
         """Submit one automatically discovered source and track its durability."""
         with self._source_submission_lock:
-            restore_source_ledger(self, bank_id)
+            restore_source_ledger(self, bank_id, refresh=True)
             if not _fresh_deferred:
                 with self._source_retain_keys_lock:
                     _, blocked = self._source_reversion_state(candidate)
@@ -1484,12 +1508,25 @@ class HindsightMemoryProvider(MemoryProvider):
                               if item[0].automatic_key != candidate.automatic_key]
                     queued.append((candidate, bank_id))
                     self._deferred_source_candidates[candidate.source_id] = queued
-                    return
+                    return False
+            token = self._source_journal.reserve(candidate)
+            if token is None:
+                if not _fresh_deferred:
+                    queued = self._deferred_source_candidates.setdefault(candidate.source_id, [])
+                    queued[:] = [item for item in queued if item[0].automatic_key != candidate.automatic_key]
+                    queued.append((candidate, bank_id))
+                return False
+            # Admission owns this source now. Refresh after claiming so a rival
+            # completion between our initial snapshot and claim cannot fool dedup.
+            restore_source_ledger(self, bank_id, refresh=True)
             if self._source_candidate_already_submitted(
                     candidate, allow_reversion=allow_reversion,
                     fresh_deferred=_fresh_deferred and allow_reversion):
                 logger.debug("Hindsight source retain skipped duplicate: %s", candidate.source_id)
-                return
+                self._source_journal.release(candidate, token)
+                return True
+            requested = False
+            submission_context = _SOURCE_SUBMISSION.set(True)
             try:
                 if candidate.file_path:
                     file_metadata = {"context": candidate.context, "document_id": candidate.source_id,
@@ -1499,6 +1536,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     file_bytes = read_verified_source_file(candidate)
                     if file_bytes is None:
                         raise ValueError("attachment changed or left the trusted media cache before retain")
+                    requested = True
                     response = self._run_hindsight_operation(
                         lambda client: client._files_api.file_retain(
                             bank_id=bank_id,
@@ -1508,19 +1546,35 @@ class HindsightMemoryProvider(MemoryProvider):
                 else:
                     item = self._build_retain_kwargs(candidate.content, context=candidate.context,
                                                      metadata=candidate.metadata, tags=list(candidate.tags))
+                    requested = True
                     response = self._retain_batch(item, bank_id=bank_id,
                                                   document_id=candidate.source_id, retain_async=True)
-                self._track_retain_ops(response, bank_id, source_candidates=[candidate])
+                self._track_retain_ops(response, bank_id, source_candidates=[candidate], submission_token=token)
+                # A durable operation receipt takes over the reservation. Without
+                # IDs, readback alone cannot prove the server has stopped writing.
+                if not (getattr(response, "operation_id", None) or getattr(response, "operation_ids", None)):
+                    if not _fresh_deferred:
+                        self._deferred_source_candidates.setdefault(candidate.source_id, []).append((candidate, bank_id))
+                    logger.warning("Hindsight source has no operation receipt; preserving unresolved submission: %s",
+                                   candidate.source_id)
+                    return False
                 logger.info("Hindsight source retain accepted: type=%s, id=%s, shape=%s, hash=%s",
                             candidate.source_type, candidate.source_id, candidate.source_shape,
                             candidate.content_hash[:16])
+                return True
             except Exception:
-                # A failed readback without operation IDs remains retryable. An
-                # accepted operation with IDs must keep its evidence on local errors.
+                if not requested:
+                    self._source_journal.release(candidate, token)
+                elif not _fresh_deferred:
+                    self._deferred_source_candidates.setdefault(candidate.source_id, []).append((candidate, bank_id))
+                # Unknown acceptance stays reserved even if the diagnostic ledger
+                # marks failure. Never replay it merely because readback failed.
                 entry = self._source_ledger.get(candidate.automatic_key, {})
                 if not entry.get("pending_operation_ids"):
                     self._source_candidate_failed(candidate)
                 raise
+            finally:
+                _SOURCE_SUBMISSION.reset(submission_context)
 
     def _retain_source_candidates(self, candidates: list[SourceCandidate], bank_id: str) -> None:
         """Fail soft per candidate: one bad source must not drop the rest of the batch."""

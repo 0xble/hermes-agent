@@ -102,6 +102,30 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 
+### Automatic source ordering and recovery
+
+Automatic source replacements coordinate through
+`$HERMES_HOME/memories/hindsight-source-operations.sqlite`. Providers sharing that
+journal, endpoint and bank reserve a source before submission. Accepted operation
+IDs are persisted before admission can pass to another version. Every known
+operation must have positive terminal status before another replacement starts.
+Different homes or hosts do not share this ordering guarantee.
+
+A request whose acceptance is unknown stays reserved across process restarts.
+There is no timeout that clears it and no automatic replay. Exact content readback
+alone does not prove that an asynchronous operation has stopped writing. The
+existing drain reports unresolved work, and later versions of that source stay
+blocked. Recovery of an unreceipted reservation requires operator reconciliation
+with server operation evidence. There is currently no automated reset command.
+Do not clear reservations based only on process death, elapsed time or a matching
+document hash.
+
+Deferred source bytes remain in memory and are retained when submission raises.
+They are not persisted or reconstructed after restart. A local file validation
+failure before any request can release admission. A transport exception after a
+request begins cannot. This trades availability after an unknown outcome for
+preserving source write order.
+
 ### Integration
 
 | Key | Default | Description |

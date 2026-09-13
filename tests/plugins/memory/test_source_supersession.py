@@ -513,7 +513,218 @@ def test_serialized_successor_failure_is_not_an_automatic_retry_loop(failure):
     if failure == 'operation':
         assert not drained
         server.statuses['1'] = 'failed'
-    assert p._wait_for_retains_drained(30)
-    assert p._wait_for_retains_drained(30)
+    assert p._wait_for_retains_drained(30) is (failure == "operation")
+    assert p._wait_for_retains_drained(30) is (failure == "operation")
     assert p._source_ledger[new.automatic_key]['status'] == 'failed'
     assert server.hash == old.content_hash and len(server.calls) == 2
+
+
+def test_deferred_exception_keeps_intermediate_payload_and_blocks_successor():
+    from dataclasses import replace
+    import hashlib
+
+    old, middle = versions('https://example.com/deferred-exception')
+    content = 'Latest source paragraph. ' * 80
+    latest = replace(middle, content=content, content_hash=hashlib.sha256(content.encode()).hexdigest())
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old, middle, latest], p._bank_id)
+    server.statuses['0'] = 'completed'
+    server.hash = old.content_hash
+    server.reject_hash = middle.content_hash
+    assert not p._wait_for_retains_drained(30)
+    assert len(server.calls) == 2
+    assert [item[0].content for item in p._deferred_source_candidates[middle.source_id]] == [middle.content, latest.content]
+
+
+def test_separate_providers_do_not_submit_overlapping_source_replacements():
+    from plugins.memory.hindsight.source_ledger import restore_source_ledger
+
+    old, new = versions('https://example.com/multi-provider')
+    server = Server()
+    first, second = provider(server), provider(server)
+    assert first is not second
+    # Both ordinary AIAgent instances can initialize before either sees a source.
+    restore_source_ledger(first, first._bank_id)
+    restore_source_ledger(second, second._bank_id)
+    first._retain_source_candidates([old], first._bank_id)
+    second._retain_source_candidates([new], second._bank_id)
+    assert len(server.calls) == 1
+
+
+def test_simultaneous_provider_admission_and_terminal_handoff(monkeypatch):
+    import contextvars
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from plugins.memory.hindsight.source_ledger import SourceJournal, restore_source_ledger
+
+    old, new = versions('https://example.com/simultaneous')
+    server = Server()
+    first, second = provider(server), provider(server)
+    for p in (first, second):
+        restore_source_ledger(p, p._bank_id)
+    barrier = threading.Barrier(2)
+    original = SourceJournal.reserve
+    def simultaneous(self, candidate):
+        barrier.wait(timeout=10)
+        return original(self, candidate)
+    monkeypatch.setattr(SourceJournal, 'reserve', simultaneous)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, p._retain_source_candidates, [c], p._bank_id)
+                   for p, c in ((first, old), (second, new))]
+        for future in futures:
+            future.result(timeout=15)
+    monkeypatch.setattr(SourceJournal, 'reserve', original)
+    assert len(server.calls) == 1
+    accepted_hash = server.calls[0]['items'][0]['metadata']['content_hash']
+    waiter = second if accepted_hash == old.content_hash else first
+    waiting = new if waiter is second else old
+    assert not waiter._wait_for_retains_drained(10)
+    assert len(server.calls) == 1
+    server.statuses['0'] = 'completed'
+    server.hash = accepted_hash
+    assert not waiter._wait_for_retains_drained(30)
+    assert len(server.calls) == 2
+    assert server.calls[1]['items'][0]['content'] == waiting.content
+    server.statuses['1'] = 'completed'
+    server.hash = waiting.content_hash
+    assert waiter._wait_for_retains_drained(30)
+
+
+@pytest.mark.parametrize('crash_phase', ['reserved', 'accepted_without_receipt', 'response_lost'])
+def test_unresolved_submission_survives_restart_without_replay(crash_phase):
+    from plugins.memory.hindsight.source_ledger import restore_source_ledger
+
+    old, new = versions('https://example.com/unknown-request')
+    server = Server()
+    first = provider(server)
+    restore_source_ledger(first, first._bank_id)
+    if crash_phase in {'reserved', 'accepted_without_receipt'}:
+        assert first._source_journal.reserve(old)
+        if crash_phase == 'accepted_without_receipt':
+            item = first._build_retain_kwargs(old.content, metadata=old.metadata)
+            server.aretain_batch(bank_id=first._bank_id, items=[item], document_id=old.source_id)
+    else:
+        original = server.aretain_batch
+        def lose_response(**kwargs):
+            original(**kwargs)
+            raise TimeoutError('response lost after acceptance')
+        server.aretain_batch = lose_response
+        first._retain_source_candidates([old], first._bank_id)
+        assert first._deferred_source_candidates[old.source_id][0][0].content == old.content
+    calls = len(server.calls)
+    restarted = provider(server)
+    restarted._retain_source_candidates([old, new], restarted._bank_id)
+    # Even a matching document is not terminal evidence for an unreceipted job.
+    server.hash = new.content_hash
+    for _ in range(3):
+        assert not restarted._wait_for_retains_drained(30)
+    assert len(server.calls) == calls
+    assert [c.content for c, _ in restarted._deferred_source_candidates[old.source_id]] == [old.content, new.content]
+
+
+def test_known_receipt_handoff_survives_restart_and_releases_on_terminal():
+    old, new = versions('https://example.com/receipt-recovery')
+    server = Server()
+    first = provider(server)
+    first._retain_source_candidates([old], first._bank_id)
+    assert not first._source_journal.unresolved_submission(old.source_id)
+    restarted = provider(server)
+    restarted._retain_source_candidates([new], restarted._bank_id)
+    assert len(server.calls) == 1
+    server.statuses['0'] = 'completed'
+    server.hash = old.content_hash
+    assert not restarted._wait_for_retains_drained(30)
+    assert len(server.calls) == 2
+
+
+def test_pre_submit_validation_releases_reservation(monkeypatch):
+    from dataclasses import replace
+    old, _ = versions('https://example.com/invalid-file')
+    old = replace(old, file_path='/nonexistent/source.txt')
+    server = Server()
+    p = provider(server)
+    monkeypatch.setattr('plugins.memory.hindsight.read_verified_source_file', lambda c: None)
+    p._retain_source_candidates([old], p._bank_id)
+    assert not server.calls
+    assert not p._source_journal.unresolved_submission(old.source_id)
+
+
+def test_unknown_reservation_without_fresh_payload_does_not_report_drained():
+    from plugins.memory.hindsight.source_ledger import restore_source_ledger
+    old, _ = versions('https://example.com/unresolved-drain')
+    server = Server()
+    first = provider(server)
+    restore_source_ledger(first, first._bank_id)
+    assert first._source_journal.reserve(old)
+    restarted = provider(server)
+    assert not restarted._wait_for_retains_drained(30)
+    assert not restarted._deferred_source_candidates
+    assert not server.calls
+
+
+def test_source_connection_error_does_not_retry_embedded_request(monkeypatch):
+    from plugins.memory.hindsight import _SOURCE_SUBMISSION
+    p = provider(Server())
+    p._mode = 'local_embedded'
+    clients = []
+    p._get_client = lambda: clients.append(object()) or clients[-1]
+    def fail(client):
+        raise ConnectionError('connection reset by peer')
+    token = _SOURCE_SUBMISSION.set(True)
+    try:
+        with pytest.raises(ConnectionError):
+            HindsightMemoryProvider._run_hindsight_operation(p, fail)
+    finally:
+        _SOURCE_SUBMISSION.reset(token)
+    assert len(clients) == 1
+
+
+def test_deferred_pre_submit_failure_retries_only_on_later_drain(monkeypatch):
+    from dataclasses import replace
+    old, middle = versions('https://example.com/validation-retry')
+    middle = replace(middle, file_path='/invalid/source.txt')
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old, middle], p._bank_id)
+    checks = []
+    monkeypatch.setattr('plugins.memory.hindsight.read_verified_source_file', lambda c: checks.append(c) or None)
+    server.statuses['0'] = 'completed'
+    server.hash = old.content_hash
+    assert not p._wait_for_retains_drained(30)
+    assert len(checks) == 1
+    assert p._deferred_source_candidates[middle.source_id][0][0].content == middle.content
+    assert not p._wait_for_retains_drained(30)
+    assert len(checks) == 2
+    assert len(server.calls) == 1
+
+
+def test_refresh_keeps_unjournaled_acceptance_reconcilable(monkeypatch):
+    from plugins.memory.hindsight.source_ledger import restore_source_ledger
+    old, new = versions('https://example.com/journal-outage')
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    server.statuses['0'] = 'completed'
+    server.hash = old.content_hash
+    assert p._wait_for_retains_drained(30)
+    p._retain_source_candidates([new], p._bank_id)
+    server.statuses['1'] = 'completed'
+    server.hash = new.content_hash
+    assert p._wait_for_retains_drained(30)
+    original = p._source_journal.save
+    def unavailable(*args, **kwargs):
+        raise OSError('journal unavailable after acceptance')
+    monkeypatch.setattr(p._source_journal, 'save', unavailable)
+    p._retain_source_candidates([old], p._bank_id)
+    assert '2' in p._source_ledger[old.automatic_key]['pending_operation_ids']
+    restore_source_ledger(p, p._bank_id, refresh=True)
+    assert '2' in p._source_ledger[old.automatic_key]['pending_operation_ids']
+    assert p._source_retain_ops['2'].content == old.content
+    assert p._source_journal.unresolved_submission(old.source_id)
+    monkeypatch.setattr(p._source_journal, 'save', original)
+    server.statuses['2'] = 'completed'
+    server.hash = old.content_hash
+    assert not p._wait_for_retains_drained(30)
+    assert '2' in p._source_journal.load()[old.automatic_key]['terminal_operation_ids']
+    assert len(server.calls) == 3

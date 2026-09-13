@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import uuid
 from contextlib import closing
 
 from hermes_constants import get_hermes_home
@@ -20,7 +21,43 @@ class SourceJournal:
                 scope TEXT NOT NULL, source_id TEXT NOT NULL, content_hash TEXT NOT NULL,
                 sequence INTEGER NOT NULL, entry TEXT NOT NULL,
                 PRIMARY KEY(scope, source_id, content_hash))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS source_submissions (
+                scope TEXT NOT NULL, source_id TEXT NOT NULL, token TEXT NOT NULL,
+                content_hash TEXT NOT NULL, PRIMARY KEY(scope, source_id))""")
         self.path.chmod(0o600)
+
+    def reserve(self, candidate):
+        """Same-journal admission. An unreceipted request never expires automatically."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM source_submissions WHERE scope=? AND source_id=?",
+                          (self.scope, candidate.source_id)).fetchone():
+                return None
+            rows = db.execute("SELECT entry FROM source_operations WHERE scope=? AND source_id=?",
+                              (self.scope, candidate.source_id)).fetchall()
+            for (raw,) in rows:
+                entry = json.loads(raw)
+                pending = set(entry.get("pending_operation_ids", []))
+                terminal = set(entry.get("terminal_operation_ids", []))
+                if pending - terminal or (entry["status"] == "accepted" and not pending):
+                    return None
+            token = uuid.uuid4().hex
+            db.execute("INSERT INTO source_submissions VALUES (?, ?, ?, ?)",
+                       (self.scope, candidate.source_id, token, candidate.content_hash))
+            return token
+
+    def release(self, candidate, token):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            db.execute("DELETE FROM source_submissions WHERE scope=? AND source_id=? AND token=?",
+                       (self.scope, candidate.source_id, token))
+
+    def unresolved_submission(self, source_id=None):
+        with closing(sqlite3.connect(self.path)) as db:
+            if source_id is None:
+                return db.execute("SELECT 1 FROM source_submissions WHERE scope=? LIMIT 1",
+                                  (self.scope,)).fetchone() is not None
+            return db.execute("SELECT 1 FROM source_submissions WHERE scope=? AND source_id=?",
+                              (self.scope, source_id)).fetchone() is not None
 
     def load(self):
         with closing(sqlite3.connect(self.path)) as db:
@@ -35,7 +72,7 @@ class SourceJournal:
             entries[entry["candidate"].automatic_key] = entry
         return entries
 
-    def save(self, entry, *, accepted=False):
+    def save(self, entry, *, accepted=False, submission_token=None):
         candidate = entry["candidate"]
         entry = dict(entry)
         with closing(sqlite3.connect(self.path)) as db, db:
@@ -55,6 +92,8 @@ class SourceJournal:
                 # Concurrent provider instances can accept the same hash. An
                 # update may retire only IDs it actually observed as terminal.
                 entry["operation_ids"] = sorted(known | previous_known)
+                entry["terminal_operation_ids"] = sorted(
+                    set(entry.get("terminal_operation_ids", [])) | set(previous.get("terminal_operation_ids", [])))
                 entry["pending_operation_ids"] = sorted(
                     (pending | previous_pending) - (known - pending) - (previous_known - previous_pending))
                 entry["sequence"] = max(entry.get("sequence", 0), previous.get("sequence", 0))
@@ -79,36 +118,68 @@ class SourceJournal:
                 sequence=excluded.sequence, entry=excluded.entry""",
                 (self.scope, candidate.source_id, candidate.content_hash,
                  entry.get("sequence", 0), json.dumps(payload)))
+            if accepted and submission_token and entry.get("pending_operation_ids"):
+                # Receipt persistence and handoff are one transaction: a crash
+                # cannot leave a known operation hidden behind an unknown claim.
+                db.execute("DELETE FROM source_submissions WHERE scope=? AND source_id=? AND token=?",
+                           (self.scope, candidate.source_id, submission_token))
         return entry
 
 
-def restore_source_ledger(provider, bank_id, *, recover_only=False):
+def restore_source_ledger(provider, bank_id, *, recover_only=False, refresh=False):
     """Lazy recovery after endpoint/bank configuration, without resubmitting writes."""
     scope = (getattr(provider, "_api_url", ""), bank_id)
     with provider._source_retain_keys_lock:
-        if getattr(provider, "_source_journal_scope", None) == scope:
+        existing = getattr(provider, "_source_journal_scope", None)
+        if existing == scope and not refresh:
             return
-        if getattr(provider, "_source_journal_scope", None) is not None:
+        if existing is not None and existing != scope:
             raise ValueError("Cannot change Hindsight source ledger scope within a provider lifecycle")
         if recover_only and not (get_hermes_home() / "memories" / "hindsight-source-operations.sqlite").exists():
             return
-        journal = SourceJournal(*scope)
+        journal = provider._source_journal if existing == scope else SourceJournal(*scope)
         entries = journal.load()
-        provider._source_ledger.update(entries)
         for key, entry in entries.items():
+            # Operation references refresh across providers, payloads stay local.
+            local = provider._source_ledger.get(key)
+            if local is not None:
+                known = set(entry.get("operation_ids", []))
+                pending = set(entry.get("pending_operation_ids", []))
+                local_known = set(local.get("operation_ids", []))
+                local_pending = set(local.get("pending_operation_ids", []))
+                terminal = set(entry.get("terminal_operation_ids", [])) | set(local.get("terminal_operation_ids", []))
+                if local.get("sequence", 0) > entry.get("sequence", 0):
+                    # A failed journal save cannot erase a newer acceptance that
+                    # this process still owns. Its unresolved claim blocks peers.
+                    entry = dict(local)
+                else:
+                    entry["candidate"] = local["candidate"]
+                entry["operation_ids"] = sorted(known | local_known)
+                entry["pending_operation_ids"] = sorted(
+                    (pending | local_pending) - (known - pending) - (local_known - local_pending))
+                entry["terminal_operation_ids"] = sorted(terminal)
+            provider._source_ledger[key] = entry
+        previous_source_ops = set(provider._source_retain_ops)
+        provider._source_retain_ops.clear()
+        for key, entry in provider._source_ledger.items():
+            provider._source_terminal_ops.update(entry.get("terminal_operation_ids", []))
             if entry["status"] == "completed":
                 provider._source_retain_verified.add(key)
+            else:
+                provider._source_retain_verified.discard(key)
             for op_id in entry.get("pending_operation_ids", []):
                 provider._source_retain_ops[op_id] = entry["candidate"]
         with provider._pending_retain_ops_lock:
+            provider._pending_retain_ops.difference_update(previous_source_ops - provider._source_retain_ops.keys())
             provider._pending_retain_ops.update(provider._source_retain_ops)
             if provider._source_retain_ops:
                 provider._retain_ops_bank_id = bank_id
+        provider._source_terminal_ops.intersection_update(provider._source_retain_ops)
         provider._source_journal = journal
         provider._source_journal_scope = scope
 
 
-def save_source_entry(provider, candidate, *, accepted=False, **changes):
+def save_source_entry(provider, candidate, *, accepted=False, submission_token=None, **changes):
     """Caller holds the source lock. Preserve acceptance order and operation evidence."""
     entry = dict(provider._source_ledger.get(candidate.automatic_key, {}),
                  candidate=candidate, **changes)
@@ -124,7 +195,7 @@ def save_source_entry(provider, candidate, *, accepted=False, **changes):
     provider._source_ledger[candidate.automatic_key] = entry
     journal = getattr(provider, "_source_journal", None)
     if journal is not None:
-        entry = journal.save(entry, accepted=accepted)
+        entry = journal.save(entry, accepted=accepted, submission_token=submission_token)
 
     provider._source_ledger[candidate.automatic_key] = entry
 
