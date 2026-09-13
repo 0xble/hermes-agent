@@ -209,6 +209,20 @@ def _shell_paths(tokens: list[str], depth: int) -> tuple[list[str], list[str], l
             words.pop(0)
             while words and words[0].startswith("-"):
                 option = words.pop(0)
+                if name == "env":
+                    directory = None
+                    if option in {"-C", "--chdir"}:
+                        if not words:
+                            raise ValueError("env directory option requires an operand")
+                        directory = words.pop(0)
+                    elif option.startswith("--chdir="):
+                        directory = option.partition("=")[2]
+                    elif option.startswith("-C"):
+                        directory = option[2:]
+                    if directory is not None:
+                        if directory and not any(char in directory for char in "$`"):
+                            moves.append(directory)
+                        continue
                 if option in {"-u", "-g", "-h", "-p", "--user", "--group", "--host"} and words:
                     words.pop(0)
                 if option == "--":

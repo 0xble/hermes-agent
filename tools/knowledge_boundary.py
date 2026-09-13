@@ -259,7 +259,8 @@ def command_denial_reason(command: str, *, tool: str = "terminal", cwd: str | No
                 for path in paths:
                     target = _real(path)
                     root = next((_real(protected) for protected in protected_roots()
-                                 if _within(_real(protected), target)), None)
+                                 if _within(_real(protected), target)
+                                 or _within(target, _real(protected))), None)
                     if root is not None:
                         break
                 if root is not None:
