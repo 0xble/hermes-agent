@@ -57,7 +57,8 @@ def test_base_final_send_metadata_keeps_business_route_without_thread(chat_type)
 
 
 @pytest.mark.asyncio
-async def test_business_update_marker_reconstructs_notification_target(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy_claimed", [False, True], ids=["current-pending", "legacy-claimed"])
+async def test_business_update_marker_reconstructs_notification_target(tmp_path, monkeypatch, legacy_claimed):
     import json
     from gateway.update_notifications import read_pending
 
@@ -75,12 +76,17 @@ async def test_business_update_marker_reconstructs_notification_target(tmp_path,
     monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
     assert await runner._handle_update_command(event) == ""
     marker, data = read_pending(tmp_path)
-    # Simulate ownership transfer to a detached updater and a fresh reader.
-    marker.rename(tmp_path / ".update_pending.claimed.json")
-    target = runner._resolve_update_target(SimpleNamespace(
-        pending=marker, claimed=tmp_path / ".update_pending.claimed.json"))
+    claimed = tmp_path / ".update_pending.claimed.json"
+    stored = marker
+    if legacy_claimed:
+        # Compatibility with historical claimed markers, not the current
+        # updater's ownership protocol. Current updates retain the pending path.
+        stored = marker.rename(claimed)
+    fresh_reader = _make_runner()
+    fresh_reader._authorization_adapter = lambda platform, profile: adapter
+    target = fresh_reader._resolve_update_target(SimpleNamespace(pending=marker, claimed=claimed))
     assert target.metadata["telegram_business_connection_id"] == "business-fixture"
-    assert json.loads((tmp_path / ".update_pending.claimed.json").read_text())["business_connection_id"] == "business-fixture"
+    assert json.loads(stored.read_text())["business_connection_id"] == "business-fixture"
 
 
 @pytest.mark.parametrize("origin", ["not json", '{"platform":"telegram","chat_id":"other","business_connection_id":"wrong"}',
