@@ -24,6 +24,21 @@ def frozen_fallback_client(pin, entry):
                                  default_headers=headers, max_retries=0)
 
 
+def validate_fallback_identities(routes, primary_provider, primary_model):
+    """Reject routes a provider/model-indexed RuntimePin cannot distinguish.
+
+    Selectors such as custom:first and custom:second may resolve to the same
+    provider. Keep physical URL/authentication checks strict; reject ambiguity
+    here rather than silently discarding or choosing a different frozen route.
+    """
+    seen = {(primary_provider, primary_model)}
+    for index, route in enumerate(routes):
+        identity = (route.provider, route.model)
+        if identity in seen:
+            raise ValueError(f"fallback {index} repeats a resolved provider/model identity")
+        seen.add(identity)
+    return tuple(routes)
+
 
 def freeze_parent_fallback_routes(parent, primary_provider, primary_model):
     from agent.reasoning_effort import clamp_effort, requested_effort, transport_supported_reasoning_efforts
@@ -45,7 +60,7 @@ def freeze_parent_fallback_routes(parent, primary_provider, primary_model):
             if route is None:
                 raise ValueError("parent fallback chain differs from its frozen authority")
             routes.append(route)
-        return tuple(routes)
+        return validate_fallback_identities(routes, primary_provider, primary_model)
 
     config = load_config() if remaining else {}
     frozen = []
@@ -79,4 +94,4 @@ def freeze_parent_fallback_routes(parent, primary_provider, primary_model):
         frozen.append(_freeze_fallback_runtime(
             runtime, FallbackDefinition(provider, model, effort), f"parent fallback {index}"))
         seen.add((provider, model))
-    return tuple(frozen)
+    return validate_fallback_identities(frozen, primary_provider, primary_model)

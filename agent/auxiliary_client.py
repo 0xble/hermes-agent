@@ -3685,7 +3685,7 @@ def _fallback_reasoning_config(task: Optional[str], fb_label: str, primary: Opti
     """Use the selected fallback route's effort, including main-chain candidates."""
     entry = _fallback_chain_entry(task, fb_label)
     attached_effort = getattr(client, "_hermes_fallback_reasoning_effort", None)
-    if entry is None and isinstance(attached_effort, str):
+    if entry is None and isinstance(attached_effort, (str, bool)):
         entry = {"reasoning_effort": attached_effort}
     if not isinstance(entry, dict) or "reasoning_effort" not in entry:
         return primary

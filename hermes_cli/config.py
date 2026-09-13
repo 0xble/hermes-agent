@@ -2207,7 +2207,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
 
 
 def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) -> Tuple[Dict[str, Any], Any]:
-    """Apply the managed-scope overlay; returns ``(merged, managed_config_or_falsy)``.
+    """Expand authored routes and merge defaults/user/managed; return merged config and raw managed.
     Managed wins at the leaf and is applied AFTER user expansion so a user ``${VAR}`` cannot shadow
     a managed literal: managed values expand only against the process environment. This
     deliberately inverts the usual env-over-config precedence for the keys the managed layer pins
@@ -2217,15 +2217,24 @@ def _merge_managed_overlay(expanded: Dict[str, Any], *, strict: bool = False) ->
         managed_config = read_config_mapping_strict(managed_dir / "config.yaml") if managed_dir else {}
     else:
         managed_config = managed_scope.load_managed_config()
-    if not managed_config:
-        return expanded, managed_config
-    # Same canonicalization as the user config BEFORE merging (parity with
-    # managed_scope.apply_managed_overlay) so the merged result never exposes a nested dict.
-    managed_normalized = _normalize_root_model_keys(managed_config)
+    # Expand the two authored layers independently against the effective namespace.
+    # Merging route sites first creates false inline conflicts (and applying defaults
+    # first makes their empty fallback lists look like an authored preset opt-out).
+    from hermes_cli.model_presets import expand_model_presets
+    managed_normalized = _normalize_root_model_keys(managed_config or {})
     if isinstance(managed_normalized.get("model"), str):
         managed_normalized = dict(managed_normalized)
         managed_normalized["model"] = {"default": managed_normalized["model"]}
-    return _merge_config_layer(expanded, _expand_env_vars(managed_normalized)), managed_config
+    managed_expanded = _expand_env_vars(managed_normalized)
+    namespace = _deep_merge(
+        {k: expanded[k] for k in ("model_presets",) if k in expanded},
+        {k: managed_expanded[k] for k in ("model_presets",) if k in managed_expanded},
+    )
+    user_routes = expand_model_presets({**expanded, **namespace})
+    managed_routes = expand_model_presets({**managed_expanded, **namespace})
+    defaults_and_user = _canonicalize_config(_merge_config_layer(
+        _expand_env_vars(copy.deepcopy(DEFAULT_CONFIG)), user_routes))
+    return _merge_config_layer(defaults_and_user, managed_routes), managed_config
 
 
 def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
@@ -2253,7 +2262,7 @@ def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str,
             if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
-        config = copy.deepcopy(DEFAULT_CONFIG)
+        config = {}
 
         if strict or user_sig is not None:
             try:
@@ -2270,11 +2279,7 @@ def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str,
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
 
-                # Expand authoring-time model routes before defaults are merged: a default empty
-                # fallback list must not look like an inline override of a named preset.
-                from hermes_cli.model_presets import expand_model_presets
-                user_config = expand_model_presets(user_config)
-                config = _merge_config_layer(config, user_config)
+                config = user_config
             except Exception as e:
                 from hermes_cli.model_presets import ModelPresetError
                 if strict or isinstance(e, ModelPresetError):

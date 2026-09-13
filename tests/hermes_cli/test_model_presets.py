@@ -412,24 +412,35 @@ def test_new_route_fields_are_saved_inline_not_as_conflicting_reference(tmp_path
     assert target[field] == value
 
 
-def test_main_fallback_preset_reasoning_reaches_auxiliary_wire_request(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+@pytest.mark.parametrize("effort", [False, "none", "low", None])
+@pytest.mark.parametrize("chain", ["main", "auxiliary"])
+def test_main_fallback_preset_reasoning_reaches_auxiliary_wire_request(tmp_path, monkeypatch, effort, chain):
     from hermes_cli import config as c
     from agent import auxiliary_client as a
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    raw = {"model_presets": {"fallback": {"provider": "openrouter", "model": "test/fallback", "reasoning_effort": "low"}},
-           "model": {"provider": "openrouter", "default": "test/main"}, "fallback_providers": [{"model_preset": "fallback"}]}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fixture-not-a-live-key")
+    fallback = {"provider": "openrouter", "model": "test/fallback"}
+    if effort is not None:
+        fallback["reasoning_effort"] = effort
+    raw = {"model_presets": {"fallback": fallback},
+           "model": {"provider": "openrouter", "default": "test/main"}}
+    if chain == "main":
+        raw["fallback_providers"] = [{"model_preset": "fallback"}]
+    else:
+        raw["auxiliary"] = {"title_generation": {"fallback_chain": [fallback]}}
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw))
     c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
-    client = SimpleNamespace(base_url="https://openrouter.ai/api/v1", _hermes_fallback_destination=a._FallbackDestination("openrouter", "https://openrouter.ai/api/v1", "chat_completions", "test/fallback"))
-    monkeypatch.setattr(a, "_resolve_fallback_entry", lambda entry: (client, entry["model"]))
-    monkeypatch.setattr(a, "_is_provider_unhealthy", lambda *args: False)
-    monkeypatch.setattr(a, "_context_too_small", lambda *args, **kwargs: None)
-    fb_client, model, label = a._try_main_fallback_chain("title_generation", "openrouter", failed_model="test/main")
+    select = a._try_main_fallback_chain if chain == "main" else a._try_configured_fallback_chain
+    fb_client, model, label = select("title_generation", "openrouter", failed_model="test/main")
     _, kwargs, _ = a._plan_fallback_candidate(fb_client, model, label, task="title_generation", effective_timeout=30,
         apply_fast_lane=False, messages=[{"role": "user", "content": "test"}], tools=None, temperature=None, max_tokens=50,
         effective_extra_body={}, reasoning_config={"enabled": True, "effort": "high"})
-    assert kwargs["extra_body"]["reasoning"]["effort"] == "low"
+    fb_client.close()
+    reasoning = kwargs["extra_body"]["reasoning"]
+    if effort in (False, "none"):
+        assert reasoning.get("enabled") is False
+    else:
+        assert reasoning["effort"] == (effort or "high")
 
 
 def test_inline_moa_nested_fallback_references_survive_unrelated_save():

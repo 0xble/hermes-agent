@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from agent.i18n import t
 from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 from hermes_cli.config import atomic_config_write, clear_model_endpoint_credentials
 from utils import base_url_host_matches
 
@@ -616,6 +617,7 @@ class GatewayModelCommandsMixin:
 
     def _apply_reasoning_selection(
         self, session_key: str, platform_key: str, value: str, persist_global: bool = False,
+        *, source: SessionSource | None = None,
     ) -> str:
         """Apply a /reasoning argument (typed or picked) and return the reply."""
         from hermes_constants import parse_reasoning_effort
@@ -642,8 +644,11 @@ class GatewayModelCommandsMixin:
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
+            route = self._resolve_channel_route_config(source, session_key)
+            model_override = (getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}
+            model = str(getattr(live_agent, "model", "") or model_override.get("model") or route.get("model") or "")
             self._reasoning_config = self._resolve_session_reasoning_config(
-                session_key=session_key, model=str(getattr(live_agent, "model", "") or ""))
+                source=source, session_key=session_key, model=model, route=route)
             _activate(self._reasoning_config)
             return t("gateway.reasoning.reset_done")
 
@@ -697,12 +702,15 @@ class GatewayModelCommandsMixin:
         _session_model = str(
             ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {}).get("model") or ""
         )
+        route = self._resolve_channel_route_config(_reasoning_source, session_key)
         self._reasoning_config = self._resolve_session_reasoning_config(
-            source=event.source, session_key=session_key, model=_session_model,
+            source=_reasoning_source, session_key=session_key,
+            model=_session_model or route.get("model", ""), route=route,
         )
         platform_key = _platform_config_key(event.source.platform)
         if raw_args:  # typed path — same applier the picker uses
-            return self._apply_reasoning_selection(session_key, platform_key, args, persist_global=persist_global)
+            return self._apply_reasoning_selection(
+                session_key, platform_key, args, persist_global=persist_global, source=_reasoning_source)
         rc = self._reasoning_config
         if rc is None:
             level, current_effort = t("gateway.reasoning.level_default"), "medium"
@@ -715,7 +723,7 @@ class GatewayModelCommandsMixin:
         scope = t("gateway.reasoning.scope_session") if has_session_override else t("gateway.reasoning.scope_global")
 
         async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-            return self._apply_reasoning_selection(session_key, platform_key, value)
+            return self._apply_reasoning_selection(session_key, platform_key, value, source=_reasoning_source)
 
         picker_sent = await self._try_send_choice_picker(
             event,

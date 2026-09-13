@@ -444,7 +444,8 @@ def freeze_fallback_routes(
             runtime, route, f"subagent_type {definition.name!r}: fallback {index}"
         ))
         seen.add((route.provider, route.model))
-    return tuple(frozen)
+    from tools.custom_subagent_fallbacks import validate_fallback_identities
+    return validate_fallback_identities(frozen, primary_provider, primary_model)
 
 
 def _freeze_fallback_runtime(runtime, route, label):

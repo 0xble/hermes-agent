@@ -212,6 +212,64 @@ async def test_reasoning_updates_live_agent_from_next_request_boundary():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("running", [False, True])
+@pytest.mark.parametrize("picker", [False, True])
+@pytest.mark.parametrize("selection", ["channel", "disabled", "session_model", "no_channel"])
+async def test_reasoning_reset_uses_selected_channel_policy(tmp_path, monkeypatch, running, picker, selection):
+    import yaml
+    from gateway.config import load_gateway_config
+    from gateway.run_config_loaders import GatewayConfigLoadersMixin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    raw = {
+        "model": {"default": "global-model"},
+        "agent": {"reasoning_effort": "medium", "reasoning_overrides": {"session-model": "low"}},
+        "model_presets": {"channel": {"provider": "custom:fixture", "model": "channel-model",
+                                         "reasoning_effort": False if selection == "disabled" else "high"}},
+        "gateway": {"platforms": {"telegram": {"channel_overrides": {
+            "c1": {"model_preset": "channel"}}}}},
+    }
+    if selection == "no_channel":
+        raw.pop("gateway")
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(raw), encoding="utf-8")
+    runner = _make_runner()
+    runner.config = load_gateway_config()
+    runner._load_reasoning_config = GatewayConfigLoadersMixin._load_reasoning_config
+    sk = build_session_key(_make_source())
+    live = runner._running_agents[sk]
+    live.model = "session-model" if selection == "session_model" else "channel-model"
+    if selection == "session_model":
+        runner._session_model_overrides = {sk: {"model": "session-model"}}
+    if not running:
+        runner._running_agents.clear()
+    previous = {"enabled": True, "effort": "xhigh"}
+    live.reasoning_config = previous
+    runner._set_session_reasoning_override(sk, previous)
+    if picker:
+        choices = {}
+        async def capture(*args, **kwargs):
+            choices.update(kwargs)
+            return True
+        runner._try_send_choice_picker = capture
+        await runner._handle_reasoning_command(_make_event("/reasoning"))
+        await choices["on_choice_selected"]("c1", "reset")
+    else:
+        await runner._handle_reasoning_command(_make_event("/reasoning reset"))
+    expected = ({"enabled": False} if selection == "disabled" else
+                {"enabled": True, "effort": {"channel": "high", "session_model": "low", "no_channel": "medium"}[selection]})
+    assert runner._reasoning_config == expected
+    assert sk not in runner._session_reasoning_overrides
+    if running:
+        assert live.reasoning_config == expected
+        assert live.reasoning_config is not previous
+        runner._evict_cached_agent.assert_not_called()
+    else:
+        runner._evict_cached_agent.assert_called_once_with(sk)
+    assert previous == {"enabled": True, "effort": "xhigh"}
+
+
+@pytest.mark.asyncio
 async def test_fresh_ancient_turn_remains_controllable(monkeypatch):
     """Total turn age must not evict an agent with fresh activity.
 
