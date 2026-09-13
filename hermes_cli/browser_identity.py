@@ -143,12 +143,12 @@ class BrowserIdentityProcessLock:
 
 
 def read_browser_identity_config() -> dict[str, Any]:
-    """Read the active profile's browser mapping without process caching."""
+    """Read effective browser policy, including managed overrides, without caching."""
 
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import load_config_readonly_strict
 
-        config = read_raw_config(strict=True)
+        config = load_config_readonly_strict()
     except Exception as exc:
         raise BrowserIdentityError(
             f"could not read browser identity configuration: {exc}"

@@ -646,7 +646,7 @@ class GatewayStartupMixin:
         reconnect fires and the row stays ``failed`` forever in a live process. Startup
         recovery cannot help either — it deliberately ignores rows owned by a live gateway.
 
-        Coalesced per adapter identity: a pending timer that already fires no earlier than
+        Coalesced per adapter identity: a pending timer that already fires no later than
         this one is left alone, so a burst of rejections inside one penalty window schedules
         one sweep, not one per lost answer. Best-effort by the ledger's contract — a failure
         here must never block a send."""
@@ -659,18 +659,18 @@ class GatewayStartupMixin:
         except Exception:
             STALE_AFTER_SECONDS = 24 * 60 * 60
         delay = min(delay, float(STALE_AFTER_SECONDS))
+        # Include the boundary margin in both the comparison and the actual wakeup.
+        sweep_at = time.monotonic() + delay + 1.0
         existing = self._deferred_obligation_sweeps.get(key)
         if existing is not None and not existing.done():
             existing_at = getattr(existing, "_hermes_sweep_at", None)
-            if existing_at is not None and existing_at >= time.monotonic() + delay:
+            if existing_at is not None and existing_at <= sweep_at:
                 return
             existing.cancel()
 
         async def _run_after_delay() -> None:
             try:
-                # +1s so we wake just OUTSIDE the server's stated window rather than
-                # racing its boundary.
-                await asyncio.sleep(delay + 1.0)
+                await asyncio.sleep(max(0.0, sweep_at - time.monotonic()))
                 # Deregister BEFORE redelivering. While the sweep runs, its own entry is no
                 # longer a cancellable *timer*: a rejection raised inside the sweep would
                 # coalesce onto it, see an elapsed ``_hermes_sweep_at``, and cancel the
@@ -691,7 +691,7 @@ class GatewayStartupMixin:
             task = asyncio.create_task(_run_after_delay())
         except RuntimeError:
             return  # No running loop (bare/test runner) — nothing to schedule.
-        task._hermes_sweep_at = time.monotonic() + delay
+        task._hermes_sweep_at = sweep_at
         self._deferred_obligation_sweeps[key] = task
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:

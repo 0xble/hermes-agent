@@ -16,6 +16,7 @@ def policy_file(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     monkeypatch.setattr(config, "get_config_path", lambda: path)
     monkeypatch.setattr(config, "_RAW_CONFIG_CACHE", {})
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
     monkeypatch.setattr(bt, "_active_sessions", {})
     monkeypatch.setattr(bt, "_is_camofox_mode", lambda: False)
     monkeypatch.setattr(bt, "_read_browser_identity_binding", lambda task: None)
@@ -24,10 +25,65 @@ def policy_file(tmp_path, monkeypatch):
     return path
 
 
-def resolve(entrypoint):
+def resolve(entrypoint, requested=None):
     if entrypoint == "policy":
-        return resolve_browser_identity(None)
-    return bt._resolve_navigation_identity("policy-test", None)
+        return resolve_browser_identity(requested)
+    return bt._resolve_navigation_identity("policy-test", requested)
+
+
+@pytest.mark.parametrize("entrypoint", ["policy", "navigation"])
+@pytest.mark.parametrize("user_policy", ["{}", "browser:\n  require_identity: false\n  real_profile_identities:\n    work:\n      browser: chrome\n      source_profile: User\n"])
+def test_managed_identity_policy_wins_and_reloads(policy_file, entrypoint, user_policy):
+    managed = policy_file.parent / "managed" / "config.yaml"
+    managed.parent.mkdir()
+    policy_file.write_text(user_policy, encoding="utf-8")
+    managed.write_text(
+        "browser:\n  require_identity: true\n  real_profile_identities:\n"
+        "    work:\n      browser: chrome\n      source_profile: Managed\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(BrowserIdentityError, match="identity is required"):
+        resolve(entrypoint)
+    assert resolve(entrypoint, "work").source_profile == "Managed"
+    managed.write_text(
+        "browser:\n  require_identity: true\n  real_profile_identities:\n"
+        "    work:\n      browser: chrome\n      source_profile: Updated\n",
+        encoding="utf-8",
+    )
+    assert resolve(entrypoint, "work").source_profile == "Updated"
+
+
+@pytest.mark.parametrize("entrypoint", ["policy", "navigation"])
+@pytest.mark.parametrize("layer", ["user", "managed"])
+@pytest.mark.parametrize("damage", ["browser: [", "[]", "false", "browser: []", "browser:\n  require_identity: nope", "browser:\n  real_profile_identities: []", "stat", "open"])
+def test_effective_policy_damage_never_uses_warm_cache(policy_file, monkeypatch, entrypoint, layer, damage):
+    managed = policy_file.parent / "managed" / "config.yaml"
+    managed.parent.mkdir()
+    policy_file.write_text("{}", encoding="utf-8")
+    managed.write_text("{}", encoding="utf-8")
+    assert resolve(entrypoint) is None
+    config.load_config_readonly()  # Even a warm permissive effective cache cannot authorize.
+    target = policy_file if layer == "user" else managed
+    if damage == "stat":
+        original = type(target).stat
+
+        def denied(path, *args, **kwargs):
+            if path == target:
+                raise PermissionError("fixture unreadable layer")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(type(target), "stat", denied)
+    elif damage == "open":
+        def denied(path, *args, **kwargs):
+            if path == target:
+                raise PermissionError("fixture unreadable layer")
+            return builtins.open(path, *args, **kwargs)
+
+        monkeypatch.setattr(config, "open", denied, raising=False)
+    else:
+        target.write_text(damage, encoding="utf-8")
+    with pytest.raises(BrowserIdentityError):
+        resolve(entrypoint)
 
 
 @pytest.mark.parametrize("entrypoint", ["policy", "navigation"])

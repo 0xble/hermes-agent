@@ -229,25 +229,32 @@ class TestDeferredSweepScheduling:
             task.cancel()
 
     @pytest.mark.asyncio
-    async def test_a_later_wait_supersedes_an_earlier_pending_one(self):
+    @pytest.mark.parametrize("first_delay, next_delay", [(0.0, 3000.0), (3000.0, 0.0), (0.0, 0.0)])
+    async def test_shared_timer_keeps_the_earliest_deadline(self, first_delay, next_delay):
         calls = []
         stub = self._stub(calls)
-
-        stub._schedule_deferred_obligation_redelivery(
-            "telegram", profile=None, delay=0.0,
-        )
-        first = stub._deferred_obligation_sweeps["telegram:default"]
-        stub._schedule_deferred_obligation_redelivery(
-            "telegram", profile=None, delay=3000.0,
-        )
-
-        # cancel() only takes effect on the next loop turn.
-        await asyncio.sleep(0)
-        assert first.cancelled() or first.done()
-        replacement = stub._deferred_obligation_sweeps["telegram:default"]
-        assert replacement is not first
-        assert replacement._hermes_sweep_at >= time.monotonic() + 2999.0
-        replacement.cancel()
+        tasks = []
+        try:
+            scheduled_at = time.monotonic()
+            stub._schedule_deferred_obligation_redelivery(
+                "telegram", profile=None, delay=first_delay,
+            )
+            first = stub._deferred_obligation_sweeps["telegram:default"]
+            tasks.append(first)
+            assert first._hermes_sweep_at >= scheduled_at + first_delay + 1.0
+            stub._schedule_deferred_obligation_redelivery(
+                "telegram", profile=None, delay=next_delay,
+            )
+            earliest = stub._deferred_obligation_sweeps["telegram:default"]
+            tasks.append(earliest)
+            assert (earliest is first) == (first_delay <= next_delay)
+            await asyncio.wait_for(asyncio.shield(earliest), timeout=5)
+            assert calls == [("telegram", None)]
+            assert stub._deferred_obligation_sweeps == {}
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_delay_is_bounded_by_the_ledger_stale_cutoff(self):
@@ -262,6 +269,61 @@ class TestDeferredSweepScheduling:
         task = stub._deferred_obligation_sweeps["telegram:default"]
         assert task._hermes_sweep_at <= time.monotonic() + dl.STALE_AFTER_SECONDS + 1
         task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_earliest_sweep_sends_only_due_rows_and_rearms_waiting_rows():
+    from gateway.run_startup import GatewayStartupMixin
+
+    runner = GatewayStartupMixin()
+    runner._running = True
+    runner._deferred_obligation_sweeps = {}
+    # Resume handling is orthogonal; the timer, ledger, dispatch and rearm are real.
+    runner._clear_resume_pending_for_claimed_obligations = AsyncMock(
+        side_effect=lambda rows, **kwargs: rows,
+    )
+    sent = []
+
+    async def send(*, chat_id, content, metadata):
+        assert content == dl.FLOOD_MARKER + "owed answer"
+        assert "telegram:default" not in runner._deferred_obligation_sweeps
+        sent.append(chat_id)
+        runner._schedule_deferred_obligation_redelivery(Platform.TELEGRAM, delay=3000)
+        await asyncio.sleep(0)  # A rejection during send must not cancel this sweep.
+        return SendResult(success=True, message_id="recovered")
+
+    adapter = SimpleNamespace(send=send)
+    runner._authorization_adapter = lambda platform, profile: adapter
+    for oid, wait in [("due-chat", 0.01), ("later-chat", 3000)]:
+        dl.record_obligation(
+            obligation_id=oid, session_key=oid, platform="telegram", chat_id=oid,
+            thread_id=None, content="owed answer",
+        )
+        dl.mark_failed(oid, f"flood_control:{wait}")
+
+    tasks = []
+    try:
+        runner._schedule_deferred_obligation_redelivery(Platform.TELEGRAM, delay=0)
+        first = runner._deferred_obligation_sweeps["telegram:default"]
+        tasks.append(first)
+        runner._schedule_deferred_obligation_redelivery(Platform.TELEGRAM, delay=3000)
+        tasks.extend(runner._deferred_obligation_sweeps.values())
+        await asyncio.wait_for(asyncio.shield(first), timeout=5)
+        assert sent == ["due-chat"]
+        assert _row("due-chat")["state"] == "delivered"
+        assert _row("later-chat")["state"] == "failed"
+        assert _row("later-chat")["attempts"] == 0
+        replacement = runner._deferred_obligation_sweeps["telegram:default"]
+        assert replacement is not first and not replacement.done()
+        assert ("telegram", "default") in runner._flood_redelivery_tasks
+        assert not runner._flood_redelivery_tasks[("telegram", "default")].done()
+    finally:
+        runner._running = False
+        tasks.extend(runner._deferred_obligation_sweeps.values())
+        tasks.extend(getattr(runner, "_flood_redelivery_tasks", {}).values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TestFloodRejectionReachesTheScheduler:
