@@ -721,8 +721,8 @@ class RuntimePin:
         if (
             normalize_route_base_url(str(getattr(client, "base_url", "") or ""))
             != normalize_route_base_url(route.base_url)
-            or hashlib.sha256(str(getattr(client, "api_key", "") or "").encode()).hexdigest()
-            != route.credential_digest
+            or any(hashlib.sha256(value.encode()).hexdigest() != route.credential_digest
+                   for value in RuntimePin._transport_credentials(client, route.api_mode))
         ):
             raise ValueError("named subagent fallback client changed after launch")
 
@@ -766,6 +766,15 @@ class RuntimePin:
                 return effort
         return None
 
+    @staticmethod
+    def _transport_credentials(client, api_mode: str) -> tuple[str, ...]:
+        # Anthropic OAuth puts the launch credential in auth_token, not api_key.
+        # If both are present the SDK sends both: neither may escape the pin.
+        fields = ("api_key", "auth_token") if api_mode == "anthropic_messages" else ("api_key",)
+        values = tuple(str(getattr(client, field)) for field in fields
+                       if getattr(client, field, None))
+        return values or ("",)
+
     def _validate_client(self, client) -> None:
         """Check the client that will physically send this request.
 
@@ -781,6 +790,10 @@ class RuntimePin:
         caught attack. Host identity is what a real route change alters.
         """
         self._validate_client_route(client)
+        if self.api_mode == "anthropic_messages" and self._pinned_credential:
+            for credential in self._transport_credentials(client, self.api_mode):
+                self._compare_credential(credential)
+            return
         api_key = getattr(client, "api_key", None)
         if self.provider == "openai-codex":
             self._compare_credential(str(api_key or ""))

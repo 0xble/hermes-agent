@@ -84,5 +84,7 @@ def test_named_fallback_rejects_changed_authority(make_child, monkeypatch, field
         child._fallback_chain[0][field] = value
     else:
         child._fallback_chain[0][field] = value
-    assert not child._try_activate_fallback()
+    from agent.errors import NamedFallbackInstallationError
+    with pytest.raises(NamedFallbackInstallationError, match="named subagent fallback installation failed"):
+        child._try_activate_fallback()
     assert not getattr(child, "_delegation_route_transitions", [])
