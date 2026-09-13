@@ -63,6 +63,7 @@ def test_chrome_followup_first_refuses_camofox_before_session_creation(tmp_path,
     monkeypatch.setattr("hermes_cli.browser_identity.read_browser_identity_config", lambda: {
         "default_identity": "personal", "real_profile_identities": {"personal": {"browser": "chrome", "source_profile": "Default"}}})
     monkeypatch.setattr(chrome, "_start_browser_cleanup_thread", lambda: None)
+    monkeypatch.setattr(chrome, "_use_real_profile", lambda: True)
     monkeypatch.setattr(session, "_create_session_for_key", lambda *a: pytest.fail("created browser"))
     with pytest.raises((RuntimeError, ValueError), match="another backend"):
         chrome._get_session_info("followup")
