@@ -25,13 +25,10 @@ def parent(monkeypatch):
 
 
 @pytest.fixture
-def local_dispatch(monkeypatch):
-    def metadata(**kwargs):
-        labels = kwargs["task_labels"]
-        return {"parent_task_id": "task", "thread_refs": [f"thread-{i}" for i in range(len(labels))],
-                "task_labels": labels}
-
-    monkeypatch.setattr("tools.async_delegation.reserve_delegation_metadata", metadata)
+def local_dispatch(monkeypatch, tmp_path):
+    # Keep reservation real: its canonical owner and resume refs are launch authority,
+    # not incidental dispatch plumbing. Only transcripts and child execution are fake.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("tools.delegation_live_log.create_live_transcripts", lambda *a, **k: ("live", [], []))
     monkeypatch.setattr(delegate_tool, "_announce_batch", lambda *args: None)
     monkeypatch.setattr(delegate_tool, "_capture_origin", lambda: ("", "", None, None, False))
@@ -158,6 +155,10 @@ def test_pre_admission_failure_preserves_resume_grant(tmp_path, monkeypatch, par
     assert config["_delegation_completed"] is True
     assert "_delegation_resume_claimed_at" not in config
     assert db.claim_delegated_resumes(["child"], claim_id="corrected-retry") is True
+    restored = reserve_delegation_metadata(
+        parent_task_id=original["parent_task_id"], owner=owner,
+        task_labels=original["task_labels"], resume_refs=original["thread_refs"], session_db=db)
+    assert restored == original
     db.close()
 
 
@@ -172,3 +173,7 @@ def test_public_delegation_sets_native_review_card_identity(parent, local_dispat
     delegate_tool.delegate_task(tasks=[{"goal": "Review source changes", "task_label": "Review source"}],
                                 parent_agent=parent, completion_contract=contract)
     assert child._progress_identity_ref["native_review"] is expected
+    from tools.async_delegation import current_delegation_owner
+
+    identity = child._progress_identity_ref
+    assert identity["owner"] == identity["card_owner"] == current_delegation_owner(parent)
