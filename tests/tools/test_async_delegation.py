@@ -306,7 +306,28 @@ def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
     monkeypatch.setattr(ad, "_STALL_GRACE_SECONDS", grace)
 
 
-def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
+@pytest.fixture
+def delegation_finalized(monkeypatch):
+    """Queue visibility precedes the finalizer releasing its live-work ownership."""
+    finalized = set()
+    changed = threading.Condition()
+    real_finalize = ad._finalize
+
+    def finalize(delegation_id, *args, **kwargs):
+        real_finalize(delegation_id, *args, **kwargs)
+        with changed:
+            finalized.add(delegation_id)
+            changed.notify_all()
+
+    def wait_for(delegation_id):
+        with changed:
+            return changed.wait_for(lambda: delegation_id in finalized, timeout=5.0)
+
+    monkeypatch.setattr(ad, "_finalize", finalize)
+    return wait_for
+
+
+def test_stalled_runner_is_interrupted_then_finalized(monkeypatch, delegation_finalized):
     _fast_stale_monitor(monkeypatch)
     gate = threading.Event()
     interrupted = {"count": 0}
@@ -337,6 +358,7 @@ def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
         assert "stalled" in evt["error"]
         # Interrupt was requested BEFORE force-finalization (grace window).
         assert interrupted["count"] >= 1
+        assert delegation_finalized(res["delegation_id"])
         assert ad.active_count() == 0
     finally:
         gate.set()
@@ -381,7 +403,7 @@ def test_progressing_runner_is_never_stalled(monkeypatch):
     assert evt["summary"] == "done"
 
 
-def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
+def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch, delegation_finalized):
     """Interrupt-responsive children finalize through the NORMAL path.
 
     The monitor's interrupt gives a wedged-looking child a grace window; if
@@ -413,6 +435,7 @@ def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     assert evt["status"] == "interrupted"
     assert evt["summary"] == "partial work saved"
     assert evt["api_calls"] == 3
+    assert delegation_finalized(res["delegation_id"])
     assert ad.active_count() == 0
 
 
