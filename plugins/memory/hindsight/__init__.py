@@ -760,8 +760,8 @@ class HindsightMemoryProvider(MemoryProvider):
         return True
 
     def _is_retain_op_complete(self, bank_id: str, op_id: str) -> bool:
-        """True when a server-side retain op is done or gone (completed ops are evicted,
-        so 404 = no longer pending). Transient errors -> False, caller keeps waiting."""
+        """Reconcile terminal operations. Missing source status still needs readback;
+        absence alone cannot authorize a deferred replacement write."""
         from hindsight_client_api.exceptions import NotFoundException
 
         # Server completion alone is not durability. Source work must match its
@@ -769,15 +769,18 @@ class HindsightMemoryProvider(MemoryProvider):
         candidate = self._source_retain_ops.get(op_id)
         _settle_if_source = lambda: True if candidate is None else self._verify_source_candidate(bank_id, candidate)  # noqa: E731
 
+        def finish():
+            finish_source_operation(self, op_id)
+            with self._source_retain_keys_lock:
+                self._source_terminal_ops.intersection_update(self._source_retain_ops)
+
         try:
             resp = self._run_hindsight_operation(
                 lambda client: client.operations.get_operation_status(bank_id=bank_id, operation_id=op_id)
             )
         except NotFoundException:
-            if candidate is not None:
-                self._source_terminal_ops.add(op_id)
             if (settled := _settle_if_source()):
-                finish_source_operation(self, op_id)
+                finish()
             return settled
         except Exception as exc:
             logger.debug("Prefetch: operation status check failed for %s: %s", op_id, exc)
@@ -787,12 +790,13 @@ class HindsightMemoryProvider(MemoryProvider):
             if candidate is not None:
                 self._source_terminal_ops.add(op_id)
             if (settled := _settle_if_source()):
-                finish_source_operation(self, op_id)
+                finish()
             return settled
-        if status == "failed":
+        if status in {"failed", "cancelled"}:
             if candidate is not None:
+                self._source_terminal_ops.add(op_id)
                 self._source_candidate_failed(candidate)
-                finish_source_operation(self, op_id)
+                finish()
             return True
         return False
 

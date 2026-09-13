@@ -409,3 +409,26 @@ def test_deferred_fresh_payload_is_never_reconstructed_on_restart():
     server.hash = new.content_hash
     assert recovered._wait_for_retains_drained(30)
     assert len(server.calls) == 2  # lost in-memory desire requires fresh observation
+
+
+@pytest.mark.parametrize('prior_status', ['gone', 'not_found', 'processing', 'failed', 'cancelled'])
+def test_deferred_reversion_requires_terminal_status_not_missing_status(prior_status):
+    old, new = versions()
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidates([old, new], p._bank_id)
+    p._retain_source_candidates([old], p._bank_id)
+    server.statuses.update({'0': prior_status, '1': 'completed'})
+    server.hash = 'unverified-remote-content'
+    assert not p._wait_for_retains_drained(30)
+    if prior_status in {'gone', 'not_found', 'processing'}:
+        assert len(server.calls) == 2  # absent/unknown status cannot authorize another write
+        assert '0' in p._pending_retain_ops
+        server.statuses['0'] = 'completed'
+        assert not p._wait_for_retains_drained(30)
+    assert len(server.calls) == 3
+    server.statuses['2'] = 'completed'
+    server.hash = old.content_hash
+    assert p._wait_for_retains_drained(30)
+    assert not p._source_terminal_ops  # only live unresolved refs retain terminal evidence
+    assert len(server.calls) == 3
