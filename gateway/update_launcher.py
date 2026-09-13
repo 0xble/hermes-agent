@@ -35,41 +35,44 @@ def launch_native_update(
     A claimed marker is still an active admission marker: it is the pending file
     after the updater atomically takes ownership.  Do not overwrite its reason.
     """
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
     home = Path(home)
     pending_path = home / ".update_pending.json"
     claimed_path = home / ".update_pending.claimed.json"
     output_path = home / ".update_output.txt"
     exit_code_path = home / ".update_exit_code"
-    if claimed_path.exists():
+    staging_path = home / ".update_pending.initializing"
+    if pending_path.exists() or claimed_path.exists():
         return {"started": False, "pending": True}
     pending = {**pending, "notification_version": 2}
     encoded = json.dumps(pending).encode("utf-8")
-    try:
-        fd = os.open(str(pending_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return {"started": False, "pending": True}
-    try:
-        with os.fdopen(fd, "wb") as marker:
-            # A prior updater may have claimed between the first check and our O_EXCL.
-            # Keep this exclusive marker empty (unresolvable by startup watchers)
-            # until all request-owned files are initialized.
-            if claimed_path.exists():
-                marker.close()  # Windows cannot unlink an open marker.
-                pending_path.unlink(missing_ok=True)
+    # Keep a stable lock inode: the kernel, not a PID/age guess, owns initializer
+    # liveness. Never unlink this file, including after an interrupted initializer.
+    with (home / ".update_admission.lock").open("a+", encoding="utf-8") as lock:
+        if not _try_acquire_file_lock(lock):
+            return {"started": False, "pending": True}
+        try:
+            if pending_path.exists() or claimed_path.exists():
                 return {"started": False, "pending": True}
-            with output_path.open("wb") as output:
-                output.flush()
-                os.fsync(output.fileno())
-            exit_code_path.unlink(missing_ok=True)
-            (home / ".update_process_exit_code").unlink(missing_ok=True)
-            marker.write(encoded)
-            marker.flush()
-            os.fsync(marker.fileno())
-        spawn(hermes_cmd, output_path, exit_code_path)
-    except Exception:
-        pending_path.unlink(missing_ok=True)
-        exit_code_path.unlink(missing_ok=True)
-        raise
+            # Staging is never a request. Only the lock owner can replace remnants
+            # from a dead initializer; existing pending/claimed files fail closed.
+            fd = os.open(str(staging_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as marker:
+                with output_path.open("wb") as output:
+                    output.flush()
+                    os.fsync(output.fileno())
+                exit_code_path.unlink(missing_ok=True)
+                (home / ".update_process_exit_code").unlink(missing_ok=True)
+                marker.write(encoded)
+                marker.flush()
+                os.fsync(marker.fileno())
+            os.replace(staging_path, pending_path)
+            # Publication is the uncertainty fence, including interruption before
+            # spawn or an exception after a child may have started. Never retract it.
+            spawn(hermes_cmd, output_path, exit_code_path)
+        finally:
+            _release_file_lock(lock)
     return {"started": True, "pending": False}
 
 

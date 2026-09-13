@@ -77,6 +77,7 @@ def test_new_request_initializes_output_before_any_watcher_can_resolve_it(tmp_pa
     adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
     runner.adapters = {Platform.TELEGRAM: adapter}
     real_fsync = update_launcher.os.fsync
+    real_replace = update_launcher.os.replace
     observations = []
 
     def observe_publication(fd):
@@ -87,7 +88,15 @@ def test_new_request_initializes_output_before_any_watcher_can_resolve_it(tmp_pa
             observations.append(output.read_bytes())
             assert output.read_bytes() == b""
 
+    def observe_replace(source, target):
+        real_replace(source, target)
+        if str(source).endswith(".update_pending.initializing"):
+            observations.append(output.read_bytes())
+            assert read_pending(tmp_path) is not None
+            assert output.read_bytes() == b""
+
     monkeypatch.setattr(update_launcher.os, "fsync", observe_publication)
+    monkeypatch.setattr(update_launcher.os, "replace", observe_replace)
 
     def delayed_child(cmd, output, exit_code):
         async def scenario():
