@@ -454,17 +454,51 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        # Announce the provisional boundary before the send starts so a slow adapter
-        # cannot let later tool progress overtake this content entry.
+        if self._preview_send_unknown:
+            # Do not retry an accepted-but-unacknowledged preview or let a later
+            # refusal resolve its boundary. The original receipt owns settlement.
+            return False
         self._open_preview_boundary()
+        self._preview_send_unknown = True
+        receipt = asyncio.create_task(self.adapter.send(
+            chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
+            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize)))
+        self._pending_preview_send = receipt
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-                metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
-        except BaseException:
-            self._retract_pending_preview_boundary()
+            result = await asyncio.shield(receipt)
+        except asyncio.CancelledError:
+            self._retain_preview_send_receipt(receipt, text, finalize=finalize)
             raise
-        if not result.success:
+        except Exception:
+            self._pending_preview_send = None
+            # Transport exceptions cannot tell us whether the platform accepted.
+            raise
+        self._pending_preview_send = None
+        return self._apply_preview_send_receipt(result, text, finalize=finalize)
+
+    def _retain_preview_send_receipt(self, receipt, text: str, *, finalize: bool) -> None:
+        """Bound the orphan ACK wait without inferring absence when it expires."""
+        expiry = asyncio.get_running_loop().call_later(30, receipt.cancel)
+
+        def received(fut):
+            expiry.cancel()
+            self._pending_preview_send = None
+            try:
+                result = fut.result()
+            except (asyncio.CancelledError, Exception):
+                return
+            self._apply_preview_send_receipt(result, text, finalize=finalize)
+            # The consumer has stopped; a known surviving preview is now durable.
+            self._settle_pending_preview_boundary()
+
+        receipt.add_done_callback(received)
+
+    def _apply_preview_send_receipt(self, result, text: str, *, finalize: bool) -> bool:
+        success = getattr(result, "success", None)
+        if success is not True and success is not False:
+            return False
+        self._preview_send_unknown = False
+        if not success:
             self._retract_pending_preview_boundary()
             self._edit_supported = False
             return False

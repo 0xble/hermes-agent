@@ -136,6 +136,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # draft frames, preview edits, and empty lifecycle signals emit no events.
         self._on_content_boundary = on_content_boundary
         self._pending_preview_boundary: Optional[ProvisionalContentBoundary] = None
+        self._preview_send_unknown = False
+        self._pending_preview_send: Optional[asyncio.Task] = None
         self._content_boundary_sequence = 0
         self._published_content_boundaries: "set[tuple[str, str]]" = set()
         self._on_before_finalize = on_before_finalize
@@ -479,7 +481,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     ) -> None:
         """Resolve a provisional preview as a persistent timeline entry."""
         pending = self._pending_preview_boundary
-        if pending is None:
+        if pending is None or self._preview_send_unknown:
             return
         self._pending_preview_boundary = None
         self._publish_content_boundary(DurableContentBoundary(
@@ -497,7 +499,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     def _retract_pending_preview_boundary(self) -> None:
         """Resolve a provisional preview that left no persistent chat entry."""
         pending = self._pending_preview_boundary
-        if pending is None:
+        if pending is None or self._preview_send_unknown:
             return
         self._pending_preview_boundary = None
         self._publish_content_boundary(
@@ -510,7 +512,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             return
         if pending.message_id is not None or self._segment_has_persistent_receipt:
             self._confirm_pending_preview_boundary()
-        else:
+        elif not self._preview_send_unknown:
+            # No send was dispatched (filtered/draft-only content), or absence is
+            # known. An unacknowledged attempt must remain provisional instead.
             self._retract_pending_preview_boundary()
 
     @staticmethod

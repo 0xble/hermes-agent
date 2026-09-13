@@ -907,10 +907,9 @@ class TurnRunner:
                 elif not ctx.progress_queue.empty():
                     raw = ctx.progress_queue.get_nowait()
                 elif st.pending_provisional_boundary_id is not None:
-                    # The stream died before resolving this preview. A missing resolution must
-                    # not silently drop the tool output buffered behind it.
-                    self._release_deferred_progress(st)
-                    continue
+                    # A cancelled stream may have been accepted without an ACK. Keep
+                    # later tools fenced; draining is not evidence of retraction.
+                    break
                 else:
                     break
                 if self._is_content_boundary(raw):
