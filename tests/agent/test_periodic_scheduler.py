@@ -2,6 +2,9 @@
 
 import threading
 import time
+from types import SimpleNamespace
+
+import pytest
 
 from agent import periodic_scheduler
 from agent.periodic_scheduler import PeriodicScheduler, schedule
@@ -16,24 +19,68 @@ def _wait_until(pred, timeout=3.0):
     return pred()
 
 
-def test_two_intervals_fire_proportionally_and_cancel_stops_one():
+def test_two_intervals_fire_proportionally(monkeypatch):
+    # Wall-clock counts also include OS scheduling latency: if the timer wakes
+    # after both deadlines, both handles fire once, not in a 5:1 catch-up burst.
+    # Control time/worker execution here; the tests below keep real threads.
+    sched = PeriodicScheduler()
+    now = 0.0
+    fast, slow = [], []
+
+    class Finished(Exception):
+        pass
+
+    def advance(timeout=None):
+        nonlocal now
+        if timeout is None or now + timeout > 1.0:
+            raise Finished
+        now += timeout
+
+    monkeypatch.setattr(periodic_scheduler, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(sched._cond, "wait", advance)
+    monkeypatch.setattr(sched, "_thread", SimpleNamespace(is_alive=lambda: True))
+    monkeypatch.setattr(sched, "_dispatch", sched._run_callback)
+
+    def slow_tick():
+        slow.append(now)
+        if len(slow) == 3:
+            h_fast.cancel()
+            h_slow.cancel()
+
+    h_fast = sched.schedule(lambda: fast.append(now), 0.01)
+    h_slow = sched.schedule(slow_tick, 0.05)
+    with pytest.raises(Finished):
+        sched._run()
+
+    assert len(slow) == 3
+    assert len(fast) > len(slow)  # 5x interval ratio -> clearly more fast ticks
+    for ticks, interval in ((fast, 0.01), (slow, 0.05)):
+        assert ticks[0] == pytest.approx(interval)
+        assert [b - a for a, b in zip(ticks, ticks[1:])] == pytest.approx(
+            [interval] * (len(ticks) - 1)
+        )
+
+
+def test_two_intervals_fire_and_cancel_stops_one():
     sched = PeriodicScheduler()
     fast, slow = [], []
     h_fast = sched.schedule(lambda: fast.append(time.monotonic()), 0.01)
     h_slow = sched.schedule(lambda: slow.append(time.monotonic()), 0.05)
 
-    assert _wait_until(lambda: len(slow) >= 3)
-    assert len(fast) > len(slow)  # 5x interval ratio -> clearly more fast ticks
-    assert sched._thread is not None and sched._thread.is_alive()
+    try:
+        assert _wait_until(lambda: len(fast) >= 3 and len(slow) >= 3)
+        assert sched._thread is not None and sched._thread.is_alive()
 
-    h_fast.cancel(wait=2.0)
-    n_fast = len(fast)
-    n_slow = len(slow)
-    assert _wait_until(lambda: len(slow) > n_slow, timeout=2.0), (
-        "sibling callback stopped when another was cancelled"
-    )
-    assert len(fast) == n_fast, "cancelled callback kept firing"
-    h_slow.cancel(wait=1.0)
+        h_fast.cancel(wait=2.0)
+        n_fast = len(fast)
+        n_slow = len(slow)
+        assert _wait_until(lambda: len(slow) > n_slow, timeout=2.0), (
+            "sibling callback stopped when another was cancelled"
+        )
+        assert len(fast) == n_fast, "cancelled callback kept firing"
+    finally:
+        h_fast.cancel(wait=2.0)
+        h_slow.cancel(wait=1.0)
     # With every handle quiesced, scheduling + cancelling adds no persistent thread.
     before = threading.active_count()
     sched.schedule(lambda: None, 0.01).cancel(wait=1.0)
