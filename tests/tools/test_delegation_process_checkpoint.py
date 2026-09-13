@@ -614,6 +614,42 @@ def test_unreadable_lost_checkpoint_cannot_clear_owner_fence(tmp_path, monkeypat
         assert registry.completion_queue.empty() and registry.pending_watchers == []
 
 
+@pytest.mark.parametrize("raw", ["{", "null", '[{"session_id":"broken","completed_result":null}]'])
+def test_secondary_profile_recovery_preserves_prior_uncertainty(tmp_path, monkeypatch, raw):
+    from tools import process_registry as pr
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    homes = [tmp_path / name for name in ("damaged", "healthy")]
+    for home in homes:
+        home.mkdir()
+    damaged, healthy = [home / "processes.json" for home in homes]
+    damaged.write_text(raw)
+    healthy.write_text("[]")
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", pr._CHECKPOINT_PATH_AT_IMPORT)
+    registry = pr.ProcessRegistry()
+    for home in homes:
+        token = set_hermes_home_override(home)
+        try:
+            assert registry.recover_from_checkpoint() == 0
+            with pytest.raises(ValueError, match="owner"):
+                registry.unresolved_owned_processes({"child-run"})
+            registry._write_checkpoint()
+        finally:
+            reset_hermes_home_override(token)
+    # The healthy source must neither clear nor inherit another home's corrupt
+    # entries, and later writes must preserve the unreadable source bytes.
+    assert json.loads(healthy.read_text()) == []
+    token = set_hermes_home_override(homes[0])
+    try:
+        registry._write_checkpoint()
+        assert damaged.read_text() == raw or json.loads(damaged.read_text()) == json.loads(raw)
+        damaged.write_text("[]")  # explicit operator repair of this exact source
+        registry.recover_from_checkpoint()
+        assert registry.unresolved_owned_processes({"child-run"}) == []
+    finally:
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("failure_at", ["completion", "observation"])
 def test_failed_receipt_successful_checkpoint_recovers_exact_unresolved_effect(tmp_path, monkeypatch, failure_at):
     from tools import process_registry as pr

@@ -18,7 +18,8 @@ class ProcessCheckpointMixin:
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
         from tools.process_registry_results import completed_result_record
 
-        if getattr(self, "_checkpoint_read_failed", False):
+        checkpoint_path = _checkpoint_path()
+        if checkpoint_path in self._checkpoint_read_failures:
             return  # Preserve unreadable source bytes until explicit repair/recovery.
         try:
             with self._lock:
@@ -47,9 +48,9 @@ class ProcessCheckpointMixin:
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
                 # Malformed originals have no replacement proof. Keep them even
                 # when their claimed ID collides with a healthy tracked entry.
-                entries.extend(self._unresolved_checkpoint_entries)
+                entries.extend(self._unresolved_checkpoint_entries.get(checkpoint_path, ()))
                 from utils import atomic_json_write
-                atomic_json_write(_checkpoint_path(), entries)
+                atomic_json_write(checkpoint_path, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -58,21 +59,24 @@ class ProcessCheckpointMixin:
         were recovered as detached sessions."""
         from tools.process_registry import _checkpoint_path
 
-        if not _checkpoint_path().exists():
+        checkpoint_path = _checkpoint_path()
+        if not checkpoint_path.exists():
             return 0
         try:
-            entries = json.loads(_checkpoint_path().read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self._checkpoint_read_failed = True
-            self._unresolved_checkpoint_entries = [None]  # Unknown ownership blocks all resumes.
+            self._checkpoint_read_failures.add(checkpoint_path)
+            self._unresolved_checkpoint_entries[checkpoint_path] = [None]  # Unknown ownership blocks all resumes.
             return 0
         if not isinstance(entries, list):
-            self._checkpoint_read_failed = True
-            self._unresolved_checkpoint_entries = [entries]
+            self._checkpoint_read_failures.add(checkpoint_path)
+            self._unresolved_checkpoint_entries[checkpoint_path] = [entries]
             return 0  # Unparseable container is left untouched, including later writes.
-        self._checkpoint_read_failed = False
+        self._checkpoint_read_failures.discard(checkpoint_path)
         recovered = 0
-        self._unresolved_checkpoint_entries = []
+        # Multiplexed startup recovers several homes into this one registry.
+        # Only rereading this exact source can replace its uncertainty fence.
+        self._unresolved_checkpoint_entries[checkpoint_path] = []
         for entry in entries:
             try:
                 if not isinstance(entry, dict):
@@ -91,7 +95,7 @@ class ProcessCheckpointMixin:
             except (ValueError, KeyError, TypeError, AttributeError):
                 # Preserve the original through subsequent checkpoint writes,
                 # without withholding unrelated healthy recovery and watchers.
-                self._unresolved_checkpoint_entries.append(entry)
+                self._unresolved_checkpoint_entries[checkpoint_path].append(entry)
                 logger.warning("Retaining malformed process checkpoint entry", exc_info=True)
         self._write_checkpoint()
         # HERMES-123: a persisted deadline is only enforceable if its expiry thread is restarted
@@ -131,7 +135,7 @@ class ProcessCheckpointMixin:
     def _recover_live_checkpoint_entry(self, entry) -> bool:
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _CHECKPOINT_DEFAULTS,
-            _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
+            _WATCHER_ROUTE_KEYS, _stop_systemd_unit, _checkpoint_path,
         )
 
         pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
@@ -164,7 +168,7 @@ class ProcessCheckpointMixin:
                     "Could not reap persisted scope %s for dead wrapper pid %s; "
                     "retaining checkpoint entry for the next startup",
                     systemd_unit, pid)
-                self._unresolved_checkpoint_entries.append(entry)
+                self._unresolved_checkpoint_entries.setdefault(_checkpoint_path(), []).append(entry)
             else:
                 self._retain_lost_checkpoint_entry(entry, "process identity lost; exit/output unavailable")
             return False

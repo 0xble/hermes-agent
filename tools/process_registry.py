@@ -498,7 +498,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._result_generation = 0
-        self._unresolved_checkpoint_entries = []
+        self._unresolved_checkpoint_entries: dict[Path, list] = {}
+        self._checkpoint_read_failures: set[Path] = set()
         self._lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -2176,7 +2177,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with self._lock:
                 generation = self._result_generation
                 from tools.process_registry_results import checkpoint_entry_owner
-                for entry in self._unresolved_checkpoint_entries:
+                for entry in (entry for entries in self._unresolved_checkpoint_entries.values() for entry in entries):
                     affected_owner = checkpoint_entry_owner(entry)
                     if affected_owner is None or affected_owner in owners:
                         raise ValueError("Malformed process checkpoint: unresolved owner")
