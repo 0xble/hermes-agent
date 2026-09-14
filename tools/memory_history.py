@@ -145,6 +145,9 @@ def rollback(record_id: str, store) -> Dict[str, Any]:
     A second successful rollback is idempotent.  Any current state other than
     the recorded after-image is a conflict and is left untouched.
     """
+    from agent.delegation_context import is_read_only_knowledge_context
+    if is_read_only_knowledge_context():
+        return {"success": False, "error": "Durable memory rollback is parent-owned for named subagents."}
     record = _read_record(record_id)
     if not record:
         return {"success": False, "error": f"Unknown memory history id '{record_id}'."}

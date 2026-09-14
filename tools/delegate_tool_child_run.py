@@ -755,7 +755,10 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                read_only_knowledge=getattr(child, "memory_access_mode", None) == "read_only",
+            ):
                 goal = self.goal
                 fork_history = deepcopy(vars(child).get("_delegation_fork_history"))
                 if fork_history is not None:
