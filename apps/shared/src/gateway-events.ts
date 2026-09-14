@@ -455,8 +455,11 @@ export const BACKEND_EVENT_NAMES = [
   'setup.ready',
   'skin.changed',
   'status.update',
+  'subagent.admitted',
   'subagent.complete',
+  'subagent.handling',
   'subagent.progress',
+  'subagent.result_turn',
   'subagent.spawn_requested',
   'subagent.start',
   'subagent.thinking',
@@ -553,8 +556,11 @@ export interface BackendGatewayEventMap {
   'setup.ready': Record<string, unknown>
   'skin.changed': HermesSkin
   'status.update': StatusUpdatePayload
+  'subagent.admitted': Record<string, unknown>
   'subagent.complete': SubagentEventPayload
+  'subagent.handling': Record<string, unknown>
   'subagent.progress': SubagentEventPayload
+  'subagent.result_turn': Record<string, unknown>
   'subagent.spawn_requested': SubagentEventPayload
   'subagent.start': SubagentEventPayload
   'subagent.thinking': SubagentEventPayload

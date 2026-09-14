@@ -1,41 +1,44 @@
 """Regression test for #25676 — nested gateway.streaming config must be loaded."""
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+import pytest
+import yaml
 
 
 
-def _load_with_yaml_dict(yaml_dict: dict):
-    """Patch filesystem so load_gateway_config() sees *yaml_dict* as config.yaml."""
+@pytest.fixture
+def load_with_yaml_dict(tmp_path, monkeypatch):
+    """Exercise the effective-config loader against a real isolated config file."""
     from gateway.config import load_gateway_config
-
-    fake_home = Path("/tmp/fake_hermes_home_25676")
-
-    def fake_exists(self):
-        return str(self).endswith("config.yaml")
-
-    with patch("gateway.config.get_hermes_home", return_value=fake_home), \
-         patch.object(Path, "exists", fake_exists), \
-         patch("builtins.open", create=True) as mock_file:
-        mock_file.return_value.__enter__ = lambda s: s
-        mock_file.return_value.__exit__ = MagicMock(return_value=False)
-        with patch("yaml.safe_load", return_value=yaml_dict):
-            return load_gateway_config()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.config.get_hermes_home", lambda: tmp_path)
+    def load(yaml_dict):
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(yaml_dict), encoding="utf-8")
+        return load_gateway_config()
+    return load
 
 
 class TestStreamingConfigNested:
-    def test_top_level_streaming(self):
-        cfg = _load_with_yaml_dict({"streaming": {"enabled": True, "transport": "draft"}})
+    def test_top_level_streaming(self, load_with_yaml_dict):
+        cfg = load_with_yaml_dict({"streaming": {"enabled": True, "transport": "draft"}})
         assert cfg.streaming.enabled is True
         assert cfg.streaming.transport == "draft"
 
 
-    def test_top_level_takes_precedence(self):
-        cfg = _load_with_yaml_dict({
+    def test_top_level_takes_precedence(self, load_with_yaml_dict):
+        cfg = load_with_yaml_dict({
             "streaming": {"enabled": True, "transport": "edit"},
             "gateway": {"streaming": {"enabled": False, "transport": "draft"}},
         })
         assert cfg.streaming.enabled is True
         assert cfg.streaming.transport == "edit"
+
+    def test_nested_streaming_when_top_level_absent(self, load_with_yaml_dict):
+        cfg = load_with_yaml_dict({"gateway": {"streaming": {"enabled": True, "transport": "draft"}}})
+        assert cfg.streaming.enabled is True
+        assert cfg.streaming.transport == "draft"
+
+    def test_empty_top_level_does_not_enable_nested_streaming(self, load_with_yaml_dict):
+        cfg = load_with_yaml_dict({"streaming": {}, "gateway": {"streaming": {"enabled": True}}})
+        assert cfg.streaming.enabled is False
 
 
 class TestStreamingModeAlias:
@@ -105,10 +108,10 @@ class TestStreamingYamlBooleanQuirk:
         assert sc.transport == "auto"
 
 
-    def test_loader_normalizes_bare_yaml_off(self):
+    def test_loader_normalizes_bare_yaml_off(self, load_with_yaml_dict):
         """End-to-end through load_gateway_config(): unquoted ``mode: off``
         (a YAML boolean) must keep streaming disabled."""
-        cfg = _load_with_yaml_dict({"streaming": {"mode": False}})
+        cfg = load_with_yaml_dict({"streaming": {"mode": False}})
         assert cfg.streaming.enabled is False
         assert cfg.streaming.transport == "off"
 

@@ -117,3 +117,57 @@ def test_pruning_keeps_complete_generation_and_verified_per_db_recovery(
         assert (root / original / "state.db").is_file()
     if replacement == "invalid-manifest":
         assert manifest.read_bytes() == b"\xff", "unknown snapshot namespace must not be pruned"
+
+
+@pytest.mark.parametrize("label", ["manual", "pre-update"])
+@pytest.mark.parametrize("prune_via", ["publication", "public-prune"])
+def test_valid_size_mismatched_db_cannot_evict_last_recovery(tmp_path, monkeypatch, label, prune_via):
+    from contextlib import closing
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text("{}\n")
+    with closing(sqlite3.connect(home / "state.db")) as db:
+        db.execute("CREATE TABLE evidence (value TEXT)")
+        db.executemany("INSERT INTO evidence VALUES (?)", ((f"row-{i:04d}",) for i in range(500)))
+        db.commit()
+    _make_db(home / "cron/executions.db", "execution_recovery")
+    with closing(sqlite3.connect(home / "cron/executions.db")) as db:
+        db.execute("INSERT INTO execution_recovery VALUES (zeroblob(32768))")
+        db.commit()
+    cap = (home / "state.db").stat().st_size
+    assert (home / "cron/executions.db").stat().st_size > cap
+
+    def capture(keep, max_file_size):
+        snap_id = create_quick_snapshot(
+            label=label, hermes_home=home, keep=keep, max_file_size=max_file_size,
+        )
+        assert snap_id
+        return home / "state-snapshots" / snap_id
+
+    original = capture(10, cap)
+    replaced = capture(10, cap)
+    manifest_bytes = (replaced / "manifest.json").read_bytes()
+    meta = json.loads(manifest_bytes)
+    replacement = tmp_path / "replacement.db"
+    _make_db(replacement, "evidence")
+    replacement.replace(replaced / "state.db")
+    integrity = backup.verify_sqlite_integrity(replaced / "state.db")
+    assert integrity["valid"]
+    assert integrity["size"] != meta["files"]["state.db"]
+    assert not backup._is_complete_quick_snapshot(original, json.loads((original / "manifest.json").read_text()))
+    latest = capture(1 if prune_via == "publication" else 10, 4096)
+    if prune_via == "public-prune":
+        backup.prune_quick_snapshots(keep=1, hermes_home=home)
+    assert original.is_dir(), "manifest-mismatched valid SQLite displaced the last good recovery"
+    assert latest.is_dir()
+    assert not replaced.exists(), "invalid coverage should not prevent bounded retention"
+    for _ in range(2):
+        backup.prune_quick_snapshots(keep=0, hermes_home=home)
+        assert original.is_dir() and latest.is_dir()
+    # Exercise the supported restore path as well as checking retained files.
+    (home / "state.db").unlink()
+    assert backup.restore_quick_snapshot(original.name, hermes_home=home)
+    with closing(sqlite3.connect(f"file:{home / 'state.db'}?mode=ro", uri=True)) as db:
+        assert db.execute("SELECT count(*) FROM evidence").fetchone() == (500,)

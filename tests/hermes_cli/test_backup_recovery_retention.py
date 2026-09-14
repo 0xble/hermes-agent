@@ -304,3 +304,42 @@ def test_same_second_numeric_suffix_does_not_regress_checkpoint(snapshots):
         assert _meta(latest)["recovery_required_dbs"] == ["projects.db"]
         assert _meta(latest)["recovery_sequence"] > previous_sequence
         previous_sequence = _meta(latest)["recovery_sequence"]
+
+
+@pytest.mark.parametrize("replacement", ["healthy", "size-mismatch", "null", "string", "float", "bool", "negative"])
+@pytest.mark.parametrize("entrypoint", ["public-prune", "publication"])
+def test_legacy_valid_db_must_match_manifest_before_clearing_obligation(snapshots, replacement, entrypoint):
+    s = snapshots
+    recovery = _legacy_generation(s, 0, ["projects.db"], ["state.db"])
+    _legacy_generation(s, 1, [], ["projects.db", "state.db"])
+    cleared = _legacy_generation(s, 2, ["projects.db"], ["state.db"])
+    meta = _meta(cleared)
+    size = meta["files"]["projects.db"]
+    if replacement == "size-mismatch":
+        # Still valid SQLite, but no longer the payload described by the manifest.
+        _database(cleared / "projects.db", large=True)
+    elif replacement != "healthy":
+        meta["files"]["projects.db"] = {
+            "null": None, "string": str(size), "float": float(size), "bool": True, "negative": -1,
+        }[replacement]
+        (cleared / "manifest.json").write_text(json.dumps(meta))
+    manifest_bytes = (cleared / "manifest.json").read_bytes()
+    integrity = s.backup.verify_sqlite_integrity(cleared / "projects.db")
+    assert integrity["valid"]
+    if replacement == "size-mismatch":
+        assert integrity["size"] != size
+    unverified = replacement != "healthy"
+    expected = {"state.db", "projects.db"} if unverified else {"state.db"}
+    if entrypoint == "public-prune":
+        for _ in range(2):
+            s.backup.prune_quick_snapshots(keep=0, hermes_home=s.home)
+            assert recovery.exists() is unverified
+        assert (cleared / "manifest.json").read_bytes() == manifest_bytes
+    complete_meta = {**_meta(cleared), "failed_dbs": []}
+    assert s.backup._is_complete_quick_snapshot(cleared, complete_meta) is (not unverified)
+    # Publication must consolidate only size-bound clears, even when the live DB
+    # has disappeared. Repeated keep=0 must not lose or resurrect obligations.
+    for _ in range(2):
+        latest = s.capture(keep=0)
+        assert set(_meta(latest)["recovery_required_dbs"]) == expected
+        assert recovery.exists() is unverified

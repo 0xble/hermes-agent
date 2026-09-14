@@ -99,24 +99,30 @@ def test_repaired_policy_recovers_without_changing_general_loader(policy_files, 
     assert called[0]["child_tool_policy"] == "inspection_only"
 
 
-def test_transient_managed_read_failure_cannot_fall_open(policy_files, monkeypatch):
+@pytest.mark.parametrize("warm", [False, True])
+def test_transient_managed_read_failure_cannot_fall_open(policy_files, monkeypatch, warm):
     import builtins
     _, managed = policy_files
     managed.write_text("auxiliary: {review: {tool_policy: inspection_only}}")
+    if warm:
+        assert config.load_config_readonly()["auxiliary"]["review"]["tool_policy"] == "inspection_only"
     real_open = builtins.open
     reads = []
-    def fail_second(path, *args, **kwargs):
+    def fail_read(path, *args, **kwargs):
         if str(path) == str(managed):
             reads.append(path)
-            if len(reads) > 1:
-                raise PermissionError("transient managed access refusal")
+            raise PermissionError("transient managed access refusal")
         return real_open(path, *args, **kwargs)
-    monkeypatch.setattr(builtins, "open", fail_second)
     called, run = dispatch(monkeypatch)
-    with pytest.raises(RuntimeError, match="cannot be read"):
-        run()
-    assert len(reads) == 2
+    with monkeypatch.context() as failure:
+        failure.setattr(builtins, "open", fail_read)
+        with pytest.raises(RuntimeError, match="cannot be read"):
+            run()
+    assert reads  # A strict review must attempt a fresh read, even with a warm cache.
     assert not called
+    assert run()["status"] == "dispatched"
+    assert len(called) == 1
+    assert called[0]["child_tool_policy"] == "inspection_only"
 
 
 @pytest.mark.parametrize("layer", [0, 1])

@@ -81,8 +81,8 @@ async def test_legacy_ambiguous_send_does_not_hide_known_aggregate_anchor(tmp_pa
     adapter.send_delegation_card.assert_not_awaited()
     assert adapter.edit_message.call_args.args[1] == 'known'
     rendered = adapter.edit_message.call_args.args[2]
-    # Both cards share the known aggregate anchor; only the heading uses bold.
-    assert rendered.count('\n✓ Task\n') == 2
+    # Both task rows share the known anchor; the first row needs no leading newline.
+    assert rendered.splitlines().count('✓ Task') == 2
     assert '\nA. ' not in rendered and '\nB. ' not in rendered
     assert all('**' not in line for line in rendered.splitlines()[1:])
     assert set(cards.cards['a'*32]['rows']) == {'A'}

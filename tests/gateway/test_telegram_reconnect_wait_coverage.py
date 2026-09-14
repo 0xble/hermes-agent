@@ -255,11 +255,58 @@ async def test_send_exec_approval_wired_through_shared_guard():
     result = await adapter.send_exec_approval("123", "rm -rf /tmp/x", "s1")
 
     assert result is sentinel
-    adapter._await_reconnection_or_delegate.assert_awaited_once_with(
-        "send_exec_approval", "123", "rm -rf /tmp/x", "s1",
-        description="dangerous command", metadata=None,
-        allow_permanent=True, allow_session=True, smart_denied=False,
+    from gateway.platforms.base import ExecApprovalPrompt
+    adapter._await_reconnection_or_delegate.assert_awaited_once()
+    method, prompt = adapter._await_reconnection_or_delegate.await_args.args
+    assert method == "_send_exec_approval_prompt"
+    assert isinstance(prompt, ExecApprovalPrompt)
+    assert (prompt.chat_id, prompt.command, prompt.session_key) == ("123", "rm -rf /tmp/x", "s1")
+    assert prompt.description == "dangerous command"
+    assert prompt.metadata is None
+    assert prompt.smart_denied is False
+    assert [choice for _, choice, _ in prompt.actions] == ["once", "session", "always", "deny"]
+    assert not adapter._approval_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_permanent,allow_session,smart_denied,choices", [
+    (True, True, False, ["once", "session", "always", "deny"]),
+    (False, False, False, ["once", "deny"]),
+    (True, True, True, ["once", "deny"]),
+])
+async def test_exec_approval_reconnect_preserves_route_and_allowed_actions(
+    monkeypatch, allow_permanent, allow_session, smart_denied, choices,
+):
+    from types import SimpleNamespace
+    from plugins.platforms.telegram import adapter as telegram_module
+    # The gateway conftest installs an optional-SDK stub. Keep the keyboard's
+    # data shape explicit so this assertion works with or without PTB installed.
+    monkeypatch.setattr(telegram_module, "InlineKeyboardButton",
+                        lambda text, callback_data: SimpleNamespace(text=text, callback_data=callback_data))
+    monkeypatch.setattr(telegram_module, "InlineKeyboardMarkup",
+                        lambda rows: SimpleNamespace(inline_keyboard=rows))
+    old = _make_adapter()
+    old._bot = None
+    live = _make_adapter()
+    live._bot = _connected_bot()
+    old._replacement_telegram_adapter = lambda: live
+
+    result = await old.send_exec_approval(
+        "-100", "echo <safe>", "session-topic", metadata={"thread_id": "42"},
+        allow_permanent=allow_permanent, allow_session=allow_session, smart_denied=smart_denied,
     )
+
+    assert result.success is True
+    live._bot.send_message.assert_awaited_once()
+    sent = live._bot.send_message.await_args.kwargs
+    assert str(sent["chat_id"]) == "-100"
+    assert sent["message_thread_id"] == 42
+    assert "echo &lt;safe&gt;" in sent["text"]
+    buttons = [button for row in sent["reply_markup"].inline_keyboard for button in row]
+    callbacks = [button.callback_data.split(":") for button in buttons]
+    assert [parts[1] for parts in callbacks] == choices
+    assert {live._approval_state[int(parts[2])] for parts in callbacks} == {"session-topic"}
+    assert not old._approval_state
 
 
 @pytest.mark.asyncio

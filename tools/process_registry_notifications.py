@@ -359,6 +359,12 @@ def async_delegation_display_text(evt: dict) -> str:
 
 PROCESS_COMPLETE_DISPLAY_KIND = "process_complete"
 
+# Shared by compact human titles and full model notifications.
+_REASON_STATUS = {
+    "lost": "marked lost because the process backend disappeared",
+    "failed_start": "failed to start",
+}
+
 
 def _short_command(command) -> str:
     cmd = " ".join(str(command or "").split())

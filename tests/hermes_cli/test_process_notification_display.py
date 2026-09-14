@@ -4,6 +4,8 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from cli import HermesCLI
 from tools.process_registry_notifications import (
     PROCESS_COMPLETE_DISPLAY_KIND, format_process_notification, process_completion_display_text)
@@ -81,3 +83,13 @@ def test_process_completion_titles_reflect_outcome_and_batch():
     long_cmd = "x" * 200
     title = process_completion_display_text([_event("p", 0, command=long_cmd)])
     assert title.endswith("...") and len(title) < 120
+
+
+@pytest.mark.parametrize("reason,model_status,title_status", [
+    ("lost", "marked lost because the process backend disappeared", "Lost"),
+    ("failed_start", "failed to start", "Failed to Start"),
+])
+def test_backend_failure_reason_reaches_model_and_compact_display(reason, model_status, title_status):
+    event = {**_event("proc-reason", None), "completion_reason": reason}
+    assert model_status in format_process_notification(event)
+    assert process_completion_display_text([event]).startswith(f"Background Process {title_status}:")

@@ -1331,9 +1331,12 @@ def _snapshot_metadata(directory: Path) -> Optional[Dict[str, Any]]:
     return meta if isinstance(meta, dict) else None
 
 
-def _verified_snapshot_db(directory: Path, rel: str) -> bool:
-    """Whether *directory* has a readable SQLite recovery copy for *rel*."""
-    if not isinstance(rel, str):
+def _verified_snapshot_db(directory: Path, rel: str, expected_size: int) -> bool:
+    """Require valid SQLite matching the manifest's byte count, not content identity.
+
+    Existing manifests have no digest, so same-size valid replacements are indistinguishable.
+    """
+    if not isinstance(rel, str) or type(expected_size) is not int or expected_size < 0:
         return False
     payload = directory / rel
     try:
@@ -1341,7 +1344,8 @@ def _verified_snapshot_db(directory: Path, rel: str) -> bool:
             return False
     except OSError:
         return False
-    return verify_sqlite_integrity(payload).get("valid", False)
+    integrity = verify_sqlite_integrity(payload)
+    return bool(integrity.get("valid") and integrity.get("size") == expected_size)
 
 
 def _is_complete_quick_snapshot(directory: Path, meta: Dict[str, Any]) -> bool:
@@ -1361,7 +1365,7 @@ def _is_complete_quick_snapshot(directory: Path, meta: Dict[str, Any]) -> bool:
                 return False
         except OSError:
             return False
-        if rel.endswith(".db") and not _verified_snapshot_db(directory, rel):
+        if rel.endswith(".db") and not _verified_snapshot_db(directory, rel, expected_size):
             return False
     return True
 
@@ -1416,7 +1420,7 @@ def _snapshot_recovery_state(
             continue
         # Only a newly verified, listed SQLite payload clears an obligation.
         for rel in required | witnesses.keys():
-            if rel in files and _verified_snapshot_db(directory, rel):
+            if rel in files and _verified_snapshot_db(directory, rel, files[rel]):
                 required.discard(rel)
                 witnesses[rel] = directory
     retained.update(witnesses.values())
@@ -1767,7 +1771,7 @@ def _prune_quick_snapshots(
         if not isinstance(files, dict):
             continue
         # Restore consumes manifest entries: an unlisted file is not recovery coverage.
-        covered = {rel for rel in missing if rel in files and _verified_snapshot_db(d, rel)}
+        covered = {rel for rel in missing if rel in files and _verified_snapshot_db(d, rel, files[rel])}
         if covered:
             retained.add(d)
             missing.difference_update(covered)

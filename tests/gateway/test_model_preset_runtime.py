@@ -9,7 +9,7 @@ import yaml
 
 
 def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and_context(tmp_path, monkeypatch):
-    """The raw config passed into a primary gateway turn is expanded at the runtime boundary."""
+    """Effective gateway config expands presets before the primary runtime consumes it."""
     import socket
 
     def deny_network(*args, **kwargs):
@@ -42,11 +42,14 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
 
-    raw = gateway_run._load_gateway_config()
-    assert raw == authored
+    effective = gateway_run._load_gateway_config()
+    assert effective["model"]["default"] == "gateway-primary-model"
+    assert effective["model"]["provider"] == "custom:gateway-test"
+    assert "model_preset" not in effective["model"]
+    loaded = copy.deepcopy(effective)
 
     runner = gateway_run.GatewayRunner(GatewayConfig())
-    model, runtime = runner._resolve_session_agent_runtime(user_config=raw)
+    model, runtime = runner._resolve_session_agent_runtime(user_config=effective)
 
     assert model == "gateway-primary-model"
     assert runtime["provider"] == "custom"
@@ -57,8 +60,9 @@ def test_gateway_primary_session_expands_preset_for_model_provider_reasoning_and
     assert not runner._refresh_fallback_model()
     assert gateway_run.GatewayRunner._load_reasoning_config(model) == {"enabled": True, "effort": "high"}
     assert gateway_run._resolve_gateway_model() == model
-    assert gateway_run._resolve_gateway_model(raw) == model
-    assert raw == authored
+    assert gateway_run._resolve_gateway_model(effective) == model
+    assert effective == loaded
+    assert yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) == authored
 
     captured = {}
 

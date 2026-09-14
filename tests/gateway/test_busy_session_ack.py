@@ -526,6 +526,7 @@ class TestLongRunningNotificationOwnership:
         from types import SimpleNamespace
         from gateway.run import GatewayRunner
         from gateway.turn_context import TurnContext
+        from gateway.run_turn_runner import TurnRunner
 
         monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.01")
         runner = object.__new__(GatewayRunner)
@@ -537,7 +538,7 @@ class TestLongRunningNotificationOwnership:
 
         async def _edit_then_restart(*a, **k):
             runner._restart_requested = True  # restart notice goes out while the edit is awaited
-            return SimpleNamespace(success=False)
+            return SimpleNamespace(success=False, error="Message to edit not found", retryable=False)
 
         adapter.edit_message = AsyncMock(side_effect=_edit_then_restart)
         runner._adapter_for_source = lambda source: adapter
@@ -549,6 +550,8 @@ class TestLongRunningNotificationOwnership:
         disp.resolve_display_setting.return_value = False
         ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform="telegram"), session_key="sess")
         ctx.agent_holder[0] = agent
+        ctx._run_still_current = lambda: runner._running_agents.get("sess") is agent
+        TurnRunner(runner, ctx)  # Own the real shielded receipt path, as a normal turn does.
 
         await asyncio.wait_for(runner._run_agent_notify_long_running(disp, ctx, [None]), 5)
 

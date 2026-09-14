@@ -460,7 +460,7 @@ def sanitize_tool_preview(text: str, max_len: int, *, shell: bool = False) -> Sa
     try:
         text = redact_sensitive_text(text, force=True, redact_url_credentials=True)
         text = summarize_shell_command(text) if shell else _oneline(text)
-        return SanitizedToolPreview(_truncate_preview(text, max_len)) if text else None
+        return SanitizedToolPreview(_tail_trunc(text, max_len)) if text else None
     except Exception:
         return None
 
@@ -587,7 +587,7 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
         preview = sanitize_tool_preview(str(args.get(preview_key) or ""), 0) if preview_key else ""
         preview = preview or ""
         label = f"{verb} {preview}".strip()
-        return _truncate_preview(label, max_len) if max_len else label
+        return _tail_trunc(label, max_len) if max_len else label
 
     verb = _TOOL_VERBS.get(tool_name)
     if not verb:

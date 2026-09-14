@@ -96,8 +96,15 @@ async def test_root_window_preserves_hierarchy_activity_and_full_ledger(tmp_path
     text = bot.edit_message_text.call_args.kwargs["text"]
     assert "Root 6" in text and "Newest identity" in text and "Root 5" not in text
     assert text.index("Root 6") < text.index("Newest identity")
-    # Config parsing failures safely restore the bounded default on the real path.
+    # Parse failure retains the prior valid profile window rather than widening it.
+    previous_text = text
+    previous_edits = bot.edit_message_text.await_count
     (tmp_path / "config.yaml").write_text("display: [broken")
+    await restored._flush(anchor)
+    assert bot.edit_message_text.call_args.kwargs["text"] == previous_text
+    assert bot.edit_message_text.await_count == previous_edits
+    # A repaired authored value is adopted without losing the stored hierarchy.
+    (tmp_path / "config.yaml").write_text("display: {delegation_max_visible_roots: 5}\n")
     await restored._flush(anchor)
     text = bot.edit_message_text.call_args.kwargs["text"]
     assert "Root 2" not in text and "Root 3" in text and "Newest identity" in text
