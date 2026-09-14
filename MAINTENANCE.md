@@ -65,6 +65,16 @@ assertion that raced the worker's own timeout. These fixture corrections do not
 change production behavior or relax the cancellation, routing or credential
 contracts.
 
+The recovery-history review allegation assumed `SessionDB.get_messages()` returns
+serialized tool calls. Its existing `_row_to_message_dict` already decodes them.
+No production normalization was added. A real persisted-tool regression in
+`tests/tools/test_delegation_resume_authorization.py` verifies successful receipts
+pass resume preflight and obtain exactly one atomic recovery claim. Missing,
+cancelled and malformed histories remain denied at the final claim boundary,
+and a newer durable row invalidates the earlier fingerprint. The raw SQLite
+representation and decoded public read are both checked without fabricating
+receipts or clearing stop authority outside the existing claim transaction.
+
 Follow-up review reproduced loss of authored Telegram link destinations when
 valid Markdown supplies an optional title. Both standard and rich rendering now
 parse the destination before checking supported schemes. Malformed destinations
