@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 MAX_AGENT_UPDATE_REASON = 240
-_UPDATE_HANDOFF = "Update accepted. End this turn now; the native updater owns completion."
+_UPDATE_HANDOFF = "Update request accepted; update is not complete. End this turn now; the native updater owns completion."
 _MAX_PARENT_DEPTH = 32
 
 
@@ -32,7 +32,8 @@ def validate_agent_update_reason(reason: object) -> str:
 
 
 def launch_native_update(
-    *, home: Path, hermes_cmd: list[str], pending: dict[str, Any], spawn: Callable[[list[str], Path, Path], None],
+    *, home: Path, hermes_cmd: list[str], pending: dict[str, Any], spawn: Callable[..., None],
+    revision: str | None = None,
 ) -> dict[str, Any]:
     """Persist one pending route and detach exactly one native updater.
 
@@ -42,6 +43,10 @@ def launch_native_update(
     """
     from gateway.status import _release_file_lock, _try_acquire_file_lock
 
+    if revision is not None:
+        from hermes_cli.update_revision import validate_revision
+        revision = validate_revision(revision)
+        pending = {**pending, "revision": revision}
     home = Path(home)
     pending_path = home / ".update_pending.json"
     claimed_path = home / ".update_pending.claimed.json"
@@ -77,7 +82,10 @@ def launch_native_update(
             # Publication is the uncertainty fence. Only a classified failure at
             # the actual process-creation boundary can retract our exact marker.
             try:
-                spawn(hermes_cmd, output_path, exit_code_path)
+                if revision is None:
+                    spawn(hermes_cmd, output_path, exit_code_path)
+                else:
+                    spawn(hermes_cmd, output_path, exit_code_path, revision=revision)
             except UpdateChildNotStarted:
                 if not claimed_path.exists():
                     try:
@@ -137,7 +145,7 @@ def _route_from_session_lineage(db: Any, session_id: str) -> tuple[str, dict[str
 
 def make_agent_update_handler(
     *, runner: Any, home: Path, main_loop: Any, resolve_hermes_bin: Callable[[], list[str] | None],
-    spawn: Callable[[list[str], Path, Path], None], is_managed: Callable[[], bool],
+    spawn: Callable[..., None], is_managed: Callable[[], bool],
 ) -> Callable[[object], dict[str, Any]]:
     """Build the synchronous socket handler; scheduling is always marshalled to its loop."""
     home = Path(home)
@@ -147,6 +155,10 @@ def make_agent_update_handler(
             return {"accepted": False, "error": "invalid update request"}
         try:
             reason = validate_agent_update_reason(payload.get("reason"))
+            revision = payload.get("revision")
+            if revision is not None:
+                from hermes_cli.update_revision import validate_revision
+                revision = validate_revision(revision)
         except ValueError as exc:
             return {"accepted": False, "error": str(exc)}
         session_id = str(payload.get("session_id") or "").strip()
@@ -184,12 +196,19 @@ def make_agent_update_handler(
             "parent_session_id": parent_session_id, "parent_route": route,
         }
         try:
-            result = launch_native_update(home=home, hermes_cmd=hermes_cmd, pending=pending, spawn=spawn)
+            result = launch_native_update(home=home, hermes_cmd=hermes_cmd, pending=pending,
+                                          spawn=spawn, revision=revision)
         except Exception:
-            return {"accepted": False, "error": "native updater could not start"}
+            return {"accepted": False, "error": "native updater handoff failed; outcome may be unknown. "
+                    "Inspect pending state before retrying"}
         if result["started"]:
             # Socket handlers run in an executor; the watcher creates asyncio tasks.
             main_loop.call_soon_threadsafe(runner._schedule_update_notification_watch)
+        else:
+            return {"accepted": False, **result,
+                    "error": "another update is already pending; this request was not accepted. "
+                    "End this turn now and inspect the existing update. "
+                    "Do not retry automatically or fall back to an unpinned update."}
         return {"accepted": True, **result, "handoff": _UPDATE_HANDOFF}
 
     return _handler

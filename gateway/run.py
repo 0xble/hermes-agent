@@ -5166,6 +5166,11 @@ async def _start_gateway_start_control_socket(runner):
             resolve_hermes_bin=_resolve_hermes_bin, spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
+        def _agent_update_revision_handler(payload):
+            if not isinstance(payload, dict) or payload.get("revision") is None:
+                return {"accepted": False, "error": "pinned update requires --revision"}
+            return _agent_update_handler(payload)
+
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
             (the watcher also rescans periodically). Runs on the socket executor: marshal onto the loop
@@ -5185,6 +5190,7 @@ async def _start_gateway_start_control_socket(runner):
             home=_hermes_home,
             verb_handlers={"pause-for-update": _pause_for_update_handler,
                            "agent-update": _agent_update_handler,
+                           "agent-update-revision": _agent_update_revision_handler,
                            "rescan-profiles": _rescan_profiles_handler})
         if not await _control_server.start():
             _control_server = None
