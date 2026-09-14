@@ -64,6 +64,9 @@ def _repository(root):
     _git(seed, "commit", "-m", "compatible installed release")
     installed = _git(seed, "rev-parse", "HEAD")
     _git(root, "clone", "--bare", str(seed), str(remote))
+    # Advertise the incompatible target: servers need not permit fetching an
+    # unadvertised ancestor by SHA, even when its object exists in the remote.
+    _git(seed, "push", str(remote), f"{stale}:refs/heads/fixture-stale")
     _git(root, "clone", str(remote), str(checkout))
     _git(checkout, "checkout", "--detach", installed)
     _git(checkout, "branch", "-f", "main", stale)
@@ -136,6 +139,8 @@ async def test_revision_handoff_never_falls_back_or_claims_completion(tmp_path, 
             if case == "duplicate":
                 assert marker.read_bytes() == before
                 assert "already pending" in output
+                assert "End this turn now and inspect the existing update" in output
+                assert "Do not retry automatically or fall back to an unpinned update" in output
             else:
                 assert not (home / ".update_pending.json").exists()
             assert "request accepted" not in output.lower()

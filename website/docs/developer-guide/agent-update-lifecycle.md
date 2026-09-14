@@ -17,11 +17,15 @@ pinned path; native quick snapshots, cron scheduling and result/ledger data are
 unchanged. Omitting the flag retains the existing branch-update behavior.
 
 Pinned requests use the `agent-update-revision` control verb. Older gateways refuse
-the unknown verb instead of silently dropping the target. Do not fall back to an
-unpinned request. A gateway predating this handoff requires an operator-owned
-bootstrap through the already-supported `hermes update --revision "$APPROVED_SHA"`
-after approval and coordination with other work; a new CLI alone cannot add a verb
-to a running old gateway.
+the unknown verb instead of silently dropping the target. The CLI cannot distinguish
+that refusal from a transport failure: `query_gateway_control` returns `None` for
+both, so the diagnostic reports unknown acceptance. Do not automatically retry or
+fall back to an unpinned request. Inspect the running gateway's version and existing
+pending update state before choosing recovery. If the gateway predates this handoff,
+an operator-owned bootstrap through the already-supported
+`hermes update --revision "$APPROVED_SHA"` requires approval and coordination with
+other work, with any pending update reconciled first. A new CLI alone cannot add a
+verb to a running old gateway.
 
 CLI exit zero means only that this request was accepted, **not** that source was
 updated or a runtime restarted. An existing pending update refuses the new request

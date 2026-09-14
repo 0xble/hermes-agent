@@ -1768,6 +1768,7 @@ def cmd_gateway(args):
 
     from hermes_cli.gateway import gateway_command
 
+    # Preserve handler return codes for main() (None = success, nonzero = refusal).
     return gateway_command(args)
 
 

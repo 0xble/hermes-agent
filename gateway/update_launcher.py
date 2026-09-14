@@ -206,7 +206,9 @@ def make_agent_update_handler(
             main_loop.call_soon_threadsafe(runner._schedule_update_notification_watch)
         else:
             return {"accepted": False, **result,
-                    "error": "another update is already pending; this request was not accepted"}
+                    "error": "another update is already pending; this request was not accepted. "
+                    "End this turn now and inspect the existing update. "
+                    "Do not retry automatically or fall back to an unpinned update."}
         return {"accepted": True, **result, "handoff": _UPDATE_HANDOFF}
 
     return _handler
