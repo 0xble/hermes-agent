@@ -103,6 +103,23 @@ ordinary unnamed callers retain their existing behavior. Coverage lives in
 `tests/tools/test_memory_history_named_child.py`. This closes the first-party API
 and execution-context gap, not arbitrary Python or shell filesystem confinement.
 
+Configured title casing now supplies the sole capitalization instruction. Default
+and explicit sentence case no longer compete with an unconditional Title Case
+rule. Real config-to-title-request regressions preserve title-case selection and
+its examples in `tests/agent/test_title_generator.py`.
+
+Deferred cron processing returns the actual finalizer result. A replaced fire
+owner, foreign execution owner or missing execution ledger cannot be reported as
+successfully deferred. The special path still avoids ordinary completion
+accounting and preserves foreign state. Real script/job/ledger races in
+`tests/cron/test_contention_deferral.py` verify these refusals.
+
+Progress cadence advances only when transport is admitted. Deferred overflow
+ticks and slow edit receipts cannot renew the shared clock and starve buffered
+continuations or sibling sessions. Existing server deadlines and actual failed
+transport attempts retain their rate limits. Continuous-event and slow-receipt
+regressions live in `tests/gateway/test_progress_idle_retry.py`.
+
 Cold-start reconnect tests now await the owned reconnect task before asserting
 its bookkeeping slot is gone. Adapter publication intentionally precedes awaited
 recovery work and final cleanup. An event barrier in the real recovery await
@@ -238,7 +255,7 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 - Reused local Python kernels reject protected actual cwd before dispatch, including source with no literal filename. Sandbox deadline completion requires positive process-group exit evidence after wrapper loss, with unknown probes retaining existing retries. Regressions: `tests/tools/test_code_kernel.py`, `test_background_deadlines.py`. Rollback preserves checkpoints and reopens these execution boundaries.
 - Queued follow-ups consume dictionary MessageEvent metadata. Native construction supplies `{}` and restart rehydration normalizes serialized null before dispatch. The real queued-turn producer/rehydration regression in `tests/gateway/test_queued_turn_reasoning_override.py` preserves this contract without broadening runtime metadata types.
 
-- Progress sends share the existing chat cadence with edits, honor server retry deadlines and permanent refusals, and preserve unsent suffixes without blocking shutdown on a backlog. Unknown acceptance still prevents replay. Regression: `tests/gateway/test_progress_send_rate.py` and existing receipt/cancellation tests. Revert the scoped transport cadence commit together with its state fields.
+- Progress sends share the existing chat cadence with edits, honor server retry deadlines and permanent refusals, and preserve unsent suffixes without blocking shutdown on a backlog. Only transport admission advances that clock; deferred overflow ticks and slow receipts never renew it. Unknown acceptance still prevents replay. Regression: `tests/gateway/test_progress_send_rate.py` and existing receipt/cancellation tests. Revert the scoped transport cadence commit together with its state fields.
 - Rich Telegram projection carries server-typed positive user IDs into existing mention gates. Rendered links alone confer no identity. Regression: `tests/plugins/test_telegram_rich_mention_ingress.py`, through native SDK ingress. Retire when upstream preserves equivalent identity evidence.
 - Browser identity recovery reuses verified endpoints before invalidating Browser Use attachments. Non-sidecar session entry enforces persisted Camofox ownership before cache access or creation. Regressions: `tests/tools/test_browser_real_profile.py` and `test_browser_camofox_named_identities.py`. Source rollback must preserve durable backend claims.
 - Known pre-request memory admission failures release source reservations without corrupting earlier completion evidence. Ambiguous remote outcomes remain reserved. Regression: `tests/plugins/memory/test_source_supersession.py`.
