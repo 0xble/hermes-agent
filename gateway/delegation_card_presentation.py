@@ -9,6 +9,9 @@ import json
 import math
 
 
+# Display expiry requires a known terminal outcome. Unknown intentionally retains
+# its original-call batch until positive resolution or audited operator dismissal,
+# even though handling may separately acknowledge an uncertain result.
 _TERMINAL = {"completed", "failed", "error", "timeout", "cancelled", "interrupted", "budget_exhausted"}
 
 
