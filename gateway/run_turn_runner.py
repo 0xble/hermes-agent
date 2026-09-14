@@ -650,7 +650,8 @@ class TurnRunner:
             remaining = _PROGRESS_EDIT_INTERVAL - self._edit_gate_elapsed(st, now)
             if remaining <= 0:
                 # Claim BEFORE the API await so another session in this chat cannot observe a
-                # stale slot and edit concurrently.
+                # stale slot and edit concurrently. Only admission advances this clock:
+                # completion or a deferred overflow tick must not postpone the next slot.
                 st.last_edit_ts = self._stamp_edit_clock(st, now)
                 return 0.0
             if not wait_for_cadence:
@@ -1063,7 +1064,6 @@ class TurnRunner:
                 logger.info("[%s] Progress edit flood control — skipping fallback send "
                             "(would re-trigger penalty); will retry edit on next tick",
                             st.adapter.name)
-                st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
                 return False
             if self._is_stale_progress_anchor_error(result) and await self._replace_stale_progress_anchor(
                 st, full_text
@@ -1130,7 +1130,6 @@ class TurnRunner:
         if not await self._roll_progress_overflow_if_needed(st):
             if not await self._progress_send_or_edit(st, None):
                 return
-        st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
         await self._progress_restore_typing(st)
 
     async def _progress_loop(self, st) -> None:
@@ -1188,7 +1187,6 @@ class TurnRunner:
                             continue  # chat parked by a server-named flood wait
                     if not await self._progress_send_or_edit(st, msg):
                         continue
-                st.last_edit_ts = self._stamp_edit_clock(st, time.monotonic())
                 await self._progress_restore_typing(st)
             except queue.Empty:
                 await asyncio.sleep(0.3)
