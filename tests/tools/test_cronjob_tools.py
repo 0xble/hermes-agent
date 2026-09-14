@@ -236,6 +236,36 @@ class TestUnifiedCronjobTool:
         monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
         monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
 
+    def test_upstream_positional_create_preserves_pause_and_messaging_default(self):
+        from cron.jobs import get_job
+
+        # Frozen upstream's positional prefix through paused_reason. Inserting
+        # fork options before all/task_id silently turns the task ID into consent.
+        created = json.loads(cronjob(
+            "create", None, "Check server status", "every 1h", "Positional", None,
+            "local", False, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
+            None, "legacy-task", "legacy-session", True, "Awaiting operator",
+        ))
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored["allow_messaging"] is False
+        assert stored["enabled"] is False and stored["state"] == "paused"
+        assert stored["paused_reason"] == "Awaiting operator"
+
+    def test_registry_forwards_keyword_timezone_and_messaging(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(registry.dispatch("cronjob_manage", {
+            "action": "create", "prompt": "Check server status", "schedule": "every 1h",
+            "timezone": "UTC", "allow_messaging": True,
+        }))
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] == "UTC"
+        assert stored["allow_messaging"] is True
+
     def test_create_and_list(self):
         created = json.loads(
             cronjob(

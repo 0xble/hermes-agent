@@ -1066,8 +1066,6 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
-    timezone: Optional[str] = None,
-    allow_messaging: Optional[bool] = None,
     all: Optional[bool] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
@@ -1075,6 +1073,8 @@ def cronjob(
     paused_reason: Optional[str] = None,
     model_preset: Optional[str] = None,
     *,
+    timezone: Optional[str] = None,
+    allow_messaging: Optional[bool] = None,
     _completion_config: Optional[CompletionConfig] = None) -> str:
     """Unified cron job management tool. _completion_config is only supplied by the CLI."""
     a = dict(locals())
