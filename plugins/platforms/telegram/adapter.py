@@ -4432,6 +4432,44 @@ class TelegramAdapter(BasePlatformAdapter):
         with contextlib.suppress(Exception):
             await self.send_typing(chat_id, metadata=metadata)
 
+    async def edit_delegation_card(self, source, message_id, content) -> SendResult:
+        """One card edit with a fresh payload inside every shared-budget attempt."""
+        from telegram.error import BadRequest, RetryAfter
+
+        try:
+            for markdown in (True, False):
+                async def edit():
+                    latest = content() if callable(content) else content
+                    if latest is None:
+                        return None
+                    text = self.format_message(latest) if markdown else _strip_mdv2(latest)
+                    if utf16_len(text) > self.MAX_MESSAGE_LENGTH:
+                        raise ValueError("Delegation card exceeds Telegram message limit")
+                    await self._bot.edit_message_text(
+                        chat_id=normalize_telegram_chat_id(source.chat_id), message_id=int(message_id),
+                        text=text, parse_mode=ParseMode.MARKDOWN_V2 if markdown else None,
+                        **self._business_connection_kwargs({
+                            "telegram_business_connection_id": source.business_connection_id}),
+                        **self._link_preview_kwargs())
+                    return True
+
+                try:
+                    applied = await self._run_send_call(source.chat_id, edit, _expendable=True, _edit=True)
+                    if applied is None:
+                        return SendResult(success=False, raw_response={"cancelled_before_send": True})
+                    return SendResult(success=True, message_id=str(message_id))
+                except BadRequest as exc:
+                    if "not modified" in str(exc).lower():
+                        return SendResult(success=True, message_id=str(message_id))
+                    if not markdown or not any(word in str(exc).lower() for word in ("parse", "markdown")):
+                        raise
+        except _TelegramSendCooldownExceeded as exc:
+            return self._send_cooldown_failure(exc)
+        except RetryAfter as exc:
+            return _flood_cap_result(self._telegram_retry_after(exc), retryable=True)
+        except Exception as exc:
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+
     async def send_delegation_card(self, source, content: str) -> SendResult:
         token = _EXPENDABLE_TRAFFIC.set(True)
         try:
@@ -4873,7 +4911,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Keep the general cleanup API boolean and non-fatal."""
         return bool(await self._delete_status_message(chat_id, message_id))
 
-    async def _delete_status_message(self, chat_id: str, message_id: str) -> Optional[bool]:
+    async def _delete_status_message(self, chat_id: str, message_id: str, *, guard=None) -> Optional[bool]:
         """Internal durable cleanup: None means the scheduler issued no request.
 
         Other callers retain the boolean delete_message API. Durable status owners
@@ -4887,6 +4925,8 @@ class TelegramAdapter(BasePlatformAdapter):
         — the caller leaves the preview in place and logs at debug level.
         """
         if not self._bot:
+            if guard is not None:
+                return None  # cannot transfer a captured anchor guard to another adapter
             outcome = await self._await_reconnection_or_delegate("_delete_status_message", chat_id, message_id)
             if outcome is self._RECONNECT_FAILED:
                 return False
@@ -4895,8 +4935,14 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Cleanup spends the shared budget too: activity-driven reanchoring
             # must not create an unmetered delete lane beside sends and typing.
-            await self._run_send_call(chat_id, self._bot.delete_message,
-                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), _expendable=True)
+            async def delete():
+                if guard is not None and not guard():
+                    return None
+                await self._bot.delete_message(chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id))
+                return True
+
+            if await self._run_send_call(chat_id, delete, _expendable=True) is None:
+                return None
             self._forget_status_message_id(chat_id, message_id)
             return True
         except _TelegramSendCooldownExceeded:

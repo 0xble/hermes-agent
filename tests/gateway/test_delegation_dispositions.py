@@ -76,7 +76,7 @@ async def test_deferred_reason_visible_persisted_not_delivery_receipt(tmp_path, 
     assert cards.receipt(None, "r", 2) == {}
     restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
     text = render_card(restored.cards[data["parent_task_id"]])
-    assert "Ⅱ" in text and "Deferred · Awaiting CI" in text
+    assert "Ⅱ" in text and "\u00a0\u00a0↳ Awaiting CI" in text
     assert data["parent_task_id"] not in text and not restored.cards[data["parent_task_id"]].get("handled")
 
 
@@ -97,7 +97,7 @@ async def test_legacy_deferred_explanation_survives_reload_and_unrelated_save(tm
     card = reloaded.cards[data["parent_task_id"]]
     assert card["handling"]["A"] == intent
     assert card["rows"]["A"]["disposition"] == intent
-    assert "Deferred · " + explanation in render_card(card)
+    assert "\u00a0\u00a0↳ " + explanation in render_card(card)
     assert not card.get("handled")
 
 

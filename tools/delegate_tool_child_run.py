@@ -899,6 +899,8 @@ class _ChildRun:
         if _cost_usd is not None:
             with _quiet(None):
                 complete_kwargs["cost_usd"] = float(_cost_usd)
+        from agent.delegation_activity import terminal_reason
+        complete_kwargs["terminal_reason"] = terminal_reason(result) if entry["status"] == "failed" else None
         _safe_progress(self.child_progress_cb, "subagent.complete", **complete_kwargs)
 
     def cleanup(self, *, heartbeat: _Heartbeat, child_pool: Any, leased_cred_id: Any, close_deferred: bool) -> None:

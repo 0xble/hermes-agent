@@ -6,6 +6,10 @@ write-ahead: link original records, publish the union, then delete exact receipt
 
 
 import json
+import math
+
+
+_TERMINAL = {"completed", "failed", "error", "timeout", "cancelled", "interrupted", "budget_exhausted"}
 
 
 def row_order(row):
@@ -24,25 +28,108 @@ def next_row_order(manager, key):
 
 
 def render(manager, key, projection):
-    """Apply the owning profile/platform display setting only at text rendering."""
+    """Render the same cap-first eligible view used by transport and expiry."""
     from gateway.delegation_cards import render_card
+
+    cap = max_visible_roots(manager, key)
+    selected = select_rows(projection, now=manager._now(), max_visible_roots=cap)
+    return render_card(projection, max_visible_roots=cap, selected_identities=selected)
+
+
+def _display_setting(manager, key, name, default):
     from gateway.display_config import resolve_display_setting
     from gateway.run import _load_gateway_config
 
-    source = manager._source(manager.cards[key])
-    source.profile = source.profile or manager.cards[key]["owner"].get("profile")
+    card = manager.cards[key]
+    source = manager._source(card)
+    if source is None:
+        return default
+    source.profile = source.profile or card["owner"].get("profile")
     home = manager.path.parents[2]
     resolver = getattr(manager.runner, "_resolve_profile_home_for_source", None)
     try:
         if resolver is not None:
             home = resolver(source)
         config = _load_gateway_config(home / "config.yaml")
-        cap = resolve_display_setting(config, source.platform.value, "delegation_max_visible_roots")
+        return resolve_display_setting(config, source.platform.value, name, default)
     except Exception:
-        # Malformed containers and failed profile resolution keep a bounded view;
-        # never borrow another profile's settings after a resolution exception.
-        cap = 5
-    return render_card(projection, max_visible_roots=cap)
+        return default  # never borrow another profile after resolution failure
+
+
+def terminal_ttl_seconds(manager, key):
+    return _display_setting(manager, key, "delegation_terminal_ttl_seconds", 300)
+
+
+def max_visible_roots(manager, key):
+    return _display_setting(manager, key, "delegation_max_visible_roots", 5)
+
+
+def _valid_number(value):
+    return type(value) in (int, float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def select_rows(projection, *, now, max_visible_roots=5):
+    """Return the display rows after cap-first selection and terminal TTL pruning.
+
+    The immutable projection remains untouched. Root selection happens before expiry pruning so an
+    expired older root can never cause a previously hidden root to be backfilled into the window.
+    Active descendants retain their terminal ancestors as context.
+    """
+    rows = dict(sorted((projection.get("rows") or {}).items(), key=lambda item: row_order(item[1])))
+    identities = set(rows)
+    children = {}
+    for identity, row in rows.items():
+        parent = row.get("card_parent_identity")
+        if parent in identities and parent != identity:
+            children.setdefault(parent, []).append(identity)
+    roots = []
+    root_for = {}
+    visited = set()
+
+    def walk(identity, root):
+        if identity in visited:
+            return
+        visited.add(identity)
+        root_for[identity] = root
+        for child in children.get(identity, ()):
+            walk(child, root)
+
+    for identity, row in rows.items():
+        parent = row.get("card_parent_identity")
+        if parent not in identities:
+            roots.append(identity)
+            walk(identity, identity)
+    for identity in rows:
+        if identity not in visited:
+            roots.append(identity)
+            walk(identity, identity)
+
+    cap = max_visible_roots if type(max_visible_roots) is int and max_visible_roots > 0 else 5
+    selected_roots = set(roots[-cap:])
+    selected = {identity for identity in rows if root_for.get(identity) in selected_roots}
+    for identity in tuple(selected):
+        row = rows[identity]
+        if row.get("state") not in _TERMINAL:
+            continue
+        if row.get("batch_display") and row.get("display_expires_at") is None:
+            continue  # complete birth roster has not reached all-terminal
+        terminal_at = row.get("terminal_at")
+        expires_at = row.get("display_expires_at")
+        # Legacy terminal rows without a trustworthy timestamp are immediately hidden. Do not
+        # invent a historical time, and do not mutate the durable projection from presentation.
+        if not _valid_number(terminal_at) or not _valid_number(expires_at) or now >= expires_at:
+            selected.discard(identity)
+
+    # Preserve every ancestor needed to explain an eligible descendant, including an expired
+    # terminal ancestor. This is display context only; it does not revive the ancestor itself.
+    for identity in tuple(selected):
+        parent = rows[identity].get("card_parent_identity")
+        seen = {identity}
+        while parent in rows and parent not in seen:
+            selected.add(parent)
+            seen.add(parent)
+            parent = rows[parent].get("card_parent_identity")
+    return selected
 
 
 def cleanup_allowed(manager, key, message_id):
@@ -100,8 +187,11 @@ def bind(manager, key):
     card = manager.cards[key]
     if card.get("retired"):
         return
+    # Handled executions can still own a live batch display window. Join their
+    # transport without undoing the independent lifecycle retirement.
     active = [(k, c) for k, c in manager.cards.items()
-              if not c.get("retired") and manager._scope(c) == manager._scope(card)]
+              if (not c.get("retired") or (c.get("original_calls") and not c.get("message_deleted")))
+              and manager._scope(c) == manager._scope(card)]
     # Existing cleanup chooses a stable survivor until its exact ledger finishes.
     # Otherwise prefer a real transport receipt, then the oldest task. Never
     # compare message numbers as chronology or merge execution/receipt owners.
@@ -118,7 +208,11 @@ def bind(manager, key):
                            if k in manager.cards and manager.cards[k].get("retired")
                            and (manager.cards[k].get("message_id") or manager.cards[k].get("reanchor"))
                            and manager._scope(manager.cards[k]) == manager._scope(card)]
+    inflight = manager._inflight.get(manager._scope(card))
+    if inflight and all(k != inflight for k, _ in candidates):
+        candidates.append((inflight, manager.cards[inflight]))
     anchor, target = min(candidates, key=lambda item: (
+        item[0] != inflight if inflight else False,
         (item[1].get("reanchor") or {}).get("order") != "delete_first",
         not bool(item[1].get("presentation_cleanup")),
         not bool(item[1].get("message_id")), item[1]["started_at"], item[0]))

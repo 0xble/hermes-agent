@@ -68,6 +68,22 @@ async def test_deferred_result_survives_notification_ack_and_pruning_until_exact
     await cards.handling(source, "r", "s", 2, actor_session_id="s", parent_task_id=parent_task_id,
                          refs=["A"], reason="deferred", detail="Need approval", turn_id="arrival")
 
+    # Display expiry cannot accept, retire, or lose a deferred payload. Exercise
+    # the real scheduler path before both pruning and exact owner retrieval.
+    row = cards.cards[parent_task_id]["rows"]["A"]
+    deadline = row["display_expires_at"]
+    cards._clock = lambda: deadline
+    scope = cards._scope(cards.cards[parent_task_id])
+    cards._expiry_callback(scope, parent_task_id, cards._expiry_tokens[scope])
+    while cards.pending:
+        await asyncio.gather(*list(cards.pending.values()))
+    assert not cards._display_projection(parent_task_id)["rows"]
+    assert row["disposition"]["detail"] == "Need approval"
+    assert row["display_expires_at"] == deadline
+    assert not cards.cards[parent_task_id].get("handled")
+    assert not cards.cards[parent_task_id].get("retired")
+    await cards.shutdown()
+
     # Exercise both age and >50-settled pruning paths without changing delivery state.
     with ad._transaction() as conn:
         conn.execute("UPDATE async_delegations SET updated_at=? WHERE delegation_id=?",

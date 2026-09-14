@@ -44,7 +44,7 @@ def eligible(manager, key):
             and not any(c.get("obsolete_message_id") for _, c in manager._members(key))
             and not presentation.pending(manager, key) and not presentation.fenced(manager, key)
             and len(manager.displacement.get(key, ())) >= DISPLACEMENT
-            and any(r.get("state") == "running" for r in manager._projection(key)["rows"].values()))
+            and any(r.get("state") == "running" for r in manager._display_projection(key)["rows"].values()))
 
 
 def pending(card):
@@ -128,7 +128,7 @@ async def replace(manager, key):
             manager._save()
 
     async with lock:
-        projection = manager._projection(key)
+        projection = manager._display_projection(key)
         if not any(r.get("state") == "running" for r in projection["rows"].values()):
             return  # terminal-only/handled during the gap must not resurrect a card
         if receipt["send_attempts"] >= 3:
@@ -146,7 +146,7 @@ async def replace(manager, key):
     def latest():
         # Called synchronously after the adapter's scheduler awaits, immediately
         # before the Bot API. No lifecycle mutation can interleave with this check.
-        projection = manager._projection(key)
+        projection = manager._display_projection(key)
         if not any(r.get("state") == "running" for r in projection["rows"].values()):
             return None
         receipt["rendered"] = render(manager, key, projection)

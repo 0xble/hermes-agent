@@ -146,7 +146,7 @@ class TurnRunner:
                 ctx.source, ctx.session_key, ctx.session_id, ctx.run_generation,
                 event_type, tool_name, kwargs), "delegation admission link failed")
             return future.result(timeout=30)
-        if (event_type in {"subagent.start", "subagent.tool", "subagent.complete"}
+        if (event_type in {"subagent.start", "subagent.tool", "subagent.activity", "subagent.complete"}
                 and kwargs.get("parent_task_id") and ctx.source.platform == Platform.TELEGRAM
                 and ctx.tool_progress_enabled and ctx.progress_mode not in {"off", "log"}):
             from gateway.delegation_cards import cards_for

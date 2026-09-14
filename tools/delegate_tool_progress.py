@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import enum
 import os
@@ -9,6 +10,8 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+from agent.delegation_activity import WAIT_LABELS
+from agent.delegation_labels import task_label_guidance, task_label_limit_for_depth
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -183,6 +186,7 @@ def _build_child_system_prompt(
             parts.append(_CONTEXT_FILES_INTRO + _ctx_files.strip())
     parts.append(_COMPLETION_INSTRUCTIONS)
     if role == "orchestrator":
+        parts.append(task_label_guidance(task_label_limit_for_depth(child_depth)))
         child_note = _LEAF_CHILDREN_NOTE if child_depth + 1 >= max_spawn_depth else _NESTED_CHILDREN_NOTE
         parts.append(
             _ORCHESTRATOR_BLOCK
@@ -282,6 +286,10 @@ class _ChildProgressRelay:
         )
         self.batch: List[str] = []
         self.tool_count = 0  # per-subagent running counter
+        self._activity_lock = threading.RLock()
+        self._activity_sequence = 0
+        self._waits = {}
+        self._completed = False
 
     def _prefix(self) -> str:
         # The batch tag is resolved lazily from session_ref: the relay is built
@@ -306,9 +314,10 @@ class _ChildProgressRelay:
                          ("task_label", "task_label"), ("role", "role"), ("owner", "owner"), ("card_owner", "card_owner"),
                          ("subagent_type", "subagent_type"), ("native_review", "native_review"),
                          ("background", "background"), ("replaces", "replaces"),
-                         ("attempt", "attempt"), ("resume_claim_id", "resume_claim_id")):
+                         ("attempt", "attempt"), ("resume_claim_id", "resume_claim_id"),
+                         ("original_call", "original_call")):
             if self.session_ref.get(src) is not None:
-                kw[dst] = self.session_ref[src]
+                kw[dst] = copy.deepcopy(self.session_ref[src]) if src == "original_call" else self.session_ref[src]
         kw["tool_count"] = self.tool_count
         return kw
 
@@ -316,7 +325,17 @@ class _ChildProgressRelay:
         if self.parent_cb:
             # kwargs override identity (e.g. status, duration_seconds).
             with _quiet("Parent callback failed: %s"):
-                self.parent_cb(event_type, tool_name, preview, args, **{**self._identity_kwargs(), **kwargs})
+                payload = {**self._identity_kwargs(), **kwargs}
+                if event_type in {"subagent.start", "subagent.tool", "subagent.activity", "subagent.complete"}:
+                    self._activity_sequence += 1
+                    payload["activity_sequence"] = self._activity_sequence
+                    payload["attempt"] = self.session_ref.get("attempt", 0)
+                    payload["activity_reason"] = next(reversed(self._waits.values()), None)
+                if event_type == "subagent.activity":
+                    allowed = {"parent_task_id", "thread_ref", "owner", "card_owner", "attempt", "activity_sequence",
+                               "activity_reason", "child_session_id", "resume_claim_id"}
+                    payload = {key: value for key, value in payload.items() if key in allowed}
+                self.parent_cb(event_type, tool_name, preview, args, **payload)
 
     def _tree_line(self, text: str) -> None:
         """Print one tree-view line above the CLI spinner (no-op without a spinner)."""
@@ -337,6 +356,8 @@ class _ChildProgressRelay:
         self._relay("subagent.start", preview=preview or self.goal_label or "", **kwargs)
 
     def _on_complete(self, tool_name, preview, args, kwargs):
+        self._completed = True
+        self._waits.clear()
         # Failed child: echo one clean reason line into the CLI tree so the human
         # sees WHY, not just a vanished branch (gateway renders off the relayed event).
         if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
@@ -368,6 +389,8 @@ class _ChildProgressRelay:
                 self.parent_cb("subagent_progress", f"{self._prefix()}{summary_text}")
 
     def _on_tool_started(self, tool_name, preview, args, kwargs):
+        if self._completed:
+            return
         self.tool_count += 1
         if self.subagent_id is not None:
             with _active_subagents_lock:
@@ -386,7 +409,33 @@ class _ChildProgressRelay:
             if len(self.batch) >= self._BATCH_SIZE:
                 self._flush()
 
+    def _on_wait(self, kwargs):
+        reason, token, active = kwargs.get("reason"), kwargs.get("wait_id"), kwargs.get("active")
+        if (self._completed or not isinstance(reason, str) or reason not in WAIT_LABELS
+                or not isinstance(token, str) or type(active) is not bool):
+            return
+        if active:
+            self._waits[token] = reason
+        elif self._waits.get(token) == reason:
+            del self._waits[token]
+        else:
+            return
+        self._relay("subagent.activity", activity_reason=next(reversed(self._waits.values()), None))
+
     def __call__(self, event_type, tool_name: str = None, preview: str = None, args=None, **kwargs):
+        # Nested events already have a runtime owner and sequence. Do not relabel them
+        # as this parent, or let grandchild housekeeping overwrite its own wait.
+        if (event_type in {"subagent.start", "subagent.tool", "subagent.activity", "subagent.complete", "subagent.admitted"}
+                and kwargs.get("parent_task_id")
+                and (kwargs.get("parent_task_id"), kwargs.get("thread_ref")) !=
+                    (self.session_ref.get("parent_task_id"), self.session_ref.get("thread_ref"))):
+            return _safe_progress(self.parent_cb, event_type, tool_name, preview, args, **kwargs)
+        with self._activity_lock:
+            if event_type == "runtime.wait":
+                return self._on_wait(kwargs)
+            return self._dispatch(event_type, tool_name, preview, args, **kwargs)
+
+    def _dispatch(self, event_type, tool_name=None, preview=None, args=None, **kwargs):
         if event_type in {"subagent.handling", "subagent.result_turn"} and self.parent_cb:
             return self.parent_cb(event_type, **kwargs)
         if event_type == "subagent.admitted" and self.parent_cb:

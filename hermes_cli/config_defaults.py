@@ -779,6 +779,10 @@ DEFAULT_CONFIG = {
 
     "display": {
         "compact": False,
+        # Display-only Telegram delegation rows remain visible after terminal completion for this
+        # many seconds. null in a per-platform override inherits this value; invalid values fall
+        # back to 300. The value is frozen when every original-call member becomes terminal.
+        "delegation_terminal_ttl_seconds": 300,
         "personality": "",
         "resume_display": "full",
         # Recap tuning for /resume and startup resume.
