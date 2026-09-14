@@ -289,6 +289,21 @@ def _model_flow_nous(config, current_model="", args=None):
     # instead of the hundreds returned by the live /models endpoint.
     from hermes_cli.models import check_nous_free_tier, get_curated_nous_model_ids
     from hermes_cli.models_pricing import get_pricing_for_provider
+    from hermes_cli.model_switch_providers import _free_tier_nous_row
+    tier_row = _free_tier_nous_row({"name": "Nous Portal", "models": []})
+    if tier_row is None:
+        print("The Nous free tier is off for this install; sign in with `hermes auth upgrade` to use Nous models.")
+        return
+    if tier_row["models"]:
+        # Free-tier identity: the welcome host serves the single pinned model; no Portal catalog,
+        # pricing, or account lookups apply.
+        creds = _nous_verified_credentials()
+        if creds is None:
+            return
+        selected = tier_row["models"][0]
+        _nous_persist_selection(selected, creds)
+        print(f"Default model set to: {selected} (via {tier_row['name']})")
+        return
     model_ids = get_curated_nous_model_ids()
     if not model_ids:
         print("No curated models available for Nous Portal.")
@@ -522,12 +537,11 @@ def _copilot_obtain_token() -> bool:
 
 
 def _model_flow_copilot(config, current_model=""):
-    """GitHub Copilot flow using env vars, gh CLI, or OAuth device code."""
-    from hermes_cli.main_provider_setup import _prompt_reasoning_effort_selection
-    from hermes_cli.setup import _current_reasoning_effort, _set_reasoning_effort
+    """GitHub Copilot flow using env vars, gh CLI, or OAuth device code. The reasoning-effort step
+    is the shared post-pick one in ``select_provider_and_model`` (Copilot's per-model level set
+    comes from ``github_model_reasoning_efforts`` there)."""
     from hermes_cli.auth import PROVIDER_REGISTRY, resolve_api_key_provider_credentials
-    from hermes_cli.config import load_config
-    from hermes_cli.models import fetch_api_models, github_model_reasoning_efforts, copilot_model_api_mode
+    from hermes_cli.models import fetch_api_models, copilot_model_api_mode
     provider_id = "copilot"
     pconfig = PROVIDER_REGISTRY[provider_id]
     creds = resolve_api_key_provider_credentials(provider_id)
@@ -557,25 +571,9 @@ def _model_flow_copilot(config, current_model=""):
         print("No change.")
         return
     selected = _normalize(selected)
-    current_effort = _current_reasoning_effort(load_config())
-    reasoning_efforts = github_model_reasoning_efforts(selected, catalog=catalog, api_key=api_key)
-    selected_effort = None
-    if reasoning_efforts:
-        print(f"  {selected} supports reasoning controls.")
-        selected_effort = _prompt_reasoning_effort_selection(reasoning_efforts, current_effort=current_effort)
-
-    def _finish(cfg, _model):
-        if selected_effort is not None:
-            _set_reasoning_effort(cfg, selected_effort)
-
     _persist_model(selected, provider_id, base_url=effective_base,
-                   api_mode=copilot_model_api_mode(selected, catalog=catalog, api_key=api_key), finish=_finish)
+                   api_mode=copilot_model_api_mode(selected, catalog=catalog, api_key=api_key))
     print(f"Default model set to: {selected} (via {pconfig.name})")
-    if reasoning_efforts:
-        if selected_effort == "none":
-            print("Reasoning disabled for this model.")
-        elif selected_effort:
-            print(f"Reasoning effort set to: {selected_effort}")
 
 
 def _model_flow_copilot_acp(config, current_model=""):

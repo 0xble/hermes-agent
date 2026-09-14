@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v2"
+SCANNER_VERSION = "skills-guard-v3"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -131,6 +131,8 @@ THREAT_PATTERNS = [
     # `cat <secrets-file>` reads credentials; `cat >`/`cat >>` WRITES one (setup heredocs) — not exfil.
     (r'cat\s+(?!>)[^\n]*(\.env|credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)',
      "read_secrets_file", "critical", "exfiltration", "reads known secrets file"),
+    (r'\b(?:readFile(?:Sync)?|readTextFile)\s*\(\s*["\'][^"\'\n]*(?:\.ssh[/\\]id_(?:rsa|ed25519|ecdsa|dsa)(?!\.pub)|\.env\b|credentials\b|\.netrc\b|\.pgpass\b|\.npmrc\b|\.pypirc\b)[^"\'\n]*["\']',
+     "js_read_secrets_file", "critical", "exfiltration", "JavaScript reads a known credential file"),
     # ── Exfiltration: programmatic env access ──
     (r'printenv|env\s*\|', "dump_all_env", "high", "exfiltration", "dumps all environment variables"),
     # Bare `os.environ` (dump/iteration) is suspicious; ANY `.get("<name>")` form is exempt — plain config
@@ -147,8 +149,11 @@ THREAT_PATTERNS = [
     # Case-sensitive Ruby ENV: (?-i:) keeps Python `env[...]` dict access from matching under IGNORECASE.
     (r'(?-i:ENV)\[.*(?:KEY|TOKEN|SECRET|PASSWORD)', "ruby_env_secret", "critical", "exfiltration", "reads secret via Ruby ENV[]"),
     # ── Exfiltration: DNS and staging ──
-    # Do not match flag names such as llama.cpp `--host 127.0.0.1 --port $PORT`.
-    (r'(?<![-/])\b(dig|nslookup|host)\s+[^\n]*\$',
+    # Exfil puts the data in the queried NAME: the first positional argument (after
+    # optional -flags with values, +opts, @server) carries the interpolation. Anything
+    # looser fires on the English noun in prose ("set the host value and run
+    # `${SKILL_DIR}/x`") and on flag names such as llama.cpp `--host 127.0.0.1 --port $PORT`.
+    (r'(?<![-/])\b(dig|nslookup|host)\s+(?:[-+@]\S*(?:\s+[^\s$"\'-][^\s$]*)?\s+)*["\']?[^\s"\'$]*\$',
      "dns_exfil", "critical", "exfiltration", "DNS lookup with variable interpolation (possible DNS exfiltration)"),
     (r'>\s*/tmp/[^\s]*\s*&&\s*(curl|wget|nc|python)',
      "tmp_staging", "critical", "exfiltration", "writes to /tmp then exfiltrates"),
