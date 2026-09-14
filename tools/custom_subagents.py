@@ -595,6 +595,36 @@ def pinning_support_error(provider: str | None, api_mode: str | None) -> str | N
     return None
 
 
+def _preserves_configured_overrides(kwargs, overrides: str) -> bool:
+    """Keep configured header/query/body authority through final SDK merges.
+
+    Builders and SDKs may add defaults. This checks the frozen fields, not a
+    blanket prohibition on every additional provider-specific request field.
+    """
+    def contains(actual, expected):
+        if isinstance(expected, dict):
+            return isinstance(actual, Mapping) and all(
+                key in actual and contains(actual[key], value) for key, value in expected.items())
+        return type(actual) is type(expected) and actual == expected
+
+    frozen = json.loads(overrides)
+    for channel in ('extra_headers', 'extra_query', 'extra_body'):
+        if channel not in frozen:
+            continue
+        expected = frozen[channel]
+        actual = kwargs.get(channel, {})
+        if channel == 'extra_headers' and isinstance(expected, dict) and isinstance(actual, Mapping):
+            # Header names are case-insensitive, but a conflicting alternate
+            # spelling must not hide the changed wire authority.
+            for key, value in expected.items():
+                matches = [item for name, item in actual.items() if str(name).lower() == str(key).lower()]
+                if not matches or not all(contains(item, value) for item in matches):
+                    return False
+        elif not contains(actual, expected):
+            return False
+    return True
+
+
 def _validate_physical_auth(client, kwargs, *, digest: str, pinned: bool, overrides: str) -> None:
     """Check SDK-merged authentication without invoking dynamic credential sources."""
     from collections.abc import Mapping
@@ -811,6 +841,8 @@ class RuntimePin:
             separators=(",", ":"), default=str,
         )
         if actual_overrides != expected_overrides:
+            raise ValueError(f"subagent_type {self.subagent_type!r}: pinned request overrides changed")
+        if final_request and not _preserves_configured_overrides(kwargs, expected_overrides):
             raise ValueError(f"subagent_type {self.subagent_type!r}: pinned request overrides changed")
         extra = kwargs.get("extra_body") or {}
         active_model = current[1]
