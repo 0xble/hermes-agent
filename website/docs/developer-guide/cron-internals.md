@@ -282,6 +282,51 @@ stopped by cleanup is resumed if termination fails; already-stopped targets keep
 their original state. Explicit graceful signals do not suspend their recipients.
 Windows continues to use `taskkill /F /T`.
 
+### Pre-agent contention deferral (fork extension)
+
+An agent-backed job's pre-run script can report resource contention without consuming
+its pending work. Exit **zero** and make the last non-empty stdout line:
+
+```json
+{"defer": {"reason": "source writer busy", "retry_after_seconds": 30}}
+```
+
+`reason` must be nonblank and at most 500 characters; `retry_after_seconds` must be an
+integer from 1 through 3600 (booleans are invalid). A malformed explicit request is a
+script-protocol failure, never silent success. Nonzero exit, timeout, and cancellation
+cannot request deferral. Ordinary output, empty-output gates, `wakeAgent:false`, and
+`no_agent` jobs keep their existing semantics; deferral takes precedence over a wake
+flag only when the successful script supplies this explicit valid request.
+
+`run_job` returns a distinct `DeferredRun`, not a successful four-tuple. The shared
+`run_one_job` finalizer requires its existing fire owner, records the attempt as
+terminal **deferred**, and leaves historical run status/error, failure streak, manual
+prompt/context, repeat completion count, and enabled state untouched. A finite
+one-shot's pre-dispatch reservation is refunded. No agent, completion verifier,
+output document (including `context_from` output), or delivery is produced.
+
+The job retains the original scheduled instant and a bounded retry eligibility time
+in `deferred_run`. The ordinary due scan and external claim boundary honor that time;
+missed-slot, cron-lattice, and stale-error repairs do not discard pending work. A later
+claim gets a new fire owner/run ID and execution ID. Deferred attempts never prove
+occurrence completion. Repeated contention may defer again; there is no retry-count
+limit or new ticker/controller. An explicit schedule/lifecycle edit supersedes pending
+retry work just as it supersedes an unclaimed scheduled slot.
+
+Jobs.json stores the exact deferred execution ID before the ledger write. Recovery,
+and any next claim, reconcile that positive pre-agent proof before removing it. This
+closes the two-store write gap without replaying an unknown agent execution. A stale
+fire owner cannot publish proof or alter either store. Deferred rows are immutable
+and share the ledger's bounded terminal retention; existing SQLite CHECK constraints
+are widened transactionally while preserving records and indexes.
+
+The concrete consumer is a maintenance pre-check unable to acquire its writer lock.
+It must report contention **before source work**, without modifying another owner's
+checkpoint or adopting that owner's receipts. This scheduler contract does not make
+a helper's side effects idempotent or replace its completion verifier. Helper changes
+and runtime activation are separate. Do not downgrade while deferred work remains:
+older schedulers do not understand the pending retry marker.
+
 ### Provider Recovery
 
 `run_job()` passes the user's configured fallback providers and credential pool into the `AIAgent` instance:

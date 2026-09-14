@@ -2145,6 +2145,10 @@ def update_job(
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             # An effective timezone move counts too: the slot was computed in the old zone.
             updated.pop("pending_slot", None)
+            if updated.get("deferred_run"):
+                from cron.deferral import reconcile_pending
+                reconcile_pending(job)
+                updated.pop("deferred_run", None)
         if inference_fields_changed and not updated.get("model_preset"):
             snapshots = _compute_provider_model_snapshots(
                 provider=updated.get("provider"),
@@ -2466,6 +2470,7 @@ def _record_run_outcome(
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
+    job.pop("deferred_run", None)
     if job.get("run_claim") is not None:  # keep key absence for legacy records
         job["run_claim"] = None
 
@@ -2766,6 +2771,7 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if (
                 job["id"] not in ids
+                or job.get("deferred_run")
                 or (is_terminal_job(job) and not _is_recoverable_error_job(job))
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
@@ -2845,12 +2851,18 @@ def claim_job_for_fire(
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
         from cron.occurrences import completed_occurrence, scheduled_instant
+        from cron.deferral import pending_due, reconcile_pending
+
+        deferred = job.get("deferred_run")
+        if deferred and pending_due(job, now) is False:
+            return False
 
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
         # stamping it would make completed_occurrence() skip that slot when it arrives.
         manual_fire = force or manual or job.get("manual_run_at") == job.get("next_run_at")
-        instant = None if manual_fire else scheduled_instant(job.get("next_run_at"))
+        instant = (deferred.get("scheduled_instant") if deferred else
+                   None if manual_fire else scheduled_instant(job.get("next_run_at")))
         if instant and completed_occurrence(job, instant):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 # HERMES-013: advance in the job's pinned zone, not raw UTC.
@@ -2859,6 +2871,9 @@ def claim_job_for_fire(
                     job["next_run_at"] = nxt
                     save_jobs(jobs)
             return False
+        if deferred:
+            reconcile_pending(job)
+            job.pop("deferred_run", None)
         # HERMES: a preserve_paused manual run must not clear the paused state it is borrowing.
         if force and not keep_paused:
             _activate_job_record(job)
@@ -3312,6 +3327,13 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         and _claim_is_live(job.get("run_claim"), now, run_claim_ttl)
     ):
         return False
+
+    from cron.deferral import pending_due
+
+    deferred_due = pending_due(job, now)
+    if deferred_due is not None:
+        job["_scheduled_instant"] = job["deferred_run"].get("scheduled_instant")
+        return deferred_due
 
     next_run = _restore_unclaimed_slot(job, scan) or job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:
