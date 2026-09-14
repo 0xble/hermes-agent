@@ -338,6 +338,10 @@ class DelegationCards:
         rows = {}
         hidden = set()
         for task_key, card in self._members(key):
+            # Audited dismissal is an explicit presentation fence, unlike handled
+            # retirement. Omit its rows even as ancestors of surviving work.
+            if card.get("presentation_dismissal"):
+                continue
             for ref, row in card["rows"].items():
                 identity = _row_identity(task_key, ref)
                 batch_fields = batches.display_fields(card, row) if retain_batches else {}
@@ -453,6 +457,8 @@ class DelegationCards:
                 or str(owner.get("thread_id", "")) != str(card_owner.get("thread_id", ""))):
             return
         card = self.cards.get(key)
+        if card and card.get("presentation_dismissal"):
+            return  # late roster/admission callbacks cannot undo operator dismissal
         late_member = bool(card and event_type == "subagent.start"
                            and batches.late_member(card, key, ref, data.get("original_call")))
         if card and (card["owner"] != card_owner

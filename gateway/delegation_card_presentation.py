@@ -190,7 +190,8 @@ def bind(manager, key):
     # Handled executions can still own a live batch display window. Join their
     # transport without undoing the independent lifecycle retirement.
     active = [(k, c) for k, c in manager.cards.items()
-              if (not c.get("retired") or (c.get("original_calls") and not c.get("message_deleted")))
+              if not c.get("presentation_dismissal")
+              and (not c.get("retired") or (c.get("original_calls") and not c.get("message_deleted")))
               and manager._scope(c) == manager._scope(card)]
     # Existing cleanup chooses a stable survivor until its exact ledger finishes.
     # Otherwise prefer a real transport receipt, then the oldest task. Never

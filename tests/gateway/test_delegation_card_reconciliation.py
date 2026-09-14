@@ -10,11 +10,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.delegation_cards import DelegationCards
+from gateway.config import Platform
 from gateway.platforms.base import SendResult
+from gateway.session import SessionSource
 from scripts.reconcile_delegation_cards import main
 
 
-def fixture(tmp_path):
+def fixture(tmp_path, batch=None):
     owner = dict(profile="default", session_id="parent", session_key="route", chat_id="42", thread_id="8")
     cards = {}
     for ref, key, message in [("B", "b" * 32, "14"), ("C", "c" * 32, "15"), ("D", "d" * 32, "16")]:
@@ -23,6 +25,11 @@ def fixture(tmp_path):
                               thread_ref=ref, state="interrupted", terminal_at=time.time() - 1,
                               display_expires_at=time.time() + 300)},
                           message_id=message, rendered="old", recoveries=0, send_attempts=1, retired=False, handled=None)
+        if batch and ref in {"B", "C"}:
+            cards[key]["rows"][ref]["original_call_id"] = key
+            cards[key]["original_calls"] = {key: {"manifest": dict(
+                id=key, parent_task_id=key,
+                member_refs=[ref, "Z"] if batch == "incomplete" else [ref])}}
     # Unsent failed transport remains retryable; it is not part of the dismissal.
     cards["e" * 32] = copy.deepcopy(cards["d" * 32])
     cards["e" * 32].update(message_id=None, send_attempts=0)
@@ -43,8 +50,9 @@ def fixture(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_explicit_dismissal_fences_startup_without_marking_results_handled(tmp_path):
-    source, manifest, plan, original = fixture(tmp_path)
+@pytest.mark.parametrize("batch", [None, "complete", "incomplete"])
+async def test_explicit_dismissal_fences_startup_without_marking_results_handled(tmp_path, batch):
+    source, manifest, plan, original = fixture(tmp_path, batch)
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="new")),
                               edit_message=AsyncMock(return_value=SendResult(success=True)),
                               delete_message=AsyncMock(return_value=False))
@@ -90,6 +98,76 @@ async def test_explicit_dismissal_fences_startup_without_marking_results_handled
     persisted = json.loads(path.read_bytes())
     assert persisted["b" * 32]["presentation_dismissal"] == result["b" * 32]["presentation_dismissal"]
     assert not persisted["d" * 32]["retired"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared_anchor", [False, True])
+async def test_batch_dismissal_fences_callbacks_and_preserves_live_descendant(tmp_path, monkeypatch, shared_anchor):
+    _, _, plan, cards = fixture(tmp_path, "incomplete")
+    key, sibling = "b" * 32, "d" * 32
+    cards.pop("c" * 32)
+    cards.pop("e" * 32)
+    plan["targets"] = plan["targets"][:1]
+    cards[key]["rows"]["B"].update(child_session_id="child", attempt=0)
+    cards[sibling]["rows"]["D"].update(
+        card_parent_task_id=key, card_parent_thread_ref="B", task_label="Live descendant", state="running")
+    if shared_anchor:
+        cards[sibling].update(presentation_key=key, message_id=None)
+    raw = json.dumps(cards)
+    plan["snapshot_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+    directory = tmp_path / "cache" / "delegation"
+    directory.mkdir(parents=True)
+    (directory / "cards.json").write_text(raw)
+    (directory / "dismissal-request.json").write_text(json.dumps(dict(snapshot_json=raw, manifest=plan)))
+    adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="new")),
+                              edit_message=AsyncMock(return_value=SendResult(success=True)),
+                              delete_message=AsyncMock(return_value=True))
+    monkeypatch.setattr("gateway.delivery_ledger.delivered_delegation_receipts", lambda: [])
+    releases = []
+    monkeypatch.setattr("tools.async_delegation.release_result_retention", lambda **kw: releases.append(kw))
+    manager = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
+
+    async def drain():
+        for _ in range(30):
+            pending = list(manager.pending.values())
+            if not pending:
+                return
+            await asyncio.gather(*pending)
+        pytest.fail("presentation failed to settle")
+
+    try:
+        await manager.reconcile()
+        await drain()
+        anchor = manager._anchor(sibling)
+        assert list(manager._display_projection(anchor)["rows"]) == [sibling + ":D"]
+        assert {call.args[1] for call in adapter.edit_message.await_args_list} == ({"14"} if shared_anchor else {"16"})
+        assert {call.args[1] for call in adapter.delete_message.await_args_list} == (set() if shared_anchor else {"14"})
+        # Shared binding may assign display refs, but cannot change execution fields.
+        for ref, original_row in cards[key]["rows"].items():
+            assert {field: manager.cards[key]["rows"][ref][field] for field in original_row} == original_row
+        assert manager.cards[key]["handled"] is None
+        assert manager.cards[key]["presentation_dismissal"]["target"] == plan["targets"][0]
+        before = copy.deepcopy(manager.cards[key])
+        for mock in (adapter.send_delegation_card, adapter.edit_message, adapter.delete_message):
+            mock.reset_mock()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
+        common = dict(owner=cards[key]["owner"], parent_task_id=key)
+        callbacks = [
+            ("start", dict(thread_ref="Z", original_call=cards[key]["original_calls"][key]["manifest"])),
+            ("complete", dict(thread_ref="B", status="completed", attempt=0)),
+            ("admitted", dict(thread_ref="B", child_session_id="child", attempt=1, resume_claim_id="new-claim")),
+        ]
+        for kind, data in callbacks:
+            await manager.observe(source, "route", "parent", 1, "subagent." + kind, None, {**common, **data})
+        await drain()
+        assert manager.cards[key] == before
+        assert releases == []
+        assert list(manager._display_projection(anchor)["rows"]) == [sibling + ":D"]
+        for mock in (adapter.send_delegation_card, adapter.edit_message, adapter.delete_message):
+            mock.assert_not_awaited()
+    finally:
+        await manager.shutdown()
+        await drain()
 
 
 def test_dismissal_rejects_drift_partial_identity_active_rows_and_output_overwrite(tmp_path):
