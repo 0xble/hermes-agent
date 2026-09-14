@@ -54,6 +54,12 @@ external-provider suppression. Linux mountinfo fixtures explicitly select Linux
 behavior and separately verify that non-Linux hosts are not flagged. Neither
 test adaptation changes production memory or WAL policy.
 
+The background-deadline test fixture joins its reader and deadline threads before
+releasing the shared checkpoint-path override. A controlled reproduction showed
+an exited reader outliving the old fixture and overwriting the next checkpoint,
+causing recovery to return zero. The regression uses an explicit teardown/join
+handshake and a real checkpoint recovery. Production process handling is unchanged.
+
 ## Compact delegation activity copy
 
 User-approved presentation-only refinement: completed and idle-running rows omit
