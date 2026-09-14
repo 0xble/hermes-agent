@@ -2758,7 +2758,7 @@ def run_one_job(
     """Run ONE due job end-to-end: execute → save output → deliver → mark. Shared by the built-in
     ticker and external providers' ``fire_due``; does NOT decide due-ness or acquire the initial
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
-    recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
+    recorded via ``mark_job_run``), False if processing raised or deferred finalization was refused. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
@@ -3228,8 +3228,7 @@ def _run_one_job_body(
                 # All scheduler entry points share this finalizer. No completion verifier,
                 # output/context_from document, failure alert, or normal advancement applies.
                 _teardown_deferred()
-                finish_deferred_run(job, result, execution_id, fire_owner)
-                return True
+                return finish_deferred_run(job, result, execution_id, fire_owner)
             success, output, final_response, error = result
         except BaseException:
             # run_job hands back the agent even when raising; tear down so a failed run never leaks.

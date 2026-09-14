@@ -161,3 +161,49 @@ def test_deferral_fences_and_nondeferral_paths(tmp_path, monkeypatch, case):
         another = executions.create_execution("other", source="test")
         executions.finish_execution(another["id"], success=True)
         assert executions.get_execution(row["id"]) is None
+
+
+@pytest.mark.parametrize("lost_ownership", ["fire", "ledger-owner", "ledger-missing"])
+def test_scheduler_reports_refused_deferral_without_accounting(tmp_path, monkeypatch, lost_ownership):
+    from cron import executions, jobs, scheduler
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("{}\n")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "gate.py").write_text(
+        'print(\'{"defer": {"reason": "writer busy", "retry_after_seconds": 30}}\')\n')
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
+    monkeypatch.setattr(scheduler, "_open_cron_session_db", lambda *a: pytest.fail("agent reached"))
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: pytest.fail("ordinary accounting reached"))
+    job = jobs.create_job(prompt="Pending maintenance", schedule="1m", script="gate.py", deliver="local")
+    claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
+    assert isinstance(claimed, dict)
+    finish = scheduler.finish_deferred_run
+    captured = {}
+
+    def lose_ownership_then_finish(job, result, execution_id, owner):
+        # Inject the race at the scheduler's finalizer boundary, after the real
+        # pre-agent script has produced a DeferredRun and the ledger is running.
+        assert executions.get_execution(execution_id)["status"] == "running"
+        if lost_ownership == "fire":
+            current = jobs.get_job(job["id"])
+            jobs.update_job(job["id"], {"fire_claim": {**current["fire_claim"], "by": "replacement"}})
+        else:
+            with executions._transaction() as conn:
+                if lost_ownership == "ledger-owner":
+                    conn.execute("UPDATE executions SET process_id='replacement' WHERE id=?", (execution_id,))
+                else:
+                    conn.execute("DELETE FROM executions WHERE id=?", (execution_id,))
+        captured["job"] = jobs.get_job(job["id"])
+        captured["execution"] = executions.get_execution(execution_id)
+        result = finish(job, result, execution_id, owner)
+        assert result is False
+        return result
+
+    monkeypatch.setattr(scheduler, "finish_deferred_run", lose_ownership_then_finish)
+    assert scheduler.run_one_job(claimed) is False
+    assert jobs.get_job(job["id"]) == captured["job"]
+    assert executions.get_execution(claimed["execution_id"]) == captured["execution"]
+    assert not captured["job"].get("deferred_run")
+    assert not list((tmp_path / "cron" / "output").glob("**/*.md"))
