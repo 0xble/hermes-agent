@@ -60,6 +60,18 @@ an exited reader outliving the old fixture and overwriting the next checkpoint,
 causing recovery to return zero. The regression uses an explicit teardown/join
 handshake and a real checkpoint recovery. Production process handling is unchanged.
 
+Later review corrections preserve elapsed cron deferral time across daylight-saving
+transitions by adding cooldowns in UTC, then serializing in the profile timezone.
+Origin-only updater branch switches select the existing remote fallback before
+the compatibility guard, install its checked immutable SHA, and configure tracking
+after checkout. Existing incompatible branches and tags remain refused. Direct
+Python `cronjob` callers retain upstream's positional prefix through `paused_reason`.
+The fork's `timezone` and `allow_messaging` options are keyword-only, preventing a
+historical positional task ID from becoming messaging permission. Callers that used
+those fork options positionally must use their names. This signature drift predates
+the current sync. Real scheduler, Git updater and persisted job-store regressions
+cover these corrections without changing live jobs or runtime configuration.
+
 ## Compact delegation activity copy
 
 User-approved presentation-only refinement: completed and idle-running rows omit
