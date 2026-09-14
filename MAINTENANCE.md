@@ -103,6 +103,12 @@ ordinary unnamed callers retain their existing behavior. Coverage lives in
 `tests/tools/test_memory_history_named_child.py`. This closes the first-party API
 and execution-context gap, not arbitrary Python or shell filesystem confinement.
 
+Cold-start reconnect tests now await the owned reconnect task before asserting
+its bookkeeping slot is gone. Adapter publication intentionally precedes awaited
+recovery work and final cleanup. An event barrier in the real recovery await
+reproduces that intermediate state deterministically and joins task cleanup even
+on assertion failure. This test-only correction changes no reconnect behavior.
+
 Follow-up review reproduced loss of authored Telegram link destinations when
 valid Markdown supplies an optional title. Both standard and rich rendering now
 parse the destination before checking supported schemes. Malformed destinations
