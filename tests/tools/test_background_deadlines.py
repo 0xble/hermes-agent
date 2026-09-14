@@ -392,3 +392,48 @@ def test_deadline_poller_requires_group_exit_after_wrapper_loss(registry, monkey
     assert session.exited and session.completion_reason == 'timed_out'
     assert registry.completion_queue.get_nowait()['completion_reason'] == 'timed_out'
     assert registry.completion_queue.empty()
+
+
+def test_deadline_poller_preserves_unconfirmed_termination_on_transport_error(
+    registry, monkeypatch
+):
+    from types import SimpleNamespace
+
+    real_time = module.time
+    monkeypatch.setattr(module, "time", SimpleNamespace(**{
+        name: (lambda _: None) if name == "sleep" else getattr(real_time, name)
+        for name in dir(real_time) if not name.startswith("__")
+    }))
+    session = ProcessSession(
+        id="transport-error-poll", command="verify", pid=12345,
+        started_at=real_time.time(), sandbox_process_group=True,
+        termination_source="terminal.timeout", termination_attempts=1,
+        termination_unconfirmed_at=real_time.time(), notify_on_complete=True,
+    )
+    registry._running[session.id] = session
+
+    class Env:
+        failed = False
+
+        def execute(self, command, timeout=10):
+            if not self.failed:
+                self.failed = True
+                raise OSError("temporary sandbox transport failure")
+            assert not session.exited
+            assert session.id in registry._running
+            if "ps -e -o pgid=" in command:
+                return {"output": "gone\n", "returncode": 0}
+            if command.startswith("kill -0"):
+                return {"output": "1\n", "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": "143\n", "returncode": 0}
+            return {"output": "0 0\n", "returncode": 0}
+
+    registry._env_poller_loop(
+        session, Env(), "/synthetic/log", "/synthetic/pid", "/synthetic/exit"
+    )
+
+    assert session.exited
+    assert session.completion_reason == "timed_out"
+    assert session.termination_source == "terminal.timeout"
+    assert registry.completion_queue.get_nowait()["completion_reason"] == "timed_out"

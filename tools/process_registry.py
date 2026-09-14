@@ -1419,7 +1419,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # kill is in flight the failure may be the kill itself: keep observing
                 # so a kill that errors without confirming exit still has a watcher,
                 # and never overwrite an exit the kill already published.
-                if session._termination_in_progress:
+                if (session._termination_in_progress
+                        or (session.termination_source == "terminal.timeout"
+                            and session.termination_unconfirmed_at > 0)):
                     continue
                 if session.exited:
                     return

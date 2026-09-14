@@ -269,7 +269,7 @@ def _captured_python_argv(
     bootstrap = (
         "import os, sys;"
         + site_setup
-        + "source = sys.stdin.buffer.read().decode('utf-8');"
+        + "source = sys.stdin.buffer.read();"
         "label = sys.argv[1];"
         "sys.argv = [label] + sys.argv[2:];"
         "sys.path[0] = os.path.dirname(os.path.abspath(label));"

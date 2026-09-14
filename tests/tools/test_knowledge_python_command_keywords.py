@@ -11,6 +11,7 @@ from tools.knowledge_command_paths import literal_paths
 @pytest.mark.parametrize("tool", ["execute_code", "terminal"])
 @pytest.mark.parametrize("target_kind", ["home", "ancestor", "unrelated"])
 @pytest.mark.parametrize("source", [
+    "import os; os.system(command={cmd})",
     "import os; os.popen({cmd}).read()",
     "import os; os.popen(cmd={cmd}).read()",
     "import os as o; o.popen(cmd={cmd}).read()",

@@ -198,6 +198,25 @@ def test_completion_script_can_verify_agent_result(monkeypatch, tmp_path):
     assert error is None
 
 
+def test_completion_script_accepts_utf8_bom(monkeypatch, tmp_path):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    verifier = scripts / "verify.py"
+    verifier.write_bytes(b"\xef\xbb\xbfprint('bom verifier ran')\n")
+
+    _, result = _run_booked_job(
+        monkeypatch,
+        tmp_path,
+        completion_script="verify.py",
+    )
+
+    success, output, final_response, error = result
+    assert success is True
+    assert "bom verifier ran" in output
+    assert final_response == "done"
+    assert error is None
+
+
 def test_completion_script_failure_cannot_surface_as_healthy(monkeypatch, tmp_path):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
