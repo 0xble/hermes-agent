@@ -11,6 +11,7 @@ behind had one (the override is per-event, never inherited across the chain).
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -60,17 +61,28 @@ async def _run_followup(GatewayRunner, runner, turn_ctx, pending_event):
 
 
 @pytest.mark.asyncio
-async def test_queued_followup_forwards_its_own_reasoning_override():
+@pytest.mark.parametrize("stored_metadata", [None, {}])
+async def test_queued_followup_forwards_its_own_reasoning_override(stored_metadata):
     """A queued ``/reasoning high`` event runs its prompt under the requested override."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.restart_inbox import serialize_event, deserialize_event
+    from gateway.session import SessionSource
+
     GatewayRunner, runner, turn_ctx, source = _runner_and_ctx(preceding_override=None)
-    pending_event = SimpleNamespace(
-        source=source, message_id="6002", channel_prompt=None, message_type=None,
-        text="explain this", turn_reasoning_config=dict(HIGH))
+    pending_event = MessageEvent(
+        source=SessionSource(platform=source.platform, chat_id=source.chat_id, chat_type="dm"),
+        message_id="6002", text="explain this", turn_reasoning_config=dict(HIGH))
+    assert pending_event.metadata == {}
+    payload = json.loads(serialize_event(pending_event))
+    payload["metadata"] = stored_metadata
+    pending_event = deserialize_event(json.dumps(payload))
+    assert pending_event.metadata == {}  # serialized null is normalized at rehydration
 
     kwargs = await _run_followup(GatewayRunner, runner, turn_ctx, pending_event)
 
     assert kwargs.get("turn_reasoning_config") == HIGH, \
         "the queued event's one-turn reasoning override did not reach the follow-up turn"
+    assert kwargs["persist_user_display_metadata"] == {"gateway_input_owner": None}
 
 
 @pytest.mark.asyncio
