@@ -892,10 +892,19 @@ def _prepare_checkout_for_update(
     if not in_place_update and current_branch == "HEAD" != branch:
         print(f"  ⚠ Currently on detached HEAD — switching to {branch} for update...")
     auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
-    if (
-        not in_place_update and current_branch != branch
-        and _git_run(git_cmd, ["checkout", branch]).returncode != 0):
-        track_result = _git_run(git_cmd, ["checkout", "-B", branch, f"origin/{branch}"])
+    needs_switch = not in_place_update and current_branch != branch
+    # A remote-only branch is valid for checkout's tracking inference, but is
+    # not a bare revision the compatibility guard can inspect. Select the
+    # existing origin fallback before invoking the guard, without mistaking a
+    # rejected capability contract for a missing local revision.
+    local_target_exists = not needs_switch or _git_run(
+        git_cmd, ["rev-parse", "--verify", "--end-of-options", f"{branch}^{{commit}}"]
+    ).returncode == 0
+    if needs_switch and (
+        not local_target_exists or _git_run(git_cmd, ["checkout", branch]).returncode != 0
+    ):
+        remote_ref = f"refs/remotes/origin/{branch}"
+        track_result = _git_run(git_cmd, ["checkout", "-B", branch, remote_ref])
         if track_result.returncode != 0:
             # Restore the stash before bailing so the user isn't stranded.
             if auto_stash_ref is not None:
@@ -905,6 +914,9 @@ def _prepare_checkout_for_update(
             if track_result.stderr.strip():
                 print(f"  {track_result.stderr.strip().splitlines()[0]}")
             sys.exit(1)
+        # The guard checks and checks out an immutable SHA. Configure tracking
+        # afterward, so no mutable ref is re-read to select the installed code.
+        _git_run(git_cmd, ["branch", f"--set-upstream-to={remote_ref}", branch], check=True)
 
     prompt_for_restore = (
         auto_stash_ref is not None

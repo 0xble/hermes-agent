@@ -162,3 +162,80 @@ def test_failed_capability_read_never_mutates(repo, monkeypatch):
     with pytest.raises(RuntimeError, match='compatib'):
         update_cmd._git_run(['git'], ['reset', '--hard', current], root)
     assert git(root, 'rev-parse', 'HEAD') == current
+
+
+def prepare_release(root, monkeypatch):
+    monkeypatch.setattr(update_cmd, '_m', lambda: SimpleNamespace(
+        PROJECT_ROOT=root, _stash_local_changes_if_needed=lambda *a: None))
+    monkeypatch.setattr(update_cmd, '_apply_parked_branch_guard', lambda *a, **kw: (False, False, None))
+    return update_cmd._prepare_checkout_for_update(
+        ['git'], 'release', 'HEAD', is_fork=True, assume_yes=True,
+        gateway_mode=False, gw_input_fn=None, switch_branch=True,
+        _windows_gateway_resume=False)
+
+
+def test_remote_only_update_creates_compatible_tracking_branch(repo, monkeypatch):
+    root, _, current = repo
+    git(root, 'remote', 'add', 'origin', 'https://fixture.invalid/repo.git')
+    git(root, 'update-ref', 'refs/remotes/origin/release', current)
+    # Git itself supports this branch name through remote tracking inference.
+    git(root, 'checkout', 'release')
+    assert git(root, 'rev-parse', '--symbolic-full-name', '@{upstream}') == 'refs/remotes/origin/release'
+    git(root, 'checkout', '--detach', current)
+    git(root, 'branch', '-D', 'release')
+    git(root, 'remote', 'add', 'other', 'https://fixture.invalid/other.git')
+    git(root, 'update-ref', 'refs/remotes/other/release', current)
+    git(root, 'config', 'checkout.defaultRemote', 'other')
+    plan = prepare_release(root, monkeypatch)
+    assert plan.commit_count == 0
+    assert git(root, 'symbolic-ref', 'HEAD') == 'refs/heads/release'
+    assert git(root, 'rev-parse', 'HEAD') == current
+    assert git(root, 'rev-parse', '--symbolic-full-name', '@{upstream}') == 'refs/remotes/origin/release'
+
+
+def test_remote_only_incompatible_update_refuses_before_branch_creation(repo, monkeypatch):
+    root, old, current = repo
+    git(root, 'remote', 'add', 'origin', 'https://fixture.invalid/repo.git')
+    git(root, 'update-ref', 'refs/remotes/origin/release', old)
+    with pytest.raises(RuntimeError, match='compatib'):
+        prepare_release(root, monkeypatch)
+    assert git(root, 'rev-parse', 'HEAD') == current
+    assert git(root, 'for-each-ref', '--format=%(refname)', 'refs/heads/release') == ''
+
+
+def test_existing_incompatible_branch_is_not_replaced_by_compatible_origin(repo, monkeypatch):
+    root, old, current = repo
+    git(root, 'branch', 'release', old)
+    git(root, 'update-ref', 'refs/remotes/origin/release', current)
+    with pytest.raises(RuntimeError, match='compatib'):
+        prepare_release(root, monkeypatch)
+    assert git(root, 'rev-parse', 'HEAD') == current
+    assert git(root, 'rev-parse', 'refs/heads/release') == old
+
+
+def test_existing_incompatible_tag_is_not_bypassed_as_missing_branch(repo, monkeypatch):
+    root, old, current = repo
+    git(root, 'tag', 'release', old)
+    git(root, 'update-ref', 'refs/remotes/origin/release', current)
+    with pytest.raises(RuntimeError, match='compatib'):
+        prepare_release(root, monkeypatch)
+    assert git(root, 'rev-parse', 'HEAD') == current
+    assert git(root, 'for-each-ref', '--format=%(refname)', 'refs/heads/release') == ''
+
+
+def test_remote_only_checkout_pins_checked_commit_even_if_remote_moves(repo, monkeypatch):
+    from hermes_cli import update_compatibility as guard
+    root, old, current = repo
+    git(root, 'remote', 'add', 'origin', 'https://fixture.invalid/repo.git')
+    git(root, 'update-ref', 'refs/remotes/origin/release', current)
+    # A lookalike tag must never override the updater's origin namespace.
+    git(root, 'tag', 'origin/release', old)
+    original = guard.require_git_target
+    def checked(*args):
+        sha = original(*args)
+        git(root, 'update-ref', 'refs/remotes/origin/release', old)
+        return sha
+    monkeypatch.setattr(guard, 'require_git_target', checked)
+    prepare_release(root, monkeypatch)
+    assert git(root, 'rev-parse', 'HEAD') == current
+    assert git(root, 'rev-parse', '--symbolic-full-name', '@{upstream}') == 'refs/remotes/origin/release'
