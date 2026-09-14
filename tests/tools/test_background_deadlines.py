@@ -20,7 +20,19 @@ def registry(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_SYSTEMD_SCOPE_AVAILABLE", False)
     value = ProcessRegistry()
     yield value
+    # kill_all skips exited sessions, but their reader/deadline threads may
+    # still be writing checkpoints. Join them before monkeypatch restores the
+    # shared path or the next test redirects it to a different checkpoint.
+    with value._lock:
+        sessions = list({**value._finished, **value._running}.values())
     value.kill_all()
+    for session in sessions:
+        session._completion_event.set()  # also stop synthetic unconfirmed retries
+    for session in sessions:
+        for thread in (session._reader_thread, session._deadline_thread):
+            if thread is not None:
+                thread.join(5)
+                assert not thread.is_alive(), f"fixture leaked {thread.name}"
 
 
 def test_explicit_deadline_exits_once_and_preserves_timeout_result(registry):
@@ -437,3 +449,57 @@ def test_deadline_poller_preserves_unconfirmed_termination_on_transport_error(
     assert session.completion_reason == "timed_out"
     assert session.termination_source == "terminal.timeout"
     assert registry.completion_queue.get_nowait()["completion_reason"] == "timed_out"
+
+
+def test_registry_fixture_joins_late_checkpoint_writer(monkeypatch, tmp_path):
+    """An exited reader must finish before another test changes CHECKPOINT_PATH."""
+    lifetime = registry.__wrapped__(monkeypatch, tmp_path / "old")
+    old = next(lifetime)
+    session = ProcessSession(id="late_reader", command="test", started_at=time.time())
+    old._running[session.id] = session
+    writer_paused, release_writer, teardown_done = (threading.Event() for _ in range(3))
+    write_checkpoint = old._write_checkpoint
+
+    def delayed_checkpoint():
+        writer_paused.set()
+        assert release_writer.wait(5), "test did not release checkpoint writer"
+        write_checkpoint()
+
+    monkeypatch.setattr(old, "_write_checkpoint", delayed_checkpoint)
+    reader = threading.Thread(target=old._finish_exited, args=(session, 0))
+    session._reader_thread = reader
+
+    def teardown():
+        next(lifetime, None)
+        teardown_done.set()
+
+    finalizer = threading.Thread(target=teardown)
+    reader.start()
+    try:
+        assert writer_paused.wait(5)
+        assert session.exited and session.id in old._finished
+        finalizer.start()
+        assert not teardown_done.wait(0.1), "fixture released a still-active checkpoint writer"
+        release_writer.set()
+        finalizer.join(5)
+        assert teardown_done.is_set() and not reader.is_alive()
+        monkeypatch.setattr(module, "CHECKPOINT_PATH", tmp_path / "next" / "processes.json")
+        fresh = ProcessRegistry()
+        pending = ProcessSession(id="next_pending", command="test", pid=1234,
+                                 host_start_time=5678, started_at=time.time())
+        fresh._running[pending.id] = pending
+        fresh._write_checkpoint()
+        recovered = ProcessRegistry()
+        monkeypatch.setattr(recovered, "_host_pid_is_ours", lambda *args: True)
+        monkeypatch.setattr(recovered, "_start_deadline", Mock())
+        assert recovered.recover_from_checkpoint() == 1
+        assert recovered.get(pending.id) is not None
+        fresh._running.clear()
+        recovered._running.clear()
+    finally:
+        release_writer.set()
+        reader.join(5)
+        if finalizer.ident is not None:
+            finalizer.join(5)
+        else:
+            next(lifetime, None)
