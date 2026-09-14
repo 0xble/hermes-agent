@@ -589,4 +589,5 @@ async def test_failed_first_delivery_defers_cleanup_and_queued_followup(
     assert result["final_response"] == "done-1"
     assert QueuedProgressAgent.run_count == 1
     assert adapter.deleted == []
-    assert adapter._pending_messages[session_key] is queued_event
+    assert session_key not in adapter._pending_messages
+    assert runner._session_state(session_key).conversation.queued_events == [queued_event]
