@@ -2032,6 +2032,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
         finally:
             if source == "terminal.timeout":
                 session._termination_in_progress = False
+                # A local reader can observe exit while the fence is raised and
+                # return after its one suppressed move. Reconcile immediately so
+                # an unconfirmed kill does not leave that already-dead process in
+                # the running set until another deadline retry.
+                if not session.exited:
+                    self._reconcile_local_exit(session)
                 if session.exited:
                     self._move_to_finished(session)
 

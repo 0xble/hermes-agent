@@ -650,6 +650,25 @@ def test_secondary_profile_recovery_preserves_prior_uncertainty(tmp_path, monkey
         reset_hermes_home_override(token)
 
 
+def test_corrupt_result_owner_reads_active_profile_checkpoint(tmp_path, monkeypatch):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from tools import process_registry as pr
+    from tools import process_registry_results as receipts
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", pr._CHECKPOINT_PATH_AT_IMPORT)
+    (home / "processes.json").write_text(json.dumps([{
+        "session_id": "proc_damaged", "owner_task_id": "child-owner",
+    }]))
+    receipt = home / "logs" / "process-results" / "proc_damaged.json"
+    token = set_hermes_home_override(home)
+    try:
+        assert receipts._corrupt_result_owner(receipt, {"id": "proc_damaged"}) == "child-owner"
+    finally:
+        reset_hermes_home_override(token)
+
+
 @pytest.mark.parametrize("failure_at", ["completion", "observation"])
 def test_failed_receipt_successful_checkpoint_recovers_exact_unresolved_effect(tmp_path, monkeypatch, failure_at):
     from tools import process_registry as pr

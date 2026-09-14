@@ -89,5 +89,7 @@ async def test_trusted_standalone_native_sender_preserves_profile_and_receipt(tm
             chat_id='chat', message='body', media_files=[('/synthetic/document.pdf', False)])
     else:
         assert result.get('error')
+        if mode in {'wrong_profile', 'live_missing', 'lookup_error'}:
+            assert result.get('delivery_stage') == 'pre_send'
         native.assert_not_awaited()
     default_adapter.send.assert_not_awaited()

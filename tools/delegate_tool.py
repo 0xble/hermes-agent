@@ -366,7 +366,7 @@ def _build_child_agent(
         if subagent_definition is not None:
             from tools.custom_subagents import (
                 RuntimePin, _authority_mapping_fingerprint, _nonsecret_request_overrides,
-                inherited_credential_pool, nonsecret_route_url,
+                inherited_credential_pool, nonsecret_route_url, route_url_authority_fingerprint,
             )
             child._delegation_named_type = subagent_definition.name
             if child.provider == "moa":
@@ -399,6 +399,7 @@ def _build_child_agent(
                     "requested_provider": subagent_definition.provider or child.provider,
                     "model": child.model,
                     "base_url": nonsecret_route_url(child.base_url), "api_mode": child.api_mode,
+                    "base_url_authority_fingerprint": route_url_authority_fingerprint(child.base_url),
                     "reasoning_effort": getattr(getattr(child, "_delegation_runtime_pin", None), "reasoning_effort", None),
                     "authority_fingerprint": getattr(getattr(child, "_delegation_runtime_pin", None), "_credential_digest", None),
                     "request_overrides": _nonsecret_request_overrides(json.loads(getattr(
@@ -713,7 +714,8 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     from hermes_constants import parse_reasoning_effort
     from tools.custom_subagents import (
         FallbackDefinition, ResolvedSubagentLaunch, SubagentDefinition,
-        freeze_fallback_routes, nonsecret_route_url, _authority_mapping_matches, resolve_named_credentials,
+        freeze_fallback_routes, nonsecret_route_url, route_url_authority_fingerprint,
+        _authority_mapping_matches, resolve_named_credentials,
     )
 
     requested = task.get("resume_session_id")
@@ -829,11 +831,17 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
                 from agent.credential_pool import credential_pool_matches_provider
                 provider_matches = credential_pool_matches_provider(
                     entry_provider, requested_provider, base_url=entry_base)
+            stored_base_fingerprint = launch.get("base_url_authority_fingerprint")
+            current_base_fingerprint = route_url_authority_fingerprint(str(entry_base or ""))
             if (
-                not provider_matches
-                or normalize_route_base_url(nonsecret_route_url(str(entry_base or "")))
-                   != normalize_route_base_url(str(launch.get("base_url") or ""))
-            ):
+                    not provider_matches
+                    or (
+                        current_base_fingerprint != stored_base_fingerprint
+                        if stored_base_fingerprint
+                        else normalize_route_base_url(nonsecret_route_url(str(entry_base or "")))
+                             != normalize_route_base_url(str(launch.get("base_url") or ""))
+                    )
+                ):
                 raise ValueError("delegated child stable credential identity changed route authority")
             runtime_key = getattr(entry, "runtime_api_key", None)
             if not isinstance(runtime_key, str) or not runtime_key:
@@ -851,8 +859,13 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             ("provider", creds.get("provider") == provider),
             ("model", (creds.get("model") or model) == model),
             ("api_mode", str(creds.get("api_mode") or "") == str(launch.get("api_mode") or "")),
-            ("base_url", normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
-             == normalize_route_base_url(str(launch.get("base_url") or ""))),
+            ("base_url", (
+                route_url_authority_fingerprint(str(creds.get("base_url") or ""))
+                == launch.get("base_url_authority_fingerprint")
+                if launch.get("base_url_authority_fingerprint")
+                else normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
+                     == normalize_route_base_url(str(launch.get("base_url") or ""))
+            )),
             ("authority", authority_matches),
             ("request_overrides", _authority_mapping_matches(
                 creds.get("request_overrides") or {}, launch.get("request_overrides") or {},

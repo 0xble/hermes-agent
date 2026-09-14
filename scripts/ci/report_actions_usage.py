@@ -68,7 +68,8 @@ def project(
     policy_minutes = summary["trusted_policy_linux_minutes"]
     dependency_minutes = summary.get("other_linux_minutes", 0)
     average_full_minutes = {
-        os_name: math.ceil(minutes / pull_request_runs) * confirmations
+        os_name: (math.ceil(minutes / pull_request_runs) * confirmations
+                  if pull_request_runs else 0)
         for os_name, minutes in summary["fork_ci_pull_request_minutes"].items()
     }
 
@@ -84,7 +85,8 @@ def project(
     }
     proposed_cost = cost(proposed_minutes)
     baseline_cost = cost(baseline)
-    reduction = 100.0 * (baseline_cost - proposed_cost) / baseline_cost
+    reduction = (100.0 * (baseline_cost - proposed_cost) / baseline_cost
+                 if baseline_cost else 0.0)
     return Projection(
         baseline_cost_usd=round(baseline_cost, 2),
         proposed_cost_usd=round(proposed_cost, 2),

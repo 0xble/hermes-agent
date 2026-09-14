@@ -62,3 +62,21 @@ def test_cli_fails_when_minimum_is_impossible() -> None:
     )
     assert completed.returncode == 1
     assert "below 99.99%" in completed.stdout
+
+
+def test_empty_usage_period_is_a_zero_cost_projection() -> None:
+    summary = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    summary["rounded_minutes"] = {"linux": 0, "windows": 0, "macos": 0}
+    summary["fork_ci_pull_request_runs"] = 0
+    summary["fork_ci_pull_request_minutes"] = {"linux": 0, "windows": 0, "macos": 0}
+    summary["trusted_policy_linux_minutes"] = 0
+    summary["other_linux_minutes"] = 0
+    summary["ordinary_pr_rounded_minutes"] = {"smoke": 0, "history": 0}
+    summary["risk_replay"]["risk_full_revision_count"] = 0
+    summary["risk_replay"]["unmatched_summary_runs"] = 0
+
+    result = MODULE.project(summary)
+
+    assert result.baseline_cost_usd == result.proposed_cost_usd == 0
+    assert result.reduction_percent == 0
+    assert result.proposed_minutes == {"linux": 0, "windows": 0, "macos": 0}

@@ -78,6 +78,7 @@ class ResolvedRoute:
         metadata = {
             "provider": self.provider, "model": self.model,
             "base_url": nonsecret_route_url(self.base_url), "api_mode": self.api_mode,
+            "base_url_authority_fingerprint": route_url_authority_fingerprint(self.base_url),
             "reasoning_effort": self.reasoning_effort,
             "authority_fingerprint": self.credential_digest,
             "request_overrides": _nonsecret_request_overrides(json.loads(self.request_overrides_json)),
@@ -104,6 +105,14 @@ def nonsecret_route_url(value: str) -> str:
         return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
     except (TypeError, ValueError):
         return ""
+
+
+def route_url_authority_fingerprint(value: str) -> str:
+    """Opaque identity for the complete normalized route, including query/userinfo authority."""
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    normalized = normalize_route_base_url(str(value or ""))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 _NONSECRET_TOKEN_LIMIT_KEYS = frozenset({

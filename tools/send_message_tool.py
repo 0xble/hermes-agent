@@ -721,7 +721,10 @@ async def _send_via_adapter(
                         .get(platform)
                     )
                 if adapter is None:
-                    return {"error": f"No live adapter for profile '{requested_profile}' and platform '{platform_name}'"}
+                    return {
+                        "error": f"No live adapter for profile '{requested_profile}' and platform '{platform_name}'",
+                        "delivery_stage": "pre_send",
+                    }
             else:
                 adapter = (getattr(runner, "adapters", None) or {}).get(platform)
         except Exception as exc:
@@ -730,7 +733,8 @@ async def _send_via_adapter(
                     "error": (
                         f"Profile resolution failed for '{str(profile).strip()}': "
                         f"{type(exc).__name__}"
-                    )
+                    ),
+                    "delivery_stage": "pre_send",
                 }
             adapter = None
         if adapter is not None:
@@ -1091,15 +1095,18 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         try:
             entry = platform_registry.get(platform_name)
             if args is not None and (entry is None or entry.send_message_handler is None):
-                return {"error": f"No scoped custom handler for profile '{profile}' and platform '{platform_name}'"}
+                return {"error": f"No scoped custom handler for profile '{profile}' and platform '{platform_name}'",
+                        "delivery_stage": "pre_send"}
             if entry is not None and entry.send_message_handler is not None:
                 scoped, _ = platform_registry.snapshot_registration(
                     platform_name, scope=platform_registry.current_scope_key())
                 if not profile_matches_home(str(profile).strip()) or scoped is not entry:
-                    return {"error": f"Cannot verify custom handler ownership for profile '{profile}' and platform '{platform_name}'"}
+                    return {"error": f"Cannot verify custom handler ownership for profile '{profile}' and platform '{platform_name}'",
+                            "delivery_stage": "pre_send"}
                 return await _send_custom_request(entry, args, chat_id, platform_name, pconfig)
         except Exception as exc:
-            return {"error": f"Custom handler profile resolution failed: {type(exc).__name__}"}
+            return {"error": f"Custom handler profile resolution failed: {type(exc).__name__}",
+                    "delivery_stage": "pre_send"}
         try:
             import sys
             # A live runner registers in this module. Do not import the entire
@@ -1107,10 +1114,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             gateway_module = sys.modules.get("gateway.run")
             runner = gateway_module._gateway_runner_ref() if gateway_module is not None else None
         except Exception as exc:
-            return {"error": f"Trusted profile gateway lookup failed: {type(exc).__name__}"}
+            return {"error": f"Trusted profile gateway lookup failed: {type(exc).__name__}",
+                    "delivery_stage": "pre_send"}
         if runner is None:
             if not profile_matches_home(str(profile).strip()):
-                return {"error": f"Cannot honor trusted profile '{profile}' for standalone platform '{platform_name}'"}
+                return {"error": f"Cannot honor trusted profile '{profile}' for standalone platform '{platform_name}'",
+                        "delivery_stage": "pre_send"}
             # This process is already scoped to the requested profile. Preserve
             # its native standalone transports rather than requiring a plugin
             # sender for built-ins such as Weixin, Signal and Telegram.

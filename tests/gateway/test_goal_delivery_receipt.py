@@ -103,14 +103,18 @@ async def test_receipt_gates_consumption_retry_and_fifo(receipt_context, lane, p
     assert not state.get("handled")
     assert not result.get("_goal_decision_consumed")
     assert judge.call_count == int(prepared)
-    assert adapter._pending_messages["route"] is user
-    assert not runner._overflow_queue("route")
+    if lane == "queued":
+        assert "route" not in adapter._pending_messages
+        assert runner._overflow_queue("route")[0] is user
+    else:
+        assert adapter._pending_messages["route"] is user
+        assert not runner._overflow_queue("route")
 
     if lane == "normal":
         await adapter._fire_post_delivery_callback("route", asyncio.Event(), 7)
     else:
-        assert await runner._run_agent_deliver_first_response(
-            ctx, adapter, result, result, None, user, user.text)
+        await adapter._fire_post_delivery_callback(
+            "route", asyncio.Event(), 7, delivery_succeeded=True)
     assert state["handled"]
     assert judge.call_count == 1  # preprepared decisions never rejudge
     assert judge.call_args.kwargs["tool_evidence"][0]["tool_call_id"] == "canonical"

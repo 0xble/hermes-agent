@@ -231,9 +231,9 @@ def _corrupt_result_owner(path, record):
         owner = record.get("owner_task_id")
         if isinstance(owner, str) and owner:
             owners.add(owner)
-    from tools.process_registry import CHECKPOINT_PATH
+    from tools.process_registry import _checkpoint_path
     try:
-        entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        entries = json.loads(_checkpoint_path().read_text(encoding="utf-8"))
         for entry in entries:
             if not isinstance(entry, dict) or entry.get("session_id") != path.stem:
                 continue

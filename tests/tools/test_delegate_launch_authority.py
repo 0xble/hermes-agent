@@ -6,7 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 from tools import delegate_tool
-from tools.custom_subagents import ResolvedSubagentLaunch, SubagentDefinition, resolve_named_credentials
+from tools.custom_subagents import (
+    ResolvedSubagentLaunch, SubagentDefinition, nonsecret_route_url,
+    resolve_named_credentials, route_url_authority_fingerprint,
+)
+
+
+def test_route_metadata_redacts_but_fingerprints_complete_url_authority():
+    first = "https://user:secret@example.invalid/v1?deployment=one"
+    second = "https://other:changed@example.invalid/v1?deployment=two"
+    assert nonsecret_route_url(first) == nonsecret_route_url(second) == "https://example.invalid/v1"
+    assert route_url_authority_fingerprint(first) != route_url_authority_fingerprint(second)
 
 
 @pytest.fixture

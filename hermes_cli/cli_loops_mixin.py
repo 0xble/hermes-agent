@@ -579,8 +579,8 @@ class CLILoopsMixin:
             decision = mgr.evaluate_after_turn(
                 last_response, user_initiated=True, background_processes=_bg_procs,
                 active_delegations=_active_deleg, tool_evidence=_tool_evidence)
-        if (automatic_goal_notices_enabled() and not decision.get("stop_explanation")
-                and mgr.claim_transition_notice(decision)):
+        if (decision.get("stop_explanation") or (
+                automatic_goal_notices_enabled() and mgr.claim_transition_notice(decision))):
             _print_decision_message(decision)
         if decision.get("should_continue"):
             prompt = decision.get("continuation_prompt")

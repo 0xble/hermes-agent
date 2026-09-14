@@ -3638,17 +3638,39 @@ class GatewayTurnMixin:
                 logger.warning("Failed to send first response before queued message: %s", e)
         if not _first_response_delivered:
             # The first answer never reached the user. Running the follow-up now would bury it
-            # under a reply to a question the user has not seen answered: put the queued event
-            # back and stop, leaving the progress bubbles as breadcrumbs.
+            # under a reply to a question the user has not seen answered. Keep it outside the
+            # adapter's ordinary post-handler drain until the outer delivery attempt confirms
+            # the predecessor. If that attempt also fails, the FIFO retains the event for a
+            # later turn instead of dispatching it out of order.
             _pending_slot = getattr(adapter, "_pending_messages", None)
-            if pending_event is not None and isinstance(_pending_slot, dict):
-                _existing_pending = _pending_slot.get(session_key)
+            _deferred_event = pending_event or MessageEvent(text=pending or "", source=turn_ctx.source)
+            _queued_events = self._session_state(session_key).conversation.queued_events
+            if isinstance(_pending_slot, dict):
+                _existing_pending = _pending_slot.pop(session_key, None)
                 if _existing_pending is not None:
-                    self._session_state(session_key).conversation.queued_events.insert(
-                        0, _existing_pending)
-                _pending_slot[session_key] = pending_event
-            elif adapter is not None and hasattr(adapter, "queue_message"):
-                adapter.queue_message(session_key, pending)
+                    _queued_events.insert(0, _existing_pending)
+            _queued_events.insert(0, _deferred_event)
+
+            async def _release_followup_after_outer_delivery() -> None:
+                from gateway.status_delivery import final_delivery_succeeded
+                if not final_delivery_succeeded.get() or not isinstance(_pending_slot, dict):
+                    return
+                try:
+                    _queued_events.remove(_deferred_event)
+                except ValueError:
+                    return
+                _late_pending = _pending_slot.get(session_key)
+                if _late_pending is not None:
+                    _queued_events.append(_late_pending)
+                _pending_slot[session_key] = _deferred_event
+
+            _callback_owner = getattr(turn_ctx, "_post_delivery_owner", None) or adapter
+            _register = getattr(_callback_owner, "register_post_delivery_callback", None)
+            if callable(_register):
+                _register(
+                    session_key, _release_followup_after_outer_delivery,
+                    generation=turn_ctx.run_generation,
+                )
             logger.warning(
                 "Queued follow-up for session %s deferred because the first response was "
                 "not delivered.", session_key or "?")

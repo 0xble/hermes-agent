@@ -205,3 +205,25 @@ def test_consent_refusal_leaves_task_free_for_later_identity(browser_boundary, t
     assert info["browser_identity"] == different
     attach.assert_called_once_with(different)
     assert bt._read_browser_identity_binding("consent-refused")[0] == different
+
+
+def test_cached_named_session_rechecks_revoked_consent(browser_boundary, tmp_path, monkeypatch):
+    from hermes_cli import config as config_module
+
+    config, _, _, _ = browser_boundary
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps({"browser": {**config, "use_real_profile": True}}))
+    monkeypatch.setattr(config_module, "get_config_path", lambda: path)
+    monkeypatch.setattr("hermes_cli.browser_identity.read_browser_identity_config", read_browser_identity_config)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
+    monkeypatch.setattr(bt, "_use_real_profile", cloud._use_real_profile)
+    monkeypatch.setattr(bt, "_create_local_session", sessions._create_local_session)
+    monkeypatch.setattr(bt, "_cleanup_real_profile_state", lambda: None)
+    monkeypatch.setattr(bt, "_real_profile_cdp", Mock(return_value=("ws://127.0.0.1:9999", None)))
+    monkeypatch.setattr(bt, "_resolve_cdp_override", lambda url: url)
+    sessions._get_session_info("cached-consent", identity="personal")
+
+    path.write_text(json.dumps({"browser": {**config, "use_real_profile": False}}))
+
+    with pytest.raises(RuntimeError, match="use_real_profile"):
+        sessions._get_session_info("cached-consent", identity="personal")

@@ -373,6 +373,9 @@ def _get_session_info(task_id: Optional[str] = None, identity: Optional[str] = N
     def _ensure_identity_binding(session_info: Dict[str, Any]) -> None:
         """Fail closed unless ``session_info`` is this home's session on the requested identity."""
         if session_info.get("browser_identity"):
+            # Consent is a live per-use setting. A cached named session must not
+            # outlive revocation and silently retain access to the real profile.
+            _reject_identity_incompatible_backend(str(session_info["browser_identity"]))
             from hermes_constants import hermes_home_key
             if session_info.get("browser_identity_home") != hermes_home_key():
                 raise RuntimeError("browser task belongs to another Hermes profile; start a new task "

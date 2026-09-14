@@ -898,7 +898,18 @@ class TurnRunner:
                 await self._flush_progress_edit(st)
             except Exception:
                 logger.debug("progress boundary seal failed (%s)", source, exc_info=True)
-        self._reset_progress_bubble(st)
+        elif st.progress_lines:
+            with suppress(Exception):
+                await self._send_unacknowledged_progress(st)
+        if st.retired_progress_lines >= len(st.progress_lines):
+            self._reset_progress_bubble(st)
+            return
+        # A boundary changes where later progress belongs, but it is not an
+        # acceptance receipt. Carry only the refused suffix into the new bubble.
+        st.progress_lines = st.progress_lines[st.retired_progress_lines:]
+        st.progress_msg_id = None
+        st.retired_progress_lines = 0
+        self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 
     def _release_deferred_progress(self, st) -> None:
         """Stop deferring and replay everything buffered behind the provisional boundary."""
@@ -959,7 +970,10 @@ class TurnRunner:
                 # split, not an oversized edit; persistent failure stays bounded here.
                 if await self._roll_progress_overflow_if_needed(st) or not st.can_edit:
                     return
-                await self._edit_progress_message(st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                result = await self._edit_progress_message(
+                    st, st.progress_msg_id, self._progress_text(st.progress_lines))
+                if result.success:
+                    st.retired_progress_lines = len(st.progress_lines)
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx

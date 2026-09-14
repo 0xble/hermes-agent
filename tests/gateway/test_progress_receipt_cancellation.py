@@ -283,6 +283,10 @@ async def test_transient_overflow_finalization_retries_split_not_oversized_edit(
         if boundary == "cancel":
             assert st.progress_msg_id == original_id
             assert st.progress_lines == lines
+        else:
+            assert st.progress_msg_id is None
+            assert st.progress_lines == lines[1:]
+            assert st.retired_progress_lines == 0
     else:
         assert adapter.edits == [(original_id, "initial\nfirst overflow line")]
         assert [text for _, text in adapter.sent] == ["initial", "second overflow line"]
