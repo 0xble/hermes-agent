@@ -770,6 +770,7 @@ class TestBuiltInIdentityRouting:
                     "hermes_cli.browser_identity.read_browser_identity_config",
                     return_value=_browser_cfg(),
                 ),
+                patch.object(bt, "_use_real_profile", return_value=True),
                 pytest.raises(RuntimeError, match="already bound"),
             ):
                 bt._get_session_info("identity-switch-test", identity="personal")
@@ -802,6 +803,7 @@ class TestBuiltInIdentityRouting:
                     "hermes_cli.browser_identity.read_browser_identity_config",
                     return_value=changed,
                 ),
+                patch.object(bt, "_use_real_profile", return_value=True),
                 pytest.raises(RuntimeError, match="already bound"),
             ):
                 bt._get_session_info("identity-remap-test", identity="lpg")
@@ -831,7 +833,10 @@ class TestBuiltInIdentityRouting:
         }
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home-b"))
         try:
-            with pytest.raises(RuntimeError, match="another Hermes profile"):
+            with (
+                patch.object(bt, "_use_real_profile", return_value=True),
+                pytest.raises(RuntimeError, match="another Hermes profile"),
+            ):
                 bt._get_session_info("cross-home-task")
         finally:
             bt._active_sessions.pop("cross-home-task", None)
