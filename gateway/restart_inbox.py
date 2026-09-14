@@ -230,6 +230,7 @@ def claim_recoverable(*, deliverable_targets: set[tuple[str, str]], db_path=None
                     if ambiguous_unlinked_attempt(dict(row)):
                         continue
                     if _owner_alive(row["owner_pid"], row["owner_started_at"]):
+                        busy_keys.add(row["session_key"])
                         continue
                     if (row["platform"], row["adapter_profile"]) not in deliverable_targets:
                         continue

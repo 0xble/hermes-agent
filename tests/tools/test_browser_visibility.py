@@ -115,6 +115,31 @@ def test_successful_targeted_daemon_reload_recovers_timeout_marker(identity, mon
     assert life._read_state(identity) == {}
 
 
+def test_reload_keeps_daemon_tracking_when_pending_marker_does_not_clear(identity, monkeypatch):
+    owner = cli._browser_exec_runtime_owner(identity)
+    daemon = "rp_fixture"
+    with life.activity(identity):
+        assert life.mark_executing(
+            identity, "loopback", daemon_name=daemon, runtime_owner=owner,
+            daemon_identity=(41, 1.0),
+        )
+    cli._browser_exec_identity_daemons[daemon] = owner
+    cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
+    monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})
+    monkeypatch.setattr(cli.subprocess, "run", lambda *_args, **_kwargs: Mock(returncode=0, stderr=""))
+    monkeypatch.setattr(cli, "_daemon_process_identity", lambda *_args: (41, 1.0))
+    monkeypatch.setattr(cli, "_process_identity_is_live", lambda *_args: False)
+    clear_persisted = Mock()
+    monkeypatch.setattr(cli, "_clear_persisted_browser_exec_daemon", clear_persisted)
+    monkeypatch.setattr(life, "clear_pending_after_daemon_reload", lambda *_args, **_kwargs: False)
+
+    assert cli._reload_browser_exec_daemons_for_runtime(owner) is False
+    assert life._read_state(identity)["pending"] == "loopback"
+    assert cli._browser_exec_identity_daemons[daemon] == owner
+    clear_persisted.assert_not_called()
+
+
 @pytest.mark.parametrize("before,after", [((41, 1.0), True), (None, False), ((42, 2.0), False)])
 def test_zero_exit_reload_without_exact_termination_proof_keeps_timeout_marker(
     identity, monkeypatch, before, after,

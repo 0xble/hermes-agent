@@ -117,6 +117,39 @@ def test_dead_owner_event_is_claimed_once_and_handoff_fences_replay():
     ) == []
 
 
+def test_live_owner_reserves_session_from_later_orphan_claim(monkeypatch):
+    first_id = inbox.record_event(
+        "session-key", _event(message_id="first"), adapter_profile="default"
+    )
+    second_id = inbox.record_event(
+        "session-key", _event(message_id="second"), adapter_profile="default"
+    )
+    with sqlite3.connect(inbox._db_path()) as conn:
+        conn.execute(
+            "UPDATE restart_inbox SET created_at=100, owner_pid=101, owner_started_at=1 "
+            "WHERE queue_id=?",
+            (first_id,),
+        )
+        conn.execute(
+            "UPDATE restart_inbox SET created_at=101, owner_pid=202, owner_started_at=2 "
+            "WHERE queue_id=?",
+            (second_id,),
+        )
+    monkeypatch.setattr(inbox.time, "time", lambda: 102)
+    monkeypatch.setattr(
+        inbox, "_owner_alive", lambda pid, started: (pid, started) == (101, 1)
+    )
+
+    assert inbox.claim_recoverable(
+        deliverable_targets={("telegram", "default")}
+    ) == []
+
+    rows = {row["queue_id"]: row for row in inbox.read_rows(inbox._db_path())}
+    assert rows[first_id]["state"] == "pending"
+    assert rows[second_id]["state"] == "pending"
+    assert rows[second_id]["attempts"] == 0
+
+
 def test_failed_dispatch_releases_claim_for_retry():
     queue_id = inbox.record_event("session-key", _event())
     _orphan(queue_id)

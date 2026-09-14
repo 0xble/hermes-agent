@@ -188,6 +188,21 @@ async def test_real_telegram_rename_failure_is_retryable_and_success_is_confirme
 
 
 @pytest.mark.asyncio
+async def test_explicit_title_rechecks_wire_when_cached_confirmation_matches():
+    runner, source = runner_and_source()
+    runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=True)
+
+    assert await runner._run_telegram_topic_title_request(
+        source, "session", "Title"
+    ) is True
+    assert await runner._run_telegram_topic_title_request(
+        source, "session", "Title", wait_for_result=True
+    ) is True
+
+    assert runner._rename_telegram_topic_for_session_title.await_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('same_title,outcome', [(False, True), (False, False), (False, None), (True, True), (True, False)])
 async def test_manual_title_joins_background_order_and_awaits_wire_result(tmp_path, monkeypatch, same_title, outcome):
     from unittest.mock import MagicMock
@@ -242,5 +257,5 @@ async def test_manual_title_joins_background_order_and_awaits_wire_result(tmp_pa
     if outcome is True:
         assert wire[-1] == manual
         assert next(iter(runner._telegram_topic_title_requests.values())).confirmed == ('session', manual)
-        assert wire == (['Auto'] if same_title else ['Auto', 'Manual'])
+        assert wire == ['Auto', manual]
     db.close()

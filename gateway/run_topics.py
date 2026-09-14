@@ -566,7 +566,7 @@ class GatewayTopicThreadsMixin:
                str(source.thread_id or ""))
         state = states.setdefault(key, _TopicTitleRenameState())
         desired = (str(session_id or ""), self._sanitize_telegram_topic_title(title))
-        if state.pending is None and state.confirmed == desired:
+        if not wait_for_result and state.pending is None and state.confirmed == desired:
             return True
         if not wait_for_result and state.pending is not None and state.pending[1:] == desired:
             return None
@@ -575,7 +575,7 @@ class GatewayTopicThreadsMixin:
         try:
             async with state.lock:
                 # A newer title can arrive while an earlier rename is awaiting its API.
-                if state.confirmed == desired:
+                if not wait_for_result and state.confirmed == desired:
                     return True
                 if state.pending is not request:
                     return False

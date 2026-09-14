@@ -411,14 +411,23 @@ def _reload_browser_exec_daemons_for_runtime(
             )
             all_stopped = False
             continue
-        _clear_persisted_browser_exec_daemon(name)
         if recovery_states:
             from tools.browser_handoff import clear_pending_after_daemon_reload
+            pending_cleared = True
             for state in recovery_states:
-                clear_pending_after_daemon_reload(
+                if not clear_pending_after_daemon_reload(
                     owner, name, daemon_identity,
                     expected_generation=state["generation"],
+                ):
+                    pending_cleared = False
+            if not pending_cleared:
+                logger.warning(
+                    "Browser Use daemon %s stopped but its timeout recovery marker "
+                    "remains pending", name,
                 )
+                all_stopped = False
+                continue
+        _clear_persisted_browser_exec_daemon(name)
         with _browser_exec_identity_lock:
             if _browser_exec_identity_daemons.get(name) == owner:
                 _browser_exec_identity_daemons.pop(name, None)
