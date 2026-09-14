@@ -29,6 +29,12 @@ before reading claim fields. A direct reproduction and real card-claim cleanup
 regressions verify that truthy string/list siblings do not prevent release after
 a lost validation acknowledgement. No production cleanup change was needed.
 
+Follow-up review reproduced loss of authored Telegram link destinations when
+valid Markdown supplies an optional title. Both standard and rich rendering now
+parse the destination before checking supported schemes. Malformed destinations
+and unsupported schemes still degrade to visible labels. Regression coverage:
+`tests/gateway/test_telegram_unsupported_link_targets.py`.
+
 Cron transport selection uses the gateway's launch-time primary identity and
 the selected adapter's resolved creation home. Per-turn identity alone can select
 the wrong primary bot, and the name `custom` is shared by unrelated homes. Missing
@@ -97,6 +103,11 @@ immediately without fabricated history. Verify with
 `tests/gateway/test_delegation_card_ttl.py` and the existing cards/anchor/reconcile
 suites. Source landing does not activate or restart a gateway; parent review owns
 promotion.
+
+Recovered `unknown` members deliberately block the all-terminal countdown:
+restart did not prove execution finished. They have no automatic display-expiry
+deadline under this contract. Audited operator dismissal can remove their
+presentation without inventing execution or delivery evidence.
 
 ## Delegated interruption and renewed authorization
 
@@ -784,6 +795,10 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 - **Verify / rollback / retirement:** Run `tests/hermes_cli/test_update_restart_warning_history.py` and `tests/hermes_cli/test_update_fleet_restart_pending.py` in the isolated test runner. Real CLI startup against a temporary home must preserve marker bytes and emit historical wording; no marker remains quiet. Revert the warning-text block and associated assertion/test changes to roll back. Retire this overlay when upstream supplies equally truthful diagnostics or independently verified conservative reconciliation without weakening unresolved-holder safety.
 
 ### HERMES-124 — Frozen custom-subagent fallback, MoA, and resume runtime
+
+- **September 14 resume correction:** A saved MoA child must still belong to a current effective MoA role, and any explicit current `moa_presets` list must include its stored preset. Changing only the default preset does not replace or revoke an existing frozen snapshot. Physical execution routes and credentials remain restored from that snapshot. Regression coverage includes revocation and preserved default-only edits through the saved-child resume boundary.
+
+- **Fallback identity boundary:** `validate_fallback_identities` rejects duplicate resolved fallback provider/model identities before launch. A named custom primary keeps its selector (for example `custom:primary`) on the actual child, while resolved fallback routes use `custom`. The configured preflight, real child and request-builder path preserves this distinction and validates primary and fallback requests. Constructing an ambiguous `RuntimePin` directly bypasses those admission rules and is not a supported launch path.
 
 - **Pinned Codex fallback repair (2026-09-08):** The real SDK appends one slash to the frozen Codex endpoint; copying that spelling onto the child caused strict runtime-pin validation to reject an authorized fallback. At named Codex activation only, retain the configured spelling after requiring the actual client endpoint to be exactly that spelling or its single SDK-added slash. Route, model, mode, effort, and credential guards remain unchanged. No broad URL normalization. Reproduced red through real `AIAgent._try_activate_fallback`, resolver, and SDK construction; `scripts/run_tests.sh tests/agent/test_named_fallback_route.py` covers successful request construction and rejects endpoint/provider/model/mode/credential drift. Source boundary: `agent/chat_completion_helpers.py`; test: `tests/agent/test_named_fallback_route.py`. Independent hypothesis precedes the fix; upstream discussion search skipped because the pin is a fork-only overlay absent from upstream `tools/custom_subagents.py`. Roll back only the named-Codex endpoint-spelling block and its focused test, leaving other HERMES-124 contracts intact. No runtime/configuration changes; live provider acceptance remains separate.
 
@@ -1936,6 +1951,7 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 ### HERMES-044 — Compose and protect final response transforms
 
 - **Summary:** Composes output-transform hooks at the finalization boundary while preserving a substantive answer when a transform returns empty or non-substantive output.
+- **Compatibility boundary:** The maintained core always supplies `hermes_cli.lifecycle.transform_llm_output`. Its compatibility fallback supports a plugin backend with only the generic dispatcher, whose missing dedicated method raises `AttributeError`. Mixing a current finalizer with an older or replaced core lifecycle module is not a supported package configuration. A real generic-backend reproduction confirms one transform invocation through the existing fallback.
 - **Surfaces:** `agent/turn_finalizer.py`; `gateway/run.py`; `hermes_cli/lifecycle.py`; `hermes_cli/plugins.py`; Telegram adapter; transform-hook and Rich Message tests.
 - **Upstream tracking:** No released upstream implementation satisfies the complete transform-composition and answer-preservation contract through `5dd15872a6` on 2026-08-18.
 - **Upstream PR:** None after checked 2026-08-18.
