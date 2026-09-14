@@ -71,3 +71,36 @@ def test_cli_rejects_unknown_scenario_without_starting_runtime(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         evaluation.main()
     assert exc.value.code != 0
+
+
+@pytest.mark.parametrize('named_role', ['explorer', 'worker'])
+@pytest.mark.parametrize('legacy', [True, False])
+def test_judge_named_role_matches_actual_delegation_preflight(monkeypatch, named_role, legacy):
+    from tools import custom_subagents, delegate_tool
+
+    # Keep real normalization, definition selection and scoring. Only the
+    # credential boundary is synthetic: this contract test never starts a model.
+    monkeypatch.setattr(custom_subagents, 'resolve_named_credentials',
+                        lambda definition, *a: ({'provider': 'fixture', 'model': definition.model}, None))
+    monkeypatch.setattr(custom_subagents, 'freeze_fallback_routes', lambda *a, **kw: ())
+    goal = 'Inspect src/retry.py and return evidence identifying the retry implementation.'
+    call = ({'goal': goal, 'role': named_role} if legacy else {
+        'tasks': [{'goal': goal, 'subagent_type': named_role}]})
+    tasks, error = delegate_tool._normalize_task_list(
+        call.get('goal'), None, call.get('tasks'), None,
+        delegate_tool._normalize_role(call.get('role')), 3)
+    assert error is None
+    launches, error = delegate_tool._preflight_task_runtime(
+        tasks, {'subagents': evaluation.ROLES}, None, None,
+        {'provider': 'fixture', 'model': 'legacy'})
+    assert error is None
+    selected = launches[0].definition
+    assert (selected.name if selected else None) == (None if legacy else named_role)
+
+    verdict = evaluation._judge(
+        {'name': 'named-role-contract', 'why': 'Configured role selection must be real.',
+         'expect': {'delegated': True, 'roles': [named_role]}},
+        [call], turn={'completed': True}, error=None)
+    assert verdict['roles'] == [None if legacy else named_role]
+    assert verdict['findings']['role_choice'] is (not legacy)
+    assert verdict['passed'] is (not legacy)
