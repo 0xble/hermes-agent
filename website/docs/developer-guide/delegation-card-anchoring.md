@@ -10,8 +10,10 @@ The presentation starts directly with the first task, without a heading or blank
 replacement line. An empty projection emits no text and is not sent to Telegram.
 Rows show `○ Task label · Role` for running, `◌` for queued, `✓` for returned,
 `!` for failed/error/timeout and `Ⅱ` for interrupted/cancelled/budget exhaustion
-or unproven recovered execution. Returned activity is `Awaiting parent`; failed
-and interrupted activity remains explicit and awaiting parent, never success.
+or unproven recovered execution. Returned rows have no activity subline; failed
+and interrupted activity keeps the specific reason without “awaiting parent”.
+Deferred rows show their detail alone, without a “Deferred” prefix. Running rows
+without an observed tool also omit the subline, with no blank replacement line.
 Unknown future states have an explicit unknown-status fallback, not a running dot.
 
 Task labels stay authored and untruncated under the existing plain-text sanitizer;
@@ -25,6 +27,41 @@ unlabeled legacy rows. Stable internal refs, parent identities and exact handlin
 replacement, recovery and final-delivery receipts remain unchanged. Identical
 labels never identify or merge tasks. Do not restore visible refs when maintaining
 the lifecycle/tool API; they are separate concerns.
+
+## Observed activity and reasons
+
+The running subline prefers a currently bracketed runtime wait over the actual
+canonical tool name. Process waits begin immediately before the registry blocks,
+not merely because a process exists. Classified provider rate-limit/upstream-rate-
+limit and overload retries bracket the existing interruptible backoff. All exits,
+including timeout, interruption and exception, clear the matching wait token.
+Nested/parallel waits preserve another still-active token; unrelated housekeeping
+cannot erase one. Verified terminal billing/rate-limit failures retain only the
+allowlisted reason, not raw errors, arguments, provider identity or retry text.
+
+The child runtime owns each attempt and monotonic event sequence. The card rejects
+late attempts/sequences, clears activity on terminal/resume/recovered unknown,
+and never lets stale deferred detail mask resumed work. Reason events are identity
+plus allowlisted enums, not an activity-report tool or model-authored phase. They
+reuse the existing callback, ownership checks, persistence and display transport;
+execution, retry outcomes, result retention and handling are not changed.
+
+Intentionally omitted: delegation-pool capacity rejection (the runtime rejects or
+runs inline, not waits); mere tracked-process existence/poll; unclassified errors;
+unverified billing; guessed task phases, percentages, translations and timer ticks.
+The Nous pre-call rate guard returns/falls back rather than waiting and currently
+has no classified `failure_reason` result, so it does not acquire a fabricated wait
+or terminal-reason label. No extra configuration knobs are required.
+
+Label admission and child authoring use the same fixed policy: a top-level parent's
+new labels allow 24 code points, then 20, 16, and a 12 floor at actual runtime depth.
+The static schema stays at 24; no cached schema mutation. Historical same-row resume
+labels and canonical profile-role names retain their identity unchanged.
+
+Producer/relay/card tests: `tests/tools/test_delegation_wait_producers.py`,
+`tests/gateway/test_delegation_activity.py`, and
+`tests/tools/test_delegate_depth_labels.py`. Real local process waiting is exercised;
+provider retry boundaries use deterministic doubles and make no provider requests.
 
 ## Eligibility and transport
 
@@ -102,6 +139,29 @@ rows and `handled` receipts remain untouched. A shared anchor with genuinely act
 unrelated rows is kept and repainted, not blindly deleted. Do not restart solely to
 force a request while another activation decision is pending; use the separately
 authorized supported updater and durable postrestart handoff.
+
+## Terminal display TTL
+
+Terminal rows remain in the durable projection and result/handling ledger, but their
+card rendering expires independently. `display.delegation_terminal_ttl_seconds`
+defaults to 300 seconds and accepts only positive integers; a platform `null`
+override inherits the profile value and invalid values resolve to 300. The value is
+frozen when every member of the original delegation call is terminal. The immutable
+birth-call manifest retains complete membership across independent completion units
+and nested owners; running, queued or not-yet-observed members prevent expiry.
+The batch deadline is the latest member `terminal_at` plus the configured TTL.
+Handling and delivery acknowledgments neither start nor shorten this display window.
+Duplicate events and restart preserve the deadline. A validated resume reopens its
+original batch until all members are terminal again; unrelated calls stay independent.
+Legacy rows without birth-call metadata retain the per-attempt fallback: a valid
+terminal timestamp derives a deadline once; missing timestamps hide immediately
+without inventing history.
+
+Expiry uses one coalesced scheduler per shared presentation scope. It deletes only
+the visible status message after a confirmed, fenced adapter deletion; it never
+retires rows, releases results, marks handling, or changes approvals/dispositions.
+Active descendants keep expired terminal ancestors as context. Root-cap selection
+runs before TTL pruning, so expired older roots do not backfill the visible window.
 
 ## Verification
 

@@ -1980,6 +1980,49 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ## Display Settings
 
+### Delegation terminal display TTL
+
+`display.delegation_terminal_ttl_seconds` defaults to **300** seconds. It controls
+only how long terminal execution rows remain in the visible delegation status card;
+the durable execution row, result ledger, handling receipt and approvals are never
+retired by expiry. Each original delegation call expires together, starting its
+countdown only after every child is terminal. Running, queued or not-yet-observed
+members block the countdown, including independent completion units. Parent
+acknowledgment is not required and does not shorten the window. The deadline
+survives restart; duplicate events do not extend it. Resuming a child reopens its
+original batch until all members are terminal again. Unrelated calls are independent.
+Older rows without birth-call metadata retain their per-attempt fallback.
+
+```yaml
+display:
+  delegation_terminal_ttl_seconds: 300
+  platforms:
+    telegram:
+      delegation_terminal_ttl_seconds: 600  # optional platform override
+```
+
+Only positive YAML integers are accepted. Zero, negative values, booleans, floats,
+strings, lists and mappings resolve to **300**. A platform `null` inherits the
+profile-level value. Legacy terminal rows without a trustworthy terminal timestamp
+are hidden immediately on recovery; Hermes does not invent historical timestamps.
+The root cap is selected before TTL pruning, so expired older roots do not backfill
+newer roots, and active descendants retain terminal ancestors as display context.
+
+### Observed delegation activity
+
+Running cards show the actual canonical tool name, or a verified runtime wait
+(process wait, classified provider rate limit or overload) while that wait is
+active. Verified terminal provider billing/rate-limit reasons remain specific;
+raw errors and arguments are never used as activity copy. No inferred phases,
+progress percentages, or extra display switches are introduced.
+
+New task-label admission uses a fixed runtime-depth policy: 24 code points at
+parent depth zero, then 20, 16, and a floor of 12. The whole invalid batch is
+rejected before spawning, not truncated. Historical same-row resume labels and
+canonical profile role names are preserved. The static schema upper bound remains
+24 and child authoring guidance gives its actual depth budget. This policy has no
+new configuration keys.
+
 ### Delegation card root window
 
 `display.delegation_max_visible_roots` defaults to **5**. It limits the **newest

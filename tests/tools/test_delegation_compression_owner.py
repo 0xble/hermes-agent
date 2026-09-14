@@ -51,7 +51,8 @@ def test_original_ledger_owner_survives_only_proven_compression(owners, mutation
         assert async_delegation.list_durable_delegations(owner=current, session_db=db) == []
     else:
         restored = async_delegation.reserve_delegation_metadata(parent_task_id=metadata["parent_task_id"],
-            owner=current, task_labels=["Inspect"], resume_refs=["A"], session_db=db)
+            owner=current, task_labels=["Inspect"], resume_refs=["A"],
+            resume_original_calls=list(metadata["original_calls"].values()), session_db=db)
         assert restored == metadata
         parent = SimpleNamespace(session_id="tip", _session_db=db)
         payload = json.loads(delegate_tool.delegate_task(action="result", delegation_id=delegation_id, parent_agent=parent))

@@ -3,6 +3,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -18,7 +19,9 @@ def fixture(tmp_path):
     cards = {}
     for ref, key, message in [("B", "b" * 32, "14"), ("C", "c" * 32, "15"), ("D", "d" * 32, "16")]:
         cards[key] = dict(owner=owner, source=dict(platform="telegram", chat_id="42", thread_id="8", message_id="source"),
-                          started_at=1, generation=4, rows={ref: dict(thread_ref=ref, state="interrupted")},
+                          started_at=1, generation=4, rows={ref: dict(
+                              thread_ref=ref, state="interrupted", terminal_at=time.time() - 1,
+                              display_expires_at=time.time() + 300)},
                           message_id=message, rendered="old", recoveries=0, send_attempts=1, retired=False, handled=None)
     # Unsent failed transport remains retryable; it is not part of the dismissal.
     cards["e" * 32] = copy.deepcopy(cards["d" * 32])

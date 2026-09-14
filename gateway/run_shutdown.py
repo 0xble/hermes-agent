@@ -1803,6 +1803,10 @@ class GatewayShutdownMixin:
         cancel_completion_batches = getattr(self, "_cancel_process_completion_batch_tasks", None)
         if cancel_completion_batches is not None:
             await cancel_completion_batches()
+        with suppress(Exception):
+            cards = getattr(self, "_delegation_cards", None)
+            if cards is not None:
+                await cards.shutdown()
         for platform, adapter in list(self.adapters.items()):
             await self._bounded_adapter_teardown(adapter, platform)
         # Disconnect secondary-profile adapters (multiplex mode).

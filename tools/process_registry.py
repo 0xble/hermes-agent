@@ -1881,7 +1881,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._observe_completed_result(session, consumed=True)
         return result
 
-    def wait(self, session_id: str, timeout: int = None) -> dict:
+    def wait(self, session_id: str, timeout: Optional[int] = None, *, progress_callback=None) -> dict:
         """Block until the process exits, the timeout elapses, the user interrupts, or a
         mid-turn user message (steer/redirect → ``request_yield``) releases the wait.
         ``timeout`` defaults to (and is clamped by) TERMINAL_TIMEOUT. Returns a dict
@@ -1904,53 +1904,61 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        deadline = time.monotonic() + effective_timeout
-        while time.monotonic() < deadline:
-            session = self._refresh_detached_session(session)
-            if session is None:
-                return _not_found(session_id)
-            self._reconcile_local_exit(session)  # orphaned-pipe reader guard
-            result = None
-            if session.exited:
-                self._observe_completed_result(session, consumed=True)
-                result = self._exit_snapshot(session, "exited")
-            elif _is_interrupted():
-                result = {
-                    "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
-                    "note": "User sent a new message -- wait interrupted"}
-            elif _consume_yield(threading.current_thread().ident):
-                # A steer/redirect landed mid-turn: redirect() asks tool workers to YIELD so
-                # the user's message is delivered instead of parked behind this wait. The
-                # process is untouched and still notify-tracked; the model should read the
-                # steer text and respond, not re-issue the wait (kimi-code#3697 class).
-                result = {
-                    "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
-                    "process_running": True,
-                    "note": ("User sent a new message -- wait released; the process is still "
-                             "running and you will be notified on exit. Respond to the user now.")}
-            if result is not None:
-                if timeout_note:
-                    result["timeout_note"] = timeout_note
-                return result
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            session._completion_event.wait(timeout=min(1.0, remaining))
-        result = {
-            "status": "timeout", "command": session.command, "output": _output_tail(session, 1000),
-            # Not a failure — models re-issued identical waits after misreading this as an error.
-            "process_running": True, **self._unconfirmed_fields(session)}
-        base_note = (
-            f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
-        if session.started_at:
-            base_note += f" Uptime: {int(time.time() - session.started_at)}s."
-        base_note += (
-            " notify_on_complete is set: you will be notified on exit — do more work instead of waiting again."
-            if session.notify_on_complete else
-            " Poll again later or use terminal(background=true, "
-            "notify_on_complete=true) next time for automatic notification.")
-        result["timeout_note"] = f"{timeout_note}. {base_note}" if timeout_note else base_note
-        return result
+        from contextlib import ExitStack
+        from agent.delegation_activity import observed_wait
+        # Enter only immediately before the first real wait, not on process existence.
+        with ExitStack() as waits:
+            waiting = False
+            deadline = time.monotonic() + effective_timeout
+            while time.monotonic() < deadline:
+                session = self._refresh_detached_session(session)
+                if session is None:
+                    return _not_found(session_id)
+                self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+                result = None
+                if session.exited:
+                    self._observe_completed_result(session, consumed=True)
+                    result = self._exit_snapshot(session, "exited")
+                elif _is_interrupted():
+                    result = {
+                        "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
+                        "note": "User sent a new message -- wait interrupted"}
+                elif _consume_yield(threading.current_thread().ident):
+                    # A steer/redirect landed mid-turn: redirect() asks tool workers to YIELD so
+                    # the user's message is delivered instead of parked behind this wait. The
+                    # process is untouched and still notify-tracked; the model should read the
+                    # steer text and respond, not re-issue the wait (kimi-code#3697 class).
+                    result = {
+                        "status": "interrupted", "command": session.command, "output": _output_tail(session, 1000),
+                        "process_running": True,
+                        "note": ("User sent a new message -- wait released; the process is still "
+                                 "running and you will be notified on exit. Respond to the user now.")}
+                if result is not None:
+                    if timeout_note:
+                        result["timeout_note"] = timeout_note
+                    return result
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if not waiting:
+                    waits.enter_context(observed_wait(progress_callback, "process"))
+                    waiting = True
+                session._completion_event.wait(timeout=min(1.0, remaining))
+            result = {
+                "status": "timeout", "command": session.command, "output": _output_tail(session, 1000),
+                # Not a failure — models re-issued identical waits after misreading this as an error.
+                "process_running": True, **self._unconfirmed_fields(session)}
+            base_note = (
+                f"Wait window of {effective_timeout}s elapsed — the process is still running. This is not an error.")
+            if session.started_at:
+                base_note += f" Uptime: {int(time.time() - session.started_at)}s."
+            base_note += (
+                " notify_on_complete is set: you will be notified on exit — do more work instead of waiting again."
+                if session.notify_on_complete else
+                " Poll again later or use terminal(background=true, "
+                "notify_on_complete=true) next time for automatic notification.")
+            result["timeout_note"] = f"{timeout_note}. {base_note}" if timeout_note else base_note
+            return result
 
     @staticmethod
     def _exit_snapshot(session: ProcessSession, status: str) -> dict:
@@ -2553,7 +2561,14 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         handler, redact = _SESSION_ACTIONS[action]
-        result = handler(session_id, args)
+        if action == "wait":
+            from tools.delegate_tool_registry import _active_subagents, _active_subagents_lock
+            with _active_subagents_lock:
+                child = (_active_subagents.get(str(kw.get("task_id") or "")) or {}).get("agent")
+            result = process_registry.wait(session_id, timeout=args.get("timeout"),
+                progress_callback=getattr(child, "tool_progress_callback", None))
+        else:
+            result = handler(session_id, args)
         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
     return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
 

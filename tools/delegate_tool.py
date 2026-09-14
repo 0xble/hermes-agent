@@ -21,7 +21,7 @@ import weakref
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb  # noqa: F401  (used via _ChildRun.await_child)
 from utils import is_truthy_value
@@ -53,6 +53,9 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from agent.delegation_disposition import DEFER_REASON_GUIDANCE
+from agent.delegation_labels import (
+    admit_task_labels, task_label_guidance,
+)
 from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
@@ -284,6 +287,10 @@ def _build_child_agent(
         card_owner = parent_card_ref.get("card_owner")
         if isinstance(card_owner, dict):
             child_session_ref["card_owner"] = card_owner
+    if isinstance(resume_launch_metadata, dict):
+        resume_card = resume_launch_metadata.get("card_identity")
+        if isinstance(resume_card, dict) and isinstance(resume_card.get("original_call"), dict):
+            child_session_ref["original_call"] = deepcopy(resume_card["original_call"])
     child_progress_cb = _build_child_progress_callback(
         task_index, goal, parent_agent, task_count, subagent_id=subagent_id, parent_id=parent_subagent_id,
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
@@ -1143,7 +1150,7 @@ def _build_children(
         raise
 
 
-def _historical_resume_task_label(task: Dict[str, Any], parent_agent) -> Optional[str]:
+def _historical_resume_task_label(task: Mapping[str, Any], parent_agent) -> Optional[str]:
     """Return a persisted, caller-authored resume label without mutating state.
 
     Old resumable rows predate labels.  They remain readable, but cannot invent a
@@ -1161,7 +1168,7 @@ def _historical_resume_task_label(task: Dict[str, Any], parent_agent) -> Optiona
         config = _parse_model_config((row or {}).get("model_config"))
         launch = config.get("_delegation_launch")
         label = launch.get("task_label") if isinstance(launch, dict) else None
-        return label.strip() if isinstance(label, str) and label.strip() else None
+        return label if isinstance(label, str) and label.strip() else None
     except Exception:
         # Resume authorization remains the authoritative later preflight.  This
         # read-only convenience must not conceal its specific error.
@@ -1177,26 +1184,10 @@ def _effective_task_labels(
     explicit blank value (which is an error rather than an accidental fallback).
     A valid named resume may reuse its own preserved historical label.
     """
-    fallback_supplied = task_label is not None
-    labels: List[str] = []
-    for index, task in enumerate(task_list):
-        supplied = task.get("task_label") if "task_label" in task else task_label
-        historical = supplied is None and task.get("resume_session_id") is not None
-        if historical:
-            supplied = _historical_resume_task_label(task, parent_agent)
-        if not isinstance(supplied, str) or not supplied.strip():
-            path = f"tasks[{index}].task_label" if "task_label" in task or not fallback_supplied else "task_label"
-            return None, (
-                f"Task {index} requires a nonempty {path}. Provide a short verb-first, privacy-safe "
-                "task_label (for example, 'Check receipt'); use at most 24 Unicode code points, never silently truncated."
-            )
-        if not historical and len(supplied) > 24:
-            path = f"tasks[{index}].task_label" if "task_label" in task or not fallback_supplied else "task_label"
-            return None, (f"{path} is {len(supplied)} Unicode code points; maximum is 24. "
-                          "Write a shorter meaningful verb-first label (for example, 'Check receipt'). "
-                          "No child was started; labels are never silently truncated.")
-        labels.append(supplied.strip())
-    return labels, None
+    return admit_task_labels(
+        task_list, task_label, parent_agent,
+        historical_label=lambda task: _historical_resume_task_label(task, parent_agent),
+    )
 
 
 def _valid_card_identity(value):
@@ -1374,6 +1365,8 @@ def delegate_task(
                 or any(i.get("owner") != identities[0].get("owner") for i in identities)
                 or any(not delegation_owner_matches(i.get("owner"), _owner,
                            getattr(parent_agent, "_session_db", None)) for i in identities)
+                or any((i or {}).get("original_call", {}).get("parent_task_id", (i or {}).get("parent_task_id")) != (i or {}).get("parent_task_id")
+                       for i in identities if isinstance((i or {}).get("original_call"), dict))
                 or (parent_task_id and parent_task_id != identities[0]["parent_task_id"])):
             _release_resume_launches(parent_agent, task_runtime)
             return tool_error("Resume requires exact owned logical card identities from one batch; split unrelated continuations. Legacy/uncheckpointed identity requires explicit reconciliation.")
@@ -1387,7 +1380,9 @@ def delegate_task(
         from tools.async_delegation import reserve_delegation_metadata
         _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
             task_labels=effective_labels or [], session_db=getattr(parent_agent, "_session_db", None),
-            **({"resume_refs": [i["thread_ref"] for i in identities]} if resumes else {}))
+            **({"resume_refs": [i["thread_ref"] for i in identities],
+                "resume_original_calls": [i.get("original_call") for i in identities]}
+                if resumes else {}))
     except ValueError as exc:
         _release_resume_launches(parent_agent, task_runtime)
         return tool_error(str(exc))
@@ -1441,6 +1436,7 @@ def delegate_task(
         if err:
             _release_replacement_claims(parent_agent, task_list)
             return tool_error(err)
+        _fresh_original_call = None if resumes else next(iter(_metadata.get("original_calls", {}).values()), None)
         for _i, (_, _, _child) in enumerate(children):
             _mode, _history = task_histories[_i]
             _child._delegation_context_mode = _mode
@@ -1451,6 +1447,13 @@ def delegate_task(
                 _launch["context_mode"] = _mode
             _ref = getattr(_child, "_progress_identity_ref", None)
             if isinstance(_ref, dict):
+                _original_call = _ref.get("original_call")
+                if not isinstance(_original_call, dict):
+                    _original_call = _fresh_original_call
+                if isinstance(_original_call, dict):
+                    _original_call = deepcopy(_original_call)
+                    _ref["original_call"] = _original_call
+                    _ref["original_call_id"] = _original_call["id"]
                 _ref.update(parent_task_id=_metadata["parent_task_id"], thread_ref=_metadata["thread_refs"][_i],
                             task_label=_metadata["task_labels"][_i], role=getattr(_child, "_delegate_role", None),
                             subagent_type=vars(_child).get("_delegation_named_type"),
@@ -1464,9 +1467,13 @@ def delegate_task(
                     launch_metadata["card_identity"] = {
                         "parent_task_id": _ref["parent_task_id"], "thread_ref": _ref["thread_ref"],
                         "task_label": _ref["task_label"], "owner": deepcopy(_owner), "attempt": _ref["attempt"],
+                        **({"original_call": deepcopy(_ref["original_call"])} if isinstance(_ref.get("original_call"), dict) else {}),
                     }
         _metadata["threads"] = [
             {"thread_ref": _metadata["thread_refs"][i], "task_label": _metadata["task_labels"][i], "task_index": i,
+             **({"original_call_id": getattr(child, "_progress_identity_ref", {}).get("original_call_id")}
+                 if isinstance(getattr(child, "_progress_identity_ref", None), dict)
+                 and getattr(child, "_progress_identity_ref", {}).get("original_call_id") is not None else {}),
              "role": getattr(child, "_delegate_role", None),
              "subagent_type": vars(child).get("_delegation_named_type"),
              "context_mode": child._delegation_context_mode}
@@ -1772,7 +1779,7 @@ def _build_subagent_type_description(roles: list) -> str:
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
-_TASK_LABEL_GUIDANCE = 'Use a concise, meaningful, verb-first, privacy-safe sentence-case display label (preserve proper nouns/acronyms: Review context forks; Check API routing; not Review Context Forks); never use the goal. Maximum 24 Unicode code points in task_label itself, including spaces; indentation, references, separators and role suffixes do not count. This is a hard admission limit, not truncation. Omit task_label on resume to preserve the existing identity, including historical longer labels.'
+_TASK_LABEL_GUIDANCE = task_label_guidance()
 
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",

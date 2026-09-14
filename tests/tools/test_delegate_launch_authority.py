@@ -167,7 +167,8 @@ def test_pre_admission_failure_preserves_resume_grant(tmp_path, monkeypatch, par
     assert db.claim_delegated_resumes(["child"], claim_id="corrected-retry") is True
     restored = reserve_delegation_metadata(
         parent_task_id=original["parent_task_id"], owner=owner,
-        task_labels=original["task_labels"], resume_refs=original["thread_refs"], session_db=db)
+        task_labels=original["task_labels"], resume_refs=original["thread_refs"],
+        resume_original_calls=list(original["original_calls"].values()), session_db=db)
     assert restored == original
     db.close()
 

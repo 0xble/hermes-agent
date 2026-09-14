@@ -1,5 +1,15 @@
 # Maintained Hermes fork
 
+## Compact delegation activity copy
+
+User-approved presentation-only refinement: completed and idle-running rows omit
+the activity subline, as do generic Error/Failed/Interrupted states (symbols remain).
+Specific blockers and observed tools remain, and deferred rows show their full detail
+without a prefix. Task symbols,
+labels, root windows, hierarchy and all lifecycle/receipt semantics are unchanged.
+Verify with the delegation cards, anchoring, dispositions and root-cap suites.
+Revert the renderer change to roll back; activation remains parent-owned.
+
 ## Delegation root window — source candidate
 
 User explicitly authorized the newest-five root-group display cap on 2026-09-13,
@@ -7,8 +17,11 @@ superseding the earlier no-row-truncation comment. Preserve the full lifecycle
 ledger and whole descendant groups, with admission (not activity) chronology.
 `display.delegation_max_visible_roots` uses the existing profile/platform resolver;
 invalid non-null values use five. This is not result retirement or flood control.
-The coupled new-label policy enforces 24 Unicode code points before spawn, not
-a renderer truncation; grandfather existing same-row resume labels unchanged.
+The coupled hardcoded label policy derives the admission limit from actual runtime
+parent depth: 24 → 20 → 16 → 12 Unicode code points, floored at 12. Admission
+rejects a whole invalid batch before side effects; never truncate. Grandfather
+existing same-row resume labels unchanged and keep canonical profile-role names.
+No label configuration framework or additional display switches are introduced.
 Schema/runtime length agreement and whole-batch refusal are covered in
 `tests/tools/test_delegate_required_labels.py` and the real saved-resume suite.
 Retire this fork delta only when upstream supplies equivalent whole-root semantics
@@ -16,6 +29,26 @@ and persisted admission ordering across consolidated execution records. Verify w
 `tests/gateway/test_delegation_root_cap.py` plus the existing anchoring, disposition,
 and retention suites. Activation is separate and parent-owned; preserve both
 capabilities in the existing runtime-compatibility manifest on any installation.
+
+## Delegation terminal-card display TTL — source candidate
+
+`display.delegation_terminal_ttl_seconds` is a display-only original-call batch
+TTL (default 300 seconds). Complete immutable birth rosters span independent
+completion units and nested owners. All members must be terminal before the
+countdown starts; running, queued and missing members block it. Handling and final
+delivery do not shorten it. Duplicate terminal events do not reset it, restart
+preserves it, and resume reopens the original batch. Legacy rows without call
+metadata retain the per-attempt fallback. Expiry uses one coalesced timer per shared
+presentation scope and only removes a confirmed status message. It never retires
+rows, releases result/handling obligations, or mutates approvals/dispositions.
+Root-cap selection precedes TTL pruning; active descendants retain expired terminal
+ancestors as context. Legacy terminal rows without a valid timestamp hide
+immediately without fabricated history. Verify with
+`tests/gateway/test_delegation_card_batch_ttl.py`,
+`tests/tools/test_delegation_original_call_metadata.py`,
+`tests/gateway/test_delegation_card_ttl.py` and the existing cards/anchor/reconcile
+suites. Source landing does not activate or restart a gateway; parent review owns
+promotion.
 
 ## Delegated interruption and renewed authorization
 

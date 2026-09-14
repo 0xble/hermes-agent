@@ -27,23 +27,25 @@ async def handling_receipt(cards, key, refs, generation):
 
 @pytest.mark.parametrize("state,symbol,activity", [
     ("running", "○", "⚡ read_file"), ("queued", "◌", "Queued"),
-    ("completed", "✓", "Awaiting parent"),
-    ("failed", "!", "Failed · awaiting parent"), ("error", "!", "Error · awaiting parent"),
-    ("timeout", "!", "Timeout · awaiting parent"),
-    ("interrupted", "Ⅱ", "Interrupted · awaiting parent"),
-    ("cancelled", "Ⅱ", "Cancelled · awaiting parent"),
-    ("budget_exhausted", "Ⅱ", "Budget exhausted · awaiting parent"),
-    ("unknown", "Ⅱ", "Interrupted · awaiting parent"),
-    ("unrecognized_<status>", "Ⅱ", "Status unknown · awaiting parent"),
-    (None, "Ⅱ", "Status unknown · awaiting parent"),
+    ("completed", "✓", None),
+    ("failed", "!", None), ("error", "!", None),
+    ("timeout", "!", "Timeout"),
+    ("interrupted", "Ⅱ", None),
+    ("cancelled", "Ⅱ", "Cancelled"),
+    ("budget_exhausted", "Ⅱ", "Budget exhausted"),
+    ("unknown", "Ⅱ", None),
+    ("unrecognized_<status>", "Ⅱ", "Status unknown"),
+    (None, "Ⅱ", "Status unknown"),
 ])
 def test_symbols_project_observed_state_without_exposing_refs_or_stale_tools(state, symbol, activity):
     import copy
     card = {"rows": {"internal:A.1": dict(thread_ref="A.1", task_label="Trace scheduler",
             subagent_type="explorer", state=state, last_tool="read_file")}}
     before = copy.deepcopy(card)
-    assert render_card(card).splitlines() == [
-        f"{symbol} Trace scheduler · Explorer", f"\u00a0\u00a0↳ {activity}"]
+    expected = f"{symbol} Trace scheduler · Explorer"
+    if activity is not None:
+        expected += f"\n\u00a0\u00a0↳ {activity}"
+    assert render_card(card) == expected
     assert card == before  # Presentation cannot rewrite lifecycle identity or state.
 
 
@@ -74,6 +76,50 @@ async def test_empty_projection_has_no_heading_and_never_sends_or_edits(tmp_path
         adapter.delete_message.assert_not_awaited()
 
 
+@pytest.mark.parametrize("detail", [None, "Under review", "Landing", "Awaiting your approval"])
+def test_idle_and_deferred_rows_keep_only_meaningful_activity(detail):
+    import copy
+
+    row: dict = dict(task_label="Review candidate", state="running")
+    if detail:
+        row.update(state="completed", last_tool="terminal",
+                   disposition=dict(reason="deferred", detail=detail))
+    card = {"rows": {"review": row, "next": dict(task_label="Next task", state="completed")}}
+    before = copy.deepcopy(card)
+    expected = "○ Review candidate" if detail is None else f"✓ Review candidate\n\u00a0\u00a0↳ {detail}"
+    assert render_card(card) == expected + "\n✓ Next task"
+    assert card == before
+
+
+def test_completed_rows_have_no_subline_without_changing_nested_root_window():
+    import copy
+
+    rows: dict[str, dict] = {f"old-{i}": dict(task_label=f"Older task {i}", state="completed") for i in range(2)}
+    rows.update({
+        "review": dict(task_label="Review candidate", state="completed", last_tool="read_file"),
+        "child": dict(task_label="Check output", state="completed", card_parent_identity="review"),
+        "active": dict(task_label="Run checks", state="running", last_tool="read_file"),
+        "deferred": dict(task_label="Wait for CI", state="completed",
+                         disposition=dict(reason="deferred", detail="Under review")),
+        "error": dict(task_label="Inspect failure", state="error"),
+        "interrupted": dict(task_label="Resume work", state="interrupted"),
+    })
+    card = {"rows": rows}
+    before = copy.deepcopy(card)
+
+    assert render_card(card) == (
+        "✓ Review candidate\n"
+        "\u00a0\u00a0\u00a0\u00a0✓ Check output\n"
+        "○ Run checks\n"
+        "\u00a0\u00a0↳ ⚡ read_file\n"
+        "✓ Wait for CI\n"
+        "\u00a0\u00a0↳ Under review\n"
+        "! Inspect failure\n"
+        "Ⅱ Resume work"
+    )
+    assert card == before
+
+
 def test_render_card_shows_lightning_only_for_observed_tool_activity():
     card = {"rows": {
         "root": dict(thread_ref="A", task_label="Run tools", subagent_type="lead",
@@ -89,10 +135,10 @@ def test_render_card_shows_lightning_only_for_observed_tool_activity():
     assert lines == [
         "○ Run tools · Lead", "\u00a0\u00a0↳ ⚡ delegate_task",
         "\u00a0\u00a0\u00a0\u00a0○ Run code", "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ execute_code",
-        "○ Await tool", "\u00a0\u00a0↳ Started · awaiting activity",
-        "✓ Await parent", "\u00a0\u00a0↳ Awaiting parent",
+        "○ Await tool",
+        "✓ Await parent",
     ]
-    assert all("⚡" not in line for line in (lines[5], lines[7]))
+    assert all("⚡" not in line for line in (lines[4], lines[5]))
     assert not any("A.1" in line or line.startswith(">") for line in lines)
 
 
@@ -371,9 +417,9 @@ def test_render_card_preserves_full_explicit_label_without_card_truncation():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state, display", [("completed", "Awaiting parent"), ("failed", "Failed"),
-    ("interrupted", "Interrupted"), ("unknown", "Interrupted"), ("future_status", "Interrupted"),
-    (None, "Interrupted"), ({"unexpected": "value"}, "Interrupted")])
+@pytest.mark.parametrize("state, display", [("completed", "✓"), ("failed", "!"),
+    ("interrupted", "Ⅱ"), ("unknown", "Ⅱ"), ("future_status", "Ⅱ"),
+    (None, "Ⅱ"), ({"unexpected": "value"}, "Ⅱ")])
 async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, display):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42", thread_id="8")
     adapter = SimpleNamespace(send_delegation_card=AsyncMock(return_value=SendResult(success=True, message_id="1")),
@@ -391,7 +437,7 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, 
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
     assert adapter.send_delegation_card.await_count == 1
-    assert adapter.send_delegation_card.call_args.args[1].startswith("○ Fix restart warning\n")
+    assert adapter.send_delegation_card.call_args.args[1] == "○ Fix restart warning"
     interim = MessageEvent(text="Working", source=source)
     assert cards.receipt(interim, "route", 1) == {}
     relay.progress_callback("subagent.tool", "terminal", preview="SECRET", args={"secret": "raw"}, **data)
@@ -404,8 +450,9 @@ async def test_card_outlives_turn_and_requires_parent_delivery(tmp_path, state, 
     relay.progress_callback("subagent.complete", status=state, **data)
     await asyncio.gather(*tasks)
     await asyncio.gather(*list(cards.pending.values()))
-    expected = display if state == "completed" else f"{display} · awaiting parent"
-    assert expected in render_card(cards.cards["a" * 32])
+    rendered = render_card(cards.cards["a" * 32])
+    assert cards.cards["a" * 32]["rows"]["A"]["state"] == (state if state in ("completed", "failed", "interrupted") else "unknown")
+    assert rendered == f"{display} Fix restart warning"
     adapter.delete_message.assert_not_awaited()
     final_event = MessageEvent(text="Returned", source=source, internal=True, metadata={
         "delegation_parent_task_id": "a" * 32, "delegation_owner": owner, "delegation_thread_refs": ["A"]})
@@ -514,7 +561,8 @@ async def test_grouping_isolation_generation_and_recovery(tmp_path):
     await asyncio.gather(*list(cards.pending.values()))
     restarted = DelegationCards(runner, home=tmp_path, interval=0)
     assert all(r["state"] == "unknown" for r in restarted.cards["b" * 32]["rows"].values())
-    assert "Interrupted · awaiting parent" in render_card(restarted.cards["b" * 32])
+    assert render_card(restarted.cards["b" * 32]).startswith("Ⅱ ")
+    assert "Interrupted" not in render_card(restarted.cards["b" * 32])
 
 
 @pytest.mark.asyncio
@@ -549,7 +597,7 @@ async def test_silent_terminal_delivery_and_unchanged_suppression(tmp_path):
     assert adapter.edit_message.await_count == before
     await cards.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "failed"})
     await asyncio.gather(*list(cards.pending.values()))
-    assert "Failed · awaiting parent" in render_card(cards.cards["c" * 32])
+    assert render_card(cards.cards["c" * 32]) == "! Task"
     event = MessageEvent(source=source, text="")
     await cards.handling(source, "r", "s", 1, actor_session_id="s", parent_task_id="c" * 32,
                          refs=["A"], reason="incorporated")
@@ -769,7 +817,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     await drain_cards(cards)
     text = adapter.edit_message.call_args.args[2]
     assert "Check receipt" not in text and "Check display" in text and "○ Check race" in text
-    assert "○ Check race\n" in text  # no fabricated default role
+    assert "○ Check race" in text.splitlines()  # no fabricated default role
     adapter.delete_message.assert_not_awaited()
     restored = DelegationCards(runner, home=tmp_path, interval=0)
     await restored.reconcile()

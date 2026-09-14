@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -29,7 +30,11 @@ def legacy():
     ):
         row = dict(thread_ref=ref, display_ref=display, state=state,
                    task_label="Audit identity paths" if key == CHILD else "Run delegated task",
-                   subagent_type="explorer" if key == CHILD else "lead", last_tool="terminal")
+                   subagent_type="explorer" if key == CHILD else "lead", last_tool="terminal",
+                   # These persisted terminal rows are intentionally visible in the
+                   # consolidation scenarios.  Legacy rows without trusted timestamps
+                   # remain covered by the dedicated TTL test.
+                   terminal_at=time.time() - 1, display_expires_at=time.time() + 300)
         if key == CHILD:
             row.update(card_parent_task_id=E, card_parent_thread_ref="E")
         cards[key] = dict(owner=copy.deepcopy(owner), delegation_owner=copy.deepcopy(owner),

@@ -1,5 +1,6 @@
 """Real Telegram gate/owner integration: local deferral is not an API attempt."""
 import asyncio
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -54,3 +55,32 @@ async def test_queued_delegation_cleanup_keeps_attempt_after_final_takes_priorit
             if not task.done():
                 task.cancel()
         await asyncio.gather(*list(pending.values()), deleting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, RuntimeError("transport failed")])
+@pytest.mark.parametrize("recovers", [False, True])
+async def test_lifecycle_cleanup_counts_failures_and_confirmed_deletion(tmp_path, failure, recovers):
+    adapter = SimpleNamespace(delete_message=AsyncMock(
+        side_effect=[failure, True] if recovers else [failure, failure, failure]))
+    manager = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter),
+                              home=tmp_path, interval=0)
+    item = {'source': {'platform': 'telegram', 'chat_id': '42'},
+            'message_id': '7', 'retired': True, 'rows': {}, 'generation': 1,
+            'owner': {'profile': 'default'}, 'started_at': time.time()}
+    manager.cards['record'] = item
+    try:
+        for attempt in range(1, 5):
+            manager._queue('record')
+            while manager.pending:
+                await asyncio.gather(*list(manager.pending.values()))
+            expected = min(attempt, 2 if recovers else 3)
+            assert adapter.delete_message.await_count == expected
+            assert item['delete_attempts'] == expected
+            assert item['message_id'] == (None if recovers and attempt >= 2 else '7')
+            saved = json.loads((tmp_path / 'cache' / 'delegation' / 'cards.json').read_text())['record']
+            assert saved['delete_attempts'] == expected
+            assert saved['message_id'] == item['message_id']
+        assert item['retired'] and item['rows'] == {}
+    finally:
+        await manager.shutdown()

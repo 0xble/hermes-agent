@@ -9,6 +9,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -128,20 +129,21 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     reconcile_state_schema(conn)
 
 
-def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any], task_labels: List[str], resume_refs: Optional[List[str]] = None, session_db=None) -> Dict[str, Any]:
-    """Reserve never-reused display refs and validate an opaque id against exact owner.
+def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[str, Any],
+                                task_labels: List[str], resume_refs: Optional[List[str]] = None,
+                                resume_original_calls: Optional[List[Dict[str, Any]]] = None, session_db=None) -> Dict[str, Any]:
+    """Reserve display refs and immutable original-call membership metadata.
 
-    ``parent_task_id`` is intentionally an opaque correlation token, never an
-    inferred identity.  Omitting it starts a fresh related-work batch.  The
-    counter is internal; callers receive spreadsheet-style refs (A..Z, AA..).
+    A fresh invocation always receives a fresh UUID-backed original-call
+    descriptor, even when it reuses an existing ``parent_task_id``. Resumes
+    carry the descriptors persisted on their child identities; those are
+    deep-copied and deduplicated by id, never regenerated.
     """
     supplied_parent_task_id = parent_task_id is not None
     if supplied_parent_task_id and (not isinstance(parent_task_id, str) or not re.fullmatch(r"[a-f0-9]{32}", parent_task_id)):
         raise ValueError("parent_task_id must be an existing lowercase 32-character hexadecimal reference")
     parent_task_id = parent_task_id if supplied_parent_task_id else uuid.uuid4().hex
     owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
-    # Exact continuations retain historical labels; only NEW identities get the
-    # admission limit. Validate raw code-point length before whitespace cleanup.
     if resume_refs is None:
         for index, label in enumerate(task_labels):
             if not isinstance(label, str) or len(label) > 24:
@@ -152,6 +154,8 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
             or len(set(resume_refs)) != len(resume_refs)
             or any(not isinstance(ref, str) or not re.fullmatch(r"[A-Z]+", ref) for ref in resume_refs)):
         raise ValueError("Continuation requires exact existing refs and parent task identity")
+    if resume_original_calls is not None and (resume_refs is None or len(resume_original_calls) != len(resume_refs)):
+        raise ValueError("Continuation original-call metadata must match the resumed refs")
     with _DB_LOCK, _transaction() as conn:
         # Existing-parent allocations otherwise read the counter before sqlite3
         # starts a write transaction. The Python lock cannot fence other processes.
@@ -167,16 +171,29 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
                     raise ValueError("parent_task_id belongs to another immutable conversation owner")
                 owner, owner_json = original, row[0]
             if resume_refs is not None:
+                original_calls: Dict[str, Dict[str, Any]] = {}
+                for descriptor in resume_original_calls or ():
+                    if descriptor is None:
+                        continue
+                    if not isinstance(descriptor, dict) or not isinstance(descriptor.get("id"), str):
+                        raise ValueError("Continuation is missing immutable original-call metadata")
+                    if descriptor.get("parent_task_id") != parent_task_id:
+                        raise ValueError("Continuation original-call metadata belongs to another parent task")
+                    original_calls.setdefault(descriptor["id"], copy.deepcopy(descriptor))
                 return {"parent_task_id": parent_task_id, "owner": owner, "owner_json": owner_json,
-                        "thread_refs": list(resume_refs), "task_labels": labels}
+                        "thread_refs": list(resume_refs), "task_labels": labels,
+                        "original_calls": original_calls}
         else:
             conn.execute("INSERT INTO delegation_parent_tasks VALUES (?, ?)", (parent_task_id, owner_json))
         row = conn.execute("SELECT next_thread_number FROM delegation_thread_counters WHERE owner_json=?", (owner_json,)).fetchone()
         start = int(row[0]) if row else 1
         conn.execute("INSERT INTO delegation_thread_counters VALUES (?, ?) ON CONFLICT(owner_json) DO UPDATE SET next_thread_number=excluded.next_thread_number", (owner_json, start + len(labels)))
-    thread_numbers = list(range(start, start + len(labels)))
+    thread_refs = [_thread_ref(n) for n in range(start, start + len(labels))]
+    original_id = uuid.uuid4().hex
+    descriptor = {"id": original_id, "parent_task_id": parent_task_id, "member_refs": list(thread_refs)}
     return {"parent_task_id": parent_task_id, "owner": owner, "owner_json": owner_json,
-            "thread_refs": [_thread_ref(n) for n in thread_numbers], "task_labels": labels}
+            "thread_refs": thread_refs, "task_labels": labels,
+            "original_calls": {original_id: descriptor}}
 
 
 def _thread_ref(number: int) -> str:
