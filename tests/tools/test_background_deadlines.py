@@ -469,9 +469,22 @@ def test_registry_fixture_joins_late_checkpoint_writer(monkeypatch, tmp_path):
     reader = threading.Thread(target=old._finish_exited, args=(session, 0))
     session._reader_thread = reader
 
+    join_entered, teardown_observed = threading.Event(), threading.Event()
+    reader_join = reader.join
+
+    def observed_join(timeout=None):
+        join_entered.set()
+        teardown_observed.set()
+        return reader_join(timeout)
+
+    monkeypatch.setattr(reader, "join", observed_join)
+
     def teardown():
-        next(lifetime, None)
-        teardown_done.set()
+        try:
+            next(lifetime, None)
+        finally:
+            teardown_done.set()
+            teardown_observed.set()
 
     finalizer = threading.Thread(target=teardown)
     reader.start()
@@ -479,7 +492,9 @@ def test_registry_fixture_joins_late_checkpoint_writer(monkeypatch, tmp_path):
         assert writer_paused.wait(5)
         assert session.exited and session.id in old._finished
         finalizer.start()
-        assert not teardown_done.wait(0.1), "fixture released a still-active checkpoint writer"
+        assert teardown_observed.wait(5), "fixture neither joined its writer nor completed"
+        assert join_entered.is_set(), "fixture released a still-active checkpoint writer"
+        assert not teardown_done.is_set(), "fixture returned before its writer was released"
         release_writer.set()
         finalizer.join(5)
         assert teardown_done.is_set() and not reader.is_alive()
