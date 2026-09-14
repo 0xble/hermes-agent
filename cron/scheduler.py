@@ -483,6 +483,7 @@ def _resolve_job_reasoning_config(
     return resolve_reasoning_config(cfg if isinstance(cfg, dict) else {}, str(model))
 
 
+from cron.deferral import DeferredRun, finish_deferred_run, parse_deferral
 from cron.jobs import (
     _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
@@ -2124,7 +2125,7 @@ def _run_doc_header(job: dict, title: str, job_id: str, prompt: str) -> str:
     )
 
 
-_RunResult = tuple[bool, str, str, Optional[str]]
+_RunResult = tuple[bool, str, str, Optional[str]] | DeferredRun
 
 
 def _prepare_job_prompt(
@@ -2175,6 +2176,13 @@ def _prepare_job_prompt(
             cancel_event=cancel_event,
         )
         _ran_ok, _script_output = prerun_script
+        if _ran_ok:
+            try:
+                deferred = parse_deferral(_script_output)
+            except ValueError as exc:
+                return (False, str(exc), "", str(exc)), None
+            if deferred is not None:
+                return deferred, None
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             silent_doc = (
@@ -2470,8 +2478,9 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
-) -> tuple[bool, str, str, Optional[str]]:
-    """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
+) -> _RunResult:
+    """Return DeferredRun for pre-agent contention, otherwise
+    (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
     MUST call ``_teardown_cron_agent(agent)`` AFTER delivery (a torn-down async client can't
     deliver). ``extra_prompt``: per-fire context, never persisted.
@@ -3137,6 +3146,7 @@ def _run_one_job_body(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
     delivery_attempted = False
     delivery_error = None
+    result: Optional[_RunResult] = None
     from agent.secret_scope import (
         build_profile_secret_scope, reset_secret_scope, set_secret_scope)
 
@@ -3213,7 +3223,14 @@ def _run_one_job_body(
         if fire_claim_lost is not None:
             _run_kwargs["cancel_event"] = fire_claim_lost
         try:
-            success, output, final_response, error = run_job(job, **_run_kwargs)
+            result = run_job(job, **_run_kwargs)
+            if isinstance(result, DeferredRun):
+                # All scheduler entry points share this finalizer. No completion verifier,
+                # output/context_from document, failure alert, or normal advancement applies.
+                _teardown_deferred()
+                finish_deferred_run(job, result, execution_id, fire_owner)
+                return True
+            success, output, final_response, error = result
         except BaseException:
             # run_job hands back the agent even when raising; tear down so a failed run never leaks.
             # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
@@ -3255,6 +3272,13 @@ def _run_one_job_body(
         return _finish_completed_run(d, fire_owner, execution_id)
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
+        if isinstance(result, DeferredRun):
+            # Never consume pending work through ordinary failure accounting if a
+            # deferral write fails or is interrupted between the two durable stores.
+            logger.exception("Failed to finalize deferred cron attempt %s", execution_id)
+            if not isinstance(e, Exception):
+                raise
+            return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
         # repeat.completed but last_run_at is never written. Record first, then re-raise
