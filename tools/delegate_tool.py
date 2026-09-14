@@ -1168,14 +1168,20 @@ def _effective_task_labels(
     labels: List[str] = []
     for index, task in enumerate(task_list):
         supplied = task.get("task_label") if "task_label" in task else task_label
-        if supplied is None and task.get("resume_session_id") is not None:
+        historical = supplied is None and task.get("resume_session_id") is not None
+        if historical:
             supplied = _historical_resume_task_label(task, parent_agent)
         if not isinstance(supplied, str) or not supplied.strip():
             path = f"tasks[{index}].task_label" if "task_label" in task or not fallback_supplied else "task_label"
             return None, (
                 f"Task {index} requires a nonempty {path}. Provide a short verb-first, privacy-safe "
-                "task_label (for example, 'Check receipt'); labels are display guidance, not truncated."
+                "task_label (for example, 'Check receipt'); use at most 24 Unicode code points, never silently truncated."
             )
+        if not historical and len(supplied) > 24:
+            path = f"tasks[{index}].task_label" if "task_label" in task or not fallback_supplied else "task_label"
+            return None, (f"{path} is {len(supplied)} Unicode code points; maximum is 24. "
+                          "Write a shorter meaningful verb-first label (for example, 'Check receipt'). "
+                          "No child was started; labels are never silently truncated.")
         labels.append(supplied.strip())
     return labels, None
 
@@ -1753,7 +1759,7 @@ def _build_subagent_type_description(roles: list) -> str:
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
-_TASK_LABEL_GUIDANCE = 'Use a concise, verb-first, privacy-safe sentence-case display label (preserve proper nouns/acronyms: Review context forks; Check API routing; not Review Context Forks); never use the goal. Aim for a 24-character total task-card row, counting four spaces per nesting level, hierarchical reference, spaces/separators, the inline named subagent role, and this label. This is AUTHORING GUIDANCE only: display guidance, not a hard limit.'
+_TASK_LABEL_GUIDANCE = 'Use a concise, meaningful, verb-first, privacy-safe sentence-case display label (preserve proper nouns/acronyms: Review context forks; Check API routing; not Review Context Forks); never use the goal. Maximum 24 Unicode code points in task_label itself, including spaces; indentation, references, separators and role suffixes do not count. This is a hard admission limit, not truncation. Omit task_label on resume to preserve the existing identity, including historical longer labels.'
 
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
@@ -1796,7 +1802,7 @@ DELEGATE_TASK_SCHEMA = {
                             "Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief instead.",
                             enum=["fresh", "fork"]),
                         "replaces": {"type": "object", "properties": {"parent_task_id": {"type": "string"}, "thread_ref": {"type": "string"}}, "required": ["parent_task_id", "thread_ref"], "additionalProperties": False, "description": "Explicit recovery of this parent-owned terminal thread; retire it only after this replacement actually starts. Failed spawn leaves it visible."},
-                        "task_label": _p("string", "Required for a new delegation. " + _TASK_LABEL_GUIDANCE),
+                        "task_label": _p("string", "Required for a new delegation. " + _TASK_LABEL_GUIDANCE, maxLength=24),
                         "resume_session_id": _p(
                             "string",
                             "Stable durable child_session_id (never the control-only subagent_id, which starts sa-) from a "
@@ -1839,7 +1845,7 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "(rebuilt at get_definitions() time)",
             },
             "parent_task_id": _p("string", "Optional opaque parent task identity. It is validated only against this exact conversation owner."),
-            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. " + _TASK_LABEL_GUIDANCE),
+            "task_label": _p("string", "Explicit top-level fallback for legacy single-task callers. " + _TASK_LABEL_GUIDANCE, maxLength=24),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(

@@ -13,6 +13,7 @@ from typing import Any
 
 # Settings configurable per-platform; other display settings are CLI-only.
 _GLOBAL_DEFAULTS: dict[str, Any] = {
+    "delegation_max_visible_roots": 5,
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
@@ -161,6 +162,7 @@ _NORMALISERS: dict[str, Any] = {
     "tool_progress_grouping": _norm_choice(("accumulate", "separate")),
     "reasoning_style": _norm_choice(("code", "blockquote", "subtext")),
     "tool_preview_length": _norm_int,
+    "delegation_max_visible_roots": lambda value: value if type(value) is int and value > 0 else 5,
 }
 
 

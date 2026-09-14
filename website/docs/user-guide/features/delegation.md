@@ -10,6 +10,34 @@ The `delegate_task` tool spawns child AIAgent instances with isolated context, i
 
 Top-level model calls run in the background automatically. Hermes returns a handle immediately so the conversation can continue, then posts the result back as a new message. An orchestrator subagent waits for its own workers so it can synthesize their results before returning.
 
+## Task labels
+
+Every new task needs a concise, meaningful, verb-first `task_label` of **at most
+24 Unicode code points**, including spaces. The limit applies to the label alone,
+not card indentation, references, separators, or an appended role name. Prefer
+“Check API routing” or “Review candidate”; do not paste the goal or clip words to
+fit. Both the model-facing JSON Schema (`maxLength: 24`) and the batch admission
+validator enforce the same limit before any child is spawned or reference reserved.
+An invalid sibling rejects the entire batch with an actionable error, including
+legacy top-level label fallback calls and native review dispatch.
+
+Counting uses Python `len` / JSON Schema string length, **not** bytes, UTF-16 units,
+grapheme clusters, or display columns. An astral emoji counts as one code point;
+a decomposed accented letter and multi-code-point emoji count as multiple. Raw
+spaces count before the existing whitespace cleanup; no Unicode normalization,
+ellipsis, or silent truncation is performed.
+
+Omit `task_label` when resuming a saved child: the exact existing logical identity
+and label are preserved, including historical labels longer than 24 code points.
+Supplying a new overlong label is still rejected before resume claims. Existing
+cards and ledger labels are never shortened or migrated. Native reviews author
+“Review candidate”; the internal missing-label metadata fallback remains the
+compliant “Run delegated task”.
+
+The separate [delegation card root window](../configuration.md#delegation-card-root-window)
+shows the newest five top-level groups by default, with every descendant of those
+groups. Label admission does not change this presentation-only selection.
+
 ## Completion delivery
 
 Messaging gateways acknowledge background completions only after their adapter actually

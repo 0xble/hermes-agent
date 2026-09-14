@@ -35,9 +35,14 @@ def test_explicit_card_label_is_not_truncated_by_metadata_reservation(tmp_path, 
     owner = {"profile": "p", "session_id": "s", "chat_id": "c", "topic_id": "t", "session_key": "k"}
     label = "retain-full-label-" * 10
 
-    metadata = ad.reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=[label])
-
-    assert metadata["task_labels"] == [label]
+    with pytest.raises(ValueError, match="24 Unicode code points"):
+        ad.reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=["Valid", label])
+    metadata = ad.reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=["🧪" * 24])
+    assert metadata["thread_refs"] == ["A"]  # bad batch consumed no counter
+    assert metadata["task_labels"] == ["🧪" * 24]
+    resumed = ad.reserve_delegation_metadata(parent_task_id=metadata["parent_task_id"], owner=owner,
+                                             task_labels=[label], resume_refs=["A"])
+    assert resumed["task_labels"] == [label]  # existing identity is not re-authored
 
 
 def test_thread_refs_continue_past_z(tmp_path, monkeypatch):

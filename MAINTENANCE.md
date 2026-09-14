@@ -1,5 +1,22 @@
 # Maintained Hermes fork
 
+## Delegation root window — source candidate
+
+User explicitly authorized the newest-five root-group display cap on 2026-09-13,
+superseding the earlier no-row-truncation comment. Preserve the full lifecycle
+ledger and whole descendant groups, with admission (not activity) chronology.
+`display.delegation_max_visible_roots` uses the existing profile/platform resolver;
+invalid non-null values use five. This is not result retirement or flood control.
+The coupled new-label policy enforces 24 Unicode code points before spawn, not
+a renderer truncation; grandfather existing same-row resume labels unchanged.
+Schema/runtime length agreement and whole-batch refusal are covered in
+`tests/tools/test_delegate_required_labels.py` and the real saved-resume suite.
+Retire this fork delta only when upstream supplies equivalent whole-root semantics
+and persisted admission ordering across consolidated execution records. Verify with
+`tests/gateway/test_delegation_root_cap.py` plus the existing anchoring, disposition,
+and retention suites. Activation is separate and parent-owned; preserve both
+capabilities in the existing runtime-compatibility manifest on any installation.
+
 ## Delegated interruption and renewed authorization
 
 Internal cancellation, timeout, stall and error paths carry non-user-stop provenance.
@@ -146,7 +163,7 @@ Commit subjects and resolved SHAs are optional, human-readable provenance, not m
 
 ## Symbol-first delegation presentation
 
-- **Contract:** [symbol-first presentation](docs/delegation-card-anchoring.md#symbol-first-presentation). Status symbols, no visible numbering/ref prefixes, inline roles, heading-text-only bold, canonical tool names only, two-space activity inset and actual-parent indentation capped at three layers. Stable internal refs/ownership and exact handling remain unchanged. This supersedes historical tool-preview/display-prefix contracts below, not their lifecycle protections.
+- **Contract:** [symbol-first presentation](docs/delegation-card-anchoring.md#symbol-first-presentation). Status symbols, no visible numbering/ref prefixes, inline roles, no heading or leading blank line, canonical tool names only, two-space activity inset and actual-parent indentation capped at three layers. Stable internal refs/ownership and exact handling remain unchanged. This supersedes historical tool-preview/display-prefix contracts below, not their lifecycle protections.
 - **Upstream:** inspected upstream `main` at `45a6101f36576367359c171cd5820ee76a3d047b`; `gateway/delegation_cards.py` is absent (contents API 404), and matching delegation-card PR search was empty. Fork-local projection, not an independently applicable upstream change. No model-preset PR changes.
 - **Verification:** symbol/status table, unknown-state fallback, native Telegram MarkdownV2 send/edit boundaries, three-layer actual parentage, duplicate-label independent ownership and exact handling; existing card/reanchor/consolidation/final cleanup regressions. Native client pixels are separate delivery evidence, never implied by mocked Bot API tests.
 - **Rollback:** revert only this presentation change; no migration or lifecycle data edits. PR159 scheduler-deferred cleanup code remains untouched.

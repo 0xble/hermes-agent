@@ -54,9 +54,10 @@ def test_resume_authority_resolution_errors_do_not_expose_values(monkeypatch):
 
 @pytest.mark.parametrize("compressed", [False, True, "foreign", "sibling", "noncompression",
     "profile", "session_key", "chat_id", "thread_id", "topic_id", "admission_failure"])
+@pytest.mark.parametrize("historical", [False, True])
 @pytest.mark.parametrize("corrupt", [False, True])
 @pytest.mark.parametrize("stopped", [False, True])
-def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped, compressed):
+def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped, compressed, historical):
     from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, _, _ = _resume_fixture(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -64,6 +65,9 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     from tools.async_delegation import reserve_delegation_metadata
     original = reserve_delegation_metadata(parent_task_id=None, owner=owner, task_labels=["Refine layering skill"])
     identity = {"parent_task_id": original["parent_task_id"], "thread_ref": "A", "task_label": "Refine layering skill", "owner": owner, "attempt": 0}
+    if historical:
+        identity["task_label"] = "Historical preserved label longer than twenty four characters"
+        metadata["task_label"] = identity["task_label"]
     if corrupt:
         identity.pop("thread_ref")
     metadata["card_identity"] = identity
@@ -120,6 +124,8 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     monkeypatch.setattr(delegate_tool, "_build_children", build)
     monkeypatch.setattr(delegate_tool, "_run_batch", lambda batch, background: json.dumps(batch.delegation_metadata))
     task = {"goal": "Continue safely", "task_label": "Recover renamed", "resume_session_id": "child"}
+    if historical:
+        task.pop("task_label")  # existing historical label remains resumable
     if stopped:
         task["resume_authorization"] = {"authorization": "User asked to resume.", "reconciliation": "Verified effects and processes."}
     before = json.loads(db.get_session("child")["model_config"])
@@ -147,7 +153,7 @@ def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch,
     assert "error" not in payload, payload
     assert payload["parent_task_id"] == identity["parent_task_id"]
     assert payload["thread_refs"] == ["A"]
-    assert payload["task_labels"] == ["Refine layering skill"]
+    assert payload["task_labels"] == [identity["task_label"]]
     assert payload["attempts"] == {"A": 1}
     assert payload["owner"] == owner
     assert built[0]._progress_identity_ref["owner"] == owner

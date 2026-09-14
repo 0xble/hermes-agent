@@ -1704,6 +1704,10 @@ delegation:
 # Display
 # =============================================================================
 display:
+  # Newest top-level task groups per shared delegation card, with all descendants.
+  # Positive integer only; missing/invalid values use 5 (no unlimited sentinel).
+  # Per-platform override: display.platforms.telegram.delegation_max_visible_roots
+  delegation_max_visible_roots: 5
   # Use compact banner mode (hides the ASCII-art banner, shows a single line).
   #   true:  Compact single-line banner
   #   false: Full ASCII banner with tool/skill summary (default)
