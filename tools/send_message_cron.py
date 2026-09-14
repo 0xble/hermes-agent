@@ -65,7 +65,7 @@ def send_cron_message(args, **kw):
                 + (f":{origin['thread_id']}" if origin.get("thread_id") else "")
             ),
             "message": message,
-        })
+        }, profile=run.profile, profile_home=run.profile_home)
     except Exception as exc:
         record = cron_outbound.mark_result(
             job_id=job_id,

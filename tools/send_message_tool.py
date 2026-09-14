@@ -206,7 +206,25 @@ def _handle_react(args, remove=False):
     return json.dumps(result if isinstance(result, dict) else {"success": bool(result)})
 
 
-def _handle_send(args):
+def _handle_send(args, *, profile=None, profile_home=None):
+    # Only trusted callers pass ownership as keywords, never model-authored args.
+    attempt = {"started": False}
+    try:
+        if profile:
+            from pathlib import Path
+            from hermes_constants import get_hermes_home
+            if profile_home is None or Path(profile_home).resolve() != get_hermes_home().resolve():
+                return json.dumps({"error": "Cron profile scope changed before send", "delivery_not_attempted": True})
+        raw = _handle_send_impl(args, profile=profile, profile_home=profile_home, attempt=attempt)
+        result = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        result = _error(f"Send failed: {type(exc).__name__}")
+    if profile and isinstance(result, dict) and result.get("error") and not attempt["started"]:
+        result["delivery_not_attempted"] = True
+    return json.dumps(result)
+
+
+def _handle_send_impl(args, *, profile, profile_home, attempt):
     target, message = args.get("target", ""), args.get("message", "")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
@@ -263,6 +281,11 @@ def _handle_send(args):
         from model_tools import _run_async
         # Only custom plugin handlers receive the complete typed request.
         handler_args = {"args": args} if entry is not None and entry.send_message_handler is not None else {}
+        if profile:
+            handler_args.update(profile=profile, profile_home=profile_home)
+        # After dispatch enters the transport, exceptions are ambiguous unless the
+        # transport explicitly reports that no external attempt was possible.
+        attempt["started"] = True
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
@@ -444,22 +467,35 @@ async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
     if gateway_loop is None or asyncio.get_running_loop() is gateway_loop:
         return await make_coro()  # same loop / no gateway loop (CLI, tests)
     if not gateway_loop.is_running():
-        return {"error": "Gateway loop is not running; cannot dispatch adapter send"}
+        return {"error": "Gateway loop is not running; cannot dispatch adapter send", "delivery_not_attempted": True}
     from agent.async_utils import safe_schedule_threadsafe
     fut = safe_schedule_threadsafe(make_coro(), gateway_loop, logger=logger, log_message=log_message)
     if fut is None:
-        return {"error": "Gateway loop unavailable for send dispatch"}
+        return {"error": "Gateway loop unavailable for send dispatch", "delivery_not_attempted": True}
     # shield: a cancelled caller must not cancel the enqueued send (a retry would duplicate it).
     # No timeout: the adapter and outer _run_async bound the wait.
     return await asyncio.shield(asyncio.wrap_future(fut))
 
 
 async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None, media_files=None,
-                            force_document=False):
+                            force_document=False, profile=None):
     """Live in-process gateway adapter first, else the plugin's ``standalone_sender_fn`` (cron),
     else an error naming both; media uses the adapter's native media APIs under the same rules."""
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     runner, adapter = _live_adapter(platform)
+    if profile:
+        try:
+            if runner is None:
+                return {"error": "Bound gateway adapter is unavailable", "delivery_not_attempted": True}
+            if profile == getattr(runner, "_primary_profile_name", None):
+                adapter = runner.adapters.get(platform)
+            else:
+                adapter = (getattr(runner, "_profile_adapters", {}) or {}).get(profile, {}).get(platform)
+            if adapter is None:
+                return {"error": f"No live adapter for profile '{profile}' and platform '{platform_name}'",
+                        "delivery_not_attempted": True}
+        except Exception as exc:
+            return {"error": f"Profile resolution failed: {type(exc).__name__}", "delivery_not_attempted": True}
     if adapter is not None:
         try:
             metadata = {**({"thread_id": thread_id} if thread_id else {}),
@@ -514,6 +550,9 @@ async def _send_chunks(chunks, send_one):
     for i, chunk in enumerate(chunks):
         result = await send_one(chunk, i == len(chunks) - 1)
         if isinstance(result, dict) and result.get("error"):
+            if i:
+                # A later chunk's preflight failure cannot make earlier sends retryable.
+                result = {**result, "delivery_not_attempted": False}
             break
     return result
 
@@ -563,8 +602,8 @@ async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chun
         pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files if is_last else empty_media, **extra))
 
 
-def _via_adapter_route(p, pc, cid, chunk, media, tid, fd):
-    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd)
+def _via_adapter_route(p, pc, cid, chunk, media, tid, fd, profile=None):
+    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd, profile=profile)
 
 
 # Native-media chunked routes for built-in platforms; media rides on the final chunk, non-final
@@ -595,13 +634,45 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None, profile=None, profile_home=None):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
     from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
+    if profile:
+        from pathlib import Path
+        from hermes_constants import get_hermes_home
+        from gateway.platform_registry import platform_registry
+        # Config and custom handlers must still belong to the scheduler's home.
+        if profile_home is None or Path(profile_home).resolve() != get_hermes_home().resolve():
+            return {"error": "Cron profile scope changed before send", "delivery_not_attempted": True}
+        entry = platform_registry.get(platform_name)
+        if entry is not None and entry.send_message_handler is not None:
+            scoped, _ = platform_registry.snapshot_registration(platform_name, scope=platform_registry.current_scope_key())
+            if scoped is not entry:
+                return {"error": "Cannot verify custom handler profile ownership", "delivery_not_attempted": True}
+            try:
+                import inspect
+                result = entry.send_message_handler(args or {}, chat_id, platform_name, pconfig)
+                return await result if inspect.isawaitable(result) else result
+            except Exception as exc:
+                return {"error": f"Plugin send_message handler failed: {type(exc).__name__}"}
+        import sys
+        gateway_module = sys.modules.get("gateway.run")
+        try:
+            runner = gateway_module._gateway_runner_ref() if gateway_module is not None else None
+        except Exception as exc:
+            return {"error": f"Gateway lookup failed: {type(exc).__name__}", "delivery_not_attempted": True}
+        if runner is not None:
+            from gateway.platforms.base import BasePlatformAdapter
+            max_len = _platform_max_length(platform)
+            chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
+            return await _send_chunks(chunks, lambda chunk, is_last: _via_adapter_route(
+                platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id,
+                force_document, profile))
+        # Standalone execution retains native built-in transports in its pinned home.
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
     # Telegram chunks internally on the *formatted* text (escaping inflates length).

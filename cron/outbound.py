@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
@@ -36,6 +36,13 @@ class CronMessagingRun:
     allowed: bool
     ledger_path: Path
     active: bool = True
+    profile: str = field(init=False)
+    profile_home: Path = field(init=False)
+
+    def __post_init__(self):
+        from hermes_cli.profiles import get_active_profile_name
+        self.profile = get_active_profile_name()
+        self.profile_home = get_hermes_home().resolve()
 
 
 # Authority is scheduler-bound, never inferred from subprocess/environment strings.
