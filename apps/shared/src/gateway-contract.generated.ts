@@ -4876,6 +4876,8 @@ export interface BackendGatewayEventMap {
   'skin.changed': SkinPayload
   /** Transient status line (kind: status, lifecycle, compacting, goal, loop, heartbeat, process, …). */
   'status.update': StatusUpdatePayload
+  /** A delegated child's observed runtime wait activity changed. */
+  'subagent.activity': SubagentEventPayload
   /** A delegated child was admitted to the parent's lifecycle ledger. */
   'subagent.admitted': SubagentEventPayload
   /** A child finished (status + observability rollup). */
@@ -4970,6 +4972,7 @@ export const GATEWAY_EVENT_TYPES = [
   'setup.ready',
   'skin.changed',
   'status.update',
+  'subagent.activity',
   'subagent.admitted',
   'subagent.complete',
   'subagent.handling',

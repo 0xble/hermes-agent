@@ -33645,6 +33645,18 @@
       ]
     },
     {
+      "name": "subagent.activity",
+      "summary": "A delegated child's observed runtime wait activity changed.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/SubagentEventPayload"
+          }
+        }
+      ]
+    },
+    {
       "name": "subagent.admitted",
       "summary": "A delegated child was admitted to the parent's lifecycle ledger.",
       "params": [

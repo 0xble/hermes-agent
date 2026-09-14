@@ -460,6 +460,7 @@ class SubagentEventPayload(Payload):
 
 
 for _name, _doc in (
+    ("subagent.activity", "A delegated child's observed runtime wait activity changed."),
     ("subagent.admitted", "A delegated child was admitted to the parent's lifecycle ledger."),
     ("subagent.handling", "The parent began handling a delegated child's result."),
     ("subagent.result_turn", "A delegated result entered the parent's result turn."),
