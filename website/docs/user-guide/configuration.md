@@ -1969,6 +1969,50 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ## Display Settings
 
+### Delegation card root window
+
+`display.delegation_max_visible_roots` defaults to **5**. It limits the **newest
+five top-level task groups** in each shared gateway delegation card, not five
+rows or five execution records. Root identity follows the displayed parent/child
+hierarchy, not synthetic delegation depth. Every descendant of a selected root
+remains visible; descendants of hidden roots are hidden with it. Labels and
+activity summaries are not shortened by this setting.
+
+```yaml
+display:
+  delegation_max_visible_roots: 5
+  platforms:
+    telegram:
+      delegation_max_visible_roots: 3  # optional platform override
+```
+
+Set it in the owning profile's `config.yaml`, or use
+`hermes config set display.delegation_max_visible_roots 5`. Platform override,
+global profile value, and built-in default follow the normal display resolver.
+Only positive YAML integers are accepted. Zero, negative values, booleans,
+floats, strings (including quoted numbers), lists, and mappings resolve to **5**;
+a null override inherits the global value. There is no unlimited sentinel.
+Missing/unreadable/malformed config uses the built-in default. Changes apply
+on the next normal card render; changing config alone does not send a message.
+
+“Newest” means first admission of a task identity, not its latest activity,
+completion, handling, or resume. Selected groups stay in chronological order.
+New identities carry a persistent monotonic presentation order across execution
+records in the conversation. Older records without that metadata sort before
+new identities using the existing stable projection order (execution start time,
+execution key for ties, then stored row order); no wall-clock timestamp is needed
+on individual rows. Equal or invalid order metadata uses that same stable tie
+order. For roots A–G, the default shows C–G with their descendants; a new activity
+on A leaves C–G unchanged, while newly admitted H changes the window to D–H.
+
+This is **presentation only**. Hidden work remains in the complete execution and
+card ledgers, retains its dispositions and unresolved obligations, and continues
+to receive lifecycle updates. The window never accepts, retires, deletes, or
+marks work handled. Existing delete-first reanchoring, cleanup, transport budgets,
+and delivery rules are unchanged. A selected root with many descendants or long
+labels can still exceed a platform's message limit; the existing transport error
+is reported rather than silently truncating that group.
+
 ```yaml
 display:
   tool_progress: all      # off | new | all | verbose

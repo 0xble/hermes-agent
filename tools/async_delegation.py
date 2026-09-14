@@ -156,6 +156,13 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
         raise ValueError("parent_task_id must be an existing lowercase 32-character hexadecimal reference")
     parent_task_id = parent_task_id if supplied_parent_task_id else uuid.uuid4().hex
     owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
+    # Exact continuations retain historical labels; only NEW identities get the
+    # admission limit. Validate raw code-point length before whitespace cleanup.
+    if resume_refs is None:
+        for index, label in enumerate(task_labels):
+            if not isinstance(label, str) or len(label) > 24:
+                raise ValueError(f"task_labels[{index}] must be a string of at most 24 Unicode code points; "
+                                 "write a shorter meaningful label. No task reference was reserved.")
     labels = [str(x or "").strip() or "Run delegated task" for x in task_labels]
     if resume_refs is not None and (not supplied_parent_task_id or len(resume_refs) != len(labels)
             or len(set(resume_refs)) != len(resume_refs)

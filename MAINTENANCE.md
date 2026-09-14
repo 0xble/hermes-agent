@@ -1,5 +1,22 @@
 # Maintained Hermes fork
 
+## Delegation root window — source candidate
+
+User explicitly authorized the newest-five root-group display cap on 2026-09-13,
+superseding the earlier no-row-truncation comment. Preserve the full lifecycle
+ledger and whole descendant groups, with admission (not activity) chronology.
+`display.delegation_max_visible_roots` uses the existing profile/platform resolver;
+invalid non-null values use five. This is not result retirement or flood control.
+The coupled new-label policy enforces 24 Unicode code points before spawn, not
+a renderer truncation; grandfather existing same-row resume labels unchanged.
+Schema/runtime length agreement and whole-batch refusal are covered in
+`tests/tools/test_delegate_required_labels.py` and the real saved-resume suite.
+Retire this fork delta only when upstream supplies equivalent whole-root semantics
+and persisted admission ordering across consolidated execution records. Verify with
+`tests/gateway/test_delegation_root_cap.py` plus the existing anchoring, disposition,
+and retention suites. Activation is separate and parent-owned; preserve both
+capabilities in the existing runtime-compatibility manifest on any installation.
+
 ## Delegated interruption and renewed authorization
 
 Internal cancellation, timeout, stall and error paths carry non-user-stop provenance.

@@ -182,8 +182,9 @@ async def test_tool_excerpt_send_edit_is_readable_bounded_and_private(tmp_path, 
         assert len(text.encode("utf-16-le")) // 2 < 4096
     row = cards.cards["a" * 32]["rows"]["A"]
     many = dict(started_at=0, rows={str(i): {**row, "thread_ref": str(i)} for i in range(100)})
-    # Card row guidance is not a renderer hard cap: authored rows are preserved.
-    assert render_card(many, now=0).count("○ Check display") == len(many["rows"])
+    # The explicit root window does not shorten labels or impose a total-row cap.
+    assert render_card(many, now=0).count("○ Check display") == 5
+    assert render_card(many, now=0, max_visible_roots=100).count("○ Check display") == len(many["rows"])
 
 
 @pytest.mark.asyncio

@@ -244,6 +244,8 @@ def test_start_review_binds_candidate_schema_and_policy(candidate_repo, monkeypa
 
     assert result["delegation_id"] == "review-1"
     assert captured["child_tool_policy"] == "inspection_only"
+    assert captured["task_label"] == "Review candidate"
+    assert len(captured["task_label"]) <= 24
     assert captured["output_schema"]["properties"]["candidate_id"]["const"] == candidate.candidate_id
     assert candidate.candidate_id in captured["context"]
     assert "IMPLEMENTER_CONFIRMATION_BIAS" not in captured["context"]

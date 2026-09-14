@@ -8,6 +8,43 @@ write-ahead: link original records, publish the union, then delete exact receipt
 import json
 
 
+def row_order(row):
+    """Immutable admission order; legacy/invalid metadata sorts before new rows."""
+    value = row.get("presentation_order")
+    return value if type(value) is int and value > 0 else 0
+
+
+def next_row_order(manager, key):
+    # Called under the conversation lock, only when admitting a new identity.
+    # Include retired records so later groups never reuse their chronology.
+    target_scope = manager._scope(manager.cards[key])
+    return 1 + max((row_order(row) for card in manager.cards.values()
+                    if manager._scope(card) == target_scope
+                    for row in card["rows"].values()), default=0)
+
+
+def render(manager, key, projection):
+    """Apply the owning profile/platform display setting only at text rendering."""
+    from gateway.delegation_cards import render_card
+    from gateway.display_config import resolve_display_setting
+    from gateway.run import _load_gateway_config
+
+    source = manager._source(manager.cards[key])
+    source.profile = source.profile or manager.cards[key]["owner"].get("profile")
+    home = manager.path.parents[2]
+    resolver = getattr(manager.runner, "_resolve_profile_home_for_source", None)
+    try:
+        if resolver is not None:
+            home = resolver(source)
+        config = _load_gateway_config(home / "config.yaml")
+        cap = resolve_display_setting(config, source.platform.value, "delegation_max_visible_roots")
+    except Exception:
+        # Malformed containers and failed profile resolution keep a bounded view;
+        # never borrow another profile's settings after a resolution exception.
+        cap = 5
+    return render_card(projection, max_visible_roots=cap)
+
+
 def cleanup_allowed(manager, key, message_id):
     """Optional operator scope guard; malformed/unreadable policy denies cleanup.
 

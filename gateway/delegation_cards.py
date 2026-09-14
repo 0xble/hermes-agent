@@ -52,10 +52,12 @@ def _row_prefix(depth):
     return "\u00a0" * (4 * min(max(0, depth), 2))
 
 
-def render_card(card, now=None):
+def render_card(card, now=None, *, max_visible_roots=5):
     # Plain rich text: cards must never render as a native quote or fake border.
     lines = ["🧵 **Delegating tasks**"]
-    rows = card["rows"]
+    # Legacy rows precede newly admitted identities; stable sort preserves stored
+    # card/row order for old records and ties, without relying on wall clocks.
+    rows = dict(sorted(card["rows"].items(), key=lambda item: presentation.row_order(item[1])))
     identities = set(rows)
     children = {}
     for identity, row in rows.items():
@@ -63,6 +65,7 @@ def render_card(card, now=None):
         if parent in identities and parent != identity:
             children.setdefault(parent, []).append(identity)
     ordered = []
+    roots = []
     visited = set()
 
     def add(identity, depth=0, ancestry=()):
@@ -71,7 +74,10 @@ def render_card(card, now=None):
         visited.add(identity)
         row = rows[identity]
         actual_depth = depth
-        row = {**row, "_display_depth": min(actual_depth, 2)}
+        if depth == 0:
+            roots.append(identity)
+        row = {**row, "_display_depth": min(actual_depth, 2),
+               "_display_root": ancestry[0] if ancestry else identity}
         ordered.append(row)
         for child in children.get(identity, ()):
             if child not in ancestry:
@@ -83,14 +89,17 @@ def render_card(card, now=None):
     for identity in rows:
         add(identity)
 
+    cap = max_visible_roots if type(max_visible_roots) is int and max_visible_roots > 0 else 5
+    selected = set(roots[-cap:])
     for row in ordered:
+        if row["_display_root"] not in selected:
+            continue
         depth = row["_display_depth"]
         prefix = _row_prefix(depth)
         named_type = _label(row.get("subagent_type"), "", 10_000)
         role_suffix = f" · {named_type.capitalize()}" if named_type else ""
-        # The model receives a 24-character row-budget guideline, but authored
-        # labels are never truncated or rejected here. Telegram's proportional
-        # fonts likewise cannot guarantee physical width.
+        # New labels are validated at admission, never shortened at rendering.
+        # Historical labels stay intact; proportional fonts do not imply fixed width.
         # Refs remain stable in the lifecycle/tool API, never in visible text.
         label = _label(row.get("task_label"), "Task", 10_000)
         state = row.get("state")
@@ -117,8 +126,8 @@ def render_card(card, now=None):
             activity = (f"{get_tool_emoji(tool)} {_tool_label(tool)}" if tool
                         else "Started · awaiting activity")
         lines.append(f"{prefix}\u00a0\u00a0↳ {activity}")
-    # Do not invent a row/card truncation policy. The platform adapter reports
-    # an over-limit send honestly rather than silently hiding authored labels.
+    # Root groups alone are windowed. Complete descendants and authored labels
+    # may still exceed the platform limit; report that transport error honestly.
     return "\n".join(lines)
 
 
@@ -398,6 +407,7 @@ class DelegationCards:
             if row:
                 return
             row = card["rows"][ref] = {"thread_ref": ref, "task_label": data.get("task_label"),
+                "presentation_order": presentation.next_row_order(self, key),
                 "role": data.get("role"), "subagent_type": data.get("subagent_type"),
                 "card_parent_task_id": data.get("card_parent_task_id"),
                 "card_parent_thread_ref": data.get("card_parent_thread_ref"),
@@ -485,7 +495,7 @@ class DelegationCards:
                     await self._delete(card)
                     await self._delete_obsolete(key)
                     return
-                text = render_card(projection)
+                text = presentation.render(self, key, projection)
                 if (text == card["rendered"]
                         and not any(e["state"] == "pending" for e in presentation.pending(self, key))):
                     await self._delete_obsolete(key)

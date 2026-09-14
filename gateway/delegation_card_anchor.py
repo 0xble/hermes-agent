@@ -78,7 +78,7 @@ async def replace(manager, key):
     remain observable while the shared outbound gate gives final replies priority.
     The manager owns one flush per anchor, and bind preserves an in-flight anchor.
     """
-    from gateway.delegation_cards import render_card
+    from gateway.delegation_card_presentation import render
 
     card = manager.cards[key]
     lock = manager.locks.setdefault(manager._scope(card), asyncio.Lock())
@@ -146,7 +146,7 @@ async def replace(manager, key):
         projection = manager._projection(key)
         if not any(r.get("state") == "running" for r in projection["rows"].values()):
             return None
-        receipt["rendered"] = render_card(projection)
+        receipt["rendered"] = render(manager, key, projection)
         manager._save()
         return receipt["rendered"]
 
