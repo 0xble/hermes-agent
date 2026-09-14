@@ -1,6 +1,6 @@
 """Explicit pre-agent contention outcome; retries remain owned by the existing job store."""
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 
@@ -63,7 +63,8 @@ def finish_deferred_run(job: dict, result: DeferredRun, execution_id: str, owner
                 or execution["status"] != "running" or execution["process_id"] != _PROCESS_ID
                 or execution["pid"] != os.getpid()):
             return False
-        retry_at = (jobs._hermes_now() + timedelta(seconds=result.retry_after_seconds)).isoformat()
+        now = jobs._hermes_now()
+        retry_at = (now.astimezone(timezone.utc) + timedelta(seconds=result.retry_after_seconds)).astimezone(now.tzinfo).isoformat()
         current["deferred_run"] = {"execution_id": execution_id, "reason": result.reason,
                                    "retry_at": retry_at,
                                    "scheduled_instant": job.get("_scheduled_instant")}
