@@ -120,6 +120,14 @@ continuations or sibling sessions. Existing server deadlines and actual failed
 transport attempts retain their rate limits. Continuous-event and slow-receipt
 regressions live in `tests/gateway/test_progress_idle_retry.py`.
 
+An unnamed descendant of a named child already inherits read-only knowledge
+context through nested context entry and copied worker context. Toolset selection
+also preserves inherited skill-management denial. The contrary review allegation
+was disproven with real nested admission, AIAgent construction, daemon execution
+and registry writes in `tests/tools/test_delegate_nested_knowledge.py`. Both
+named and unrestricted parent controls are covered. This adds regression evidence
+without changing production authority or claiming arbitrary-code confinement.
+
 Cold-start reconnect tests now await the owned reconnect task before asserting
 its bookkeeping slot is gone. Adapter publication intentionally precedes awaited
 recovery work and final cleanup. An event barrier in the real recovery await
