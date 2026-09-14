@@ -706,10 +706,8 @@ async def _send_via_adapter(
     if runner is not None:
         try:
             profile_name = str(profile or "").strip()
-            active_profile = None
-            active_profile_fn = getattr(runner, "_active_profile_name", None)
-            if callable(active_profile_fn):
-                active_profile = str(active_profile_fn() or "").strip() or None
+            # Per-turn active identity follows the caller, not the primary map owner.
+            active_profile = getattr(runner, "_primary_profile_name", None)
             if profile_name:
                 requested_profile = profile_name
                 if requested_profile == active_profile:
@@ -725,6 +723,12 @@ async def _send_via_adapter(
                         "error": f"No live adapter for profile '{requested_profile}' and platform '{platform_name}'",
                         "delivery_stage": "pre_send",
                     }
+                from pathlib import Path
+                from hermes_constants import get_hermes_home
+                owner_home = getattr(adapter, "_hermes_profile_home", None)
+                if owner_home is None or Path(owner_home).resolve() != get_hermes_home().resolve():
+                    return {"error": "Live adapter does not belong to the trusted profile home",
+                            "delivery_stage": "pre_send"}
             else:
                 adapter = (getattr(runner, "adapters", None) or {}).get(platform)
         except Exception as exc:

@@ -1488,9 +1488,13 @@ class GatewayAdapterLifecycleMixin:
     def _create_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Create an adapter bound to this runner (every lifecycle path goes through here so
         adapters can resolve inbound profile routes before handlers or connect())."""
+        from hermes_constants import get_hermes_home
+        owner_home = get_hermes_home().resolve()
         adapter = self._instantiate_adapter(platform, config)
         if adapter is not None:
             adapter.gateway_runner = self
+            # Instance metadata stays coherent when an adapter is replaced or removed.
+            adapter._hermes_profile_home = owner_home
         return adapter
 
     def _instantiate_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:

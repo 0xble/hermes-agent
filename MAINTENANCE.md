@@ -14,6 +14,25 @@ Integration checks use the repository runner, generated-contract verification,
 and shared TypeScript type checking. Source publication and runtime promotion
 retain separate run-scoped evidence.
 
+Cron transport selection uses the gateway's launch-time primary identity and
+the selected adapter's resolved creation home. Per-turn identity alone can select
+the wrong primary bot, and the name `custom` is shared by unrelated homes. Missing
+or mismatched adapter-home evidence refuses delivery before dispatch. The common
+adapter factory stamps every replacement instance. Focused coverage includes
+real scoped factory construction, secondary ownership, custom-home collisions,
+and retry-safe refusal. Shared corrections are published to existing contribution
+PR #86648 at `a46133cd0e8d327813ca39f7359c2cfd2d79435b`, with a clean continuation
+of its configured Hermes review. The manifest-size recovery correction is also
+published to PR #106101 at `1057b39d2b41d01813f96af3b89724b1e53d3c53`.
+Both exact heads were read back on September 14 and reported no hosted checks.
+These updates supersede earlier unverified contribution-parity notes only for
+the named corrections, not all historical differences from those PRs.
+
+Imported cron-memory tests retain HERMES-036's explicit local-memory opt-in and
+external-provider suppression. Linux mountinfo fixtures explicitly select Linux
+behavior and separately verify that non-Linux hosts are not flagged. Neither
+test adaptation changes production memory or WAL policy.
+
 ## Delegation root window — source candidate
 
 User explicitly authorized the newest-five root-group display cap on 2026-09-13,

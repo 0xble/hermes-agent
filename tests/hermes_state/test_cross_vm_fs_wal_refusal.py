@@ -28,6 +28,11 @@ SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share r
 
 
 class TestDetectCrossVmFs:
+    @pytest.fixture(autouse=True)
+    def _linux_mountinfo(self, monkeypatch):
+        # These fixtures model Linux mountinfo even when the test host is macOS.
+        monkeypatch.setattr(hermes_state_wal.sys, "platform", "linux")
+
     @pytest.mark.parametrize("path,expected", [
         ("/data/agent", True),          # fuse.virtiofs bind mount
         ("/mnt/host/db", True),         # 9p bind mount
@@ -50,6 +55,12 @@ class TestDetectCrossVmFs:
 
     def test_missing_mountinfo_conservative_false(self, tmp_path):
         assert _detect_cross_vm_fs("/data", mountinfo_path=str(tmp_path / "nope")) is False
+
+    @pytest.mark.parametrize("platform", ["darwin", "win32"])
+    def test_non_linux_does_not_flag_linux_fixture(self, tmp_path, monkeypatch, platform):
+        mi = _mountinfo(tmp_path, [ROOT_EXT4, BIND_VIRTIOFS])
+        monkeypatch.setattr(hermes_state_wal.sys, "platform", platform)
+        assert _detect_cross_vm_fs("/data/agent", mountinfo_path=mi) is False
 
 
 class TestWalRefusalOnCrossVmFs:

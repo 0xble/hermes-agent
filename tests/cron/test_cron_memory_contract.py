@@ -1,44 +1,11 @@
-"""Contract pin: cron <-> persistent-memory loading.
+"""Cron memory contract adapted to the intentional maintained-fork policy HERMES-036.
 
-This contract FLIPPED TWICE in August 2026 and must never flip silently again:
-
-  * #91269 reported "cron loads MEMORY.md even though skip_memory is on".
-  * PR #91384 flipped cron to ``skip_memory=True`` and denylisted the
-    ``memory`` toolset ("do not load MEMORY.md into scheduled jobs").
-  * PR #91447 flipped it BACK: "cron jobs now load and update persistent
-    memory like every other agent" — ``skip_memory=False`` at the scheduler's
-    AIAgent construction site, ``memory`` removed from the cron denylist,
-    and ``agent/agent_init.py`` clarified that ``skip_memory`` skips the
-    *external memory provider* path (built-in MEMORY.md/USER.md store follows
-    the normal ``not skip_memory or memory-toolset-requested`` rule).
-
-CURRENT INTENDED MATRIX (as of PR #91447, pinned here):
-
-  default cron job          -> skip_memory=False; MEMORY.md/USER.md load into
-                               the system prompt; ``memory`` toolset follows
-                               normal resolution (NOT policy-denied).
-  per-job enabled_toolsets  -> naming ``memory`` keeps it; skip_memory stays
-                               False.
-  config.yaml
-  agent.disabled_toolsets:
-    [memory]                -> the ONLY off-switch: ``memory`` lands in the
-                               cron agent's disabled_toolsets (tool denied,
-                               and agent_init treats a denylisted toolset as
-                               not-requested). skip_memory itself is NOT a
-                               per-job/config toggle — the scheduler always
-                               passes False.
-
-ANY future flip of this behavior MUST consciously edit this test and cite
-the issue/PR that decided the flip in the module docstring above, extending
-the flip history. Do not "fix" a failure here by inverting an assertion
-without that citation.
-
-Tests drive the REAL ``cron.scheduler.run_job`` path and capture the actual
-kwargs the scheduler passes to AIAgent (patched at ``run_agent.AIAgent``,
-matching tests/cron/test_scheduler.py's pattern). The ON direction (default
-skip_memory=False, memory not denylisted, per-job memory toolset kept) is
-already pinned by tests/cron/test_scheduler.py::test_run_job_*memory*; this
-module pins the OFF direction and the "no per-job knob" rule.
+Upstream #91384 disabled persistent memory; #91447 enabled it by default.
+This fork deliberately retains external-provider suppression and permits only
+explicit per-job local MEMORY.md/USER.md opt-in. See MAINTENANCE.md HERMES-036
+and tests/agent/test_skip_memory_store_65429.py for the real store/provider
+boundary. A job cannot change skip_memory directly, and a profile denylist
+still overrides a local-memory request.
 """
 
 from __future__ import annotations
@@ -86,15 +53,17 @@ def _run_job_patches(tmp_path):
 
 
 class TestCronMemoryContractOn:
-    """Direction (a): default cron agents GET persistent memory (#91447)."""
+    """Only an explicit job toolset request enables local memory."""
 
-    def test_resolver_denylist_has_no_memory_entry(self):
-        """_resolve_cron_disabled_toolsets({}) itself never emits 'memory'."""
+    def test_resolver_requires_explicit_local_memory_opt_in(self):
         from cron.scheduler import _resolve_cron_disabled_toolsets
 
-        assert "memory" not in _resolve_cron_disabled_toolsets({})
-        assert "memory" not in _resolve_cron_disabled_toolsets(
+        assert "memory" in _resolve_cron_disabled_toolsets({})
+        assert "memory" in _resolve_cron_disabled_toolsets(
             {"cron": {"allow_agent_scheduling": True}}
+        )
+        assert "memory" not in _resolve_cron_disabled_toolsets(
+            {"enabled_toolsets": ["memory", "file"]}, {}
         )
 
 
@@ -127,19 +96,14 @@ class TestCronMemoryContractOff:
         )
 
     def test_skip_memory_is_not_a_per_job_knob(self, tmp_path):
-        """No per-job field flips skip_memory: the scheduler always passes False.
-
-        Guards against a partial re-flip where some job shape quietly gets
-        #91384 behavior back. A field named skip_memory on the job dict is
-        ignored by the construction site.
-        """
+        """An unsupported job field cannot enable external memory providers."""
         job = {
             "id": "mem-contract-noknob",
             "name": "t",
             "prompt": "hi",
-            "skip_memory": True,  # not a supported job field; must be ignored
+            "skip_memory": False,  # not a supported job field; must be ignored
         }
         with _run_job_patches(tmp_path) as (_db, agent_cls):
             run_job(job)
         kwargs = agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
+        assert kwargs["skip_memory"] is True

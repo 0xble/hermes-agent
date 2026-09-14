@@ -265,6 +265,8 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
     from gateway.session import SessionEntry, SessionSource, SessionStore
     from gateway.session_lifecycle import _now
 
+    # Active-scope and routing-index lookups must address the same failed DB.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db_path = tmp_path / "state.db"
     sessions_dir = tmp_path / "sessions"
     scope = str(sessions_dir.resolve())
@@ -304,7 +306,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
             scope=scope,
         )
     database.close()
-    sessions_dir.mkdir()
+    sessions_dir.mkdir(exist_ok=True)
     (sessions_dir / "sessions.json").write_text(
         json.dumps(
             {
@@ -327,12 +329,23 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
 
     monkeypatch.setattr(hermes_state, "SessionDB", fail_once_session_db)
     monkeypatch.setattr(hermes_state, "_default_db_path", lambda: db_path)
+    # Construction and loading both consult the cache. Keep the failed open's
+    # backoff fixed until the fallback edits are ready, regardless of host load.
+    clock = _Clock()
+    monkeypatch.setattr(
+        "gateway.session_db_recovery.RecoverableHandleCache",
+        lambda **kwargs: RecoverableHandleCache(
+            clock=clock, initial_retry_delay=1, **kwargs
+        ),
+    )
     store = SessionStore(
         sessions_dir,
         GatewayConfig(sessions_dir=sessions_dir, write_sessions_json=False),
     )
     store._ensure_loaded()
-    store._db_handle_cache._unavailable[db_path].next_retry_at = 0
+    assert calls == 1
+    assert durable.session_key not in store._entries
+    clock.now = 1.0
 
     current = SessionEntry(
         session_key="agent:main:telegram:dm:current",
@@ -350,6 +363,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
         store._save()
 
     rows = store._db.load_gateway_routing_entries(scope=scope)
+    assert calls == 2
     assert set(rows) == {durable.session_key, changed.session_key, current.session_key}
     assert store._entries[durable.session_key].session_id == durable.session_id
     assert (

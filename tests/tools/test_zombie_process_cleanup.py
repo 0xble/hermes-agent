@@ -461,7 +461,8 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import _run_single_child, _set_subagent_approval_cb
+        from tools.daemon_pool import DaemonThreadPoolExecutor
 
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
@@ -469,6 +470,24 @@ class TestDelegationCleanup:
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
+        child_future = None
+
+        class StartedChildExecutor(DaemonThreadPoolExecutor):
+            def submit(self, fn, /, *args, **kwargs):
+                nonlocal child_future
+                future = super().submit(fn, *args, **kwargs)
+                # Relay has its own executor. Synchronize only the delegation
+                # worker, identified by its approval-callback initializer.
+                if self._initializer is not _set_subagent_approval_cb:
+                    return future
+                child_future = future
+                # This contract concerns an active turn at timeout. Wait for the
+                # real worker to establish that turn before Future.result starts
+                # its short timeout, regardless of scheduler contention.
+                assert child_started.wait(timeout=30), "child never established its Relay turn"
+                return child_future
+
+        monkeypatch.setattr("tools.daemon_pool.DaemonThreadPoolExecutor", StartedChildExecutor)
         parent = MagicMock()
         parent._active_children = []
         parent._active_children_lock = threading.Lock()
@@ -494,7 +513,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                release_child.wait()
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -528,12 +547,16 @@ class TestDelegationCleanup:
             relay_host.unregister_subagent.assert_not_called()
 
             release_child.set()
-            assert child_finished.wait(timeout=5)
+            assert child_finished.wait(timeout=30)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
                 profile_key=str(profile_home),
                 session_id=child.session_id,
             )
         finally:
             release_child.set()
-            reset_hermes_home_override(profile_token)
-            relay_runtime._reset_for_tests()
+            try:
+                if child_future is not None:
+                    child_future.result(timeout=30)
+            finally:
+                reset_hermes_home_override(profile_token)
+                relay_runtime._reset_for_tests()

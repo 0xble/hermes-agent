@@ -5,6 +5,7 @@ live adapter by bare platform posted (and reacted) with the default bot's identi
 honour ``_profile_adapters[profile]`` and fail closed (``None`` → scoped standalone sender / error)
 when the profile has no adapter for that platform — never the default bot.
 """
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -66,7 +67,7 @@ async def test_trusted_standalone_native_sender_preserves_profile_and_receipt(tm
     monkeypatch.setattr(weixin, 'send_weixin_direct', native)
     default_adapter = SimpleNamespace(send=AsyncMock())
     if mode == 'live_missing':
-        runner = SimpleNamespace(_active_profile_name=lambda: 'default',
+        runner = SimpleNamespace(_primary_profile_name='default', _active_profile_name=lambda: 'default',
             adapters={Platform.WEIXIN: default_adapter}, _profile_adapters={})
         monkeypatch.setattr(gateway_run, '_gateway_runner_ref', lambda: runner)
     elif mode == 'not_loaded':
@@ -93,3 +94,64 @@ async def test_trusted_standalone_native_sender_preserves_profile_and_receipt(tm
             assert result.get('delivery_stage') == 'pre_send'
         native.assert_not_awaited()
     default_adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trusted_send_uses_factory_home_and_launch_owner(mux_runner, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gateway.platforms.base import SendResult
+    from tools.send_message_tool import _send_via_adapter
+    import gateway.run as gateway_run
+
+    home, _, _ = mux_runner
+    runner = gateway_run._gateway_runner_ref()
+    monkeypatch.setattr(runner, "_instantiate_adapter", lambda *a: SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="receipt"))))
+    primary = runner._create_adapter(Platform.SLACK, SimpleNamespace())
+    with _profile_runtime_scope(home / "profiles" / "sec", {}):
+        secondary = runner._create_adapter(Platform.SLACK, SimpleNamespace())
+    runner.adapters = {Platform.SLACK: primary}
+    runner._profile_adapters = {"sec": {Platform.SLACK: secondary}}
+    runner._gateway_loop = asyncio.get_running_loop()
+    with _profile_runtime_scope(home / "profiles" / "sec", {}):
+        assert runner._active_profile_name() == "sec"
+        result = await _send_via_adapter(Platform.SLACK, SimpleNamespace(), "C123", "hello", profile="sec")
+    assert result["success"]
+    assert primary._hermes_profile_home == home.resolve()
+    assert secondary._hermes_profile_home == (home / "profiles" / "sec").resolve()
+    primary.send.assert_not_awaited()
+    secondary.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_known", [True, False])
+async def test_custom_profile_names_do_not_authorize_other_homes(mux_runner, monkeypatch, owner_known):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from gateway.platforms.base import SendResult
+    from tools.send_message_tool import _send_via_adapter
+    import gateway.run as gateway_run
+
+    home, _, _ = mux_runner
+    runner = gateway_run._gateway_runner_ref()
+    runner._primary_profile_name = "custom"
+    runner._profile_adapters = {}
+    runner._gateway_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(runner, "_instantiate_adapter", lambda *a: SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="receipt"))))
+    with _profile_runtime_scope(home.parent / "custom-a", {}):
+        wrong = runner._create_adapter(Platform.SLACK, SimpleNamespace())
+    if not owner_known:
+        del wrong._hermes_profile_home
+    runner.adapters = {Platform.SLACK: wrong}
+    with _profile_runtime_scope(home.parent / "custom-b", {}):
+        assert runner._active_profile_name() == "custom"
+        result = await _send_via_adapter(Platform.SLACK, SimpleNamespace(), "C123", "hello", profile="custom")
+        assert result["delivery_stage"] == "pre_send"
+        wrong.send.assert_not_awaited()
+        right = runner._create_adapter(Platform.SLACK, SimpleNamespace())
+        runner.adapters[Platform.SLACK] = right
+        result = await _send_via_adapter(Platform.SLACK, SimpleNamespace(), "C123", "hello", profile="custom")
+    assert result["success"]
+    right.send.assert_awaited_once()

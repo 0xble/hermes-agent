@@ -52,6 +52,13 @@ def standalone_telegram(tmp_path, monkeypatch):
     with _profile_runtime_scope(secondary, {}):
         yield bot.send_message
 
+def _stamp_adapter_home(runner):
+    """Synthetic adapters model the ownership metadata set by the real factory."""
+    from hermes_constants import get_hermes_home
+    for mapping in [runner.adapters, *runner._profile_adapters.values()]:
+        for adapter in mapping.values():
+            adapter._hermes_profile_home = get_hermes_home().resolve()
+
 
 class TestJobOptIn:
     def test_default_job_keeps_messaging_disabled(self):
@@ -380,8 +387,10 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: default_adapter},
             _profile_adapters={"secondary": {Platform.TELEGRAM: secondary_adapter}},
+            _primary_profile_name="default",
             _active_profile_name=lambda: "default",
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         async def exercise():
@@ -416,8 +425,10 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: active_adapter},
             _profile_adapters={"default": {Platform.TELEGRAM: default_adapter}},
+            _primary_profile_name="secondary",
             _active_profile_name=lambda: "secondary",
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         async def exercise():
@@ -442,8 +453,10 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: SimpleNamespace(send=AsyncMock())},
             _profile_adapters={},
+            _primary_profile_name="secondary",
             _active_profile_name=lambda: "secondary",
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         result = asyncio.run(_send_via_adapter(
@@ -554,9 +567,11 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: adapter},
             _profile_adapters={},
+            _primary_profile_name="default",
             _active_profile_name=lambda: "default",
             _gateway_loop=gateway_loop,
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         try:
@@ -583,9 +598,11 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: adapter},
             _profile_adapters={},
+            _primary_profile_name="default",
             _active_profile_name=lambda: "default",
             _gateway_loop=stopped_loop,
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         try:
@@ -626,9 +643,11 @@ class TestSendGate:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: adapter},
             _profile_adapters={},
+            _primary_profile_name="default",
             _active_profile_name=lambda: "default",
             _gateway_loop=gateway_loop,
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
         monkeypatch.setattr(send_tool, "_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS", 0.01)
 
@@ -735,9 +754,11 @@ class TestLiveAdapterMedia:
         runner = SimpleNamespace(
             adapters={Platform.TELEGRAM: adapter},
             _profile_adapters={},
+            _primary_profile_name="default",
             _active_profile_name=lambda: "default",
             _gateway_loop=None,
         )
+        _stamp_adapter_home(runner)
         monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
 
         async def _run():
