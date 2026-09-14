@@ -32,6 +32,18 @@ class GatewayExecutor(ThreadPoolExecutor):
         super().__init__(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
         self._admission_lock = threading.Lock()
         self._outstanding = 0
+        self._capacity_callbacks = set()
+
+    def notify_when_capacity_available(self, callback) -> bool:
+        """Notify once when admission opens, without occupying another executor slot."""
+        with self._admission_lock:
+            if self._shutdown:
+                return False
+            if self._outstanding >= 2 * self._max_workers:
+                self._capacity_callbacks.add(callback)
+                return True
+        callback()
+        return True
 
     def submit(self, fn, /, *args, **kwargs):
         with self._admission_lock:
@@ -54,8 +66,15 @@ class GatewayExecutor(ThreadPoolExecutor):
         def released(work=None):
             with self._admission_lock:
                 self._outstanding -= 1
+                callbacks = tuple(self._capacity_callbacks)
+                self._capacity_callbacks.clear()
             if work is not None and work.cancelled():
                 result.cancel()
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    logger.exception("Gateway capacity callback failed")
 
         try:
             work = super().submit(run)

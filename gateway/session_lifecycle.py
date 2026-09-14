@@ -229,6 +229,28 @@ class SessionLifecycleMixin:
             self._set_turn_marker_locked(session_key, entry, None, None, settled_at=settled_at)
         return True
 
+    def mark_restart_input_not_started(self, session_key: str, token: str, input_owner: str) -> bool:
+        """Persist exact non-execution proof before any inbox ownership release."""
+        from gateway.restart_inbox import linked_row
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            link = entry.restart_inbox_link if entry else None
+            if (not link or entry.active_turn_token != token or link.get("turn_token") != token
+                    or link.get("input_owner") != input_owner or link.get("mode") != "active"):
+                return False
+            row = linked_row(link)
+            if (row["state"] != "attempting" or (row["owner_pid"], row["owner_started_at"]) !=
+                    (link["owner_pid"], link["owner_started_at"])):
+                return False
+            db = self._db_for_key(session_key)
+            if db is None or db.get_session(link["session_id"]) is None:
+                return False
+            if self.has_input_owner(link["session_id"], input_owner):
+                return False
+            self._set_turn_marker_locked(session_key, entry, None, None,
+                                         restart_link=dict(link, mode="not_started"))
+            return True
+
     def reconcile_restart_inbox(self, db_paths, *, running_keys=()):
         """Partition linked work before either startup consumer. Unknown evidence parks both."""
         from pathlib import Path
@@ -268,7 +290,8 @@ class SessionLifecycleMixin:
                     row = linked_row(link)
                     if row["state"] in ("delivered", "abandoned"):
                         mode = "delivered"
-                    elif _owner_alive(row["owner_pid"], row["owner_started_at"]):
+                    elif (_owner_alive(row["owner_pid"], row["owner_started_at"])
+                          and link.get("mode") != "not_started"):
                         raise ValueError("Restart claim is still owned by a live process")
                     elif entry.suspended or key in legacy_keys:
                         raise ValueError("Suspended or ambiguous legacy recovery")
@@ -290,7 +313,13 @@ class SessionLifecycleMixin:
                         mode = "continuation" if ingested else "replay"
                         if row["state"] == "handed_off" and not ingested:
                             raise ValueError("Previously ingested input no longer has proof")
-                        if not transition_link(link, "handed_off" if ingested else "pending", recovery=True):
+                        released = (link.get("mode") == "not_started" and not ingested
+                                    and row["state"] == "pending" and row["owner_pid"] is None)
+                        if not released and not transition_link(
+                            link, "handed_off" if ingested else "pending",
+                            recovery=link.get("mode") != "not_started",
+                            refund_attempt=link.get("mode") == "not_started",
+                        ):
                             raise ValueError("Restart recovery claim changed")
                     candidate.update(active_turn_token=None, active_turn_started_at=None,
                                      resume_pending=mode == "continuation",

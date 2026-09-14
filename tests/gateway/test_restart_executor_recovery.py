@@ -108,6 +108,9 @@ def wire_fake_model(runner, entry, event, monkeypatch, model):
 async def test_capacity_refusal_keeps_exact_link_until_proven_recovery(linked_turn, monkeypatch, recovery):
     runner, _adapter, entry, event, path = linked_turn
     store = runner.session_store
+    # Without a committed non-execution proof, retain the original conservative
+    # crash-recovery contract. Successful same-process release is covered below.
+    monkeypatch.setattr(store, "mark_restart_input_not_started", MagicMock(return_value=False))
     owner = event._restart_inbox_claim["input_owner"]
     assert await runner._mark_durable_active_turn(event, entry.session_key)
     token = entry.active_turn_token
@@ -203,3 +206,91 @@ async def test_started_worker_cannot_claim_admission_refusal(linked_turn, worker
     assert inbox.read_rows(path)[0]["state"] == "delivered"
     orphan(path)
     assert inbox.claim_recoverable(deliverable_targets={("telegram", "default")}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routing_failure", [False, True])
+async def test_capacity_refusal_replays_without_orphaning_live_gateway(linked_turn, monkeypatch, routing_failure):
+    runner, _adapter, entry, event, path = linked_turn
+    assert await runner._mark_durable_active_turn(event, entry.session_key)
+    owner = event._restart_inbox_claim["input_owner"]
+    ran = []
+    wire_fake_model(runner, entry, event, monkeypatch, lambda: ran.append(True))
+    release, started = threading.Event(), threading.Event()
+    def block():
+        started.set()
+        assert release.wait(10)
+    first = runner._executor.submit(block)
+    second = None
+    capacity_ready = asyncio.Event()
+    wakeups = []
+    def wake():
+        wakeups.append(True)
+        capacity_ready.set()
+    monkeypatch.setattr(runner, "_schedule_restart_inbox_drain", wake)
+    try:
+        assert started.wait(5)
+        second = runner._executor.submit(lambda: None)
+        response = await runner._handle_message_with_agent(event, event.source, entry.session_key, 1)
+        assert "not started" in response and ran == []
+        assert not await runner._clear_durable_active_turn(event)
+        assert event._restart_input_retryable
+        runner._retry_restart_inbox_when_capacity_available()
+        runner._retry_restart_inbox_when_capacity_available()
+        assert not capacity_ready.is_set()
+        assert len(runner._executor._capacity_callbacks) == 1
+    finally:
+        release.set()
+        first.result(timeout=5)
+        if second is not None:
+            second.result(timeout=5)
+    await asyncio.wait_for(capacity_ready.wait(), 5)
+    assert wakeups == [True]
+    if routing_failure:
+        with monkeypatch.context() as failing:
+            failing.setattr(runner.session_store._db, "save_gateway_routing_entry",
+                            MagicMock(side_effect=OSError("routing unavailable")))
+            with pytest.raises(OSError, match="routing unavailable"):
+                runner.session_store.reconcile_restart_inbox([path])
+        assert entry.restart_inbox_link["mode"] == "not_started"
+        assert inbox.read_rows(path)[0]["state"] == "pending"
+    blocked = runner.session_store.reconcile_restart_inbox([path])[str(path)]
+    replays = inbox.claim_recoverable(deliverable_targets={("telegram", "default")}, excluded_queue_ids=blocked)
+    assert len(replays) == 1
+    replay = replays[0]["event"]
+    assert replay._restart_inbox_claim["input_owner"] == owner
+    assert inbox.serialize_event(replay) == inbox.serialize_event(event)
+    assert inbox.read_rows(path)[0]["attempts"] == 1  # capacity refusal was refunded once
+    assert await runner._mark_durable_active_turn(replay, entry.session_key)
+    runner.session_store._db.append_message(entry.session_id, "user", replay.text,
+                                           display_metadata={"gateway_input_owner": owner})
+    assert await runner._clear_durable_active_turn(replay)
+    assert inbox.read_rows(path)[0]["state"] == "delivered"
+    assert runner.session_store.mark_turn_active(entry.session_key)
+
+
+@pytest.mark.parametrize("fault", ["stale_token", "claim_owner", "ingested", "read_failure", "primary_failure"])
+def test_unstarted_input_proof_refuses_ambiguous_or_stale_release(linked_turn, monkeypatch, fault):
+    runner, _adapter, entry, event, path = linked_turn
+    store = runner.session_store
+    claim = event._restart_inbox_claim
+    token = store.mark_turn_active(entry.session_key, restart_claim=claim)
+    if fault == "claim_owner":
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE restart_inbox SET owner_started_at=COALESCE(owner_started_at,0)+1")
+    if fault == "ingested":
+        store._db.append_message(entry.session_id, "user", event.text,
+                                 display_metadata={"gateway_input_owner": claim["input_owner"]})
+    before_entry, before_rows = entry.to_dict(), inbox.read_rows(path)
+    if fault == "read_failure":
+        monkeypatch.setattr(store, "has_input_owner", MagicMock(side_effect=OSError("proof unavailable")))
+    if fault == "primary_failure":
+        monkeypatch.setattr(store._db, "save_gateway_routing_entry", MagicMock(side_effect=OSError("primary unavailable")))
+    args = (entry.session_key, "stale" if fault == "stale_token" else token, claim["input_owner"])
+    if fault in {"read_failure", "primary_failure"}:
+        with pytest.raises(OSError):
+            store.mark_restart_input_not_started(*args)
+    else:
+        assert not store.mark_restart_input_not_started(*args)
+    assert entry.to_dict() == before_entry
+    assert inbox.read_rows(path) == before_rows

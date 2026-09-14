@@ -99,6 +99,28 @@ class GatewayStartupMixin:
         if getattr(self, "_running", False) and not getattr(self, "_draining", False):
             self._retain_background_task(asyncio.create_task(self._drain_restart_inbox()))
 
+    def _retry_restart_inbox_when_capacity_available(self):
+        """Coalesce refused-input retries until executor admission becomes available."""
+        if getattr(self, "_restart_inbox_capacity_waiting", False):
+            return
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            self._schedule_restart_inbox_drain()
+            return
+        loop = asyncio.get_running_loop()
+        self._restart_inbox_capacity_waiting = True
+
+        def wake():
+            self._restart_inbox_capacity_waiting = False
+            self._schedule_restart_inbox_drain()
+
+        def available():
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(wake)
+
+        if not executor.notify_when_capacity_available(available):
+            self._restart_inbox_capacity_waiting = False
+
     async def _drain_restart_inbox_serial(self) -> int:
         """Replay messages the PREVIOUS draining process durably accepted. Rows are claimed
         under this boot's live adapter identities; a claim we cannot dispatch is released
@@ -183,9 +205,13 @@ class GatewayStartupMixin:
                 inflight.add(row["session_key"])
                 def completed(_task, *, key=row["session_key"], accepted=event):
                     inflight.discard(key)
-                    if not getattr(accepted, "_restart_input_admission_failed", False):
+                    if getattr(accepted, "_restart_input_retryable", False):
+                        self._retry_restart_inbox_when_capacity_available()
+                    elif not getattr(accepted, "_restart_input_admission_failed", False):
                         self._schedule_restart_inbox_drain()
                 task.add_done_callback(completed)
+            elif getattr(event, "_restart_input_retryable", False):
+                self._retry_restart_inbox_when_capacity_available()
             elif (getattr(event, "_restart_inbox_agent_started", False)
                   and not getattr(event, "_restart_input_admission_failed", False)):
                 # The turn has executed and owns the claim. A transient DB read failure must not

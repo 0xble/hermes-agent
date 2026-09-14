@@ -2110,10 +2110,17 @@ class GatewayTurnMixin:
                     and prepared.persistence_owner
                     and agent_result.get("not_started_input_owner") == prepared.persistence_owner
                     and session_entry.restart_inbox_link):
-                # Keep the exact durable claim/token for canonical reconciliation.
-                # Do not fabricate ingestion or deliver this input because the
-                # overload notice was sent. A queued successor owns its own receipt.
+                # Only exact non-execution proof permits same-process reconciliation.
+                # The overload notice does not prove ingestion or input delivery.
+                # A queued successor owns its own receipt.
                 event._restart_input_admission_failed = True
+                try:
+                    event._restart_input_retryable = await self.async_session_store.mark_restart_input_not_started(
+                        session_key, getattr(event, "_gateway_active_turn_token", None),
+                        prepared.persistence_owner,
+                    )
+                except Exception:
+                    logger.exception("Could not persist unstarted restart input for retry")
                 await self._hmwa_stop_typing_for_turn(event, source)
                 return agent_result["final_response"]
 
