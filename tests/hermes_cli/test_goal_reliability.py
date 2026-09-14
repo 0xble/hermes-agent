@@ -381,6 +381,34 @@ def test_cli_post_turn_passes_canonical_evidence_and_silences_routine_continue(m
     assert captured["tool_evidence"][0]["tool_call_id"] == "call-cli"
 
 
+def test_cli_does_not_repeat_prepared_goal_stop_explanation(monkeypatch):
+    decision = {
+        "status": "paused",
+        "should_continue": False,
+        "stop_explanation": "Goal paused after the bounded turn.",
+    }
+
+    class Manager:
+        def is_active(self): return False
+        def claim_transition_notice(self, value):
+            raise AssertionError("prepared outcome must not claim another notice")
+
+    cli = _CLI()
+    cli._get_goal_manager = lambda: Manager()
+    cli._last_turn_interrupted = False
+    cli._last_assistant_response_text = lambda: "Goal paused after the bounded turn."
+    cli._last_agent_result = {
+        "_goal_decision": decision,
+        "_goal_outcome_prepared": True,
+    }
+    cli._pending_input = queue.Queue()
+
+    with patch("hermes_cli.cli_loops_mixin._print_decision_message") as printer:
+        cli._maybe_continue_goal_after_turn()
+
+    printer.assert_not_called()
+
+
 def test_judge_prompt_never_receives_credentialed_artifact_or_revision(monkeypatch):
     manager = goals.GoalManager("credentialed-artifact")
     manager.set("Publish the release artifact")

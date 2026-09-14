@@ -26,7 +26,7 @@ import re
 import shlex
 
 
-_GLOB_MASKS = {chr(0xE000 + index): char for index, char in enumerate("*?[]!^-~;&|()\n<>")}
+_GLOB_MASKS = {chr(0xE000 + index): char for index, char in enumerate("*?[]!^-~;&|(){}\n<>")}
 
 
 class ShellWord(str):
@@ -79,7 +79,8 @@ def shell_tokens(command: str) -> list[str]:
         lexer.whitespace_split, lexer.commenters = True, ""
         for token in lexer:
             value = "".join(masks.get(char, char) for char in token)
-            tokens.append(ShellWord(value, token if glob.has_magic(token) else None,
+            pattern = token if glob.has_magic(token) or any(char in token for char in "{}") else None
+            tokens.append(ShellWord(value, pattern,
                                     control=bool(token) and set(token) <= set(";&|()\n")))
         tokens.append(";")
     return tokens
@@ -95,6 +96,8 @@ def destructive_glob_paths(token: str, bases) -> list[str]:
     pattern = getattr(token, "glob_pattern", None)
     if pattern is None:
         return []
+    if "{" in pattern or "}" in pattern:
+        raise ValueError("unsupported shell brace expansion")
     # Validate only destructive patterns, not unrelated regex/read arguments.
     # Python fnmatch cannot safely interpret shell quoting inside classes or
     # POSIX named/collating classes. Unsupported cases fail closed.

@@ -24,6 +24,8 @@ from tools.knowledge_boundary import command_denial_reason
     ("{project}/hidden/[.]alias", False),
     ("{project}/ordinary/*", False),
     ("{home}/memor?es", True),
+    ("{home}/{{memories,skills}}", True),
+    ("'{home}/{{memories,skills}}'", False),
     ("'{home}/*'", False),
     ('"{home}/*"', False),
     (r"{home}/\*", False),

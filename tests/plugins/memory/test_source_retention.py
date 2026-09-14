@@ -151,6 +151,20 @@ def test_transcript_is_complete_source_and_secret_bearing_content_is_skipped():
     ) == []
 
 
+def test_transcript_rejects_unsupported_credentialed_source_url():
+    transcript = "Speaker A: substantive transcript. " * 60
+    candidates = discover_source_candidates(
+        _tool_turn(
+            "speech_to_text",
+            {"source_url": "ftp://alice:credential@example.com/audio?token=credential"},
+            transcript,
+        ),
+        retain_tool_sources=True,
+    )
+
+    assert candidates == []
+
+
 def test_durable_artifact_is_retained_but_scratch_and_code_are_skipped():
     content = "Report finding. " * 60
     retained = discover_source_candidates(

@@ -100,7 +100,7 @@ def _normalize_url(value: str) -> str:
     try:
         parsed = urlsplit(value.strip())
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return value.strip()
+            return ""
         hostname = parsed.hostname.lower()
         if ":" in hostname and not hostname.startswith("["):
             hostname = f"[{hostname}]"
@@ -154,6 +154,8 @@ def _url_identity_value(args: dict[str, Any]) -> str:
         if not isinstance(value, str) or not value.strip():
             continue
         origin = _normalize_url(value)
+        if not origin:
+            continue
         try:
             parsed = urlsplit(value.strip())
             if (
