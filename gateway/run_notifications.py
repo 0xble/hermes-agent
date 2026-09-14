@@ -750,7 +750,10 @@ class GatewayNotificationsMixin:
             _, pending = current
             request = request_identity(pending)
             outcome = final_outcome(paths.pending.parent, pending)
-            unresolved = outcome is None and not process_completed(paths.pending.parent, pending)
+            unresolved = outcome is None and (
+                not process_completed(paths.pending.parent, pending)
+                or (paths.pending.parent / "fleet_restart_pending").exists()
+            )
             if outcome is None:
                 if not timed_out:
                     return False
@@ -780,8 +783,8 @@ class GatewayNotificationsMixin:
             if current is None or request_identity(current[1]) != request:
                 return False
             if unresolved:
-                # The bounded watcher may stop, but the detached writer still owns
-                # admission and every update file. Persist only the notice ACK so
+                # The bounded watcher may stop, but updater/fleet finalization still
+                # owns admission and every update file. Persist only the notice ACK so
                 # restart recovery neither replays it nor mistakes it for completion.
                 marker, pending = current
                 pending["timeout_notified"] = True

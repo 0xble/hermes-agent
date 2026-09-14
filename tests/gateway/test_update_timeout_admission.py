@@ -119,3 +119,66 @@ async def test_timeout_acknowledges_only_accepted_current_request(tmp_path, duri
             finalize_update(tmp_path)
         assert await runner._send_update_notification() is True
         assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_name", [".update_pending.json", ".update_pending.claimed.json"])
+async def test_completed_wrapper_timeout_retains_pending_fleet_obligation(tmp_path, marker_name):
+    data = pending(tmp_path)
+    (tmp_path / ".update_pending.json").rename(tmp_path / marker_name)
+    finalize_update(tmp_path)  # Real persisted successful receipt and wrapper exit 0.
+    fleet_pending = tmp_path / "fleet_restart_pending"
+    fleet_pending.write_text("fleet restart still pending", encoding="utf-8")
+    output = tmp_path / ".update_output.txt"
+    output.write_text("completed wrapper output\n", encoding="utf-8")
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    spawn = Mock()
+    with patch("gateway.run._hermes_home", tmp_path):
+        await asyncio.wait_for(runner._watch_update_progress(timeout=0), 2)
+        current = read_pending(tmp_path)
+        assert current is not None, "timeout released unfinished fleet admission"
+        assert request_identity(current[1]) == request_identity(data)
+        assert current[1]["timeout_notified"] is True
+        assert output.read_text() == "completed wrapper output\n"
+        assert (tmp_path / ".update_process_exit_code").read_text() == "0"
+        assert fleet_pending.exists()
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn) == {
+            "started": False, "pending": True}
+        spawn.assert_not_called()
+        calls = adapter.send.await_count
+        second = _make_runner()
+        second.adapters = {Platform.TELEGRAM: adapter}
+        await asyncio.wait_for(second._watch_update_progress(timeout=0), 2)
+        assert adapter.send.await_count == calls
+        assert read_pending(tmp_path) is not None
+        # The native fleet finalizer has now completed its retained obligation.
+        fleet_pending.unlink()
+        assert await second._send_update_notification() is True
+        assert await second._send_update_notification() is False
+        assert read_pending(tmp_path) is None
+        assert not output.exists()
+        assert not (tmp_path / ".update_process_exit_code").exists()
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn)["started"]
+        spawn.assert_called_once()
+    messages = [call.args[1] for call in adapter.send.call_args_list]
+    assert sum("notification deadline" in text for text in messages) == 1
+    assert sum("completed wrapper output" in text for text in messages) == 1
+    assert sum(text.startswith("✅ Update Complete") for text in messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_wrapper_still_releases_update_admission(tmp_path):
+    pending(tmp_path)
+    (tmp_path / ".update_process_exit_code").write_text("7", encoding="utf-8")
+    (tmp_path / "fleet_restart_pending").write_text("unfulfilled failed update", encoding="utf-8")
+    runner = _make_runner()
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification(timed_out=True) is True
+        assert read_pending(tmp_path) is None
+        assert await runner._send_update_notification(timed_out=True) is False
+    messages = [call.args[1] for call in adapter.send.call_args_list]
+    assert sum("updater exited with code 7" in text for text in messages) == 1
