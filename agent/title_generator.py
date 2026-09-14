@@ -116,7 +116,6 @@ _TITLE_PROMPT_TEMPLATE = (
     "title that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
     "__LENGTH_RULE__\n"
-    "- Use concise Title Case by default, including for technical titles.\n"
     "- Title the concrete subject or artifact discussed, not the conversation's "
     "abstract intent, theme, goal, or emotional tone.\n"
     "- Use a noun phrase, not a command, instruction, recommendation, question, "

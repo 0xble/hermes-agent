@@ -445,6 +445,31 @@ class TestGenerateTitle:
         assert "Fixing" in prompt
         assert "Do not include emoji" in prompt
 
+    @pytest.mark.parametrize("case_style", [None, "sentence_case", "title_case"])
+    def test_request_has_only_configured_casing_guidance(
+        self, tmp_path, monkeypatch, case_style
+    ):
+        """The real config-to-request path must not give competing case rules."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        if case_style is not None:
+            (tmp_path / "config.yaml").write_text(
+                "auxiliary:\n  title_generation:\n"
+                f"    case_style: {case_style}\n"
+            )
+        response = MagicMock()
+        response.choices[0].message.content = '{"title": "Financial report review"}'
+
+        with patch("agent.title_generator.call_llm", return_value=response) as llm:
+            generate_title("Review the quarterly financial report")
+
+        prompt = llm.call_args.kwargs["messages"][0]["content"]
+        expected = "title case" if case_style == "title_case" else "sentence case"
+        conflicting = "sentence case" if case_style == "title_case" else "title case"
+        assert expected in prompt.lower()
+        assert conflicting not in prompt.lower()
+        example = "Mobile Login Fix" if case_style == "title_case" else "Mobile login fix"
+        assert f'Good: {{"title": "{example}"}}' in prompt
+
     def test_compact_preferences_and_name_aliases_are_configurable(self):
         response = MagicMock()
         response.choices = [MagicMock()]
