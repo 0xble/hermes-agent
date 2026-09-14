@@ -180,7 +180,7 @@ def _popen_detached_update(*args, **kwargs):
         raise UpdateChildNotStarted(str(exc)) from exc
 
 
-def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
+def _spawn_detached_update(hermes_cmd, output_path, exit_code_path, *, revision=None) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
     Under systemd the spawn is first placed in a transient user scope (see
     :func:`_systemd_scope_wrap_if_supervised`): ``setsid`` alone is portable (works where
@@ -192,16 +192,20 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     replace it), redirects both outputs to one file and writes the exit code."""
     import shutil
     import subprocess
+    update_args = ["update", "--gateway"]
+    if revision is not None:
+        from hermes_cli.update_revision import validate_revision
+        update_args.extend(["--revision", validate_revision(revision)])
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         _popen_detached_update(
             [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
-             sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
+             sys.executable, "-m", "hermes_cli.main", *update_args],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
-    hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+    hermes_cmd_str = " ".join(shlex.quote(part) for part in [*hermes_cmd, *update_args])
     update_cmd = (
-        f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+        f"PYTHONUNBUFFERED=1 {hermes_cmd_str}"
         f" >> {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
