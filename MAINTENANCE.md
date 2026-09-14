@@ -57,6 +57,14 @@ preflight, child construction and SDK dispatch with synthetic credentials and
 mock transport, proving changed or removed header/query/nested-body values cannot
 reach transport while unchanged values and additional defaults can.
 
+The corresponding metadata fixture now uses the real request builder for all
+frozen channels, and the profile-routing mock binds the real replay ingress
+guard. The hygiene cancellation regression gates its worker until the host
+returns, then verifies deferred cleanup. This replaces a whole-handler latency
+assertion that raced the worker's own timeout. These fixture corrections do not
+change production behavior or relax the cancellation, routing or credential
+contracts.
+
 Follow-up review reproduced loss of authored Telegram link destinations when
 valid Markdown supplies an optional title. Both standard and rich rendering now
 parse the destination before checking supported schemes. Malformed destinations
