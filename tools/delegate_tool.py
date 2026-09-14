@@ -797,6 +797,17 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     resume_credential_pool = None
     resume_credential_id = None
     if provider == "moa":
+        current = definitions[role]
+        current_defaults = defaults if defaults is not None else _load_config()
+        current_provider = current.provider or (
+            getattr(parent_agent, "provider", None) if current.inherit_parent else current_defaults.get("provider")
+        ) or getattr(parent_agent, "provider", None)
+        # A new default does not replace this child's frozen preset. Explicit
+        # provider or allowlist revocation still removes current role authority.
+        if current_provider != "moa" or (
+            current.moa_presets is not None and stored_preset not in current.moa_presets
+        ):
+            raise ValueError("delegated child is no longer authorized by the current named MoA role")
         from agent.moa_loop import restore_moa_preset
         snapshot = restore_moa_preset(launch.get("moa") or {})
         # Reuse the same virtual transport contract as a fresh named MoA child;
