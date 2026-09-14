@@ -79,6 +79,85 @@ async def test_complete_roster_blocks_early_expiry_and_handled_siblings_stay_vis
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_from", ["completion", "restart"])
+@pytest.mark.parametrize("resolution", ["dismissal", "completed_attempt"])
+async def test_unknown_member_retains_batch_until_explicit_resolution(setup, tmp_path, monkeypatch, unknown_from, resolution):
+    import copy
+    import hashlib
+    import json
+
+    manager, source, owner, now, adapter = setup
+    monkeypatch.setattr("gateway.delivery_ledger.delivered_delegation_receipts", lambda: [])
+    key, call = "c" * 32, "d" * 32
+    a = event(owner, key, "A", call, ["A", "B"])
+    b = event(owner, key, "B", call, ["A", "B"])
+    try:
+        for data in (a, b):
+            await emit(manager, source, data)
+        await emit(manager, source, a, "complete", status="completed")
+        if unknown_from == "completion":
+            await emit(manager, source, b, "complete", status="unknown")
+        else:
+            await drain(manager)
+            await manager.shutdown()
+            manager = DelegationCards(manager.runner, home=tmp_path, interval=0, clock=lambda: now[0])
+        await manager.reconcile()
+        await drain(manager)
+        before = copy.deepcopy(manager.cards[key]["rows"])
+        assert before["A"]["state"] == "completed"
+        assert before["B"]["state"] == "unknown"
+        assert ("terminal_at" in before["B"]) is (unknown_from == "completion")
+
+        # Age alone neither establishes completion nor starts the batch TTL.
+        now[0] = 10000
+        await manager.reconcile()
+        await drain(manager)
+        assert labels(manager, key) == {"A", "B"}
+        assert not manager._expiry_timers
+        assert "display_expires_at" not in manager.cards[key]["original_calls"][call]
+        assert manager.cards[key]["rows"] == before
+        assert not manager.cards[key].get("handled")
+        assert not manager.cards[key]["retired"]
+        adapter.delete_message.assert_not_awaited()
+
+        if resolution == "dismissal":
+            await manager.shutdown()
+            raw = manager.path.read_bytes()
+            card = json.loads(raw)[key]
+            manifest = dict(schema="delegation-card-dismissal-v1", snapshot_sha256=hashlib.sha256(raw).hexdigest(),
+                operator="test-operator", authorization="explicit exact-target fixture dismissal", targets=[dict(
+                    parent_task_id=key, owner=card["owner"], source=card["source"], refs=["A", "B"],
+                    message_id=card["message_id"], reason="dismissed", evidence="operator reconciled this fixture")])
+            manager.path.with_name("dismissal-request.json").write_text(json.dumps(
+                dict(snapshot_json=raw.decode(), manifest=manifest)))
+            manager = DelegationCards(manager.runner, home=tmp_path, interval=0, clock=lambda: now[0])
+            await manager.reconcile()
+            await drain(manager)
+            assert manager.cards[key]["rows"] == before
+            assert manager.cards[key]["presentation_dismissal"]["target"] == manifest["targets"][0]
+        else:
+            await emit(manager, source, b, "admitted", attempt=1, resume_claim_id="resolved-attempt")
+            await emit(manager, source, b, "complete", attempt=1,
+                       resume_claim_id="resolved-attempt", status="completed")
+            deadline = manager.cards[key]["original_calls"][call]["display_expires_at"]
+            assert deadline == now[0] + 30
+            scope = manager._scope(manager.cards[key])
+            token = manager._expiry_tokens[scope]
+            now[0] = deadline - 1
+            assert labels(manager, key) == {"A", "B"}
+            now[0] = deadline
+            manager._expiry_callback(scope, key, token)
+            await drain(manager)
+            assert not manager.cards[key]["retired"]
+        assert labels(manager, key) == set()
+        assert not manager.cards[key].get("handled")
+        adapter.delete_message.assert_awaited_once_with("42", "msg")
+    finally:
+        await manager.shutdown()
+        await drain(manager)
+
+
+@pytest.mark.asyncio
 async def test_distinct_calls_sharing_parent_and_anchor_have_independent_deadlines(setup):
     manager, source, owner, now, _ = setup
     key = "c" * 32
