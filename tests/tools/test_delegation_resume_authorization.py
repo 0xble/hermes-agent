@@ -1,5 +1,6 @@
 """Owner-authorized continuation does not confuse cancellation with a user stop."""
 import json
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -69,6 +70,66 @@ def test_stopped_child_explicit_resume_is_atomic_and_single_use(tmp_path, monkey
     assert config["_delegation_completed"] is False
     assert config["_delegation_resume_authorizations"][0]["claim_id"] == "first"
     db.close()
+
+
+@pytest.mark.parametrize('history', ['safe', 'missing', 'cancelled', 'malformed-json',
+                                    'null', 'object', 'malformed-call', 'missing-id'])
+def test_authorized_resume_tool_receipts_are_checked_before_atomic_claim(tmp_path, monkeypatch, history):
+    from tools.delegate_tool import _resolve_resume_launch
+    from tools.delegate_tool_checkpoint import resume_message_fingerprint
+
+    db, definitions, parent = stopped_fixture(tmp_path, monkeypatch)
+    try:
+        db.append_message('child', role='assistant', tool_calls=[{
+            'id': 'read', 'type': 'function', 'function': {'name': 'read_file', 'arguments': '{}'}}])
+        if history != 'missing':
+            content = '[Tool execution cancelled]' if history == 'cancelled' else '{"result":"read succeeded"}'
+            db.append_message('child', role='tool', tool_call_id='read', content=content)
+        malformed = {'malformed-json': '{broken', 'null': 'null', 'object': '{}',
+                     'malformed-call': '[null]', 'missing-id': '[{"type":"function"}]'}
+        if history in malformed:
+            # Model corrupt persisted state directly, without a read helper
+            # dropping malformed calls or synthesizing replacement receipts.
+            with sqlite3.connect(tmp_path / 'state.db') as conn:
+                conn.execute("UPDATE messages SET tool_calls = ? WHERE session_id = 'child' AND role = 'assistant'",
+                                 (malformed[history],))
+        original = db.get_messages('child')
+        with sqlite3.connect(tmp_path / 'state.db') as conn:
+            raw = conn.execute("SELECT tool_calls FROM messages WHERE session_id = 'child' AND role = 'assistant'").fetchone()[0]
+        assert isinstance(raw, str)
+        if history not in malformed:
+            assert isinstance(next(row for row in original if row['role'] == 'assistant')['tool_calls'], list)
+        task = {'resume_session_id': 'child', 'resume_authorization': authorization()}
+        if history != 'safe':
+            # The public read may decode corrupt JSON to an empty collection.
+            # Even then the final claim rechecks exact raw rows, so an apparent
+            # preparation success can never authorize unresolved tool effects.
+            claimed = False
+            try:
+                launch = _resolve_resume_launch(task, definitions, parent)
+                claimed = db.claim_delegated_resumes(
+                    ['child'], claim_id='unsafe', reconciliations={'child': launch.resume_recovery})
+            except ValueError:
+                pass
+            assert not claimed
+            assert db.get_messages('child') == original
+            config = json.loads(db.get_session('child')['model_config'])
+            assert config['_delegation_user_stopped'] is True
+            assert config.get('_delegation_resume_claimed_at') is None
+            return
+        launch = _resolve_resume_launch(task, definitions, parent)
+        recovery = launch.resume_recovery
+        assert recovery['messages_fingerprint'] == resume_message_fingerprint(original)
+        assert db.get_messages('child') == original
+        # A new durable row invalidates the exact reconciliation, even when it
+        # does not introduce a missing receipt. A fresh grant remains usable.
+        db.append_message('child', role='assistant', content='Settled checkpoint')
+        assert not db.claim_delegated_resumes(['child'], claim_id='stale', reconciliations={'child': recovery})
+        fresh = _resolve_resume_launch(task, definitions, parent)
+        assert db.claim_delegated_resumes(['child'], claim_id='fresh', reconciliations={'child': fresh.resume_recovery})
+        assert not db.claim_delegated_resumes(['child'], claim_id='duplicate', reconciliations={'child': fresh.resume_recovery})
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("change", ["new_stop", "message", "lease", "foreign", "unknown_tool"])
