@@ -17,9 +17,12 @@ class ProcessNotificationBatch:
 
     notifications: tuple[tuple[dict, str], ...]
 
+    def _live(self, registry) -> list:
+        return [(event, text) for event, text in self.notifications
+                if not registry.is_completion_consumed(event.get("session_id", ""))]
+
     def render(self, registry) -> str | None:
-        messages = [text for event, text in self.notifications
-                    if not registry.is_completion_consumed(event.get("session_id", ""))]
+        messages = [text for _event, text in self._live(registry)]
         if not messages:
             return None
         if len(messages) == 1:
@@ -28,6 +31,9 @@ class ProcessNotificationBatch:
                   "Treat these results as one batch and give one consolidated response; "
                   "preserve failures and actionable results.]")
         return "\n\n".join((header, *messages))
+
+    def display_text(self, registry) -> str:
+        return process_completion_display_text([event for event, _text in self._live(registry)])
 
 
 def group_process_notifications(notifications):
@@ -286,25 +292,6 @@ def _format_native_review(evt: dict, deleg_id: str, completed_at: float) -> str:
     return "\n".join(lines)
 
 
-def _process_accounting_lines(r: dict) -> list:
-    """Runtime-truth lines about a child's background processes: what it handed to you (you own it now, its
-    completion lands here) and what it left running (terminated at teardown — never trust a child's "watcher running")."""
-    lines = []
-    for h in r.get("handed_off_processes") or []:
-        lines.append(f"Handed off to you: {h.get('session_id')} ({h.get('command', '')[:120]}) — {h.get('note', '')}. "
-                     "You own it now; its completion notice will arrive here.")
-    orphans = r.get("orphaned_processes") or []
-    if orphans:
-        lines.append(f"Child left {len(orphans)} background process(es) running that were TERMINATED with it "
-                     "(subagent process notices never reach you): "
-                     + "; ".join(f"{o.get('session_id')} `{o.get('command', '')[:100]}` ({o.get('runtime_seconds')}s)" for o in orphans)
-                     + ". Re-launch in this session anything you still need.")
-    for u in r.get("unread_completions") or []:
-        lines.append(f"Child's process {u.get('session_id')} `{u.get('command', '')[:100]}` finished (exit code "
-                     f"{u.get('exit_code')}) but the child never read its result; output tail:\n{u.get('output_tail', '')}")
-    return lines
-
-
 def _format_async_delegation(evt: dict) -> str:
     """Self-contained re-injection for an async-delegation completion: the FULL
     original task source (goal, context, toolsets, role, model), dispatch time, status
@@ -370,15 +357,47 @@ def async_delegation_display_text(evt: dict) -> str:
     return f"Subagent Tasks {outcome}: {title} ({len(results)} tasks)"
 
 
-class SubagentNotification(str):
-    """Keep queued model text string-compatible, with a separate human preview."""
+PROCESS_COMPLETE_DISPLAY_KIND = "process_complete"
+
+
+def _short_command(command) -> str:
+    cmd = " ".join(str(command or "").split())
+    return cmd[:77] + "..." if len(cmd) > 80 else cmd
+
+
+def process_completion_display_text(events: list) -> str:
+    """Compact UI title for one or more process completions; the model text keeps the full output."""
+    if len(events) != 1:
+        return f"{len(events)} Background Processes Finished"
+    evt = events[0]
+    reason, exit_code = evt.get("completion_reason") or "exited", evt.get("exit_code", "?")
+    if reason == "killed":
+        outcome = "Terminated"
+    elif reason in _REASON_STATUS:
+        outcome = "Lost" if reason == "lost" else "Failed to Start"
+    else:
+        outcome = "Finished" if exit_code == 0 else "Failed"
+    cmd = _short_command(evt.get("command"))
+    detail = f" (exit {exit_code})" if reason not in ("killed", *_REASON_STATUS) and exit_code != 0 else ""
+    return f"Background Process {outcome}{detail}: {cmd}" if cmd else f"Background Process {outcome}{detail}"
+
+
+class TimelineNotification(str):
+    """Queued model text that stays string-compatible, plus the display kind and compact human
+    title the surface paints instead of the raw notification wall."""
 
     display_text: str
+    display_kind: str
 
-    def __new__(cls, text: str, event: dict):
+    def __new__(cls, text: str, display_text: str, display_kind: str):
         instance = super().__new__(cls, text)
-        instance.display_text = async_delegation_display_text(event)
+        instance.display_text = display_text
+        instance.display_kind = display_kind
         return instance
+
+    @classmethod
+    def for_delegation(cls, text: str, event: dict) -> "TimelineNotification":
+        return cls(text, async_delegation_display_text(event), "async_delegation_complete")
 
 
 def _delegation_attribution_line(evt: dict) -> "str | None":
@@ -399,9 +418,6 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
     goal = goal[:117] + "..." if len(goal) > 120 else goal
     return (f"Started by subagent {task_id}" + (f" of delegation {deleg}" if deleg else "") + "."
             + (f' Task: "{goal}"' if goal else ""))
-
-
-_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
 
 
 def _completion_status(evt: dict) -> str:

@@ -39,7 +39,8 @@ def test_canonical_rewrite_invalidates_only_its_replay_sidecar(tmp_path, monkeyp
         assert messages[0]["api_content"] == "earlier user context"
         assert messages[1]["api_content"] == "earlier wire"
         replay_agent = SimpleNamespace(_copy_reasoning_content_for_api=lambda *a: None,
-            _should_sanitize_tool_calls=lambda: False, ephemeral_system_prompt=None)
+            _should_sanitize_tool_calls=lambda: False, ephemeral_system_prompt=None,
+            _current_turn_timestamp=10_000.0)
         for history in (messages, db.get_messages_as_conversation(agent.session_id)):
             wire, _ = build_api_messages(replay_agent, history, current_turn_user_idx=None,
                 ext_prefetch_cache=None, plugin_user_context=None, moa_config=None, active_system_prompt=None)

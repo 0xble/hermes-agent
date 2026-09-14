@@ -329,6 +329,21 @@ class TestMemoryManager:
         assert "removed=0" in info_text
         assert "private_late_tool" not in info_text
 
+    def test_failed_schema_load_leaves_manager_unregistered(self):
+        """A provider whose get_tool_schemas() raises must not poison the single-external slot (#9948)."""
+        class BrokenProvider(FakeMemoryProvider):
+            def get_tool_schemas(self):
+                raise RuntimeError("boom")
+
+        mgr = MemoryManager()
+        with pytest.raises(RuntimeError):
+            mgr.add_provider(BrokenProvider("broken"))
+        assert mgr.providers == []
+
+        ok = FakeMemoryProvider("ok")
+        mgr.add_provider(ok)
+        assert mgr.get_provider("ok") is ok
+
     def test_on_turn_start_passes_each_provider_only_the_kwargs_it_accepts(self):
         """A provider with the two-positional ``on_turn_start`` still runs; one declaring the author kwargs gets them."""
         class AuthorAwareProvider(FakeMemoryProvider):
@@ -366,7 +381,7 @@ class TestMemoryManager:
         assert "external memory prefetch output truncated" in result
         spill_files = list((tmp_path / "session-1").glob("*.txt"))
         assert len(spill_files) == 1
-        assert spill_files[0].read_text() == provider._prefetch_result + "\n"
+        assert spill_files[0].read_text(encoding="utf-8") == provider._prefetch_result + "\n"
 
     def test_builtin_prefetch_is_not_spilled(self, tmp_path, monkeypatch):
         self._set_spill_config(monkeypatch, tmp_path, max_chars=10)
@@ -579,10 +594,10 @@ class TestUserInstalledProviderDiscovery:
             "    def sync_turn(self, *a, **kw): pass\n"
             "    def get_tool_schemas(self): return []\n"
             "    def handle_tool_call(self, *a, **kw): return '{}'\n"
-        )
+        , encoding="utf-8")
         (plugin_dir / "plugin.yaml").write_text(
             f"name: {name}\ndescription: Test user provider\n"
-        )
+        , encoding="utf-8")
         return plugin_dir
 
 
@@ -615,7 +630,7 @@ class TestUserInstalledProviderDiscovery:
             "    def sync_turn(self, *a, **kw): pass\n"
             "    def get_tool_schemas(self): return []\n"
             "    def handle_tool_call(self, *a, **kw): return '{}'\n"
-        )
+        , encoding="utf-8")
         monkeypatch.setattr(
             "plugins.memory._get_user_plugins_dir",
             lambda: tmp_path / "plugins",
@@ -740,7 +755,7 @@ class TestEntryPointMemoryProviderDiscovery:
             skill_md.write_text(
                 "---\nname: maintenance\ndescription: Memory maintenance\n---\n\n"
                 "Packaged provider maintenance body.\n"
-            )
+            , encoding="utf-8")
             register_skill = (
                 "    ctx.register_skill(\n"
                 "        'maintenance',\n"
@@ -1664,3 +1679,40 @@ class TestSystemPromptGateParity:
         assert added == 1
         names = {t["function"]["name"] for t in agent.tools}
         assert "mnemosyne_remember" in names
+
+
+def test_registration_consumes_new_provider_schemas_once():
+    class OneReadProvider(FakeMemoryProvider):
+        reads = 0
+
+        def get_tool_schemas(self):
+            self.reads += 1
+            if self.reads != 1:
+                raise RuntimeError("schemas already consumed")
+            return iter([{"name": "snapshot_tool", "description": "snapshot", "parameters": {}}])
+
+    provider = OneReadProvider("external")
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    assert provider.reads == 1
+    assert manager.has_tool("snapshot_tool")
+    assert json.loads(manager.handle_tool_call("snapshot_tool", {}))["handled"] == "snapshot_tool"
+
+
+def test_registration_schema_generator_failure_does_not_reserve_external_slot():
+    class BrokenProvider(FakeMemoryProvider):
+        def get_tool_schemas(self):
+            yield {"name": "partial_tool", "description": "partial", "parameters": {}}
+            raise RuntimeError("schema iteration failed")
+
+    manager = MemoryManager()
+    builtin = FakeMemoryProvider("builtin", tools=[{"name": "existing_tool", "parameters": {}}])
+    manager.add_provider(builtin)
+    before = manager.get_all_tool_names()
+    with pytest.raises(RuntimeError, match="schema iteration failed"):
+        manager.add_provider(BrokenProvider("broken"))
+    assert manager.providers == [builtin]
+    assert manager.get_all_tool_names() == before
+    replacement = FakeMemoryProvider("replacement")
+    manager.add_provider(replacement)
+    assert manager.get_provider("replacement") is replacement

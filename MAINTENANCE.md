@@ -81,6 +81,15 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 ## Background
 
+### Frozen upstream reconciliation, September 13, 2026
+
+- Candidate cutoff: `ee4452991d17534aa561f31ee55596d082aa94e7`; the run's immutable source-helper evidence owns test, review and publication status. This source integration does not authorize runtime activation.
+- Shared effective-config loading retains authored-layer preset expansion before defaults/managed route merging, including gateway, TUI, cron, and last-known-good recovery. Upstream's presence-sensitive readers still do not inject defaults.
+- Adopt upstream cron wall-clock/DST calculations and elapsed-time intervals while retaining per-job IANA zones, reservation ownership, paused manual-run schedules, and bounded unreachable-model retries.
+- Adopt upstream manual-compression and native-approval interfaces without losing live-session dedup reset, reconnect-safe Telegram approval prompts, receipt-owned progress or generation-fenced cancellation.
+- Preserve updater completion verification through upstream dependency-repair decomposition; all updater exercises in this source run use isolated test doubles, not installed-runtime updates.
+- Adopt upstream test/document relocation; fork-only tests remain under `tests/agent` and `tests/hermes_state`, with canonical import references. Upstream's removed GitHub fallback remains removed under the fork's trusted CI policy.
+
 ### Frozen upstream reconciliation, September 12, 2026
 
 - Frozen upstream: `f364c19775617acb6c16140b790cda9fb05e1906`, integrating 177 commits from the September 11 cutoff. Source verification and publication remain separate from runtime promotion.

@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 import pytest
 import yaml
-from tests.run_agent.test_custom_subagent_runtime import make_child
+from tests.agent.test_custom_subagent_runtime import make_child
 from tools.delegate_tool import _preflight_task_runtime, _build_child_agent
 
 @pytest.fixture

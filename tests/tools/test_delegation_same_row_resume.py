@@ -17,7 +17,7 @@ from tools import delegate_tool
     ("request_overrides", {"authorization": "PRIVATE-OVERRIDE"}, "request_overrides"),
 ])
 def test_resume_reports_only_mismatched_field_names(monkeypatch, field, value, diagnostic):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, definitions, parent = _resume_fixture(monkeypatch)
     creds = {"provider": "fixture", "model": "m", "base_url": "https://fixture/v1",
              "api_key": "secret", "api_mode": "chat_completions"}
@@ -31,7 +31,7 @@ def test_resume_reports_only_mismatched_field_names(monkeypatch, field, value, d
 
 
 def test_resume_accepts_equivalent_normalized_route_without_repinning(monkeypatch):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, definitions, parent = _resume_fixture(monkeypatch)
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
         "provider": "fixture", "model": "m", "base_url": "https://fixture/v1/",
@@ -42,7 +42,7 @@ def test_resume_accepts_equivalent_normalized_route_without_repinning(monkeypatc
 
 
 def test_resume_authority_resolution_errors_do_not_expose_values(monkeypatch):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     _, definitions, parent = _resume_fixture(monkeypatch)
     def refuse(*a, **kw):
         raise ValueError("PRIVATE-ROUTE-VALUE")
@@ -58,7 +58,7 @@ def test_resume_authority_resolution_errors_do_not_expose_values(monkeypatch):
 @pytest.mark.parametrize("corrupt", [False, True])
 @pytest.mark.parametrize("stopped", [False, True])
 def test_normal_resume_dispatch_restores_logical_identity(tmp_path, monkeypatch, corrupt, stopped, compressed, historical):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, _, _ = _resume_fixture(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     owner = {"profile": str(tmp_path), "session_id": "root", "session_key": "", "chat_id": "", "thread_id": "", "topic_id": ""}

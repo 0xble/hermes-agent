@@ -35,7 +35,7 @@ def test_internal_child_stop_retains_cancellation_provenance():
 
 
 def stopped_fixture(tmp_path, monkeypatch):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     metadata, definitions, _ = _resume_fixture(monkeypatch)
     db = SessionDB(db_path=tmp_path / "state.db")
     db.create_session("root", source="cli")

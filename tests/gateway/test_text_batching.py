@@ -53,7 +53,7 @@ def _make_discord_adapter():
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(DiscordAdapter)
-    adapter._platform = Platform.DISCORD
+    adapter._platform = adapter.platform = Platform.DISCORD
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -111,7 +111,7 @@ def _make_matrix_adapter():
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(MatrixAdapter)
-    adapter._platform = Platform.MATRIX
+    adapter._platform = adapter.platform = Platform.MATRIX
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -166,7 +166,7 @@ def _make_wecom_adapter():
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(WeComAdapter)
-    adapter._platform = Platform.WECOM
+    adapter._platform = adapter.platform = Platform.WECOM
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -221,7 +221,7 @@ def _make_telegram_adapter():
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(TelegramAdapter)
-    adapter._platform = Platform.TELEGRAM
+    adapter._platform = adapter.platform = Platform.TELEGRAM
     adapter.config = config
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
@@ -255,7 +255,7 @@ def _make_feishu_adapter():
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(FeishuAdapter)
-    adapter._platform = Platform.FEISHU
+    adapter._platform = adapter.platform = Platform.FEISHU
     adapter.config = config
     batch_state = FeishuBatchState()
     adapter._pending_text_batches = batch_state.events

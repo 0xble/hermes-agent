@@ -50,7 +50,7 @@ def test_interrupted_checkpoint_boundaries(tmp_path, boundary, allowed):
 
 
 def test_interrupted_resume_freezes_route_owner_and_context(tmp_path, monkeypatch):
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     from tools.delegate_tool import _resolve_resume_launch
     metadata, definitions, _ = _resume_fixture(monkeypatch)
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -78,7 +78,7 @@ def test_interrupted_resume_freezes_route_owner_and_context(tmp_path, monkeypatc
 def test_failed_builder_checkpoint_and_same_child_recovery(tmp_path, monkeypatch, boundary):
     from tools.delegate_tool_child_run import _build_result_entry, _SchemaOutcome
     from tools.delegate_tool import _resolve_resume_launch
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     from tools import process_registry as pr
 
     monkeypatch.setenv("HOME", str(tmp_path))

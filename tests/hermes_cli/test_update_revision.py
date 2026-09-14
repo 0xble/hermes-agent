@@ -349,7 +349,7 @@ def test_finish_already_up_to_date_verifies_runtime_after_catchup(monkeypatch, t
     ))
     update_cmd._finish_already_up_to_date(
         ["git"], "pinned revision", "HEAD", plan, assume_yes=True, gateway_mode=False,
-        gw_input_fn=None, pre_update_snapshot_id=None, desktop_dir=tmp_path,
+        gw_input_fn=None, pre_update_snapshot_id=None,
         had_desktop_app_before_update=False, active_lazy_features=None,
         active_tool_dependencies=None, _windows_gateway_resume=None,
         final_head_guard=lambda: calls.append("runtime"),
@@ -381,7 +381,7 @@ def test_deferred_verified_completion_false_exits_partial(monkeypatch, tmp_path)
     with pytest.raises(SystemExit) as error:
         update_cmd._finish_already_up_to_date(
             ["git"], "pinned revision", "HEAD", plan, assume_yes=True, gateway_mode=True,
-            gw_input_fn=None, pre_update_snapshot_id=None, desktop_dir=tmp_path,
+            gw_input_fn=None, pre_update_snapshot_id=None,
             had_desktop_app_before_update=False, active_lazy_features=None,
             active_tool_dependencies=None, _windows_gateway_resume=None,
             final_head_guard=lambda: calls.append("runtime"),

@@ -507,7 +507,7 @@ def test_lost_process_owner_fence_survives_restart_and_same_child_resume(tmp_pat
     from tools import process_registry as pr
     from tools import process_registry_results as receipts
     from tools.delegate_tool import _resolve_resume_launch
-    from tests.run_agent.test_delegation_frozen_runtime import _resume_fixture
+    from tests.agent.test_delegation_frozen_runtime import _resume_fixture
     from gateway.session_context import scoped_current_session_id
     import utils
 

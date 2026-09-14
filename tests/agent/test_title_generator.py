@@ -253,6 +253,29 @@ class TestGenerateTitle:
         assert failures[0][0] == "title generation"
         assert "truncated response" in str(failures[0][1])
 
+    def test_generate_title_disables_reasoning(self):
+        """The titling pass must explicitly disable thinking (#91927).
+
+        With the aux default reasoning_effort "" (provider default), Gemini
+        bills internal thought tokens against max_tokens=64, the JSON payload
+        never lands, and the prose fallback stores the opening fence
+        ("```json") as the title. Enforce the module's documented
+        thinking-disabled contract at the call site.
+        """
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Reasoning Off"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            assert generate_title("question") == "Reasoning Off"
+
+        assert captured_kwargs["reasoning_config"]["enabled"] is False
+
 
 
     def test_strips_think_blocks(self):

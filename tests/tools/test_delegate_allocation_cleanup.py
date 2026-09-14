@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tests.run_agent.test_custom_subagent_runtime import make_child
+from tests.agent.test_custom_subagent_runtime import make_child
 from tools import delegate_tool
 from tools.custom_subagents import SubagentDefinition
 import hermes_state_registry as registry
