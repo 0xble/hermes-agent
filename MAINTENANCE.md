@@ -75,6 +75,34 @@ and a newer durable row invalidates the earlier fingerprint. The raw SQLite
 representation and decoded public read are both checked without fabricating
 receipts or clearing stop authority outside the existing claim transaction.
 
+Update notification deadlines retain native update admission while an explicit
+`fleet_restart_pending` obligation remains, even when the wrapper has exited.
+The timeout acknowledgement survives runner restart without duplicate delivery,
+and later verified fleet completion sends the final notice once and releases
+admission. Explicit failed-wrapper outcomes and the existing completed-wrapper
+without-usable-receipt timeout contract remain unchanged. The real watcher,
+persisted receipt and launch-admission regressions live in
+`tests/gateway/test_update_timeout_admission.py`.
+
+Initial background children execute in process-local daemon threads and report
+card events through captured in-memory callbacks. They do not survive a gateway
+process restart. Recovery replays durable `async_delegation` result notifications,
+not claimless `subagent.complete` callbacks. Recovered unknown card rows therefore
+retain the existing admitted-resume claim requirement and conservative retention.
+The contrary review allegation did not establish a production callback path.
+Possible reconciliation of a persisted completion with a lost card update would
+require separately proven durable receipt authority, not relaxation of that guard.
+
+Named child execution now carries its read-only knowledge mode into the worker
+thread, where the existing context and subprocess environment propagation enforce
+first-party mutation restrictions. Memory-history rollback checks that authority
+before reading or writing history/store state. A real named AIAgent executed via
+`_ChildRun.await_child` verifies direct rollback, the persistent `execute_code`
+subprocess and the terminal rollback CLI all refuse mutation, while parent and
+ordinary unnamed callers retain their existing behavior. Coverage lives in
+`tests/tools/test_memory_history_named_child.py`. This closes the first-party API
+and execution-context gap, not arbitrary Python or shell filesystem confinement.
+
 Follow-up review reproduced loss of authored Telegram link destinations when
 valid Markdown supplies an optional title. Both standard and rich rendering now
 parse the destination before checking supported schemes. Malformed destinations
