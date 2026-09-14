@@ -65,6 +65,61 @@ def _orphan(queue_id):
         )
 
 
+def test_legacy_column_migration_tolerates_concurrent_winner(monkeypatch):
+    path = inbox._db_path()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE restart_inbox (
+                queue_id TEXT PRIMARY KEY,
+                session_key TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                adapter_profile TEXT NOT NULL DEFAULT 'default',
+                event_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+
+    real_connect = sqlite3.connect
+    raced = False
+
+    class RacingConnection:
+        def __init__(self, connection):
+            object.__setattr__(self, "connection", connection)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+        def __setattr__(self, name, value):
+            setattr(self.connection, name, value)
+
+        def execute(self, sql, *args, **kwargs):
+            nonlocal raced
+            if not raced and sql.startswith("ALTER TABLE restart_inbox ADD COLUMN protocol"):
+                raced = True
+                self.connection.execute(sql, *args, **kwargs)
+                raise sqlite3.OperationalError("duplicate column name: protocol")
+            return self.connection.execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(
+        inbox.sqlite3,
+        "connect",
+        lambda *args, **kwargs: RacingConnection(real_connect(*args, **kwargs)),
+    )
+
+    conn = inbox._connect(path)
+    conn.close()
+
+    with real_connect(path) as check:
+        columns = {row[1] for row in check.execute("PRAGMA table_info(restart_inbox)")}
+    assert raced is True
+    assert {"protocol", "input_owner"} <= columns
+
+
 def test_round_trip_preserves_normalized_event_without_raw_platform_object():
     original = _event()
     payload = inbox.serialize_event(original)

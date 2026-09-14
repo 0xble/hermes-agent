@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli.sqlite_util import add_column_if_missing
 from hermes_constants import get_hermes_home
 
 _LOCK = threading.Lock()
@@ -90,7 +91,7 @@ def _connect(db_path=None) -> sqlite3.Connection:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(restart_inbox)")}
     for name, declaration in (("protocol", "INTEGER NOT NULL DEFAULT 0"), ("input_owner", "TEXT")):
         if name not in columns:
-            conn.execute(f"ALTER TABLE restart_inbox ADD COLUMN {name} {declaration}")
+            add_column_if_missing(conn, "restart_inbox", name, f"{name} {declaration}")
     return conn
 
 
