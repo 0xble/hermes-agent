@@ -6,7 +6,8 @@ Task IDs, internal display references and original task start times do not chang
 
 ## Symbol-first presentation
 
-Only the heading text is bold: 🧵 **Delegating tasks** (the emoji is plain text).
+The presentation starts directly with the first task, without a heading or blank
+replacement line. An empty projection emits no text and is not sent to Telegram.
 Rows show `○ Task label · Role` for running, `◌` for queued, `✓` for returned,
 `!` for failed/error/timeout and `Ⅱ` for interrupted/cancelled/budget exhaustion
 or unproven recovered execution. Returned activity is `Awaiting parent`; failed

@@ -29,7 +29,8 @@ def main():
         assert text.count("Verify child") == cap
         assert "without shortening" in text
         (directory / f"cap-{cap}.txt").write_text(text, encoding="utf-8")
-        body = html.escape(text).replace("**Delegating tasks**", "<b>Delegating tasks</b>")
+        assert text.startswith("○ ")  # First task, not a heading or blank line.
+        body = html.escape(text)
         cards.append(f"<section><h2>Root cap {cap}</h2><article>{body}</article></section>")
     page = '''<!doctype html><meta charset="utf-8"><title>Synthetic delegation root window</title>
 <style>body{font:16px/1.55 system-ui;margin:24px;background:#f2f2f2;color:#161616}

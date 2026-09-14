@@ -54,7 +54,7 @@ def _row_prefix(depth):
 
 def render_card(card, now=None, *, max_visible_roots=5):
     # Plain rich text: cards must never render as a native quote or fake border.
-    lines = ["🧵 **Delegating tasks**"]
+    lines = []
     # Legacy rows precede newly admitted identities; stable sort preserves stored
     # card/row order for old records and ties, without relying on wall clocks.
     rows = dict(sorted(card["rows"].items(), key=lambda item: presentation.row_order(item[1])))
