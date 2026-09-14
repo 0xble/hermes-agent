@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -427,6 +428,31 @@ class TestSecondaryProfileFatalRecovery:
         assert runner._profile_failed_platforms == {}
 
 
+@pytest_asyncio.fixture
+async def held_reconnect_recovery(monkeypatch):
+    """Keep post-install recovery pending until the test explicitly releases it."""
+    held = []
+
+    def install(runner):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def drain():
+            started.set()
+            await release.wait()
+            return 0
+
+        monkeypatch.setattr(runner, "_drain_restart_inbox", drain)
+        held.append((runner, release))
+        return started, release
+
+    yield install
+    for runner, release in held:
+        release.set()
+        tasks = list(runner._background_tasks)
+        if tasks:
+            await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+
 class TestSecondaryStartupFailureRecovery:
     """Cold-start connect failures must reach the same reconnect slot as
     mid-run fatals — one unlucky connect window must not kill the platform
@@ -434,9 +460,10 @@ class TestSecondaryStartupFailureRecovery:
 
     @pytest.mark.asyncio
     async def test_retryable_initial_failure_schedules_reconnect(
-        self, monkeypatch
+        self, monkeypatch, held_reconnect_recovery
     ):
         runner = _secondary_recovery_runner()
+        recovery_started, release_recovery = held_reconnect_recovery(runner)
         failed = _SecondaryRecoveryAdapter()
         replacement = _SecondaryRecoveryAdapter()
         scoped_homes: list[Path] = []
@@ -479,15 +506,14 @@ class TestSecondaryStartupFailureRecovery:
         # gateway is already running) to the regular reconnect task, which
         # publishes the replacement and clears its own slot.
         await asyncio.wait_for(bridge[0], timeout=0.5)
-        # The reconnect runner hops to a worker thread for secret hydration,
-        # so wait on a deadline rather than a fixed number of loop turns.
-        deadline = time.monotonic() + 1.0
-        while (
-            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
-            is not replacement
-            and time.monotonic() < deadline
-        ):
-            await asyncio.sleep(0.005)
+        # Adapter publication precedes awaited inbox recovery. The reconnect
+        # task still owns its slot until that recovery finishes.
+        await asyncio.wait_for(recovery_started.wait(), timeout=5)
+        reconnect = runner._profile_failed_platforms["reviewer"][Platform.DISCORD]
+        assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        assert not reconnect.done()
+        release_recovery.set()
+        await asyncio.wait_for(reconnect, timeout=5)
         assert (
             runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
         )
@@ -503,9 +529,10 @@ class TestSecondaryStartupFailureRecovery:
 
     @pytest.mark.asyncio
     async def test_raising_initial_connect_schedules_reconnect(
-        self, monkeypatch
+        self, monkeypatch, held_reconnect_recovery
     ):
         runner = _secondary_recovery_runner()
+        recovery_started, release_recovery = held_reconnect_recovery(runner)
         failed = _SecondaryRecoveryAdapter()
         replacement = _SecondaryRecoveryAdapter()
         _install_secondary_reconnect_context(monkeypatch, runner, replacement)
@@ -534,15 +561,14 @@ class TestSecondaryStartupFailureRecovery:
         bridge = list(runner._background_tasks)
         assert len(bridge) == 1
         await asyncio.wait_for(bridge[0], timeout=0.5)
-        # The reconnect runner hops to a worker thread for secret hydration,
-        # so wait on a deadline rather than a fixed number of loop turns.
-        deadline = time.monotonic() + 1.0
-        while (
-            runner._profile_adapters.get("reviewer", {}).get(Platform.DISCORD)
-            is not replacement
-            and time.monotonic() < deadline
-        ):
-            await asyncio.sleep(0.005)
+        # Adapter publication precedes awaited inbox recovery. The reconnect
+        # task still owns its slot until that recovery finishes.
+        await asyncio.wait_for(recovery_started.wait(), timeout=5)
+        reconnect = runner._profile_failed_platforms["reviewer"][Platform.DISCORD]
+        assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        assert not reconnect.done()
+        release_recovery.set()
+        await asyncio.wait_for(reconnect, timeout=5)
         assert (
             runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
         )
