@@ -257,12 +257,26 @@ def advance_goal_control_revision(session_id: str) -> int:
     if not sid:
         return 0
     with _goal_control_lock(sid):
-        revision = _read_goal_control_revision_unlocked(sid) + 1
-        _MODEL_GOAL_CONTROL_REVISIONS[_goal_control_cache_key(sid)] = revision
+        cache_key = _goal_control_cache_key(sid)
+        revision = _MODEL_GOAL_CONTROL_REVISIONS.get(cache_key, 0) + 1
+        _MODEL_GOAL_CONTROL_REVISIONS[cache_key] = revision
         db = _get_session_db()
         if db is not None:
             try:
-                db.set_meta(_goal_control_revision_key(sid), str(revision))
+                key = _goal_control_revision_key(sid)
+                while True:
+                    baseline = db.get_meta(key)
+                    try:
+                        stored = int(baseline or 0)
+                    except (TypeError, ValueError):
+                        logger.warning("Goal control revision is invalid for %s", sid)
+                        stored = 0
+                    revision = max(revision, stored + 1)
+                    _MODEL_GOAL_CONTROL_REVISIONS[cache_key] = revision
+                    # The local lock protects this process only. A competing control
+                    # must invalidate our snapshot instead of publishing the same token.
+                    if db.compare_and_set_meta({key: baseline}, {key: str(revision)}):
+                        break
             except Exception as exc:
                 logger.warning(
                     "Goal control revision %s for %s was not persisted: %s",
