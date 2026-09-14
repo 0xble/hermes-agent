@@ -7,6 +7,9 @@ named on the child's result as orphaned before teardown kills it.
 """
 
 import json
+import shlex
+import socket
+import sys
 import time
 import weakref
 
@@ -49,7 +52,28 @@ def clean_queue():
         process_registry.completion_queue.get_nowait()
 
 
-def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(clean_queue):
+@pytest.fixture
+def held_child():
+    """Keep a real child alive until the test explicitly releases its socket read."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10)
+        script = (
+            f"import socket; s = socket.create_connection({listener.getsockname()!r}); "
+            "assert s.recv(1) == b'x'; print('ci-green')"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        def release():
+            connection, _ = listener.accept()
+            with connection:
+                connection.sendall(b"x")
+
+        yield command, release
+
+
+def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(clean_queue, held_child):
     """A real child-owned process handed off carries the parent's owner id (so the parent's drain accepts it, with the
     handoff purpose), while a sibling the child did not hand off is still owned by the child and is listed as orphaned
     on the child's result."""
@@ -58,24 +82,26 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     child = _Child(parent)
     _register(sid, child)
     try:
-        handed = process_registry.spawn_local("sleep 0.4; echo ci-green", task_id=sid, owner_task_id=sid)
+        command, release = held_child
+        handed = process_registry.spawn_local(command, task_id=sid, owner_task_id=sid)
         handed.notify_on_complete = True
         leftover = process_registry.spawn_local("sleep 30", task_id=sid, owner_task_id=sid)
 
         out = json.loads(_handle_process(
             {"action": "handoff", "session_id": handed.id, "data": "CI watcher for PR 1"}, task_id=sid))
-        assert out["status"] == "handed_off"
+        assert out.get("status") == "handed_off", out
         assert handed.owner_task_id == "parent-turn-1" and handed.session_key == "sess-handoff"
         assert child._handed_off_processes[0]["session_id"] == handed.id
 
         # Only the un-handed sibling is left in the child's name — this is what the result entry reports as orphaned.
         assert [s.id for s in process_registry.running_owned_by(sid)] == [leftover.id]
 
-        # Let it exit on its own — a registry wait() would mark the completion consumed (that is the parent-observed path).
-        deadline = time.time() + 10
-        while process_registry.completion_queue.empty() and time.time() < deadline:
-            time.sleep(0.05)
-        assert handed.exited
+        # Release only after handoff. Registry wait() would consume the completion,
+        # so await publication directly before the parent's notification drain.
+        release()
+        assert handed._completion_event.wait(10)
+        assert handed.exited and handed.exit_code == 0
+        assert "ci-green" in handed.output_buffer
         # The parent drains with the default suppression of sa- owners: the handed-off completion passes it.
         events = process_registry.drain_notifications(owns_event=lambda e: True)
         mine = [(e, text) for e, text in events if e.get("session_id") == handed.id]
