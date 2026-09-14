@@ -142,6 +142,9 @@ def reserve_delegation_metadata(*, parent_task_id: Optional[str], owner: Dict[st
             or any(not isinstance(ref, str) or not re.fullmatch(r"[A-Z]+", ref) for ref in resume_refs)):
         raise ValueError("Continuation requires exact existing refs and parent task identity")
     with _DB_LOCK, _transaction() as conn:
+        # Existing-parent allocations otherwise read the counter before sqlite3
+        # starts a write transaction. The Python lock cannot fence other processes.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT owner_json FROM delegation_parent_tasks WHERE parent_task_id=?", (parent_task_id,)).fetchone()
         if supplied_parent_task_id:
             if row is None:
@@ -370,13 +373,13 @@ def _prune_durable_records() -> None:
         # SELECT alone does not begin sqlite3's implicit write transaction.
         # Fence competing claims/metadata changes before deciding eligibility.
         conn.execute("BEGIN IMMEDIATE")
-        exhausted = conn.execute("""SELECT delegation_id, task_json, result_json, event_json,
+        exhausted = conn.execute("""SELECT delegation_id, task_json, result_json, event_json, state,
                         parent_task_id, thread_number, task_label, owner_json
-               FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled')
+               FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled','unknown')
                  AND delivery_state='pending_recovery' AND delivery_claim IS NULL
                  AND delivery_attempts>=? AND delivery_recovery_attempts>=?""",
             (_MAX_DELIVERY_ATTEMPTS, _MAX_DELIVERY_RECOVERIES)).fetchall()
-        for uid, task_json, result_json, event_json, *projection in exhausted:
+        for uid, task_json, result_json, event_json, state, *projection in exhausted:
             if any(value not in (None, "") for value in projection):
                 continue
             if _has_retained_result(task_json, result_json):
@@ -386,6 +389,16 @@ def _prune_durable_records() -> None:
             except (TypeError, ValueError):
                 continue
             if not all(isinstance(payload, dict) for payload in (task, result, event)):
+                continue
+            # Recovery records an explicit terminal unknown outcome when an owner
+            # disappears. A bare/unrecognized lifecycle state is not that proof.
+            if state == 'unknown' and not (
+                event.get('type') == 'async_delegation'
+                and event.get('delegation_id') == uid
+                and event.get('status') == result.get('status') == 'unknown'
+                and isinstance(event.get('error'), str) and event['error']
+                and result.get('error') == event['error']
+            ):
                 continue
             entries = result.get("results", [])
             if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
@@ -453,6 +466,8 @@ def release_result_retention(*, owner: Dict[str, Any], parent_task_id: str,
     owner_json = json.dumps(owner, sort_keys=True, separators=(",", ":"))
     changed = 0
     with _DB_LOCK, _transaction() as conn:
+        # Merge exact-attempt receipts under a cross-process write reservation.
+        conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute("""SELECT delegation_id, task_json, result_json FROM async_delegations
                WHERE parent_task_id=? AND owner_json=?""", (parent_task_id, owner_json)).fetchall()
         for delegation_id, task_json, result_json in rows:

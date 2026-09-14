@@ -126,3 +126,28 @@ def test_pruner_locks_eligibility_snapshot_against_second_connection(tmp_path, m
         assert contender.execute("SELECT owner_json FROM async_delegations WHERE delegation_id='contended'").fetchone() == ('{"owner":"after"}',)
     finally:
         contender.close()
+
+
+@pytest.mark.parametrize('pruning', ['age', 'capacity'])
+def test_known_owner_abandoned_outcome_enters_exhausted_history(tmp_path, monkeypatch, pruning):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(ad, '_db_path', lambda: tmp_path / 'async.db')
+    monkeypatch.setattr(ad, '_MAX_DELIVERY_ATTEMPTS', 1)
+    monkeypatch.setattr(ad, '_MAX_RETAINED_COMPLETED', 0)
+    ad._persist_dispatch({'delegation_id': 'abandoned', 'session_key': 'unavailable',
+                          'dispatched_at': time.time()})
+    # Null owner means no process to probe or terminate.
+    with ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET owner_pid=NULL WHERE delegation_id='abandoned'")
+    assert ad.recover_abandoned_delegations() == 1
+    for cycle in range(ad._MAX_DELIVERY_RECOVERIES + 1):
+        if cycle:
+            assert ad.recover_completion_delivery('abandoned')
+        assert ad.claim_completion_delivery('abandoned', 'claim')
+        assert ad.release_completion_delivery('abandoned', 'claim')
+    if pruning == 'age':
+        monkeypatch.setattr(ad, '_MAX_RETAINED_COMPLETED', 50)
+        with ad._transaction() as conn:
+            conn.execute("UPDATE async_delegations SET updated_at=0 WHERE delegation_id='abandoned'")
+    ad._prune_durable_records()
+    assert ad.get_durable_delegation('abandoned') is None
