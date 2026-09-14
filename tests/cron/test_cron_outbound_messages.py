@@ -445,7 +445,8 @@ class TestSendGate:
         ))
 
         assert result == {
-            "error": "No live adapter for profile 'default' and platform 'telegram'"
+            "error": "No live adapter for profile 'default' and platform 'telegram'",
+            "delivery_stage": "pre_send",
         }
         runner.adapters[Platform.TELEGRAM].send.assert_not_awaited()
 
@@ -517,7 +518,8 @@ class TestSendGate:
         ))
 
         assert result == {
-            "error": "Cannot honor trusted profile 'default' for standalone platform 'telegram'"
+            "error": "Cannot honor trusted profile 'default' for standalone platform 'telegram'",
+            "delivery_stage": "pre_send",
         }
         standalone_telegram.assert_not_awaited()
 
