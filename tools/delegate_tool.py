@@ -320,6 +320,9 @@ def _build_child_agent(
         # A named child reads shared knowledge but never writes it, and cannot manage skills.
         child_optional_kwargs["memory_access_mode"] = "read_only"
         child_disabled_toolsets = [*(child_disabled_toolsets or []), "skill_management"]
+    # False here does not clear an inherited knowledge restriction: the context
+    # manager ORs parent authority, worker dispatch copies it, and child toolsets
+    # already inherit the parent's skill-management denial.
     with delegated_child_context(read_only_knowledge=subagent_definition is not None):
         try:
             child = AIAgent(
