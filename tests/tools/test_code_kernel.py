@@ -466,3 +466,26 @@ class TestPerCellRpcAuthority(unittest.TestCase):
             _run("y = 2")
             self.assertIsNot(kernel.cell_authority, first_authority)
             self.assertFalse(kernel.cell_authority.active)
+
+
+@pytest.mark.parametrize('protected', [True, False])
+def test_reused_kernel_checks_actual_cwd_before_pathless_mutation(tmp_path, monkeypatch, protected):
+    from agent.delegation_context import delegated_child_context
+    home = tmp_path / 'home'
+    directory = home / 'memories' if protected else tmp_path / 'ordinary'
+    directory.mkdir(parents=True)
+    directory.chmod(0o700)
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    with _kernel_config(mode='project'):
+        with delegated_child_context('cwd-child', read_only_knowledge=False):
+            first = _run(f'import os; os.chdir({str(directory)!r})')
+            assert first['status'] == 'success', first
+        with delegated_child_context('cwd-child', read_only_knowledge=True):
+            result = _run('import os; os.chmod(os.getcwd(), 0o755)')
+    if protected:
+        assert result['status'] == 'error', result
+        assert 'Parent-owned shared knowledge' in result['error']
+        assert directory.stat().st_mode & 0o777 == 0o700
+    else:
+        assert result['status'] == 'success', result
+        assert directory.stat().st_mode & 0o777 == 0o755

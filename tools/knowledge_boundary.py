@@ -292,6 +292,9 @@ def execution_denial_reason(command: str, *, current_cwd: Callable[[], str]) -> 
         cwd = current_cwd()
         if not cwd or not os.path.isabs(cwd):
             return _UNEVALUATED
+        denial = write_denial_reason([cwd], how="code execution in this directory")
+        if denial:
+            return denial
         return command_denial_reason(command, tool="execute_code", cwd=cwd)
     except Exception:
         return _UNEVALUATED
