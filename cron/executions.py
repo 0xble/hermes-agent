@@ -25,7 +25,7 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "unknown", "deferred")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -56,7 +56,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
+               ('claimed','running','completed','failed','unknown','deferred')),
              handoff_pending INTEGER NOT NULL DEFAULT 0,
              handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
@@ -72,6 +72,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    _migrate_deferred_status(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -86,6 +87,30 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+
+
+def _migrate_deferred_status(conn: sqlite3.Connection) -> None:
+    """SQLite cannot widen a CHECK in place. Rebuild once, preserving columns and indexes."""
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'").fetchone()[0]
+    # Older ledgers without a status CHECK already accept the new value.
+    if "'deferred'" in sql or "'unknown'" not in sql:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'").fetchone()[0]
+        if "'deferred'" not in sql:
+            indexes = conn.execute("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='executions' AND sql IS NOT NULL").fetchall()
+            expanded = sql.partition("(")[2].replace("'unknown'", "'unknown','deferred'")
+            conn.execute("CREATE TABLE executions_deferred (" + expanded)
+            conn.execute("INSERT INTO executions_deferred SELECT * FROM executions")
+            conn.execute("DROP TABLE executions")
+            conn.execute("ALTER TABLE executions_deferred RENAME TO executions")
+            for index in indexes:
+                conn.execute(index[0])
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 @contextmanager
@@ -138,7 +163,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown','deferred')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -269,8 +294,35 @@ def finish_execution(
     return record
 
 
+def _finish_deferred_execution(job_id: str, execution_id: str, reason: str) -> None:
+    """Seal an attempt from durable jobs.json pre-agent proof, including crash recovery.
+
+    Only cron.deferral calls this while holding the job lock and matching the exact pending
+    execution. Unlike finish_execution this may reconcile an exited process's attempt.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET status='deferred', finished_at=?, error=?, "
+            "handoff_pending=0, handoff_started_at=NULL, delivery_outcome='suppressed' "
+            "WHERE id=? AND job_id=? AND status IN ('claimed','running')",
+            (_hermes_now().isoformat(), reason, execution_id, job_id))
+        if cur.rowcount != 1:
+            return
+        _prune_unlocked(conn)
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome="suppressed")
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
+    # Reconcile positive pre-agent proof before marking abandoned attempts unknown.
+    # Lock order matches finalization: jobs first, then executions.
+    from cron import jobs
+    from cron.deferral import reconcile_pending
+
+    with jobs._jobs_lock():
+        for job in jobs.load_jobs():
+            reconcile_pending(job)
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
