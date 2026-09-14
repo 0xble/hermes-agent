@@ -1254,7 +1254,14 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        # Adapter handoff schedules a task; shutdown can start before this handler
+        # runs or while ingress admission awaits. Do not settle that rejection as
+        # a successfully handled control, and do not record a duplicate queue ID.
+        if await self._defer_restart_inbox_on_shutdown(event):
+            return None
         _admitted = await self._hm_admit_event(event)
+        if await self._defer_restart_inbox_on_shutdown(event):
+            return None
         if _admitted is None:
             return None
         event, source, is_internal = _admitted

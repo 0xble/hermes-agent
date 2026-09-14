@@ -355,3 +355,94 @@ async def test_profile_claim_failure_does_not_strand_healthy_live_owner(tmp_path
     assert await runner._drain_restart_inbox() == 1
     assert await runner._drain_restart_inbox() == 0
     assert [c.args[0].message_id for c in adapter.handle_message.await_args_list] == ['msg-1', 'other-input']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["entry", "reconcile", "claim", "dispatch"])
+@pytest.mark.parametrize("flag,value", [("_draining", True), ("_running", False)])
+async def test_shutdown_defers_undispatched_inbox_without_spending_attempts(monkeypatch, stage, flag, value):
+    queued = []
+    for index in range(2):
+        queue_id = inbox.record_event(f"session-{index}", _event(message_id=f"msg-{index}"))
+        _orphan(queue_id)
+        queued.append(queue_id)
+    original = {row["queue_id"]: row["event_json"] for row in inbox.read_rows(inbox._db_path())}
+    runner, adapter = make_restart_runner()
+    runner._schedule_restart_inbox_drain = lambda: None
+    reconcile, claim = runner._reconcile_restart_recovery, inbox.claim_recoverable
+
+    def stop():
+        setattr(runner, flag, value)
+
+    def reconcile_then_stop():
+        result = reconcile()
+        if stage == "reconcile":
+            stop()
+        return result
+
+    def claim_then_stop(**kwargs):
+        result = claim(**kwargs)
+        if stage == "claim":
+            stop()
+        return result
+
+    async def handle(event):
+        if stage == "dispatch":
+            stop()
+
+    runner._reconcile_restart_recovery = reconcile_then_stop
+    monkeypatch.setattr(inbox, "claim_recoverable", claim_then_stop)
+    adapter.handle_message = AsyncMock(side_effect=handle)
+    if stage == "entry":
+        stop()
+    count = await runner._drain_restart_inbox()
+    expected = 1 if stage == "dispatch" else 0
+    assert count == adapter.handle_message.await_count == expected
+    rows = inbox.read_rows(inbox._db_path())
+    pending = [row for row in rows if row["state"] == "pending"]
+    assert len(pending) == 2 - expected
+    assert all(row["attempts"] == 0 for row in pending)
+    assert all(row["event_json"] == original[row["queue_id"]] for row in rows)
+    assert all(row["state"] in ("pending", "delivered") for row in rows)
+    # Restore admission: the exact pending rows remain claimable, once each.
+    runner._running, runner._draining = True, False
+    runner._reconcile_restart_recovery = reconcile
+    monkeypatch.setattr(inbox, "claim_recoverable", claim)
+    adapter.handle_message = AsyncMock()
+    assert await runner._drain_restart_inbox() == 2 - expected
+    rows = inbox.read_rows(inbox._db_path())
+    assert {row["queue_id"] for row in rows} == set(queued)
+    assert all(row["state"] == "delivered" and row["attempts"] == 1 for row in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["adapter_task", "admission"])
+async def test_shutdown_after_adapter_handoff_does_not_settle_rejected_input(monkeypatch, stage):
+    queue_id = inbox.record_event("session-key", _event())
+    _orphan(queue_id)
+    runner, adapter = make_restart_runner()
+    runner._schedule_restart_inbox_drain = lambda: None
+    adapter._event_session_key = lambda _event: "session-key"
+    observed = []
+
+    async def processing_hook(name, event, *args, **kwargs):
+        if name == "on_processing_start":
+            observed.append(event)
+            if stage == "adapter_task":
+                runner._draining = True
+
+    async def admit(event):
+        if stage == "admission":
+            runner._draining = True
+        return None
+
+    monkeypatch.setattr(adapter, "_run_processing_hook", processing_hook)
+    monkeypatch.setattr(runner, "_hm_admit_event", admit)
+    adapter.set_message_handler(runner._handle_message)
+    assert await runner._drain_restart_inbox() == 1
+    task = adapter._session_tasks["session-key"]
+    await asyncio.wait_for(task, 5)
+    row = next(row for row in inbox.read_rows(inbox._db_path()) if row["queue_id"] == queue_id)
+    assert row["state"] == "pending" and row["attempts"] == 0
+    assert row["owner_pid"] is None and row["owner_started_at"] is None
+    assert observed[0]._restart_input_admission_failed is True

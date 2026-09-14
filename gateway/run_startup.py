@@ -95,8 +95,26 @@ class GatewayStartupMixin:
         async with lock:
             return await self._drain_restart_inbox_serial()
 
+    def _restart_inbox_admission_open(self) -> bool:
+        return bool(getattr(self, "_running", False) and not getattr(self, "_draining", False))
+
+    async def _defer_restart_inbox_on_shutdown(self, event: MessageEvent) -> bool:
+        """Reject an unprocessed replay without letting no-agent completion consume it."""
+        claim = getattr(event, "_restart_inbox_claim", None)
+        if (not claim or self._restart_inbox_admission_open()
+                or getattr(event, "_restart_inbox_agent_started", False)):
+            return False
+        event._restart_input_admission_failed = True
+        try:
+            from gateway.restart_inbox import transition_link
+            if not await asyncio.to_thread(transition_link, claim, "pending", refund_attempt=True):
+                logger.warning("Could not defer shutdown restart inbox claim %s", claim["queue_id"])
+        except Exception:
+            logger.exception("Could not defer shutdown restart inbox claim %s", claim["queue_id"])
+        return True
+
     def _schedule_restart_inbox_drain(self):
-        if getattr(self, "_running", False) and not getattr(self, "_draining", False):
+        if self._restart_inbox_admission_open():
             self._retain_background_task(asyncio.create_task(self._drain_restart_inbox()))
 
     def _retry_restart_inbox_when_capacity_available(self):
@@ -125,10 +143,13 @@ class GatewayStartupMixin:
         """Replay messages the PREVIOUS draining process durably accepted. Rows are claimed
         under this boot's live adapter identities; a claim we cannot dispatch is released
         rather than spent, so the next boot can still deliver it."""
+        if not self._restart_inbox_admission_open():
+            return 0
         try:
             from gateway.restart_inbox import claim_recoverable, transition_link, linked_row, RestartInboxBusy
 
-            if not await asyncio.to_thread(self._reconcile_restart_recovery):
+            if (not await asyncio.to_thread(self._reconcile_restart_recovery)
+                    or not self._restart_inbox_admission_open()):
                 return 0
 
             targets = {
@@ -151,6 +172,8 @@ class GatewayStartupMixin:
                 if isinstance(tasks, dict):
                     busy_keys.update(key for key, task in tasks.items() if task and not task.done())
             for path, excluded in self._restart_inbox_blocked.items():
+                if not self._restart_inbox_admission_open():
+                    break
                 try:
                     batch = await asyncio.to_thread(
                         claim_recoverable, deliverable_targets=targets, db_path=path,
@@ -170,6 +193,8 @@ class GatewayStartupMixin:
         dispatched = 0
         for row in claimed:
             event = row["event"]
+            if await self._defer_restart_inbox_on_shutdown(event):
+                continue
             adapter: Any = self._adapter_for_source(event.source)
             if adapter is None:
                 logger.warning(
