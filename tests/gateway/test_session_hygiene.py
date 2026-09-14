@@ -1667,9 +1667,11 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
     """
     from hermes_state import SessionDB
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
-    cleanup_done = threading.Event()
+    worker_finished = threading.Event()
+    cleanup_done = asyncio.Event()
     session_id = "sess-fence-wait"
 
     class HungAfterFenceCancelAgent:
@@ -1685,7 +1687,7 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
                 _last_aux_model_failure_model=None,
             )
             self.shutdown_memory_provider = MagicMock()
-            self.close = MagicMock(side_effect=cleanup_done.set)
+            self.close = MagicMock(side_effect=lambda: loop.call_soon_threadsafe(cleanup_done.set))
             type(self).last_instance = self
 
         def _compress_context(
@@ -1693,44 +1695,50 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         ):
             if commit_fence is not None:
                 commit_fence.try_cancel_before_commit()
-            worker_started.set()
+            loop.call_soon_threadsafe(worker_started.set)
             # Keep the worker alive (and keep reporting "progress") so a
             # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
+            # Only the test can release it: machine load cannot make a timed
+            # worker exit race the host's continuation assertion.
+            while not release_worker.wait(0.02):
                 if commit_fence is not None:
                     commit_fence.touch_progress()
-                if release_worker.is_set():
-                    break
-                time.sleep(0.02)
+            worker_finished.set()
             return (messages, None)
 
     db = SessionDB(db_path=tmp_path / "state.db")
+    handler = None
     try:
         db.create_session(session_id, "telegram")
         runner, adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id
         )
-        started = time.monotonic()
-        result = await runner._handle_message(event)
-        elapsed = time.monotonic() - started
+        handler = asyncio.create_task(runner._handle_message(event))
+        # Timeouts are hang guards, not latency assertions. The behavior under
+        # test is that the host returns while the cancelled worker is blocked.
+        await asyncio.wait_for(worker_started.wait(), timeout=10)
+        result = await asyncio.wait_for(asyncio.shield(handler), timeout=10)
 
         assert result == "ok"
-        assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
-            f"hygiene host waited {elapsed:.1f}s after fence cancel — "
-            "must not extend toward the 600s ceiling (#96953)"
-        )
+        assert not worker_finished.is_set(), "host must continue before the cancelled worker finishes"
+        assert not cleanup_done.is_set(), "worker resources must remain owned until it finishes"
         assert runner._run_agent.await_count == 1
         state = db.get_compression_failure_cooldown(session_id)
         assert state is not None and state["remaining_seconds"] > 0
         assert not any(
             "Context compression timed out" in s["content"] for s in adapter.sent
         ), "fence-cancel is not a summary-model timeout; no timeout toast"
-        release_worker.set()
-        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
     finally:
-        db.close()
+        release_worker.set()
+        try:
+            if handler is not None:
+                if not handler.done():
+                    handler.cancel()
+                await asyncio.gather(handler, return_exceptions=True)
+            if worker_started.is_set():
+                await asyncio.wait_for(cleanup_done.wait(), timeout=10)
+        finally:
+            db.close()
 
 
 @pytest.mark.asyncio
