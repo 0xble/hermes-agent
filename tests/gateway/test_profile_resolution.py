@@ -24,6 +24,9 @@ def mock_runner():
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     # _handle_message's ingress gates (profile route rejection) live in this helper.
     runner._hm_admit_event = GatewayRunner._hm_admit_event.__get__(runner)
+    # Use the real replay gate: an unconfigured AsyncMock returns truthy and
+    # bypasses the profile-routing ingress this fixture is meant to exercise.
+    runner._defer_restart_inbox_on_shutdown = GatewayRunner._defer_restart_inbox_on_shutdown.__get__(runner)
     return runner
 
 
