@@ -458,6 +458,32 @@ def _tg_link_target_supported(target: str) -> bool:
     return bool(_SUPPORTED_LINK_TARGET_RE.match(target.strip()))
 
 
+def _markdown_link_target(destination: str) -> str:
+    """Separate an optional CommonMark title from the actual URL.
+
+    Keep bare targets byte-for-byte for the existing escaping path. Parse the
+    whole destination before accepting title syntax, so arbitrary whitespace
+    or trailing text cannot turn an invalid target into a clickable prefix.
+    """
+    if not any(char.isspace() for char in destination) and not destination.startswith('<'):
+        return destination
+    from markdown_it.helpers import parseLinkDestination, parseLinkTitle
+
+    source = destination.strip()
+    parsed = parseLinkDestination(source, 0, len(source))
+    if not parsed.ok:
+        return ''
+    remainder = source[parsed.pos:]
+    if remainder:
+        if not remainder[0].isspace():
+            return ''
+        title = remainder.lstrip()
+        parsed_title = parseLinkTitle(title, 0, len(title))
+        if not parsed_title.ok or title[parsed_title.pos:].strip():
+            return ''
+    return parsed.str
+
+
 def _degrade_unsupported_markdown_links(text: str) -> str:
     """Degrade markdown links Telegram cannot render to their display text.
 
@@ -470,13 +496,13 @@ def _degrade_unsupported_markdown_links(text: str) -> str:
         return text
 
     def _degrade_citation(m):
-        display, target = m.group(1), m.group(2)
+        display, target = m.group(1), _markdown_link_target(m.group(2))
         if not _tg_link_target_supported(target):
             return f'[{display}]'
         return f'[\\[{display}\\]]({target})'
 
     def _degrade(m):
-        display, target = m.group(1), m.group(2)
+        display, target = m.group(1), _markdown_link_target(m.group(2))
         if not _tg_link_target_supported(target):
             return display
         return m.group(0)
@@ -6487,7 +6513,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # cannot render (schemeless destinations, @session: references) degrade to the escaped display text
         # so the raw bracket syntax is never exposed (#97497).
         def _convert_explicit_citation(m):
-            display, target = m.group(1), m.group(2)
+            display, target = m.group(1), _markdown_link_target(m.group(2))
             visible_marker = f'\\[{_escape_mdv2(display)}\\]'
             if not _tg_link_target_supported(target):
                 return _ph(visible_marker)
@@ -6497,9 +6523,10 @@ class TelegramAdapter(BasePlatformAdapter):
         def _convert_link(m):
             authored_display = m.group(1)
             display = _escape_mdv2(authored_display)
-            if not _tg_link_target_supported(m.group(2)):
+            target = _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
                 return _ph(display)
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            url = target.replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
         text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_explicit_citation, text)

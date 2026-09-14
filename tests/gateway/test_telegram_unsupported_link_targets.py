@@ -18,10 +18,67 @@ Code spans/blocks and table blocks hold literal content and must be left
 verbatim.
 """
 
+import pytest
+
 from plugins.platforms.telegram.adapter import (
     TelegramAdapter,
     _degrade_unsupported_markdown_links,
 )
+
+
+@pytest.mark.parametrize("destination", [
+    'https://example.com/docs "Reference"',
+    "https://example.com/docs 'Reference'",
+    'https://example.com/docs (Reference)',
+    '<https://example.com/docs> "Reference"',
+    'https://example.com/docs "Reference with \\"quotes\\""',
+])
+def test_authored_link_title_preserves_url_on_both_paths(destination):
+    adapter = object.__new__(TelegramAdapter)
+    text = f'[Documentation]({destination})'
+    assert adapter.format_message(text) == '[Documentation](https://example.com/docs)'
+    assert adapter._rich_message_payload(text)['markdown'] == text
+
+
+@pytest.mark.parametrize("destination", [
+    '@session:default/id "Reference"',
+    'javascript:alert(1) "Reference"',
+    'https://example.com/not a url',
+    '<https://example.com/not a url> "Reference"',
+    'https://example.com/docs "unterminated',
+    'https://example.com/docs "Reference" trailing',
+])
+def test_invalid_or_unsupported_titled_destination_still_degrades(destination):
+    adapter = object.__new__(TelegramAdapter)
+    text = f'[Documentation]({destination})'
+    assert adapter.format_message(text) == 'Documentation'
+    assert adapter._rich_message_payload(text)['markdown'] == 'Documentation'
+
+
+def test_titled_explicit_citation_retains_clickable_marker():
+    adapter = object.__new__(TelegramAdapter)
+    text = '[[3](https://example.com/docs "Reference")]'
+    assert adapter.format_message(text) == r'[\[3\]](https://example.com/docs)'
+    assert adapter._rich_message_payload(text)['markdown'] == r'[\[3\]](https://example.com/docs)'
+
+
+@pytest.mark.parametrize('url', [
+    'tg://settings',
+    'https://example.com/docs_(reference)',
+    'https://example.com/a?x=1&y=2',
+])
+def test_title_does_not_change_supported_url_or_legacy_escaping(url):
+    adapter = object.__new__(TelegramAdapter)
+    plain = f'[Documentation]({url})'
+    titled = f'[Documentation]({url} "Reference")'
+    assert adapter.format_message(titled) == adapter.format_message(plain)
+    assert adapter._rich_message_payload(titled)['markdown'] == titled
+
+
+def test_titled_links_in_protected_rich_regions_are_unchanged():
+    link = '[Documentation](https://example.com/docs "Reference")'
+    for text in (f'`{link}`', f'```md\n{link}\n```', f'| docs |\n|---|\n| {link} |'):
+        assert _degrade_unsupported_markdown_links(text) == text
 
 
 class TestLegacyMarkdownV2LinkDegrade:
