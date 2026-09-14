@@ -29,6 +29,34 @@ before reading claim fields. A direct reproduction and real card-claim cleanup
 regressions verify that truthy string/list siblings do not prevent release after
 a lost validation acknowledgement. No production cleanup change was needed.
 
+Restart-inbox replay checks running/non-draining admission before reconciliation,
+before each profile claim, and before each dispatch. Shutdown returns unprocessed
+exact claims to pending through the existing CAS and refunds their attempt budget.
+The claimed-event ingress guard also covers adapter background-task handoff and
+awaited admission, marking rejection before refund so no-agent completion cannot
+incorrectly mark the input delivered. Already-started execution remains untouched.
+Real SQLite and adapter regressions in `tests/gateway/test_restart_inbox.py` cover
+both shutdown flags and restore claimability after admission reopens.
+
+The evaluator's named-role scoring deliberately does not translate legacy `role`
+into `subagent_type`. Legacy leaf/orchestrator depth semantics do not select a
+configured explorer/worker definition. Named selection uses `tasks[].subagent_type`.
+`tests/scripts/test_eval_delegation_selection.py` verifies actual normalization and
+runtime preflight agree with scoring for both call shapes. No production scoring
+change was needed for the contrary review allegation.
+
+Named delegation pins also preserve configured header, query and body override
+values at the final SDK request boundary. Checking the child's frozen attribute
+alone did not detect middleware changes to the physical request. The check allows
+additional builder/SDK defaults, compares header names case-insensitively, and
+rejects conflicting spellings of configured headers. It reuses the active frozen
+primary/fallback overrides and existing provider-authentication checks. This
+preserves configured values, not a blanket ban on arbitrary new request fields.
+`tests/agent/test_named_frozen_request_overrides.py` exercises actual configured
+preflight, child construction and SDK dispatch with synthetic credentials and
+mock transport, proving changed or removed header/query/nested-body values cannot
+reach transport while unchanged values and additional defaults can.
+
 Follow-up review reproduced loss of authored Telegram link destinations when
 valid Markdown supplies an optional title. Both standard and rich rendering now
 parse the destination before checking supported schemes. Malformed destinations
@@ -122,10 +150,13 @@ immediately without fabricated history. Verify with
 suites. Source landing does not activate or restart a gateway; parent review owns
 promotion.
 
-Recovered `unknown` members deliberately block the all-terminal countdown:
-restart did not prove execution finished. They have no automatic display-expiry
-deadline under this contract. Audited operator dismissal can remove their
-presentation without inventing execution or delivery evidence.
+Unknown members deliberately block the all-terminal countdown, whether recovered
+after restart or reported by a completion event: neither proves execution finished.
+They have no automatic display-expiry deadline under this contract. Audited
+operator dismissal can remove their presentation without inventing execution or
+delivery evidence. The batch-TTL regression exercises both sources, a completed
+sibling, far-future reconciliation, audited dismissal and a completed resumed
+attempt that starts the ordinary countdown.
 
 ## Delegated interruption and renewed authorization
 
