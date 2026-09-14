@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
 from tools.delegate_tool_child_run import (  # noqa: F401
-    _ChildRun, _attach_child, _close_child, _detach_child, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
+    _ChildRun, _attach_child, _build_child_goal_message, _close_child, _detach_child, _build_result_entry, _dump_subagent_timeout_diagnostic, _fabricated_entry,
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (  # noqa: F401
@@ -53,7 +53,9 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from agent.delegation_disposition import DEFER_REASON_GUIDANCE
-from tools.delegate_tool_tasks import _coerce_task_schemas, _normalize_task_list
+from tools.delegate_tool_tasks import (  # noqa: F401
+    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+)
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
@@ -1070,6 +1072,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, live_deleg_id: Optional[str], live_writers: list,
     task_runtime: Optional[List[Any]] = None,
+    task_images: Optional[List[Optional[List[str]]]] = None,
     task_labels: Optional[List[str]] = None,
     routing_cfg: Optional[Dict[str, Any]] = None,
     child_tool_policy: Optional[str] = None,
@@ -1121,6 +1124,10 @@ def _build_children(
             if _task_schema is not None:
                 with _quiet("Could not attach output schema to child %d", i):
                     child._delegate_output_schema = _task_schema
+            _t_images = task_images[i] if task_images and i < len(task_images) else None
+            if _t_images:
+                with _quiet("Could not attach images to child %d", i):
+                    child._delegate_images = _t_images
             # Tee progress events into the live transcript (wrapper keeps the
             # _flush contract and swallows writer failures).
             _writer = live_writers[i] if i < len(live_writers) else None
@@ -1236,7 +1243,8 @@ def _card_handling(parent_agent, parent_task_id, refs, reason, detail=None):
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
-    output_schema: Optional[Dict[str, Any]] = None, action: Optional[str] = None, subagent_id: Optional[str] = None,
+    output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None,
+    action: Optional[str] = None, subagent_id: Optional[str] = None,
     message: Optional[str] = None, parent_agent=None, credentials_cfg: Optional[Dict[str, Any]] = None,
     child_tool_policy: Optional[str] = None,
     completion_contract: Optional[Dict[str, Any]] = None,
@@ -1324,6 +1332,8 @@ def delegate_task(
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list or [], output_schema)
+    if not err:
+        task_images, err = _coerce_task_images(task_list or [], images)
     if err:
         return tool_error(err)
     # This is intentionally before metadata reservation, resume claims, live
@@ -1435,6 +1445,7 @@ def delegate_task(
         children, err = _build_children(
             task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
             live_deleg_id=live_deleg_id, live_writers=live_writers, task_runtime=task_runtime,
+            task_images=task_images,
             task_labels=effective_labels or [],
             routing_cfg=routing_cfg, child_tool_policy=child_tool_policy,
         )
@@ -1843,6 +1854,14 @@ DELEGATE_TASK_SCHEMA = {
                             "schema_valid, plus schema_errors on failure). Keep it forgiving — require only "
                             "fields you will read.",
                         ),
+                        "images": _p(
+                            "array",
+                            "Optional images this child must SEE (max 8): local file paths or http(s) URLs — e.g. a "
+                            "screenshot the user sent, a design mock, a chart. Vision-capable children receive the "
+                            "pixels on their first turn; non-vision children get path hints for vision_analyze. Text "
+                            "files do NOT belong here — put paths in 'context' instead.",
+                            items={"type": "string"},
+                        ),
                         "group": _p(
                             "string",
                             "Optional result-delivery bucket within this call (only when delegation.independent_completions "
@@ -1917,7 +1936,7 @@ registry.register(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
-        action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_task_id=args.get("parent_task_id"), task_label=args.get("task_label"),
         handled_refs=args.get("handled_refs"), handling=args.get("handling"), defer_reason=args.get("defer_reason"),
         parent_agent=kw.get("parent_agent"), delegation_id=args.get("delegation_id"),

@@ -3,7 +3,8 @@ import {
   type GatewayEvent,
   reconnectBackoffDelayMs,
   registryBackendScopeKey,
-  resolveGatewayWsUrl
+  resolveGatewayWsUrl,
+  type ServerRequest
 } from '@hermes/shared'
 import { atom } from 'nanostores'
 
@@ -57,6 +58,10 @@ interface RegistryConfig {
    * the connection store. */
   activeConnectionId?: () => null | string
   onEvent: (event: GatewayEvent) => void
+  /** Server→client request (clarify, approval, …) from ANY socket the registry owns; the
+   *  request's `respond` already routes to the socket it came from. `profile` /
+   *  `connectionId` tag the source the same way events are tagged. */
+  onServerRequest?: (request: ScopedServerRequest) => void
   onActiveConnectionInvalidated?: (fallbackProfile: string, activationEpoch: number) => void
   onActiveConnectionChanged?: (connection: HermesConnection) => void
   /**
@@ -101,6 +106,7 @@ interface Secondary {
   activeRequests: number
   connectPromise: Promise<void> | null
   offEvent: () => void
+  offRequest: () => void
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
@@ -268,6 +274,19 @@ export function configureGatewayRegistry(cfg: RegistryConfig): void {
  */
 export function emitLocalGatewayEvent(event: GatewayEvent): void {
   g.config?.onEvent(event)
+}
+
+/** A server→client request tagged with the registry source it arrived from (like `GatewayEvent.profile`). */
+export interface ScopedServerRequest extends ServerRequest {
+  connectionId?: string
+  profile: string
+}
+
+/** Fan a primary-socket server request into the registry handler with the active source tags. */
+export function dispatchPrimaryServerRequest(request: ServerRequest, profile: string): void {
+  const connectionId = g.config?.activeConnectionId?.() ?? null
+
+  g.config?.onServerRequest?.({ ...request, ...(connectionId ? { connectionId } : {}), profile })
 }
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
@@ -802,6 +821,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     activeRequests: 0,
     connectPromise: null,
     offEvent: () => {},
+    offRequest: () => {},
     offState: () => {},
     reconnectTimer: null,
     reconnectAttempt: 0,
@@ -824,6 +844,10 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     g.config?.onEvent(scopedEvent)
     releaseTerminalTurnLease(entry.scope, event)
   })
+  entry.offRequest =
+    gateway.onRequest?.(request => {
+      g.config?.onServerRequest?.({ ...request, ...(connectionId ? { connectionId } : {}), profile })
+    }) ?? (() => {})
   entry.offState = gateway.onState(state => {
     reportGatewayState(scope, state)
 
@@ -1743,6 +1767,7 @@ function disposeSecondary(entry: Secondary): void {
   entry.wantOpen = false
   clearTimer(entry)
   entry.offEvent()
+  entry.offRequest()
   entry.offState()
   entry.gateway.close()
 }

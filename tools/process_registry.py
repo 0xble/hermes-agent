@@ -1503,6 +1503,16 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 self._running.pop(session.id)
             self._finished[session.id] = session
             self._result_generation += 1
+        # Release the retained Popen/PTY handles now: otherwise every
+        # finished-but-unpruned session keeps its stdout pipe (or PTY master)
+        # FD open until FINISHED_TTL_SECONDS elapses, and heavy background
+        # churn can exhaust the gateway's FD limit. On the reader-thread path
+        # the pipe is already at EOF; on the kill/reconcile paths the reader
+        # may still be draining — its next read raises on the closed stream
+        # and the loop exits, dropping at most the unread tail of a process
+        # that was just killed. poll()/wait()/read_log() serve from the
+        # buffered ``output_buffer``, never from the pipe.
+        self._release_finished_handles(session)
         self._write_checkpoint()
         from tools.process_registry_results import prune_completed_results
         prune_completed_results()
@@ -1532,6 +1542,28 @@ class ProcessRegistry(ProcessCheckpointMixin):
             "completion_reason": session.completion_reason,
             "termination_source": session.termination_source,
         }
+
+    def _release_finished_handles(self, session: ProcessSession):
+        """Close a finished session's OS handles (Popen pipes / PTY master).
+
+        Best-effort and idempotent: the session may have no local Popen (env
+        backends, detached recovery), or the handles may already be closed by
+        the reader loop / kill path. Closing a Popen's stream objects does not
+        kill anything — the child has already exited — it only releases the
+        parent's pipe FDs, which is exactly the retained-resource leak.
+        """
+        proc = session.process
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr, proc.stdin):
+                if stream is not None:
+                    with suppress(OSError, ValueError):  # a stdin flush can hit EPIPE
+                        stream.close()
+        if session._pty is not None:
+            # ptyprocess/pywinpty close() is idempotent (``closed`` flag) and
+            # closes the master fd exactly once; it raises only if the child
+            # ignores SIGKILL, which we don't want to surface on the finish path.
+            with suppress(Exception):
+                session._pty.close()
 
     # ----- Query Methods -----
 
@@ -2373,11 +2405,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if over_cap and (survivors := [sid for sid in self._finished if sid not in expired]):
             expired.append(min(survivors, key=lambda sid: self._finished[sid].started_at))
         for sid in expired:
+            # Belt-and-suspenders handle release: sessions normally arrive in
+            # _finished via _move_to_finished(), which already released their
+            # Popen/PTY handles — but any session inserted into _finished
+            # directly (defensive paths, historical checkpoints) would
+            # otherwise carry its OS handles to the grave unreleased. The
+            # release is idempotent, so double-closing is safe.
             session = self._finished[sid]
             # Evict payloads only after their unresolved fence is durable. On disk
             # failure keep the live entry; never trade safety for a cache target.
             if (session._result_persist_failed or (session.owner_task_id and not session._result_observed)) and not save_completed_result(session):
                 continue
+            self._release_finished_handles(session)
             del self._finished[sid]
             # A previously failed publication may only now be durable; owner
             # snapshots scanning outside the lock must retry.

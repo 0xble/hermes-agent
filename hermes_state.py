@@ -45,6 +45,7 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_schema import SessionSchemaMixin
 import hermes_state_holders as _state_holders
+import hermes_state_lockguard as _lockguard
 from hermes_state_dbfile import (
     _canonical_sqlite_path, _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
@@ -524,6 +525,7 @@ class SessionDB(
         self._retired_capture_lock = threading.Lock()
         self._retire_connection: Optional[Callable[[Any], None]] = None
         self._connection_pinned = False  # one unmatched C reference taken at most once per handle
+        self._wal_lock_guard: dict = {}  # hermes_state_lockguard.hold() record, see _open_writer
         self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
         self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
         self._fts_enabled = self._fts_stale = self._trigram_available = False
@@ -602,6 +604,11 @@ class SessionDB(
             self._connect_and_init_with_lock_patience()
         # FTS optimization is OPT-IN (`hermes db optimize`); no background worker races session lifecycle.
         self._ensure_db_file_generation()
+        if self._wal_active:
+            # OFD copies of the two POSIX locks that keep a sibling's close from unlinking this WAL
+            # generation: any in-process open()/close() of state.db or -shm cancels SQLite's own
+            # (howtocorrupt §2.2); these survive it. Lifted in close().
+            self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _open_read_only(self) -> None:
         """Read-only attach for cross-profile aggregation: no schema init, NO write
@@ -1357,6 +1364,8 @@ class SessionDB(
         """
         if self._quarantine_reason() is not None:
             return
+        if self._wal_lock_guard:
+            _lockguard.hold(self.db_path, self._wal_lock_guard)  # a -shm minted after open
         try:
             with self._lock:
                 result = self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
@@ -1435,6 +1444,7 @@ class SessionDB(
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     except Exception as exc:
                         logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+                _lockguard.release(self._wal_lock_guard)  # before the close: see release()
                 if retire_without_close:
                     self._pin_connection(self._conn)
                     self._conn = None

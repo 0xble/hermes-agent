@@ -1,5 +1,19 @@
 # Maintained Hermes fork
 
+## September 14 frozen upstream integration
+
+Cutoff `743140cd8221ad04897c4c3e706e0fc8a7613b8e` builds on verified fork
+`134e479eb48b88346f2a1dd794dd8b104b6ce2c6`. Upstream's generated gateway
+contracts now own the wire schema. Preserve the fork's admitted, handling and
+result-turn delegation events in that registry rather than retaining the retired
+JSON inventory. Image attachments compose with quoted fork context. Late child
+attachment inherits the parent's exact interrupt reason, preserving user-stop
+provenance. Keep configured title examples aligned with upstream's echo guard,
+and retain Telegram receipt/reconnect behavior alongside compression cleanup.
+Integration checks use the repository runner, generated-contract verification,
+and shared TypeScript type checking. Source publication and runtime promotion
+retain separate run-scoped evidence.
+
 ## Delegation root window — source candidate
 
 User explicitly authorized the newest-five root-group display cap on 2026-09-13,

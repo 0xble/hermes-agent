@@ -84,6 +84,33 @@ _MAX_PERSISTED_TITLE_CHARS = 100
 # and the persisted title is still hard-capped below.
 TITLE_MAX_OUTPUT_TOKENS = 1024
 
+# Keep the fork's configurable noun-phrase examples and upstream's legacy echo
+# rejection. Render the current examples from the same values the guard checks.
+_PROMPT_GOOD_EXAMPLES_SENTENCE_CASE = (
+    "iCloud+ 2TB subscription review",
+    "Mobile login fix",
+    "Postgres pool exhaustion",
+    "Friendly greeting",
+)
+_PROMPT_GOOD_EXAMPLES_TITLE_CASE = (
+    "iCloud+ 2TB Subscription Review",
+    "Mobile Login Fix",
+    "Postgres Pool Exhaustion",
+    "Friendly Greeting",
+)
+_PROMPT_VAGUE_EXAMPLE = "Code changes"
+_EXAMPLE_ECHO_REJECT = frozenset(
+    title.lower()
+    for title in (
+        *_PROMPT_GOOD_EXAMPLES_SENTENCE_CASE,
+        *_PROMPT_GOOD_EXAMPLES_TITLE_CASE,
+        "Fix login button on mobile",
+        "Postgres connection pool exhaustion",
+        _PROMPT_VAGUE_EXAMPLE,
+    )
+    if title.lower() != "friendly greeting"
+)
+
 _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a short "
     "title that lets them find this conversation again in a list.\n\n"
@@ -115,17 +142,11 @@ _TITLE_PROMPT_TEMPLATE = (
 
 _TITLE_EXAMPLES_SENTENCE_CASE = (
     'Bad: {"title": "Cancel iCloud+ 2TB if unused"}\n'
-    'Good: {"title": "iCloud+ 2TB subscription review"}\n'
-    'Good: {"title": "Mobile login fix"}\n'
-    'Good: {"title": "Postgres pool exhaustion"}\n'
-    'Good: {"title": "Friendly greeting"}\n'
+    + "".join(f'Good: {{"title": "{title}"}}\n' for title in _PROMPT_GOOD_EXAMPLES_SENTENCE_CASE)
 )
 _TITLE_EXAMPLES_TITLE_CASE = (
     'Bad: {"title": "Cancel iCloud+ 2TB If Unused"}\n'
-    'Good: {"title": "iCloud+ 2TB Subscription Review"}\n'
-    'Good: {"title": "Mobile Login Fix"}\n'
-    'Good: {"title": "Postgres Pool Exhaustion"}\n'
-    'Good: {"title": "Friendly Greeting"}\n'
+    + "".join(f'Good: {{"title": "{title}"}}\n' for title in _PROMPT_GOOD_EXAMPLES_TITLE_CASE)
 )
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
@@ -622,6 +643,18 @@ def _clean_title(
     return title or None
 
 
+def _is_prompt_example_echo(title: str) -> bool:
+    """Return True when *title* is one of the prompt's own example titles.
+
+    Comparison is case-insensitive after stripping any leading/trailing run of
+    non-letter/non-digit characters, so bracket/quote wrappers cannot bypass
+    the guard — while ``_clean_title`` keeps brackets for real titles like
+    "(WIP) Fix build". Unicode-aware so full-width wrappers are covered too.
+    """
+    normalized = re.sub(r"^[\W_]+|[\W_]+$", "", title.strip(), flags=re.UNICODE).lower()
+    return normalized in _EXAMPLE_ECHO_REJECT
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -734,6 +767,9 @@ def generate_title(
                 len(title.split()), _MAX_TITLE_WORDS,
             )
             title = None
+        if title is not None and _is_prompt_example_echo(title):
+            logger.debug("Rejecting prompt-example echo title: %r", title)
+            return None
         if title is None:
             return None  # Aliases must not revive rejected output as LLM authority.
         canonical_name = _canonical_name_for_message(
