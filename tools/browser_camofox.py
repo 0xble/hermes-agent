@@ -454,7 +454,9 @@ def _navigate_tab(task_id: Optional[str], browser_url: str, identity: Optional[s
     """Open ``browser_url`` in the task's tab (creating it if missing) and return
     ``(session, navigate_response)``. A 404 on the existing tab means the server
     garbage-collected it — recreate instead of failing."""
-    session = _get_session(task_id, identity=identity)
+    session = _get_session(
+        task_id, identity=identity, adopt_existing_tab=True
+    )
     if session["tab_id"]:
         try:
             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)

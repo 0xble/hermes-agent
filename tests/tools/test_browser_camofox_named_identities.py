@@ -200,6 +200,44 @@ def test_named_camofox_renavigate_uses_existing_binding(tmp_path, monkeypatch):
     assert second["success"] is True
 
 
+def test_named_camofox_rehydration_navigates_adopted_tab(tmp_path, monkeypatch):
+    from tools import browser_camofox
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+    tabs = []
+    posts = []
+
+    def fake_post(path, body, timeout=None):
+        posts.append((path, body))
+        if path == "/tabs":
+            tabs.append({"tabId": "tab-a", "listItemId": body["listItemId"]})
+            return {"tabId": "tab-a", "url": body["url"]}
+        assert path == "/tabs/tab-a/navigate"
+        return {"ok": True, "url": body["url"]}
+
+    with (
+        patch("hermes_cli.browser_identity.read_browser_identity_config", return_value=_identities()),
+        patch("tools.browser_camofox._get", side_effect=lambda path, **_: {"tabs": list(tabs)}),
+        patch("tools.browser_camofox._post", side_effect=fake_post),
+    ):
+        first = json.loads(browser_camofox.camofox_navigate(
+            "https://example.com", task_id="task-a", identity="personal"
+        ))
+        with browser_camofox._sessions_lock:
+            browser_camofox._sessions.clear()
+        second = json.loads(browser_camofox.camofox_navigate(
+            "https://example.org", task_id="task-a", identity="personal"
+        ))
+
+    assert first["success"] is True
+    assert second["success"] is True
+    assert posts[-1] == (
+        "/tabs/tab-a/navigate",
+        {"userId": posts[0][1]["userId"], "url": "https://example.org"},
+    )
+
+
 def test_named_close_refuses_tab_delete_without_checkpoint(tmp_path, monkeypatch):
     from tools.browser_camofox import camofox_close, camofox_navigate
 

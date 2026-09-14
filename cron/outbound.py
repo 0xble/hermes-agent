@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.sqlite_util import write_txn
 from hermes_time import now as _hermes_now
 
 # Test/embedding override only. Production resolves the active profile's home
@@ -98,7 +99,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn = _connect()
         try:
             _initialize_schema(conn)
-            with conn:
+            with write_txn(conn):
                 yield conn
         finally:
             conn.close()

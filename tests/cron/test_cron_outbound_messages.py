@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,6 +117,15 @@ class TestOutboundLedger:
         ):
             assert cron_outbound._outbound_file() == first / "cron" / "outbound.db"
             assert cron_outbound._outbound_file() == second / "cron" / "outbound.db"
+
+    def test_transaction_holds_write_lock_before_reading(self, tmp_outbound):
+        with cron_outbound._transaction():
+            competitor = sqlite3.connect(cron_outbound._outbound_file(), timeout=0)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                    competitor.execute("BEGIN IMMEDIATE")
+            finally:
+                competitor.close()
 
     def test_two_keys_are_distinct(self, tmp_outbound):
         first = claim_or_reuse(

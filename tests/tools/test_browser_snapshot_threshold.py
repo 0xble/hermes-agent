@@ -168,7 +168,11 @@ def test_camofox_navigation_applies_same_profile_threshold(
         "_rewrite_loopback_url_for_camofox",
         lambda url: (url, None),
     )
-    monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id, identity=None: session)
+    monkeypatch.setattr(
+        browser_camofox,
+        "_get_session",
+        lambda task_id, identity=None, adopt_existing_tab=False: session,
+    )
     monkeypatch.setattr(
         browser_camofox,
         "_post",
