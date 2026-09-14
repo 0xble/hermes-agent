@@ -211,12 +211,19 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
     pin = child._delegation_runtime_pin
     assert "SENTINEL" not in repr(pin)
     assert "PRIMARY-AUTH-SENTINEL" in pin.request_overrides_json
-    pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
+    from agent.transports.chat_completions import ChatCompletionsTransport
+    # A final request includes the configured query/body authority as well as
+    # headers. Exercise the real merge instead of omitting frozen fields in a
+    # hand-built request that the guard correctly refuses.
+    wire = ChatCompletionsTransport().build_kwargs(
+        "m", [{"role": "user", "content": "probe"}], request_overrides=raw_overrides,
+    )
+    pin.validate_request(child, wire, client=SimpleNamespace(
         api_key="PRIMARY-API-SENTINEL", base_url=endpoint,
     ))
     child.request_overrides = {"max_output_tokens": 321}
     with pytest.raises(ValueError, match="pinned request overrides changed"):
-        pin.validate_request(child, {"model": "m", "extra_headers": raw_overrides["extra_headers"]}, client=SimpleNamespace(
+        pin.validate_request(child, wire, client=SimpleNamespace(
             api_key="PRIMARY-API-SENTINEL", base_url=endpoint,
         ))
 
