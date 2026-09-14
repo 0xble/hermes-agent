@@ -14,6 +14,21 @@ Integration checks use the repository runner, generated-contract verification,
 and shared TypeScript type checking. Source publication and runtime promotion
 retain separate run-scoped evidence.
 
+The September 14 complete review found two confirmed integration defects.
+Audited presentation dismissal now overrides original-call batch retention,
+including ancestor projection, transport binding and late admission callbacks.
+Ordinary handled-batch retention and execution outcomes remain intact. Goal
+control revisions use the existing SQLite metadata compare-and-set operation
+so concurrent processes cannot publish the same revision and preserve older
+turn authority. This fixes revision allocation, not serialization of the whole
+goal activation transaction. Focused regressions cover both boundaries.
+
+The same review's malformed replacement cleanup finding did not match the
+candidate: `_release_replacement_claims` already checks `isinstance(..., dict)`
+before reading claim fields. A direct reproduction and real card-claim cleanup
+regressions verify that truthy string/list siblings do not prevent release after
+a lost validation acknowledgement. No production cleanup change was needed.
+
 Cron transport selection uses the gateway's launch-time primary identity and
 the selected adapter's resolved creation home. Per-turn identity alone can select
 the wrong primary bot, and the name `custom` is shared by unrelated homes. Missing

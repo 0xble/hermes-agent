@@ -13,6 +13,46 @@ from tools import delegate_tool
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["invalid", ["invalid"]])
+async def test_malformed_sibling_does_not_interrupt_claim_cleanup(tmp_path, monkeypatch, malformed):
+    cards, source, _, data, parent = await setup(tmp_path, monkeypatch)
+    await cards.observe(source, "r", "s", 1, "subagent.complete", None, {**data, "status": "failed"})
+    await drain(cards)
+    _valid_runtime(monkeypatch)
+    launch = delegate_tool._preflight_task_runtime()[0][0]
+    monkeypatch.setattr(delegate_tool, "_preflight_task_runtime",
+                        lambda tasks, *a: ([deepcopy(launch) for _ in tasks], None))
+    monkeypatch.setattr(delegate_tool, "_capture_origin", lambda: (None, None, None, None, False))
+    monkeypatch.setattr(delegate_tool, "_build_children", lambda *a, **k: pytest.fail("preflight launched children"))
+    parent._delegate_depth = 0
+    loop = asyncio.get_running_loop()
+    reasons = []
+
+    def callback(event, **kwargs):
+        if event != "subagent.handling":
+            return None
+        reasons.append(kwargs["reason"])
+        result = asyncio.run_coroutine_threadsafe(cards.handling(source, "r", "s", 2, **kwargs), loop).result(5)
+        if kwargs["reason"] == "validate_replacement":
+            raise TimeoutError("validation acknowledgement lost")
+        return result
+
+    parent.tool_progress_callback = callback
+    tasks = [
+        {"goal": "Replace failed work", "task_label": "Retry work", "replaces": {
+            "parent_task_id": data["parent_task_id"], "thread_ref": "A"}},
+        {"goal": "Invalid sibling", "task_label": "Invalid sibling", "replaces": malformed},
+    ]
+    result = json.loads(await asyncio.to_thread(delegate_tool.delegate_task, parent_agent=parent, tasks=tasks))
+    assert "acknowledgement lost" in result["error"]
+    assert reasons == ["validate_replacement", "release_replacement"]
+    restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
+    assert not restored.cards[data["parent_task_id"]].get("replacement_claims")
+    assert not restored.cards[data["parent_task_id"]].get("handled")
+    await drain(cards)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_lost_validation_receipt_cancels_exact_request_before_retry(tmp_path, monkeypatch, committed):
     cards, source, _, data, parent = await setup(tmp_path, monkeypatch)
