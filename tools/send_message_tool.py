@@ -460,25 +460,27 @@ async def _send_live_adapter_media(adapter, chat_id, message, media_files, *, th
     return {"success": True, "message_id": last_result.message_id, "media_delivered": True}
 
 
-async def _dispatch_on_gateway_loop(runner, make_coro, log_message):
+async def _dispatch_on_gateway_loop(runner, make_coro, log_message, *, track_attempt=False):
     """Await ``make_coro()`` on the gateway's loop: adapter.send() uses queues/tasks bound to it,
     so awaiting from another loop (the tool worker thread) deadlocks."""
     gateway_loop = getattr(runner, "_gateway_loop", None)
     if gateway_loop is None or asyncio.get_running_loop() is gateway_loop:
         return await make_coro()  # same loop / no gateway loop (CLI, tests)
     if not gateway_loop.is_running():
-        return {"error": "Gateway loop is not running; cannot dispatch adapter send", "delivery_not_attempted": True}
+        return {"error": "Gateway loop is not running; cannot dispatch adapter send",
+                **({"delivery_not_attempted": True} if track_attempt else {})}
     from agent.async_utils import safe_schedule_threadsafe
     fut = safe_schedule_threadsafe(make_coro(), gateway_loop, logger=logger, log_message=log_message)
     if fut is None:
-        return {"error": "Gateway loop unavailable for send dispatch", "delivery_not_attempted": True}
+        return {"error": "Gateway loop unavailable for send dispatch",
+                **({"delivery_not_attempted": True} if track_attempt else {})}
     # shield: a cancelled caller must not cancel the enqueued send (a retry would duplicate it).
     # No timeout: the adapter and outer _run_async bound the wait.
     return await asyncio.shield(asyncio.wrap_future(fut))
 
 
 async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None, media_files=None,
-                            force_document=False, profile=None):
+                            force_document=False, profile=None, profile_home=None):
     """Live in-process gateway adapter first, else the plugin's ``standalone_sender_fn`` (cron),
     else an error naming both; media uses the adapter's native media APIs under the same rules."""
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
@@ -494,6 +496,12 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
             if adapter is None:
                 return {"error": f"No live adapter for profile '{profile}' and platform '{platform_name}'",
                         "delivery_not_attempted": True}
+            from pathlib import Path
+            owner_home = getattr(adapter, "_hermes_profile_home", None)
+            if (profile_home is None or owner_home is None
+                    or Path(owner_home).resolve() != Path(profile_home).resolve()):
+                return {"error": "Live adapter does not belong to the bound cron home",
+                        "delivery_not_attempted": True}
         except Exception as exc:
             return {"error": f"Profile resolution failed: {type(exc).__name__}", "delivery_not_attempted": True}
     if adapter is not None:
@@ -507,7 +515,8 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
             else:
                 make_coro = lambda: adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)  # noqa: E731
             result = await _dispatch_on_gateway_loop(
-                runner, make_coro, f"send_message: failed to schedule{' media send' if media_files else ''} on gateway loop")
+                runner, make_coro, f"send_message: failed to schedule{' media send' if media_files else ''} on gateway loop",
+                track_attempt=bool(profile))
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -540,7 +549,7 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk, *, thread_id=None
                       f"expected a dict with 'success' or 'error' keys, got {type(result).__name__}")}
 
 
-async def _send_chunks(chunks, send_one):
+async def _send_chunks(chunks, send_one, *, track_attempt=False):
     """``send_one(chunk, is_last)`` in order; stop at the first error dict, else last result."""
     result = None
     # --- Matrix: route ALL sends through the native adapter so text is encrypted in E2EE rooms too (issue:
@@ -550,7 +559,7 @@ async def _send_chunks(chunks, send_one):
     for i, chunk in enumerate(chunks):
         result = await send_one(chunk, i == len(chunks) - 1)
         if isinstance(result, dict) and result.get("error"):
-            if i:
+            if i and track_attempt:
                 # A later chunk's preflight failure cannot make earlier sends retryable.
                 result = {**result, "delivery_not_attempted": False}
             break
@@ -602,8 +611,8 @@ async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chun
         pconfig, chat_id, chunk, thread_id=thread_id, media_files=media_files if is_last else empty_media, **extra))
 
 
-def _via_adapter_route(p, pc, cid, chunk, media, tid, fd, profile=None):
-    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd, profile=profile)
+def _via_adapter_route(p, pc, cid, chunk, media, tid, fd, profile=None, profile_home=None):
+    return _send_via_adapter(p, pc, cid, chunk, thread_id=tid, media_files=media, force_document=fd, profile=profile, profile_home=profile_home)
 
 
 # Native-media chunked routes for built-in platforms; media rides on the final chunk, non-final
@@ -671,7 +680,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
             return await _send_chunks(chunks, lambda chunk, is_last: _via_adapter_route(
                 platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id,
-                force_document, profile))
+                force_document, profile, profile_home), track_attempt=True)
         # Standalone execution retains native built-in transports in its pinned home.
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
@@ -717,7 +726,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         # Plugin platform: live gateway adapter if available, else standalone_sender_fn.
         send_one = lambda chunk, is_last: _via_adapter_route(  # noqa: E731
             platform, pconfig, chat_id, chunk, media_files if is_last else [], thread_id, force_document)
-    last_result = await _send_chunks(chunks, send_one)
+    last_result = await _send_chunks(chunks, send_one, track_attempt=bool(profile))
     if (warning and isinstance(last_result, dict) and last_result.get("success")
             and not last_result.get("media_delivered")):
         last_result["warnings"] = [*last_result.get("warnings", []), warning]
