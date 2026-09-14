@@ -356,3 +356,39 @@ def test_real_recovered_deadline_rearms_without_extending(registry, monkeypatch)
         session.process.wait(timeout=5)
     finally:
         recovered.kill_all()
+
+
+@pytest.mark.parametrize('first_probe', ['alive', 'unknown', 'gone'])
+def test_deadline_poller_requires_group_exit_after_wrapper_loss(registry, monkeypatch, first_probe):
+    from types import SimpleNamespace
+    real_time = module.time
+    monkeypatch.setattr(module, 'time', SimpleNamespace(**{
+        name: (lambda _: None) if name == 'sleep' else getattr(real_time, name)
+        for name in dir(real_time) if not name.startswith('__')}))
+    session = ProcessSession(id='group-poll', command='verify', pid=12345,
+        started_at=real_time.time(), sandbox_process_group=True,
+        termination_source='terminal.timeout', termination_attempts=1,
+        termination_unconfirmed_at=real_time.time(), notify_on_complete=True)
+    registry._running[session.id] = session
+    class Env:
+        polls = 0
+        probes = 0
+        def execute(self, command, timeout=10):
+            if 'ps -e -o pgid=' in command:
+                self.probes += 1
+                outcome = first_probe if self.probes == 1 else 'gone'
+                return {'output': outcome + '\n', 'returncode': 0 if outcome != 'unknown' else 2}
+            if command.startswith('kill -0'):
+                return {'output': '1\n', 'returncode': 0}  # wrapper has exited
+            if command.startswith('cat '):
+                return {'output': '143\n', 'returncode': 0}
+            self.polls += 1
+            assert self.polls <= 3, 'poller failed to consume positive group-exit evidence'
+            assert not session._completion_event.is_set()
+            return {'output': '0 0\n', 'returncode': 0}
+    env = Env()
+    registry._env_poller_loop(session, env, '/synthetic/log', '/synthetic/pid', '/synthetic/exit')
+    assert env.polls == (1 if first_probe == 'gone' else 2)
+    assert session.exited and session.completion_reason == 'timed_out'
+    assert registry.completion_queue.get_nowait()['completion_reason'] == 'timed_out'
+    assert registry.completion_queue.empty()

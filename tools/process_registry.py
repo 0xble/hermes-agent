@@ -1302,6 +1302,20 @@ class ProcessRegistry(ProcessCheckpointMixin):
             f"tail -c +$((O+1)) {quoted_log_path} 2>/dev/null | head -c $((S-O)); fi"
         )
 
+    @staticmethod
+    def _sandbox_group_exited(env: Any, pid: int) -> bool:
+        # kill -0 cannot distinguish absence from EPERM. Require a successful
+        # process-table observation before settling the owned group.
+        probe = ("set -o pipefail; ps -e -o pgid= | "
+                 f"awk -v target={int(pid)} '$1 == target {{found=1}} "
+                 "END {print found ? \"alive\" : \"gone\"}'")
+        try:
+            result = env.execute(f"bash -lc {shlex.quote(probe)}", timeout=5)
+            return (result.get("returncode", result.get("exit_code")) == 0
+                    and result.get("output", "").strip() == "gone")
+        except Exception:
+            return False
+
     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
         """Background thread: poll a sandbox log file for non-local backends."""
         q = shlex.quote
@@ -1346,6 +1360,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         # The observer is fenced while a deadline kill publishes this
                         # exit. Re-poll instead of dropping the observation so an
                         # errored kill still has a watcher to retire the session.
+                        continue
+                    if (session.sandbox_process_group and session.pid
+                            and session.termination_source == "terminal.timeout"
+                            and not self._sandbox_group_exited(env, session.pid)):
+                        # Losing the wrapper is not proof that a failed deadline
+                        # kill stopped descendants. Keep the deadline retry alive.
                         continue
                     # Exited -- read the exit code captured by the wrapper shell.
                     exit_str = env.execute(f"cat {q(exit_path)} 2>/dev/null", timeout=5).get("output", "").strip()
@@ -1981,7 +2001,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     f"! kill -0 {target} 2>/dev/null"
                 )
                 result = session.env_ref.execute(f"bash -lc {shlex.quote(stop)}", timeout=5)
-                if result.get("returncode", result.get("exit_code")) != 0:
+                if (result.get("returncode", result.get("exit_code")) != 0
+                        or not self._sandbox_group_exited(session.env_ref, session.pid)):
                     raise RuntimeError("sandbox process group termination could not be confirmed")
             else:
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
