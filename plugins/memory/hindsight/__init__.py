@@ -57,6 +57,39 @@ from .settings import (
 logger = logging.getLogger(__name__)
 _SOURCE_SUBMISSION = contextvars.ContextVar("hindsight_source_submission", default=False)
 
+
+def _source_request_rejected(exc: Exception) -> bool:
+    """Only SDK HTTP responses proving admission failed before async queuing.
+
+    Authentication/access checks precede submission. FastAPI's structured
+    request-validation response also precedes the route. Generic 400/422 errors
+    may originate inside an engine after work began and do not prove rejection.
+    """
+    try:
+        from hindsight_client_api.exceptions import ApiException
+    except ImportError:
+        return False
+
+    if not isinstance(exc, ApiException):
+        return False
+    if exc.status in (401, 403):
+        return True
+    if exc.status != 422:
+        return False
+    payload = exc.data
+    if not isinstance(payload, dict):
+        try:
+            payload = json.loads(exc.body or "null")
+        except (TypeError, ValueError):
+            return False
+    details = payload.get("detail") if isinstance(payload, dict) else None
+    return isinstance(details, list) and bool(details) and all(
+        isinstance(item, dict) and isinstance(item.get("loc"), list) and bool(item["loc"])
+        and item["loc"][0] in ("body", "path", "query", "header")
+        and isinstance(item.get("type"), str) and bool(item["type"])
+        and isinstance(item.get("msg"), str) and bool(item["msg"])
+        for item in details)
+
 # Keep in sync with pyproject.toml, tools/lazy_deps.py ("memory.hindsight"),
 # plugin.yaml, and uv.lock. Hermes intentionally exact-pins managed SDKs so
 # eager, lazy, setup, and runtime-repair installs converge on reviewed bytes.
@@ -1518,6 +1551,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return False
             requested = False
             prepared = False
+            response_received = False
             submission_context = _SOURCE_SUBMISSION.set(True)
             try:
                 # Admission owns this source now. Refresh after claiming so a rival
@@ -1551,6 +1585,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     requested = True
                     response = self._retain_batch(item, bank_id=bank_id,
                                                   document_id=candidate.source_id, retain_async=True)
+                response_received = True
                 self._track_retain_ops(response, bank_id, source_candidates=[candidate], submission_token=token)
                 # A durable operation receipt takes over the reservation. Without
                 # IDs, readback alone cannot prove the server has stopped writing.
@@ -1564,10 +1599,10 @@ class HindsightMemoryProvider(MemoryProvider):
                             candidate.source_type, candidate.source_id, candidate.source_shape,
                             candidate.content_hash[:16])
                 return True
-            except Exception:
-                if not requested:
+            except Exception as exc:
+                if not requested or (not response_received and _source_request_rejected(exc)):
                     self._source_journal.release(candidate, token)
-                elif not _fresh_deferred:
+                if requested and not _fresh_deferred:
                     self._deferred_source_candidates.setdefault(candidate.source_id, []).append((candidate, bank_id))
                 # Unknown acceptance stays reserved even if the diagnostic ledger
                 # marks failure. Never replay it merely because readback failed.

@@ -117,14 +117,22 @@ alone does not prove that an asynchronous operation has stopped writing. The
 existing drain reports unresolved work, and later versions of that source stay
 blocked. Recovery of an unreceipted reservation requires operator reconciliation
 with server operation evidence. There is currently no automated reset command.
+The same limitation applies if a known operation disappears before its terminal
+status was recorded. The server's missing-operation response does not identify
+the deletion cause, and this plugin has no supported CLI to settle that missing
+receipt. Restarting or repairing credentials alone does not clear it.
 Do not clear reservations based only on process death, elapsed time or a matching
 document hash.
 
 Deferred source bytes remain in memory and are retained when submission raises.
 They are not persisted or reconstructed after restart. A local file validation
 failure before any request can release admission. A transport exception after a
-request begins cannot. This trades availability after an unknown outcome for
-preserving source write order.
+request begins cannot. SDK HTTP 401/403 responses from the submission call and
+structured FastAPI 422 request-validation responses are definite prequeue
+rejections and release the matching reservation. Generic 400/422 errors and
+errors after a submission response remain unresolved. A later drain can retry
+the preserved source after the credential or input problem is repaired. This
+trades availability after an unknown outcome for preserving source write order.
 
 ### Integration
 

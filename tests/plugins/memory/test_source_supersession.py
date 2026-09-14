@@ -771,3 +771,88 @@ def test_pre_request_admission_failure_releases_real_reservation(monkeypatch, fa
     p._retain_source_candidates([old], p._bank_id)
     assert len(server.calls) == 1
     assert server.calls[0]['items'][0]['content'] == old.content
+
+
+@pytest.mark.parametrize('rejection', ['unauthorized', 'forbidden', 'schema'])
+@pytest.mark.parametrize('file_upload', [False, True])
+def test_definite_request_rejection_releases_source_admission(monkeypatch, rejection, file_upload):
+    from dataclasses import replace
+    from hindsight_client_api.exceptions import ApiException, UnauthorizedException, ForbiddenException
+    old, _ = versions('https://example.com/definite-rejection')
+    if file_upload:
+        old = replace(old, file_path='/synthetic/source.txt')
+        monkeypatch.setattr('plugins.memory.hindsight.read_verified_source_file', lambda c: b'bytes')
+    server = Server()
+    error = {
+        'unauthorized': UnauthorizedException(status=401, body='{"detail":"Invalid API key"}'),
+        'forbidden': ForbiddenException(status=403, body='{"detail":"Operation not allowed"}'),
+        'schema': ApiException(status=422, body='{"detail":[{"type":"missing","loc":["body","items"],"msg":"Field required"}]}'),
+    }[rejection]
+    calls = []
+    def rejected(**kwargs):
+        calls.append(kwargs)
+        raise error
+    server.aretain_batch = rejected
+    server._files_api = SimpleNamespace(file_retain=rejected)
+    p = provider(server)
+    p._retain_source_candidates([old], p._bank_id)
+    assert len(calls) == 1
+    assert not p._source_journal.unresolved_submission(old.source_id)
+    assert old.automatic_key not in p._source_retain_verified
+    # After an operator repairs credentials/input, one fresh attempt can proceed.
+    def accepted(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(operation_id='accepted-after-fix')
+    server.aretain_batch = accepted
+    server._files_api.file_retain = accepted
+    assert not p._wait_for_retains_drained(10)
+    assert len(calls) == 2
+    assert p._source_retain_ops['accepted-after-fix'].content == old.content
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'bad_request', 'server', 'unknown_422', 'defense_422', 'text_401', 'after_response'])
+def test_uncertain_request_failure_keeps_exact_source_reservation(monkeypatch, failure):
+    from hindsight_client_api.exceptions import ApiException, BadRequestException, UnauthorizedException
+    old, _ = versions('https://example.com/uncertain-rejection')
+    server = Server()
+    error = {
+        'timeout': TimeoutError('response lost'),
+        'bad_request': BadRequestException(status=400, body='{"detail":"engine rejected late"}'),
+        'server': ApiException(status=503),
+        'unknown_422': ApiException(status=422, body='{"detail":"unknown validation stage"}'),
+        'defense_422': ApiException(status=422, body='{"detail":{"violations":[]}}'),
+        'text_401': RuntimeError('401 Unauthorized'),
+        'after_response': UnauthorizedException(status=401),
+    }[failure]
+    p = provider(server)
+    if failure == 'after_response':
+        def fail_tracking(*args, **kwargs):
+            raise error
+        monkeypatch.setattr(p, '_track_retain_ops', fail_tracking)
+    else:
+        def fail_request(**kwargs):
+            server.calls.append(kwargs)
+            raise error
+        server.aretain_batch = fail_request
+    p._retain_source_candidates([old], p._bank_id)
+    assert p._source_journal.unresolved_submission(old.source_id)
+    assert len(server.calls) == 1
+    assert p._deferred_source_candidates[old.source_id][0][0].content == old.content
+    assert not p._wait_for_retains_drained(10)
+    assert len(server.calls) == 1
+
+
+def test_rejection_cleanup_does_not_release_a_different_token(monkeypatch):
+    from hindsight_client_api.exceptions import UnauthorizedException
+    old, _ = versions('https://example.com/rejection-token')
+    server = Server()
+    p = provider(server)
+    def replaced_claim(**kwargs):
+        import sqlite3
+        with sqlite3.connect(p._source_journal.path) as db:
+            db.execute('UPDATE source_submissions SET token=? WHERE scope=? AND source_id=?',
+                       ('replacement-token', p._source_journal.scope, old.source_id))
+        raise UnauthorizedException(status=401)
+    server.aretain_batch = replaced_claim
+    p._retain_source_candidates([old], p._bank_id)
+    assert p._source_journal.unresolved_submission(old.source_id)
