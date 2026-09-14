@@ -121,6 +121,9 @@ def build_gateway_parser(
         "update", help="Request a native update from a delegated agent session")
     gateway_update.add_argument("--reason", required=True,
         help="Short single-paragraph reason for the parent-session update handoff")
+    gateway_update.add_argument("--revision", default=None, metavar="SHA",
+        help="Request this exact 40-character lowercase commit SHA; requires a gateway "
+             "supporting pinned updates. Acceptance is not update completion.")
 
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 

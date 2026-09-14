@@ -123,8 +123,9 @@ def test_agent_update_socket_uses_real_sqlite_session_lineage_and_marshals_watch
     result, duplicate, unknown = asyncio.run(scenario())
     marker = json.loads((tmp_path / ".update_pending.json").read_text())
     assert result["accepted"] is True and result["started"] is True
-    assert duplicate == {"accepted": True, "started": False, "pending": True,
-                         "handoff": "Update accepted. End this turn now; the native updater owns completion."}
+    assert duplicate is not None
+    assert duplicate["accepted"] is False and duplicate["pending"] is True
+    assert duplicate["started"] is False and "already pending" in duplicate["error"]
     assert unknown is None
     assert marker["reason"] == "Apply security fix"
     assert marker["parent_session_id"] == direct_id

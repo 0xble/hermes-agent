@@ -6388,9 +6388,13 @@ def _cmd_migrate_legacy(args):
 def _cmd_update(args) -> int:
     """Forward an agent's update handoff to its owning gateway only."""
     from gateway.update_launcher import validate_agent_update_reason
+    from hermes_cli.update_revision import validate_revision
 
     try:
         reason = validate_agent_update_reason(getattr(args, "reason", None))
+        revision = getattr(args, "revision", None)
+        if revision is not None:
+            revision = validate_revision(revision)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 2
@@ -6406,11 +6410,16 @@ def _cmd_update(args) -> int:
     if not get_gateway_runtime_snapshot().running and named_profile_served_by_running_multiplexer():
         from hermes_constants import get_default_hermes_root
         target_home = get_default_hermes_root()
-    result = query_gateway_control(target_home, "agent-update", payload={
-        "reason": reason, "session_id": session_id,
-    })
+    payload = {"reason": reason, "session_id": session_id}
+    if revision is not None:
+        payload["revision"] = revision
+    # A separate verb fails closed on older gateways which would silently ignore
+    # an unfamiliar revision field and start a mutable branch update instead.
+    verb = "agent-update-revision" if revision is not None else "agent-update"
+    result = query_gateway_control(target_home, verb, payload=payload)
     if not result:
-        print("Error: gateway update handoff unavailable")
+        print("Error: gateway update handoff unavailable; acceptance is unknown. "
+              "Do not retry automatically or fall back to an unpinned update.")
         return 1
     if not result.get("accepted"):
         print(f"Error: {result.get('error') or 'gateway refused update handoff'}")
