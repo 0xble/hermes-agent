@@ -61,6 +61,12 @@ def _result_paths():
     whether its uncertainty affects the caller. No malformed file is pruned.
     """
     directory = get_hermes_home() / "logs" / "process-results"
+    try:
+        # glob may suppress directory-access errors, falsely clearing an owner
+        # barrier. Only an absent first-use directory proves there are no receipts.
+        paths = [path for path in directory.iterdir() if path.match("proc_*.json")]
+    except FileNotFoundError:
+        return []
     cutoff = time.time() - RESULT_RETENTION_SECONDS
     retained, unresolved = [], []
     db, cache = None, {}
@@ -70,7 +76,7 @@ def _result_paths():
     except sqlite3.Error:
         pass
     try:
-        for path in directory.glob("proc_*.json"):
+        for path in paths:
             try:
                 modified = path.stat().st_mtime
                 record = json.loads(path.read_text(encoding="utf-8"))
