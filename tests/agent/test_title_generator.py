@@ -583,6 +583,24 @@ class TestGenerateTitle:
             title = generate_title("Audit Host & Home quarterly pricing")
         assert title == "Quarterly Host & Home Pricing Audit"
 
+    @pytest.mark.parametrize("alias", ["tool suite", "tool & suite"])
+    @pytest.mark.parametrize("canonical", [r"C:\tools", r"C:\Projects", r"Team\1", "ToolSuite"])
+    def test_configured_alias_replacement_is_literal(
+        self, tmp_path, monkeypatch, alias, canonical
+    ):
+        """Strict and punctuation-tolerant matches preserve operator display text."""
+        import json
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(json.dumps({
+            "auxiliary": {"title_generation": {"name_aliases": {alias: canonical}}}
+        }))
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Tool Suite migration"}'
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(f"Plan the {alias} migration") == f"{canonical} migration"
+
     def test_alias_preserves_stylized_brand_case(self):
         aliases = {"gog": "gog", "onepass": "1Password"}
         cases = [

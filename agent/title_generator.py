@@ -794,11 +794,11 @@ def generate_title(
                     if canonical != canonical_name:
                         continue
                     pattern = re.compile(rf"(?<!\w){re.escape(alias)}(?!\w)", re.IGNORECASE)
-                    title, count = pattern.subn(canonical_name, title)
+                    title, count = pattern.subn(lambda _match: canonical_name, title)
                     if not count:
                         loose_pattern = _punctuation_tolerant_alias_pattern(alias)
                         if loose_pattern is not None:
-                            title, count = loose_pattern.subn(canonical_name, title)
+                            title, count = loose_pattern.subn(lambda _match: canonical_name, title)
                     if count:
                         replaced = True
                         break
