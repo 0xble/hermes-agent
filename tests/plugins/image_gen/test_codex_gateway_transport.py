@@ -10,7 +10,7 @@ def test_gateway_credentials_and_missing_key_fail_closed(monkeypatch):
     config = {"base_url": "http://127.0.0.1:8317/v1/", "api_key": "test-key"}
     monkeypatch.setattr(plugin, "load_image_gen_config", lambda: config)
     monkeypatch.setattr(plugin, "_read_codex_access_token", lambda: pytest.fail("OAuth read"))
-    assert plugin._resolve_transport() == ("http://127.0.0.1:8317/v1", "test-key", True)
+    assert plugin._resolve_transport() == ("http://127.0.0.1:8317/v1", "test-key", True, "responses")
     config.pop("api_key")
     with pytest.raises(ValueError, match="api_key"):
         plugin._resolve_transport()

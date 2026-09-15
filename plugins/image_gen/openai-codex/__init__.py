@@ -91,8 +91,11 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _resolve_transport() -> Tuple[str, Optional[str], bool]:
-    """An explicit gateway never reads or refreshes direct Codex credentials."""
+def _resolve_transport() -> Tuple[str, Optional[str], bool, str]:
+    """Snapshot endpoint, credentials and protocol together for every attempt.
+
+    An explicit gateway never reads or refreshes direct Codex credentials.
+    """
     config = load_image_gen_config()
     base_url = str(config.get("base_url") or "").strip().rstrip("/")
     if base_url:
@@ -103,8 +106,8 @@ def _resolve_transport() -> Tuple[str, Optional[str], bool]:
         key = str(config.get("api_key") or "").strip()
         if not key or key.startswith("${"):
             raise ValueError("image_gen.api_key must resolve when image_gen.base_url is configured")
-        return base_url, key, True
-    return _CODEX_BASE_URL, _read_codex_access_token(), False
+        return base_url, key, True, "images" if config.get("api_mode") == "images" else "responses"
+    return _CODEX_BASE_URL, _read_codex_access_token(), False, "responses"
 
 
 def _httpx_available() -> bool:
@@ -296,14 +299,14 @@ def _iter_sse_json(response: Any):
 
 def _collect_image_b64(
     token: str, *, prompt: str, size: str, quality: str, input_images: Optional[List[Dict[str, str]]] = None,
-    base_url: str = _CODEX_BASE_URL, gateway: bool = False
+    base_url: str = _CODEX_BASE_URL, gateway: bool = False, api_mode: str = "responses"
 ) -> Optional[Dict[str, str]]:
     """Stream a Codex Responses image_generation call → ``{"b64", "source": "final"|"partial"}`` or
     ``None``. A partial is kept only when no final arrives; callers must not treat it as success."""
     import httpx
     from agent.codex_headers import codex_cloudflare_headers
 
-    if gateway and load_image_gen_config().get("api_mode") == "images":
+    if gateway and api_mode == "images":
         payload = {"model": API_MODEL, "prompt": prompt, "size": size,
                    "quality": quality, "n": 1}
         with httpx.Client(timeout=300.0) as http:
@@ -394,7 +397,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
         if not prompt:
             return prompt_required_error("openai-codex", aspect)
         try:
-            base_url, token, gateway = _resolve_transport()
+            base_url, token, gateway, api_mode = _resolve_transport()
         except ValueError as exc:
             return error_factory("openai-codex", aspect)(str(exc), "invalid_config")
         if not token:
@@ -418,7 +421,7 @@ class OpenAICodexImageGenProvider(StaticImageGenProvider):
                 collected = _collect_image_b64(
                     token, prompt=prompt, size=size, quality=meta["quality"],
                     input_images=input_images or None,
-                    **({"base_url": base_url, "gateway": True} if gateway else {}))
+                    base_url=base_url, gateway=gateway, api_mode=api_mode)
                 if collected and collected.get("source") == "final" and collected.get("b64"):
                     break
                 if attempt < _NONFINAL_RETRIES:

@@ -127,7 +127,8 @@ class TestGenerate:
 
         captured = {}
 
-        def _collect(token, *, prompt, size, quality, input_images=None):
+        def _collect(token, *, prompt, size, quality, input_images=None, base_url, gateway, api_mode):
+            assert base_url == codex_plugin._CODEX_BASE_URL and not gateway and api_mode == "responses"
             captured.update(codex_plugin._build_responses_payload(
                 prompt=prompt,
                 size=size,

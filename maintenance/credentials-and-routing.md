@@ -5,6 +5,8 @@ requires it on every run and owns shared adoption/publication policy.
 
 ## Coupled current adaptations
 
+- Codex image generation snapshots explicit gateway endpoint, key and API mode together once per generation, preserving that transport through input preparation and nonfinal-result retries. Direct Codex keeps Responses and never borrows gateway credentials. Regression: `tests/plugins/image_gen/test_codex_transport_snapshot.py` drives the real provider/config loader through HTTPX with generation/edit and configuration-rotation cases. The existing gateway feature comes from fork PR `#136`; upstream `#91131` and `#65323` remain related open proposals as checked on 2026-09-15, not equivalent fixes or contribution associations.
+
 - Runtime credential refresh may recover a missing dispatched ID only through one uniquely matching request-key hint. Missing CLI targets without a hint, unknown hints and ambiguous matches still refresh no account. This extends HERMES-121 without weakening its explicit CLI targeting contract. Regression: `tests/agent/test_credential_pool_operations.py`.
 
 - Preset-reference restoration strips unauthored empty fallback chains.
