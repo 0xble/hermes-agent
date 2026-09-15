@@ -210,19 +210,41 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path, *, revision=
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
         f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path.parent / '.update_process_exit_code'))}")
-    # Preferred: setsid creates a new session, fully detached; fallback start_new_session=True
-    # calls os.setsid() in the child.
-    setsid_bin = shutil.which("setsid")
-    argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
-    scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
+    # Scope mode execs bash directly. A nested setsid can fork and let the exact
+    # Popen child exit before the updater, destroying pre-execution failure proof.
+    scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(["bash", "-c", update_cmd])
+    handshake = None
     if scoped_env is not None:
-        _popen_detached_update(
+        from gateway.update_launcher import scope_launch_handshake
+        handshake = scope_launch_handshake(exit_code_path.parent)
+        if handshake is not None:
+            entered, _identity = handshake
+            prelude = (
+                "import os,sys; "
+                "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600); "
+                "written=os.write(fd,b'entered'); os.fsync(fd); os.close(fd); "
+                "sys.exit(0 if written == 7 else 125)"
+            )
+            # No updater instruction is reachable if the entry acknowledgement fails.
+            command = " ".join(shlex.quote(x) for x in [sys.executable, "-c", prelude, str(entered)])
+            scoped_argv[-1] = f"{command} || exit 125; {update_cmd}"
+        process = _popen_detached_update(
             scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, env=scoped_env,
         )
+        if handshake is not None:
+            import threading
+            from gateway.update_launcher import observe_scope_launch
+            threading.Thread(
+                target=observe_scope_launch,
+                args=(process, exit_code_path.parent, *handshake), daemon=True,
+                name="update-scope-launch",
+            ).start()
     else:
+        setsid_bin = shutil.which("setsid")
+        argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
         _popen_detached_update(
-            scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -55,8 +56,6 @@ def launch_native_update(
     staging_path = home / ".update_pending.initializing"
     if pending_path.exists() or claimed_path.exists():
         return {"started": False, "pending": True}
-    pending = {**pending, "notification_version": 2}
-    encoded = json.dumps(pending).encode("utf-8")
     # Keep a stable lock inode: the kernel, not a PID/age guess, owns initializer
     # liveness. Never unlink this file, including after an interrupted initializer.
     with (home / ".update_admission.lock").open("a+", encoding="utf-8") as lock:
@@ -65,6 +64,9 @@ def launch_native_update(
         try:
             if pending_path.exists() or claimed_path.exists():
                 return {"started": False, "pending": True}
+            pending = {**pending, "notification_version": 2, "launch_id": uuid.uuid4().hex}
+            pending.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+            encoded = json.dumps(pending).encode("utf-8")
             # Staging is never a request. Only the lock owner can replace remnants
             # from a dead initializer; existing pending/claimed files fail closed.
             fd = os.open(str(staging_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -99,6 +101,77 @@ def launch_native_update(
         finally:
             _release_file_lock(lock)
     return {"started": True, "pending": False}
+
+
+def scope_launch_handshake(home: Path) -> tuple[Path, str] | None:
+    """Capture the published admission while its caller still owns admission lock."""
+    from gateway.update_notifications import request_identity
+
+    try:
+        pending = json.loads((home / ".update_pending.json").read_text())
+        launch_id = pending["launch_id"]
+        if not isinstance(launch_id, str) or uuid.UUID(hex=launch_id).hex != launch_id:
+            return None
+        return home / f".update_scope_entered-{launch_id}", request_identity(pending)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def observe_scope_launch(process, home: Path, entered: Path, identity: str, *, poll_interval: float = 0.2) -> None:
+    """Settle only a reaped scope that provably never entered its mandatory prelude.
+
+    systemd-run --scope execs its command in-place. Its direct command must be bash,
+    never a forking setsid wrapper. A live child, lost observer, unreadable marker,
+    or changed admission leaves it unresolved. No retries or time-based release occur.
+    """
+    import time
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+    from gateway.update_notifications import request_identity
+
+    try:
+        while True:
+            current = json.loads((home / ".update_pending.json").read_text())
+            if request_identity(current) != identity:
+                return
+            try:
+                entered.lstat()
+                return
+            except FileNotFoundError:
+                pass
+            code = process.poll()  # Reaps this exact child, not a PID lookup.
+            if code is None:
+                time.sleep(poll_interval)
+                continue
+            # Recheck after reaping: the child might have entered after the first stat.
+            try:
+                entered.lstat()
+                return
+            except FileNotFoundError:
+                pass
+            with (home / ".update_admission.lock").open("a+") as lock:
+                if not _try_acquire_file_lock(lock):
+                    time.sleep(poll_interval)
+                    continue
+                try:
+                    try:
+                        (home / ".update_pending.claimed.json").lstat()
+                        return
+                    except FileNotFoundError:
+                        pass
+                    pending = json.loads((home / ".update_pending.json").read_text())
+                    if (pending.get("launch_id") != entered.name.removeprefix(".update_scope_entered-")
+                            or request_identity(pending) != identity):
+                        return
+                    # The notifier owns delivery and release. Never unlink admission.
+                    with (home / ".update_process_exit_code").open("x") as receipt:
+                        receipt.write(str(code or 125))
+                        receipt.flush()
+                        os.fsync(receipt.fileno())
+                    return
+                finally:
+                    _release_file_lock(lock)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return  # Unknown evidence is never authority to release admission.
 
 
 def _route_from_session_lineage(db: Any, session_id: str) -> tuple[str, dict[str, Any]] | None:
