@@ -115,6 +115,10 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
     assert response == ""
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
+    assert appended[-1]["display_kind"] == "hidden"
+    runner._session_db.set_latest_matching_message_display_kind.assert_called_once_with(
+        "sess-silent", role="assistant", content="[SILENT]", display_kind="hidden",
+    )
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
 
 
