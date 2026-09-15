@@ -1091,10 +1091,42 @@ def _debug_candidate_paths(system: str):
                     yield posixpath.join(base, *parts)
 
 
+# Stable package launchers and their installed process binaries. PATH aliases may
+# resolve to these launchers; arbitrary same-named wrappers do not gain authority.
+_LINUX_BROWSER_LAUNCHER_BINARIES = {
+    "chrome": {"/opt/google/chrome/google-chrome": "/opt/google/chrome/chrome"},
+    "chromium": {"/usr/bin/chromium": "/usr/lib/chromium/chromium"},
+    "brave": {"/opt/brave.com/brave/brave-browser": "/opt/brave.com/brave/brave"},
+    "brave-origin": {"/opt/brave.com/brave-origin/brave-origin": "/opt/brave.com/brave-origin/brave"},
+    "edge": {"/opt/microsoft/msedge/microsoft-edge": "/opt/microsoft/msedge/msedge"},
+}
+
+
+def _snapshot_browser_executables() -> set[str]:
+    """Bind cleanup to installed launchers and their known package binaries."""
+    executables = set()
+    for browser in _BROWSER_BY_KEY:
+        path = chromium_executable(browser)
+        if not path:
+            continue
+        launcher = _normalized_host_path(path)
+        executables.add(launcher)
+        binary = _LINUX_BROWSER_LAUNCHER_BINARIES.get(browser, {}).get(launcher)
+        if not binary or not os.path.isfile(launcher) or not os.access(launcher, os.X_OK):
+            continue
+        resolved = _normalized_host_path(binary)
+        # A package path redirected elsewhere is not proof of that installation's
+        # binary. In particular, never adopt a generic basename from a PATH wrapper.
+        if (resolved == os.path.normcase(os.path.normpath(binary))
+                and os.path.isfile(binary) and os.access(binary, os.X_OK)):
+            executables.add(resolved)
+    return executables
+
+
 def stop_snapshot_browser_processes(snapshot_root: str) -> int:
     """Stop directly launched Chromium trees rooted in ``snapshot_root``.
 
-    The match is intentionally strict: exact installed browser executable,
+    The match is intentionally strict: exact installed browser launcher/binary,
     dynamic remote debugging, ``Default`` profile, and a user-data-dir below
     Hermes' snapshot root. This recovers cleanup after a gateway crash without
     risking the user's live browser profile.
@@ -1102,11 +1134,7 @@ def stop_snapshot_browser_processes(snapshot_root: str) -> int:
     import psutil
 
     root = _normalized_host_path(snapshot_root)
-    executables = {
-        os.path.normcase(os.path.realpath(path))
-        for browser in _BROWSER_BY_KEY
-        if (path := chromium_executable(browser))
-    }
+    executables = _snapshot_browser_executables()
     if not executables:
         return 0
 
