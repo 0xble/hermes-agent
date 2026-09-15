@@ -59,6 +59,8 @@ _DB_LOCK = threading.Lock()
 _completion_publish_lock = threading.RLock()
 _completion_retry_homes: set[Path] = set()
 _completion_publications: Dict[tuple[Path, str], Dict[str, Any]] = {}
+# Only dispatch in this process can create this binding, never checkpoint replay.
+_completion_producer_owners: Dict[tuple[Path, str], tuple[int, Optional[int]]] = {}
 _BUSY_RETRY_DELAYS_S = (0.02, 0.04, 0.08, 0.12, 0.15)
 _TERMINAL_CHECKPOINT_SCHEMA = "async_delegation_terminal_v1"
 _CHECKPOINT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -372,6 +374,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              json.dumps(task_payload), record.get("origin_session_id", ""), projection["parent_task_id"],
              projection["thread_number"], projection["task_label"], projection["owner_json"]))
     _prune_durable_records()
+    with _completion_publish_lock:
+        _completion_producer_owners[(get_hermes_home().resolve(), record["delegation_id"])] = (
+            os.getpid(), owner_started_at)
 
 
 def _prune_durable_records() -> None:
@@ -505,6 +510,18 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
     from gateway.status import get_process_start_time
     pid = os.getpid()
     started = get_process_start_time(pid)
+    key = (get_hermes_home().resolve(), event["delegation_id"])
+    with _completion_publish_lock:
+        producer = _completion_producer_owners.get(key)
+    if producer is not None:
+        owner_pid, captured_start = producer
+        if owner_pid != pid or (started is not None and captured_start is not None and started != captured_start):
+            return False
+        # A missing lookup does not revoke a binding created by this live process.
+        # A restarted/reused PID has no binding and must prove a non-null start.
+        started = captured_start
+    elif started is None:
+        return False
 
     def _write() -> bool:
         now = time.time()
@@ -516,7 +533,11 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> bool:
                 (event.get("status", "completed"), event.get("completed_at", now), now,
                  json.dumps(event), json.dumps(result), event["delegation_id"], pid, started))
             return changed.rowcount == 1
-    return _run_with_busy_retry(_write)
+    won = _run_with_busy_retry(_write)
+    if won:
+        with _completion_publish_lock:
+            _completion_producer_owners.pop(key, None)
+    return won
 
 
 def _publish_completion(event: Dict[str, Any], target_queue) -> None:
@@ -537,12 +558,8 @@ def retry_current_owner_terminal_checkpoints(target_queue) -> int:
     Only homes registered by a local producer are considered. Dead-owner startup
     recovery and retry-exhausted delivery budgets retain their separate semantics.
     """
-    from gateway.status import get_process_start_time
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     pid = os.getpid()
-    started = get_process_start_time(pid)
-    if started is None:
-        return 0
     published = 0
     with _completion_publish_lock:
         for home in tuple(_completion_retry_homes):
@@ -551,8 +568,8 @@ def retry_current_owner_terminal_checkpoints(target_queue) -> int:
                 with _DB_LOCK, _transaction() as conn:
                     ids = [r[0] for r in conn.execute(
                         "SELECT delegation_id FROM async_delegations "
-                        "WHERE state IN ('running','finalizing') AND owner_pid=? AND owner_started_at=?",
-                        (pid, started))]
+                        "WHERE state IN ('running','finalizing') AND owner_pid=?",
+                        (pid,))]
                 for delegation_id in ids:
                     checkpoint = _load_terminal_checkpoint(delegation_id)
                     if checkpoint is None:
@@ -1354,6 +1371,8 @@ def _dispatch(
             _records.pop(delegation_id, None)
         with _DB_LOCK, _transaction() as conn:
             conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        with _completion_publish_lock:
+            _completion_producer_owners.pop((get_hermes_home().resolve(), delegation_id), None)
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -1526,6 +1545,8 @@ def _push_completion_event(record: Dict[str, Any], result: Dict[str, Any], statu
     try:
         _checkpoint_terminal_result(evt, result)
         checkpointed = True
+        with _completion_publish_lock:
+            _completion_retry_homes.add(get_hermes_home().resolve())
     except Exception as exc:  # noqa: BLE001 — SQLite persist is the primary store
         logger.error("Async delegation%s %s: terminal checkpoint failed: %s",
                      label, record.get("delegation_id"), exc)
@@ -1804,6 +1825,10 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    with _completion_publish_lock:
+        _completion_producer_owners.clear()
+        _completion_retry_homes.clear()
+        _completion_publications.clear()
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

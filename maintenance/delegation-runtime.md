@@ -139,3 +139,14 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 ## September 15 boundary correction
 
 MoA prefetched streams use an explicit idempotent iterator owner so closing before the first consumer read releases the already-active transport and its semaphore. Exhaustion and errors also close the source, preserving chunk order and no replay after emitted output. Real prefetch regressions retain the underlying source so garbage collection cannot mask leaks. Revert the owner and close-boundary tests together.
+
+- Same-process terminal publication retains a profile-bound producer identity captured
+  only by successful dispatch. Missing subsequent process-start lookup cannot strand
+  the exact checkpoint, including when dispatch initially recorded no start time.
+  Foreign PID and conflicting known start values still refuse, and restart replay
+  cannot reconstruct the in-memory binding from a checkpoint. Completion, failed
+  executor admission and test reset release bindings. Regression:
+  `tests/tools/test_live_terminal_checkpoint_retry.py` plus async delegation tests.
+  This repairs the fork's existing checkpoint contract without schema or runtime
+  changes. Retire only with equivalent upstream live-owner recovery and PID-reuse
+  protection, preserving pending checkpoint files during rollback.
