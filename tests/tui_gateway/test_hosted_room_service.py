@@ -637,10 +637,27 @@ def test_active_same_thread_followup_waits_for_current_task(tmp_path: Path):
     )
     # Exercise real concurrent admission while the first scheduler cycle owns the
     # task. Explicit release, not a wall-clock deadline, controls the fake RPC.
-    worker = threading.Thread(target=service.runtime._run_cycle)
+    worker_errors = []
+    worker_finished = threading.Event()
+
+    def run_cycle():
+        try:
+            service.runtime._run_cycle()
+        except BaseException as exc:
+            worker_errors.append(exc)
+        finally:
+            worker_finished.set()
+            service.rpc.first_started.set()  # wake the harness even if submit never started
+
+    # This is a deadlock guard, not a room response-time contract. A broken worker
+    # must neither block pytest forever nor leave a non-daemon thread at shutdown.
+    safety_timeout = 30.0
+    worker = threading.Thread(target=run_cycle, daemon=True)
     worker.start()
     try:
-        service.rpc.first_started.wait()
+        assert service.rpc.first_started.wait(safety_timeout), "room worker never reached submit"
+        assert not worker_errors, f"room worker failed: {worker_errors!r}"
+        assert not worker_finished.is_set(), "room worker exited before reaching blocked submit"
         service.send(
             room_id="room-1",
             event_id="user-2",
@@ -649,7 +666,9 @@ def test_active_same_thread_followup_waits_for_current_task(tmp_path: Path):
         assert len(service.rpc.prompts) == 1
     finally:
         service.rpc.release_first.set()
-        worker.join()
+        worker.join(safety_timeout)
+        assert not worker.is_alive(), "room worker did not exit after explicit release"
+    assert not worker_errors, f"room worker failed: {worker_errors!r}"
     service.runtime._run_cycle()
     assert len(service.rpc.prompts) == 2
     assert any(
@@ -658,6 +677,22 @@ def test_active_same_thread_followup_waits_for_current_task(tmp_path: Path):
         for event in service._events("room-1")
     )
     assert "User (user): @hermes follow up" in service.rpc.prompts[1][1]
+
+
+@pytest.mark.parametrize("worker_failure", ["raise", "return"])
+def test_active_followup_harness_reports_worker_failure_before_submit(
+    tmp_path: Path, monkeypatch, worker_failure,
+):
+    from tui_gateway.hosted_room_driver import HostedRoomRuntime
+
+    def broken_cycle(self):
+        if worker_failure == "raise":
+            raise RuntimeError("injected cycle failure before submit")
+
+    monkeypatch.setattr(HostedRoomRuntime, "_run_cycle", broken_cycle)
+    message = "room worker failed" if worker_failure == "raise" else "room worker exited"
+    with pytest.raises(AssertionError, match=message):
+        test_active_same_thread_followup_waits_for_current_task(tmp_path)
 
 
 def test_thread_transcript_prunes_committed_message_and_settlement_together(
