@@ -805,3 +805,53 @@ def test_empty_file_metadata_and_enumeration_are_bounded(candidate_repo, monkeyp
     monkeypatch.setattr(capture, "MAX_ENUMERATION_BYTES", 16)
     with pytest.raises(ValueError, match="aggregate review evidence bound"):
         capture._git(candidate_repo, "ls-files", "--others", "-z")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="local upload-pack probe uses a POSIX shell")
+@pytest.mark.parametrize("legacy_no_lazy_fetch", [False, True])
+def test_partial_clone_capture_never_fetches_or_writes_objects(tmp_path, monkeypatch, legacy_no_lazy_fetch):
+    """Real promisor objects must remain missing, including on older Git versions."""
+    import shlex
+    import agent.review_candidate as capture
+
+    origin = _init_repo(tmp_path / "origin")
+    (origin / "tracked.py").write_text("original promised blob\n")
+    _git(origin, "add", "tracked.py")
+    _git(origin, "commit", "-qm", "base")
+    _git(origin, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "partial"
+    _git(tmp_path, "-c", "protocol.file.allow=always", "clone", "--filter=blob:none",
+         "--no-checkout", origin.as_uri(), str(clone))
+    _git(clone, "read-tree", "HEAD")
+    (clone / "tracked.py").write_text("changed worktree\n")
+    promised = _git(origin, "rev-parse", "HEAD:tracked.py")
+    assert "?" + promised in _git(clone, "rev-list", "--objects", "--missing=print", "HEAD")
+    marker = tmp_path / "transport-invoked"
+    upload_pack = tmp_path / "upload-pack-probe"
+    upload_pack.write_text("#!/bin/sh\n: > " + shlex.quote(str(marker)) + '\nexec git-upload-pack "$@"\n')
+    upload_pack.chmod(0o755)
+    _git(clone, "config", "remote.origin.uploadpack", str(upload_pack))
+    # Even caller opt-in to file transport must not authorize capture-time fetch.
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    monkeypatch.setenv("GIT_NO_LAZY_FETCH", "0")
+    if legacy_no_lazy_fetch:
+        real_popen = subprocess.Popen
+
+        def without_lazy_fetch_guard(*args, **kwargs):
+            kwargs["env"] = {**kwargs.get("env", os.environ), "GIT_NO_LAZY_FETCH": "0"}
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(capture.subprocess, "Popen", without_lazy_fetch_guard)
+
+    def objects():
+        return {str(p.relative_to(clone)): p.read_bytes()
+                for p in (clone / ".git/objects").rglob("*") if p.is_file()}
+
+    before, index = objects(), (clone / ".git/index").read_bytes()
+    try:
+        with pytest.raises(ValueError, match="Could not capture review candidate with git"):
+            capture_review_candidate(clone, "HEAD", ["tracked.py"])
+    finally:
+        assert not marker.exists(), "capture invoked the remote upload-pack transport"
+        assert objects() == before, "capture fetched and persisted promised objects"
+        assert (clone / ".git/index").read_bytes() == index

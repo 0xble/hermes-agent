@@ -255,6 +255,11 @@ def _git(repo: Path, *args: str, max_stdout_bytes: int | None = None) -> bytes:
         process = subprocess.Popen(
             ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", *args],
             cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # Read-only commands can fetch missing promisor objects. Disable
+            # that path and all transports, including local upload-pack and
+            # remote helpers. GIT_ALLOW_PROTOCOL also fails closed on older
+            # Git releases that do not recognize GIT_NO_LAZY_FETCH.
+            env={**os.environ, "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": ""},
         )
         assert process.stdout is not None and process.stderr is not None
         stdout: list[bytes] = []
