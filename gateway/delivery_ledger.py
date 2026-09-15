@@ -354,8 +354,27 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
+def mark_failed(obligation_id: str, error: str = "", *, retry_content: Optional[str] = None,
+                expected_content: Optional[str] = None) -> bool:
+    """Settle a send's failure and known remainder atomically against its owned payload.
+
+    A competing recovery owner or a later payload cannot be overwritten by a stale receipt.
+    Callers without a send snapshot retain the existing state-only interface.
+    """
+    if expected_content is None:
+        _update_state(obligation_id, "failed", error=error)
+        return True
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', content=COALESCE(?, content), updated_at=?, last_error=?
+               WHERE obligation_id=? AND content=?
+                 AND owner_pid IS ? AND owner_started_at IS ?
+                 AND state IN ('pending', 'attempting', 'failed')""",
+            (retry_content, time.time(), error[:500] if error else None,
+             obligation_id, expected_content, pid, started))
+    return bool(cursor.rowcount)
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:

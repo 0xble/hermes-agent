@@ -619,9 +619,13 @@ class GatewayStartupMixin:
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                    settled = await asyncio.to_thread(
+                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed"),
+                        retry_content=BasePlatformAdapter._delivery_retry_suffix(result, "") or None,
+                        expected_content=row["content"],
                     )
+                    if settled is False:
+                        continue
                     if (
                         getattr(result, "error", None) == "send_path_degraded"
                         and isinstance(adapter, BasePlatformAdapter)

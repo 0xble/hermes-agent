@@ -3518,18 +3518,30 @@ class BasePlatformAdapter(ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> "SendResult":
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        retry_content = content
+
+        def _remember_suffix(result: "SendResult") -> "SendResult":
+            nonlocal retry_content
+            retry_content = self._delivery_retry_suffix(result, retry_content)
+            if not result.success and retry_content != content:
+                # A later refusal may omit chunk metadata. Keep the positively established
+                # remainder on the returned failure so durable settlement cannot replay its prefix.
+                raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+                result.raw_response = {**raw, "delivery_retry_content": retry_content}
+            return result
+
         async def _send(text: str) -> "SendResult":
-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+            return _remember_suffix(await self.send(
+                chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata))
         result = await _send(content)
-        retry_content = self._delivery_retry_suffix(result, content)
         if result.success or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
         stale_recovery = await self._recover_stale_subchat_delivery(
-            chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata,
+            chat_id=chat_id, content=retry_content, reply_to=reply_to, metadata=metadata,
             send_result=result, error_text=error_str)
         if stale_recovery is not None:
-            return stale_recovery
+            return _remember_suffix(stale_recovery)
         # A rate-limited / flood-capped send is transient: it should back off
         # (honoring the server's retry_after when present) rather than fall
         # through to the plain-text fallback, which re-enters the ban and can
@@ -3572,7 +3584,6 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
-                retry_content = self._delivery_retry_suffix(result, retry_content)
                 error_str = result.error or ""
                 if self._send_retry_is_final(result):
                     return result
@@ -3590,6 +3601,8 @@ class BasePlatformAdapter(ABC):
                     or result.retry_after is not None
                     or self._is_retryable_error(error_str)
                 ):
+                    if self._is_timeout_error(error_str):
+                        return result  # the suffix may have arrived; formatting fallback is unsafe
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user.
@@ -3619,7 +3632,8 @@ class BasePlatformAdapter(ABC):
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
+        fallback_result = _remember_suffix(await self._send_plain_fallback(
+            chat_id, retry_content, reply_to=reply_to, metadata=metadata))
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -4109,7 +4123,7 @@ class BasePlatformAdapter(ABC):
 
     async def _finalize_delivery_obligation(
         self, obligation_id: str, result: Any, event: MessageEvent,
-        delivery_adapter: "BasePlatformAdapter") -> None:
+        delivery_adapter: "BasePlatformAdapter", *, expected_content: Optional[str] = None) -> None:
         """Mark the ledger row delivered/failed (best-effort). A flood-control rejection is retryable
         but not yet — park a coalesced sweep for when the platform's stated wait elapses, so the reply
         goes out once the penalty has passed instead of staying terminally failed with attempts=0 for
@@ -4127,7 +4141,12 @@ class BasePlatformAdapter(ABC):
                     await cards.delivered(getattr(event, "_delegation_card_receipt", None))
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
+            settled = await asyncio.to_thread(
+                mark_failed, obligation_id, error,
+                retry_content=self._delivery_retry_suffix(result, "") or None,
+                expected_content=expected_content)
+            if settled is False:
+                return
             profile = getattr(delivery_adapter, "_owner_profile", None)
             # Upstream's recogniser (canonical ``flood_control:<seconds>`` AND rows still carrying the
             # platform's own wording) decides IF this defers; the wait it states decides FOR HOW LONG,
@@ -4255,7 +4274,8 @@ class BasePlatformAdapter(ABC):
         result = await delivery_adapter._send_with_retry(
             chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
         if obligation_id is not None:
-            await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+            await self._finalize_delivery_obligation(
+                obligation_id, result, event, delivery_adapter, expected_content=text_content)
         return result, delivery_adapter
 
     async def _send_final_text(
