@@ -73,7 +73,7 @@ class _RecordingSessionDB:
 
 
 def _run_booked_job(
-    monkeypatch, tmp_path, *, live_job_updates=None, **job_updates
+    monkeypatch, tmp_path, *, live_job_updates=None, live_job_lookup=None, **job_updates
 ):
     import hermes_state
     import run_agent
@@ -128,7 +128,7 @@ def _run_booked_job(
             live.update(live_job_updates)
         return live
 
-    monkeypatch.setattr(cron_scheduler, "resolve_job_ref", _live_job)
+    monkeypatch.setattr(cron_scheduler, "resolve_job_ref", live_job_lookup or _live_job)
     if job.get("completion_script") and not job.get("completion_script_sha256"):
         script_path = tmp_path / "scripts" / job["completion_script"]
         job["completion_script_sha256"] = hashlib.sha256(
@@ -270,28 +270,45 @@ def test_agent_cannot_replace_its_completion_verifier(monkeypatch, tmp_path):
     assert error is not None
 
 
-@pytest.mark.parametrize("mutation", [None, "pause", "owner", "verifier"])
-def test_paused_manual_run_verifies_without_resuming(monkeypatch, tmp_path, mutation):
+@pytest.mark.parametrize("schedule", ["every 5m", "0 21 * * *", "in 1m"])
+@pytest.mark.parametrize("mutation", [None, "pause", "owner", "verifier", "admission"])
+def test_paused_manual_run_verifies_without_resuming(monkeypatch, tmp_path, mutation, schedule):
     """An owner-bound manual pause survives verification; later changes fail closed."""
+    global _on_agent_run
     scripts = tmp_path / "scripts"
     scripts.mkdir()
-    (scripts / "verify.py").write_text("print('verifier ran')\n", encoding="utf-8")
-    from cron.jobs import create_job, pause_job, claim_job_for_fire
+    verifier = scripts / "verify.py"
+    verifier.write_text("print('verifier ran')\n", encoding="utf-8")
+    from cron import jobs
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    stored = create_job(prompt="x", schedule="every 5m")
-    pause_job(stored["id"], reason="operator hold")
-    claimed = claim_job_for_fire(stored["id"], force=True, preserve_paused=True, return_job=True)
+    stored = jobs.create_job(prompt="x", schedule=schedule)
+    jobs.update_job(stored["id"], {
+        "completion_script": "verify.py",
+        "completion_script_sha256": hashlib.sha256(verifier.read_bytes()).hexdigest(),
+    }, trusted_completion_config=True)
+    jobs.pause_job(stored["id"], reason="operator hold")
+    claimed = jobs.claim_job_for_fire(stored["id"], force=True, preserve_paused=True, return_job=True)
     assert isinstance(claimed, dict)
-    mutations = {
-        "pause": {"paused_at": "later-pause"},
-        "owner": {"fire_claim": {"by": "replacement", "run_id": "replacement"}},
-        "verifier": {"completion_script": "replacement.py"},
-    }
+
+    def mutate_during_run():
+        if mutation == "pause":
+            jobs.pause_job(stored["id"], reason="new operator hold")
+        elif mutation == "owner":
+            jobs.update_job(stored["id"], {
+                "fire_claim": {**claimed["fire_claim"], "by": "replacement", "run_id": "replacement"},
+            })
+        elif mutation == "verifier":
+            jobs.update_job(stored["id"], {"completion_script": "replacement.py"},
+                            trusted_completion_config=True)
+        elif mutation == "admission":
+            claim = dict(claimed["fire_claim"])
+            claim.pop("preserve_paused", None)
+            jobs.update_job(stored["id"], {"fire_claim": claim})
+
+    _on_agent_run = mutate_during_run
     _, result = _run_booked_job(
-        monkeypatch, tmp_path, completion_script="verify.py",
-        live_job_updates=mutations.get(mutation),
-        **{k: claimed[k] for k in ("id", "enabled", "state", "paused_at", "paused_reason", "fire_claim")},
+        monkeypatch, tmp_path, live_job_lookup=jobs.get_job, **claimed,
     )
     success, output, _, error = result
     assert success is (mutation is None)
@@ -301,6 +318,10 @@ def test_paused_manual_run_verifies_without_resuming(monkeypatch, tmp_path, muta
     else:
         assert "verifier ran" in output
         assert error is None
+    current = jobs.get_job(stored["id"])
+    assert current["enabled"] is False
+    assert current["state"] == "paused"
+    assert current["next_run_at"] == claimed["next_run_at"]
 
 
 def test_agent_cannot_disable_completion_verification_mid_run(monkeypatch, tmp_path):

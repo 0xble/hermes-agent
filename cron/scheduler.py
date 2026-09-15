@@ -1982,8 +1982,9 @@ def _completion_configuration_failure(job: dict[str, Any]) -> Optional[str]:
             job.get("enabled") is False
             and job.get("state") == live_job.get("state") == "paused"
             and isinstance(claim, dict)
-            and "preserve_paused_next_run_at" in claim
+            and claim.get("preserve_paused") is True
             and isinstance(live_claim, dict)
+            and live_claim.get("preserve_paused") is True
             and bool(claim.get("by"))
             and claim.get("by") == live_claim.get("by")
             and claim.get("run_id") == live_claim.get("run_id")

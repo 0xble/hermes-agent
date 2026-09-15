@@ -152,3 +152,10 @@ does on rename, preserves both unclaimed slots and durable deferred occurrences.
 Actual schedule changes, cron timezone changes and explicit lifecycle rewrites
 still supersede pending work. Real script/job/ledger tests prove the original
 deferred instant remains claimable after the catch-up window.
+
+Manual paused admission is recorded independently from the recurring next-run
+snapshot. Completion verification accepts an unchanged paused one-shot, interval
+or cron job only while both captured and live claims retain that admission and
+the same owner/run and pause identity. Real persisted-job changes during the
+agent turn verify that later pauses, replaced owners, removed admission and
+verifier changes still fail closed before the verifier executes.

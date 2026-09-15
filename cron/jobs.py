@@ -2889,8 +2889,11 @@ def claim_job_for_fire(
             "run_id": str(uuid.uuid4()),
         }
         kind = job.get("schedule", {}).get("kind")
-        if keep_paused and kind in {"cron", "interval"}:
-            fire_claim["preserve_paused_next_run_at"] = copy.deepcopy(job.get("next_run_at"))
+        if keep_paused:
+            # Admission applies to every schedule; only recurring jobs restore a future slot.
+            fire_claim["preserve_paused"] = True
+            if kind in {"cron", "interval"}:
+                fire_claim["preserve_paused_next_run_at"] = copy.deepcopy(job.get("next_run_at"))
         job["fire_claim"] = fire_claim
         # Claimed: the occurrence is now owned by a run (its ledger row + fire claim carry it).
         job.pop("pending_slot", None)
