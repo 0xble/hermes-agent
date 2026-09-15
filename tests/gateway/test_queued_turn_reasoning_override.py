@@ -107,3 +107,33 @@ async def test_steer_text_followup_without_an_event_runs_without_an_override():
     kwargs = await _run_followup(GatewayRunner, runner, turn_ctx, pending_event=None)
 
     assert kwargs.get("turn_reasoning_config") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [None, {}, {"gateway_input_owner": {"token": "owned-input"}}])
+async def test_live_queued_event_metadata_preserves_owner_after_consumption(metadata):
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from tests.gateway.restart_test_helpers import make_restart_runner
+
+    GatewayRunner, followup, turn_ctx, source = _runner_and_ctx()
+    queue_runner, adapter = make_restart_runner()
+    queue_runner._adapter_for_source = lambda _: adapter
+    queue_runner._pending_event_audio_paths = lambda _: []
+    event = MessageEvent(
+        source=SessionSource(platform=source.platform, chat_id=source.chat_id, chat_type="dm"),
+        message_id="6002", text="live queued input", metadata=metadata,
+        turn_reasoning_config=dict(HIGH),
+    )
+    queue_runner._queue_or_replace_pending_event(SESSION_KEY, event)
+    consumed, text = await queue_runner._run_agent_drain_pending(
+        {"messages": []}, adapter, event.source, SESSION_KEY)
+    assert consumed is event
+    assert text == event.text
+    assert SESSION_KEY not in adapter._pending_messages
+    kwargs = await _run_followup(GatewayRunner, followup, turn_ctx, consumed)
+    assert kwargs["persist_user_display_metadata"] == {
+        "gateway_input_owner": (metadata or {}).get("gateway_input_owner")}
+    assert kwargs["persist_user_display_kind"] is None
+    assert kwargs["turn_reasoning_config"] == HIGH
+    assert event.metadata is metadata  # no ownership or event rewrite

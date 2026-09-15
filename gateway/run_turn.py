@@ -3833,7 +3833,7 @@ class GatewayTurnMixin:
                 from gateway.delegation_delivery_receipt import delivery_metadata_for_event
                 queued_persist_kind = "internal_notification" if getattr(pending_event, "internal", False) else None
                 queued_persist_metadata = delivery_metadata_for_event(
-                    pending_event, getattr(pending_event, "metadata", {}).get("gateway_input_owner"))
+                    pending_event, (getattr(pending_event, "metadata", None) or {}).get("gateway_input_owner"))
             followup_result = await self._run_agent(
                 goal_user_text=(
                     self._goal_authority_text_for_event(pending_event, typed_text=next_goal_typed_text)
