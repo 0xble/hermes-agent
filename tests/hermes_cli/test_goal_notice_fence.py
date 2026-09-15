@@ -71,4 +71,3 @@ def test_uncommittable_notice_cannot_change_state(manager, monkeypatch, change):
     before = db.get_meta(goals._meta_key(manager.session_id))
     assert manager.claim_transition_notice(decision) is False
     assert db.get_meta(goals._meta_key(manager.session_id)) == before
-
