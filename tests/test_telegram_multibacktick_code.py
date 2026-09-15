@@ -2,7 +2,13 @@
 from datetime import datetime, timezone
 
 import pytest
+
+pytest.importorskip("telegram", reason="python-telegram-bot not installed")
 from telegram import Chat, Message, MessageEntity
+
+if not all(isinstance(cls, type) and cls.__module__.startswith("telegram.")
+           for cls in (Chat, Message, MessageEntity)):
+    pytest.skip("real python-telegram-bot serializers required", allow_module_level=True)
 
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
