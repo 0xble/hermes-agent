@@ -213,9 +213,8 @@ def test_newer_observation_receipt_wins_over_stale_fallback_checkpoint(tmp_path,
     assert registry.pending_watchers == []
 
 
-@pytest.mark.parametrize("raw_owner", ["missing", ""])
-@pytest.mark.parametrize("damaged_output", [False, True])
-def test_fallback_without_raw_owner_blocks_reopened_resume(tmp_path, monkeypatch, raw_owner, damaged_output):
+@pytest.mark.parametrize("raw_owner,damaged_output", [("missing", False), ("missing", True), ("", True)])
+def test_malformed_fallback_without_raw_owner_blocks_reopened_resume(tmp_path, monkeypatch, raw_owner, damaged_output):
     from tools import process_registry as pr
     from tools import process_registry_results as receipts
     from gateway.session_context import scoped_current_session_id
@@ -737,3 +736,49 @@ def test_failed_receipt_successful_checkpoint_recovers_exact_unresolved_effect(t
         assert fresh.completion_queue.empty()
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("ownership", ["empty", "missing", "null", "invalid"])
+def test_ownerless_completed_fallback_distinguishes_unknown_ownership(tmp_path, monkeypatch, ownership):
+    from tools import process_registry as pr
+    from tools import process_registry_results as receipts
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    checkpoint_path = tmp_path / "processes.json"
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", checkpoint_path)
+    registry = pr.ProcessRegistry()
+    session = pr.ProcessSession(id="proc_ownerless", command="completed effect", task_id="shared-container",
+        owner_task_id="", exited=True, exit_code=0, pid=12345, started_at=1,
+        output_buffer="retained ownerless output")
+    registry._running[session.id] = session
+
+    def fail_receipt(*args, **kwargs):
+        raise OSError("injected receipt disk failure")
+
+    monkeypatch.setattr(receipts, "atomic_json_write", fail_receipt)
+    registry._move_to_finished(session)
+    entries = json.loads(checkpoint_path.read_text())
+    assert entries[0]["completed_result"]["owner_task_id"] == ""
+    if ownership == "missing":
+        del entries[0]["completed_result"]["owner_task_id"]
+    elif ownership != "empty":
+        entries[0]["completed_result"]["owner_task_id"] = None if ownership == "null" else 17
+    checkpoint_path.write_text(json.dumps(entries))
+    for _ in range(2):
+        restored = pr.ProcessRegistry()
+        monkeypatch.setattr(restored, "_host_pid_is_ours", lambda *a: pytest.fail("probed completed PID"))
+        assert restored.recover_from_checkpoint() == 0
+        assert not restored.has_any_active()
+        assert restored.completion_queue.empty()
+        if ownership == "empty":
+            assert restored.unresolved_owned_processes({"unrelated", "shared-container"}) == []
+            result = restored._finished[session.id]
+            assert result.owner_task_id == "" and result._result_persist_failed
+            assert result.output_buffer == "retained ownerless output"
+            assert result.process is None and result.pid is None
+            assert restored.unresolved_owned_processes({""}) == [result]
+        else:
+            with pytest.raises(ValueError, match="unresolved owner"):
+                restored.unresolved_owned_processes({"unrelated"})
+        restored._write_checkpoint()
+        assert json.loads(checkpoint_path.read_text()), "recovery discarded unresolved fallback"

@@ -170,8 +170,9 @@ def restore_checkpoint_result(record):
     write. Never republish the stale unobserved snapshot over observation proof.
     """
     session = restore_completed_result(record)
-    if not session.owner_task_id:
-        raise ValueError("Completed checkpoint has no raw owner")
+    # The producer permits explicitly ownerless sessions. The strict receipt
+    # parser above distinguishes that empty string from missing/invalid metadata.
+    # Preserve the raw owner; task_id may be a shared container, not its owner.
     session._result_observed = False
     session._result_persist_failed = True
     path = get_hermes_home() / "logs" / "process-results" / f"{session.id}.json"

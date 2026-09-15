@@ -114,7 +114,13 @@ class ProcessCheckpointMixin:
         or notification is restored. Exact newer observation proof wins.
         """
         from tools.process_registry import ProcessSession
-        from tools.process_registry_results import completed_result_record, restore_checkpoint_result
+        from tools.process_registry_results import checkpoint_entry_owner, completed_result_record, restore_checkpoint_result
+
+        # A legacy live entry without ownership is unknown, unlike an explicit
+        # empty owner in a fully validated completed record. Do not manufacture
+        # known ownerlessness while converting malformed/lost live evidence.
+        if checkpoint_entry_owner(entry) is None:
+            raise ValueError("Lost process checkpoint has no known owner")
 
         session = ProcessSession(
             id=entry["session_id"], command=entry.get("command", "unknown"),
