@@ -9,6 +9,29 @@ from tests.gateway.test_progress_receipt_cancellation import ReceiptAdapter, _ru
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("old_anchor", [None, "original-bubble"])
+async def test_overflow_accepted_without_id_retires_anchor_and_content(monkeypatch, old_anchor):
+    monkeypatch.setattr("gateway.run_turn_runner._PROGRESS_EDIT_INTERVAL", 0)
+    adapter = ReceiptAdapter("no_id")
+    _, runner = _runner(adapter)
+    st = runner._progress_edit_state(adapter)
+    st._PROGRESS_TEXT_LIMIT = 12
+    st.progress_msg_id = old_anchor
+    st.progress_lines = ["first-tool", "second-tool"]
+    assert await runner._roll_progress_overflow_if_needed(st)
+    assert st.progress_msg_id is None
+    assert st.can_edit is False
+    assert st.retired_progress_lines == len(st.progress_lines)
+    old_edits = list(adapter.edits)
+    old_sends = list(adapter.sent)
+    runner._progress_absorb(st, "third-tool")
+    await runner._progress_send_or_edit(st, "third-tool")
+    assert adapter.edits == old_edits
+    assert adapter.sent[:-1] == old_sends
+    assert adapter.sent[-1][1] == "third-tool"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["raise", "missing"])
 @pytest.mark.parametrize("path", ["event", "overflow", "send_only", "stale"])
 async def test_ambiguous_receipt_fences_event_overflow_idle_and_boundary(monkeypatch, mode, path):

@@ -80,7 +80,9 @@ async def test_send_only_backlog_uses_shared_chat_cadence(monkeypatch, overflow,
     assert await runner._send_unacknowledged_progress(sibling)
     assert [text for _, text in attempts] == ["one", "two", *(["two"] if refuse_middle else []), "six", "sibling"]
     assert all(b[0] - a[0] >= module._PROGRESS_EDIT_INTERVAL for a, b in zip(attempts, attempts[1:]))
-    assert st.retired_progress_lines == (1 if overflow else 3)
+    # No-ID overflow acknowledgments switch to send-only mode, so the buffer may
+    # retain multiple acknowledged lines. All buffered content must be retired.
+    assert st.retired_progress_lines == len(st.progress_lines)
     assert sibling.retired_progress_lines == 1
 
 

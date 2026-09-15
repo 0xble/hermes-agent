@@ -868,8 +868,9 @@ class TurnRunner:
                 st.progress_msg_id = None
                 st.retired_progress_lines = 0
                 return True
-            if result.success and result.message_id:
+            if result.success:
                 st.progress_msg_id = result.message_id
+                st.can_edit = bool(result.message_id)
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
         st.progress_lines = groups[-1]
