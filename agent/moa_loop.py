@@ -556,9 +556,14 @@ def _price_reference_response(
 def _run_reference(slot: dict[str, Any], ref_messages: list[dict[str, Any]], **kwargs: Any) -> tuple[str, str, Any]:
     requested = _slot_label(slot)
     try:
-        label, text, acct = run_slot_chain(slot, lambda candidate: _run_reference_candidate(candidate, ref_messages, **kwargs))
-        served = _slot_label({"provider": acct.provider, "model": acct.model})
-        acct.rerouted = (acct.provider, acct.model) != (slot.get("provider"), slot.get("model"))
+        selected, result = run_slot_chain(slot, lambda candidate: (
+            candidate, _run_reference_candidate(candidate, ref_messages, **kwargs)))
+        label, text, acct = result
+        provider = str(selected.get("provider") or "").strip()
+        physical_provider = "custom" if provider.startswith("custom:") else provider
+        route_changed = (acct.provider, acct.model) != (physical_provider, selected.get("model"))
+        acct.rerouted = selected is not slot or route_changed
+        served = _slot_label({"provider": acct.provider, "model": acct.model}) if route_changed else label
         return (f"{requested} -> {served}" if acct.rerouted else requested), text, acct
     except Exception as exc:
         note = f"[failed: {type(exc).__name__}]"

@@ -7,6 +7,43 @@ import pytest
 import yaml
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+def test_named_custom_reference_reports_only_actual_fallback(tmp_path, monkeypatch, fallback):
+    from agent import moa_loop
+    from hermes_cli import runtime_provider
+
+    primary = {"provider": "custom:primary", "model": "advisor",
+               "fallback_models": [{"provider": "custom:backup", "model": "advisor"}]}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"moa": {
+        "reference_models": [primary], "aggregator": {"provider": "custom:primary", "model": "synthesis"},
+    }}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", lambda requested, target_model: {
+        "provider": "custom", "model": target_model, "api_mode": "chat_completions",
+        "api_key": "fixture-secret", "base_url": f"https://{requested.split(':')[1]}.example.test/v1",
+    })
+    frozen = moa_loop.snapshot_moa_preset("default")
+    calls = []
+
+    class Unavailable(Exception):
+        status_code = 503
+
+    def transport(**kwargs):
+        calls.append(kwargs)
+        if fallback and kwargs["base_url"].startswith("https://primary."):
+            raise Unavailable("unavailable")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="advice"))], usage=None)
+
+    monkeypatch.setattr(moa_loop, "call_llm", transport)
+    label, text, accounting = moa_loop._run_reference(
+        frozen.preset["reference_models"][0], [{"role": "user", "content": "Review this"}])
+    assert text == "advice"
+    assert accounting.provider == "custom"
+    assert accounting.rerouted is fallback
+    assert len(calls) == (2 if fallback else 1)
+    assert label == ("custom:primary:advisor -> custom:backup:advisor" if fallback else "custom:primary:advisor")
+
+
 @pytest.mark.parametrize("status,body,uses_fallback", [
     (429, "usage exhausted", True), (503, "unavailable", True),
     (404, "model_not_found", True), (402, "quota exhausted", True),

@@ -688,14 +688,20 @@ def generate_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return None
 
-    if runtime_validator is not None:
+    def _runtime_is_current() -> bool:
+        if runtime_validator is None:
+            return True
         try:
             if not runtime_validator():
                 logger.debug("Title generation skipped: runtime validator returned False")
-                return None
+                return False
         except Exception:
             # Fail open: a broken validator must not disable titling.
             logger.debug("Title runtime validator raised; proceeding", exc_info=True)
+        return True
+
+    if not _runtime_is_current():
+        return None
 
     # Collapse slash-skill scaffolding before prompt construction, deterministic
     # alias matching, and truncation. Hidden expanded skill prose must not win
@@ -740,6 +746,8 @@ def generate_title(
         except Exception:
             if not isinstance(request_content, list):
                 raise
+            if not _runtime_is_current():
+                return None
             # Auxiliary routes are not uniformly multimodal. Preserve automatic
             # titles by retrying once with the same bounded text when a selected
             # provider rejects supported native image parts.

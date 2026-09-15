@@ -1511,6 +1511,24 @@ class TestRuntimeValidator:
     """runtime_validator gating (#19027): a stale background title request
     must not fire when the session's model/provider changed after spawn."""
 
+    def test_model_switch_during_image_request_skips_text_retry(self):
+        validator = MagicMock(side_effect=[True, False])
+        failure = MagicMock()
+        config = {"auxiliary": {"title_generation": {"include_attachments": True}}}
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm", side_effect=RuntimeError("text-only route")) as llm,
+        ):
+            assert generate_title(
+                "Inspect this screenshot", runtime_validator=validator,
+                failure_callback=failure,
+                title_context=[{"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,aW1hZ2U="}}],
+            ) is None
+        assert validator.call_count == 2
+        llm.assert_called_once()
+        failure.assert_not_called()
+
 
 
     def test_broken_validator_fails_open(self):

@@ -117,6 +117,8 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 ### HERMES-124 — Frozen custom-subagent fallback, MoA, and resume runtime
 
+- **Named custom-reference accounting:** Normalize configured custom aliases only when comparing their physical provider identity. Successful primary requests keep their configured display label and do not claim fallback. A selected fallback retains its own alias, including when two aliases use the same model through different frozen endpoints. `tests/agent/test_moa_reference_fallback.py` covers both outcomes through real preset loading and route freezing.
+
 - **Fallback identity boundary:** `validate_fallback_identities` rejects duplicate resolved fallback provider/model identities before launch. A named custom primary keeps its selector (for example `custom:primary`) on the actual child, while resolved fallback routes use `custom`. The configured preflight, real child and request-builder path preserves this distinction and validates primary and fallback requests. Constructing an ambiguous `RuntimePin` directly bypasses those admission rules and is not a supported launch path.
 
 - **September 14 resume correction:** A saved MoA child must still belong to a current effective MoA role, and any explicit current `moa_presets` list must include its stored preset. Changing only the default preset does not replace or revoke an existing frozen snapshot. Physical execution routes and credentials remain restored from that snapshot. Regression coverage includes revocation and preserved default-only edits through the saved-child resume boundary.

@@ -21,6 +21,8 @@ its examples in `tests/agent/test_title_generator.py`.
 
 Optional title-route telemetry callbacks are isolated from title generation. A callback exception preserves the validated title and does not call the generation failure callback. `tests/agent/test_title_generator.py` covers a raising callback alongside ordinary route reporting. This preserves the existing native title-history contract.
 
+Multimodal title fallback rechecks the captured runtime before sending its text-only retry. A model switch while the image request is outstanding silently cancels that retry without emitting a generation-failure callback. Broken validators retain the existing fail-open behavior.
+
 ## Maintained patch index
 
 | ID | Status |
