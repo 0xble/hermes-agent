@@ -147,3 +147,7 @@ contracts.
 ## Isolated CI execution boundary
 
 The manual hybrid pilot intentionally permits candidate shell inside an isolated guest. The trusted external supervisor at commit `0668172a8838dc9e1078713929de92cab76dcc44` starts disposable QEMU, then executes GitHub `run.sh --jitconfig` inside that guest over SSH. Workflow steps do not launch the isolation boundary. Recorded guest-root probes and GitHub runner identities corroborate this architecture. Regular Python and JS jobs remain GitHub-hosted. This evidence does not certify production heavy routing or an active runner service.
+
+## September 15 capture and recovery follow-up
+
+Read-only review capture disables Git lazy fetching and every transport for each capture subprocess. Missing promisor objects produce unavailable evidence instead of fetching or executing remote helpers. Real local partial-clone tests verify no transport, object, or index writes, including the protocol fallback for Git versions without the newer lazy-fetch switch.

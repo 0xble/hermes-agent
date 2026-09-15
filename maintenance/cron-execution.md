@@ -128,3 +128,7 @@ cover these corrections without changing live jobs or runtime configuration.
 - **Retired:** `refactor(cron): remove total run budgets (#70)` (2026-09-06). User-requested source retirement; legacy `run_budget_seconds` keys remain inert until active jobs are cleared through the native API. The independent inactivity watchdog and durable claim/worker-ownership protections remain active.
 - **Rollback:** Git history preserves the retired implementation. Do not restore it without new explicit authorization.
 - **Additional historical subjects (optional provenance):** `fix(cron): enforce total run budgets`; `fix(cron): enforce monitor read deadlines`; `fix(cron): retain claims until timed-out workers exit`; `fix(cron): bound teardown while retaining worker tombstones`; `fix(cron): preserve teardown after budget exhaustion`; `merge: land reviewed cron cleanup fix for release`.
+
+## September 15 capture and recovery follow-up
+
+Timezone-only edits recompute and invalidate pending occurrences only for cron wall-clock schedules. Interval and absolute one-shot schedules retain existing due times and recovery slots unless their schedule or lifecycle is explicitly changed. Real persisted-job tests cover timezone changes/clears and combined schedule edits.

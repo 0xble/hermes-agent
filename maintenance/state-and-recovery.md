@@ -117,3 +117,7 @@ Linux mountinfo fixtures explicitly select Linux behavior and separately verify 
 - **Retirement:** Remove the fork-only implementation when released upstream passes bounded incomplete retention, newest complete generation, readable omitted-DB coverage, alternating failures, and snapshot-family/profile isolation regressions. Preserve useful behavior tests only when not duplicated upstream.
 - **Runtime scope:** Source-only. No live snapshot cleanup, configuration change, B2 action, deployment or restart authorized or performed.
 - **Additional historical subjects (optional provenance):** `fix(backup): retain verified quick-snapshot recovery generations`.
+
+## September 15 capture and recovery follow-up
+
+Completed process checkpoint fallback accepts an explicitly empty string owner after strict receipt validation, retaining unobserved persistence-failed evidence without fencing unrelated delegated owners. Missing or invalid ownership remains unresolved. Legacy lost-live conversion validates ownership before creating a completed record so absent metadata cannot become known ownerlessness. Real producer/checkpoint/restore tests cover repeated recovery and shared-container identities.
