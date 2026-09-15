@@ -17,10 +17,14 @@ def validate_correction_client(agent, client):
     expose the same surface while launching an external agent or fan-out loop.
     Rechecked on the physical request client as factories can replace it.
     """
-    from openai import OpenAI
-    from anthropic import Anthropic
-    native = ((agent.api_mode in {"chat_completions", "codex_responses"} and type(client) is OpenAI)
-              or (agent.api_mode == "anthropic_messages" and type(client) is Anthropic))
+    if agent.api_mode in {"chat_completions", "codex_responses"}:
+        from openai import OpenAI
+        native = type(client) is OpenAI
+    elif agent.api_mode == "anthropic_messages":
+        from anthropic import Anthropic
+        native = type(client) is Anthropic
+    else:
+        native = False
     if not native or agent.provider == "moa" or client.max_retries != 0:
         raise ValueError("This transport cannot guarantee a bounded disposition correction")
 

@@ -139,3 +139,10 @@ promotion.
 - **Regression:** `scripts/run_tests.sh tests/gateway/test_delegation_cards.py tests/tools/test_delegation_label_guidance.py`. Covers actual Telegram formatter payload construction for initial send and edit, visible depth-one/depth-two prefixes, third-level hierarchy references, tool-only activity rows, preserved full overlong labels, and the model-facing 24-character guidance on both task-label schemas.
 - **Rollback:** Revert only `fix(telegram): preserve nested delegation card indentation`, restoring ASCII prefixes and the former 32-character guidance; no schema, configuration, state, or migration is involved.
 - **Retirement:** Retire when released upstream preserves visible nested Telegram delegation indentation using an ordinary text-safe representation and retains equivalent formatter/send/edit coverage; remove this fork delta rather than retain duplicate behavior.
+
+- Correction transport validation imports only the native SDK selected by api_mode.
+  A base OpenAI installation does not require the optional Anthropic extra, and
+  unsupported modes refuse without loading either SDK. Exact native types, zero
+  retries and MoA refusal remain mandatory. Real-client import-blocked regressions
+  live in `tests/agent/test_delegation_correction_real_loop.py`; retire this scoped
+  repair only when upstream preserves optional dependency isolation and the bound.

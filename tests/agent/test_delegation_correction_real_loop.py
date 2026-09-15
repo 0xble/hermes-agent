@@ -134,3 +134,51 @@ def test_virtual_transport_rejected_before_repair_and_at_physical_dispatch(tmp_p
         _dispatch_nonstreaming_api_request(agent, {}, make_client=lambda *a, **kw: client)
     assert not launched
     client.close()
+
+
+@pytest.mark.parametrize('api_mode', ['chat_completions', 'codex_responses', 'anthropic_messages'])
+@pytest.mark.parametrize('kind', ['native', 'subclass', 'retries', 'moa'])
+def test_correction_sdk_validation_does_not_require_other_provider(monkeypatch, api_mode, kind):
+    import builtins
+    from types import SimpleNamespace
+    from agent.delegation_correction import validate_correction_client
+    if api_mode == 'anthropic_messages':
+        from anthropic import Anthropic as NativeClient
+        unrelated = 'openai'
+    else:
+        from openai import OpenAI as NativeClient
+        unrelated = 'anthropic'
+    client_type = type('DerivedClient', (NativeClient,), {}) if kind == 'subclass' else NativeClient
+    def no_network(request):
+        raise AssertionError('validation must not send requests')
+    client = client_type(api_key='test-key', max_retries=1 if kind == 'retries' else 0,
+                         http_client=httpx.Client(transport=httpx.MockTransport(no_network)))
+    real_import = builtins.__import__
+    def without_other_provider(name, *args, **kwargs):
+        if name == unrelated or name.startswith(unrelated + '.'):
+            raise ModuleNotFoundError(f'optional {unrelated} is not installed')
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_other_provider)
+    agent = SimpleNamespace(api_mode=api_mode, provider='moa' if kind == 'moa' else 'native')
+    try:
+        if kind == 'native':
+            validate_correction_client(agent, client)
+        else:
+            with pytest.raises(ValueError, match='bounded disposition'):
+                validate_correction_client(agent, client)
+    finally:
+        client.close()
+
+
+def test_unsupported_correction_mode_refuses_without_sdk_imports(monkeypatch):
+    import builtins
+    from types import SimpleNamespace
+    from agent.delegation_correction import validate_correction_client
+    original = builtins.__import__
+    def no_sdk(name, *args, **kwargs):
+        if name in {'openai', 'anthropic'}:
+            raise ModuleNotFoundError(name)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', no_sdk)
+    with pytest.raises(ValueError, match='bounded disposition'):
+        validate_correction_client(SimpleNamespace(api_mode='virtual', provider='native'), object())
