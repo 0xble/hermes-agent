@@ -128,6 +128,14 @@ and registry writes in `tests/tools/test_delegate_nested_knowledge.py`. Both
 named and unrestricted parent controls are covered. This adds regression evidence
 without changing production authority or claiming arbitrary-code confinement.
 
+The process-handoff regression now holds its real child on an explicit socket
+release until ownership transfer and sibling accounting finish. The former
+0.4-second lifetime could expire before handoff under suite load, correctly
+triggering the production refusal. A causal reproduction confirms that path,
+although the original failing run did not preserve the returned error object.
+The fixture then awaits completion publication before draining the parent notice.
+This changes no production handoff semantics.
+
 Cold-start reconnect tests now await the owned reconnect task before asserting
 its bookkeeping slot is gone. Adapter publication intentionally precedes awaited
 recovery work and final cleanup. An event barrier in the real recovery await
