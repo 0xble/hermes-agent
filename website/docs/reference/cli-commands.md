@@ -1813,14 +1813,31 @@ hermes completion fish > ~/.config/fish/completions/hermes.fish
 
 ```bash
 hermes update [--gateway] [--check] [--plan] [--no-backup] [--backup] [--yes]
+              [--branch NAME | --revision SHA]
 ```
 
 Pulls the latest `hermes-agent` code and reinstalls dependencies in the managed venv, then re-runs the post-install hooks (MCP servers, skills sync, completion install). Safe to run on a live install. Use `--check` to see whether your checkout is behind `origin/main` without installing.
 
-`hermes update` pulls the configured update branch (default: `main`). If your checkout is on another branch, Hermes may check out the update branch before pulling. Commit branch work before updating when you want to keep it outside the update autostash flow.
+`hermes update` selects `updates.channel` (default: `main`). Explicit `--branch`
+or `--revision` overrides channel selection. A normal branch update may check out
+the update branch before pulling; commit branch work before updating.
+
+For the owned fork, `hermes update --branch stable` freezes the operator-promoted
+stable SHA once and installs/verifies exactly that object even if the remote moves.
+It requires a clean tree, complete ancestry (shallow checkouts are deepened against
+the frozen SHAs), and a successful quick snapshot. Missing stable, divergent history,
+implicit downgrade, disabled/failed backup, and ZIP updates are refused. The previous
+source ref/manifests are retained; migrations and installed dependencies are not
+transactionally rolled back. Invalid channel/configuration fails closed, not to main.
+`--check` reports selected-branch availability, not test/review/settling eligibility.
+Only opt in after the maintenance owner qualifies and publishes stable; see
+[configuration](../user-guide/configuration.md#update-behavior) and the
+[canonical promotion/rollback policy](../developer-guide/stable-promotion.md).
 
 | Option | Description |
 |--------|-------------|
+| `--branch NAME` | One-shot override of `updates.channel`. `stable` uses the immutable path described above; other branches use normal branch updating. |
+| `--revision SHA` | Install an exact lowercase 40-character commit SHA. Refuses dirty/divergent state, retains a source rollback ref, and disables mutable branch movement and ZIP fallback. This selects a target; it is not authorization to waive required promotion checks. |
 | `--gateway` | Internal mode used by the messaging `/update` command. Uses file-based IPC for prompts and progress streaming instead of reading from terminal stdin. Not a gateway restart flag. |
 | `--check` | Check whether an update is available without pulling, installing dependencies, or restarting anything. |
 | `--plan` | Print the update plan and exit without changing anything: install kind (git/Docker/Nix/apt), every running Hermes service across all profiles with its supervisor and running code version, and how each will be restarted. On image- or package-managed installs, reports the correct external update command instead. Read-only. |

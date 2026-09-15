@@ -2188,6 +2188,8 @@ DEFAULT_CONFIG = {
     },
 
     "updates": {
+        # Opt-in validated fork pointer; explicit --branch / --revision wins.
+        "channel": "main",
         # Passive version/banner checks only; explicit `hermes update --check` remains enabled.
         "check": True,
         # Pre-update backup. quick = snapshot small critical state (pairing JSONs, cron jobs,

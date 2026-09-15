@@ -1400,6 +1400,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
+    revision = getattr(args, "revision", None)
+    stable = revision is None and _m()._resolve_update_branch(args) == "stable"
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 
@@ -1411,12 +1413,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
     pinned_target = None
     git_cmd = None
     is_fork = False
-    if getattr(args, "revision", None) is not None:
-        from hermes_cli.update_revision import prepare_revision_target, record_revision_receipt
+    if stable and getattr(args, "no_backup", False):
+        print("✗ Stable updates require a quick state snapshot; --no-backup is not allowed")
+        sys.exit(1)
+    if revision is not None or stable:
+        from hermes_cli.update_revision import (
+            prepare_revision_target, prepare_stable_target, record_revision_receipt,
+        )
         try:
             _, git_cmd, _ = _prepare_git_command(pinned_revision=True)
-            pinned_target = prepare_revision_target(
-                _git_run, git_cmd, _m().PROJECT_ROOT, getattr(args, "revision"))
+            if stable:
+                pinned_target = prepare_stable_target(_git_run, git_cmd, _m().PROJECT_ROOT)
+                # All downstream retry/fallback paths see only this immutable SHA.
+                args.revision = pinned_target.sha
+                _record_update_step("stable_target", True, f"sha={pinned_target.sha}")
+            else:
+                pinned_target = prepare_revision_target(
+                    _git_run, git_cmd, _m().PROJECT_ROOT, revision)
             record_revision_receipt(pinned_target)
         except (ValueError, RuntimeError) as exc:
             print(f"✗ {exc}")
@@ -1428,6 +1441,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     _record_update_step(
         "pre_update_backup", pre_update_snapshot_id is not None,
         f"snapshot={pre_update_snapshot_id}" if pre_update_snapshot_id else "disabled or failed")
+
+    if stable and pre_update_snapshot_id is None:
+        print("✗ Stable update refused: required state snapshot was not created")
+        sys.exit(1)
 
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:

@@ -45,8 +45,9 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
     target_group = update_parser.add_mutually_exclusive_group()
     target_group.add_argument(
         "--branch", default=None, metavar="NAME",
-        help="Update against this branch instead of the default (main). "
-        "If the local checkout is on a different branch, hermes will "
+        help="Update against this branch instead of updates.channel (default main). "
+        "stable uses the evidence-qualified immutable revision path. "
+        "For other branches, if the local checkout is different, hermes will "
         "switch to the requested branch first (auto-stashing any "
         "uncommitted changes).")
     target_group.add_argument(
