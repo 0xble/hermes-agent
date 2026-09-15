@@ -218,6 +218,25 @@ class TestGenerateTitle:
             {"provider": "gemini", "model": "gemini-3.7-flash"}
         ]
 
+    def test_raising_route_callback_preserves_valid_title(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title":"Financial Systems Check"}'
+        route = {"provider": "gemini", "model": "gemini-3.7-flash"}
+        response._hermes_auxiliary_route = route
+        callback = MagicMock(side_effect=RuntimeError("telemetry unavailable"))
+        failure = MagicMock()
+
+        with patch("agent.title_generator.call_llm", return_value=response):
+            assert generate_title(
+                "Verify the financial tables", route_callback=callback,
+                failure_callback=failure,
+            ) == "Financial Systems Check"
+
+        callback.assert_called_once_with(route)
+        assert callback.call_args.args[0] is not route
+        failure.assert_not_called()
+
     def test_does_not_publish_route_for_malformed_title(self):
         response = MagicMock()
         response.choices = [MagicMock()]

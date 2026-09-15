@@ -812,7 +812,10 @@ def generate_title(
         if final_title and route_callback is not None:
             route = getattr(response, "_hermes_auxiliary_route", None)
             if isinstance(route, dict) and route:
-                route_callback(dict(route))
+                try:
+                    route_callback(dict(route))
+                except Exception:
+                    logger.debug("Title generation route_callback raised", exc_info=True)
         return final_title
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
