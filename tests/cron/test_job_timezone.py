@@ -335,3 +335,42 @@ def test_fold_crossing_oneshot_grace_uses_elapsed_seconds(cron_store, monkeypatc
     job = create_job('one shot across DST', 'in 1m', timezone='America/New_York')
     update_job(job['id'], {'next_run_at': scheduled})
     assert bool(get_due_jobs()) is due
+
+
+@pytest.mark.parametrize('schedule', ['every 2h', '2026-01-02T09:00:00+05:30'])
+@pytest.mark.parametrize('zone', ['America/Los_Angeles', ''])
+def test_timezone_only_edit_preserves_absolute_occurrence(cron_store, fixed_now, monkeypatch, schedule, zone):
+    from datetime import timedelta
+    from cron.occurrences import pending_slot_stamp
+
+    job = create_job('preserve occurrence', schedule, timezone='America/New_York')
+    pending = pending_slot_stamp(job['next_run_at'], fixed_now)
+    stored = load_jobs()
+    stored[0]['pending_slot'] = pending
+    save_jobs(stored)
+    monkeypatch.setattr('cron.jobs._hermes_now', lambda: fixed_now + timedelta(hours=1))
+    changed = update_job(job['id'], {'timezone': zone})
+    persisted = get_job(job['id'])
+    for result in (changed, persisted):
+        assert result['next_run_at'] == job['next_run_at']
+        assert result['pending_slot'] == pending
+        assert result['schedule'] == job['schedule']
+        assert result['timezone'] == (zone or None)
+
+
+@pytest.mark.parametrize('old_schedule,new_schedule,expected', [
+    ('every 2h', '0 9 * * *', '2026-01-01T17:00:00+00:00'),
+    ('0 9 * * *', 'every 3h', '2026-01-01T15:00:00+00:00'),
+    ('every 2h', '2026-01-02T09:00:00+05:30', '2026-01-02T03:30:00+00:00'),
+])
+def test_schedule_and_timezone_edit_recomputes_new_schedule(cron_store, fixed_now, old_schedule, new_schedule, expected):
+    from cron.occurrences import pending_slot_stamp
+
+    job = create_job('replace occurrence', old_schedule, timezone='America/New_York')
+    stored = load_jobs()
+    stored[0]['pending_slot'] = pending_slot_stamp(job['next_run_at'], fixed_now)
+    save_jobs(stored)
+    changed = update_job(job['id'], {'schedule': new_schedule, 'timezone': 'America/Los_Angeles'})
+    assert _absolute(changed['next_run_at']) == datetime.fromisoformat(expected)
+    assert 'pending_slot' not in changed
+    assert 'pending_slot' not in get_job(job['id'])

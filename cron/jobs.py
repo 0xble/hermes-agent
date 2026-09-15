@@ -2136,14 +2136,17 @@ def update_job(
             updated["schedule_display"] = updates.get(
                 "schedule_display",
                 updated_schedule.get("display", updated.get("schedule_display")))
-        if schedule_changed or timezone_changed:
+        # Timezones change cron wall-clock occurrences, not elapsed intervals
+        # or absolute one-shot instants and their already-persisted recovery slots.
+        timezone_changes_schedule = timezone_changed and updated["schedule"].get("kind") == "cron"
+        if schedule_changed or timezone_changes_schedule:
             updated["next_run_at"] = _compute_next_run_for_job(updated)
-        if timezone_changed or {
+        if timezone_changes_schedule or {
             "schedule", "next_run_at", "enabled", "state"
         }.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
-            # An effective timezone move counts too: the slot was computed in the old zone.
+            # A cron timezone move counts too: its slot was computed in the old zone.
             updated.pop("pending_slot", None)
             if updated.get("deferred_run"):
                 from cron.deferral import reconcile_pending
