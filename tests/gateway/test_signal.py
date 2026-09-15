@@ -1149,6 +1149,56 @@ def _patch_scheduler_sleep(monkeypatch, capture: list):
 
 class TestSignalSendMultipleImages:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("last_batch_succeeds", [True, False])
+    async def test_live_media_consumer_counts_images_not_rpc_batches(
+        self, monkeypatch, tmp_path, last_batch_succeeds
+    ):
+        from tools.send_message_tool import _send_live_adapter_media
+
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 2)
+        responses = [{"timestamp": 1}, {"timestamp": 2}] if last_batch_succeeds else [
+            {"timestamp": 1}, None, None,
+        ]
+        adapter._rpc, captured = _stub_rpc_responses(responses)
+        adapter._stop_typing_indicator = AsyncMock()
+        _patch_scheduler_sleep(monkeypatch, [])
+        images = _make_image_files(tmp_path, 3)
+        paths = [str(tmp_path / f"img_{i}.png") for i in range(len(images))]
+
+        result = await _send_live_adapter_media(
+            adapter, "group:fixture", "", [(path, False) for path in paths]
+        )
+
+        assert captured[0]["params"]["attachments"] == paths[:2]
+        assert captured[1]["params"]["attachments"] == paths[2:]
+        assert result["_media_delivered"] == (3 if last_batch_succeeds else 2)
+        assert bool(result.get("success")) is last_batch_succeeds
+        if not last_batch_succeeds:
+            assert "after 2/3 files" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_receipts_preserve_input_order_across_rejections_and_batches(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(monkeypatch)
+        monkeypatch.setattr("gateway.platforms.signal.SIGNAL_MAX_ATTACHMENTS_PER_MSG", 2)
+        adapter._rpc, captured = _stub_rpc_responses([{"timestamp": 1}, None, None])
+        adapter._stop_typing_indicator = AsyncMock()
+        _patch_scheduler_sleep(monkeypatch, [])
+        images = _make_image_files(tmp_path, 3)
+        images.insert(1, ((tmp_path / "missing.png").as_uri(), ""))
+
+        results = await adapter.send_multiple_images("group:fixture", images)
+
+        assert [result.success for result in results] == [True, False, True, False]
+        assert results[1].error == "Signal image validation failed"
+        assert results[3].error == "Signal image batch send failed"
+        assert captured[0]["params"]["attachments"] == [
+            str(tmp_path / "img_0.png"), str(tmp_path / "img_1.png"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_empty_list_is_noop(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         mock_rpc, captured = _stub_rpc_responses([])

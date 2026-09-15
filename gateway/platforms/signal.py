@@ -780,9 +780,9 @@ class SignalAdapter(BasePlatformAdapter):
         """Send a batch of images via chunked Signal RPC calls. Alt texts are dropped (one shared body
         per send); bad images are skipped with a warning; ``human_delay`` is ignored (scheduler paces).
 
-        Returns one SendResult per validation failure plus one per attachment batch, so a caller can
-        see which part of a partially delivered batch still owes the user something."""
-        results: List[SendResult] = []
+        Returns one SendResult per input image in input order. Every image in an attachment batch
+        receives that batch's outcome, preserving exact delivered-image counts for callers."""
+        results = [SendResult(success=False, error="Signal image validation failed") for _ in images]
         if not images:
             # Empty -> _aggregate_image_results renders upstream's "no images to send" outcome;
             # the adapter stays purely per-image.
@@ -791,15 +791,14 @@ class SignalAdapter(BasePlatformAdapter):
         logger.info("Signal send_multiple_images: received %d image(s) for %s — scheduler state: %s", len(images),
                     chat_id[:30], scheduler.state())
         await self._stop_typing_indicator(chat_id)
-        attachments: List[str] = []
+        attachments: List[Tuple[int, str]] = []
         skipped = {"download": 0, "missing": 0, "oversize": 0}
-        for image_url, _alt_text in images:
+        for image_index, (image_url, _alt_text) in enumerate(images):
             file_path, reason, detail = await self._resolve_image_path(image_url)
             if not reason:
-                attachments.append(file_path)
+                attachments.append((image_index, file_path))
                 continue
             skipped[reason] += 1
-            results.append(SendResult(success=False, error="Signal image validation failed"))
             logger.warning(*_SKIP_IMAGE_LOG[reason](image_url, detail))
         if not attachments:
             logger.error("Signal: no valid images in batch of %d (download=%d missing=%d oversize=%d)", len(images),
@@ -812,18 +811,19 @@ class SignalAdapter(BasePlatformAdapter):
         per = SIGNAL_MAX_ATTACHMENTS_PER_MSG
         att_batches = [attachments[i:i + per] for i in range(0, len(attachments), per)]
         n_batches = len(att_batches)
-        delivered = False
         for idx, att_batch in enumerate(att_batches, start=1):
             n = len(att_batch)
             estimated = scheduler.estimate_wait(n)
             logger.debug("Signal batch %d/%d: %d attachments, estimated wait=%.1fs", idx, n_batches, n, estimated)
             if estimated >= SIGNAL_BATCH_PACING_NOTICE_THRESHOLD:
                 await self._notify_batch_pacing(chat_id, idx, n_batches, estimated)
-            sent = await self._send_attachment_batch(scheduler, dict(base_params, attachments=att_batch), n,
-                                                     f"{idx}/{n_batches}")
-            results.append(
-                SendResult(success=True) if sent
-                else SendResult(success=False, error="Signal image batch send failed", retryable=True))
+            sent = await self._send_attachment_batch(
+                scheduler, dict(base_params, attachments=[path for _, path in att_batch]), n,
+                f"{idx}/{n_batches}")
+            for image_index, _ in att_batch:
+                results[image_index] = (
+                    SendResult(success=True) if sent
+                    else SendResult(success=False, error="Signal image batch send failed", retryable=True))
         return results
 
     async def _send_attachment_batch(self, scheduler, params: Dict[str, Any], n: int, label: str) -> bool:

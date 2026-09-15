@@ -5,6 +5,8 @@ requires it on every run and owns shared adoption/publication policy.
 
 ## Coupled current adaptations
 
+- Signal image batches return one result per input image, in input order, including validation failures and every image in a failed RPC batch. This preserves the live `send_message` media consumer's exact delivered counts instead of reporting a successful multi-image batch as an incomplete album. `tests/gateway/test_signal.py` exercises the real adapter and consumer with transport-only fixtures, plus interleaved invalid images and failed batches. This corrects the fork's per-image receipt contract, not upstream's aggregate result API. Related upstream #106557 and #106153 cover media-only outcome tracking. Retire with equivalent per-image accounting upstream, or revert this correction only together with its strict consumer and regressions.
+
 Positively acknowledged partial text sends retain their undelivered suffix
 through inline retries, existing fallback routes and durable failure settlement.
 The ledger updates failure state and remaining payload together only when the
