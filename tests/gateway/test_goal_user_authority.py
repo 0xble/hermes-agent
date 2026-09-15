@@ -19,9 +19,15 @@ from tools.goal_tool import set_goal_tool
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    goals._DB_CACHE.clear()
-    yield
-    goals._DB_CACHE.clear()
+    # These authority tests require persisted state, not a cold bootstrap race.
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    db = goals._get_session_db()
+    assert db is not None
+    try:
+        yield
+    finally:
+        goals._DB_CACHE.clear()
+        goals._release_session_db(db)
 
 
 def runner_and_source():
@@ -54,6 +60,7 @@ async def test_real_reply_renderer_binds_user_requested_resume_to_event_body():
     assert rendered.startswith("[Replying to:")
     goals.GoalManager("reply").set("Fix parser")
     goals.GoalManager("reply").pause(user_requested=True)
+    assert goals.load_goal("reply").status == "paused"
 
     async def inner(message, *args, **kwargs):
         return await runner._run_in_executor_with_context(
@@ -62,7 +69,7 @@ async def test_real_reply_renderer_binds_user_requested_resume_to_event_body():
 
     runner._run_agent_inner = inner
     result = await runner._run_agent(rendered, "", [], source, "reply", goal_user_text=event.text)
-    assert result["success"] is True
+    assert result["success"] is True, result
     state = goals.load_goal("reply")
     assert state is not None and state.status == "active"
     assert goal_authorization_task("reply", "local") == "local"
@@ -82,7 +89,7 @@ async def test_authenticated_nonempty_body_releases_user_stop_without_magic_phra
         '[Replying to: "Please continue working."]\n\nYes, continue.',
         "", [], source, "quote", goal_user_text="Yes, continue.",
     )
-    assert result["success"] is True
+    assert result["success"] is True, result
     state = goals.load_goal("quote")
     assert state is not None and state.status == "active"
 

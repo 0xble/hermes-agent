@@ -15,11 +15,23 @@ from tools.goal_authority import goal_authorization_task
 from tools.goal_tool import set_goal_tool
 
 
+@pytest.fixture
+def ready_goal_db(tmp_path, monkeypatch):
+    """Initialize real persistence before entering the async authority test."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(goals, "_DB_CACHE", {})
+    db = goals._get_session_db()
+    assert db is not None
+    try:
+        yield db
+    finally:
+        goals._DB_CACHE.clear()
+        goals._release_session_db(db)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("successful", [True, False])
-async def test_voice_stt_then_authority_releases_only_current_successful_transcript(tmp_path, monkeypatch, successful):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    goals._DB_CACHE.clear()
+async def test_voice_stt_then_authority_releases_only_current_successful_transcript(ready_goal_db, successful):
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")})
     runner.adapters = {}
@@ -39,6 +51,7 @@ async def test_voice_stt_then_authority_releases_only_current_successful_transcr
     assert authority == (transcript if successful else "")
     goals.GoalManager("voice").set("Implementation")
     goals.GoalManager("voice").pause(user_requested=True)
+    assert goals.load_goal("voice").status == "paused"
 
     async def inner(*args, **kwargs):
         return await runner._run_in_executor_with_context(lambda: json.loads(set_goal_tool(
@@ -48,10 +61,9 @@ async def test_voice_stt_then_authority_releases_only_current_successful_transcr
 
     runner._run_agent_inner = inner
     result = await runner._run_agent(rendered, "", [], source, "voice", goal_user_text=authority)
-    assert result["success"] is successful
+    assert result["success"] is successful, result
     assert goals.load_goal("voice").status == ("active" if successful else "paused")
     assert goal_authorization_task("voice", "outside") == "outside"
-    goals._DB_CACHE.clear()
 
 
 @pytest.mark.asyncio
