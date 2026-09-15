@@ -1953,8 +1953,13 @@ class TelegramAdapter(BasePlatformAdapter):
         others_can_mark_tasks_as_done: bool = False, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a native checklist through an explicit Telegram Business connection."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected", retryable=False)
+        guarded = await self._reconnect_guarded(
+            "send_checklist", chat_id, title, tasks, business_connection_id=business_connection_id,
+            others_can_add_tasks=others_can_add_tasks,
+            others_can_mark_tasks_as_done=others_can_mark_tasks_as_done,
+            reply_to=reply_to, metadata=metadata)
+        if guarded is not None:
+            return guarded
         connection_id = str(
             business_connection_id or (metadata or {}).get("telegram_business_connection_id") or "").strip()
         if not connection_id:
@@ -1988,8 +1993,12 @@ class TelegramAdapter(BasePlatformAdapter):
         business_connection_id: Optional[str] = None, others_can_add_tasks: bool = False,
         others_can_mark_tasks_as_done: bool = False, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Idempotently replace a native checklist through its Business connection."""
-        if not self._bot:
-            return SendResult(success=False, error="Not connected", retryable=False)
+        guarded = await self._reconnect_guarded(
+            "edit_checklist", chat_id, message_id, title, tasks,
+            business_connection_id=business_connection_id, others_can_add_tasks=others_can_add_tasks,
+            others_can_mark_tasks_as_done=others_can_mark_tasks_as_done, metadata=metadata)
+        if guarded is not None:
+            return guarded
         connection_id = str(
             business_connection_id or (metadata or {}).get("telegram_business_connection_id") or "").strip()
         if not connection_id:

@@ -204,8 +204,8 @@ def test_business_turn_skips_draft_api_that_cannot_route_connection():
 
 
 class _InputChecklistTask:
-    def __init__(self, task_id, text):
-        self.id = task_id
+    def __init__(self, *, id, text):
+        self.id = id
         self.text = text
 
 
@@ -226,11 +226,73 @@ class _InputChecklist:
 
 def _install_checklist_types(monkeypatch):
     monkeypatch.setattr(
-        telegram_adapter,
+        TelegramAdapter,
         "_load_input_checklist_types",
-        lambda: (_InputChecklist, _InputChecklistTask),
-        raising=False,
+        staticmethod(lambda: (_InputChecklist, _InputChecklistTask)),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["send_checklist", "edit_checklist"])
+@pytest.mark.parametrize("recovery", ["same", "replacement", "late_replacement", "timeout", "fatal"])
+async def test_checklist_reconnect_keeps_profile_arguments_and_failure_contract(monkeypatch, method, recovery):
+    _install_checklist_types(monkeypatch)
+    old, live, primary = _adapter(), _adapter(), _adapter()
+    old.set_owner_profile("reviewer")
+    live.set_owner_profile("reviewer")
+    old._bot = None
+    bot = SimpleNamespace(
+        send_checklist=AsyncMock(return_value=SimpleNamespace(message_id=91)),
+        edit_message_checklist=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+    )
+    live._bot = bot
+    primary._bot = SimpleNamespace(send_checklist=AsyncMock(), edit_message_checklist=AsyncMock())
+    runner = MagicMock()
+    runner.adapters = {old.platform: primary}
+    runner._profile_adapters = {}
+    old.gateway_runner = runner
+    spy = AsyncMock(wraps=getattr(live, method))
+    monkeypatch.setattr(live, method, spy)
+    if recovery == "replacement":
+        runner._profile_adapters = {"reviewer": {old.platform: live}}
+        old._wait_for_reconnection = AsyncMock(side_effect=AssertionError("live replacement must not wait"))
+    elif recovery == "late_replacement":
+        async def install_replacement():
+            runner._profile_adapters = {"reviewer": {old.platform: live}}
+            return True
+        old._wait_for_reconnection = AsyncMock(side_effect=install_replacement)
+    elif recovery == "same":
+        async def reconnect_same():
+            old._bot = bot
+            return True
+        old._wait_for_reconnection = AsyncMock(side_effect=reconnect_same)
+    elif recovery == "fatal":
+        old._set_fatal_error("telegram_auth_error", "invalid token", retryable=False)
+        old._wait_for_reconnection = AsyncMock(side_effect=AssertionError("fatal must not wait"))
+    else:
+        old._wait_for_reconnection = AsyncMock(return_value=False)
+    args = ("123", *(["77"] if method == "edit_checklist" else []), "Launch", [{"id": 1, "text": "Venue"}])
+    kwargs = dict(business_connection_id="biz-A", others_can_add_tasks=True,
+                  others_can_mark_tasks_as_done=True, metadata={"notify": True, "thread_id": "7"})
+    if method == "send_checklist":
+        kwargs["reply_to"] = "55"
+    result = await getattr(old, method)(*args, **kwargs)
+    primary._bot.send_checklist.assert_not_awaited()
+    primary._bot.edit_message_checklist.assert_not_awaited()
+    if recovery in {"fatal", "timeout"}:
+        assert not result.success
+        assert result.retryable is (recovery == "timeout")
+        bot.send_checklist.assert_not_awaited()
+        bot.edit_message_checklist.assert_not_awaited()
+    else:
+        assert result.success
+        if recovery in {"replacement", "late_replacement"}:
+            spy.assert_awaited_once_with(*args, **kwargs)
+        wire = (bot.send_checklist if method == "send_checklist" else bot.edit_message_checklist).await_args.kwargs
+        assert wire["business_connection_id"] == "biz-A"
+        assert wire["checklist"].title == "Launch"
+        assert wire["checklist"].others_can_add_tasks is True
+        assert wire["checklist"].others_can_mark_tasks_as_done is True
 
 
 def test_send_checklist_requires_connection_and_builds_typed_payload(monkeypatch):
