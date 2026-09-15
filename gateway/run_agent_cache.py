@@ -264,6 +264,7 @@ class GatewayAgentCacheMixin:
         # Turn boundary: a running-agent slot was just released; persist the new (lower) in-flight count
         # so the dashboard readout stays current. Preserves gateway_state (see _persist_active_agents).
         self._persist_active_agents()
+        self._restart_inbox_session_became_idle(session_key)
         return True
 
     def _drop_turn_slot(self, session_key: str, *, run_generation: Optional[int] = None) -> None:

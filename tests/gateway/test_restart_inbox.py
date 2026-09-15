@@ -446,3 +446,83 @@ async def test_shutdown_after_adapter_handoff_does_not_settle_rejected_input(mon
     assert row["state"] == "pending" and row["attempts"] == 0
     assert row["owner_pid"] is None and row["owner_started_at"] is None
     assert observed[0]._restart_input_admission_failed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('shutdown', [False, True])
+async def test_busy_ordinary_adapter_completion_wakes_pending_restart_input(shutdown):
+    runner, adapter = make_restart_runner()
+    adapter.gateway_runner = runner
+    event = _event(text='ordinary turn')
+    key = runner._session_key_for_source(event.source)
+    started, release, replayed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def handle(incoming):
+        if incoming.text == 'ordinary turn':
+            started.set()
+            await release.wait()
+        else:
+            replayed.set()
+        return None
+
+    adapter._message_handler = handle
+    # Real adapter ownership and cleanup, with only the agent boundary replaced.
+    await adapter.handle_message(event)
+    await asyncio.wait_for(started.wait(), 5)
+    ordinary = adapter._session_tasks[key]
+    queue_id = inbox.record_event(key, _event(message_id='after', text='pending restart input'))
+    _orphan(queue_id)
+    try:
+        assert await runner._drain_restart_inbox() == 0
+        assert await runner._drain_restart_inbox() == 0
+        assert runner._restart_inbox_busy_tasks == {ordinary}
+        row = next(r for r in inbox.read_rows(inbox._db_path()) if r['queue_id'] == queue_id)
+        assert (row['state'], row['attempts']) == ('pending', 0)
+        if shutdown:
+            runner._draining = True
+        release.set()
+        await asyncio.wait_for(ordinary, 5)
+        if shutdown:
+            await asyncio.sleep(0)
+            assert not replayed.is_set()
+            row = next(r for r in inbox.read_rows(inbox._db_path()) if r['queue_id'] == queue_id)
+            assert (row['state'], row['attempts']) == ('pending', 0)
+        else:
+            await asyncio.wait_for(replayed.wait(), 5)
+    finally:
+        release.set()
+        await asyncio.gather(ordinary, return_exceptions=True)
+        await adapter.cancel_background_tasks()
+        for task in tuple(runner._background_tasks):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_running_turn_release_wakes_inbox_but_stale_generation_does_not():
+    runner, adapter = make_restart_runner()
+    event = _event()
+    runner.session_store.get_or_create_session(event.source)
+    key = runner._session_key_for_source(event.source)
+    state = runner._session_state(key)
+    state.turn.agent = object()
+    state.persistent.run_generation = 2
+    queue_id = inbox.record_event(key, event)
+    _orphan(queue_id)
+    replayed = asyncio.Event()
+
+    async def handle(incoming):
+        replayed.set()
+
+    adapter.handle_message = handle
+    assert await runner._drain_restart_inbox() == 0
+    assert await runner._drain_restart_inbox() == 0
+    assert len(runner._restart_inbox_busy_sessions) == 1
+    assert runner._release_running_agent_state(key, run_generation=1) is False
+    assert not replayed.is_set()
+    assert runner._release_running_agent_state(key, run_generation=2) is True
+    await asyncio.wait_for(replayed.wait(), 5)
+    for task in tuple(runner._background_tasks):
+        await task
+    row = next(r for r in inbox.read_rows(inbox._db_path()) if r['queue_id'] == queue_id)
+    assert (row['state'], row['attempts']) == ('delivered', 1)
+    assert runner._restart_inbox_busy_sessions == {}

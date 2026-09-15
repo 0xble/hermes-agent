@@ -139,6 +139,28 @@ class GatewayStartupMixin:
         if not executor.notify_when_capacity_available(available):
             self._restart_inbox_capacity_waiting = False
 
+    def _watch_restart_inbox_busy_task(self, task):
+        """One completion wakeup per excluded adapter owner, across repeated sweeps."""
+        watched = getattr(self, "_restart_inbox_busy_tasks", None)
+        if watched is None:
+            watched = self._restart_inbox_busy_tasks = set()
+        if task in watched:
+            return
+        watched.add(task)
+
+        def completed(done):
+            watched.discard(done)
+            self._schedule_restart_inbox_drain()
+
+        task.add_done_callback(completed)
+
+    def _restart_inbox_session_became_idle(self, session_key):
+        """Wake only sessions an inbox sweep actually excluded for a running turn."""
+        waiting = getattr(self, "_restart_inbox_busy_sessions", {})
+        loop = waiting.pop(session_key, None)
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._schedule_restart_inbox_drain)
+
     async def _drain_restart_inbox_serial(self) -> int:
         """Replay messages the PREVIOUS draining process durably accepted. Rows are claimed
         under this boot's live adapter identities; a claim we cannot dispatch is released
@@ -163,14 +185,24 @@ class GatewayStartupMixin:
             claimed = []
             busy_keys = set(getattr(self, "_restart_inbox_inflight_keys", ()))
             with self.session_store._lock:
-                busy_keys.update(key for key in self.session_store._entries if self._is_session_running(key))
+                running = {key for key in self.session_store._entries if self._is_session_running(key)}
+                busy_keys.update(running)
+                waiting = getattr(self, "_restart_inbox_busy_sessions", None)
+                if waiting is None:
+                    waiting = self._restart_inbox_busy_sessions = {}
+                loop = asyncio.get_running_loop()
+                waiting.update((key, loop) for key in running)
             all_adapters = list(self.adapters.values())
             all_adapters.extend(adapter for group in (getattr(self, "_profile_adapters", None) or {}).values()
                                 for adapter in group.values())
             for adapter in all_adapters:
                 tasks = getattr(adapter, "_session_tasks", None)
                 if isinstance(tasks, dict):
-                    busy_keys.update(key for key, task in tasks.items() if task and not task.done())
+                    for key, task in tuple(tasks.items()):
+                        if task and not task.done():
+                            busy_keys.add(key)
+                            if isinstance(task, asyncio.Task):
+                                self._watch_restart_inbox_busy_task(task)
             for path, excluded in self._restart_inbox_blocked.items():
                 if not self._restart_inbox_admission_open():
                     break
