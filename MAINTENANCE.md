@@ -103,6 +103,27 @@ ordinary unnamed callers retain their existing behavior. Coverage lives in
 `tests/tools/test_memory_history_named_child.py`. This closes the first-party API
 and execution-context gap, not arbitrary Python or shell filesystem confinement.
 
+Configured alias replacement treats operator display text literally, including
+backslashes, in both strict and punctuation-tolerant matching. Callable regex
+replacements avoid interpreting that text as escape sequences or backreferences.
+Real config-to-title regressions in `tests/agent/test_title_generator.py` cover
+both paths and ordinary-name controls. This is part of HERMES-017's configured
+alias contract, without changing upstream title defaults.
+
+Positively acknowledged partial text sends retain their undelivered suffix
+through inline retries, existing fallback routes and durable failure settlement.
+The ledger updates failure state and remaining payload together only when the
+expected payload, current process owner and nonterminal state still match.
+Producer and startup recovery both use that settlement, so a later failure with
+no new chunk metadata cannot restore an acknowledged prefix. Timeout on a suffix
+attempt retains the existing no-inline-resend rule. This extends the HERMES-004 /
+HERMES-085 boundary with real receipt, SQLite and startup regressions in
+`tests/gateway/test_delivery_retry_suffix_durable.py`. No schema migration is
+needed. Existing marked at-least-once recovery for genuinely unknown/crashed
+sends remains unchanged; this does not promise global exactly-once delivery.
+Rollback preserves the existing ledger payloads and reverts the coupled retry
+and failure-settlement changes together.
+
 Configured title casing now supplies the sole capitalization instruction. Default
 and explicit sentence case no longer compete with an unconditional Title Case
 rule. Real config-to-title-request regressions preserve title-case selection and
