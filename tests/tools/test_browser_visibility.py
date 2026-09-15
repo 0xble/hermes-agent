@@ -181,6 +181,8 @@ def test_reload_clears_marker_whose_recorded_daemon_is_verifiably_dead(
         )
     cli._browser_exec_identity_daemons[daemon] = owner
     cli._browser_exec_identity_daemon_homes[daemon] = __import__("hermes_constants").hermes_home_key()
+    monkeypatch.setitem(cli._browser_exec_identity_daemon_envs, daemon,
+                        cli._browser_exec_runtime_env(daemon, {}))
     run = Mock(return_value=Mock(returncode=0, stderr=""))
     monkeypatch.setattr(cli, "_find_cli", lambda: ["browser-use"])
     monkeypatch.setattr(cli, "_base_subprocess_env", lambda: {})

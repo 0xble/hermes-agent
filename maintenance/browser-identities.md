@@ -7,6 +7,8 @@ HERMES-133 retires the unsafe immutable snapshot path: earlier HERMES-077 descri
 
 ## Coupled current adaptations
 
+- HERMES-064 Browser Use daemon bindings retain only their resolved harness runtime directory and shared-name mode. Cleanup reuses that launch locator after profile switches or restart, enters the owning Hermes-home context for recovery and binding markers, and forwards no browser credentials or CDP route during local reload. Missing legacy locators require active-profile PID evidence, while foreign or corrupt records remain tracked. Regression: `tests/tools/test_browser_use_runtime_owner.py`, plus identity and visibility recovery tests. No browser data or credential store migration.
+
 - Browser identity recovery reuses verified endpoints before invalidating Browser Use attachments. Non-sidecar session entry enforces persisted Camofox ownership before cache access or creation. Regressions: `tests/tools/test_browser_real_profile.py` and `test_browser_camofox_named_identities.py`. Source rollback must preserve durable backend claims.
 
 - Snapshot browser cleanup reuses the existing ambiguity-rejecting profile-argument parser and current browser inventory. Repeated switches, arguments after a terminator, malformed argv and escaped snapshot paths cannot authorize termination. `tests/hermes_cli/test_browser_snapshot_process_ownership.py` retains positive owned-tree cleanup coverage. Rollback of the inventory repair alone restores a runtime NameError; do not reintroduce first-argument ownership selection when adopting upstream cleanup.

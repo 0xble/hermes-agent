@@ -33,6 +33,7 @@ _browser_exec_identity_lock = threading.Lock()
 _browser_exec_identity_bindings: dict[str, str] = {}
 _browser_exec_identity_daemons: dict[str, str] = {}
 _browser_exec_identity_daemon_homes: dict[str, str] = {}
+_browser_exec_identity_daemon_envs: dict[str, dict[str, str] | None] = {}
 _LEGACY_BROWSER_BINDING = "__legacy__"
 
 
@@ -196,9 +197,49 @@ def _claim_browser_exec_durable_binding(session: str, owner: str) -> str | None:
             shutil.rmtree(temporary, ignore_errors=True)
 
 
-def _persist_browser_exec_daemon(session: str, daemon_name: str) -> None:
+def _browser_exec_runtime_env(name: str, env: dict) -> dict[str, str]:
+    """Capture only the resolved IPC locator, never CDP or provider credentials."""
+    pid_path = _daemon_pid_path(name, env)
+    return {
+        "BH_RUNTIME_DIR": str(pid_path.parent.absolute()),
+        "BH_RUNTIME_DIR_SHARED": "1" if pid_path.name == f"bu-{name}.pid" else "0",
+    }
+
+
+def _read_browser_exec_runtime_env(claim: Path) -> dict[str, str] | None:
+    try:
+        value = json.loads((claim / "runtime.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None  # Legacy record. Only the active profile can prove its locator.
+    except (OSError, ValueError):
+        return {}  # Corrupt evidence must not fall back to the active environment.
+    if (not isinstance(value, dict)
+            or set(value) != {"BH_RUNTIME_DIR", "BH_RUNTIME_DIR_SHARED"}
+            or not isinstance(value["BH_RUNTIME_DIR"], str)
+            or not Path(value["BH_RUNTIME_DIR"]).is_absolute()
+            or value["BH_RUNTIME_DIR_SHARED"] not in ("0", "1")):
+        return {}
+    return value
+
+
+def _persist_browser_exec_daemon(session: str, daemon_name: str, env: dict) -> dict[str, str]:
     claim = _browser_exec_durable_binding_dir(session)
+    runtime_env = _browser_exec_runtime_env(daemon_name, env)
+    if (claim / "daemon").exists():
+        previous = _read_browser_exec_runtime_env(claim)
+        if previous is None:
+            if _daemon_process_identity(daemon_name, env) is None:
+                raise OSError("legacy browser daemon runtime cannot be verified")
+        elif previous != runtime_env:
+            raise OSError("browser daemon runtime changed or is corrupt; clean up its owning runtime first")
+    temporary = claim / f".runtime.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        temporary.write_text(json.dumps(runtime_env) + "\n", encoding="utf-8")
+        temporary.replace(claim / "runtime.json")
+    finally:
+        temporary.unlink(missing_ok=True)
     (claim / "daemon").write_text(daemon_name + "\n", encoding="utf-8")
+    return runtime_env
 
 
 def _clear_persisted_browser_exec_daemon(daemon_name: str) -> None:
@@ -212,6 +253,7 @@ def _clear_persisted_browser_exec_daemon(daemon_name: str) -> None:
         try:
             if daemon.read_text(encoding="utf-8").strip() == daemon_name:
                 daemon.unlink(missing_ok=True)
+                (claim / "runtime.json").unlink(missing_ok=True)
         except OSError:
             continue
 
@@ -265,6 +307,7 @@ def _recover_browser_exec_daemons(*, home_key: str) -> None:
         with _browser_exec_identity_lock:
             _browser_exec_identity_daemons[name] = owner
             _browser_exec_identity_daemon_homes[name] = home_key
+            _browser_exec_identity_daemon_envs[name] = _read_browser_exec_runtime_env(claim)
 
 
 def _check_browser_exec_identity_binding(identity, session: str) -> str | None:
@@ -284,7 +327,7 @@ def _check_browser_exec_identity_binding(identity, session: str) -> str | None:
     return None
 
 
-def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str | None]:
+def _bind_browser_exec_identity(identity, session: str, *, env: dict | None = None) -> tuple[str | None, str | None]:
     """Bind a Browser Use session immutably and return its opaque daemon name."""
     binding_key = _browser_exec_binding_key(session)
     owner = _browser_exec_runtime_owner(identity)
@@ -300,7 +343,9 @@ def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str
     daemon_name = _identity_daemon_name(identity, session)
     if daemon_name:
         try:
-            _persist_browser_exec_daemon(session, daemon_name)
+            runtime_env = _persist_browser_exec_daemon(
+                session, daemon_name, env if env is not None else _base_subprocess_env(),
+            )
         except OSError as exc:
             return None, f"could not persist browser daemon binding: {exc}"
     with _browser_exec_identity_lock:
@@ -316,6 +361,7 @@ def _bind_browser_exec_identity(identity, session: str) -> tuple[str | None, str
 
             _browser_exec_identity_daemons[daemon_name] = owner
             _browser_exec_identity_daemon_homes[daemon_name] = hermes_home_key()
+            _browser_exec_identity_daemon_envs[daemon_name] = runtime_env
     return daemon_name, None
 
 
@@ -325,14 +371,17 @@ def _reload_browser_exec_daemons_for_runtime(
     home_key: str | None = None,
 ) -> bool:
     """Stop identity-owned Browser Use daemons so a new CDP is picked up."""
-    from hermes_constants import hermes_home_key
+    from hermes_constants import (
+        hermes_home_key, reset_hermes_home_override, set_hermes_home_override,
+    )
 
     active_home = hermes_home_key()
     if home_key is None or home_key == active_home:
         _recover_browser_exec_daemons(home_key=active_home)
     with _browser_exec_identity_lock:
         targets = {
-            name: owner
+            name: (owner, _browser_exec_identity_daemon_homes.get(name, active_home),
+                   _browser_exec_identity_daemon_envs.get(name))
             for name, owner in _browser_exec_identity_daemons.items()
             if (runtime_key is None or owner == runtime_key)
             and (
@@ -347,91 +396,115 @@ def _reload_browser_exec_daemons_for_runtime(
         logger.warning("could not stop Browser Use identity daemons: CLI unavailable")
         return False
     all_stopped = True
-    for name, owner in targets.items():
+    for name, (owner, target_home, runtime_env) in targets.items():
         env = _base_subprocess_env()
-        env["BU_NAME"] = name
-        from tools.browser_handoff import pending_daemon_recovery_state
+        if runtime_env is None:
+            if target_home != active_home or _daemon_process_identity(name, env) is None:
+                logger.warning("cannot prove legacy Browser Use daemon %s runtime; keeping ownership", name)
+                all_stopped = False
+                continue
+            runtime_env = _browser_exec_runtime_env(name, env)
+        if not runtime_env:
+            logger.warning("invalid Browser Use daemon %s runtime record; keeping ownership", name)
+            all_stopped = False
+            continue
+        # Reload is local IPC. It must not forward the active profile's browser
+        # credentials or attach route to a different profile's daemon.
+        from tools.browser_tool import _BROWSER_PASSTHROUGH_KEYS
 
-        recovery_states = pending_daemon_recovery_state(owner, name)
-        daemon_identity: tuple[int, float] = (0, 0.0)
-        if recovery_states:
-            observed_identity = _daemon_process_identity(name, env)
-            # A daemon that already exited (or was replaced) cannot be reloaded,
-            # but its marker can still be retired once its recorded PID is gone.
-            recovery_states = _clear_pending_for_gone_daemon(
-                owner, name, recovery_states, observed_identity,
-            )
-        if recovery_states:
-            if observed_identity is None:
+        for key in (*_BROWSER_PASSTHROUGH_KEYS, "BU_CDP_URL", "BU_CDP_WS",
+                    "BH_HOME", "BROWSER_HARNESS_HOME"):
+            env.pop(key, None)
+        env.update(runtime_env)
+        env["BU_NAME"] = name
+        env["HERMES_HOME"] = target_home
+        token = set_hermes_home_override(target_home)
+        try:
+            from tools.browser_handoff import pending_daemon_recovery_state
+
+            recovery_states = pending_daemon_recovery_state(owner, name)
+            daemon_identity: tuple[int, float] = (0, 0.0)
+            if recovery_states:
+                observed_identity = _daemon_process_identity(name, env)
+                # A daemon that already exited (or was replaced) cannot be reloaded,
+                # but its marker can still be retired once its recorded PID is gone.
+                recovery_states = _clear_pending_for_gone_daemon(
+                    owner, name, recovery_states, observed_identity,
+                )
+            if recovery_states:
+                if observed_identity is None:
+                    logger.warning(
+                        "cannot prove Browser Use daemon %s identity before reload; "
+                        "timeout recovery remains pending", name,
+                    )
+                    all_stopped = False
+                    continue
+                daemon_identity = observed_identity
+            if recovery_states and any(
+                state.get("daemon_pid") != daemon_identity[0]
+                or state.get("daemon_created") != daemon_identity[1]
+                or not isinstance(state.get("generation"), str)
+                for state in recovery_states
+            ):
                 logger.warning(
-                    "cannot prove Browser Use daemon %s identity before reload; "
+                    "cannot prove Browser Use daemon %s matches the timed-out execution; "
                     "timeout recovery remains pending", name,
                 )
                 all_stopped = False
                 continue
-            daemon_identity = observed_identity
-        if recovery_states and any(
-            state.get("daemon_pid") != daemon_identity[0]
-            or state.get("daemon_created") != daemon_identity[1]
-            or not isinstance(state.get("generation"), str)
-            for state in recovery_states
-        ):
-            logger.warning(
-                "cannot prove Browser Use daemon %s matches the timed-out execution; "
-                "timeout recovery remains pending", name,
-            )
-            all_stopped = False
-            continue
-        try:
-            proc = subprocess.run(
-                [*cmd, "--reload"],
-                input="",
-                capture_output=True,
-                text=True,
-                timeout=15,
-                env=env,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("could not stop Browser Use identity daemon %s: %s", name, exc)
-            all_stopped = False
-            continue
-        if getattr(proc, "returncode", 0) != 0:
-            logger.warning(
-                "could not stop Browser Use identity daemon %s (exit %s): %s",
-                name,
-                proc.returncode,
-                (getattr(proc, "stderr", "") or "").strip(),
-            )
-            all_stopped = False
-            continue
-        if recovery_states and _process_identity_is_live(daemon_identity) is not False:
-            logger.warning(
-                "Browser Use daemon %s did not prove termination after reload; "
-                "timeout recovery remains pending", name,
-            )
-            all_stopped = False
-            continue
-        if recovery_states:
-            from tools.browser_handoff import clear_pending_after_daemon_reload
-            pending_cleared = True
-            for state in recovery_states:
-                if not clear_pending_after_daemon_reload(
-                    owner, name, daemon_identity,
-                    expected_generation=state["generation"],
-                ):
-                    pending_cleared = False
-            if not pending_cleared:
+            try:
+                proc = subprocess.run(
+                    [*cmd, "--reload"],
+                    input="",
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("could not stop Browser Use identity daemon %s: %s", name, exc)
+                all_stopped = False
+                continue
+            if getattr(proc, "returncode", 0) != 0:
                 logger.warning(
-                    "Browser Use daemon %s stopped but its timeout recovery marker "
-                    "remains pending", name,
+                    "could not stop Browser Use identity daemon %s (exit %s): %s",
+                    name,
+                    proc.returncode,
+                    (getattr(proc, "stderr", "") or "").strip(),
                 )
                 all_stopped = False
                 continue
-        _clear_persisted_browser_exec_daemon(name)
-        with _browser_exec_identity_lock:
-            if _browser_exec_identity_daemons.get(name) == owner:
-                _browser_exec_identity_daemons.pop(name, None)
-                _browser_exec_identity_daemon_homes.pop(name, None)
+            if recovery_states and _process_identity_is_live(daemon_identity) is not False:
+                logger.warning(
+                    "Browser Use daemon %s did not prove termination after reload; "
+                    "timeout recovery remains pending", name,
+                )
+                all_stopped = False
+                continue
+            if recovery_states:
+                from tools.browser_handoff import clear_pending_after_daemon_reload
+                pending_cleared = True
+                for state in recovery_states:
+                    if not clear_pending_after_daemon_reload(
+                        owner, name, daemon_identity,
+                        expected_generation=state["generation"],
+                    ):
+                        pending_cleared = False
+                if not pending_cleared:
+                    logger.warning(
+                        "Browser Use daemon %s stopped but its timeout recovery marker "
+                        "remains pending", name,
+                    )
+                    all_stopped = False
+                    continue
+            _clear_persisted_browser_exec_daemon(name)
+            with _browser_exec_identity_lock:
+                if _browser_exec_identity_daemons.get(name) == owner:
+                    _browser_exec_identity_daemons.pop(name, None)
+                    _browser_exec_identity_daemon_homes.pop(name, None)
+                    _browser_exec_identity_daemon_envs.pop(name, None)
+        finally:
+            reset_hermes_home_override(token)
     return all_stopped
 
 
@@ -1272,7 +1345,7 @@ def _browser_exec(
     # Bind only after routing succeeds. A failed cloud/CDP/consent preflight
     # must not poison the user-visible session name for a later valid retry.
     _, binding_error = _bind_browser_exec_identity(
-        resolved_identity, effective_session
+        resolved_identity, effective_session, env=env
     )
     if binding_error:
         return tool_error(binding_error)

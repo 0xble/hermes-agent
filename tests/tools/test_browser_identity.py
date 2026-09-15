@@ -328,10 +328,12 @@ class TestBrowserUseIdentityRouting:
         bu._browser_exec_identity_bindings.clear()
         bu._browser_exec_identity_daemons.clear()
         bu._browser_exec_identity_daemon_homes.clear()
+        bu._browser_exec_identity_daemon_envs.clear()
         yield
         bu._browser_exec_identity_bindings.clear()
         bu._browser_exec_identity_daemons.clear()
         bu._browser_exec_identity_daemon_homes.clear()
+        bu._browser_exec_identity_daemon_envs.clear()
 
     def test_schema_exposes_aliases_and_strict_requirement(self):
         import tools.browser_use_cli as bu
@@ -554,6 +556,7 @@ class TestBrowserUseIdentityRouting:
         calls = []
         monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])
         monkeypatch.setattr(bu, "_base_subprocess_env", lambda: {})
+        monkeypatch.setattr(bu, "_daemon_process_identity", lambda *_args: (41, 1.0))
         monkeypatch.setattr(
             bu.subprocess,
             "run",
@@ -580,6 +583,7 @@ class TestBrowserUseIdentityRouting:
         bu._browser_exec_identity_daemon_homes.clear()
         calls = []
         monkeypatch.setattr(bu, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(bu, "_daemon_process_identity", lambda *_args: (41, 1.0))
         monkeypatch.setattr(
             bu.subprocess,
             "run",
