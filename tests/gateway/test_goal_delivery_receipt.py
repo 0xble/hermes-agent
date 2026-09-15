@@ -38,7 +38,7 @@ def receipt_context(monkeypatch, tmp_path):
     runner = _setup_runner(monkeypatch, tmp_path)
     token = set_hermes_home_override(str(tmp_path / "home"))
     goals._DB_CACHE.clear()
-    goals._get_session_db()  # warm on sync fixture thread, not the event loop
+    assert goals._get_session_db() is not None  # synchronous fixture, before the event loop
     mgr = goals.GoalManager("goal-receipt")
     mgr.set("Finish the local fix", max_turns=10)
     judge = MagicMock(return_value=("continue", "still working", False, None, False))
@@ -273,15 +273,14 @@ async def test_failed_final_recovers_prepared_goal_via_ledger(receipt_context, m
     assert ledger.sweep_recoverable() == []
 
 
-@pytest.mark.asyncio
-async def test_normal_durable_receipt_consumes_in_originating_profile(receipt_context, monkeypatch, tmp_path):
-    from gateway import delivery_ledger as ledger
+@pytest.fixture
+def routed_receipt_context(receipt_context, monkeypatch, tmp_path):
+    """Prepare the routed profile's real DB before the async receipt lifecycle."""
     from gateway import run as gateway_run
-    from gateway.platforms.base import SendResult
     from hermes_cli import goals
     from hermes_constants import get_hermes_home
 
-    runner, adapter, ambient_manager, judge = receipt_context
+    runner, _, _, _ = receipt_context
     profile_home = tmp_path / 'routed-profile'
     profile_home.mkdir()
     runner.config.multiplex_profiles = True
@@ -289,10 +288,32 @@ async def test_normal_durable_receipt_consumes_in_originating_profile(receipt_co
     monkeypatch.setattr(gateway_run, '_load_profile_secret_scope', lambda _home: {})
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='12345', chat_type='dm')
     with runner._profile_scope_for_source(source):
+        assert get_hermes_home() == profile_home
+        db = goals._get_session_db()
+        assert db is not None
+    try:
+        yield profile_home, source
+    finally:
+        goals._DB_CACHE.pop(str(profile_home), None)
+        goals._release_session_db(db)
+
+
+@pytest.mark.asyncio
+async def test_normal_durable_receipt_consumes_in_originating_profile(receipt_context, routed_receipt_context, monkeypatch):
+    from gateway import delivery_ledger as ledger
+    from gateway.platforms.base import SendResult
+    from hermes_cli import goals
+    from hermes_constants import get_hermes_home
+
+    runner, adapter, ambient_manager, judge = receipt_context
+    profile_home, source = routed_receipt_context
+    with runner._profile_scope_for_source(source):
         mgr = goals.GoalManager(ambient_manager.session_id)
         mgr.set('Finish the routed profile task', max_turns=10)
+        assert goals.load_goal(mgr.session_id).goal == 'Finish the routed profile task'
         result = {'final_response': 'Profile progress.',
                   '_goal_decision': mgr.evaluate_after_turn('Profile progress.')}
+        assert result['_goal_decision']['should_continue']
     state = {}
     runner._schedule_goal_after_delivery(adapter=adapter, session_key='route', generation=7,
         session_entry=SimpleNamespace(session_id=mgr.session_id), source=source,
