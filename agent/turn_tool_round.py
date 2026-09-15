@@ -201,7 +201,10 @@ def run_tool_round(
         # in the work phase that requested the review.
         agent._review_yield_requested = False
         _turn_exit_reason = "review_dispatched"
-        final_response = "[SILENT]"
+        # This is an internal phase boundary, not an intentional user silence.
+        # Keep the model-facing result empty so the review dispatcher cannot leak
+        # its scheduler sentinel into an ordinary session response.
+        final_response = ""
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
