@@ -146,3 +146,9 @@ cover these corrections without changing live jobs or runtime configuration.
 ## September 15 capture and recovery follow-up
 
 Timezone-only edits recompute and invalidate pending occurrences only for cron wall-clock schedules. Interval and absolute one-shot schedules retain existing due times and recovery slots unless their schedule or lifecycle is explicitly changed. Real persisted-job tests cover timezone changes/clears and combined schedule edits.
+
+Resubmitting an unchanged schedule and normalized timezone, as the desktop editor
+does on rename, preserves both unclaimed slots and durable deferred occurrences.
+Actual schedule changes, cron timezone changes and explicit lifecycle rewrites
+still supersede pending work. Real script/job/ledger tests prove the original
+deferred instant remains claimable after the catch-up window.

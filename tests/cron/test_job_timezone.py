@@ -154,9 +154,12 @@ def test_timezone_update_invalidates_unclaimed_pending_slot(cron_store, fixed_no
     save_jobs(stored)
     assert "pending_slot" in get_job(job["id"])
 
-    # Same zone: no effective change, so the pending occurrence is left alone.
-    same = update_job(job["id"], {"timezone": "America/New_York"})
-    assert "pending_slot" in same
+    # The editor resubmits schedule and zone on a rename. Neither changes the occurrence.
+    same = update_job(job["id"], {
+        "name": "Renamed", "schedule": job["schedule"], "timezone": "America/New_York",
+    })
+    assert same["pending_slot"] == rec["pending_slot"]
+    assert get_job(job["id"])["pending_slot"] == rec["pending_slot"]
 
     moved = update_job(job["id"], {"timezone": "America/Los_Angeles"})
     assert moved["next_run_at"] != job["next_run_at"]

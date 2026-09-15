@@ -5,6 +5,61 @@ from datetime import datetime, timedelta
 import pytest
 
 
+@pytest.mark.parametrize("edit", [
+    "same-dict", "same-string", "same-timezone", "schedule", "timezone",
+    "next-run", "pause", "disable",
+])
+def test_deferred_occurrence_survives_only_non_schedule_edits(tmp_path, monkeypatch, edit):
+    from cron import executions, jobs, scheduler
+    from hermes_time import now
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("{}\n")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "gate.py").write_text(
+        'print(\'{"defer": {"reason": "writer busy", "retry_after_seconds": 30}}\')\n')
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
+    monkeypatch.setattr(scheduler, "_open_cron_session_db", lambda *a: pytest.fail("agent reached"))
+    clock = now()
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock)
+    job = jobs.create_job(prompt="Pending maintenance", schedule="0 21 * * *",
+                          timezone="UTC", script="gate.py", deliver="local")
+    jobs.update_job(job["id"], {"next_run_at": clock.isoformat()})
+    claimed = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(claimed, dict)
+    assert scheduler.run_one_job(claimed)
+    before = jobs.get_job(job["id"])
+    original_execution = executions.get_execution(claimed["execution_id"])
+    edits = {
+        "same-dict": {"schedule": before["schedule"], "timezone": "UTC"},
+        "same-string": {"schedule": "0 21 * * *", "timezone": " UTC "},
+        "same-timezone": {"timezone": " UTC "},
+        "schedule": {"schedule": "0 22 * * *"},
+        "timezone": {"timezone": "America/New_York"},
+        "next-run": {"next_run_at": (clock + timedelta(days=1)).isoformat()},
+        "pause": {"state": "paused"},
+        "disable": {"enabled": False},
+    }
+    changed = jobs.update_job(job["id"], {"name": "Renamed", **edits[edit]})
+    assert changed["name"] == "Renamed"
+    assert executions.get_execution(claimed["execution_id"]) == original_execution
+    if not edit.startswith("same-"):
+        assert not changed.get("deferred_run")
+        assert not jobs.get_job(job["id"]).get("deferred_run")
+        return
+    assert changed["deferred_run"] == before["deferred_run"]
+    assert changed["next_run_at"] == before["next_run_at"]
+    assert jobs.get_job(job["id"])["deferred_run"] == before["deferred_run"]
+    # Even after the catch-up grace window, the original occurrence remains due.
+    clock += timedelta(days=2)
+    assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
+    retry = jobs.claim_job_for_fire(job["id"], return_job=True)
+    assert isinstance(retry, dict)
+    assert retry["_scheduled_instant"] == claimed["_scheduled_instant"]
+    assert retry["fire_claim"]["run_id"] != claimed["fire_claim"]["run_id"]
+
+
 @pytest.mark.parametrize("schedule", ["every 1h", "0 21 * * *"])
 @pytest.mark.parametrize("null_schedule", [False, True])
 @pytest.mark.parametrize("retry_mode", ["manual", "resume"])

@@ -2141,8 +2141,8 @@ def update_job(
         timezone_changes_schedule = timezone_changed and updated["schedule"].get("kind") == "cron"
         if schedule_changed or timezone_changes_schedule:
             updated["next_run_at"] = _compute_next_run_for_job(updated)
-        if timezone_changes_schedule or {
-            "schedule", "next_run_at", "enabled", "state"
+        if schedule_changed or timezone_changes_schedule or {
+            "next_run_at", "enabled", "state"
         }.intersection(updates):
             # An explicit schedule/lifecycle rewrite supersedes any occurrence the dispatcher
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
