@@ -886,40 +886,61 @@ def _title_request_content(text: str, title_context: Any) -> Any:
     images: list[dict[str, Any]] = []
     encoded_budget = 2 * 1024 * 1024
     encoded_used = 0
+    import base64
+    import binascii
+    import json
+
+    supported_media = {"image/png", "image/jpeg", "image/gif", "image/webp"}
     for part in parts:
         if len(images) >= 4 or not isinstance(part, Mapping):
             continue
         kind = str(part.get("type") or "").strip().casefold()
-        if kind == "image_url":
+        detail = None
+        if kind in {"image_url", "input_image"}:
             value = part.get("image_url")
             url = value.get("url") if isinstance(value, Mapping) else value
-            if (
-                isinstance(url, str)
-                and url.strip().casefold().startswith("data:image/")
-                and ";base64," in url[:128].casefold()
-            ):
-                size = len(url.encode("utf-8"))
-                if encoded_used + size <= encoded_budget:
-                    images.append(dict(part))
-                    encoded_used += size
-        elif kind == "input_image":
-            value = part.get("image_url")
-            if (
-                isinstance(value, str)
-                and value.strip().casefold().startswith("data:image/")
-                and ";base64," in value[:128].casefold()
-            ):
-                size = len(value.encode("utf-8"))
-                if encoded_used + size <= encoded_budget:
-                    images.append(dict(part))
-                    encoded_used += size
+            if not isinstance(url, str) or len(url) > encoded_budget:
+                continue
+            header, separator, data = url.partition(",")
+            if not separator or not header.casefold().startswith("data:") or not header.casefold().endswith(";base64"):
+                continue
+            media_type = header[5:-7].casefold()
+            detail = value.get("detail") if isinstance(value, Mapping) else part.get("detail")
         elif kind == "image":
             source = part.get("source")
-            if isinstance(source, Mapping) and source.get("data"):
-                size = len(str(source.get("data")).encode("utf-8"))
-                if encoded_used + size <= encoded_budget:
-                    images.append(dict(part))
-                    encoded_used += size
+            if not isinstance(source, Mapping) or source.get("type") != "base64":
+                continue
+            media_type = source.get("media_type")
+            data = source.get("data")
+        else:
+            continue
+        if (not isinstance(media_type, str) or media_type not in supported_media
+                or not isinstance(data, str) or not data or len(data) > encoded_budget):
+            continue
+        try:
+            if not base64.b64decode(data, validate=True):
+                continue
+        except (ValueError, binascii.Error):
+            continue
+        # Never copy caller fields: metadata and alternate URLs can carry private
+        # authority even when an otherwise valid inline payload is present.
+        if kind == "image":
+            image = {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
+        else:
+            inline_url = f"data:{media_type};base64,{data}"
+            if kind == "image_url":
+                image = {"type": "image_url", "image_url": {"url": inline_url}}
+                if detail in ("auto", "low", "high"):
+                    image["image_url"]["detail"] = detail
+            else:
+                image = {"type": "input_image", "image_url": inline_url}
+                if detail in ("auto", "low", "high"):
+                    image["detail"] = detail
+        # Bound the whole forwarded image payload, not just its data field.
+        size = len(json.dumps(image, ensure_ascii=False).encode("utf-8"))
+        if encoded_used + size <= encoded_budget:
+            images.append(image)
+            encoded_used += size
     if not images:
         return text
     return [{"type": "text", "text": text}, *images]
