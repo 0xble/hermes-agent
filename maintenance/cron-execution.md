@@ -11,6 +11,20 @@ successfully deferred. The special path still avoids ordinary completion
 accounting and preserves foreign state. Real script/job/ledger races in
 `tests/cron/test_contention_deferral.py` verify these refusals.
 
+Paused recurring manual fires also retain their claimed schedule snapshot on
+deferral, including an explicit null next-run time. The cooldown stays in the
+durable deferred record and its execution settles without ordinary run accounting.
+The job stays paused: after cooldown, another explicit manual fire can retry while
+preserving the schedule. Explicit resume instead supersedes deferred work and
+computes a fresh future schedule, following the existing lifecycle-edit contract.
+The real script/scheduler/job/ledger regression in
+`tests/cron/test_contention_deferral.py` covers interval and wall-clock schedules,
+both retry routes, and unchanged paused markers. This is a fork-only adaptation:
+the deferral module is absent from frozen upstream `743140cd8221ad04897c4c3e706e0fc8a7613b8e`.
+Retire this guard only when released upstream satisfies the same pause and ledger
+contract. Roll back this guard and its focused regression together, without
+rewriting live schedules or deferred execution records.
+
 Cron transport selection uses the gateway's launch-time primary identity and
 the selected adapter's resolved creation home. Per-turn identity alone can select
 the wrong primary bot, and the name `custom` is shared by unrelated homes. Missing

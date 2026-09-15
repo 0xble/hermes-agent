@@ -1,8 +1,76 @@
 """Pre-agent contention must retain work, not manufacture a successful occurrence."""
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
+
+
+@pytest.mark.parametrize("schedule", ["every 1h", "0 21 * * *"])
+@pytest.mark.parametrize("null_schedule", [False, True])
+@pytest.mark.parametrize("retry_mode", ["manual", "resume"])
+def test_paused_manual_deferral_preserves_schedule(tmp_path, monkeypatch, schedule, null_schedule, retry_mode):
+    from cron import executions, jobs, scheduler
+    from hermes_time import now
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("{}\n")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    gate = scripts / "gate.py"
+    gate.write_text('print(\'{"defer": {"reason": "writer busy", "retry_after_seconds": 30}}\')\n')
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
+    monkeypatch.setattr(scheduler, "_open_cron_session_db", lambda *a: pytest.fail("agent reached"))
+    clock = now()
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: clock)
+    job = jobs.create_job(prompt="Paused maintenance", schedule=schedule, script="gate.py", deliver="local")
+    jobs.pause_job(job["id"])
+    snapshot = None if null_schedule else (clock + timedelta(hours=2)).isoformat()
+    jobs.update_job(job["id"], {"next_run_at": snapshot})
+    before = jobs.get_job(job["id"])
+    claimed = jobs.claim_job_for_fire(job["id"], force=True, manual=True, preserve_paused=True, return_job=True)
+    assert isinstance(claimed, dict)
+    assert scheduler.run_one_job(claimed)
+    after = jobs.get_job(job["id"])
+    assert after["next_run_at"] == snapshot
+    for key in ("enabled", "state", "paused_at", "paused_reason", "repeat", "last_status", "last_error", "last_run_at"):
+        assert after.get(key) == before.get(key), key
+    assert after["fire_claim"] is None
+    assert not after.get("run_claim")
+    row = executions.get_execution(claimed["execution_id"])
+    assert row["status"] == "deferred"
+    assert row["finished_at"]
+    assert after["deferred_run"]["execution_id"] == row["id"]
+    assert jobs.claim_job_for_fire(job["id"], force=True, manual=True, preserve_paused=True) is False
+    clock += timedelta(seconds=31)
+    assert jobs.get_due_jobs() == []
+    assert jobs.claim_job_for_fire(job["id"]) is False
+    if retry_mode == "resume":
+        resumed = jobs.resume_job(job["id"])
+        assert resumed["enabled"] is True
+        # Explicit resume supersedes the old deferred occurrence with a fresh schedule.
+        assert not resumed.get("deferred_run")
+        assert jobs.get_due_jobs() == []
+        clock = datetime.fromisoformat(resumed["next_run_at"]) + timedelta(seconds=1)
+        assert [j["id"] for j in jobs.get_due_jobs()] == [job["id"]]
+        retry = jobs.claim_job_for_fire(job["id"], return_job=True)
+    else:
+        retry = jobs.claim_job_for_fire(job["id"], force=True, manual=True, preserve_paused=True, return_job=True)
+    assert isinstance(retry, dict)
+    assert retry["fire_claim"]["by"] != claimed["fire_claim"]["by"]
+    assert not retry.get("deferred_run")
+    gate.write_text('print(\'{"wakeAgent": false}\')\n')
+    assert scheduler.run_one_job(retry)
+    final = jobs.get_job(job["id"])
+    assert final["repeat"]["completed"] == before["repeat"]["completed"] + 1
+    assert executions.get_execution(retry["execution_id"])["status"] == "completed"
+    assert executions.get_execution(claimed["execution_id"]) == row
+    if retry_mode == "manual":
+        assert final["enabled"] is False
+        assert final["state"] == "paused"
+        assert final["next_run_at"] == snapshot
+    else:
+        assert final["enabled"] is True
+        assert final["state"] == "scheduled"
 
 
 @pytest.mark.parametrize("schedule,manual", [("every 1h", True), ("every 1h", False), ("0 21 * * *", False), ("1m", False)])

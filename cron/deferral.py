@@ -68,7 +68,14 @@ def finish_deferred_run(job: dict, result: DeferredRun, execution_id: str, owner
         current["deferred_run"] = {"execution_id": execution_id, "reason": result.reason,
                                    "retry_at": retry_at,
                                    "scheduled_instant": job.get("_scheduled_instant")}
-        current["next_run_at"] = retry_at
+        if ("preserve_paused_next_run_at" in claim
+                and current.get("schedule", {}).get("kind") in {"cron", "interval"}
+                and current.get("enabled") is False and current.get("state") == "paused"):
+            # A borrowed manual fire cannot rewrite the operator's paused schedule.
+            # A later manual fire may retry; explicit resume replaces the pending work.
+            current["next_run_at"] = claim["preserve_paused_next_run_at"]
+        else:
+            current["next_run_at"] = retry_at
         # Finite one-shots reserve their budget before running even the pre-check. No agent
         # started: refund only this exact owner's dispatch reservation.
         repeat = current.get("repeat") or {}
