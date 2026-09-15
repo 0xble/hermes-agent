@@ -4296,11 +4296,22 @@ class BasePlatformAdapter(ABC):
                 or retry["adapter_profile"] != getattr(self, "_owner_profile", None)):
             return SendResult(success=False, error="queued_delivery_retry_owner_mismatch")
         initial_result = SendResult(**retry["result"])
+        obligation_id = retry.get("obligation_id")
+        if obligation_id:
+            from gateway.delivery_ledger import attach_retry_receipts
+            goal_state = (getattr(event, "_goal_post_turn_state", {}) or {}).get("delivery", {})
+            attached = await asyncio.to_thread(
+                attach_retry_receipts, obligation_id, retry["content"],
+                turn_token=getattr(event, "_gateway_active_turn_token", None),
+                goal_receipt=goal_state.get("receipt") if not goal_state.get("discarded") else None,
+                delegation_receipt=getattr(event, "_delegation_card_receipt", None))
+            if not attached:
+                return SendResult(success=False, error="queued_delivery_retry_claim_unavailable")
+            goal_state["obligation_id"] = obligation_id
         # The original bracket already parked a long flood refusal. Do not renew its
         # deadline or spend another attempt when this outer frame cannot retry inline.
         if initial_result.retry_after is not None and initial_result.retry_after > _SEND_RETRY_INLINE_WAIT_CAP_SECS:
             return initial_result
-        obligation_id = retry.get("obligation_id")
         if obligation_id:
             from gateway.delivery_ledger import claim_failed_retry
             if not await asyncio.to_thread(claim_failed_retry, obligation_id, retry["content"]):

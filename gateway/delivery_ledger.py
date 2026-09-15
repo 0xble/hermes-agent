@@ -355,6 +355,23 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
+def attach_retry_receipts(obligation_id: str, expected_content: str, *, turn_token: Optional[str] = None,
+                          goal_receipt: Optional[dict] = None, delegation_receipt: Optional[dict] = None) -> bool:
+    """Attach the outer turn's receipts without resetting the predecessor's retry state."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET turn_token=COALESCE(turn_token, ?),
+                   goal_receipt=CASE WHEN goal_receipt_consumed=0 THEN COALESCE(goal_receipt, ?) ELSE goal_receipt END,
+                   delegation_receipt=COALESCE(delegation_receipt, ?)
+               WHERE obligation_id=? AND content=? AND state='failed'
+                 AND owner_pid IS ? AND owner_started_at IS ?""",
+            (turn_token, json.dumps(goal_receipt) if goal_receipt else None,
+             json.dumps(delegation_receipt) if delegation_receipt else None,
+             obligation_id, expected_content, pid, started))
+    return bool(cursor.rowcount)
+
+
 def claim_failed_retry(obligation_id: str, expected_content: str) -> bool:
     """Reserve an immediate outer retry without replacing its original obligation."""
     pid, started = _owner_stamp()

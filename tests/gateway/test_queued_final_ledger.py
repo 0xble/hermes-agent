@@ -160,6 +160,8 @@ async def test_partial_queued_predecessor_outer_delivery_preserves_wire_and_obli
     original_obligation = row["obligation_id"]
     event = MessageEvent(text="original question", source=source, message_id=INBOUND_ID)
     event._gateway_active_turn_token = "turn-7"
+    event._goal_post_turn_state = {"delivery": {"receipt": {"goal": "receipt-7"}}}
+    event._delegation_card_receipt = {"batch": "original-call"}
     GatewayRunner._bind_queued_delivery_retry(event, outer, SESSION_KEY, 7)
     assert "queued_delivery_retry" not in outer
     if outer_outcome == "other_event":
@@ -177,6 +179,8 @@ async def test_partial_queued_predecessor_outer_delivery_preserves_wire_and_obli
             conn.execute("UPDATE delivery_obligations SET state='attempting', owner_pid=999999")
             conn.commit()
     before = _rows()[0]
+    with dl._connect() as conn:
+        prior_updated_at = conn.execute("SELECT updated_at FROM delivery_obligations").fetchone()[0]
     result, _ = await adapter.send_final_ledgered(event, SESSION_KEY, text, {}, reply_to=None)
     assert not hasattr(event, "_queued_delivery_retry")
     await adapter._fire_post_delivery_callback(
@@ -184,6 +188,18 @@ async def test_partial_queued_predecessor_outer_delivery_preserves_wire_and_obli
     rows = _rows()
     assert len(rows) == 1 and rows[0]["obligation_id"] == original_obligation
     assert rows[0]["content"] == refused_wire
+    with dl._connect() as conn:
+        receipts = conn.execute(
+            "SELECT goal_receipt, delegation_receipt, turn_token, updated_at FROM delivery_obligations").fetchone()
+    if outer_outcome in {"success", "refusal", "long_wait"}:
+        assert json.loads(receipts[0]) == {"goal": "receipt-7"}
+        assert json.loads(receipts[1]) == {"batch": "original-call"}
+        assert receipts[2] == "turn-7"
+        assert event._goal_post_turn_state["delivery"]["obligation_id"] == original_obligation
+    else:
+        assert receipts[:3] == (None, None, None)
+    if outer_outcome == "long_wait":
+        assert receipts[3] == prior_updated_at
     if outer_outcome in {"long_wait", "foreign_claim", "other_event", "new_turn", "other_profile"}:
         assert not result.success
         assert adapter._bot.send_message.await_count == 0
