@@ -355,6 +355,18 @@ def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
 
 
+def claim_failed_retry(obligation_id: str, expected_content: str) -> bool:
+    """Reserve an immediate outer retry without replacing its original obligation."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET state='attempting', attempts=attempts+1
+               WHERE obligation_id=? AND content=? AND state='failed'
+                 AND owner_pid IS ? AND owner_started_at IS ? AND attempts < ?""",
+            (obligation_id, expected_content, pid, started, MAX_ATTEMPTS))
+    return bool(cursor.rowcount)
+
+
 def mark_failed(obligation_id: str, error: str = "", *, retry_content: Optional[str] = None,
                 retry_payload: Optional[dict] = None,
                 expected_content: Optional[str] = None) -> bool:

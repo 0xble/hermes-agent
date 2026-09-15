@@ -47,6 +47,7 @@ class TurnContext:
     run_generation: Optional[int] = None
     # Logical response receipt; recursive turns may share a run generation.
     _goal_delivery_state: Optional[dict[str, Any]] = None
+    queued_delivery_retry: Optional[dict[str, Any]] = None
     process_task_id: str = ""
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0

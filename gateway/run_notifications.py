@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import BasePlatformAdapter, SendResult, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -328,10 +328,10 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
-    ) -> bool:
+    ) -> bool | SendResult:
         """Deliver a queued response using the normal text+attachment split, and report whether
-        the TEXT actually landed. The caller gates the queued follow-up on it: answering the
-        next message while the first answer is undelivered buries the answer.
+        the TEXT actually landed (or return its failed SendResult). The caller gates the queued
+        follow-up on it: answering the next message while the first answer is undelivered buries it.
 
         ``session_key`` lets the text send record a delivery-ledger obligation like the normal final
         send does, keyed on ``inbound_message_id`` (the raw inbound id, distinct from the
@@ -386,7 +386,8 @@ class GatewayNotificationsMixin:
                         inbound_message_id)
                     _delivery_confirmed = bool(getattr(_send_result, "success", False))
                     if not _delivery_confirmed:
-                        return False
+                        # Preserve positive partial-delivery evidence for the outer final send.
+                        return _send_result if isinstance(_send_result, SendResult) else False
             else:
                 _delivery_confirmed = True
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if

@@ -23,6 +23,10 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
+import copy
+import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -100,6 +104,125 @@ async def _deliver(adapter, *, session_key=SESSION_KEY, stream_consumer=None, me
         _runner(), text, source=source or _source(), adapter=adapter, metadata=metadata,
         event_message_id=anchor, text_already_delivered=False, deliver_media=False,
         stream_consumer=stream_consumer, session_key=session_key, inbound_message_id=inbound_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outer_outcome", [
+    "success", "refusal", "long_wait", "foreign_claim", "other_event", "new_turn", "other_profile",
+])
+async def test_partial_queued_predecessor_outer_delivery_preserves_wire_and_obligation(monkeypatch, outer_outcome):
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.run_startup import GatewayStartupMixin
+    from gateway.session import SessionSource
+    from gateway.turn_context import TurnContext
+    from plugins.platforms.telegram.adapter import TelegramAdapter, _TelegramSendCooldownExceeded
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={}))
+    adapter._rich_messages_enabled = False
+    adapter._send_cooldown_max_wait = 0.01
+    adapter._bot = MagicMock()
+    wait = 999 if outer_outcome == "long_wait" else 0.1
+    adapter._bot.send_message = AsyncMock(side_effect=[
+        SimpleNamespace(message_id=101),
+        *[_TelegramSendCooldownExceeded(wait) for _ in range(1 if wait == 999 else 3)],
+    ])
+
+    async def immediate(chat_id, send_fn, *args, **kwargs):
+        return await send_fn(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_run_send_call", immediate)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    runner = _runner()
+    runner._MAX_INTERRUPT_DEPTH = 8
+    runner._adapter_for_source = lambda source: adapter
+    queue = []
+    runner._session_state = lambda key: SimpleNamespace(conversation=SimpleNamespace(queued_events=queue))
+    runner._schedule_deferred_obligation_redelivery = MagicMock()
+    adapter.gateway_runner = runner
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT)
+    ctx = TurnContext(source=source, session_key=SESSION_KEY, session_id="session", run_generation=7,
+                      inbound_message_id=INBOUND_ID, history=[], _status_thread_metadata={})
+    pending = MessageEvent(text="follow-up", source=source, message_id="successor")
+    text = "x" * adapter.MAX_MESSAGE_LENGTH + "\n\n**bold**."
+    history = [{"role": "assistant", "content": text}]
+    canonical = {"final_response": text, "messages": history}
+    outer = await runner._run_agent_queued_followup(
+        ctx, adapter, pending.text, pending, canonical, canonical, None)
+    assert outer["final_response"] == text and outer["messages"] == history
+    assert "queued_delivery_retry" in outer
+    assert queue == [pending] and SESSION_KEY not in adapter._pending_messages
+    attempts = adapter._bot.send_message.await_args_list
+    refused_wire = attempts[1].kwargs["text"]
+    assert "*bold*" in refused_wire
+    row = _rows()[0]
+    assert row["content"] == refused_wire
+    original_obligation = row["obligation_id"]
+    event = MessageEvent(text="original question", source=source, message_id=INBOUND_ID)
+    event._gateway_active_turn_token = "turn-7"
+    GatewayRunner._bind_queued_delivery_retry(event, outer, SESSION_KEY, 7)
+    assert "queued_delivery_retry" not in outer
+    if outer_outcome == "other_event":
+        event = copy.copy(event)
+    elif outer_outcome == "new_turn":
+        event._gateway_active_turn_token = "turn-8"
+    elif outer_outcome == "other_profile":
+        adapter._owner_profile = "another-profile"
+    adapter._bot.send_message.reset_mock()
+    adapter._bot.send_message.side_effect = (
+        [_TelegramSendCooldownExceeded(999)] if outer_outcome == "refusal" else None)
+    adapter._bot.send_message.return_value = SimpleNamespace(message_id=102)
+    if outer_outcome == "foreign_claim":
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET state='attempting', owner_pid=999999")
+            conn.commit()
+    before = _rows()[0]
+    result, _ = await adapter.send_final_ledgered(event, SESSION_KEY, text, {}, reply_to=None)
+    assert not hasattr(event, "_queued_delivery_retry")
+    await adapter._fire_post_delivery_callback(
+        SESSION_KEY, asyncio.Event(), 7, delivery_succeeded=result.success)
+    rows = _rows()
+    assert len(rows) == 1 and rows[0]["obligation_id"] == original_obligation
+    assert rows[0]["content"] == refused_wire
+    if outer_outcome in {"long_wait", "foreign_claim", "other_event", "new_turn", "other_profile"}:
+        assert not result.success
+        assert adapter._bot.send_message.await_count == 0
+        assert rows[0] == before
+    else:
+        assert adapter._bot.send_message.await_count == 1
+        assert adapter._bot.send_message.await_args.kwargs["text"] == refused_wire
+        assert result.success is (outer_outcome == "success")
+    if result.success:
+        assert rows[0]["state"] == "delivered"
+        assert adapter._pending_messages[SESSION_KEY] is pending and queue == []
+    else:
+        assert queue == [pending] and SESSION_KEY not in adapter._pending_messages
+    if outer_outcome == "refusal":
+        with dl._connect() as conn:
+            payload = conn.execute("SELECT retry_payload FROM delivery_obligations").fetchone()[0]
+        assert json.loads(payload)["chunks"] == [refused_wire]
+        adapter._bot.send_message.reset_mock()
+        adapter._bot.send_message.side_effect = None
+        monkeypatch.setattr(dl, "_owner_alive", lambda *_: False)
+        claimed = dl.sweep_recoverable(now=time.time() + 1000)
+        replay = SimpleNamespace(_obligation_adapter=AsyncMock(return_value=adapter),
+                                 _consume_delivered_goal_receipt=AsyncMock(),
+                                 _arm_flood_timers_for_waiting_rows=AsyncMock())
+        assert await GatewayStartupMixin._redeliver_claimed_obligations(replay, claimed) == 1
+        assert adapter._bot.send_message.await_args_list[-1].kwargs["text"] == refused_wire
+        assert _rows()[0]["state"] == "delivered"
+
+
+def test_a_later_turn_without_handoff_clears_stale_event_retry():
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+
+    event = MessageEvent(text="next question", source=_source(), message_id=INBOUND_ID)
+    event._queued_delivery_retry = {"stale": True}
+    result = {"final_response": "new canonical answer", "messages": []}
+    GatewayRunner._bind_queued_delivery_retry(event, result, SESSION_KEY, 8)
+    assert not hasattr(event, "_queued_delivery_retry")
+    assert result == {"final_response": "new canonical answer", "messages": []}
 
 
 # ---------------------------------------------------------------------------

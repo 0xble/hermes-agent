@@ -21,7 +21,7 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -2139,6 +2139,7 @@ class GatewayTurnMixin:
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                 return None
 
+            self._bind_queued_delivery_retry(event, agent_result, session_key, run_generation)
             response, _intentional_silence, agent_messages = await self._hmwa_shape_agent_response(
                 agent_result, source, history, session_entry, session_key,
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
@@ -3610,6 +3611,7 @@ class GatewayTurnMixin:
         False when that delivery failed: the queued event has been put back and the caller must
         NOT recurse — answering a follow-up while the first answer is still undelivered buries it.
         """
+        turn_ctx.queued_delivery_retry = None
         session_key = turn_ctx.session_key
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
@@ -3647,6 +3649,22 @@ class GatewayTurnMixin:
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
                 )
+                if isinstance(_first_response_delivered, SendResult):
+                    receipt = _first_response_delivered
+                    suffix = BasePlatformAdapter._delivery_retry_suffix(receipt, "")
+                    if not receipt.success and suffix:
+                        raw = receipt.raw_response if isinstance(receipt.raw_response, dict) else {}
+                        turn_ctx.queued_delivery_retry = {
+                            "session_key": session_key, "inbound_message_id": turn_ctx.inbound_message_id,
+                            "run_generation": turn_ctx.run_generation,
+                            "adapter_profile": getattr(adapter, "_owner_profile", None),
+                            "content": suffix, "obligation_id": raw.get("delivery_obligation_id"),
+                            "result": {"success": False, "message_id": receipt.message_id,
+                                       "error": receipt.error, "retryable": receipt.retryable,
+                                       "retry_after": receipt.retry_after, "error_kind": receipt.error_kind,
+                                       "raw_response": raw},
+                        }
+                    _first_response_delivered = bool(receipt.success)
             except Exception as e:
                 _first_response_delivered = False
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -3700,6 +3718,23 @@ class GatewayTurnMixin:
                     await _bg_result
         return True
 
+    @staticmethod
+    def _bind_queued_delivery_retry(event, result, session_key, run_generation) -> None:
+        """Bind the internal predecessor receipt once to its actual outer event and turn."""
+        if hasattr(event, "_queued_delivery_retry"):
+            del event._queued_delivery_retry
+        retry = result.pop("queued_delivery_retry", None) if isinstance(result, dict) else None
+        if retry is None:
+            return
+        inbound = getattr(event, "ledger_message_id", None) or getattr(event, "message_id", None)
+        if (retry["session_key"] != session_key or retry["run_generation"] != run_generation
+                or str(retry["inbound_message_id"] or "") != str(inbound or "")):
+            raise RuntimeError("Queued delivery receipt does not belong to this event/turn")
+        event._queued_delivery_retry = {
+            **retry, "event_identity": id(event),
+            "turn_token": getattr(event, "_gateway_active_turn_token", None),
+        }
+
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
@@ -3740,7 +3775,11 @@ class GatewayTurnMixin:
             if not await self._run_agent_deliver_first_response(
                 turn_ctx, adapter, response, result, stream_task, pending_event, pending
             ):
-                return result or {"final_response": response, "messages": history}
+                outer_result = result or {"final_response": response, "messages": history}
+                retry = getattr(turn_ctx, "queued_delivery_retry", None)
+                if retry is not None:
+                    return {**outer_result, "queued_delivery_retry": retry}
+                return outer_result
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key

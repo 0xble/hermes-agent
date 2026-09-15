@@ -3528,7 +3528,8 @@ class BasePlatformAdapter(ABC):
 
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> "SendResult":
+        max_retries: int = 2, base_delay: float = 2.0,
+        initial_result: Optional["SendResult"] = None) -> "SendResult":
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         retry_content = content
@@ -3540,7 +3541,7 @@ class BasePlatformAdapter(ABC):
             if isinstance(raw.get("delivery_retry_content"), str) and raw["delivery_retry_content"]:
                 retry_payload = self._delivery_retry_payload(result)
             retry_content = self._delivery_retry_suffix(result, retry_content)
-            if not result.success and retry_content != content:
+            if not result.success and (retry_content != content or retry_payload is not None):
                 # A later refusal may omit chunk metadata. Keep the positively established
                 # remainder on the returned failure so durable settlement cannot replay its prefix.
                 raw = result.raw_response if isinstance(result.raw_response, dict) else {}
@@ -3555,7 +3556,7 @@ class BasePlatformAdapter(ABC):
                     chat_id, text, retry_payload, reply_to=reply_to, metadata=metadata))
             return _remember_suffix(await self.send(
                 chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata))
-        result = await _send(content)
+        result = _remember_suffix(initial_result) if initial_result is not None else await _send(content)
         if result.success or self._send_retry_is_final(result):
             return result
         error_str = result.error or ""
@@ -4090,7 +4091,8 @@ class BasePlatformAdapter(ABC):
         skipped when streaming TTS already delivered audio this turn."""
         generation = getattr(interrupt_event, "_hermes_run_generation", None)
         return bool(
-            self._should_auto_tts_for_chat(event.source.chat_id)
+            not getattr(event, "_queued_delivery_retry", None)
+            and self._should_auto_tts_for_chat(event.source.chat_id)
             and event.message_type == MessageType.VOICE and text_content and not media_files
             and not self._streaming_tts_turn_completed(session_key, generation, event=event))
 
@@ -4283,6 +4285,34 @@ class BasePlatformAdapter(ABC):
             return
         record_delivery(_aggregate_image_results(result))
 
+    async def _resume_queued_final_delivery(
+        self, event: MessageEvent, session_key: str, retry: dict, metadata: dict,
+        reply_to: Optional[str],
+    ) -> SendResult:
+        inbound = getattr(event, "ledger_message_id", None) or getattr(event, "message_id", None)
+        if (retry["event_identity"] != id(event) or retry["session_key"] != session_key
+                or retry["turn_token"] != getattr(event, "_gateway_active_turn_token", None)
+                or str(retry["inbound_message_id"] or "") != str(inbound or "")
+                or retry["adapter_profile"] != getattr(self, "_owner_profile", None)):
+            return SendResult(success=False, error="queued_delivery_retry_owner_mismatch")
+        initial_result = SendResult(**retry["result"])
+        # The original bracket already parked a long flood refusal. Do not renew its
+        # deadline or spend another attempt when this outer frame cannot retry inline.
+        if initial_result.retry_after is not None and initial_result.retry_after > _SEND_RETRY_INLINE_WAIT_CAP_SECS:
+            return initial_result
+        obligation_id = retry.get("obligation_id")
+        if obligation_id:
+            from gateway.delivery_ledger import claim_failed_retry
+            if not await asyncio.to_thread(claim_failed_retry, obligation_id, retry["content"]):
+                return SendResult(success=False, error="queued_delivery_retry_claim_unavailable")
+        result = await self._send_with_retry(
+            event.source.chat_id, retry["content"], reply_to=reply_to, metadata=metadata,
+            initial_result=initial_result)
+        if obligation_id:
+            await self._finalize_delivery_obligation(
+                obligation_id, result, event, self, expected_content=retry["content"])
+        return result
+
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: Dict[str, Any], *,
         reply_to: Optional[str], is_ephemeral_response: bool = False,
@@ -4295,6 +4325,12 @@ class BasePlatformAdapter(ABC):
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
+        retry = getattr(event, "_queued_delivery_retry", None)
+        if retry is not None:
+            del event._queued_delivery_retry
+            result = await delivery_adapter._resume_queued_final_delivery(
+                event, session_key, retry, metadata, reply_to)
+            return result, delivery_adapter
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
@@ -4304,6 +4340,8 @@ class BasePlatformAdapter(ABC):
         if obligation_id is not None:
             await self._finalize_delivery_obligation(
                 obligation_id, result, event, delivery_adapter, expected_content=text_content)
+            if not result.success and self._delivery_retry_suffix(result, ""):
+                result.raw_response["delivery_obligation_id"] = obligation_id
         return result, delivery_adapter
 
     async def _send_final_text(
