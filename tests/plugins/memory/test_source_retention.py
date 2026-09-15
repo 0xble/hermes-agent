@@ -269,6 +269,7 @@ def _source_candidate(tmp_path):
 
 def _provider_for_source_tests():
     provider = object.__new__(HindsightMemoryProvider)
+    provider._retain_tags = []
     provider._source_retain_keys = set()
     provider._source_retain_keys_lock = threading.Lock()
     provider._source_submission_lock = threading.RLock()

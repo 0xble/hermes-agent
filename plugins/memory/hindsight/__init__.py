@@ -1430,6 +1430,10 @@ class HindsightMemoryProvider(MemoryProvider):
         metadata.update({name: value for name in _METADATA_ATTRS if (value := getattr(self, f"_{name}"))})
         return metadata
 
+    def _build_retain_tags(self, tags: List[str] | None = None) -> List[str]:
+        """Apply configured retention shaping to both text and file submissions."""
+        return _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
+
     def _build_retain_kwargs(self, content: str, *, context: str | None = None,
                              metadata: Dict[str, str] | None = None, tags: List[str] | None = None,
                              occurred_at: str | None = None, update_mode: str | None = None) -> Dict[str, Any]:
@@ -1442,7 +1446,7 @@ class HindsightMemoryProvider(MemoryProvider):
             "metadata": metadata or self._build_metadata(message_count=1, turn_index=self._turn_index),
             "timestamp": (occurred_at or "").strip() or _event_timestamp(),
         }
-        merged_tags = _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
+        merged_tags = self._build_retain_tags(tags)
         item.update({k: v for k, v in (("context", context), ("update_mode", update_mode)) if v is not None})
         item.update({k: v for k, v in (("tags", merged_tags), ("observation_scopes", self._observation_scopes)) if v})
         return item
@@ -1579,7 +1583,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 prepared = True
                 if candidate.file_path:
                     file_metadata = {"context": candidate.context, "document_id": candidate.source_id,
-                                     "tags": list(candidate.tags), "metadata": candidate.metadata}
+                                     "tags": self._build_retain_tags(list(candidate.tags)),
+                                     "metadata": candidate.metadata}
                     # Re-verify at the upload boundary: an attachment that changed
                     # or left the trusted media cache since discovery must not ship.
                     file_bytes = read_verified_source_file(candidate)
