@@ -1427,17 +1427,19 @@ def _live_system_guard(request, monkeypatch):
             try:
                 if _psutil.Process(pid).create_time() == expected_created:
                     return True
+            except _psutil.NoSuchProcess:
+                # Preserve absent-child cleanup semantics without signaling a PID
+                # that could be recycled between inspection and the OS call.
+                raise ProcessLookupError(pid) from None
             except Exception:
-                # The recorded child exited. A kill against the stale PID is a
-                # no-op unless the OS has already recycled it, which the
-                # creation-time mismatch above rejects.
-                return True
+                return False
             _spawned_identities.pop(pid, None)
         try:
             walker = _psutil.Process(pid)
+        except _psutil.NoSuchProcess:
+            raise ProcessLookupError(pid) from None
         except Exception:
-            # Stale PID — kill would be a no-op anyway, allow it.
-            return True
+            return False
         try:
             for parent in walker.parents():
                 if parent.pid == test_pid:
