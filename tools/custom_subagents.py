@@ -94,7 +94,7 @@ class ResolvedRoute:
 
 
 def nonsecret_route_url(value: str) -> str:
-    """Credential-free canonical URL suitable for durable launch metadata."""
+    """Origin-only URL for metadata; arbitrary paths can carry credentials."""
     try:
         parsed = urlsplit(str(value or ""))
         host = parsed.hostname or ""
@@ -102,9 +102,29 @@ def nonsecret_route_url(value: str) -> str:
             host = f"[{host}]"
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
-        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+        return urlunsplit((parsed.scheme, host, "", "", ""))
     except (TypeError, ValueError):
         return ""
+
+
+def _route_url_matches_metadata(value: str, metadata: dict) -> bool:
+    """Compare full fingerprints, or the exact historical path-bearing projection.
+
+    Legacy projection is comparison-only. Never serialize it or compare legacy
+    records using origins alone: different tenant paths are different authority.
+    """
+    from hermes_cli.route_identity import normalize_route_base_url
+
+    fingerprint = metadata.get("base_url_authority_fingerprint")
+    if fingerprint:
+        return route_url_authority_fingerprint(value) == fingerprint
+    try:
+        parsed = urlsplit(value)
+        origin = urlsplit(nonsecret_route_url(value))
+        legacy = urlunsplit((origin.scheme, origin.netloc, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        legacy = ""
+    return normalize_route_base_url(legacy) == normalize_route_base_url(metadata.get("base_url") or "")
 
 
 def route_url_authority_fingerprint(value: str) -> str:

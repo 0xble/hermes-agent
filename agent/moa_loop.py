@@ -172,12 +172,14 @@ def _nonsecret_moa_value(value: Any) -> Any:
 
 def _moa_runtime_identity(runtime: dict[str, Any]) -> dict[str, Any]:
     """Durable nonsecret identity for one frozen physical MoA slot."""
-    from tools.custom_subagents import _authority_mapping_fingerprint, _nonsecret_request_overrides, nonsecret_route_url
+    from tools.custom_subagents import (_authority_mapping_fingerprint, _nonsecret_request_overrides,
+                                       nonsecret_route_url, route_url_authority_fingerprint)
     request_overrides = copy.deepcopy(runtime.get("request_overrides") or {})
     return {
         "provider": str(runtime.get("provider") or ""),
         "model": str(runtime.get("model") or ""),
         "base_url": nonsecret_route_url(str(runtime.get("base_url") or "")),
+        "base_url_authority_fingerprint": route_url_authority_fingerprint(str(runtime.get("base_url") or "")),
         "api_mode": str(runtime.get("api_mode") or ""),
         "authority_fingerprint": hashlib.sha256(
             str(runtime.get("api_key") or "").encode()
@@ -223,14 +225,19 @@ def restore_moa_preset(metadata: dict[str, Any]) -> FrozenMoaPreset:
         runtime = {**runtime, "model": model}
         stored_identity = slot.get("runtime_identity")
         current_identity = _moa_runtime_identity(runtime)
-        from tools.custom_subagents import _authority_mapping_matches
+        from tools.custom_subagents import _authority_mapping_matches, _route_url_matches_metadata
         authority_matches = isinstance(stored_identity, dict) and _authority_mapping_matches(
             runtime.get("request_overrides") or {},
             stored_identity.get("request_overrides") or {},
             stored_identity.get("request_overrides_fingerprint"),
         )
+        authority_matches = authority_matches and _route_url_matches_metadata(
+            str(runtime.get("base_url") or ""), stored_identity)
         comparable_current = dict(current_identity)
         comparable_stored = dict(stored_identity) if isinstance(stored_identity, dict) else {}
+        for key in ("base_url", "base_url_authority_fingerprint"):
+            comparable_current.pop(key, None)
+            comparable_stored.pop(key, None)
         comparable_current.pop("request_overrides_fingerprint", None)
         comparable_stored.pop("request_overrides_fingerprint", None)
         comparable_current.pop("request_overrides", None)

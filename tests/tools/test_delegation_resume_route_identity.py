@@ -26,7 +26,7 @@ def test_custom_selector_resume(tmp_path, monkeypatch, historical):
     assert result.credentials["provider"] == "custom"
     assert result.credentials["api_key"] == key
     assert result.definition.provider == selector
-    for field, value in (("base_url", "https://other.invalid/v1"), ("api_key", "changed-fixture-key")):
+    for field, value in (("base_url", "http://127.0.0.1:9876/other-tenant/v1"), ("base_url", "https://other.invalid/v1"), ("api_key", "changed-fixture-key")):
         changed = json.loads(json.dumps(config))
         changed["custom_providers"][0][field] = value
         (tmp_path / "config.yaml").write_text(yaml.safe_dump(changed))

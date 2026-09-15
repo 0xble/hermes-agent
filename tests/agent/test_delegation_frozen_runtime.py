@@ -199,7 +199,7 @@ def test_primary_launch_metadata_redacts_secrets_but_keeps_runtime_pin_and_resum
         subagent_definition=definition,
     )
     launch = child._delegation_launch_metadata
-    assert launch["base_url"] == endpoint
+    assert launch["base_url"] == endpoint.removesuffix("/v1")
     durable = json.dumps(launch)
     assert launch["request_overrides"] == {"max_output_tokens": 321}
     assert all(sentinel not in durable for sentinel in (
@@ -316,7 +316,10 @@ def test_resume_preserves_launch_metadata_and_uses_stable_pool_identity(monkeypa
     assert launch.credentials["api_key"] == "refreshed-secret"
     assert launch._credential_pool is pool
     assert launch.resume_credential_id == "account-a"
-    assert launch.launch_metadata == metadata
+    expected = dict(metadata)
+    expected["base_url"] = "https://fixture"
+    expected["base_url_authority_fingerprint"] = hashlib.sha256(b"https://fixture/v1").hexdigest()
+    assert launch.launch_metadata == expected
     assert "refreshed-secret" not in json.dumps(launch.launch_metadata)
 
     # The current parent cannot supply the child's provider pool. Exercise the
@@ -1078,3 +1081,39 @@ def test_moa_override_projection_reauthorizes_and_rewrites_legacy_snapshot(monke
         assert "SENTINEL" not in json.dumps(restored.metadata())
         assert restored.preset["aggregator"]["_frozen_runtime"]["request_overrides"] == overrides
         assert moa_loop.restore_moa_preset(restored.metadata()).metadata() == restored.metadata()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+def test_moa_route_paths_remain_private_and_resume_authority_stays_exact(monkeypatch, legacy, changed):
+    from copy import deepcopy
+    from agent import moa_loop
+    from agent.moa_fallback import physical_slots
+
+    url = "https://gateway.invalid/api/path-secret/v1"
+    runtime = {"provider": "custom", "model": "fixture", "base_url": url,
+               "api_key": "fixture-key", "api_mode": "chat_completions"}
+    preset = {"reference_models": [{"provider": "custom:fixture", "model": "fixture"}],
+              "aggregator": {"provider": "custom:fixture", "model": "fixture"}}
+    monkeypatch.setattr(moa_loop, "_resolve_preset_cached", lambda name: (deepcopy(preset), {}))
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: dict(runtime))
+    frozen = moa_loop.snapshot_moa_preset("fixture")
+    metadata = frozen.metadata()
+    assert "path-secret" not in json.dumps(metadata)
+    if legacy:
+        # Historical snapshots carried the path but lacked its complete fingerprint.
+        for slot in physical_slots(metadata["preset_snapshot"]):
+            slot["runtime_identity"]["base_url"] = url
+            slot["runtime_identity"].pop("base_url_authority_fingerprint", None)
+        metadata["preset_fingerprint"] = hashlib.sha256(json.dumps(
+            {"preset": metadata["preset_snapshot"], "options": metadata["options"]},
+            sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()[:16]
+    if changed:
+        runtime["base_url"] = url.replace("path-secret", "other-secret")
+        with pytest.raises(ValueError, match="frozen authority"):
+            moa_loop.restore_moa_preset(metadata)
+    else:
+        restored = moa_loop.restore_moa_preset(metadata)
+        assert "path-secret" not in json.dumps(restored.metadata())
+        assert all(slot["_frozen_runtime"]["base_url"] == url for slot in physical_slots(restored.preset))
+        assert moa_loop.restore_moa_preset(restored.metadata()).fingerprint == restored.fingerprint

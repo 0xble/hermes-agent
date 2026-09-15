@@ -15,7 +15,7 @@ from tools.custom_subagents import (
 def test_route_metadata_redacts_but_fingerprints_complete_url_authority():
     first = "https://user:secret@example.invalid/v1?deployment=one"
     second = "https://other:changed@example.invalid/v1?deployment=two"
-    assert nonsecret_route_url(first) == nonsecret_route_url(second) == "https://example.invalid/v1"
+    assert nonsecret_route_url(first) == nonsecret_route_url(second) == "https://example.invalid"
     assert route_url_authority_fingerprint(first) != route_url_authority_fingerprint(second)
 
 
@@ -188,3 +188,45 @@ def test_public_delegation_sets_native_review_card_identity(parent, local_dispat
 
     identity = child._progress_identity_ref
     assert identity["owner"] == identity["card_owner"] == current_delegation_owner(parent)
+
+
+def test_named_launch_checkpoint_omits_path_credentials(tmp_path, monkeypatch, parent):
+    from hermes_state import SessionDB
+    from tools.custom_subagents import FallbackDefinition, _freeze_fallback_runtime
+    from tools.delegate_tool_checkpoint import checkpoint_child_resume
+
+    url = "https://gateway.invalid/api/path-secret/v1?credential=query-secret"
+    parent.base_url = url
+    role = SubagentDefinition("worker", "Work", "Inspect", provider=parent.provider, model=parent.model)
+    monkeypatch.setattr(delegate_tool, "_get_orchestrator_enabled", lambda: False)
+    monkeypatch.setattr(delegate_tool, "_resolve_child_toolsets", lambda *a, **k: ([], []))
+    monkeypatch.setattr(delegate_tool, "_build_child_system_prompt", lambda *a, **k: "Instructions")
+    monkeypatch.setattr(delegate_tool, "_build_child_progress_callback", lambda *a, **k: None)
+    monkeypatch.setattr("tools.custom_subagents.inherited_credential_pool", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a, **k: None)
+    monkeypatch.setattr("run_agent.AIAgent", lambda **kwargs: SimpleNamespace(
+        **kwargs, tools=[], valid_tool_names=set(), _session_init_model_config={}))
+    fallback = _freeze_fallback_runtime(
+        {"provider": "custom", "model": "fallback", "base_url": url.replace("path-secret", "fallback-secret"),
+         "api_mode": "chat_completions", "api_key": "fallback-key"},
+        FallbackDefinition("custom:fixture", "fallback"), "fixture")
+    child = delegate_tool._build_child_agent(
+        0, "Inspect source", None, [], parent.model, 1, 1, parent,
+        subagent_definition=role, resolved_fallback_routes=(fallback,))
+    db = SessionDB(tmp_path / "checkpoint.db")
+    try:
+        child._session_db = db
+        child.session_id = "path-child"  # The constructor double does not allocate a session ID.
+        db.create_session(child.session_id, source="tool")
+        # Even unsafe-history checkpoints persist the route receipt for recovery.
+        checkpoint_child_resume(child, None, {"status": "failed"})
+        stored = json.loads(db.get_session(child.session_id)["model_config"])["_delegation_launch"]
+        assert stored["base_url"] == "https://gateway.invalid"
+        assert stored["fallbacks"][0]["base_url"] == "https://gateway.invalid"
+        assert stored["base_url_authority_fingerprint"] == route_url_authority_fingerprint(url)
+        assert stored["fallbacks"][0]["base_url_authority_fingerprint"] == route_url_authority_fingerprint(fallback.base_url)
+        assert all(secret not in json.dumps(stored) for secret in ("path-secret", "query-secret", "fallback-secret"))
+        assert child.base_url == url
+        assert child._fallback_chain[0]["base_url"] == fallback.base_url
+    finally:
+        db.close()

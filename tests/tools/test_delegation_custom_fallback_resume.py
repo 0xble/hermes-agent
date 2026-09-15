@@ -63,7 +63,10 @@ def test_custom_fallback_resume_keeps_selector_and_physical_authority(tmp_path, 
             route = resumed.credentials if active else resumed.fallback_routes[0].native_entry()
             assert route["base_url"] == config["providers"]["first"]["base_url"]
             assert route["api_key"] == config["providers"]["first"]["api_key"]
-            assert resumed.launch_metadata == metadata
+            expected = deepcopy(metadata)
+            expected["base_url"] = "https://primary.invalid"
+            expected["base_url_authority_fingerprint"] = hashlib.sha256(b"https://primary.invalid/v1").hexdigest()
+            assert resumed.launch_metadata == expected
             assert bool(resumed.fallback_routes) is not active
         row = db.get_session("child")
         assert row is not None

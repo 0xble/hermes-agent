@@ -579,7 +579,7 @@ def _restore_fallback_authority(routes, expected, normalize_route_base_url):
 
 def _fallback_metadata_matches(routes, expected, *, refreshed_accounts=frozenset()) -> bool:
     """Compare public route data plus complete override authority, including legacy-safe metadata."""
-    from tools.custom_subagents import _authority_mapping_matches
+    from tools.custom_subagents import _authority_mapping_matches, _route_url_matches_metadata
     if not isinstance(expected, list) or len(routes) != len(expected):
         return False
     for index, (route, stored) in enumerate(zip(routes, expected)):
@@ -591,10 +591,15 @@ def _fallback_metadata_matches(routes, expected, *, refreshed_accounts=frozenset
             stored.get("request_overrides_fingerprint"),
         ):
             return False
+        if not _route_url_matches_metadata(route.base_url, stored):
+            return False
         current = route.metadata()
         # Full authority was checked above. Public projections can become stricter
         # without changing which request this historical launch authorized.
         stored = dict(stored)
+        for key in ("base_url", "base_url_authority_fingerprint"):
+            current.pop(key, None)
+            stored.pop(key, None)
         current.pop("request_overrides", None)
         stored.pop("request_overrides", None)
         if index in refreshed_accounts:
@@ -727,9 +732,10 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
     from tools.custom_subagents import (
         FallbackDefinition, ResolvedSubagentLaunch, SubagentDefinition,
         freeze_fallback_routes, nonsecret_route_url, route_url_authority_fingerprint,
-        _authority_mapping_matches, resolve_named_credentials,
+        _authority_mapping_matches, _route_url_matches_metadata, resolve_named_credentials,
     )
 
+    authorized_route_urls = None
     requested = task.get("resume_session_id")
     if not isinstance(requested, str) or not requested.strip():
         raise ValueError("resume_session_id must be a nonempty delegated child session id")
@@ -854,17 +860,7 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
                 from agent.credential_pool import credential_pool_matches_provider
                 provider_matches = credential_pool_matches_provider(
                     entry_provider, requested_provider, base_url=entry_base)
-            stored_base_fingerprint = launch.get("base_url_authority_fingerprint")
-            current_base_fingerprint = route_url_authority_fingerprint(str(entry_base or ""))
-            if (
-                    not provider_matches
-                    or (
-                        current_base_fingerprint != stored_base_fingerprint
-                        if stored_base_fingerprint
-                        else normalize_route_base_url(nonsecret_route_url(str(entry_base or "")))
-                             != normalize_route_base_url(str(launch.get("base_url") or ""))
-                    )
-                ):
+            if not provider_matches or not _route_url_matches_metadata(str(entry_base or ""), launch):
                 raise ValueError("delegated child stable credential identity changed route authority")
             runtime_key = getattr(entry, "runtime_api_key", None)
             if not isinstance(runtime_key, str) or not runtime_key:
@@ -882,13 +878,7 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             ("provider", creds.get("provider") == provider),
             ("model", (creds.get("model") or model) == model),
             ("api_mode", str(creds.get("api_mode") or "") == str(launch.get("api_mode") or "")),
-            ("base_url", (
-                route_url_authority_fingerprint(str(creds.get("base_url") or ""))
-                == launch.get("base_url_authority_fingerprint")
-                if launch.get("base_url_authority_fingerprint")
-                else normalize_route_base_url(nonsecret_route_url(str(creds.get("base_url") or "")))
-                     == normalize_route_base_url(str(launch.get("base_url") or ""))
-            )),
+            ("base_url", _route_url_matches_metadata(str(creds.get("base_url") or ""), launch)),
             ("authority", authority_matches),
             ("request_overrides", _authority_mapping_matches(
                 creds.get("request_overrides") or {}, launch.get("request_overrides") or {},
@@ -917,6 +907,7 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             fallbacks, expected_fallbacks, normalize_route_base_url)
         if not _fallback_metadata_matches(fallbacks, expected_fallbacks, refreshed_accounts=refreshed_accounts):
             raise ValueError("delegated child fallback routes no longer match their frozen identities")
+        authorized_route_urls = [str(creds.get("base_url") or ""), *(route.base_url for route in fallbacks)]
         resume_credential_id = stable_credential_id
         active = config.get("_delegation_active_route") or {"provider": provider, "model": model}
         active_id = (active.get("provider"), active.get("model")) if isinstance(active, dict) else (None, None)
@@ -942,6 +933,10 @@ def _resolve_resume_launch(task, definitions, parent_agent, defaults=None):
             )
     from tools.custom_subagents import _authority_mapping_fingerprint, _nonsecret_request_overrides
     launch = deepcopy(launch)
+    if authorized_route_urls is not None:
+        for route_metadata, authorized_url in zip([launch, *(launch.get("fallbacks") or [])], authorized_route_urls):
+            route_metadata["base_url"] = nonsecret_route_url(authorized_url)
+            route_metadata["base_url_authority_fingerprint"] = route_url_authority_fingerprint(authorized_url)
     for route_metadata in [launch, *(launch.get("fallbacks") or [])]:
         prior_overrides = route_metadata.get("request_overrides") or {}
         public_overrides = _nonsecret_request_overrides(prior_overrides)

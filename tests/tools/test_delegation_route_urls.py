@@ -7,14 +7,14 @@ from tools.custom_subagents import nonsecret_route_url
 
 
 @pytest.mark.parametrize("url,expected", [
-    ("http://[::1]:8000/v1", "http://[::1]:8000/v1"),
-    ("http://[::1]/v1", "http://[::1]/v1"),
-    ("http://[::1]:0/v1", "http://[::1]:0/v1"),
-    ("https://user:secret@[2001:db8::1]:8443/v1?token=secret#secret", "https://[2001:db8::1]:8443/v1"),
-    ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/v1"),
-    ("https://user:secret@fixture.invalid/v1?token=secret#secret", "https://fixture.invalid/v1"),
+    ("http://[::1]:8000/v1", "http://[::1]:8000"),
+    ("http://[::1]/v1", "http://[::1]"),
+    ("http://[::1]:0/v1", "http://[::1]:0"),
+    ("https://user:secret@[2001:db8::1]:8443/v1?token=secret#secret", "https://[2001:db8::1]:8443"),
+    ("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000"),
+    ("https://user:secret@fixture.invalid/v1?token=secret#secret", "https://fixture.invalid"),
 ])
-def test_durable_url_preserves_endpoint_without_secrets(url, expected):
+def test_durable_url_preserves_origin_without_secrets(url, expected):
     stored = nonsecret_route_url(url)
     assert stored == expected
     assert nonsecret_route_url(stored) == stored

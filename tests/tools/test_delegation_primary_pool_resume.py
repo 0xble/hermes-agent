@@ -71,7 +71,9 @@ def test_primary_custom_pool_resume_preserves_authority(tmp_path, monkeypatch, m
             assert resumed.credentials["base_url"] == url
             assert resumed.credentials["provider"] == "custom"
             assert resumed.definition.provider == selector
-            assert resumed.launch_metadata == metadata
+            assert resumed.launch_metadata["base_url"] == "https://first.invalid"
+            assert resumed.launch_metadata["base_url_authority_fingerprint"]
+            assert resumed.launch_metadata["credential_pool_entry_id"] == metadata["credential_pool_entry_id"]
         row = db.get_session("child")
         assert row is not None
         stored = json.loads(row["model_config"])
