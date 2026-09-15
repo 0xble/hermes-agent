@@ -152,6 +152,39 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 
 ## Update Behavior
 
+### Validated stable channel (owned fork)
+
+The default is `updates.channel: main`. Opt in only after your maintenance owner
+has published a qualified `origin/stable` pointer using the
+[stable promotion policy](../developer-guide/stable-promotion.md):
+
+```yaml
+updates:
+  channel: stable
+  pre_update_backup: quick
+```
+
+Stable must be a validated ancestor of main: exact-SHA required tests and independent
+review, no blocking findings or known regressions, and at least 24 hours of recorded
+settling. Age alone does not qualify. The existing maintenance owner evaluates
+that evidence before publishing; the updater does not infer eligibility from Git.
+If no candidate qualifies, leave the current runtime and channel unchanged.
+
+`hermes update --branch stable` selects it once without changing config. Explicit
+`--branch main` or `--revision <exact-SHA>` overrides configured channel selection.
+Stable resolves remote main/stable once, fetches those frozen objects (deepening
+shallow history when needed), and refuses missing stable, divergent history or an
+implicit downgrade. Moving remote tips cannot retarget the attempt. A clean tree
+and a successful quick snapshot are required; `--no-backup`, disabled/failed backup,
+and ZIP installation are refused. The previous source ref and dependency manifests
+are retained, but rollback does not reverse migrations or preserve an entire venv.
+See the policy's rollback limits before recovery.
+
+Malformed/unreadable configuration, a non-mapping `updates`, or a channel other than
+`main`/`stable` fails closed with an actionable error, not a fallback to main.
+`--check` checks branch availability, not promotion eligibility; `--plan` inventories
+running services without changing them.
+
 ### Background checks
 
 Passive update checks (CLI banner, TUI badge, dashboard, desktop app) ask the

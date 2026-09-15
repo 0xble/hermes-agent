@@ -82,6 +82,39 @@ def _ensure_clean_and_not_divergent(git_run: Callable[..., Any], git_cmd: list[s
         raise RuntimeError("Pinned revision update refuses a divergent branch; reconcile it manually first")
 
 
+def prepare_stable_target(git_run: Callable[..., Any], git_cmd: list[str], cwd: Path) -> RevisionTarget:
+    """Freeze the operator-promoted origin/stable pointer exactly once.
+
+    Promotion uses the existing maintenance tests/review gates, not a second
+    approval system in the updater. This function only enforces Git ancestry,
+    no implicit downgrade and immutable installation of that promoted pointer.
+    """
+    dirty = _require_ok(_run(git_run, git_cmd, ["status", "--porcelain"], cwd),
+                        "Could not inspect working tree")
+    if dirty:
+        raise RuntimeError("Pinned revision update refuses a dirty working tree; commit or discard changes first")
+    remote = _require_ok(_run(git_run, git_cmd,
+        ["ls-remote", "--exit-code", "origin", "refs/heads/main", "refs/heads/stable"],
+        cwd, network=True), "Could not resolve origin/main and origin/stable")
+    refs = {name: sha for sha, name in (line.split() for line in remote.splitlines())}
+    if set(refs) != {"refs/heads/main", "refs/heads/stable"}:
+        raise RuntimeError("origin/main or origin/stable is unavailable; keep the installed version")
+    main = validate_revision(refs["refs/heads/main"])
+    sha = validate_revision(refs["refs/heads/stable"])
+    shallow = _require_ok(_run(git_run, git_cmd, ["rev-parse", "--is-shallow-repository"], cwd),
+                          "Could not inspect Git history completeness")
+    # Fetching an exact object alone does not remove existing shallow boundaries.
+    # Deepen using the SAME frozen objects, never re-resolve the moving branches.
+    history = ["--unshallow"] if shallow == "true" else []
+    _require_ok(_run(git_run, git_cmd, ["fetch", *history, "origin", main, sha], cwd, network=True),
+                "Could not fetch complete history for the frozen main/stable commits")
+    _require_ok(_run(git_run, git_cmd, ["merge-base", "--is-ancestor", sha, main], cwd),
+                "Stable is not an ancestor of origin/main; refusing divergent release history")
+    _require_ok(_run(git_run, git_cmd, ["merge-base", "--is-ancestor", "HEAD", sha], cwd),
+                "Stable would downgrade or diverge from the current runtime; keep the installed version")
+    return prepare_revision_target(git_run, git_cmd, cwd, sha)
+
+
 def prepare_revision_target(git_run: Callable[..., Any], git_cmd: list[str], cwd: Path, revision: object) -> RevisionTarget:
     """Reject unsafe state, fetch the requested object, and prove its commit/tree.
 

@@ -1990,6 +1990,10 @@ telemetry:
 # Update Behavior
 # =============================================================================
 updates:
+  # Default main. Opt into stable only after the maintenance owner publishes a
+  # qualified origin/stable (exact-SHA tests/review + observed settling).
+  # channel: main
+  # Stable freezes one SHA, requires a quick snapshot and refuses downgrade/ZIP.
   # Disable passive CLI/banner update checks with `hermes config set updates.check false`.
   # Explicit `hermes update --check` and `hermes update` remain available.
   check: true

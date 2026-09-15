@@ -1,5 +1,18 @@
 # Maintained Hermes fork
 
+## Validated stable pointer
+
+[Stable promotion policy](website/docs/developer-guide/stable-promotion.md) owns
+semi-stable eligibility and operational evidence. Main continues syncing upstream;
+stable is only a validated ancestor pointer. The existing pinned updater freezes
+stable once, requires a state snapshot, retains the previous source ref and
+manifest evidence, and refuses implicit downgrade. Independent review and 24-hour
+observed settling are separate from tests; urgent approval skips age only.
+Regression: `tests/hermes_cli/test_update_stable.py` plus the existing immutable
+revision suites. Configuration/activation is parent-owned and must wait for a
+qualified remote stable ref. No new schedule or runtime activation is included.
+
+
 ## Background
 
 Canonical target: `/Users/brianle/Repos/hermes-agent`, the Brian-owned `0xble/hermes-agent` fork of `NousResearch/hermes-agent`. Upstream remains authoritative for unmodified code; intentional divergence and released-equivalence decisions justify enrollment. Fork `main` is the last candidate that passed fork verification, not evidence of runtime promotion. This root is the sole enrollment and scheduling unit; `maintenance/*.md` extends it without independent enrollment.

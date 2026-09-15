@@ -2262,6 +2262,11 @@ def _update_preflight_handled(args) -> bool:
         record_refusal_receipt(refusal)
         sys.exit(2)
 
+    # Validate before acquiring an update lock or creating receipts/backups. The
+    # explicit immutable-revision path does not use configured branch selection.
+    if getattr(args, "revision", None) is None:
+        _resolve_update_branch(args)
+
     if getattr(args, "check", False):
         # --check honors --branch so its answer matches what update would pull.
         branch = _resolve_update_branch(args)

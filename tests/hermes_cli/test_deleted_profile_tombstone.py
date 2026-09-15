@@ -226,3 +226,26 @@ class TestNamedProfileHome:
         (profiles_dir / ".deleted").mkdir(parents=True)
         worker = profiles_dir / "worker"
         assert named_profile_home(worker / "logs") == worker
+
+
+@pytest.mark.parametrize("reader", ["strict", "updater"])
+def test_deleted_profile_cannot_be_read_or_recreated(profile_env, monkeypatch, reader):
+    from hermes_cli import config
+    from hermes_cli.main_install_repair import _resolve_update_branch
+    from types import SimpleNamespace
+    home = create_profile("worker", no_alias=True, no_skills=True)
+    _delete("worker")
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("updates:\n  channel: stable\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    before = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    for _ in range(2):
+        if reader == "strict":
+            with pytest.raises(FileNotFoundError, match="Named profile home does not exist"):
+                config.load_config_readonly_strict()
+        else:
+            with pytest.raises(SystemExit) as exc:
+                _resolve_update_branch(SimpleNamespace(branch=None))
+            assert exc.value.code == 1
+        assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+        assert set(p.name for p in home.iterdir()) == {"config.yaml"}
