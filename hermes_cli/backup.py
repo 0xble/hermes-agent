@@ -1405,6 +1405,19 @@ def _snapshot_recovery_state(
         checkpoint = _snapshot_recovery_paths(directory, meta, "recovery_required_dbs")
         if checkpoint is not None:
             required = checkpoint
+            # A checkpoint only discharged omissions while its captured DBs were
+            # usable. Reconstruct damaged listed payloads before trusting that
+            # discharge to prune an older recovery copy. Non-DB damage does not
+            # resurrect database obligations, nor does absence from the live home.
+            files = meta.get("files")
+            if isinstance(files, dict):
+                for rel, size in files.items():
+                    if not isinstance(rel, str) or not rel.endswith(".db"):
+                        continue
+                    candidate = {"recovery_required_dbs": [rel]}
+                    if (_snapshot_recovery_paths(directory, candidate, "recovery_required_dbs")
+                            and not _verified_snapshot_db(directory, rel, size)):
+                        required.add(rel)
             retained.add(directory)
             break
         newer.append(directory)

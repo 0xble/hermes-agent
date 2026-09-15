@@ -343,3 +343,43 @@ def test_legacy_valid_db_must_match_manifest_before_clearing_obligation(snapshot
         latest = s.capture(keep=0)
         assert set(_meta(latest)["recovery_required_dbs"]) == expected
         assert recovery.exists() is unverified
+
+
+@pytest.mark.parametrize("fully_cleared", [True, False])
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "size-mismatch"])
+@pytest.mark.parametrize("entrypoint", ["public-prune", "publication"])
+def test_damaged_clearing_checkpoint_restores_database_obligation(snapshots, damage, entrypoint, fully_cleared):
+    s = snapshots
+    _database(s.home / "state.db")
+    complete = s.capture(keep=10)
+    _database(s.home / "projects.db", "sole older recovery")
+    s.failed.add("state.db")
+    recovery = s.capture(keep=10)
+    s.failed.add("projects.db")
+    s.capture(keep=10)
+    s.failed.remove("projects.db")
+    if fully_cleared:
+        s.failed.clear()
+    cleared = s.capture(keep=10)
+    assert _meta(cleared)["recovery_required_dbs"] == ([] if fully_cleared else ["state.db"])
+    s.failed.add("state.db")
+    payload = cleared / "projects.db"
+    if damage == "missing":
+        payload.unlink()
+    elif damage == "corrupt":
+        payload.write_bytes(b"x" * payload.stat().st_size)
+    else:
+        _database(payload, large=True)
+    (s.home / "projects.db").unlink()
+    original = (cleared / "manifest.json").read_bytes()
+    if entrypoint == "public-prune":
+        s.backup.prune_quick_snapshots(keep=0, hermes_home=s.home)
+        assert recovery.exists(), "damaged checkpoint pruned the only valid database copy"
+        assert (cleared / "manifest.json").read_bytes() == original
+    for _ in range(3):
+        latest = s.capture(keep=0)
+        assert recovery.exists(), "empty inherited checkpoint pruned the only valid database copy"
+        assert set(_meta(latest)["recovery_required_dbs"]) == {"state.db", "projects.db"}
+        assert complete.exists()
+        with sqlite3.connect(recovery / "projects.db") as conn:
+            assert conn.execute("SELECT value FROM evidence").fetchall() == [("sole older recovery",)]
