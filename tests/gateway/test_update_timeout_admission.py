@@ -169,16 +169,63 @@ async def test_completed_wrapper_timeout_retains_pending_fleet_obligation(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_failed_wrapper_still_releases_update_admission(tmp_path):
-    pending(tmp_path)
-    (tmp_path / ".update_process_exit_code").write_text("7", encoding="utf-8")
-    (tmp_path / "fleet_restart_pending").write_text("unfulfilled failed update", encoding="utf-8")
-    runner = _make_runner()
+@pytest.mark.parametrize("marker_name", [".update_pending.json", ".update_pending.claimed.json"])
+@pytest.mark.parametrize("failure", ["wrapper", "receipt", "incomplete"])
+@pytest.mark.parametrize("later_success", [True, False])
+async def test_failure_retains_fleet_admission_without_replaying_notice(tmp_path, marker_name, failure, later_success):
+    data = pending(tmp_path)
+    (tmp_path / ".update_pending.json").rename(tmp_path / marker_name)
+    if failure == "wrapper":
+        (tmp_path / ".update_process_exit_code").write_text("7")
+    else:
+        receipt_path = finalize_update(tmp_path, outcome="failed" if failure == "receipt" else "success")
+        if failure == "incomplete":
+            import json
+            receipt = json.loads(receipt_path.read_text())
+            receipt["gateway_restart"]["incomplete"] = True
+            receipt_path.write_text(json.dumps(receipt))
+            (receipt_path.parent / "latest.json").write_text(json.dumps(receipt))
+    fleet = tmp_path / "fleet_restart_pending"
+    fleet.write_text("unfulfilled fleet ownership")
+    output = tmp_path / ".update_output.txt"
+    output.write_text("failed updater output\n")
     adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = _make_runner()
     runner.adapters = {Platform.TELEGRAM: adapter}
+    spawn = Mock()
     with patch("gateway.run._hermes_home", tmp_path):
-        assert await runner._send_update_notification(timed_out=True) is True
+        # Rejected delivery must not persist an ACK or release fleet admission.
+        adapter.send.side_effect = lambda chat_id, text, **kwargs: SimpleNamespace(
+            success=not text.startswith("❌ Update Failed"))
+        assert await runner._send_update_notification() is False
+        assert not read_pending(tmp_path)[1].get("final_outcome_notified")
+        assert adapter.send.call_args.args[1].startswith("❌ Update Failed")
+        rejected = adapter.send.call_args_list[-1]
+        adapter.send.side_effect = None
+        adapter.send.return_value = SimpleNamespace(success=True)
+        assert await runner._send_update_notification() is False
+        current = read_pending(tmp_path)
+        assert current is not None
+        assert request_identity(current[1]) == request_identity(data)
+        assert output.exists() and fleet.exists()
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn)["pending"]
+        spawn.assert_not_called()
+        calls = adapter.send.await_count
+        second = _make_runner()
+        second.adapters = {Platform.TELEGRAM: adapter}
+        assert await second._send_update_notification(timed_out=True) is False
+        assert adapter.send.await_count == calls
+        fleet.unlink()  # Native fleet owner resolves its obligation.
+        if later_success:
+            finalize_update(tmp_path)
+        assert await second._send_update_notification() is True
+        assert await second._send_update_notification() is False
+        assert adapter.send.await_count == calls + int(later_success)
         assert read_pending(tmp_path) is None
-        assert await runner._send_update_notification(timed_out=True) is False
+        assert not output.exists()
+        assert launch_native_update(home=tmp_path, hermes_cmd=["hermes"], pending={"reason": "new"}, spawn=spawn)["started"]
     messages = [call.args[1] for call in adapter.send.call_args_list]
-    assert sum("updater exited with code 7" in text for text in messages) == 1
+    messages.remove(rejected.args[1])
+    assert sum(text.startswith("❌ Update Failed") for text in messages) == 1
+    assert sum(text.startswith("✅") for text in messages) == int(later_success)
+    assert sum("failed updater output" in text for text in messages) == 1

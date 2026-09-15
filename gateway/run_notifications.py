@@ -750,10 +750,10 @@ class GatewayNotificationsMixin:
             _, pending = current
             request = request_identity(pending)
             outcome = final_outcome(paths.pending.parent, pending)
-            unresolved = outcome is None and (
-                not process_completed(paths.pending.parent, pending)
-                or (paths.pending.parent / "fleet_restart_pending").exists()
+            unresolved = (paths.pending.parent / "fleet_restart_pending").exists() or (
+                outcome is None and not process_completed(paths.pending.parent, pending)
             )
+            known_outcome = outcome is not None
             if outcome is None:
                 if not timed_out:
                     return False
@@ -776,18 +776,24 @@ class GatewayNotificationsMixin:
                 return False
             _, pending = current
             heading = "✅ Update Complete" if success else "❌ Update Failed"
-            result = await target.send(notice(heading, pending, detail))
-            if _send_failed(result):
-                return False
+            delivered_outcome = [success, detail]
+            if not known_outcome or pending.get("final_outcome_notified") != delivered_outcome:
+                result = await target.send(notice(heading, pending, detail))
+                if _send_failed(result):
+                    return False
             current = read_pending(paths.pending.parent)
             if current is None or request_identity(current[1]) != request:
                 return False
             if unresolved:
                 # The bounded watcher may stop, but updater/fleet finalization still
-                # owns admission and every update file. Persist only the notice ACK so
+                # owns admission and every update file, even after a known failure.
+                # Persist only the delivered outcome/timeout ACK so
                 # restart recovery neither replays it nor mistakes it for completion.
                 marker, pending = current
-                pending["timeout_notified"] = True
+                if known_outcome:
+                    pending["final_outcome_notified"] = delivered_outcome
+                else:
+                    pending["timeout_notified"] = True
                 save_pending(marker, pending)
                 return False
             self._clear_update_markers(paths, target.session_key)

@@ -24,7 +24,7 @@ def read_pending(home: Path) -> tuple[Path, dict] | None:
 
 def request_identity(pending: dict) -> str:
     """Stable across pending-to-claimed moves and delivery checkpoints."""
-    progress = {"output_offset", "output_batch", "updating_notified", "restarting_notified", "timeout_notified"}
+    progress = {"output_offset", "output_batch", "updating_notified", "restarting_notified", "timeout_notified", "final_outcome_notified"}
     request = {key: value for key, value in pending.items() if key not in progress}
     return hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
 
