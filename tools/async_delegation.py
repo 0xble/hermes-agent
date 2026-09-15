@@ -395,7 +395,7 @@ def _prune_durable_records() -> None:
         conn.execute("BEGIN IMMEDIATE")
         exhausted = conn.execute("""SELECT delegation_id, task_json, result_json, event_json, state,
                         parent_task_id, thread_number, task_label, owner_json
-               FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled','unknown')
+               FROM async_delegations WHERE state IN ('completed','error','failed','stalled','interrupted','cancelled','unknown','budget_exhausted')
                  AND delivery_state='pending_recovery' AND delivery_claim IS NULL
                  AND delivery_attempts>=? AND delivery_recovery_attempts>=?""",
             (_MAX_DELIVERY_ATTEMPTS, _MAX_DELIVERY_RECOVERIES)).fetchall()

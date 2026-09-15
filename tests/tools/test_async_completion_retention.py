@@ -8,11 +8,11 @@ import pytest
 from tools import async_delegation as ad
 
 
-def exhausted(uid, now, metadata=None):
+def exhausted(uid, now, metadata=None, status="completed"):
     ad._persist_dispatch({'delegation_id': uid, 'session_key': 'unavailable',
                           'dispatched_at': now, **({'delegation_metadata': metadata} if metadata else {})})
     ad._persist_completion({'type': 'async_delegation', 'delegation_id': uid,
-                           'status': 'completed', 'summary': uid, 'completed_at': now},
+                           'status': status, 'summary': uid, 'completed_at': now},
                           {'summary': uid})
     for cycle in range(ad._MAX_DELIVERY_RECOVERIES + 1):
         if cycle:
@@ -23,8 +23,9 @@ def exhausted(uid, now, metadata=None):
             assert ad.release_completion_delivery(uid, claim)
 
 
+@pytest.mark.parametrize('status', ['completed', 'budget_exhausted'])
 @pytest.mark.parametrize('pruning', ['age', 'capacity'])
-def test_exhausted_unlabelled_completion_history_is_bounded(tmp_path, monkeypatch, pruning):
+def test_exhausted_unlabelled_completion_history_is_bounded(tmp_path, monkeypatch, pruning, status):
     monkeypatch.setattr(ad, '_db_path', lambda: tmp_path / 'async.db')
     monkeypatch.setattr(ad, '_MAX_DELIVERY_ATTEMPTS', 1)
     monkeypatch.setattr(ad, '_MAX_RETAINED_COMPLETED', 2)
@@ -32,7 +33,7 @@ def test_exhausted_unlabelled_completion_history_is_bounded(tmp_path, monkeypatc
     monkeypatch.setattr(ad.time, 'time', lambda: clock[0])
     for i in range(4):
         clock[0] += 1
-        exhausted(f'legacy-{i}', clock[0])
+        exhausted(f'legacy-{i}', clock[0], status=status)
     assert ad.retry_exhausted_completions() == []
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
     if pruning == 'age':
@@ -47,12 +48,13 @@ def test_exhausted_unlabelled_completion_history_is_bounded(tmp_path, monkeypatc
         assert {uid for uid, _ in rows} == {'legacy-2', 'legacy-3'}
 
 
+@pytest.mark.parametrize('status', ['completed', 'budget_exhausted'])
 @pytest.mark.parametrize('protection', [
     'retained_card', 'owner_projection', 'label_projection', 'event_owner', 'result_label',
     'malformed_task', 'malformed_result', 'malformed_event', 'unknown_metadata',
     'running', 'finalizing', 'stalling', 'unknown_state', 'live_claim', 'unused_recovery', 'unused_attempts',
 ])
-def test_exhaustion_pruning_preserves_uncertain_or_recoverable_work(tmp_path, monkeypatch, protection):
+def test_exhaustion_pruning_preserves_uncertain_or_recoverable_work(tmp_path, monkeypatch, protection, status):
     monkeypatch.setattr(ad, '_db_path', lambda: tmp_path / 'async.db')
     monkeypatch.setattr(ad, '_MAX_DELIVERY_ATTEMPTS', 1)
     monkeypatch.setattr(ad, '_MAX_RETAINED_COMPLETED', 0)
@@ -62,7 +64,7 @@ def test_exhaustion_pruning_preserves_uncertain_or_recoverable_work(tmp_path, mo
                 'threads': [{'thread_ref': 'A', 'task_label': 'Task A'}]} if protection == 'retained_card' else None
     if metadata:
         metadata['owner_json'] = json.dumps(metadata['owner'], sort_keys=True, separators=(',', ':'))
-    exhausted('protected', clock[0], metadata)
+    exhausted('protected', clock[0], metadata, status=status)
     changes = {
         'owner_projection': ('owner_json', '{"session_id":"parent"}'),
         'label_projection': ('task_label', 'Task A'),
