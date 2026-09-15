@@ -128,7 +128,10 @@ def test_paused_manual_deferral_preserves_schedule(tmp_path, monkeypatch, schedu
         assert final["state"] == "scheduled"
 
 
-@pytest.mark.parametrize("schedule,manual", [("every 1h", True), ("every 1h", False), ("0 21 * * *", False), ("1m", False)])
+@pytest.mark.parametrize("schedule,manual", [
+    ("every 1h", True), ("every 1h", False), ("0 21 * * *", False),
+    ("1m", False), ("in 1m", False),
+])
 def test_deferred_attempt_retries_with_fresh_identity(tmp_path, monkeypatch, schedule, manual):
     from cron import executions, jobs, scheduler
     from cron.occurrences import completed_occurrence
@@ -287,7 +290,8 @@ def test_deferral_fences_and_nondeferral_paths(tmp_path, monkeypatch, case):
 
 
 @pytest.mark.parametrize("lost_ownership", ["fire", "ledger-owner", "ledger-missing"])
-def test_scheduler_reports_refused_deferral_without_accounting(tmp_path, monkeypatch, lost_ownership):
+@pytest.mark.parametrize("schedule", ["1m", "in 1m"])
+def test_scheduler_reports_refused_deferral_without_accounting(tmp_path, monkeypatch, lost_ownership, schedule):
     from cron import executions, jobs, scheduler
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -299,7 +303,7 @@ def test_scheduler_reports_refused_deferral_without_accounting(tmp_path, monkeyp
     monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda job: False)
     monkeypatch.setattr(scheduler, "_open_cron_session_db", lambda *a: pytest.fail("agent reached"))
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: pytest.fail("ordinary accounting reached"))
-    job = jobs.create_job(prompt="Pending maintenance", schedule="1m", script="gate.py", deliver="local")
+    job = jobs.create_job(prompt="Pending maintenance", schedule=schedule, script="gate.py", deliver="local")
     claimed = jobs.claim_job_for_fire(job["id"], force=True, return_job=True)
     assert isinstance(claimed, dict)
     finish = scheduler.finish_deferred_run
