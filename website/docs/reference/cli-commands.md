@@ -1840,11 +1840,15 @@ stored pool rows without auto-import, refresh, repair, or persistence. Without
 other providers explicitly return `unsupported`.
 
 `--verify` refreshes through the native credential-owner locking path, reads back
-the selected persisted token pair, then probes that account's quota. It never
-refreshes all accounts. A successful refresh may adopt a peer's rotation and does
-not by itself establish quota availability or successful model inference.
+the selected persisted token pair, then probes that same credential's quota. It
+never refreshes all accounts or changes the selected credential ID. The native
+owner may satisfy the refresh from already-rotated peer token material, so this
+does not prove a new provider POST occurred; persisted readback plus the quota
+probe, not token novelty, is the verification basis. It does not establish
+successful model inference.
 
-JSON uses `schema_version: 1`, separate `cached` and `quota` objects, observation
+JSON uses `schema_version: 1` and an explicit `mode` (`cached`, `live`, `refresh`,
+or `refresh_verified`), with separate `cached` and `quota` objects, observation
 and reset timestamps, and outcomes such as `available`, `exhausted`, `unknown`,
 `refreshed_available`, `refreshed_exhausted`, `refreshed_unknown`, and
 `reauth_required`. A rejected access token alone never establishes reauth.

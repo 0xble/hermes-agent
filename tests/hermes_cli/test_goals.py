@@ -64,15 +64,15 @@ class TestParseJudgeResponse:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# judge_goal — fail-open semantics
+# judge_goal — failure is reported separately; lifecycle callers fail closed
 # ──────────────────────────────────────────────────────────────────────
 
 
 class TestJudgeGoal:
 
 
-    def test_api_error_continues(self):
-        """Judge exception → fail-open continue (don't wedge progress on judge bugs)."""
+    def test_api_error_is_reported_for_lifecycle_to_fail_closed(self):
+        """The low-level tuple preserves transport failure for the manager."""
         from hermes_cli import goals
 
         with patch(
@@ -188,35 +188,56 @@ class TestJudgeParseFailureAutoPause:
         assert parse_failed is False
         assert transport_failed is True
 
-
-    def test_auto_pause_after_three_consecutive_parse_failures(self, hermes_home):
-        """N=3 consecutive parse failures → auto-pause with config pointer."""
+    def test_transport_failure_pauses_before_continuation(self, hermes_home):
         from hermes_cli import goals
-        from hermes_cli.goals import GoalManager, DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
+        from hermes_cli.goals import GoalManager
 
-        assert DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES == 3
+        mgr = GoalManager(session_id="transport-fail-sid", default_max_turns=20)
+        mgr.set("do a thing")
+        with patch.object(
+            goals, "judge_goal", return_value=("continue", "judge error: RuntimeError", False, None, True)
+        ):
+            decision = mgr.evaluate_after_turn("step 1")
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert "judge API" in decision["message"]
+        assert mgr.state is not None
+        assert mgr.state.turns_used == 1
+
+    def test_parse_failure_pauses_before_continuation(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="parse-fail-sid", default_max_turns=20)
+        mgr.set("do a thing")
+        with patch.object(
+            goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None, False)
+        ):
+            decision = mgr.evaluate_after_turn("step 1")
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert "unparseable" in decision["message"]
+        assert mgr.state is not None
+        assert mgr.state.turns_used == 1
+
+
+    def test_parse_failure_pauses_immediately(self, hermes_home):
+        """Unusable judge output cannot authorize another autonomous turn."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
         mgr = GoalManager(session_id="parse-fail-sid-1", default_max_turns=20)
         mgr.set("do a thing")
 
         with patch.object(
             goals, "judge_goal", return_value=("continue", "judge returned empty response", True, None, False)
         ):
-            d1 = mgr.evaluate_after_turn("step 1")
-            assert d1["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 1
-
-            d2 = mgr.evaluate_after_turn("step 2")
-            assert d2["should_continue"] is True
-            assert mgr.state.consecutive_parse_failures == 2
-
-            d3 = mgr.evaluate_after_turn("step 3")
-            assert d3["should_continue"] is False
-            assert d3["status"] == "paused"
-            assert mgr.state.consecutive_parse_failures == 3
-            # Message points at the config surface so the user can fix it.
-            assert "auxiliary" in d3["message"]
-            assert "goal_judge" in d3["message"]
-            assert "config.yaml" in d3["message"]
+            decision = mgr.evaluate_after_turn("step 1")
+        assert decision["should_continue"] is False
+        assert decision["status"] == "paused"
+        assert mgr.state is not None
+        assert mgr.state.consecutive_parse_failures == 1
+        assert "goal_judge" in decision["message"]
 
 
 

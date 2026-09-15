@@ -227,6 +227,7 @@ def run_status(args):
     index, entry = _selected(args)
     report = {
         "provider": args.provider,
+        "mode": "live" if getattr(args, "live", False) else "cached",
         "credential": _view(index, entry),
         "cached": _cached(entry),
         "outcome": "not_probed",
@@ -259,7 +260,11 @@ def _refresh_selected(provider, credential_id):
 
 def run_refresh(args):
     index, chosen = _selected(args)
-    report = {"provider": args.provider, "credential": _view(index, chosen)}
+    report = {
+        "provider": args.provider,
+        "mode": "refresh_verified" if getattr(args, "verify", False) else "refresh",
+        "credential": _view(index, chosen),
+    }
     if (
         args.provider not in REFRESHABLE_OAUTH_PROVIDERS
         or chosen.auth_type != AUTH_TYPE_OAUTH

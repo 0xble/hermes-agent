@@ -846,9 +846,11 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
-    """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
+    """Parse the judge's reply without granting continuation on unusable output.
 
-    ``parse_failed`` flags non-JSON output so callers can auto-pause after N in a row.
+    Returns ``(verdict, reason, parse_failed, wait_directive)``. ``parse_failed``
+    is retained separately so callers can preserve the four model verdicts while
+    fail-closing the lifecycle when the judge cannot supply one.
     ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` for a ``wait``
     verdict; a wait with no target is downgraded to ``continue``. Accepts ``{"verdict": ...}`` and
     the legacy ``{"done": <bool>}`` shape.
@@ -953,8 +955,9 @@ def judge_goal(
     """Ask the auxiliary model whether the goal is satisfied.
 
     Returns ``(verdict, reason, parse_failed, wait_directive, transport_failed)``; verdict is done /
-    blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
-    set ``transport_failed`` instead and fail-open to ``continue``.
+    blocked / continue / wait / skipped. ``parse_failed`` means unusable output and
+    ``transport_failed`` means the judge could not be called; the lifecycle pauses
+    before continuation in either case.
     """
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
@@ -1558,6 +1561,18 @@ class GoalManager:
         state.consecutive_parse_failures = state.consecutive_parse_failures + 1 if parse_failed else 0
         state.consecutive_transport_failures = state.consecutive_transport_failures + 1 if transport_failed else 0
 
+        # A judge failure is not evidence that the goal remains actionable. Keep
+        # the four-verdict contract, but park immediately until the judge can be
+        # reconciled; otherwise repeated transport/parse failures could consume
+        # turns and trigger unauthorized-looking autonomous work.
+        if transport_failed or parse_failed:
+            failure_kind = "judge API returned an error" if transport_failed else "judge returned unparseable output"
+            return self._pause_decision(
+                f"{failure_kind}; no verified verdict available",
+                "continue", reason,
+                f"⏸ Goal paused — {failure_kind}. Reconcile the goal_judge provider/configuration before resuming.",
+            )
+
         if verdict == "wait" and wait_directive:
             return self._apply_wait_directive(wait_directive, reason)
 
@@ -1575,24 +1590,6 @@ class GoalManager:
             state.status = "done"
             self._save()
             return _decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
-
-        # Persistent judge failures (API unreachable / unparseable output) auto-pause and point at the
-        # goal_judge config so a broken judge can't burn the whole turn budget.
-        n_tx, n_parse = state.consecutive_transport_failures, state.consecutive_parse_failures
-        if n_tx >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
-            return self._pause_decision(
-                f"judge API unreachable {n_tx} turns in a row (check auxiliary.goal_judge provider/key in config.yaml)",
-                "continue", reason,
-                f"⏸ Goal paused — judge API returned errors ({n_tx} turns). Check the goal_judge provider/key in "
-                + _JUDGE_CONFIG_HINT.format(provider="deepseek", model="deepseek-v4-flash"),
-            )
-        if n_parse >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
-            return self._pause_decision(
-                f"judge model returned unparseable output {n_parse} turns in a row", "continue", reason,
-                f"⏸ Goal paused — the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
-                "Route the judge to a stricter model in "
-                + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
-            )
 
         if state.turns_used >= state.max_turns:
             return self._budget_pause(state, "continue", reason)

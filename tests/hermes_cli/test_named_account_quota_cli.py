@@ -120,6 +120,7 @@ def test_status_is_readonly(monkeypatch, tmp_path, capsys):
         r["credential"]["id"] == "chosen"
         and r["cached"]["status"] == "exhausted"
         and r["outcome"] == "available"
+        and r["mode"] == "live"
     )
     assert p.read_bytes() == before
 
@@ -140,7 +141,9 @@ def test_cached_no_probe(monkeypatch, tmp_path, capsys):
         "agent.account_usage._get_json", lambda *a, **k: pytest.fail("must not request")
     )
     run_status(args(live=False))
-    assert json.loads(capsys.readouterr().out)["outcome"] == "not_probed"
+    report = json.loads(capsys.readouterr().out)
+    assert report["outcome"] == "not_probed"
+    assert report["mode"] == "cached"
 
 
 def test_refresh_readback(monkeypatch, tmp_path, capsys):
@@ -165,6 +168,7 @@ def test_refresh_readback(monkeypatch, tmp_path, capsys):
     run_refresh(args())
     r = json.loads(capsys.readouterr().out)
     assert r["outcome"] == "refreshed_available" and "rotated" not in json.dumps(r)
+    assert r["mode"] == "refresh_verified"
 
 
 def test_none_not_reauth(monkeypatch, tmp_path, capsys):
