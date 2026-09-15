@@ -19,6 +19,8 @@ its examples in `tests/agent/test_title_generator.py`.
 
 - Native turn-start titling includes the current user row. The opening turn may create a derived title and one auxiliary worker. A later native turn has two user rows, so neither the historical `> 1` guard nor the present guard provides a second-exchange retry. Explicit derived-title upgrades remain available through the dedicated title API.
 
+Optional title-route telemetry callbacks are isolated from title generation. A callback exception preserves the validated title and does not call the generation failure callback. `tests/agent/test_title_generator.py` covers a raising callback alongside ordinary route reporting. This preserves the existing native title-history contract.
+
 ## Maintained patch index
 
 | ID | Status |
