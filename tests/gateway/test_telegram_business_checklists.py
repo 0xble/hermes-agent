@@ -295,6 +295,33 @@ async def test_checklist_reconnect_keeps_profile_arguments_and_failure_contract(
         assert wire["checklist"].others_can_mark_tasks_as_done is True
 
 
+@pytest.mark.asyncio
+async def test_checklist_edits_obey_configured_edit_interval(monkeypatch):
+    _install_checklist_types(monkeypatch)
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token", extra={
+        "edit_min_interval_seconds": 30, "send_cooldown_max_wait_seconds": 60,
+    }))
+    now = [100.0]
+    attempts = []
+    monkeypatch.setattr(telegram_adapter, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    async def sleep(delay):
+        now[0] += delay
+
+    async def edit(**kwargs):
+        attempts.append(now[0])
+        assert "_edit" not in kwargs
+        return SimpleNamespace(message_id=77)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    adapter._bot = SimpleNamespace(edit_message_checklist=AsyncMock(side_effect=edit))
+    for title in ["First", "Updated"]:
+        result = await adapter.edit_checklist(
+            "123", "77", title, [{"id": 1, "text": "Venue"}], business_connection_id="biz-A")
+        assert result.success
+    assert attempts == [100.0, 130.0]
+
+
 def test_send_checklist_requires_connection_and_builds_typed_payload(monkeypatch):
     adapter = _adapter()
     checklist_payload = SimpleNamespace(

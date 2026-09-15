@@ -2015,7 +2015,7 @@ class TelegramAdapter(BasePlatformAdapter):
             message = await self._run_send_call(
                 chat_id, self._bot.edit_message_checklist, business_connection_id=connection_id,
                 chat_id=normalize_telegram_chat_id(chat_id), message_id=normalized_message_id,
-                checklist=checklist)
+                checklist=checklist, _edit=True)
         except _TelegramSendCooldownExceeded as error:
             return self._send_cooldown_failure(error)
         except Exception as error:
