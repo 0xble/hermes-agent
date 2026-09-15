@@ -118,3 +118,66 @@ def decision_is_current(decision: dict) -> bool:
                 and goals.get_goal_control_revision(sid) == authority.get("revision"))
     except Exception:
         return False
+
+
+def claim_transition_notice(manager: goals.GoalManager, decision: dict) -> bool:
+    """Claim once without restoring a goal superseded by a concurrent control."""
+    db = goals._get_session_db()
+    if db is None:
+        return False
+    key = goals._meta_key(manager.session_id)
+    revision_key = goals._goal_control_revision_key(manager.session_id)
+    cache_key = goals._goal_control_cache_key(manager.session_id)
+    try:
+        baseline = db.get_meta_values([key, revision_key])
+        raw = baseline[key]
+        revision = int(baseline[revision_key] or 0)
+        state = goals.GoalState.from_json(raw) if raw else None
+        if state is None or state.status == "cleared":
+            return False
+        authority = decision.get("_goal_authority")
+        if authority is not None and (
+            authority.get("session_id") != manager.session_id
+            or authority.get("revision") != revision
+            or authority.get("state_token") != state_token(raw)
+        ):
+            return False
+        notice_key = _transition_notice_key(state, decision)
+        if not notice_key or state.last_notice_key == notice_key:
+            return False
+        state.last_notice_key = notice_key
+        manager._touch_state(state)
+        # Do not take the control lock inside the database transaction: controls
+        # take these locks in the opposite order. Failed revision persistence
+        # must still invalidate authority in the current process.
+        return db.compare_and_set_meta(
+            baseline, {key: state.to_json()},
+            is_current=lambda: goals._MODEL_GOAL_CONTROL_REVISIONS.get(cache_key, revision) == revision,
+        )
+    except Exception as exc:
+        goals.logger.warning("Goal notice claim unavailable: %s", type(exc).__name__)
+        return False
+    finally:
+        # Never replace local controls with the detached notice snapshot.
+        manager.refresh()
+
+
+def _transition_notice_key(state: goals.GoalState, decision: dict) -> str:
+    transition = str(decision.get("transition") or "")
+    if not transition:
+        if decision.get("verdict") == "done":
+            transition = "done"
+        elif decision.get("verdict") == "blocked":
+            transition = "blocked"
+        elif decision.get("verdict") == "gate_failed":
+            transition = "gate_failed"
+        elif decision.get("status") == "paused":
+            transition = "paused"
+    if not transition:
+        return ""
+    if transition == "waiting":
+        target = state.waiting_on_delegation or state.waiting_on_session or state.waiting_on_pid or state.waiting_until
+        key = f"waiting:{target}:{state.waiting_since}"
+    else:
+        key = f"{transition}:{decision.get('reason') or ''}"
+    return key

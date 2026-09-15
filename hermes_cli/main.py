@@ -2222,6 +2222,10 @@ def _finalize_update_receipt(code: int, reason: str) -> None:
 
 def _update_preflight_handled(args) -> bool:
     """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
+    if getattr(args, "revision", None) is not None and getattr(args, "check", False):
+        print("--revision cannot be combined with --check. "
+              "Use --check with a branch, or omit --check to apply the exact revision.")
+        sys.exit(2)
     from hermes_cli.config import is_managed, managed_error
 
     if is_managed():

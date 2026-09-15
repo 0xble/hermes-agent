@@ -293,6 +293,7 @@ after checkout. Existing incompatible branches and tags remain refused. Real Git
 - **Upstream tracking:** The inspected upstream-derived updater lacks an immutable revision option. Searches for update revision and exact-commit updates found no direct equivalent on 2026-09-06.
 - **Upstream PR:** None after checked 2026-09-06. No upstream PR has been opened.
 - **Regression:** `tests/hermes_cli/test_update_revision.py` covers real Git preparation, rollback references, drift rejection and immutable retry behavior.
+- **Check boundary:** `--revision --check` is rejected before branch resolution or update effects because branch availability cannot answer an exact-revision check. `tests/hermes_cli/test_update_channel_errors.py` covers parsed CLI and direct dispatch. Retire this refusal only when an exact-revision check is implemented and verified. Related open upstream [PR #97056](https://github.com/NousResearch/hermes-agent/pull/97056) independently rejects `--check --commit`; its broader feature is not adopted here.
 - **Published commit identity:** Stable subject `feat(update): bind promotion to an immutable revision`.
 - **Rollback:** Revert that subject. Retained Git references restore source only, not dependencies or user state. Runtime recovery retains its separate snapshot and health requirements.
 - **Retirement:** Remove this extension when released upstream proves equivalent immutable preparation, retry and verification behavior.

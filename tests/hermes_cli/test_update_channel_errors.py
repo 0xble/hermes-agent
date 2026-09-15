@@ -112,3 +112,27 @@ def test_image_package_refusal_precedes_invalid_channel(monkeypatch, code):
     with pytest.raises(SystemExit) as exc:
         main.cmd_update(SimpleNamespace(branch=None, revision=None, check=True))
     assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("parsed", [True, False])
+def test_revision_check_refuses_before_channel_or_update_effects(monkeypatch, capsys, parsed):
+    import argparse
+    from hermes_cli.subcommands.update import build_update_parser
+    if parsed:
+        parser = argparse.ArgumentParser()
+        build_update_parser(parser.add_subparsers(), cmd_update=main.cmd_update)
+        args = parser.parse_args(["update", "--revision", "a" * 40, "--check"])
+    else:
+        args = SimpleNamespace(revision="a" * 40, check=True)
+    effects = Mock(side_effect=AssertionError("must refuse before update effects"))
+    monkeypatch.setattr(main, "_resolve_update_branch", effects)
+    monkeypatch.setattr(main, "_install_hangup_protection", effects)
+    monkeypatch.setattr(update_cmd, "_cmd_update_check", effects)
+    monkeypatch.setattr(config, "is_managed", lambda: False)
+    from hermes_cli import update_contract
+    monkeypatch.setattr(update_contract, "evaluate_update_admission", effects)
+    with pytest.raises(SystemExit) as error:
+        main.cmd_update(args)
+    assert error.value.code == 2
+    assert "--revision cannot be combined with --check" in capsys.readouterr().out
+    effects.assert_not_called()

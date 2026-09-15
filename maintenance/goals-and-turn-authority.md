@@ -11,6 +11,16 @@ so concurrent processes cannot publish the same revision and preserve older
 turn authority. This fixes revision allocation, not serialization of the whole
 goal activation transaction. Focused regressions cover this boundary.
 
+Transition-notice claims also compare the complete stored goal and control
+revision before writing a detached snapshot. A concurrent pause, clear, duplicate
+claim or locally revoked revision wins, and storage failure never reports a
+successful claim. Supplied decision authority must match the captured state.
+`tests/hermes_cli/test_goal_notice_fence.py` exercises these interleavings against
+real SQLite, alongside the existing notice deduplication and evaluation suites.
+This is a fork-only repair of the existing notice/authority contract, without
+new commands, state fields or migration. Retire with an equivalent upstream
+claim fence, or revert the scoped repair while preserving user goal records.
+
 ## Goal instruction contract — active
 
 - **Contract and provenance:** User-approved rewrite of fork-owned autonomous goal controls, based on `3ea56599d0bd6e6ab193c77b3fc9ceb39de45a35`. The exposed schema still permitted clearing “completed” tracking and the guide conflated success with stop conditions. Align the tool description, progressive guide, parameter help, continuation and evaluator/drafter prompts: clear is removal, never completion; preserve every user obligation, evidence, limits and user stop while managing routine tracking autonomously. Stable subject: `fix(goals): separate tracking removal from verified completion`.

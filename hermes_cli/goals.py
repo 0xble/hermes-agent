@@ -2080,31 +2080,8 @@ class GoalManager:
 
     def claim_transition_notice(self, decision: Dict[str, Any]) -> bool:
         """Persistently claim a meaningful transition notice; routine continue is silent."""
-        state = self.refresh()
-        if state is None:
-            return False
-        transition = str(decision.get("transition") or "")
-        if not transition:
-            if decision.get("verdict") == "done":
-                transition = "done"
-            elif decision.get("verdict") == "blocked":
-                transition = "blocked"
-            elif decision.get("verdict") == "gate_failed":
-                transition = "gate_failed"
-            elif decision.get("status") == "paused":
-                transition = "paused"
-        if not transition:
-            return False
-        if transition == "waiting":
-            target = state.waiting_on_delegation or state.waiting_on_session or state.waiting_on_pid or state.waiting_until
-            key = f"waiting:{target}:{state.waiting_since}"
-        else:
-            key = f"{transition}:{decision.get('reason') or ''}"
-        if state.last_notice_key == key:
-            return False
-        state.last_notice_key = key
-        self._save()
-        return True
+        from hermes_cli.goals_evaluation import claim_transition_notice
+        return claim_transition_notice(self, decision)
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         budget_cause = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
