@@ -76,6 +76,8 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         serialised = _serialise_value(value)
         if serialised is None:
             return False
+        if extra.get("session_id") and isinstance(serialised, dict):
+            serialised.setdefault("session_id", extra.pop("session_id"))
         _write_payload(flush_dir, {"session_key": session_key, **extra, "data": serialised})
         return True
     except Exception as exc:
@@ -83,20 +85,25 @@ def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **ext
         return False
 
 
-def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown") -> int:
+def flush_pending_to_file(pending: Dict[str, Any], *, reason: str = "shutdown",
+                          session_ids: Optional[Dict[str, str]] = None) -> int:
     """Serialise non-empty ``_pending_messages`` slots (``MessageEvent`` or str); return count."""
     if not pending:
         return 0
     flush_dir, ts, flushed = _get_flush_dir(), int(time.time()), 0
     for session_key, value in list(pending.items()):
         if value is not None:
-            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts)
+            session_id = (session_ids or {}).get(session_key)
+            flushed += _flush_value(flush_dir, "pending", session_key, value, reason=reason, ts=ts,
+                                    session_id=session_id) if session_id else _flush_value(
+                                        flush_dir, "pending", session_key, value, reason=reason, ts=ts)
     if flushed:
         logger.info("Flushed %d pending message(s) to %s (reason=%s)", flushed, flush_dir, reason)
     return flushed
 
 
-def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown") -> int:
+def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str = "shutdown",
+                           session_ids: Optional[Dict[str, str]] = None) -> int:
     """Serialise the FIFO overflow tails (``queued_events``) to disk; return events flushed.
 
     The adapter slot holds the queue head and ``SessionState.conversation.queued_events`` the
@@ -111,8 +118,11 @@ def flush_overflow_to_file(overflow_by_session: Dict[str, Any], *, reason: str =
             continue
         for seq, value in enumerate(list(events)):
             if value is not None:
-                flushed += _flush_value(flush_dir, "overflow", session_key, value, reason=reason,
-                                        ts=ts, seq=seq)
+                session_id = (session_ids or {}).get(session_key)
+                extra = {"reason": reason, "ts": ts, "seq": seq}
+                if session_id:
+                    extra["session_id"] = session_id
+                flushed += _flush_value(flush_dir, "overflow", session_key, value, **extra)
     if flushed:
         logger.info("Flushed %d queued overflow message(s) to %s (reason=%s)", flushed, flush_dir,
                     reason)

@@ -38,8 +38,17 @@ def test_flush_writes_string_pending_to_file(tmp_path, monkeypatch):
     assert payload["session_key"] == "agent:main:telegram:supergroup:123"
     assert payload["reason"] == "shutdown"
     assert payload["data"]["text"] == "hello world"
+    assert "session_id" not in payload["data"]
     assert ":" not in files[0].name
     assert "telegram" not in files[0].name
+
+
+def test_flush_writes_runner_session_id_into_payload(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    assert flush_pending_to_file({"key": "hello"}, session_ids={"key": "sid-1"}) == 1
+    payload = json.loads(next(flush_dir.glob("*.json")).read_text())
+    assert payload["data"]["session_id"] == "sid-1"
 
 
 def test_flush_skips_durable_internal_delegation_event(tmp_path, monkeypatch):
@@ -250,3 +259,13 @@ def test_flushed_overflow_is_replayed_by_recover_pending_to_db(tmp_path, monkeyp
 def test_flush_overflow_noop_on_empty():
     assert flush_overflow_to_file({}) == 0
     assert flush_overflow_to_file({"k": []}) == 0
+
+
+def test_flush_overflow_writes_runner_session_id(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    event = _overflow_event("hello")
+    event.session_id = None
+    assert flush_overflow_to_file({"key": [event]}, session_ids={"key": "sid-2"}) == 1
+    payload = json.loads(next(flush_dir.glob("*.json")).read_text())
+    assert payload["data"]["session_id"] == "sid-2"
