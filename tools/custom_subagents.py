@@ -478,7 +478,7 @@ def freeze_fallback_routes(
 def _freeze_fallback_runtime(runtime, route, label):
     provider = str(runtime.get("provider") or route.provider).strip()
     model = str(runtime.get("model") or route.model).strip()
-    base_url = str(runtime.get("base_url") or "").rstrip("/")
+    base_url = str(runtime.get("base_url") or "")
     api_mode = str(runtime.get("api_mode") or "").strip()
     api_key = runtime.get("api_key")
     if not provider or not model or not base_url or not api_mode or not api_key:

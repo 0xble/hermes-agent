@@ -62,3 +62,21 @@ def test_preflight_checks_resolved_fallback_identities(routes_home, source, coll
             ("custom", "shared", "https://first.invalid/v1"),
             ("custom", "other", "https://second.invalid/v1")]
         assert [r.api_key for r in routes] == ["fixture-first-key", "fixture-second-key"]
+
+
+@pytest.mark.parametrize("url", [
+    "https://gateway.invalid/v1?credential=abc/",
+    "https://gateway.invalid/v1?credential=abc//#fragment/",
+    "https://gateway.invalid/api/secret/v1/",
+])
+def test_freezing_preserves_complete_runtime_url_authority(url):
+    from tools.custom_subagents import route_url_authority_fingerprint
+
+    runtime = {"provider": "custom", "model": "fixture", "base_url": url,
+               "api_mode": "chat_completions", "api_key": "fixture-key"}
+    route = _freeze_fallback_runtime(runtime, FallbackDefinition("custom:fixture", "fixture"), "fixture")
+    assert route.base_url == url
+    assert route.native_entry()["base_url"] == url
+    assert route.metadata()["base_url_authority_fingerprint"] == route_url_authority_fingerprint(url)
+    if "?" in url and "#" not in url:
+        assert route_url_authority_fingerprint(route.base_url) != route_url_authority_fingerprint(url.rstrip("/"))
