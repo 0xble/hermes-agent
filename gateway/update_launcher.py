@@ -108,7 +108,7 @@ def scope_launch_handshake(home: Path) -> tuple[Path, str] | None:
     from gateway.update_notifications import request_identity
 
     try:
-        pending = json.loads((home / ".update_pending.json").read_text())
+        pending = json.loads((home / ".update_pending.json").read_text(encoding="utf-8"))
         launch_id = pending["launch_id"]
         if not isinstance(launch_id, str) or uuid.UUID(hex=launch_id).hex != launch_id:
             return None
@@ -130,7 +130,7 @@ def observe_scope_launch(process, home: Path, entered: Path, identity: str, *, p
 
     try:
         while True:
-            current = json.loads((home / ".update_pending.json").read_text())
+            current = json.loads((home / ".update_pending.json").read_text(encoding="utf-8"))
             if request_identity(current) != identity:
                 return
             try:
@@ -148,7 +148,7 @@ def observe_scope_launch(process, home: Path, entered: Path, identity: str, *, p
                 return
             except FileNotFoundError:
                 pass
-            with (home / ".update_admission.lock").open("a+") as lock:
+            with (home / ".update_admission.lock").open("a+", encoding="utf-8") as lock:
                 if not _try_acquire_file_lock(lock):
                     time.sleep(poll_interval)
                     continue
@@ -158,12 +158,12 @@ def observe_scope_launch(process, home: Path, entered: Path, identity: str, *, p
                         return
                     except FileNotFoundError:
                         pass
-                    pending = json.loads((home / ".update_pending.json").read_text())
+                    pending = json.loads((home / ".update_pending.json").read_text(encoding="utf-8"))
                     if (pending.get("launch_id") != entered.name.removeprefix(".update_scope_entered-")
                             or request_identity(pending) != identity):
                         return
                     # The notifier owns delivery and release. Never unlink admission.
-                    with (home / ".update_process_exit_code").open("x") as receipt:
+                    with (home / ".update_process_exit_code").open("x", encoding="utf-8") as receipt:
                         receipt.write(str(code or 125))
                         receipt.flush()
                         os.fsync(receipt.fileno())
