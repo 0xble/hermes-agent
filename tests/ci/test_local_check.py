@@ -296,7 +296,13 @@ def test_type_change_selects_python_and_reaches_compile(git_repo):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
-@pytest.mark.parametrize("mutation", ["dirty", "untracked", "index", "hidden", "mode", "delete", "create", "symlink"])
+@pytest.mark.parametrize("mutation", [
+    "dirty", "untracked", "index", "hidden",
+    # Windows chmod changes only read-only state, not executable bits.
+    pytest.param("mode", marks=pytest.mark.linux_only, id="mode-linux"),
+    pytest.param("mode", marks=pytest.mark.macos_only, id="mode-macos"),
+    "delete", "create", "symlink",
+])
 def test_mutation_receipt_binds_contents_and_index(git_repo, monkeypatch, capsys, mutation, dry_run):
     import os
     root, git = git_repo
