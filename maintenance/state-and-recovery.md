@@ -5,6 +5,8 @@ requires it on every run and owns shared adoption/publication policy.
 
 ## Coupled current adaptations
 
+Forensic database bundles copy bytes first, acquire a writable staged-file handle before restoring source metadata (including read-only mode), then flush through that handle. This preserves Windows file-flush support without discarding metadata. Sidecars publish before the main database commit marker, with existing directory barriers and failure cleanup retained. Native disposable-file regressions cover writable flush, byte/mode/mtime preservation and bundle order in `tests/hermes_state/test_backup_flush.py`; existing repair-loop and offline-registry tests retain failure and connection-ownership coverage.
+
 The manifest-size recovery correction is published to PR #106101 at `1057b39d2b41d01813f96af3b89724b1e53d3c53`. The exact head was read back on September 14 and reported no hosted checks. This supersedes earlier unverified contribution-parity notes only for that correction, not all historical differences from the PR.
 
 Linux mountinfo fixtures explicitly select Linux behavior and separately verify that non-Linux hosts are not flagged. This test adaptation does not change production WAL policy.

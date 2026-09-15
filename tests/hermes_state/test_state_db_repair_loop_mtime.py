@@ -201,16 +201,16 @@ def test_failed_copy_leaves_no_countable_debris(tmp_path):
     roomy = type(
         "Usage", (), {"total": 500_000_000_000, "used": 0, "free": 400_000_000_000}
     )()
-    real_copy2 = shutil.copy2
+    real_copyfile = shutil.copyfile
 
     def sidecar_fails(src, dst, *a, **kw):
         if str(src).endswith("-wal"):
             Path(dst).write_bytes(b"PARTIAL" * 100)
             raise OSError(28, "No space left on device")
-        return real_copy2(src, dst, *a, **kw)
+        return real_copyfile(src, dst, *a, **kw)
 
     with patch("shutil.disk_usage", return_value=roomy), \
-            patch("shutil.copy2", sidecar_fails):
+            patch("shutil.copyfile", sidecar_fails):
         for _ in range(6):
             _backup_db_file(db)
             time.sleep(0.01)
@@ -386,15 +386,15 @@ def test_staging_name_is_outside_the_backup_prefix(tmp_path):
     roomy = type(
         "Usage", (), {"total": 500_000_000_000, "used": 0, "free": 400_000_000_000}
     )()
-    real_copy2 = shutil.copy2
+    real_copyfile = shutil.copyfile
     staging_names: list[str] = []
 
     def capture(src, dst, *a, **kw):
         staging_names.append(Path(dst).name)
-        return real_copy2(src, dst, *a, **kw)
+        return real_copyfile(src, dst, *a, **kw)
 
     with patch("shutil.disk_usage", return_value=roomy), \
-            patch("shutil.copy2", capture):
+            patch("shutil.copyfile", capture):
         path, reason = _backup_db_file(db)
 
     assert reason is None and path is not None
@@ -423,15 +423,15 @@ def test_orphaned_staging_is_never_returned_as_the_backup_path(tmp_path):
 
     # Discover the staging name the implementation actually uses, then plant an
     # orphan under it — so this binds to the code's scheme, not to a literal.
-    real_copy2 = shutil.copy2
+    real_copyfile = shutil.copyfile
     seen: list[Path] = []
 
     def capture(src, dst, *a, **kw):
         seen.append(Path(dst))
-        return real_copy2(src, dst, *a, **kw)
+        return real_copyfile(src, dst, *a, **kw)
 
     with patch("shutil.disk_usage", return_value=roomy), \
-            patch("shutil.copy2", capture):
+            patch("shutil.copyfile", capture):
         first, _ = _backup_db_file(db)
     assert first is not None
     Path(first).unlink(missing_ok=True)
@@ -732,7 +732,7 @@ def test_publication_failure_leaves_no_countable_partial_bundle(tmp_path):
     legitimate forensic copy on the next pass.
 
     Distinct from ``test_failed_copy_leaves_no_countable_debris``, which fails
-    during ``copy2`` (before any ``os.replace``); this exercises the
+    during ``copyfile`` (before any ``os.replace``); this exercises the
     publication window.
     """
     db = _damaged_db(tmp_path, size=200_000)

@@ -480,10 +480,11 @@ def _publish_backup_bundle(db_path: Path, staging: Path, backup_path: Path) -> N
     published: "List[Path]" = []
     try:
         for src, staged, _dst in (main, *sidecars):
-            shutil.copy2(src, staged)
-            # The backup only helps after the crash that made it necessary, so each copy is flushed
-            # before it is published rather than left in the page cache.
-            with staged.open("rb") as handle:
+            shutil.copyfile(src, staged)
+            # Acquire write access before restoring possibly read-only metadata:
+            # Windows requires a writable handle for fsync/FlushFileBuffers.
+            with staged.open("r+b") as handle:
+                shutil.copystat(src, staged)
                 os.fsync(handle.fileno())
         _fsync_directory(db_path.parent)
         for _src, staged, dst in (*sidecars, main):

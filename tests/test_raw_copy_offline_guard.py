@@ -98,7 +98,7 @@ def db_file(tmp_path):
 
 
 def _connect_attempt_during(monkeypatch, db_path):
-    """Patch ``shutil.copy2`` so a tracked connect races the first copy.
+    """Patch ``shutil.copyfile`` so a tracked connect races the first copy.
 
     The verdict is taken INSIDE the patched copy, while the raw I/O is still
     in flight -- once the site under test returns, its guard has released the
@@ -109,7 +109,7 @@ def _connect_attempt_during(monkeypatch, db_path):
     whether the connect got through mid-copy; ``holder`` collects the
     connection so the test can close it.
     """
-    real_copy2 = shutil.copy2
+    real_copyfile = shutil.copyfile
     started = threading.Event()
     holder: list[sqlite3.Connection] = []
     verdict: dict = {"landed_during_copy": None}
@@ -122,7 +122,7 @@ def _connect_attempt_during(monkeypatch, db_path):
     thread = threading.Thread(target=_racing_connect, daemon=True)
     fired = threading.Event()
 
-    def _copy2_with_race(src, dst, *a, **kw):
+    def _copyfile_with_race(src, dst, *a, **kw):
         if not fired.is_set():
             fired.set()
             thread.start()
@@ -130,12 +130,12 @@ def _connect_attempt_during(monkeypatch, db_path):
             # Give the connector every chance to slip in if nothing blocks it.
             thread.join(timeout=0.5)
             verdict["landed_during_copy"] = bool(holder)
-        return real_copy2(src, dst, *a, **kw)
+        return real_copyfile(src, dst, *a, **kw)
 
     # Both call sites bind the stdlib module object (kanban_db at module
     # level, hermes_state via a function-local ``import shutil``), so one
     # patch on the module covers both.
-    monkeypatch.setattr(shutil, "copy2", _copy2_with_race)
+    monkeypatch.setattr(shutil, "copyfile", _copyfile_with_race)
     return thread, holder, verdict
 
 
