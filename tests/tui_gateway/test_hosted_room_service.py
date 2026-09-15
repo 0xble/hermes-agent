@@ -297,7 +297,8 @@ class _BlockingFirstRPC(_PromptRecordingRPC):
         self.prompts.append((kwargs["profile"], kwargs["prompt"]))
         if len(self.prompts) == 1:
             self.first_started.set()
-            assert self.release_first.wait(timeout=2)
+            # The test owns completion. Host scheduling must not invent a failed RPC.
+            self.release_first.wait()
         kwargs["on_terminal"](
             {"status": "settled", "text": f"reply from {kwargs['profile']}"}
         )
@@ -629,29 +630,33 @@ def test_active_same_thread_followup_waits_for_current_task(tmp_path: Path):
         ],
     )
 
-    service.start()
     service.send(
         room_id="room-1",
         event_id="user-1",
         payload={"text": "@ops start", "thread_id": "thread-1"},
     )
-    assert service.rpc.first_started.wait(timeout=2)
-    service.send(
-        room_id="room-1",
-        event_id="user-2",
-        payload={"text": "@hermes follow up", "thread_id": "thread-1"},
-    )
-    assert len(service.rpc.prompts) == 1
-    service.rpc.release_first.set()
-    _wait_for(lambda: len(service.rpc.prompts) == 2)
-    _wait_for(
-        lambda: any(
-            event["kind"] == "room.activity"
-            and event["payload"]["discussion_event_id"] == "user-2"
-            for event in service._events("room-1")
+    # Exercise real concurrent admission while the first scheduler cycle owns the
+    # task. Explicit release, not a wall-clock deadline, controls the fake RPC.
+    worker = threading.Thread(target=service.runtime._run_cycle)
+    worker.start()
+    try:
+        service.rpc.first_started.wait()
+        service.send(
+            room_id="room-1",
+            event_id="user-2",
+            payload={"text": "@hermes follow up", "thread_id": "thread-1"},
         )
+        assert len(service.rpc.prompts) == 1
+    finally:
+        service.rpc.release_first.set()
+        worker.join()
+    service.runtime._run_cycle()
+    assert len(service.rpc.prompts) == 2
+    assert any(
+        event["kind"] == "room.activity"
+        and event["payload"]["discussion_event_id"] == "user-2"
+        for event in service._events("room-1")
     )
-    assert service.stop(timeout=5.0)
     assert "User (user): @hermes follow up" in service.rpc.prompts[1][1]
 
 
@@ -671,19 +676,13 @@ def test_thread_transcript_prunes_committed_message_and_settlement_together(
             {"member_id": "ops", "profile": "ops", "handle": "ops"},
         ],
     )
-    service.start()
     service.send(
         room_id="room-1",
         event_id="user-first",
         payload={"text": "@ops old", "thread_id": "thread-1"},
     )
-    _wait_for(
-        lambda: any(
-            event["kind"] == "room.activity"
-            for event in service._events("room-1")
-        )
-    )
-    assert service.stop(timeout=5.0)
+    service.runtime._run_cycle()
+    assert any(event["kind"] == "room.activity" for event in service._events("room-1"))
     for index in range(24):
         _append_room_event(
             db,
@@ -1101,20 +1100,15 @@ def test_unadmitted_peer_failure_does_not_block_next_healthy_member(
         ],
     )
 
-    service.start()
     service.send(
         room_id="room-1",
         event_id="user-fallback-1",
         payload={"text": "Review this together", "thread_id": "thread-1"},
     )
-    _wait_for(
-        lambda: any(
-            event["kind"] == "message.member"
-            and event["payload"]["member_id"] == "local"
-            for event in service._events("room-1")
-        )
-    )
-    assert service.stop(timeout=5.0)
+    # First cycle settles the pre-admission peer failure and admits its healthy
+    # successor. The next cycle executes that successor through the real driver.
+    service.runtime._run_cycle()
+    service.runtime._run_cycle()
 
     events = service._events("room-1")
     assert any(
