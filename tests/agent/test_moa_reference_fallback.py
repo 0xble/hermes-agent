@@ -124,3 +124,110 @@ def test_invalid_reference_chains_fail_closed(chain):
     assert validate_moa_payload(config)
     with pytest.raises(ValueError, match="fallback_models"):
         normalize_moa_config(config)
+
+
+@pytest.mark.parametrize("consume", [0, 1, 2, 3])
+@pytest.mark.parametrize("fails", [False, True])
+def test_prefetched_aggregator_closes_transport_before_or_during_consumption(
+    tmp_path, monkeypatch, consume, fails
+):
+    """A caller may abandon a returned stream before reading its prefetched chunk."""
+    import threading
+    from agent import moa_loop
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"moa": {
+        "reference_models": [{"provider": "custom", "model": "advisor"}],
+        "aggregator": {"provider": "custom", "model": "primary",
+                       "fallback_models": [{"provider": "custom", "model": "secondary"}]},
+    }}))
+    monkeypatch.setattr(moa_loop, "_slot_runtime", lambda slot: {
+        "provider": slot["provider"], "model": slot["model"]})
+    permit = threading.BoundedSemaphore(1)
+    chunks = [object(), object()]
+    closed, calls, sources = [], [], []
+
+    def transport():
+        assert permit.acquire(blocking=False)
+        try:
+            yield chunks[0]
+            yield chunks[1]
+            if fails:
+                raise ConnectionError("midstream failure must not replay")
+        finally:
+            closed.append(True)
+            permit.release()
+
+    def call(**kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == "advisor":
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="advice"))], usage=None)
+        source = transport()
+        sources.append(source)  # SDK may retain its stream independently of the consumer
+        return source
+
+    monkeypatch.setattr(moa_loop, "call_llm", call)
+    client = moa_loop.MoAClient("default")
+    stream = client.chat.completions.create(
+        messages=[{"role": "user", "content": "question"}], stream=True)
+    assert not permit.acquire(blocking=False)  # real aggregator prefetch owns the permit
+    try:
+        assert iter(stream) is stream
+        for index in range(min(consume, 2)):
+            assert next(stream) is chunks[index]
+        if consume == 3:
+            with pytest.raises(ConnectionError if fails else StopIteration):
+                next(stream)
+            assert closed == [True]
+        stream.close()
+        stream.close()
+        assert closed == [True]
+        assert permit.acquire(blocking=False)
+        permit.release()
+        with pytest.raises(StopIteration):
+            next(stream)
+        assert calls == ["advisor", "primary"]
+    finally:
+        stream.close()
+        for source in sources:
+            source.close()
+
+
+def test_prefetched_stream_closes_distinct_source_once_even_when_close_raises():
+    from agent.moa_fallback import prefetched_stream
+
+    class Source:
+        close_count = 0
+
+        def close(self):
+            self.close_count += 1
+            raise OSError("fixture close error")
+
+    source = Source()
+    stream = prefetched_stream(None, iter(["tail"]), source)
+    with pytest.raises(OSError, match="fixture close error"):
+        stream.close()
+    stream.close()
+    assert source.close_count == 1
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_prefetched_stream_closes_separate_live_iterator_and_source():
+    from agent.moa_fallback import prefetched_stream
+
+    released = []
+
+    def chunks():
+        try:
+            yield "first"
+            yield "tail"
+        finally:
+            released.append("iterator")
+
+    iterator = chunks()
+    source = SimpleNamespace(close=lambda: released.append("source"))
+    stream = prefetched_stream(next(iterator), iterator, source)
+    stream.close()
+    stream.close()
+    assert released == ["iterator", "source"]

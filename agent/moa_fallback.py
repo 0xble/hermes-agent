@@ -34,14 +34,54 @@ def fallback_reason(exc: Exception) -> str | None:
     return None
 
 
+class _PrefetchedStream:
+    """Own a transport already advanced by the aggregator's fallback probe."""
+
+    def __init__(self, first: Any, iterator: Any, source: Any):
+        self._first = first
+        self._pending = True
+        self._iterator = iterator
+        self._source = source
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        if self._pending:
+            self._pending = False
+            first, self._first = self._first, None
+            return first
+        try:
+            return next(self._iterator)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        # A generator's finally does not run if close precedes its first next.
+        # The underlying source is already live, so close it explicitly here.
+        if self._closed:
+            return
+        self._closed = True
+        self._first = None
+        source, self._source = self._source, None
+        iterator, self._iterator = self._iterator, None
+        try:
+            if iterator is not source:
+                close_iterator = getattr(iterator, "close", None)
+                if close_iterator is not None:
+                    close_iterator()
+        finally:
+            close_source = getattr(source, "close", None)
+            if close_source is not None:
+                close_source()
+
+
 def prefetched_stream(first: Any, iterator: Any, source: Any):
-    try:
-        yield first
-        yield from iterator
-    finally:
-        close = getattr(source, "close", None)
-        if close is not None:
-            close()
+    return _PrefetchedStream(first, iterator, source)
 
 
 def run_slot_chain(slot: dict[str, Any], call) -> Any:
