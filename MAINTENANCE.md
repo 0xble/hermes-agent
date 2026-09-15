@@ -1564,6 +1564,8 @@ The umbrella commit contains independently retireable fixes. Never revert it who
 
 ### HERMES-057 — Retired total cron run budgets
 
+- **September 15 retained-worker ownership repair:** The independent inactivity watchdog now carries the exact worker Future into durable finalization. Completion waits for that worker to exit while fire/run heartbeats retain ownership. Late results do not replace the timeout, and a replacement owner remains fenced from stale completion. Real recurring and one-shot tests verify durable state and competing-process exclusion. This retains a scheduler worker slot while execution lingers and does not restore total run budgets. Roll back the Future handoff and matching lifecycle regressions together.
+
 - **Summary:** Historical optional per-job total wall-clock cap across cron persistence, model-tool and CLI surfaces, pre-agent work, agent execution, and teardown.
 - **Upstream tracking:** Historical issue #79244 and PR #79880 did not provide an equivalent per-job contract; upstream commit `803397e` supplies only the separate native agent-level `run_budget_seconds` behavior, which remains intact.
 - **Upstream PR:** Historical related PR #79880; no upstream replacement is claimed for this user-directed retirement.
@@ -2248,6 +2250,8 @@ On every maintenance run, and before publishing, promoting, or retiring a patch:
 - **Retirement:** Replace with released upstream behavior after equivalent literal-prefix, code/heading preservation, transport regressions, and live rich-message readback pass. Remove the fork-only implementation rather than retaining duplicate normalization.
 
 ### HERMES-131 — Verified bounded quick-snapshot recovery
+
+- **September 15 checkpoint repair:** Revalidate listed database payloads on the active cumulative recovery checkpoint before trusting cleared omissions. Missing, corrupt, or manifest-size-mismatched payloads restore per-database recovery obligations, preserving an older verified copy through public prune and subsequent publication. Twelve real SQLite regression cases cover fully and partly cleared checkpoints. Same-size structurally valid replacement detection remains outside the existing manifest contract. Roll back this correction with its focused recovery-retention tests, preserving all existing snapshots.
 
 - **Summary:** Keep a bounded recovery set (recent configured window, newest complete generation and needed verified per-database coverage) rather than an unbounded history of partial snapshots. Separate automatic snapshot families from manual snapshots. This is recovery retention, not an archive of every historical config version.
 - **Source surfaces:** `hermes_cli/backup.py`, `tests/hermes_cli/test_backup.py`, `tests/hermes_cli/test_quick_retention_repro.py`. Preserve the fork's existing full-backup session exclusions.
