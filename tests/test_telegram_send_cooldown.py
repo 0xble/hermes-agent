@@ -76,6 +76,48 @@ def _make_adapter() -> TelegramAdapter:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tail", ["**bold**.", "```python\nprint('ok')\n```", "[link](https://example.com/a?q=1)"])
+@pytest.mark.parametrize("plain_fallback", [False, True])
+async def test_partial_markdown_suffix_inline_retry_preserves_wire_format(monkeypatch, tail, plain_fallback):
+    import plugins.platforms.telegram.adapter as adapter_module
+    from telegram.error import BadRequest
+
+    assert Path(adapter_module.__file__).resolve().is_relative_to(Path(__file__).resolve().parents[1])
+    adapter = _make_adapter()
+    adapter._rich_messages_enabled = False
+    adapter._send_cooldown_max_wait = 0.01
+
+    async def immediate_send(chat_id, send_fn, *args, **kwargs):
+        return await send_fn(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_run_send_call", immediate_send)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    adapter._bot.send_message.side_effect = [
+        SimpleNamespace(message_id=101),
+        _TelegramSendCooldownExceeded(1.0),
+        *([BadRequest("Can't parse entities")] if plain_fallback else []),
+        SimpleNamespace(message_id=102),
+    ]
+    result = await adapter._send_with_retry(
+        "chunk-chat", "x" * adapter.MAX_MESSAGE_LENGTH + "\n\n" + tail,
+        metadata={"notify": True}, max_retries=1,
+    )
+
+    assert result.success is True
+    attempts = adapter._bot.send_message.await_args_list
+    assert len(attempts) == (4 if plain_fallback else 3)
+    refused_wire = attempts[1].kwargs["text"]
+    retried_wire = attempts[2].kwargs["text"]
+    if tail == "**bold**.":
+        assert "*bold*" in refused_wire
+        assert "*bold*" in retried_wire
+    assert retried_wire == refused_wire
+    if plain_fallback:
+        assert attempts[3].kwargs["parse_mode"] is None
+        assert "x" * 100 not in attempts[3].kwargs["text"]
+
+
+@pytest.mark.asyncio
 async def test_first_send_stamps_cooldown_for_same_chat(monkeypatch):
     """A successful send records a cooldown timestamp so the next send to
     the same chat can be gated by ``send()``."""

@@ -623,8 +623,12 @@ class GatewayStartupMixin:
             if adapter is None:
                 continue
             content = row["content"]
+            retry_payload = row.get("retry_payload")
+            recovery_prefix = ""
             if row.get("needs_marker"):
-                content = row.get("marker", RECOVERED_MARKER) + content
+                recovery_prefix = row.get("marker", RECOVERED_MARKER)
+                if retry_payload is None:
+                    content = recovery_prefix + content
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             if row["platform"] == "telegram" and row.get("business_connection_id"):
                 metadata = dict(metadata or {})
@@ -633,7 +637,11 @@ class GatewayStartupMixin:
             # proves the send path recovered while we were on it.
             recovery_generation = getattr(adapter, "_send_path_recovery_generation", 0)
             try:
-                result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+                if retry_payload is not None and isinstance(adapter, BasePlatformAdapter):
+                    result = await adapter.send_retry_content(
+                        row["chat_id"], content, retry_payload, metadata=metadata, prefix=recovery_prefix)
+                else:
+                    result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
@@ -654,6 +662,7 @@ class GatewayStartupMixin:
                     settled = await asyncio.to_thread(
                         mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed"),
                         retry_content=BasePlatformAdapter._delivery_retry_suffix(result, "") or None,
+                        retry_payload=BasePlatformAdapter._delivery_retry_payload(result),
                         expected_content=row["content"],
                     )
                     if settled is False:

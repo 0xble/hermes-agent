@@ -4336,6 +4336,7 @@ class TelegramAdapter(BasePlatformAdapter):
             delivered_chunks=len(message_ids),
             total_chunks=len(chunks),
             delivery_retry_content="".join(chunks[len(message_ids):]),
+            delivery_retry_payload={"format": "telegram_markdown_v2", "chunks": chunks[len(message_ids):]},
         )
         # ``retryable`` stays exactly as the send path set it. On a flood rejection
         # ``_send_retry_after_outcome`` clears it so that a consumer reading the flag ALONE cannot
@@ -4544,10 +4545,28 @@ class TelegramAdapter(BasePlatformAdapter):
         finally:
             _EXPENDABLE_TRAFFIC.reset(token)
 
+    async def send_retry_content(
+        self, chat_id: str, content: str, payload: dict, *, reply_to: Optional[str] = None,
+        metadata: Any = None, prefix: str = "",
+    ) -> SendResult:
+        chunks = payload.get("chunks")
+        if (payload.get("format") != "telegram_markdown_v2" or not isinstance(chunks, list)
+                or not chunks or not all(isinstance(chunk, str) and chunk for chunk in chunks)
+                or "".join(chunks) != content):
+            return SendResult(success=False, error="invalid_delivery_retry_payload", retryable=False)
+        # The receipt carries exact wire chunks, including repaired fences and indicators.
+        # Recovery notices are new authored text and must be formatted independently.
+        return await self.send(chat_id, content, reply_to=reply_to, metadata={
+            **(metadata or {}), "_telegram_retry_chunks": list(chunks),
+            "_telegram_retry_prefix": prefix,
+        })
+
     async def _send_impl(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
-        content = _normalize_dollar_entities(content)
+        retry_chunks = (metadata or {}).get("_telegram_retry_chunks")
+        if retry_chunks is None:
+            content = _normalize_dollar_entities(content)
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
@@ -4572,19 +4591,23 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Bot API 10.1 rich fast-path; falls through to legacy MarkdownV2 on permanent/capability
             # errors or DM-topic skips; returns directly on success or transient failure (no legacy resend).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if retry_chunks is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
-            if len(chunks) > 1:
+            chunks = (list(retry_chunks) if retry_chunks is not None else
+                      self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len))
+            if retry_chunks is None and len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
                     _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
                     for chunk in chunks
                ]
+            retry_prefix = (metadata or {}).get("_telegram_retry_prefix")
+            if retry_chunks is not None and retry_prefix:
+                chunks = [self.format_message(retry_prefix), *chunks]
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)

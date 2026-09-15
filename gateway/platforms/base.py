@@ -3513,24 +3513,46 @@ class BasePlatformAdapter(ABC):
                 return suffix
         return current
 
+    @staticmethod
+    def _delivery_retry_payload(result: "SendResult") -> Optional[dict]:
+        raw = getattr(result, "raw_response", None)
+        payload = raw.get("delivery_retry_payload") if isinstance(raw, dict) else None
+        return payload if isinstance(payload, dict) else None
+
+    async def send_retry_content(
+        self, chat_id: str, content: str, payload: dict, *, reply_to: Optional[str] = None,
+        metadata: Any = None, prefix: str = "",
+    ) -> "SendResult":
+        """Replay an adapter's explicit representation, with a separately authored notice."""
+        return await self.send(chat_id=chat_id, content=prefix + content, reply_to=reply_to, metadata=metadata)
+
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
         max_retries: int = 2, base_delay: float = 2.0) -> "SendResult":
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         retry_content = content
+        retry_payload = None
 
         def _remember_suffix(result: "SendResult") -> "SendResult":
-            nonlocal retry_content
+            nonlocal retry_content, retry_payload
+            raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+            if isinstance(raw.get("delivery_retry_content"), str) and raw["delivery_retry_content"]:
+                retry_payload = self._delivery_retry_payload(result)
             retry_content = self._delivery_retry_suffix(result, retry_content)
             if not result.success and retry_content != content:
                 # A later refusal may omit chunk metadata. Keep the positively established
                 # remainder on the returned failure so durable settlement cannot replay its prefix.
                 raw = result.raw_response if isinstance(result.raw_response, dict) else {}
                 result.raw_response = {**raw, "delivery_retry_content": retry_content}
+                if retry_payload is not None:
+                    result.raw_response["delivery_retry_payload"] = retry_payload
             return result
 
         async def _send(text: str) -> "SendResult":
+            if retry_payload is not None and text == retry_content:
+                return _remember_suffix(await self.send_retry_content(
+                    chat_id, text, retry_payload, reply_to=reply_to, metadata=metadata))
             return _remember_suffix(await self.send(
                 chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata))
         result = await _send(content)
@@ -3632,8 +3654,13 @@ class BasePlatformAdapter(ABC):
         # rate-limited error never reaches here: it classifies as network above and the
         # loop only breaks on a non-transient, non-rate-limited error.
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = _remember_suffix(await self._send_plain_fallback(
-            chat_id, retry_content, reply_to=reply_to, metadata=metadata))
+        if retry_payload is not None:
+            fallback_result = _remember_suffix(await self.send_retry_content(
+                chat_id, retry_content, retry_payload, reply_to=reply_to, metadata=metadata,
+                prefix="(Response formatting failed, plain text:)\n\n"))
+        else:
+            fallback_result = _remember_suffix(await self._send_plain_fallback(
+                chat_id, retry_content, reply_to=reply_to, metadata=metadata))
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
@@ -4144,6 +4171,7 @@ class BasePlatformAdapter(ABC):
             settled = await asyncio.to_thread(
                 mark_failed, obligation_id, error,
                 retry_content=self._delivery_retry_suffix(result, "") or None,
+                retry_payload=self._delivery_retry_payload(result),
                 expected_content=expected_content)
             if settled is False:
                 return

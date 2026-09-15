@@ -1,18 +1,21 @@
 """Partial-send receipts survive failure settlement and durable recovery."""
 import sqlite3
 import time
-from unittest.mock import AsyncMock
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway import delivery_ledger as dl
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_startup import GatewayStartupMixin
 from gateway.session import SessionSource
 from tests.gateway.test_send_retry import _StubAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _TelegramSendCooldownExceeded
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +51,55 @@ class _Replay(GatewayStartupMixin):
         self._authorization_adapter = lambda platform, profile: self.adapters.get(platform)
         self._arm_flood_timers_for_waiting_rows = AsyncMock()
         self._consume_delivered_goal_receipt = AsyncMock()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime", [False, True])
+@pytest.mark.parametrize("intermediate_failure", [False, True])
+async def test_real_telegram_wire_suffix_survives_durable_replay(monkeypatch, runtime, intermediate_failure):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    assert Path(adapter_module.__file__).resolve().is_relative_to(Path(__file__).resolve().parents[2])
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._rich_messages_enabled = False
+    adapter._send_cooldown_max_wait = 0.01
+    adapter._bot = MagicMock()
+    adapter._bot.send_message = AsyncMock(side_effect=[
+        SimpleNamespace(message_id=101), _TelegramSendCooldownExceeded(999),
+    ])
+
+    async def immediate_send(chat_id, send_fn, *args, **kwargs):
+        return await send_fn(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_run_send_call", immediate_send)
+    result, _ = await _produce(adapter, "x" * adapter.MAX_MESSAGE_LENGTH + "\n\n**bold**.")
+    assert not result.success
+    refused_wire = adapter._bot.send_message.await_args_list[1].kwargs["text"]
+    assert "*bold*" in refused_wire
+    assert _row()["content"] == refused_wire
+    assert json.loads(_row()["retry_payload"])["chunks"] == [refused_wire]
+    replay = _Replay(adapter)
+
+    def claim():
+        now = time.time() + 1000
+        return dl.sweep_failed_for_runtime("telegram", now=now) if runtime else dl.sweep_recoverable(now=now)
+
+    if intermediate_failure:
+        adapter._send_path_degraded = True
+        assert await replay._redeliver_claimed_obligations(claim()) == 0
+        assert _row()["content"] == refused_wire
+        assert json.loads(_row()["retry_payload"])["chunks"] == [refused_wire]
+        adapter._send_path_degraded = False
+
+    adapter._bot.send_message.reset_mock()
+    adapter._bot.send_message.side_effect = None
+    adapter._bot.send_message.return_value = SimpleNamespace(message_id=102)
+    assert await replay._redeliver_claimed_obligations(claim()) == 1
+    attempts = adapter._bot.send_message.await_args_list
+    assert len(attempts) == 2  # separately formatted recovery notice, then exact suffix
+    assert "Recovered reply" in attempts[0].kwargs["text"]
+    assert attempts[1].kwargs["text"] == refused_wire
+    assert _row()["state"] == "delivered"
 
 
 @pytest.mark.asyncio

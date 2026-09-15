@@ -204,6 +204,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                         ("obligation_kind", "obligation_kind TEXT NOT NULL DEFAULT 'legacy'"),
                         ("turn_token", "turn_token TEXT"),
                         ("business_connection_id", "business_connection_id TEXT"),
+                        ("retry_payload", "retry_payload TEXT"),
                         ("delegation_receipt", "delegation_receipt TEXT"),
                         ("goal_receipt", "goal_receipt TEXT"),
                         ("goal_receipt_consumed", "goal_receipt_consumed INTEGER NOT NULL DEFAULT 0")):
@@ -355,6 +356,7 @@ def mark_delivered(obligation_id: str) -> None:
 
 
 def mark_failed(obligation_id: str, error: str = "", *, retry_content: Optional[str] = None,
+                retry_payload: Optional[dict] = None,
                 expected_content: Optional[str] = None) -> bool:
     """Settle a send's failure and known remainder atomically against its owned payload.
 
@@ -368,11 +370,13 @@ def mark_failed(obligation_id: str, error: str = "", *, retry_content: Optional[
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state='failed', content=COALESCE(?, content), updated_at=?, last_error=?
+               SET state='failed', content=COALESCE(?, content),
+                   retry_payload=CASE WHEN ? IS NOT NULL THEN ? ELSE retry_payload END, updated_at=?, last_error=?
                WHERE obligation_id=? AND content=?
                  AND owner_pid IS ? AND owner_started_at IS ?
                  AND state IN ('pending', 'attempting', 'failed')""",
-            (retry_content, time.time(), error[:500] if error else None,
+            (retry_content, retry_content, json.dumps(retry_payload) if retry_payload is not None else None,
+             time.time(), error[:500] if error else None,
              obligation_id, expected_content, pid, started))
     return bool(cursor.rowcount)
 
@@ -412,7 +416,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
                  obligation_kind: Optional[str] = None, turn_token: Optional[str] = None,
                  last_error: Optional[str] = None, delegation_receipt: Optional[str] = None,
-                 business_connection_id: Optional[str] = None) -> Dict[str, Any]:
+                 business_connection_id: Optional[str] = None, retry_payload: Optional[str] = None) -> Dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime, a
     ``runtime`` reconnect replay gets RECONNECTED_MARKER, and a boot-recovered crash keeps the runner's
@@ -428,7 +432,8 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}),
             "attempts": attempts + 1, "obligation_kind": obligation_kind, "turn_token": turn_token,
-            "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id}
+            "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id,
+            "retry_payload": json.loads(retry_payload) if retry_payload else None}
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,
@@ -457,13 +462,13 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile,
-                      obligation_kind, turn_token, last_error, updated_at, delegation_receipt, business_connection_id
+                      obligation_kind, turn_token, last_error, updated_at, delegation_receipt, business_connection_id, retry_payload
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, obligation_kind, turn_token,
-             last_error, updated_at, delegation_receipt, business_connection_id) in rows:
+             last_error, updated_at, delegation_receipt, business_connection_id, retry_payload) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -491,7 +496,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "profile": adapter_profile or "default", "attempts": attempts,
                         "adopted": True, "not_before": flood_not_before(updated_at, last_error),
                         "obligation_kind": obligation_kind, "turn_token": turn_token,
-                        "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id})
+                        "delegation_receipt": delegation_receipt, "business_connection_id": business_connection_id,
+                        "retry_payload": json.loads(retry_payload) if retry_payload else None})
                 continue
             # A claimed flood row is resent as a fresh attempt: clear the stale refusal so an interrupted
             # resend is seen as 'attempting' with no error by the next boot and gets the marker.
@@ -511,7 +517,7 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                                             adapter_profile or "default", needs_marker=state != "pending",
                                             flood=flood_row, obligation_kind=obligation_kind,
                                             turn_token=turn_token, delegation_receipt=delegation_receipt,
-                                            business_connection_id=business_connection_id))
+                                            business_connection_id=business_connection_id, retry_payload=retry_payload))
     return claimed
 
 
@@ -537,12 +543,12 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile,
-                      obligation_kind, turn_token, updated_at, delegation_receipt, business_connection_id
+                      obligation_kind, turn_token, updated_at, delegation_receipt, business_connection_id, retry_payload
                FROM delivery_obligations
                WHERE state='failed' AND platform=?""", (platform,)).fetchall()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, obligation_kind, turn_token,
-             updated_at, delegation_receipt, business_connection_id) in rows:
+             updated_at, delegation_receipt, business_connection_id, retry_payload) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
                     or not _runtime_retryable(last_error)):
@@ -572,7 +578,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                                             attempts, adapter_profile, needs_marker=True, runtime=True,
                                             flood=is_flood_error(last_error), last_error=last_error,
                                             obligation_kind=obligation_kind, turn_token=turn_token, delegation_receipt=delegation_receipt,
-                                            business_connection_id=business_connection_id))
+                                            business_connection_id=business_connection_id, retry_payload=retry_payload))
     return claimed
 
 
