@@ -86,7 +86,7 @@ Config file: `~/.hermes/hindsight/config.json`
 >
 > Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
 >
-> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
+> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This supplies the default for **both** auto-recall and the `hindsight_recall` tool. Explicit tool calls can override it with `types`.
 
 ### Retain
 
@@ -101,6 +101,12 @@ Config file: `~/.hermes/hindsight/config.json`
 | `retain_indicator` | `true` | Show a `🧠 Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
+
+`observation_scopes` applies to text retention, including explicit `[[]]` for
+one shared consolidation scope. The pinned Hindsight 0.9.1 file-retention API
+cannot carry this setting. Raw attachments continue to use the server's existing
+file-retention behavior. Hermes does not change bank policy to approximate
+per-item scopes.
 
 ### Automatic source ordering and recovery
 
@@ -183,6 +189,16 @@ Available in `hybrid` and `tools` memory modes:
 | `hindsight_retain` | Store information with auto entity extraction; supports optional per-call `tags` |
 | `hindsight_recall` | Multi-strategy search (semantic + entity graph) |
 | `hindsight_reflect` | Cross-memory synthesis (LLM-powered) |
+
+Explicit `hindsight_recall` calls can select `types`, `tags`, and `tags_match`,
+request entity context, source chunks, or source facts with their corresponding
+`include_*` flags and token budgets, and control local provenance formatting with
+`include_provenance`. Expansions remain opt-in. `offset` (0–500) and `limit`
+(1–50) slice the returned memories locally and do not fetch server pages.
+
+The pinned 0.9.1 SDK imports a missing model when `tag_groups` is supplied to
+`arecall`, so the tool schema does not advertise that filter. Existing direct
+requests with unsupported filters fail closed instead of retrying without them.
 
 ## Environment Variables
 

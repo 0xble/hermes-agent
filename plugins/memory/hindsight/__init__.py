@@ -378,8 +378,34 @@ RECALL_SCHEMA = {
         "Search long-term memory. Returns memories ranked by relevance using "
         "semantic search, keyword matching, entity graph traversal, and reranking."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "What to search for."}}},
+    "parameters": {
+        "type": "object", "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "types": {"type": "array", "minItems": 1,
+                      "items": {"type": "string", "enum": ["world", "experience", "observation"]},
+                      "description": "Fact types to retrieve. Omit to use configured recall_types (default: observation)."},
+            "include_entities": {"type": "boolean", "description": "Include entity observations. Opt-in by default."},
+            "max_entity_tokens": {"type": "integer", "minimum": 1, "maximum": 2000,
+                                  "description": "Entity expansion token budget when enabled (default: 500)."},
+            "include_chunks": {"type": "boolean", "description": "Include original source chunks (default: false)."},
+            "max_chunk_tokens": {"type": "integer", "minimum": 1, "maximum": 8192,
+                                 "description": "Source chunk token budget when enabled (default: 8192)."},
+            "include_source_facts": {"type": "boolean", "description": "Include source facts behind observations (default: false)."},
+            "max_source_facts_tokens": {"type": "integer", "minimum": 1, "maximum": 8192,
+                                        "description": "Source fact token budget when enabled (default: 4096)."},
+            "include_provenance": {"type": "boolean",
+                                   "description": "Format available memory IDs, document IDs, tags and dates locally. Uses the configured explicit-recall default when omitted."},
+            "tags": {"type": "array", "minItems": 1, "items": {"type": "string"},
+                     "description": "Per-call recall tags. Omit to retain configured recall_tags."},
+            "tags_match": {"type": "string", "enum": ["any", "all", "any_strict", "all_strict", "exact"],
+                           "description": "Match mode for active recall tags. Strict modes exclude untagged memories; exact requires the same tag set."},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 500,
+                       "description": "Skip this many memories in this response before formatting (default: 0). Local slicing only, not server pagination."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50,
+                      "description": "Format at most this many memories from this response (default: 50). Does not fetch another server page."},
+        },
+    },
 }
 
 INVALIDATE_SCHEMA = {
