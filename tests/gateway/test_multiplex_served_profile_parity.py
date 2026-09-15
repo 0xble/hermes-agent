@@ -141,23 +141,28 @@ def test_watch_event_gate_uses_the_owning_profiles_mode(served):
     assert served.default_adapter.calls == []
 
 
-def test_served_profile_process_checkpoint_is_recovered_at_startup(served, monkeypatch):
+def test_served_profile_process_checkpoint_is_recovered_at_startup(served):
     """A background process checkpointed during alpha's turn (alpha/processes.json) is re-adopted by
     the multiplexer's startup recovery, once, with its watcher re-armed."""
-    from tools.process_registry import ProcessRegistry
+    from tools.process_registry import ProcessRegistry, ProcessSession
 
     runner = served.runner
     import os
-    entry = {"session_id": "proc_alpha01", "pid": os.getpid(), "pid_scope": "host", "command": "sleep 1",
-             "started_at": 1.0, "watcher_interval": 5, "notify_on_complete": True,
-             "session_key": "agent:alpha:telegram:dm:1001"}
-    (served.alpha / "processes.json").write_text(json.dumps([entry]))
+    # Use the producer's actual root-process contract, including explicit empty
+    # ownership and its PID-start identity, rather than incomplete legacy metadata.
+    producer = ProcessRegistry()
+    session = ProcessSession(id="proc_alpha01", pid=os.getpid(), pid_scope="host", command="test process",
+                             started_at=1.0, watcher_interval=5, notify_on_complete=True,
+                             session_key="agent:alpha:telegram:dm:1001")
+    producer._running[session.id] = session
+    with _profile_runtime_scope(served.alpha):
+        producer._write_checkpoint()
     registry = ProcessRegistry()
-    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start: True)
 
     recovered = registry.recover_from_checkpoint()
     recovered += runner._recover_secondary_process_checkpoints(registry)
     assert recovered == 1
+    assert registry._running[session.id].owner_task_id == ""
     assert [w["session_id"] for w in registry.pending_watchers] == ["proc_alpha01"]
     # Idempotent across homes: the process-global registry already tracks it.
     assert runner._recover_secondary_process_checkpoints(registry) == 0
