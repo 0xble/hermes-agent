@@ -196,3 +196,7 @@ external-provider suppression. This test adaptation does not change production m
 - **Rollback:** Revert only `fix(skills): stop duplicating root skill names`, restore snapshot version 2 and the prior root-path category expression, remove the focused regression, index row, and this record. No schema, configuration, or persistent-data rollback is required; a later prompt rebuild recreates the prior index.
 - **Retirement:** Retire after a released upstream version classifies root-level skills under `general`, invalidates stale self-qualified snapshots, and passes equivalent root, nested, and plugin-qualified regressions. Remove the fork implementation and duplicate test rather than retaining parallel behavior.
 - **Source references from initial investigation:** `research/DESCRIPTION.md`; `research/SKILL.md`.
+
+## September 15 boundary correction
+
+The static knowledge path resolver combines literal multi-component pathlib constructors using native absolute-component reset semantics. Destructive ancestor checks therefore see the actual literal target. Dynamic arguments remain unresolved under the existing cooperative first-party guard contract. Tests cover terminal refusal, execute-code dispatch and its cwd-aware execution boundary with disposable sentinels; no arbitrary-Python confinement is claimed.

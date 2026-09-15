@@ -133,3 +133,7 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 - **Regression:** Run `scripts/run_tests.sh tests/tools/test_custom_subagents.py tests/tools/test_delegate.py tests/agent/test_custom_subagent_runtime.py tests/agent/test_delegation_frozen_runtime.py tests/agent/test_moa_reasoning_effort.py tests/agent/test_moa_fanout_cadence.py tests/agent/test_turn_facade_lease.py` plus the full suite before publication.
 - **Rollback:** Revert this extension without changing live profile configuration. Existing unnamed delegation and the original explorer/worker roles remain the compatibility baseline.
 - **Additional historical subjects (optional provenance):** `feat(delegate): freeze named subagent fallback, MoA, and resume runtime`; `fix(delegate): preserve pinned Codex fallback endpoint spelling`.
+
+## September 15 boundary correction
+
+MoA prefetched streams use an explicit idempotent iterator owner so closing before the first consumer read releases the already-active transport and its semaphore. Exhaustion and errors also close the source, preserving chunk order and no replay after emitted output. Real prefetch regressions retain the underlying source so garbage collection cannot mask leaks. Revert the owner and close-boundary tests together.

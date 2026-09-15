@@ -359,3 +359,7 @@ after checkout. Existing incompatible branches and tags remain refused. Real Git
 Restart-inbox sweeps register coalesced completion wakeups for excluded adapter tasks and an idle trigger for running-agent slots. The generation-checked release path wakes only keys an earlier sweep excluded. Real adapter and durable-inbox tests verify replay after ordinary turn completion without another reconnect, while shutdown and stale-generation guards remain intact. Revert the idle hooks and their tests together.
 
 Failed update outcomes retain admission independently of outstanding fleet recovery. A persisted exact-outcome acknowledgment prevents duplicate failure notifications across runner reconstruction, while a later changed outcome can still be delivered. Failed transport does not acknowledge delivery. Admission markers remain until fleet ownership resolves. Tests cover pending and claimed requests, nonzero wrappers, failed/incomplete receipts, and later success. Revert the acknowledgment identity exclusion and notification logic together.
+
+## September 15 boundary correction
+
+Queued ordinary events explicitly carrying null metadata now normalize it only when reading the input-owner field. Actual queue admission, consumption and follow-up tests preserve nonempty ownership and reasoning overrides. This does not mutate event metadata or grant authority.
