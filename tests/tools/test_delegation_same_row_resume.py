@@ -36,8 +36,14 @@ def test_resume_accepts_equivalent_normalized_route_without_repinning(monkeypatc
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
         "provider": "fixture", "model": "m", "base_url": "https://fixture/v1/",
         "api_key": "secret", "api_mode": "chat_completions"})
+    original = deepcopy(metadata)
     launch = delegate_tool._resolve_resume_launch({"resume_session_id": "child"}, definitions, parent)
-    assert launch.launch_metadata == metadata
+    expected = deepcopy(original)
+    expected["base_url"] = "https://fixture"
+    expected["base_url_authority_fingerprint"] = __import__("hashlib").sha256(b"https://fixture/v1").hexdigest()
+    assert launch.launch_metadata == expected
+    assert metadata == original
+    assert launch.credentials["base_url"] == "https://fixture/v1/"
     assert launch.reasoning == {"enabled": True, "effort": "high"}
 
 
