@@ -1241,5 +1241,59 @@ def _resolve_node_runtime_npm() -> str | None:
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` to a non-empty name (default ``main``; blank/whitespace = default)."""
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    """CLI target selection reads only updates semantics, not model routes."""
+    branch = getattr(args, "branch", None)
+    if branch is not None:
+        return branch.strip() or "main"
+    from hermes_cli import config, managed_scope
+    from hermes_constants import assert_named_profile_home_live, get_hermes_home
+    try:
+        assert_named_profile_home_live(get_hermes_home())
+    except FileNotFoundError:
+        print("✗ Cannot resolve update channel: named profile is deleted or missing; "
+              "select a live profile or explicitly recreate it.")
+        raise SystemExit(1) from None
+    label = "user"
+    try:
+        with config._CONFIG_LOCK:
+            user_path = config.get_config_path()
+            managed_dir = managed_scope.get_managed_dir()
+            paths = [("user", user_path)]
+            if managed_dir is not None:
+                paths.append(("managed", managed_dir / "config.yaml"))
+            signatures = [config._strict_layer_signature(p) for _, p in paths]
+            merged = {"updates": {"channel": "main"}}
+            for label, path in paths:
+                layer = config.read_config_mapping_strict(path)
+                updates = layer.get("updates", {})
+                if not isinstance(updates, dict):
+                    raise ValueError("updates must be a mapping")
+                # Expand each authored layer independently, then apply the same
+                # managed-last leaf merge as the shared config loader. Never run
+                # unrelated model-preset normalization to select an update target.
+                expanded = config._expand_env_vars(updates)
+                assert isinstance(expanded, dict)
+                if "channel" in expanded and expanded["channel"] not in ("main", "stable"):
+                    raise ValueError("updates.channel must be main or stable")
+                merged = config._merge_config_layer(merged, {"updates": expanded})
+            if (config.get_config_path() != user_path
+                    or managed_scope.get_managed_dir() != managed_dir
+                    or signatures != [config._strict_layer_signature(p) for _, p in paths]):
+                raise ValueError("configuration changed while reading; retry")
+            return merged["updates"]["channel"]
+    except config.ConfigReadError as exc:
+        # YAML exception text can contain source lines, secrets and arbitrary
+        # paths. Expose only an actionable category and numeric location.
+        detail = "invalid YAML or non-mapping root" if exc.parse_failure else "unreadable file; check permissions or broken symlink"
+        mark = getattr(exc.cause, "problem_mark", None)
+        location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        print(f"✗ Cannot resolve update channel: {label} config.yaml {detail}{location}; repair this layer.")
+    except ValueError as exc:
+        allowed = {"updates must be a mapping", "updates.channel must be main or stable",
+                   "configuration changed while reading; retry"}
+        detail = str(exc) if str(exc) in allowed else "invalid update configuration"
+        print(f"✗ Cannot resolve update channel: {label} config.yaml: {detail}.")
+    except Exception as exc:
+        print(f"✗ Cannot resolve update channel: {label} config.yaml could not be read "
+              f"({type(exc).__name__}); check file access and repair this layer.")
+    raise SystemExit(1) from None
