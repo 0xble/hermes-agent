@@ -139,6 +139,7 @@ class ProcessCheckpointMixin:
             self._result_generation += 1
 
     def _recover_live_checkpoint_entry(self, entry) -> bool:
+        from tools.process_registry_results import checkpoint_entry_owner
         from tools.process_registry import (
             ProcessSession, _CHECKPOINT_FIELDS, _CHECKPOINT_DEFAULTS,
             _WATCHER_ROUTE_KEYS, _stop_systemd_unit, _checkpoint_path,
@@ -178,10 +179,18 @@ class ProcessCheckpointMixin:
             else:
                 self._retain_lost_checkpoint_entry(entry, "process identity lost; exit/output unavailable")
             return False
+        owner = checkpoint_entry_owner(entry)
+        explicit_ownerless = entry.get("owner_task_id") == entry.get("task_id") == ""
+        if (any(key in entry and not isinstance(entry[key], str) for key in ("owner_task_id", "task_id"))
+                or (owner is None and not explicit_ownerless)):
+            # PID identity proves which process survived, not which child owns its
+            # effects. Preserve malformed originals as uncertainty instead of
+            # defaulting them to the supported explicitly ownerless root contract.
+            raise ValueError("Live process checkpoint has no valid ownership")
         fields = {f: entry.get(f, _CHECKPOINT_DEFAULTS[f]) for f in _CHECKPOINT_FIELDS}
         fields.update(
             command=entry.get("command", "unknown"),
-            owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
+            owner_task_id=owner or "",
             started_at=entry.get("started_at", time.time()))
         # detached: can't read output, but can report status + kill
         session = ProcessSession(id=entry["session_id"], detached=True, **fields)

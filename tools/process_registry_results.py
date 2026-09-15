@@ -220,6 +220,8 @@ def checkpoint_entry_owner(entry):
         return None
     owner = identity.get("owner_task_id")
     if "completed_result" not in entry:
+        if "owner_task_id" in identity and not isinstance(owner, str):
+            return None  # Invalid raw ownership cannot become a legacy container owner.
         owner = owner or identity.get("task_id")
     return owner if isinstance(owner, str) and owner else None
 

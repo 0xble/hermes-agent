@@ -80,6 +80,8 @@ after checkout. Existing incompatible branches and tags remain refused. Real Git
 
 - Receipt enumeration propagates directory-access failures into the existing owner-scoped resume barrier. Only an absent first-use directory counts as empty. `tests/tools/test_process_receipt_enumeration.py` injects failures at the OS enumeration boundary and proves blocked durable child resume beside normal first use. No receipt schema or live state changes. Retire only when upstream preserves this uncertainty contract; roll back enumeration and its regression together.
 
+- Healthy live PIDs do not establish checkpoint ownership. Missing/invalid ownership remains an uncertainty fence across recovery and later writes. The explicit empty owner/task pair produced for root processes stays supported, as does validated legacy task ownership. Invalid raw owner metadata cannot be reinterpreted as a container owner. `tests/tools/test_live_checkpoint_ownership.py` covers real PID identity, preserved malformed records, owner-scoped barriers and these compatibility controls without signaling processes. Roll back validation and its regressions together; preserve unknown records until reconciliation.
+
 - Preserve updater completion verification through upstream dependency-repair decomposition; all updater exercises in this source run use isolated test doubles, not installed-runtime updates.
 
 - Adopt upstream's `_interrupt_running_turn` sync core and `_drop_turn_slot` guarded release. The fork's /stop contracts — generation-owned continuation and restart-turn stop-owner cancellation — are re-expressed in the async `_interrupt_and_clear_session` wrapper, not duplicated in the sync core.
