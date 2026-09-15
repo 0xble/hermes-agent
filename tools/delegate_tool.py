@@ -1365,74 +1365,74 @@ def delegate_task(
     task_runtime, err = _preflight_task_runtime(task_list, cfg, credentials_cfg, parent_agent, creds)
     if err:
         return tool_error(err)
-    from tools.delegation_history import prepare_task_histories
-    try:
-        task_histories = prepare_task_histories(
-            task_list, task_runtime, parent_agent,
-            independent_review=(child_tool_policy == "inspection_only"
-                                or (completion_contract or {}).get("kind") == "native_review_result_v1"),
-        )
-    except ValueError as exc:
-        _release_resume_launches(parent_agent, task_runtime)
-        return tool_error(str(exc))
-    resumes = [launch for launch in task_runtime if launch.resume_session_id]
-    if resumes:
-        identities = [(launch.launch_metadata or {}).get("card_identity") for launch in resumes]
-        if (len(resumes) != len(task_runtime) or any(not _valid_card_identity(i) for i in identities)
-                or any(t.get("replaces") is not None for t in task_list)
-                or len({i["parent_task_id"] for i in identities}) != 1
-                or any(i.get("owner") != identities[0].get("owner") for i in identities)
-                or any(not delegation_owner_matches(i.get("owner"), _owner,
-                           getattr(parent_agent, "_session_db", None)) for i in identities)
-                or any((i or {}).get("original_call", {}).get("parent_task_id", (i or {}).get("parent_task_id")) != (i or {}).get("parent_task_id")
-                       for i in identities if isinstance((i or {}).get("original_call"), dict))
-                or (parent_task_id and parent_task_id != identities[0]["parent_task_id"])):
-            _release_resume_launches(parent_agent, task_runtime)
-            return tool_error("Resume requires exact owned logical card identities from one batch; split unrelated continuations. Legacy/uncheckpointed identity requires explicit reconciliation.")
-        # The requesting tip gains authority, never ownership of the old row.
-        if _card_owner == _owner:
-            _card_owner = deepcopy(identities[0]["owner"])
-        _owner = deepcopy(identities[0]["owner"])
-        parent_task_id = identities[0]["parent_task_id"]
-        effective_labels = [i["task_label"] for i in identities]
-    try:
-        from tools.async_delegation import reserve_delegation_metadata
-        _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
-            task_labels=effective_labels or [], session_db=getattr(parent_agent, "_session_db", None),
-            **({"resume_refs": [i["thread_ref"] for i in identities],
-                "resume_original_calls": [i.get("original_call") for i in identities]}
-                if resumes else {}))
-    except ValueError as exc:
-        _release_resume_launches(parent_agent, task_runtime)
-        return tool_error(str(exc))
-    if _card_owner == _owner:
-        _card_owner = deepcopy(_metadata["owner"])
-    _owner = deepcopy(_metadata["owner"])
-    _metadata["attempts"] = {ref: ((task_runtime[i].launch_metadata or {}).get("card_identity", {}).get("attempt", 0) + 1
-                                 if task_runtime[i].resume_session_id else 0)
-                            for i, ref in enumerate(_metadata["thread_refs"])}
-    for task in task_list:
-        replacement = task.get("replaces")
-        if replacement is not None:
-            if not isinstance(replacement, dict) or set(replacement) != {"parent_task_id", "thread_ref"}:
-                _release_resume_launches(parent_agent, task_runtime)
-                _release_replacement_claims(parent_agent, task_list)
-                return tool_error("replaces must name an exact parent_task_id and thread_ref")
-            # The caller owns the identity before a callback can persist and lose
-            # its reply. It is internal-only (the public replaces shape above is
-            # exact), and cleanup can cancel even a not-yet-committed validation.
-            claim_id = uuid.uuid4().hex
-            task["replaces"] = {**replacement, "claim_id": claim_id}
-            try:
-                claim = _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]],
-                                       "validate_replacement", claim_id)
-                task["replaces"] = {**replacement, "claim_id": claim["claim_id"], "attempt": claim["attempt"]}
-            except (ValueError, TimeoutError) as exc:
-                _release_resume_launches(parent_agent, task_runtime)
-                _release_replacement_claims(parent_agent, task_list)
-                return tool_error(str(exc))
     children = []
     try:
+        from tools.delegation_history import prepare_task_histories
+        try:
+            task_histories = prepare_task_histories(
+                task_list, task_runtime, parent_agent,
+                independent_review=(child_tool_policy == "inspection_only"
+                                    or (completion_contract or {}).get("kind") == "native_review_result_v1"),
+            )
+        except ValueError as exc:
+            _release_resume_launches(parent_agent, task_runtime)
+            return tool_error(str(exc))
+        resumes = [launch for launch in task_runtime if launch.resume_session_id]
+        if resumes:
+            identities = [(launch.launch_metadata or {}).get("card_identity") for launch in resumes]
+            if (len(resumes) != len(task_runtime) or any(not _valid_card_identity(i) for i in identities)
+                    or any(t.get("replaces") is not None for t in task_list)
+                    or len({i["parent_task_id"] for i in identities}) != 1
+                    or any(i.get("owner") != identities[0].get("owner") for i in identities)
+                    or any(not delegation_owner_matches(i.get("owner"), _owner,
+                               getattr(parent_agent, "_session_db", None)) for i in identities)
+                    or any((i or {}).get("original_call", {}).get("parent_task_id", (i or {}).get("parent_task_id")) != (i or {}).get("parent_task_id")
+                           for i in identities if isinstance((i or {}).get("original_call"), dict))
+                    or (parent_task_id and parent_task_id != identities[0]["parent_task_id"])):
+                _release_resume_launches(parent_agent, task_runtime)
+                return tool_error("Resume requires exact owned logical card identities from one batch; split unrelated continuations. Legacy/uncheckpointed identity requires explicit reconciliation.")
+            # The requesting tip gains authority, never ownership of the old row.
+            if _card_owner == _owner:
+                _card_owner = deepcopy(identities[0]["owner"])
+            _owner = deepcopy(identities[0]["owner"])
+            parent_task_id = identities[0]["parent_task_id"]
+            effective_labels = [i["task_label"] for i in identities]
+        try:
+            from tools.async_delegation import reserve_delegation_metadata
+            _metadata = reserve_delegation_metadata(parent_task_id=parent_task_id, owner=_owner,
+                task_labels=effective_labels or [], session_db=getattr(parent_agent, "_session_db", None),
+                **({"resume_refs": [i["thread_ref"] for i in identities],
+                    "resume_original_calls": [i.get("original_call") for i in identities]}
+                    if resumes else {}))
+        except ValueError as exc:
+            _release_resume_launches(parent_agent, task_runtime)
+            return tool_error(str(exc))
+        if _card_owner == _owner:
+            _card_owner = deepcopy(_metadata["owner"])
+        _owner = deepcopy(_metadata["owner"])
+        _metadata["attempts"] = {ref: ((task_runtime[i].launch_metadata or {}).get("card_identity", {}).get("attempt", 0) + 1
+                                     if task_runtime[i].resume_session_id else 0)
+                                for i, ref in enumerate(_metadata["thread_refs"])}
+        for task in task_list:
+            replacement = task.get("replaces")
+            if replacement is not None:
+                if not isinstance(replacement, dict) or set(replacement) != {"parent_task_id", "thread_ref"}:
+                    _release_resume_launches(parent_agent, task_runtime)
+                    _release_replacement_claims(parent_agent, task_list)
+                    return tool_error("replaces must name an exact parent_task_id and thread_ref")
+                # The caller owns the identity before a callback can persist and lose
+                # its reply. It is internal-only (the public replaces shape above is
+                # exact), and cleanup can cancel even a not-yet-committed validation.
+                claim_id = uuid.uuid4().hex
+                task["replaces"] = {**replacement, "claim_id": claim_id}
+                try:
+                    claim = _card_handling(parent_agent, replacement["parent_task_id"], [replacement["thread_ref"]],
+                                           "validate_replacement", claim_id)
+                    task["replaces"] = {**replacement, "claim_id": claim["claim_id"], "attempt": claim["attempt"]}
+                except (ValueError, TimeoutError) as exc:
+                    _release_resume_launches(parent_agent, task_runtime)
+                    _release_replacement_claims(parent_agent, task_list)
+                    return tool_error(str(exc))
         creds = dict(task_runtime[0].credentials)
 
         overall_start = time.monotonic()
@@ -1508,8 +1508,12 @@ def delegate_task(
         )
     except BaseException:
         try:
-            _release_resume_launches(parent_agent, task_runtime)
-            _release_replacement_claims(parent_agent, task_list)
+            # Setup owns both reservations until the runner receives the batch.
+            # One failed compensation must not hide the setup error or skip the other.
+            with _quiet("Resume setup compensation failed; preserve claim: %s", exc_info=True):
+                _release_resume_launches(parent_agent, task_runtime)
+            with _quiet("Replacement setup compensation failed; preserve claim: %s", exc_info=True):
+                _release_replacement_claims(parent_agent, task_list)
         finally:
             # Ownership passes to the runner only after batch setup succeeds.
             for _, _, child in children:

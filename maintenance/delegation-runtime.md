@@ -64,6 +64,8 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 - Failed child construction closes allocated agents and releases their SessionDB references through the existing teardown owner, including post-constructor setup, partial sibling batches and pre-run batch handoff. Successful children remain owned by the runner. `tests/tools/test_delegate_allocation_cleanup.py` verifies real allocation/reference counts and both failed and successful ownership transfers. Rollback must preserve active-run and resume-claim ownership.
 
+- The same setup cleanup boundary starts immediately after resume preflight consumes its exact batch claim. History, identity, metadata-storage and replacement-validation failures before child construction compensate the owned claims, preserving existing validation errors and propagating other setup exceptions. Compensation failures do not mask the primary error or prevent the other claim cleanup. Exact claim IDs, active-turn-lease guards and launched replacement ownership remain authoritative. `tests/tools/test_delegate_setup_compensation.py` drives registered delegation through real SQLite sibling claims, reservation failure and durable replacement cancellation, including successor and active-lease refusal. Rollback must not reopen the post-preflight claim leak.
+
 - Use upstream's canonical `SCHEMA_SQL` reconciliation for async delegations, including the fork's recovery and presentation metadata and counter tables. Retain stable display references and exact ownership.
 
 ## Maintained patch index
