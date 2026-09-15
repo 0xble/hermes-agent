@@ -2478,6 +2478,7 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    worker_state: Optional[dict] = None,
 ) -> _RunResult:
     """Return DeferredRun for pre-agent contention, otherwise
     (success, full_output_doc, final_response, error).
@@ -2494,6 +2495,8 @@ def run_job(
     existing caller is unchanged.
     ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
     to the stored prompt for this fire only — never persisted to the job definition.
+    ``worker_state``: caller-owned holder for the exact model-worker Future, so durable
+    completion can wait for execution to stop even when this function returns a timeout.
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
@@ -2515,7 +2518,7 @@ def run_job(
     completion_script = str(job.get("completion_script") or "").strip()
     completion_snapshot: Optional[bytes] = None
     completion_failed = False
-    _worker_state: dict = {}
+    _worker_state: dict = worker_state if worker_state is not None else {}
     scope = _CronRunScope(job, job_id, execution_id)
     try:
         if completion_script:
@@ -3216,14 +3219,25 @@ def _run_one_job_body(
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
 
+        worker_state: dict = {}
         _run_kwargs = {
             "defer_agent_teardown": _deferred_agents,
             "extra_prompt": extra_prompt,
-            "execution_id": execution_id}
+            "execution_id": execution_id,
+            "worker_state": worker_state}
         if fire_claim_lost is not None:
             _run_kwargs["cancel_event"] = fire_claim_lost
         try:
-            result = run_job(job, **_run_kwargs)
+            try:
+                result = run_job(job, **_run_kwargs)
+            finally:
+                # A timeout result is not proof the model worker stopped. Keep
+                # this fire's outer heartbeat alive and defer every terminal
+                # side effect until the exact worker has relinquished execution.
+                # Late worker results never replace the recorded timeout.
+                worker_future = worker_state.get("future")
+                if worker_future is not None:
+                    concurrent.futures.wait({worker_future})
             if isinstance(result, DeferredRun):
                 # All scheduler entry points share this finalizer. No completion verifier,
                 # output/context_from document, failure alert, or normal advancement applies.
