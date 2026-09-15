@@ -269,11 +269,12 @@ are retained. No refork, raw database edits or automatic restart after a new sto
 
 Each result includes `child_session_id`. A later task may pass it as
 `resume_session_id` to append a new user turn to the same named child's durable
-conversation. Reaching the global 250-iteration segment limit is reported as
+conversation. Reaching the global `delegation.max_iterations` segment limit
+(default: 250) is reported as
 `status: budget_exhausted` with `exit_reason: max_iterations`; it is a checkpoint,
 not completion. Hermes never starts another segment automatically. The parent
-must explicitly resume, and every resumed turn receives the same configured
-250-iteration limit rather than an unlimited or role-specific budget.
+must explicitly resume, and every resumed turn receives that configured limit
+rather than an unlimited or role-specific budget.
 
 Hermes resolves compression continuations, preserves the existing workspace and
 session lineage, reloads history only after acquiring the native session turn
@@ -286,7 +287,7 @@ an old tool call or interrupted work whose external effects are unknown.
 
 Named children receive shared authorized skill discovery, launch-time standing
 memory, and read-only memory-provider/session retrieval. They do not receive the
-parent transcript automatically. Pass task context explicitly. Provider tools
+parent transcript in `fresh` mode. Pass task context explicitly. Provider tools
 without a declared read-only contract are unavailable to these children. Result
 metadata lists skipped or failed providers in `unavailable_memory_providers`;
 the parent must not claim retrieval from those providers. Hindsight
@@ -342,8 +343,8 @@ restores the ordinary selection surface.
 
 ## How Subagent Context Works
 
-:::warning Critical: Subagents Know Nothing
-Subagents start with a **completely fresh conversation**. They do not automatically receive the parent's conversation history or prior tool calls. Pass the task-specific brief through `goal` and `context`. Named custom subagents also receive their standing instructions and authorized read-only shared knowledge.
+:::warning Supply context for the selected mode
+With `context_mode: "fresh"`, subagents do not receive the parent's conversation history or prior tool calls. With `"fork"`, they receive a one-time reference snapshot of the current context window. The task can override its named role's default; `owner` defaults to `fork`, while other roles and unnamed children default to `fresh`. See [Conversation context](#conversation-context-context_mode) for forced-fresh and resume rules. Pass the task-specific brief through `goal` and `context`. Named custom subagents also receive their standing instructions and authorized read-only shared knowledge.
 :::
 
 ### Four things "isolated" does not mean
@@ -352,7 +353,7 @@ Subagents start with a **completely fresh conversation**. They do not automatica
 are worth stating outright, because conflating them leads to wrong assumptions
 about what a child can do:
 
-1. **Conversation isolation is not filesystem isolation.** A child gets a fresh
+1. **Conversation isolation is not filesystem isolation.** A child gets its own
    conversation and its own terminal session, but by default it shares the
    parent's working directory and the whole filesystem. Set
    `delegation.worktree_isolation: true` for a separate git worktree per child;
@@ -373,7 +374,7 @@ about what a child can do:
 
 One exception: when the parent has a resolved workspace directory, every subagent's system prompt embeds that workspace's **project context files** (`.hermes.md` > AGENTS.md chain > CLAUDE.md > `.cursorrules` — the same discovery, priority, and size caps as the main agent's system prompt; SOUL.md is excluded). Subagents working in a repo operate under the repo's own conventions without having to rediscover them.
 
-This means the parent agent must pass **everything** the subagent needs in the call:
+In `fresh` mode, the parent agent must pass the task-specific context the subagent needs in the call:
 
 ```python
 # BAD - subagent has no idea what "the error" is
@@ -654,7 +655,7 @@ delegation:
   max_iterations: 60   # lower it for fleets of simple tasks, raise it for long investigations
 ```
 
-The limit applies to each explicitly started segment. A child that exhausts its budget returns `status: budget_exhausted` with `exit_reason: max_iterations` and `truncated: true`, so the parent can tell a budget stop from a completed task. That is a resumable checkpoint: Hermes does not treat the task as completed, remove the limit, or start another segment on its own — see [Continue a completed or budget-exhausted child](#continue-a-completed-or-budget-exhausted-child).
+The limit applies to each explicitly started segment. A child that exhausts its budget returns `status: budget_exhausted` with `exit_reason: max_iterations` and `truncated: true`, so the parent can tell a budget stop from a completed task. That is a resumable checkpoint: Hermes does not treat the task as completed, remove the limit, or start another segment on its own — see [Continue a completed or interrupted child](#continue-a-completed-or-interrupted-child).
 
 ## Child Timeout
 
