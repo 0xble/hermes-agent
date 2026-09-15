@@ -23,6 +23,7 @@ import fnmatch
 import glob
 import os
 import re
+from pathlib import Path
 import shlex
 
 
@@ -326,6 +327,11 @@ def _python_paths(source: str, depth: int) -> tuple[list[str], list[str], list[s
                 return "."
             if len(node.args) == 1:
                 return path(node.args[0])
+            parts = [path(arg) for arg in node.args]
+            if all(part is not None for part in parts):
+                # pathlib discards preceding segments when a later segment is
+                # absolute. Evaluate literals only, never execute dynamic args.
+                return str(Path(*parts))
         return None
 
     refs = [node.value for node in nodes if isinstance(node, ast.Constant) and isinstance(node.value, str)]
