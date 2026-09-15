@@ -555,13 +555,19 @@ class TurnRunner:
                 # Fall back to the existing non-edit behavior.
                 return False
             groups = groups[1:]
-        for group in groups:
+        for index, group in enumerate(groups):
             result = await self._send_progress_text(st, self._progress_text(group))
-            if result.success and result.message_id:
-                st.progress_msg_id = result.message_id
+            if not result.success:
+                st.progress_msg_id = None
+                st.progress_lines = [line for pending in groups[index:] for line in pending]
+                return True
+            st.progress_msg_id = result.message_id
+            st.can_edit = bool(result.message_id)
         # The newest continuation is the only mutable bubble: keep just its lines so later
         # edits update it instead of replaying the full transcript into new messages.
-        st.progress_lines = groups[-1]
+        # An accepted continuation without an editable ID must not be sent again
+        # by a later content-boundary seal or cancellation drain.
+        st.progress_lines = [] if result.success and not result.message_id else groups[-1]
         return True
 
     def _next_progress_event(self, st):
@@ -572,7 +578,8 @@ class TurnRunner:
     async def _seal_progress_boundary(self, st):
         await self._roll_progress_overflow_if_needed(st)
         if st.progress_lines and st.progress_msg_id is None:
-            await self._progress_send_or_edit(st, self._progress_text(st.progress_lines))
+            if not await self._progress_send_or_edit(st, self._progress_text(st.progress_lines)):
+                return
         await self._flush_progress_edit(st)
         self._reset_progress_bubble(st)
 
@@ -614,8 +621,7 @@ class TurnRunner:
             else:
                 msg = self._progress_absorb(st, raw)
                 if not st.can_edit:
-                    await self._send_progress_text(st, msg)
-                    st.progress_lines.clear()
+                    await self._progress_send_or_edit(st, msg)
                 else:
                     await self._roll_progress_overflow_if_needed(st)
         if st.can_edit and st.progress_lines:
@@ -635,6 +641,18 @@ class TurnRunner:
         Transient network errors (ConnectError, timeouts) must not disable editing; only permanent
         failures (not found, permissions) set can_edit=False. Flood control backs off but keeps editing.
         """
+        if not st.can_edit:
+            # This buffer can include an earlier refused overflow, not just msg.
+            # Retire each accepted group, retaining the first failure and everything after it.
+            groups = self._split_progress_groups(st, st.progress_lines)
+            for index, group in enumerate(groups):
+                result = await self._send_progress_text(st, self._progress_text(group))
+                st.progress_msg_id = None
+                if not result.success:
+                    st.progress_lines = [line for pending in groups[index:] for line in pending]
+                    return False
+            st.progress_lines.clear()
+            return True
         if st.can_edit and st.progress_msg_id is not None:
             result = await self._edit_progress_message(st, st.progress_msg_id, "\n".join(st.progress_lines))
             if result.success:
@@ -646,12 +664,16 @@ class TurnRunner:
                 logger.info("[%s] Progress edit flood control, backing off", st.adapter.name)
             else:
                 st.can_edit = False
-            await self._send_progress_text(st, msg)
-            return True
-        # First tool: send all accumulated text as a new message; editing unsupported: just this line.
-        result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
-        if result.success and result.message_id:
+            result = await self._send_progress_text(st, msg)
+        else:
+            # First tool: send all accumulated text; editing unsupported: just this line.
+            result = await self._send_progress_text(st, "\n".join(st.progress_lines) if st.can_edit else msg)
+        if result.success:
             st.progress_msg_id = result.message_id
+            if not st.can_edit or not result.message_id:
+                st.progress_lines.clear()
+            if not result.message_id:
+                st.can_edit = False
         return True
 
     async def send_progress_messages(self):
