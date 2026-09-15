@@ -861,6 +861,25 @@ class DelegationCards:
             if not card or not self._actor_matches(card, actor_session_id, actor_owner):
                 continue
             async with self.locks.setdefault(self._scope(card), asyncio.Lock()):
+                from gateway.delegation_card_recovery import terminal_states
+
+                recovered = terminal_states(self.path.parents[2], card, item["parent_task_id"], item)
+                for ref, state in recovered.items():
+                    row = card["rows"][ref]
+                    row.update(state=state, terminal_at=self._now(), last_tool=None)
+                    row.pop("activity_reason", None)
+                    row.pop("terminal_reason", None)
+                    # Only the lost callback knew this child's composition turn.
+                    # A prior attempt's retained value cannot authorize nested delivery.
+                    row.pop("result_turn_id", None)
+                    if not row.get("original_call_id"):
+                        row["display_expires_at"] = row["terminal_at"] + presentation.terminal_ttl_seconds(self, item["parent_task_id"])
+                if recovered:
+                    batches.refresh(self, item["parent_task_id"])
+                    anchor = self.cards[self._anchor(item["parent_task_id"])]
+                    anchor["revision"] = anchor.get("revision", 0) + 1
+                    self._queue(item["parent_task_id"])
+                    self._schedule_expiry(item["parent_task_id"])
                 for ref in item.get("thread_refs") or ():
                     row = card["rows"].get(ref)
                     if not row or row["state"] not in _TERMINAL | {"unknown"}:

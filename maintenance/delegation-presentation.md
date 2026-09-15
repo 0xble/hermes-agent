@@ -14,11 +14,23 @@ a lost validation acknowledgement. No production cleanup change was needed.
 Initial background children execute in process-local daemon threads and report
 card events through captured in-memory callbacks. They do not survive a gateway
 process restart. Recovery replays durable `async_delegation` result notifications,
-not claimless `subagent.complete` callbacks. Recovered unknown card rows therefore
-retain the existing admitted-resume claim requirement and conservative retention.
-The contrary review allegation did not establish a production callback path.
-Possible reconciliation of a persisted completion with a lost card update would
-require separately proven durable receipt authority, not relaxation of that guard.
+not claimless `subagent.complete` callbacks. That callback guard retains its
+admitted-resume claim requirement. A separate proven crash window can commit the
+terminal result while its asynchronously scheduled card observation is pending.
+Recovered result notifications now carry their durable delegation IDs into result
+processing. The card's own profile ledger must prove the immutable owner, parent,
+thread, original call, explicit attempt and child session before an unknown row
+can adopt a recorded per-child terminal status. Aggregate batch outcomes,
+presentation and handled receipts are insufficient, and ambiguous or duplicate
+evidence leaves the row unknown. Completed members of a recovered partial unit
+can resolve while its unrecorded siblings remain unknown.
+
+Reconciliation preserves handling, presentation and delivery receipts and prior
+attempt history. It starts the ordinary terminal display window and never
+manufactures a child composition-turn identity or nested delivery receipt.
+`tests/gateway/test_recovered_card_terminal_evidence.py` reproduces the crash
+window through real durable storage, notification injection and card recovery,
+with stale, foreign, missing and conflicting evidence refusals.
 
 Audited presentation dismissal now overrides original-call batch retention,
 including ancestor projection, transport binding and late admission callbacks.

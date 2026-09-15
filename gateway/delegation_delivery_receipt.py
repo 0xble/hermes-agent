@@ -19,13 +19,16 @@ def delivery_metadata_for_event(event: Any, gateway_input_owner: Any) -> dict[st
     if getattr(event, "_restart_inbox_claim", None):
         result["gateway_input_required"] = True
     parent_task_id = metadata.get("delegation_parent_task_id")
+    deliveries = _deliveries(metadata.get("delegation_deliveries"))
     if getattr(event, "internal", False) and parent_task_id:
         result["delegation_results"] = [{
             "parent_task_id": parent_task_id,
             "thread_refs": list(metadata.get("delegation_thread_refs") or []),
             "attempts": dict(metadata.get("delegation_attempts") or {}),
+            "delegation_ids": list(dict.fromkeys(
+                item["delegation_id"] for item in deliveries
+                if isinstance(item["delegation_id"], str))),
         }]
-    deliveries = _deliveries(metadata.get("delegation_deliveries"))
     if getattr(event, "internal", False) and deliveries:
         result["delegation_deliveries"] = deliveries
     return result
