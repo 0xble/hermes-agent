@@ -104,6 +104,18 @@ Config file: `~/.hermes/hindsight/config.json`
 
 ### Automatic source ordering and recovery
 
+Public source URLs omit credentials, query strings and fragments. Generic query
+parameters named `key` or `code` can identify either documents or credentials,
+and extraction results provide no trustworthy canonical document identifier.
+For these ambiguous URLs, private identity includes the extracted content hash
+after credential filtering. Distinct contents remain separate documents instead
+of overwriting each other. Identical content at the same sanitized identity
+coalesces, and changed content gets a new immutable identity rather than a known
+document revision. This preserves evidence without claiming to recover the true
+locator identity. Explicit token rotation and ordinary query-selector versioning
+retain their existing semantics. No raw credential values are added to metadata
+or the journal, and existing remote documents are not migrated or deleted.
+
 Automatic source replacements coordinate through
 `$HERMES_HOME/memories/hindsight-source-operations.sqlite`. Providers sharing that
 journal, endpoint and bank reserve a source before submission. Accepted operation

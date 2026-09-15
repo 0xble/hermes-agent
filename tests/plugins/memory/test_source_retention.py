@@ -445,17 +445,40 @@ def test_valid_sdk_document_without_source_hash_cannot_verify(tmp_path):
 
 
 def test_query_addressed_documents_keep_distinct_private_identities():
-    def candidate(query):
+    def candidate(query, content="Source paragraph. " * 60):
         return discover_source_candidates(_tool_turn("web_extract", {
-            "url": "https://example.com/document?" + query}, "Source paragraph. " * 60),
+            "url": "https://example.com/document?" + query}, content),
             session_id="query-identity", retain_tool_sources=True)[0]
     first = candidate("id=1&token=secret")
     assert first.source_id != candidate("id=2&token=secret").source_id
     assert first.source_id == candidate("id=1&X-Amz-Credential=changed&%74oken=other").source_id
+    assert first.source_id == candidate("id=1&token=rotated", "Updated paragraph. " * 60).source_id
     assert candidate("id=1&id=2").source_id != candidate("id=2&id=1").source_id
     assert candidate("id=").source_id != candidate("").source_id
     assert first.metadata["source_origin"] == "https://example.com/document"
     assert "secret" not in json.dumps(first.metadata)
+
+
+@pytest.mark.parametrize("query_key", ["key", "code", "%6bey", "%2563ode"])
+@pytest.mark.parametrize("tool", ["web_extract", "speech_to_text"])
+def test_ambiguous_query_sources_preserve_contents_without_auth_identity(query_key, tool):
+    def candidate(selector, content, token="fixture-token"):
+        url = f"https://example.com/document?{query_key}={selector}&token={token}"
+        return discover_source_candidates(_tool_turn(tool, {"url": url}, content),
+                                          retain_tool_sources=True)[0]
+
+    first_text, second_text = "Earlier source. " * 80, "Different source. " * 80
+    first = candidate("fixture-selector-a", first_text)
+    second = candidate("fixture-selector-b", second_text)
+    assert first.source_id != second.source_id
+    # Unknown locator semantics: preserve content, without treating auth rotation
+    # as identity or pretending an updated extraction is a known document version.
+    assert first.source_id == candidate("fixture-selector-b", first_text, "rotated-token").source_id
+    assert first.source_id != candidate("fixture-selector-a", second_text).source_id
+    assert first.metadata["source_origin"] == second.metadata["source_origin"] == "https://example.com/document"
+    emitted = json.dumps([vars(first), vars(second)])
+    for value in ("fixture-selector-a", "fixture-selector-b", "fixture-token", "rotated-token"):
+        assert value not in emitted
 
 
 @pytest.mark.parametrize("matches", [True, False])

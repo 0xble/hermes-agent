@@ -5,6 +5,19 @@ requires it on every run and owns shared adoption/publication policy.
 
 ## Coupled current adaptations
 
+Ambiguous generic `key`/`code` URL parameters remain credential-filtered. Successful
+extractions lack a trustworthy canonical identifier, so their private identity
+includes content hash: distinct contents cannot overwrite one another, identical
+content at the same sanitized identity coalesces, and updates become new immutable
+identities rather than inferred document revisions. Explicit credential rotation,
+ordinary selector/version semantics and public URL stripping remain intact.
+`tests/plugins/memory/test_source_retention.py` and `test_source_supersession.py`
+cover encoded keys, web/transcript extraction, safe submission metadata and distinct
+remote document IDs using a fake SDK boundary. No live Hindsight writes or state
+migration are part of this correction. Retire only when released upstream preserves
+the same identity/privacy contract. Roll back the identity fallback and regressions
+together without removing retained documents or unresolved operation records.
+
 Named child execution now carries its read-only knowledge mode into the worker
 thread, where the existing context and subprocess environment propagation enforce
 first-party mutation restrictions. Memory-history rollback checks that authority

@@ -73,6 +73,21 @@ def provider(server):
     return result
 
 
+def test_ambiguous_query_contents_submit_as_distinct_documents():
+    first, _ = versions("https://example.com/document?key=fixture-selector-a&token=fixture-token")
+    _, second = versions("https://example.com/document?key=fixture-selector-b&token=rotated-token")
+    server = Server()
+    p = provider(server)
+    p._retain_source_candidate(first, p._bank_id)
+    p._retain_source_candidate(second, p._bank_id)
+    assert len(server.calls) == 2
+    assert server.calls[0]["document_id"] != server.calls[1]["document_id"]
+    assert not p._deferred_source_candidates
+    emitted = json.dumps(server.calls)
+    for value in ("fixture-selector-a", "fixture-selector-b", "fixture-token", "rotated-token"):
+        assert value not in emitted
+
+
 def accept_preexisting_versions(p, candidates):
     """Seed real accepted-operation tracking from a previous/concurrent producer.
 

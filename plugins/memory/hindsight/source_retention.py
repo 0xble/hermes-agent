@@ -135,18 +135,22 @@ _CREDENTIAL_QUERY_KEYS = frozenset({
 })
 
 
-def _credential_query_key(raw: str) -> bool:
+def _normalized_query_key(raw: str) -> str:
     name = raw
     for _ in range(3):
         decoded = unquote_plus(name)
         if decoded == name:
             break
         name = decoded
-    name = name.casefold().replace("-", "_")
+    return name.casefold().replace("-", "_")
+
+
+def _credential_query_key(raw: str) -> bool:
+    name = _normalized_query_key(raw)
     return name in _CREDENTIAL_QUERY_KEYS or name.startswith(("x_amz_", "x_goog_"))
 
 
-def _url_identity_value(args: dict[str, Any]) -> str:
+def _url_identity_value(args: dict[str, Any], content: str) -> str:
     """Return a private identity input without retaining URL credentials."""
 
     for key in ("url", "source_url", "video_url", "webpage_url"):
@@ -174,8 +178,13 @@ def _url_identity_value(args: dict[str, Any]) -> str:
             # semantics. Only the hash uses this input; public origins stay clean.
             query = "&".join(part for part in parsed.query.split("&")
                              if part and not _credential_query_key(part.partition("=")[0]))
-            if query:
-                return f"{origin}\0query:{query}"
+            identity = f"{origin}\0query:{query}" if query else origin
+            if any(_normalized_query_key(part.partition("=")[0]) in {"key", "code"}
+                   for part in parsed.query.split("&")):
+                # These names may select a document or carry credentials. Without
+                # a canonical ID, retain distinct contents, never their secret values.
+                return f"{identity}\0content:{_sha256_text(content.strip())}"
+            return identity
         except (TypeError, ValueError):
             pass
         return origin
@@ -336,7 +345,7 @@ def _source_payloads(name: str, args: dict[str, Any], result: str) -> Iterable[t
             if page.get("truncated") or "──────── [TRUNCATED] ────────" in content:
                 continue
             source = {"url": url}
-            yield content, _url_value(source), _url_identity_value(source)
+            yield content, _url_value(source), _url_identity_value(source, content)
         return
     if kind == "file_extraction":
         content = envelope.get("content")
@@ -358,7 +367,7 @@ def _source_payloads(name: str, args: dict[str, Any], result: str) -> Iterable[t
         return
     origin = _url_value(args) or _path_value(args)
     if origin:
-        yield content, origin, _url_identity_value(args) or origin
+        yield content, origin, _url_identity_value(args, content) or origin
 
 
 def _verified_file_write(result: str, content: str) -> bool:
