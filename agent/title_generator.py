@@ -1240,7 +1240,7 @@ def choose_topic_icon(
         return selected
 
 
-def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
+def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, clean=True):
     """Persist a title at *source* authority, recovering from name collisions.
 
     The write goes through ``set_auto_title`` (precedence check + write in one
@@ -1261,11 +1261,14 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     Returns the title actually persisted, or None when a higher-authority
     title already held the row (nothing was written).
     """
+    # Always resolved: the collision-suffix loop below sizes its stem against them even when the
+    # caller supplies a title that is already normalized for the store (``clean=False``).
     preferences = _title_preferences()
     effective_max_characters = (
         preferences.max_characters or _MAX_PERSISTED_TITLE_CHARS
     )
-    title = _clean_title(title, effective_max_characters, preferences.max_words)
+    if clean:
+        title = _clean_title(title, effective_max_characters, preferences.max_words)
     if not title:
         return None
     auto_fn = getattr(session_db, "set_auto_title", None)
@@ -1297,7 +1300,12 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
 
     for number in range(2, 10_000):
         suffix = f"#{number}"
-        if preferences.max_words <= 1:
+        if not clean:
+            # An already-normalized title (a human-written Kanban card, sized for the store with
+            # room for this suffix) keeps its exact text: the word/character preferences shape
+            # GENERATED titles, and re-trimming here would rename the card.
+            candidate = f"{title} {suffix}"
+        elif preferences.max_words <= 1:
             stem = _truncate_title(title, effective_max_characters - len(suffix))
             candidate = f"{stem}{suffix}"
         else:
@@ -1635,7 +1643,11 @@ def maybe_auto_title(
         # only competes with the worker for capacity (#111166). Final (``llm``) authority: nothing
         # upgrades it later, and a manual ``/title`` still wins inside ``set_auto_title``.
         try:
-            persisted = _persist_session_title(session_db, session_id, kanban_title, source="llm")
+            # The card title is already normalized and capped for the store (with its own
+            # ellipsis); re-cleaning it to the configured word/character preferences would
+            # trim that marker back off and hide the truncation.
+            persisted = _persist_session_title(
+                session_db, session_id, kanban_title, source="llm", clean=False)
             if persisted and title_callback is not None:
                 try:
                     title_callback(persisted, "llm")
