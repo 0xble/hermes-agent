@@ -1347,6 +1347,7 @@ class _CodexCompletionsAdapter:
         # call_id, so every Responses path normalizes tool history identically and cannot drift.
         from agent.codex_responses_adapter import (
             _chat_messages_to_responses_input,
+            _responses_tools,
             _classify_responses_issuer,
             _wire_model_identity,
             classify_responses_route,
@@ -1432,15 +1433,7 @@ class _CodexCompletionsAdapter:
                     "Auxiliary client: failed to sanitize tool schemas for "
                     "Codex/xAI Responses path: %s", exc,
                 )
-            converted = []
-            for t in tools:
-                fn = t.get("function", {}) if isinstance(t, dict) else {}
-                name = fn.get("name")
-                if name:
-                    converted.append({
-                        "type": "function", "name": name, "description": fn.get("description", ""),
-                        "parameters": fn.get("parameters", {}),
-                    })
+            converted = _responses_tools(tools)
             if converted:
                 resp_kwargs["tools"] = converted
         # Stable prompt-cache routing: key is content-addressed from the static prefix
