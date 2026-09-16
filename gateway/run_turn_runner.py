@@ -663,6 +663,24 @@ class TurnRunner:
                     clock.pop(key, None)
         return now
 
+    def _release_progress_transport_slot(self, st, claimed_at: float, previous: float) -> None:
+        """Give back a cadence slot whose transport call never happened.
+
+        The slot is claimed BEFORE the API await so a concurrent session cannot observe a stale
+        one. A send that fails because the adapter is not connected made no API call, so it must
+        not spend the chat's budget and park the recovery send behind a full interval. Only the
+        claim this call made is released: a newer claim by another session is left alone.
+        """
+        if st.last_edit_ts != claimed_at:
+            return
+        st.last_edit_ts = previous
+        clock = self._edit_clock()
+        if clock is not None and clock.get(st.edit_clock_key) == claimed_at:
+            if previous:
+                clock[st.edit_clock_key] = previous
+            else:
+                clock.pop(st.edit_clock_key, None)
+
     def _defer_progress_edits(self, st, now: float, retry_after: float) -> None:
         """A flood rejection names its own wait: park the whole chat until it elapses."""
         st.retry_deadline = max(getattr(st, "retry_deadline", 0.0), now + retry_after)
@@ -689,7 +707,11 @@ class TurnRunner:
         """Claim chat cadence before transport I/O, or return a server flood wait."""
         if not st.edit_clock_key:
             source = self._ctx.source
-            st.edit_clock_key = "%s:%s" % (getattr(source.platform, "value", source.platform), source.chat_id)
+            # The cadence key only has to be stable per chat; a source without a platform
+            # (relay/native card paths that carry the chat alone) still gets its own lane
+            # rather than crashing the publish it is meant to pace.
+            platform = getattr(source, "platform", "")
+            st.edit_clock_key = "%s:%s" % (getattr(platform, "value", platform), source.chat_id)
         deadlines = self._edit_retry_deadlines()
         while True:
             now = time.monotonic()
@@ -794,10 +816,12 @@ class TurnRunner:
             return SendResult(success=False, error="progress_send_ambiguous", retryable=False)
         if st.progress_send_failed_permanently:
             return SendResult(success=False, error="progress_send_permanently_refused", retryable=False)
+        previous_edit_ts = st.last_edit_ts
         retry_after = await self._claim_progress_transport_slot(st, wait_for_cadence=False)
         if retry_after:
             return SendResult(success=False, error="progress_send_cadence_deferred",
                               retryable=True, retry_after=retry_after)
+        claimed_at = st.last_edit_ts
         ctx = self._ctx
         receipt = asyncio.create_task(st.adapter.send(
             chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
@@ -829,7 +853,14 @@ class TurnRunner:
             retry_after = self._note_edit_retry_after(st, result)
             error_kind = getattr(result, "error_kind", None) or classify_send_error(
                 None, getattr(result, "error", "") or "")
-            if (not retry_after and not getattr(result, "retryable", False)
+            # A disconnected adapter ("Not connected", every platform's wording for "the client
+            # is not up yet") made no API call and reconnects on its own, so it is transient in
+            # the only sense this latch cares about. Latching on it silenced progress for the
+            # whole turn even after the transport recovered mid-turn.
+            disconnected = "not connected" in (getattr(result, "error", "") or "").lower()
+            if disconnected:
+                self._release_progress_transport_slot(st, claimed_at, previous_edit_ts)
+            if (not retry_after and not disconnected and not getattr(result, "retryable", False)
                     and error_kind not in {"transient", "rate_limited"}):
                 st.progress_send_failed_permanently = True
         return result
