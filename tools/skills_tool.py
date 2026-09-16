@@ -308,12 +308,17 @@ def _resolve_plugin_skill(name, file_path, task_id, preprocess):
     return None, (f"{namespace}/{bare}" if bare else None)  # plugin not found → local scan
 
 
-def _under_any(path: Path, dirs) -> bool:
-    """True when ``path`` (resolved where possible) lives under one of ``dirs``."""
-    resolved = path
-    with suppress(Exception):
-        resolved = path.resolve()
-    return any(resolved.is_relative_to(d) for d in dirs)
+def _under_any(path: Path, dirs, *, resolve: bool = True) -> bool:
+    """True when ``path`` lives under one of ``dirs``.
+
+    Resolved containment is the default security check; lexical containment is
+    used only for explicitly configured external symlink farms.
+    """
+    candidate = path
+    if resolve:
+        with suppress(Exception):
+            candidate = path.resolve()
+    return any(candidate.is_relative_to(d) for d in dirs)
 
 
 def _collect_skill_candidates(name, local_category_name, all_dirs):
@@ -513,7 +518,16 @@ def _check_skill_security(name: str, skill_md: Path, content: str, all_dirs, act
     trusted_dirs = [active_skills_dir.resolve()]
     with suppress(Exception):
         trusted_dirs.extend(d.resolve() for d in all_dirs)
-    if not _under_any(skill_md, trusted_dirs):
+    # Explicit external roots may intentionally be symlink farms (for example,
+    # managed entries into a generated build tree).  Trust the lexical entry
+    # only at that configured boundary; profile/local roots remain resolved-only
+    # so an unconfigured symlink cannot escape into arbitrary content.
+    external_dirs = []
+    with suppress(Exception):
+        from agent.skill_utils import get_external_skills_dirs
+        external_dirs = get_external_skills_dirs()
+    externally_configured = _under_any(skill_md, external_dirs, resolve=False)
+    if not _under_any(skill_md, trusted_dirs) and not externally_configured:
         logger.warning("Refusing skill '%s' outside configured resolved roots: %s", name, skill_md)
         return _fail(
             f"Skill '{name}' resolves outside configured skill roots. "
