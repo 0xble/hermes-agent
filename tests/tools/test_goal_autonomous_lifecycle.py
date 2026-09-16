@@ -1,5 +1,6 @@
 """Real registry lifecycle: autonomous bookkeeping, durable user stops."""
 
+import os
 import json
 
 import pytest
@@ -52,9 +53,11 @@ def test_autonomous_lifecycle_without_new_user_instruction():
 
 
 def test_resume_releases_active_wait_barrier():
+    # ``wait`` rejects a pid that is not alive on this host, so park on a real one.
+    live_pid = os.getpid()
     assert invoke("set", goal="Wait for the authorized build", max_turns=8)["success"]
-    assert invoke("wait", pid=123456, reason="Build running")["success"]
-    assert saved().status == "active" and saved().waiting_on_pid == 123456
+    assert invoke("wait", pid=live_pid, reason="Build running")["success"]
+    assert saved().status == "active" and saved().waiting_on_pid == live_pid
     assert invoke("resume")["success"]
     assert saved().status == "active" and saved().waiting_on_pid is None
     assert saved().max_turns == 8

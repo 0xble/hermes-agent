@@ -1502,10 +1502,15 @@ def test_connect_creates_state_db_0o600_under_permissive_umask(tmp_path, monkeyp
             assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
 
 
-def test_persist_failure_still_delivers_result_and_frees_slot(monkeypatch):
-    """A failing terminal durable write (locked/full state.db) must not eat the completion
-    event or park the record on ``finalizing`` (#76605, #112030): the event is the only delivery
-    path and ``finalizing`` counts against ``max_concurrent_children`` forever."""
+def test_persist_failure_frees_the_slot_and_delivers_once_persistence_recovers(monkeypatch):
+    """A failing terminal durable write (locked/full state.db) must not park the record on
+    ``finalizing`` (#76605, #112030) — that counts against ``max_concurrent_children`` forever.
+
+    The fork does not deliver the event in-memory on that path: the terminal checkpoint is
+    already durable, and the same-owner retry publishes the exact result exactly once when the
+    write succeeds. So the slot frees immediately and delivery follows recovery, rather than a
+    result being enqueued that no durable row backs.
+    """
     def boom(event, result):
         raise RuntimeError("database is locked")
 
@@ -1514,15 +1519,23 @@ def test_persist_failure_still_delivers_result_and_frees_slot(monkeypatch):
         goal="g", context=None, toolsets=None, role="leaf", model="m", session_key="",
         runner=lambda: {"status": "completed", "summary": "done"}, max_async_children=1,
     )
-    evt = _drain_for(res["delegation_id"])
 
-    assert evt is not None and evt["status"] == "completed" and evt["summary"] == "done"
+    # The slot is released and the record is terminal even though the durable write failed.
     deadline = time.monotonic() + 2.0
     while ad.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert ad.active_count() == 0
     with ad._records_lock:
         assert ad._records[res["delegation_id"]]["status"] == "completed"
+    assert _drain_for(res["delegation_id"], timeout=0.5) is None
+
+    # Once the store accepts the write, the retained result is delivered — once.
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: True)
+    queue = process_registry.completion_queue
+    assert ad.retry_current_owner_terminal_checkpoints(queue) >= 1
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None and evt["status"] == "completed" and evt["summary"] == "done"
+    assert _drain_for(res["delegation_id"], timeout=0.5) is None
 
 
 def test_prune_never_evicts_live_records():
