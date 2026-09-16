@@ -2387,8 +2387,10 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
         job, _cfg if isinstance(_cfg, dict) else {}, str(jc.model)
     )
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
+    # Per-model reasoning config must be keyed to the model actually about to run: after an
+    # auth-fallback swap that is setup.model, not the primary jc.model.
     setup.reasoning_config = _resolve_job_reasoning_config(
-        job, _cfg if isinstance(_cfg, dict) else {}, str(jc.model),
+        job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model or jc.model),
         setup.runtime.get("_hermes_fallback_entry"),
     )
     if "_hermes_fallback_entry" not in setup.runtime:

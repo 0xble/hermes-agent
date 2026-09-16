@@ -1706,12 +1706,16 @@ def _compute_provider_model_snapshots(
 
 def _normalized_inference_axes(
     job: Dict[str, Any],
-) -> Tuple[Optional[str], Optional[str], Optional[str], bool]:
-    """Return the stored inference-routing fields in their semantic form."""
+) -> Tuple[Optional[str], Optional[str], Optional[str], bool, Optional[str]]:
+    """Return the stored inference-routing fields in their semantic form.
+
+    ``model_preset`` is an axis: adopting or clearing one re-points the route just as a
+    provider/model edit does, and the stored snapshots must follow it.
+    """
     return (
         _normalize_job_optional_text(job.get("provider")),
         _normalize_job_optional_text(job.get("model")), _normalize_base_url(job.get("base_url")),
-        bool(job.get("no_agent")),
+        bool(job.get("no_agent")), _normalize_job_optional_text(job.get("model_preset")),
     )
 
 
@@ -1856,8 +1860,13 @@ def create_job(
         or "cron job"
     )
     name = name or label_source[:50].strip()
-    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-        provider=f["provider"], model=f["model"], base_url=f["base_url"], no_agent=f["no_agent"])
+    # A named route resolves at every fire and outranks snapshots, so a preset job must not be
+    # born carrying one: update_job nulls them on adopt, and a stale creation snapshot here
+    # would be the only copy that disagrees.
+    provider_snapshot, model_snapshot = (None, None) if f["model_preset"] else (
+        _compute_provider_model_snapshots(
+            provider=f["provider"], model=f["model"], base_url=f["base_url"],
+            no_agent=f["no_agent"]))
     next_run_at = (
         compute_next_run(parsed_schedule, timezone=normalized_timezone)
         if normalized_timezone else compute_next_run(parsed_schedule)
@@ -2118,7 +2127,7 @@ def update_job(
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         inference_fields_changed = bool(
-            {"provider", "model", "base_url", "no_agent"}.intersection(updates)
+            {"provider", "model", "base_url", "no_agent", "model_preset"}.intersection(updates)
         ) and _normalized_inference_axes(updated) != previous_inference_axes
 
         schedule_changed = (
@@ -2152,7 +2161,12 @@ def update_job(
                 from cron.deferral import reconcile_pending
                 reconcile_pending(job)
                 updated.pop("deferred_run", None)
-        if inference_fields_changed and not updated.get("model_preset"):
+        if inference_fields_changed and updated.get("model_preset"):
+            # A preset resolves at fire time, so a stale creation-time snapshot must not
+            # linger and silently outrank it.
+            updated["provider_snapshot"] = None
+            updated["model_snapshot"] = None
+        elif inference_fields_changed:
             snapshots = _compute_provider_model_snapshots(
                 provider=updated.get("provider"),
                 model=updated.get("model"),

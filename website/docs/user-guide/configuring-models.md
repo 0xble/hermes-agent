@@ -63,8 +63,26 @@ moa:
 A preset definition is flat: `provider`, `model`, optional `reasoning_effort`, and optional
 ordered `fallbacks` only. Fallback entries are themselves inline flat routes; presets cannot
 reference other presets or inherit from one another. At a reference site, do not combine
-`model_preset` with inline route fields. The exception is `fallbacks: []`, which explicitly
-turns off a preset's fallback chain for main, delegation, auxiliary, cron, and platform routes. A main preset
+`model_preset` with inline route fields that would change where the request goes.
+
+Two narrow overrides are allowed beside a reference, because neither forks the route:
+
+- `reasoning_effort` retunes how hard that one site thinks while keeping the preset's
+  provider, model, and fallbacks. The shared definition is unchanged for every other consumer.
+- `fallbacks: []` explicitly turns off a preset's fallback chain for main, delegation,
+  auxiliary, cron, and platform routes.
+
+```yaml
+delegation:
+  model_preset: coding      # openrouter / anthropic/claude-sonnet-4.6
+  reasoning_effort: low     # this site only; the preset still says high
+```
+
+Everything else that selects a route or its credentials stays forbidden next to a
+`model_preset`: `provider`, `model`, `base_url`, `api_key`, `api_mode`, and any inline
+fallback chain. An authored `reasoning_effort` override is preserved across config
+writes, so an unrelated save never silently reverts the site to the preset's effort.
+A main preset
 that declares fallbacks cannot also be combined with a top-level fallback chain. Hermes rejects
 unknown names, malformed definitions, route conflicts, and recursive fallback routes with the
 affected config path. Config writes preserve unchanged references; deliberate route edits stay

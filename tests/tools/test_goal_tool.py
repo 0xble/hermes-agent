@@ -255,6 +255,10 @@ def test_writing_guidance_is_progressively_disclosed(isolated_goal_db):
     assert "Manage tracking autonomously" in ambient
     assert "action='guide'" in ambient
     assert "verbatim request or implementation plan" not in ambient
+    assert "multiple dependent turns" in GOAL_WRITING_GUIDANCE
+    assert "delegated subtask whose parent already owns the durable outcome" in GOAL_WRITING_GUIDANCE
+    assert "Do not weaken, reinterpret, replace, or remove criteria" in GOAL_WRITING_GUIDANCE
+    assert "Execute the work end to end" in GOAL_WRITING_GUIDANCE
     result = call_goal(action="guide", session_id="disclosure")
     assert result["guidance"] == GOAL_WRITING_GUIDANCE
     assert result["state"] is None
