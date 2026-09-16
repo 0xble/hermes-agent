@@ -136,8 +136,9 @@ def test_review_handoff_crosses_agent_gateway_boundary(caplog, persistence_error
 
 @pytest.mark.parametrize("overrides, text, expected", [
     ({"turn_exit_reason": "unknown"}, "", "no response was generated"),
-    ({"failed": True, "error": "review failed"}, "", "review failed"),
-    ({"partial": True, "error": "incomplete"}, "", "Processing stopped"),
+    # A failed turn's raw error stays in the gateway log; the chat gets the curated notice.
+    ({"failed": True, "error": "review failed"}, "", "Something went wrong"),
+    ({"partial": True, "error": "incomplete"}, "", "I had to stop before finishing"),
     ({"failed": True, "failure_reason": "session_persistence_failed:disk"}, "", "disk"),
     ({"interrupted": True, "api_calls": 0}, "", "interrupted before processing"),
     ({"interrupted": True}, "", ""),
