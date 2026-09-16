@@ -438,7 +438,7 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "knowledge-brain"
 
-    def test_configured_external_symlink_farm_is_trusted(self, tmp_path, caplog):
+    def test_configured_external_symlink_escape_is_refused(self, tmp_path, caplog):
         local_root = tmp_path / "local"
         external_root = tmp_path / "external"
         build_root = tmp_path / "build"
@@ -462,8 +462,8 @@ class TestSkillView:
         ):
             result = json.loads(skill_view("managed-skill"))
 
-        assert result["success"] is True
-        assert "outside configured resolved roots" not in caplog.text
+        assert result["success"] is False
+        assert "outside configured resolved roots" in caplog.text
 
     def test_allowlisted_symlink_target_root_does_not_warn(self, tmp_path, caplog):
         local_root = tmp_path / "local"
