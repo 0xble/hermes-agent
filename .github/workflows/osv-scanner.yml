@@ -20,6 +20,11 @@ name: OSV-Scanner
 # The scanner remains fail-closed: known vulnerabilities fail the scan job.
 
 on:
+  workflow_call:
+    outputs:
+      review_status:
+        description: JSON review status emitted by the scanner
+        value: ${{ jobs.emit-status.outputs.review_status }}
   schedule:
     # Weekly scan against main — catches CVEs published after merge for
     # deps that haven't changed since.
