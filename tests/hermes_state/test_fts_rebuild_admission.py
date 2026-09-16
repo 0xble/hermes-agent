@@ -121,6 +121,12 @@ def db(tmp_path):
         pass
 
 
+# The contract is "did not wait out the 30s admission budget", not a latency target: under the
+# parallel runner a genuinely non-blocking call still loses whole seconds to scheduling, so the
+# bound is generous but far below the budget it must not have waited on.
+_NON_BLOCKING_BUDGET_S = 10.0
+
+
 class TestRebuildFtsAdmission:
     def test_rebuild_defers_while_another_process_holds_authority(
         self, db, fast_timeout
@@ -386,7 +392,7 @@ class TestNonContentionErrnoFailsFast:
         t0 = time.monotonic()
         with hermes_state_common.fts_rebuild_admission(db_path) as admitted:
             assert admitted is False
-        assert time.monotonic() - t0 < 2.0
+        assert time.monotonic() - t0 < _NON_BLOCKING_BUDGET_S
 
     def test_retry_deferred_fts_recovery_rebuilds_same_instance(
         self, tmp_path, monkeypatch
@@ -475,7 +481,7 @@ class TestNonContentionErrnoFailsFast:
         t0 = time.monotonic()
         with hermes_state_repair._cross_process_repair_lock(tmp_path / "state.db") as ok:
             assert ok is False
-        assert time.monotonic() - t0 < 2.0
+        assert time.monotonic() - t0 < _NON_BLOCKING_BUDGET_S
 
     @pytest.mark.parametrize(
         "exc, expected",
@@ -537,7 +543,7 @@ class TestDeferredFtsRetryInProcess:
                 )
                 t0 = time.monotonic()
                 assert gw.retry_deferred_fts_recovery() is False
-                assert time.monotonic() - t0 < 2.0
+                assert time.monotonic() - t0 < _NON_BLOCKING_BUDGET_S
                 assert gw._fts_stale is True
                 # Rate limit engaged: an immediate second call is a no-op.
                 assert gw.retry_deferred_fts_recovery() is False
