@@ -340,7 +340,7 @@ def test_finish_already_up_to_date_verifies_runtime_after_catchup(monkeypatch, t
     )
     monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
     monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kwargs: calls.append("repair") or True)
-    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda: calls.append("catchup"))
+    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda **_kwargs: calls.append("catchup"))
     monkeypatch.setattr(update_cmd, "_print_verified_update_completion", lambda message: calls.append(message) or True)
     monkeypatch.setattr(update_cmd, "_m", lambda: SimpleNamespace(
         PROJECT_ROOT=tmp_path,
@@ -368,7 +368,7 @@ def test_deferred_verified_completion_false_exits_partial(monkeypatch, tmp_path)
     calls = []
     monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
     monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **kwargs: True)
-    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda: None)
+    monkeypatch.setattr(update_cmd, "_apply_pending_fleet_restart_catchup", lambda **_kwargs: None)
     monkeypatch.setattr(update_cmd, "_print_verified_update_completion", lambda message: False)
     monkeypatch.setattr(update_cmd, "_write_gateway_update_exit_code", lambda ok: calls.append(("exit", ok)))
     monkeypatch.setattr(update_cmd, "_finalize_receipt", lambda *args, **kwargs: calls.append(args[0]))

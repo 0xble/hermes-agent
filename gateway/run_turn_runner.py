@@ -2432,7 +2432,7 @@ class TurnRunner:
             logger.exception("Gateway goal turn failed before normal completion")
             return self._prepare_failed_goal_result(exc)
 
-    def _prepare_failed_goal_result(self, exc, prefix="Agent turn failed", final_response=None):
+    def _prepare_failed_goal_result(self, exc, prefix="Agent turn failed"):
         from types import SimpleNamespace
         from hermes_cli.goals import GoalManager, _get_session_db
         from hermes_cli.goal_outcomes import prepare_goal_turn
@@ -2450,7 +2450,7 @@ class TurnRunner:
         from gateway.run import _redact_gateway_user_facing_secrets
         # Goal preparation can persist, stream and classify this text before outer reply shaping.
         safe_error = _redact_gateway_user_facing_secrets(str(exc))
-        result = {"final_response": final_response or f"⚠️ {prefix}: {safe_error}", "messages": messages,
+        result = {"final_response": f"⚠️ {prefix}: {safe_error}", "messages": messages,
                   "failed": True, "error": safe_error, "turn_exit_reason": "exception",
                   "completed": False, "api_calls": 0, "tools": [], "session_id": sid}
         prepare_goal_turn(GoalManager(sid), agent, result, is_current=ctx._run_still_current)
@@ -2490,17 +2490,14 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began; the raw text (URLs, status
-            # codes) belongs in the log, and the chat gets the commands that fix it. The goal-turn
-            # preparation still runs so an active goal records this turn's real outcome.
-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc)
-            return self._prepare_failed_goal_result(
-                exc, "Provider authentication failed",
-                final_response=(
-                    "⚠️ I couldn't connect to the AI model service, so this message wasn't processed. "
-                    "Use /login to sign in again, or /model to pick a different model. If it keeps "
-                    "failing, run `hermes doctor` on the host."),
-            )
+            # Model/credential resolution failed before the turn began. The reason is useful and
+            # is surfaced, but only after the same redaction the reply gets: a resolution failure
+            # routinely carries the Authorization header it just tried.
+            from gateway.run import _redact_gateway_user_facing_secrets
+
+            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "",
+                           _redact_gateway_user_facing_secrets(str(exc)))
+            return self._prepare_failed_goal_result(exc, "Provider authentication failed")
         pr = runner._provider_routing
         channel_route = runner._resolve_channel_route_config(ctx.source, ctx.session_key)
         reasoning_config = runner._resolve_session_reasoning_config(
