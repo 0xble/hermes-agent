@@ -54,7 +54,7 @@ export type OnboardingFlow =
       saving: boolean
       status: 'confirming_model'
     }
-  | { message: string; provider?: OAuthProvider; start?: OAuthStartResponse; status: 'error' }
+  | { detail?: string; message: string; provider?: OAuthProvider; start?: OAuthStartResponse; status: 'error' }
 
 export interface DesktopOnboardingState {
   /** null until the first runtime check resolves. Seeded from localStorage so
@@ -182,6 +182,14 @@ let pollTimer: number | null = null
 let providersRefreshPromise: null | Promise<void> = null
 
 const errMessage = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+// One plain sentence for every way a provider sign-in can fail (start, poll,
+// code exchange); the raw error text rides along as `detail` (desktop-09).
+function signInDidNotFinish(provider: OAuthProvider, raw: unknown): { message: string; detail?: string } {
+  const detail = raw instanceof Error ? errMessage(raw) : typeof raw === 'string' ? raw.trim() : ''
+
+  return { message: translateNow('onboarding.signInDidNotFinish', provider.name), detail: detail || undefined }
+}
 
 const patch = (update: Partial<DesktopOnboardingState>) =>
   $desktopOnboarding.set({ ...$desktopOnboarding.get(), ...update })
@@ -669,7 +677,13 @@ export function setOnboardingMode(mode: OnboardingMode) {
   patch({ mode })
 }
 
-export async function refreshOnboarding(ctx: OnboardingContext) {
+/**
+ * `stillWanted`, when given, is re-asked after the readiness round: a background
+ * caller (the `setup.ready` listener) passes it so a user action that started
+ * during the round — opening the API-key form, picking a provider — is never
+ * dismissed by a late "ready".
+ */
+export async function refreshOnboarding(ctx: OnboardingContext, stillWanted?: () => boolean) {
   const source = freeTierGeneration()
 
   // Manual mode (user opened the selector from a working app): never
@@ -683,6 +697,10 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
   }
 
   const runtime = await checkRuntime(ctx)
+
+  if (stillWanted && !stillWanted()) {
+    return false
+  }
 
   if (runtime.ready) {
     completeDesktopOnboarding()
@@ -845,7 +863,7 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
       return
     }
 
-    setFlow({ status: 'error', provider, message: `Could not start sign-in: ${errMessage(error)}` })
+    setFlow({ status: 'error', provider, ...signInDidNotFinish(provider, error) })
   }
 }
 
@@ -870,7 +888,7 @@ async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: Onb
       )
     } else if (status !== 'pending') {
       clearPoll()
-      setFlow({ status: 'error', provider, start, message: error_message || `Sign-in ${status}.` })
+      setFlow({ status: 'error', provider, start, ...signInDidNotFinish(provider, error_message || status) })
     }
   } catch (error) {
     if (generation !== flowGeneration) {
@@ -878,7 +896,7 @@ async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: Onb
     }
 
     clearPoll()
-    setFlow({ status: 'error', provider, start, message: `Polling failed: ${errMessage(error)}` })
+    setFlow({ status: 'error', provider, start, ...signInDidNotFinish(provider, error) })
   }
 }
 
@@ -920,14 +938,14 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
         })
       )
     } else {
-      setFlow({ status: 'error', provider, start, message: resp.message || 'Token exchange failed.' })
+      setFlow({ status: 'error', provider, start, ...signInDidNotFinish(provider, resp.message) })
     }
   } catch (error) {
     if (generation !== flowGeneration) {
       return
     }
 
-    setFlow({ status: 'error', provider, start, message: errMessage(error) })
+    setFlow({ status: 'error', provider, start, ...signInDidNotFinish(provider, error) })
   }
 }
 

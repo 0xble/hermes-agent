@@ -20,10 +20,9 @@ same ``custom > ai > fallback`` precedence in its session importer.
 import hashlib
 import json
 import logging
+import os
 import re
-import threading
 import unicodedata
-from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 
@@ -1573,6 +1572,28 @@ def _session_is_untitled(session_db, session_id: str) -> bool:
         return False
 
 
+def _kanban_task_title() -> Optional[str]:
+    """Kanban worker: the card's title, or ``Kanban task <id>`` when the board can't be read; None elsewhere."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return None
+    try:
+        from hermes_cli import kanban_db, kanban_db_connect
+        from hermes_state import SessionDB
+        with kanban_db_connect.connect_closing() as conn:
+            task = kanban_db.get_task(conn, task_id)
+        title = " ".join((task.title or "").split()) if task is not None else ""
+        # Cards have no length cap; the title store rejects past MAX_TITLE_LENGTH (and the ``#N``
+        # retry suffix needs room), which would leave the worker nameless.
+        cap = SessionDB.MAX_TITLE_LENGTH - 4
+        if len(title) > cap:
+            title = title[: cap - 1].rstrip() + "…"
+    except Exception:
+        logger.debug("Kanban task %s unreadable; naming the session after its id", task_id, exc_info=True)
+        title = ""
+    return title or f"Kanban task {task_id}"
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -1608,6 +1629,22 @@ def maybe_auto_title(
     if user_msg_count >= 1 and not _session_is_untitled(session_db, session_id):
         return
 
+    kanban_title = _kanban_task_title()
+    if kanban_title:
+        # The card already carries a human-written name; an auxiliary model call per spawned worker
+        # only competes with the worker for capacity (#111166). Final (``llm``) authority: nothing
+        # upgrades it later, and a manual ``/title`` still wins inside ``set_auto_title``.
+        try:
+            persisted = _persist_session_title(session_db, session_id, kanban_title, source="llm")
+            if persisted and title_callback is not None:
+                try:
+                    title_callback(persisted, "llm")
+                except Exception:
+                    logger.debug("Kanban task title callback failed", exc_info=True)
+        except Exception:
+            logger.debug("Kanban task title failed", exc_info=True)
+        return
+
     if not is_titleable_user_message(request_text):
         return
 
@@ -1620,10 +1657,11 @@ def maybe_auto_title(
     if user_message:
         apply_instant_title(session_db, session_id, user_message, title_callback)
 
-    # Context vars carry the active Hermes profile and runtime provenance. A
-    # plain daemon thread starts with an empty context and can read the wrong
-    # profile's config or credentials.
-    context = copy_context()
+    # The thread must resolve auxiliary.title_generation (config, provider key, language) for the
+    # profile whose turn this is: a bare Thread starts with an empty context and lands on the launch
+    # profile under multiplex, titling X's session with the default profile's model and billing its key.
+    from agent.memory_provider import spawn_context_thread
+
     worker_kwargs = {
         "failure_callback": failure_callback,
         "main_runtime": main_runtime,
@@ -1633,11 +1671,8 @@ def maybe_auto_title(
     }
     if title_context is not None:
         worker_kwargs["title_context"] = title_context
-    thread = threading.Thread(
-        target=context.run,
-        args=(auto_title_session, session_db, session_id, user_message),
+    spawn_context_thread(
+        auto_title_session, name="auto-title",
+        args=(session_db, session_id, user_message),
         kwargs=worker_kwargs,
-        daemon=True,
-        name="auto-title",
-    )
-    thread.start()
+    ).start()

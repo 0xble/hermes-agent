@@ -1058,6 +1058,7 @@ gateway:
       extra:
         rich_messages: auto    # auto (default), always, or never
         rich_drafts: false     # set true to enable rich draft previews
+        allow_cjk_rich_messages: false
 ```
 
 `rich_messages: true` remains accepted as a compatibility alias for `auto`; `false` maps to `never`.
@@ -1068,7 +1069,20 @@ gateway:
 - **Larger or wider tables** fall back to a **fenced code block** with aligned columns so nothing collapses.
 
 
-This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls the experimental rich draft preview path during Telegram DM streaming and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls the experimental rich draft preview path during Telegram DM streaming and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws.
+
+CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: auto` to opt in to that client-side risk.
+
+If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+||||||| 743140cd822
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+=======
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message.
+
+CJK text (Chinese, Japanese, Korean, and rare Han extensions) stays on the legacy MarkdownV2 path by default because affected Telegram Desktop/macOS clients have rendered Bot API rich messages with overlapping CJK glyph artifacts. If you use an unaffected client and prefer native rich tables/task lists/details/math for CJK payloads, set `allow_cjk_rich_messages: true` alongside `rich_messages: true` to opt in to that client-side risk.
+
+If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+>>>>>>> a09195b1e8d232e8c83b5430da4261970f62a820
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 

@@ -77,7 +77,7 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
 
         shutdown_seen = threading.Event()
 
-        def _stalled():
+        def _one_keepalive_then_block():
             # Emit one keepalive so the watchdog is armed, then block the owner
             # until the Timer has taken the shutdown path. The owner therefore
             # cannot win the deadline race even on a loaded runner.
@@ -86,7 +86,7 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
             yield SimpleNamespace(type="response.in_progress")
 
         adapter, events, shutdown_seen = _adapter_with_recording_client(
-            _stalled(), shutdown_seen=shutdown_seen
+            _one_keepalive_then_block(), shutdown_seen=shutdown_seen
         )
         owner_tid = threading.get_ident()
 

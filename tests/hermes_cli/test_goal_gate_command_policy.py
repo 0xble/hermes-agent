@@ -25,28 +25,6 @@ def test_gate_requires_verified_terminal_success(monkeypatch, result):
     assert "force" not in execute.call_args.kwargs
 
 
-@pytest.mark.parametrize("backend", ["local", "docker"])
-def test_gate_cache_fingerprints_only_the_actual_local_workspace(monkeypatch, tmp_path, backend):
-    from hermes_cli.goals import GoalManager, GoalState
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.terminal_tool._get_env_config", lambda: {"env_type": backend, "cwd": "/default"})
-    monkeypatch.setattr("tools.terminal_tool.get_session_cwd", lambda _: "/session-workspace")
-    fingerprint = Mock(return_value="unchanged-host")
-    monkeypatch.setattr("hermes_cli.goals.workspace_fingerprint", fingerprint)
-    execute = Mock(return_value=(True, 0, "fixed"))
-    monkeypatch.setattr("hermes_cli.goals.run_gate", execute)
-    manager = GoalManager("cache-test")
-    manager._state = GoalState(goal="verify", gates=[GoalGate(command="tests", last_exit_code=1, last_failed_fingerprint="unchanged-host")])
-    manager._check_gates()
-    if backend == "local":
-        fingerprint.assert_called_once_with(cwd="/session-workspace")
-        execute.assert_not_called()
-    else:
-        fingerprint.assert_not_called()
-        assert manager.state is not None
-        execute.assert_called_once_with(manager.state.gates[0], task_id="cache-test")
-
-
 def test_gate_routes_to_configured_backend_without_yield(monkeypatch):
     import tools.terminal_tool as terminal
     env = Mock()

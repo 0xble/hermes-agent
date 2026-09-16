@@ -1263,7 +1263,9 @@ def _new_delegation_id() -> str:
 
 
 def _prune_completed_locked() -> None:
-    """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``."""
+    """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``.
+    ``stalling``/``finalizing`` are still live: evicting one makes the late runner return hit
+    ``_finalize``'s missing-record path and silently drop a real result."""
     completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
@@ -1695,15 +1697,23 @@ def _stale_monitor_loop() -> None:
             return
 
 
+def _stalled_error_text(event_record: Dict[str, Any]) -> str:
+    """Human wording for a force-finalized stall. This string reaches the user (CLI timeline, Desktop
+    async-result card), so it names the task, how long it was silent, and what to do — no issue
+    numbers or worker internals (those stay in the log line and the stall_* metadata)."""
+    goal = " ".join(str(event_record.get("goal") or "").split())
+    label = f'Background task "{goal[:120]}"' if goal else "The background task"
+    quiet = float(event_record.get("_stall_quiet_seconds") or 0)
+    silence = f" after {round(quiet / 60)} min of no progress" if quiet >= 60 else ""
+    return (f"{label} stopped responding{silence} and was cancelled. Nothing else was affected; "
+            "ask me to run it again if you still need it.")
+
+
 def _stalled_result(delegation_id: str, event_record: Dict[str, Any]) -> Dict[str, Any]:
     """Synthetic terminal result for a stalling delegation whose runner never returned."""
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(completed_at - (event_record.get("dispatched_at") or completed_at), 2)
-    error = (
-        f"Async delegation {delegation_id} stalled: the detached subagent stopped making progress "
-        "(no new API calls, tool activity, or streamed tokens), did not respond to interruption, and never "
-        "produced a completion event. The worker may be wedged inside a model API call — this is a known "
-        "failure mode of long-lived gateway processes (#60203). Re-dispatch the task if it is still needed.")
+    error = _stalled_error_text(event_record)
     logger.error("Async delegation %s force-finalized as stalled after %.0fs", delegation_id, duration)
     # Structured stall metadata lets parents/UIs distinguish a stall-monitor
     # kill from other failures without parsing the error string.

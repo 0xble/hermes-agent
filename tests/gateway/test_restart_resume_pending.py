@@ -998,8 +998,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "I'll try to resume it automatically after restart."
+        "⚠️ Hermes is restarting — your current task will be interrupted. "
+        "I'll try to resume it automatically after the restart."
     ]
     assert adapter.sent_calls[0][2] == {"_interim_send": True}
 
@@ -1117,8 +1117,8 @@ async def test_restart_ask_policy_keeps_message_to_resume_hint():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "⚠️ Hermes is restarting — your current task will be interrupted. "
+        "Send any message after the restart and I'll try to resume where you left off."
     ]
 
 

@@ -96,7 +96,6 @@ def test_gate_changes_are_private_until_evaluation_commit(manager, monkeypatch, 
         assert release.wait(10)
         return "done", "old completion", False, None, False
     monkeypatch.setattr(goals, "run_gate", gate)
-    monkeypatch.setattr(goals, "workspace_fingerprint", lambda **kw: "fingerprint")
     monkeypatch.setattr(goals, "judge_goal", judge)
     worker, results, errors = _thread(lambda: manager.evaluate_after_turn("old response"))
     try:
@@ -141,7 +140,6 @@ def test_local_unsaved_gate_edit_preserved_when_storage_unchanged(manager, monke
     manager.add_gate("true")
     manager.state.gates[0].max_retries = 7
     monkeypatch.setattr(goals, "run_gate", lambda *a, **kw: (False, 1, "failed"))
-    monkeypatch.setattr(goals, "workspace_fingerprint", lambda **kw: "fingerprint")
     decision = manager.evaluate_after_turn("working")
     assert decision["should_continue"]
     assert goals.load_goal(manager.session_id).gates[0].max_retries == 7
@@ -231,7 +229,6 @@ def test_cancellation_after_gate_save_discards_the_entire_draft(manager, monkeyp
     baseline = goals.load_goal(manager.session_id).to_json()
     current = [True]
     monkeypatch.setattr(goals, "run_gate", lambda *a, **kw: (True, 0, "passed"))
-    monkeypatch.setattr(goals, "workspace_fingerprint", lambda **kw: "fingerprint")
     def judge(*args, **kwargs):
         assert goals.load_goal(manager.session_id).to_json() == baseline
         current[0] = False

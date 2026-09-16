@@ -57,9 +57,14 @@ def _patch_gateway_discovery():
     phase's fresh ``from hermes_cli.gateway import ...`` then loads an
     UNPATCHED copy of the module — silently discarding every mock here and
     letting real gateway discovery (and real ``os.kill``) run on the dev box.
+
+    The launchd scope is neutralised too: on a macOS host the restart phase
+    derives labels from the profile layout, so a default profile alone hands
+    it ``ai.hermes.gateway`` and the verify step exits 1 (#111866, #110701).
     """
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.update_cmd_fleet._restart_macos_launchd_gateways", lambda *a, **k: None), \
          patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
          patch("hermes_cli.gateway.is_macos", return_value=False), \
          patch("hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", return_value=None), \

@@ -136,6 +136,8 @@ def save_completed_result(session) -> bool:
     record = completed_result_record(session)
     directory = get_hermes_home() / "logs" / "process-results"
     try:
+        from hermes_constants import assert_named_profile_home_live
+        assert_named_profile_home_live(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
         session._result_persist_failed = False
@@ -199,7 +201,9 @@ def _owns_result(owner: str, parent: str | None) -> bool:
         return True
     from hermes_state import SessionDB
 
-    db = SessionDB()
+    # Pure lineage read on the hot path of every retained-result load; a writable open here
+    # was one more writer handle per call inside the gateway (#100896).
+    db = SessionDB(read_only=True)
     try:
         return db.get_compression_tip(parent) == owner
     finally:
