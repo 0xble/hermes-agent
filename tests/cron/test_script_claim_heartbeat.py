@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import contextlib
 import sys
 import threading
+import itertools
 import time
 from unittest.mock import MagicMock, patch
 
@@ -666,7 +667,9 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     last_confirmed_at = []
     cancellation_after = []
     calls = 0
-    clock = iter([0.0, 0.01, 0.04])
+    # The reads themselves are not the contract (see the docstring): hold the last value so an
+    # extra clock read in the run path cannot turn an elapsed-time assertion into StopIteration.
+    clock = itertools.chain([0.0, 0.01], itertools.repeat(0.04))
 
     def heartbeat(*_args, **_kwargs):
         nonlocal calls

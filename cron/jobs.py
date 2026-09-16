@@ -2436,7 +2436,13 @@ def remove_job(job_id: str) -> bool:
             current = next((item for item in jobs if item.get("id") == canonical_id), None)
             if current is None:
                 return False
-            if _claim_is_live(current.get("fire_claim"), _hermes_now(), FIRE_CLAIM_TTL_SECONDS):
+            # A live claim owns the record — except when it is THIS run's own claim: a job
+            # removing itself mid-fire is the supported self-removal path, and the marker
+            # names exactly the job whose run is active here.
+            marker = _self_removal_delivery.get()
+            own_fire = marker is not None and marker.job_id == canonical_id
+            if not own_fire and _claim_is_live(
+                    current.get("fire_claim"), _hermes_now(), FIRE_CLAIM_TTL_SECONDS):
                 return False
             jobs = [j for j in jobs if j.get("id") != canonical_id]
             # Resolve BEFORE saving so a legacy unsafe ID fails closed without a half-applied removal.
