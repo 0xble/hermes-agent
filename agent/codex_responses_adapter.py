@@ -308,12 +308,73 @@ def _derive_responses_function_call_id(call_id: str, response_item_id: Optional[
 
 # --- Schema conversion --------------------------------------------------------
 
+def _strict_schema_compatible(schema: Any, *, root: bool = False) -> bool:
+    """Conservatively recognize a bounded, inline Responses strict subset.
+
+    This is not a full JSON Schema validator or a provider acceptance guarantee.
+    OpenAI supports references/recursive schemas, but we deliberately downgrade
+    them rather than resolve them or rewrite caller schemas. Unknown keywords
+    (including composition/tuple/unevaluated shapes) also fail closed.
+    https://developers.openai.com/api/docs/guides/structured-outputs#supported-schemas
+    """
+    allowed = {
+        "type", "properties", "required", "additionalProperties", "items", "anyOf",
+        "title", "description", "enum", "pattern", "format", "minimum", "maximum",
+        "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minItems", "maxItems",
+    }
+    types = {"object", "array", "string", "number", "integer", "boolean", "null"}
+    pending = [(schema, 1, root)]
+    visited = 0
+    while pending:
+        node, depth, is_root = pending.pop()
+        visited += 1
+        # Local conservative work/depth budgets also terminate Python cycles.
+        if depth > 10 or visited > 5000 or not isinstance(node, dict):
+            return False
+        if not set(node).issubset(allowed):
+            return False
+        kind = node.get("type")
+        if "type" in node and kind is None:
+            return False
+        kinds = kind if isinstance(kind, list) else [kind]
+        if any(not isinstance(k, str) or k not in types for k in kinds):
+            if kind is not None or "anyOf" not in node:
+                return False
+        if not kinds or (is_root and (kind != "object" or "anyOf" in node)):
+            return False
+        if "object" in kinds:
+            props, required = node.get("properties"), node.get("required")
+            if (not isinstance(props, dict) or len(props) + len(pending) + visited > 5000
+                    or node.get("additionalProperties") is not False
+                    or not isinstance(required, list)
+                    or not all(isinstance(key, str) for key in required)
+                    or len(required) != len(set(required)) or set(required) != set(props)):
+                return False
+            pending.extend((child, depth + 1, False) for child in props.values())
+        elif any(key in node for key in ("properties", "required", "additionalProperties")):
+            return False
+        if "array" in kinds:
+            if not isinstance(node.get("items"), dict):
+                return False
+            pending.append((node["items"], depth + 1, False))
+        elif "items" in node:
+            return False
+        if "anyOf" in node:
+            branches = node["anyOf"]
+            if (not isinstance(branches, list) or not branches
+                    or len(branches) + len(pending) + visited > 5000):
+                return False
+            pending.extend((child, depth + 1, False) for child in branches)
+    return True
+
+
 def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
     """Convert chat-completions tool schemas to Responses function-tool schemas."""
     fns = [item.get("function", {}) if isinstance(item, dict) else {} for item in tools or []]
     converted = [
         {
-            "type": "function", "name": fn["name"], "description": fn.get("description", ""), "strict": False,
+            "type": "function", "name": fn["name"], "description": fn.get("description", ""),
+            "strict": (fn.get("strict") is True) and _strict_schema_compatible(fn.get("parameters"), root=True),
             "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
         }
         for fn in fns if _nonblank(fn.get("name"))
