@@ -799,7 +799,7 @@ def skill_manage(
         except Exception as exc:
             return tool_error(f"Could not persist skill observation: {exc}", success=False)
         return json.dumps({"success": True, "observed": True, "observation_id": row["id"],
-                           "message": "Skill recommendation recorded; no skill files changed."})
+                           "message": "Skill recommendation recorded"})
     if operations is not None:
         return _skill_manage_batch(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)

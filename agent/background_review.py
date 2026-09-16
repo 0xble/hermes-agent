@@ -1159,10 +1159,7 @@ def _run_review_fork(
 
 def _publish_review_summary(agent: Any, actions: List[str]) -> None:
     summary = " · ".join(dict.fromkeys(actions))
-    if summary == "Skill recommendation recorded; no skill files changed.":
-        notification = "Skill recommendation saved for review. No skills changed."
-    else:
-        notification = f"💾 Self-improvement review: {summary}"
+    notification = f"💾 Self-improvement review: {summary}"
     agent._safe_print(f"  {notification}")
     if agent.background_review_callback:
         with suppress(Exception):
