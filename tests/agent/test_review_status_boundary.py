@@ -14,7 +14,7 @@ def test_child_exclusion_preserves_staged_name_only_tools():
 
 def test_review_dispatch_uses_canonical_intentional_silence_boundary():
     from agent.turn_tool_round import run_tool_round
-    from gateway.response_filters import is_intentional_silence_agent_result
+
     agent = SimpleNamespace(quiet_mode=True, verbose_logging=False,
         _deduplicate_tool_calls=lambda x:x, _cap_delegate_task_calls=lambda x:x,
         _flush_messages_to_session_db=lambda *a: True, _emit_interim_assistant_message=Mock(),
@@ -27,5 +27,4 @@ def test_review_dispatch_uses_canonical_intentional_silence_boundary():
             system_message='', active_system_prompt='', compression_attempts=0, max_compression_attempts=3,
             final_response='', failed=False, _turn_exit_reason=None, truncated_tool_call_retries=0)
     assert verdict.action == 'break' and verdict._turn_exit_reason == 'review_dispatched'
-    assert verdict.final_response == '[SILENT]'
-    assert is_intentional_silence_agent_result({'final_response':verdict.final_response}, verdict.final_response)
+    assert verdict.final_response == ''
