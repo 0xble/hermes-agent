@@ -1733,14 +1733,14 @@ def _build_dynamic_schema_overrides() -> dict:
     from tools.delegate_tool_config import _get_independent_completions
 
     independent_completions = _get_independent_completions()
-    overrides_params = {**DELEGATE_TASK_SCHEMA["parameters"]}
-    # Copy properties so the static schema dict is never mutated.
-    overrides_params["properties"] = {k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()}
+    from copy import deepcopy
+    # The nested task schema is shared by the registry entry; copy it all the way down so one
+    # config rebuild cannot mutate the static schema or a schema returned by an earlier rebuild.
+    overrides_params = deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
 
     # HERMES-108: advertise ONLY the configured aliases and their selection descriptions. The
     # definitions' ``instructions`` are trusted server-side text and never enter the schema.
-    from copy import deepcopy
     from tools.custom_subagents import advertised_settings, parse_definitions
 
     cfg = _load_config()
@@ -1754,6 +1754,9 @@ def _build_dynamic_schema_overrides() -> dict:
         # untouched (they never consult definitions); say exactly what is invalid.
         definitions = {}
         definition_error = str(exc)
+    overrides_params["properties"]["tasks"]["items"]["properties"]["context_mode"]["description"] = (
+        _build_context_mode_description(definitions, definition_error=definition_error)
+    )
     if definitions:
         task_schema = deepcopy(overrides_params["properties"]["tasks"])
         task_schema["items"]["properties"]["subagent_type"] = {
@@ -1800,6 +1803,35 @@ def _build_subagent_type_description(roles: list) -> str:
         "simple work with yourself rather than delegating it at all.")
     return "\n".join(lines)
 
+
+def _build_context_mode_description(definitions: dict, *, definition_error: str | None = None) -> str:
+    """Describe context defaults from the same parsed definitions used at launch."""
+    if definition_error:
+        return (
+            "Conversation context, separate from model inheritance: fresh uses only your brief; fork "
+            "snapshots the current visible parent window once as reference, never permissions. "
+            "Configured named-role defaults are unavailable because delegation.subagents is invalid; "
+            "unnamed delegation defaults to fresh. Use fresh for independent work/review; fork for task "
+            "takeover or accumulated discussion. Native reviews force fresh. Omit on resume: it retains "
+            "its own history. Unsupported/opaque history fails explicitly; supply a fresh task-relevant "
+            "brief instead."
+        )
+    if definitions:
+        defaults = "; ".join(
+            f"{name}: {definitions[name].context_mode}" for name in sorted(definitions)
+        )
+        role_default = f"Defaults to the selected named role's configured context mode ({defaults});"
+    else:
+        role_default = "No named roles are configured;"
+    return (
+        "Conversation context, separate from model inheritance: fresh uses only your brief; fork snapshots "
+        "the current visible parent window once as reference, never permissions. "
+        f"{role_default} unnamed delegation defaults to fresh. Use fresh for independent work/review; fork "
+        "for task takeover or accumulated discussion. Native reviews force fresh. Omit on resume: it retains "
+        "its own history. Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief "
+        "instead."
+    )
+
 def _p(type_: str, description: str, **extra) -> dict:
     return {"type": type_, **extra, "description": description}
 
@@ -1840,7 +1872,8 @@ DELEGATE_TASK_SCHEMA = {
                         "context_mode": _p("string",
                             "Conversation context, separate from model inheritance: fresh uses only your brief; "
                             "fork snapshots the current visible parent window once as reference, never permissions. "
-                            "Defaults come from the named role (owner: fork; others/unnamed: fresh). Use fresh for "
+                            "Defaults come from the selected named role's configured context mode; unnamed delegation "
+                            "defaults to fresh. Use fresh for "
                             "independent work/review; fork for task takeover or accumulated discussion. "
                             "Native reviews force fresh. Omit on resume: it retains its own history. "
                             "Unsupported/opaque history fails explicitly; supply a fresh task-relevant brief instead.",

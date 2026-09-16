@@ -138,6 +138,77 @@ def test_schema_advertises_configurable_context_separate_from_model(monkeypatch)
     assert "context_mode" not in props["resume_session_id"].get("required", [])
 
 
+@pytest.mark.parametrize(("raw_subagents", "expected"), [
+    ({"owner": {"context_mode": "fresh"}, "planner": {"context_mode": "fork"}},
+     {"owner": "fresh", "planner": "fork"}),
+    ({"owner": {"context_mode": "fork"}, "planner": {"context_mode": "fresh"}},
+     {"owner": "fork", "planner": "fresh"}),
+    ({"owner": {}, "planner": {}}, {"owner": "fork", "planner": "fresh"}),
+    ({"reviewer": {"context_mode": "fork"}}, {"reviewer": "fork"}),
+    ({}, {}),
+])
+def test_registry_context_mode_description_matches_each_configured_role(
+    monkeypatch, raw_subagents, expected,
+):
+    from tools import delegate_tool
+    from tools.registry import registry
+
+    config = {"subagents": {
+        name: {"description": "fixture", "instructions": "fixture", **fields}
+        for name, fields in raw_subagents.items()
+    }}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+    schema = registry.get_definitions({"delegate_task"}, quiet=True)[0]["function"]
+    props = schema["parameters"]["properties"]["tasks"]["items"]["properties"]
+    description = props["context_mode"]["description"]
+    parsed = parse_definitions(config)
+
+    assert "unnamed delegation defaults to fresh" in description
+    for name, definition in parsed.items():
+        expected_mode = resolve_context_mode({}, definition)
+        assert expected[name] == expected_mode
+        assert f"{name}: {expected_mode}" in description
+    if not expected:
+        assert "configured named-role defaults are unavailable" not in description
+
+
+def test_registry_context_schema_is_truthful_for_invalid_config_and_previous_results_stay_stable(
+    monkeypatch,
+):
+    from tools import delegate_tool
+    from tools.registry import registry
+    static_description = (delegate_tool.DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]
+                          ["items"]["properties"]["context_mode"]["description"])
+    assert "selected named role's configured context mode" in static_description
+    assert "owner: fork" not in static_description
+
+    first = {"subagents": {
+        "owner": {"description": "fixture", "instructions": "fixture", "context_mode": "fork"},
+    }}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: first)
+    old_schema = registry.get_definitions({"delegate_task"}, quiet=True)[0]["function"]
+    old_description = old_schema["parameters"]["properties"]["tasks"]["items"]["properties"]["context_mode"]["description"]
+
+    second = {"subagents": {
+        "planner": {"description": "fixture", "instructions": "fixture", "context_mode": "fresh"},
+    }}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: second)
+    new_schema = registry.get_definitions({"delegate_task"}, quiet=True)[0]["function"]
+    new_description = new_schema["parameters"]["properties"]["tasks"]["items"]["properties"]["context_mode"]["description"]
+    assert "owner: fork" in old_description
+    assert "planner: fresh" in new_description
+    assert "owner: fork" not in new_description
+    assert old_description == old_schema["parameters"]["properties"]["tasks"]["items"]["properties"]["context_mode"]["description"]
+
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {
+        "subagents": {"planner": {"description": "fixture", "instructions": "fixture", "context_mode": "invalid"}},
+    })
+    invalid_schema = registry.get_definitions({"delegate_task"}, quiet=True)[0]["function"]
+    invalid_description = invalid_schema["parameters"]["properties"]["tasks"]["items"]["properties"]["context_mode"]["description"]
+    assert "Configured named-role defaults are unavailable" in invalid_description
+    assert "planner: invalid" not in invalid_description
+
+
 def test_real_registry_dispatch_validates_whole_batch_before_children(monkeypatch):
     from tools import delegate_tool as dt
     from tools.registry import registry

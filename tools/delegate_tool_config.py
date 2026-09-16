@@ -105,11 +105,36 @@ def _get_independent_completions() -> bool:
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
 
-def _get_worktree_isolation() -> bool:
-    """delegation.worktree_isolation (bool, default False): each child gets its own
-    git worktree off the parent's HEAD so parallel children never contend for one
-    working copy. Git-only and local-backend-only; otherwise silently ignored."""
-    return bool(_cfg().get("worktree_isolation", False))
+def _get_worktree_isolation():
+    """Return the isolation mode: False, True (best effort), or ``required``.
+
+    Invalid values are errors, never permission to launch in a shared workspace.
+    """
+    raw = _cfg().get("worktree_isolation", False)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value == "required":
+            return "required"
+        if value in {"true", "1", "yes", "on"}:
+            return True
+        if value in {"false", "0", "no", "off", ""}:
+            return False
+    if raw is None:
+        return False
+    raise ValueError("delegation.worktree_isolation must be false, true, or 'required'")
+
+
+def _get_worktree_repo_root() -> Optional[str]:
+    """Optional explicit worktree anchor, expanded but not silently redirected."""
+    raw = _cfg().get("worktree_repo_root")
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str):
+        logger.warning("delegation.worktree_repo_root=%r is invalid; rejecting explicit isolation anchor", raw)
+        return ""
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))
 
 def _get_max_async_children() -> int:
     """Concurrency cap for background delegations == delegation.max_concurrent_children. At capacity a new async

@@ -29,9 +29,14 @@ def _run_git(args, cwd: str, timeout: int = _GIT_TIMEOUT):
     repo the parent sits in and ``worktree add`` runs hooks, so a malicious ``.git/config`` must
     not execute.
     """
+    env = noninteractive_git_env()
+    # A parent shell may export routing variables for an unrelated repository.
+    # Internal probes must follow cwd/explicit anchors, never that ambient repo.
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+        env.pop(key, None)
     return subprocess.run(["git", *harden_git_argv(args)], cwd=cwd, capture_output=True,
                           text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                          stdin=subprocess.DEVNULL, env=noninteractive_git_env())
+                          stdin=subprocess.DEVNULL, env=env)
 
 
 def local_backend_active() -> bool:
@@ -59,23 +64,41 @@ def resolve_repo_root(path: Optional[str]) -> Optional[str]:
     return (result.stdout.strip() or None) if result.returncode == 0 else None
 
 
+def is_linked_worktree(path: Optional[str], repo_root: Optional[str] = None) -> bool:
+    """Whether *path* is an existing linked worktree, not the primary checkout."""
+    if not path or not os.path.isdir(path) or not (Path(path) / ".git").is_file():
+        return False
+    actual = resolve_repo_root(path)
+    return bool(actual and (not repo_root or os.path.realpath(actual) == os.path.realpath(repo_root)))
+
+
 def _ensure_gitignore_entry(repo_root: str) -> None:
-    """Best-effort: keep ``.worktrees/`` out of git status."""
-    gitignore = Path(repo_root) / ".gitignore"
+    """Best-effort: keep ``.worktrees/`` out of git status without changing tracked files."""
     try:
-        existing = gitignore.read_text(encoding="utf-8-sig", errors="replace") if gitignore.exists() else ""
+        excluded = _run_git(["rev-parse", "--git-path", "info/exclude"], cwd=repo_root)
+        if excluded.returncode != 0:
+            return
+        exclude_path = Path(excluded.stdout.strip())
+        if not exclude_path.is_absolute():
+            exclude_path = Path(repo_root) / exclude_path
+        existing = exclude_path.read_text(encoding="utf-8-sig", errors="replace") if exclude_path.exists() else ""
         if ".worktrees/" not in existing.splitlines():
-            with open(gitignore, "a", encoding="utf-8") as f:
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude_path, "a", encoding="utf-8") as f:
                 sep = "\n" if existing and not existing.endswith("\n") else ""
                 f.write(f"{sep}.worktrees/\n")
     except Exception as exc:
-        logger.debug("subagent worktree: could not update .gitignore: %s", exc)
+        logger.debug("subagent worktree: could not update info/exclude: %s", exc)
 
 
-def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[str] = None) -> Optional[Dict[str, str]]:
-    """Create an isolated worktree for one child; None (silent downgrade) outside git/on failure."""
-    repo_root = resolve_repo_root(parent_cwd)
+def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[str] = None,
+                             *, repo_root: Optional[str] = None,
+                             status: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, str]]:
+    """Create an isolated worktree. ``status`` receives a machine-readable outcome."""
+    repo_root = resolve_repo_root(repo_root) if repo_root is not None else resolve_repo_root(parent_cwd)
     if not repo_root:
+        if status is not None:
+            status.update(state="skipped", reason="no_valid_git_repo", repo_root=None)
         return None
     wt_name = f"subagent-{(subagent_id or uuid.uuid4().hex[:8]).replace('/', '-')}"
     branch = f"hermes-subagent/{wt_name}"
@@ -88,12 +111,18 @@ def create_subagent_worktree(parent_cwd: Optional[str], subagent_id: Optional[st
         result = _run_git(["worktree", "add", str(wt_path), "-b", branch, "HEAD"], cwd=repo_root)
     except Exception as exc:
         logger.warning("subagent worktree: creation failed: %s", exc)
+        if status is not None:
+            status.update(state="failed", reason=f"creation_exception:{exc}", repo_root=repo_root)
         return None
     if result.returncode != 0:
         # Common on repos with zero commits (unborn HEAD) — degrade silently.
         logger.warning("subagent worktree: git worktree add failed: %s", result.stderr.strip())
+        if status is not None:
+            status.update(state="failed", reason=f"creation_failed:{result.stderr.strip()[:200]}", repo_root=repo_root)
         return None
     logger.info("subagent worktree created: %s (branch %s)", wt_path, branch)
+    if status is not None:
+        status.update(state="engaged", reason="created", repo_root=repo_root)
     return {"path": str(wt_path), "branch": branch, "repo_root": repo_root, "base_commit": base_commit}
 
 

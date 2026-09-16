@@ -916,10 +916,48 @@ With isolation on:
   defaults, not measurements, so inspect the worktree rather than assuming
   the child produced nothing.
 
-Scope: opt-in, git-only, and local-terminal-backend-only. In a non-git
-directory, on docker/ssh/modal backends, or if worktree creation fails, the
-setting degrades silently to today's shared-workspace behavior — never an
-error.
+Isolation is local-terminal and Git-only, with three configuration modes:
+
+- `false` (default): disabled; shared workspaces report `state: disabled`.
+- `true`: best effort. Unsupported backends or unavailable repositories report
+  `skipped`; creation errors report `failed`, and execution may use the shared workspace.
+- `required`: fail closed before child execution if isolation or its cwd cannot
+  be established. This is working-tree separation, not a filesystem permission sandbox.
+
+Every result carries `worktree_isolation` with `state`, `reason`, and `repo_root`.
+An explicit `delegation.worktree_repo_root` must be a valid repository; an invalid
+anchor is never silently replaced by an unrelated cwd or environment hint.
+Otherwise, the resolved workspace and validated cwd candidates determine the repo.
+`.worktrees/` is excluded through Git's common `info/exclude`, not a tracked
+`.gitignore` edit (including when the parent is itself a linked worktree).
+
+Resume retains the persisted workspace. A verified existing linked worktree reports
+`resumed`. A nonlinked resume reports `disabled` when isolation is off, `skipped`
+in best-effort mode, and `failed` without executing the child in required mode.
+
+### Owned-task prompt cache and decision probes
+
+Kanban lifecycle guidance requires all three: a nonblank `HERMES_KANBAN_TASK`,
+a dispatcher-owned worker context, and the `kanban_show` tool. Initialization and
+the prompt-builder fallback both cache the derived value, including an empty
+result; later ambient environment changes cannot grant or revoke that guidance.
+
+The opt-in decision evaluator has separate role scopes:
+
+```bash
+python scripts/eval_delegation_selection.py --only boundary --roles-source configured
+python scripts/eval_delegation_selection.py --only boundary --roles-source fixture
+```
+
+`configured` copies the active profile's nonsecret role policy read-only into an
+isolated evaluation home and uses the actual generated tool schema. `fixture`
+uses a fixed test-role catalog; a fixture pass is **not** live-role policy coverage.
+Both call the configured parent model while intercepting every tool proposal and
+simulating child results (including planner HTTP 429); neither executes child
+models or real proposed tool effects. Receipts include `roles_source`, the catalog,
+advertised tools, raw messages, route, and an interception-safety verdict.
+Boundary cases use six rounds and a 180-second wall limit; legacy scenarios retain
+sixteen rounds. Unfinished calls are inconclusive, not successful decisions.
 
 ## Delegation vs execute_code
 

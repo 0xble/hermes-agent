@@ -286,8 +286,13 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
     # the kanban_show fallback covers code paths that bypass agent_init.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance is None and "kanban_show" in names:
-        _kanban_guidance = KANBAN_GUIDANCE
+    if _kanban_guidance is None:
+        _task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        _owned_worker = is_dispatcher_owned_worker_context()
+        _kanban_guidance = KANBAN_GUIDANCE if (
+            _task_id and _owned_worker and "kanban_show" in names) else ""
+        agent._kanban_worker_guidance = _kanban_guidance
     # session_search is transcript search. When a provider also supplies durable
     # semantic memory, the model needs the guidance that distinguishes the two —
     # otherwise it treats consolidated memory as if it were a transcript grep.

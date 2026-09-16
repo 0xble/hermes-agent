@@ -25,6 +25,13 @@ from tools.delegate_tool_results import (
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
+
+class WorktreeIsolationRequiredError(RuntimeError):
+    """Required isolation could not be established before child execution."""
+    def __init__(self, reason: str, status: Optional[Dict[str, Any]] = None):
+        super().__init__(reason)
+        self.status = dict(status or {})
+
 def _num(value: Any, default: int = 0) -> int:
     """int() for counters that may be mocks/None on test doubles."""
     return int(value) if isinstance(value, (int, float)) else default
@@ -331,26 +338,50 @@ def _register_child(
     })
     return _subagent_id
 
-def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str]):
-    """Opt-in worktree isolation: own git worktree off the parent's HEAD (the
-    child's terminal starts there). Git-only, local-backend-only; failures
-    degrade silently to the shared workspace. Returns the worktree info or None."""
+def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_id: Optional[str],
+                              status: Optional[Dict[str, Any]] = None):
+    """Set up isolation and return worktree info; optional status receives the receipt."""
     from tools.delegate_tool import _get_worktree_isolation, _resolve_workspace_hint
-    if not _get_worktree_isolation():
+    from tools.delegate_tool_config import _get_worktree_repo_root
+    from tools import subagent_worktree
+    mode = _get_worktree_isolation()
+    status = status if status is not None else {"state": "disabled", "reason": "disabled", "repo_root": None}
+    if not mode:
         return None
-    with _quiet("worktree isolation setup failed: %s"):
-        from tools import subagent_worktree
+    try:
         if not subagent_worktree.local_backend_active():
-            logger.debug("worktree isolation skipped: non-local terminal backend")
+            status.update(state="skipped", reason="nonlocal_terminal_backend")
+            if mode == "required":
+                raise WorktreeIsolationRequiredError(status["reason"], status)
             return None
         _parent_cwd = None
         with _quiet(None):
             from tools.terminal_tool import get_session_cwd as _gsc
             _parent_cwd = _gsc(parent_task_id)
-        return subagent_worktree.create_subagent_worktree(
-            _parent_cwd or _resolve_workspace_hint(parent_agent), subagent_id=subagent_id,
-        )
-    return None
+        explicit = _get_worktree_repo_root()
+        if explicit is not None:
+            anchor = explicit
+            if not subagent_worktree.resolve_repo_root(anchor):
+                status.update(state="failed", reason="invalid_explicit_repo_root")
+                if mode == "required":
+                    raise WorktreeIsolationRequiredError(status["reason"], status)
+                return None
+        else:
+            # Try cwd and hint independently; a home cwd must not suppress a valid hint.
+            candidates = [_parent_cwd, _resolve_workspace_hint(parent_agent)]
+            anchor = next((p for p in candidates if subagent_worktree.resolve_repo_root(p)), None)
+        info = subagent_worktree.create_subagent_worktree(anchor, subagent_id=subagent_id, status=status)
+        if info is None and mode == "required":
+            raise WorktreeIsolationRequiredError(status.get("reason", "creation_failed"), status)
+        return info
+    except WorktreeIsolationRequiredError:
+        raise
+    except Exception as exc:
+        status.update(state="failed", reason=f"setup_exception:{exc}")
+        logger.warning("worktree isolation setup failed: %s", exc)
+        if mode == "required":
+            raise WorktreeIsolationRequiredError(status["reason"], status) from exc
+        return None
 
 def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     """Hand ``child.close()`` to a Future done-callback and drain its transports.
@@ -446,7 +477,10 @@ def _validate_child_output_schema(
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
-        with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        with delegated_child_context(
+            str(getattr(child, "session_id", "") or ""),
+            read_only_knowledge=getattr(child, "memory_access_mode", None) == "read_only",
+        ):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
                 stream_callback=relay_child_text,
@@ -659,6 +693,7 @@ class _ChildRun:
     child_progress_cb: Any
     child_start: float = field(default_factory=time.monotonic)
     worktree_info: Optional[Dict[str, str]] = None
+    worktree_isolation: Dict[str, Any] = field(default_factory=lambda: {"state": "disabled", "reason": "disabled", "repo_root": None})
     child_task_id: str = ""
     parent_task_id: Optional[str] = None
     wall_start: float = 0.0
@@ -675,6 +710,7 @@ class _ChildRun:
 
     def attach_worktree(self, entry_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Inspect + prune the child worktree, reporting into the entry (no-op without isolation)."""
+        entry_dict["worktree_isolation"] = dict(self.worktree_isolation)
         info = self.worktree_info
         if info is None:
             return entry_dict
@@ -710,17 +746,52 @@ class _ChildRun:
         # Creating a fresh isolated worktree here would silently move the continuation
         # away from the files produced by the previous segment.
         resume_workspace = getattr(self.child, "_delegation_resume_workspace_path", None)
-        self.worktree_info = None if resume_workspace else _create_isolated_worktree(
-            self.parent_agent, self.parent_task_id, self.subagent_id,
-        )
+        if resume_workspace:
+            from tools import subagent_worktree
+            from tools.delegate_tool import _get_worktree_isolation
+            mode = _get_worktree_isolation()
+            if mode == "required":
+                if not subagent_worktree.local_backend_active():
+                    self.worktree_isolation = {"state": "failed", "reason": "unsupported_backend", "repo_root": None}
+                    raise WorktreeIsolationRequiredError("unsupported_backend", self.worktree_isolation)
+                try:
+                    from tools.terminal_tool import record_session_cwd
+                    record_session_cwd(self.child_task_id, resume_workspace)
+                except Exception as exc:
+                    self.worktree_isolation = {"state": "failed", "reason": f"cwd_seed_failed:{exc}", "repo_root": None}
+                    raise WorktreeIsolationRequiredError(self.worktree_isolation["reason"], self.worktree_isolation) from exc
+            repo_root = subagent_worktree.resolve_repo_root(resume_workspace)
+            self.worktree_isolation = {"state": "resumed", "reason": "existing_linked_worktree", "repo_root": repo_root}
+            if not subagent_worktree.is_linked_worktree(resume_workspace, repo_root):
+                state = "failed" if mode == "required" else "skipped" if mode else "disabled"
+                self.worktree_isolation = {"state": state, "reason": "resume_workspace_not_linked" if mode else "disabled", "repo_root": repo_root}
+                if mode == "required":
+                    raise WorktreeIsolationRequiredError(self.worktree_isolation["reason"], self.worktree_isolation)
+            self.worktree_info = None
+        else:
+            try:
+                self.worktree_isolation = {"state": "disabled", "reason": "disabled", "repo_root": None}
+                self.worktree_info = _create_isolated_worktree(
+                    self.parent_agent, self.parent_task_id, self.subagent_id, self.worktree_isolation,
+                )
+            except WorktreeIsolationRequiredError as exc:
+                self.worktree_isolation = {"state": "failed", "reason": str(exc), "repo_root": exc.status.get("repo_root")}
+                raise
         if self.worktree_info is not None:
-            with _quiet("worktree cwd seed failed: %s"):
+            try:
                 from tools.terminal_tool import record_session_cwd as _rsc
                 _rsc(self.child_task_id, self.worktree_info["path"])
-            # The child's context is already built; carry the isolation contract on
-            # the goal message instead (same turn, no system-prompt mutation).
-            from tools.subagent_worktree import build_worktree_context_note
-            self.goal = self.goal + build_worktree_context_note(self.worktree_info)
+            except Exception as exc:
+                self.worktree_isolation.update(state="failed", reason=f"cwd_seed_failed:{exc}")
+                from tools.delegate_tool import _get_worktree_isolation
+                if _get_worktree_isolation() == "required":
+                    raise WorktreeIsolationRequiredError(self.worktree_isolation["reason"], self.worktree_isolation)
+                logger.warning("worktree cwd seed failed: %s", exc)
+                self.worktree_info = None
+            if self.worktree_info is not None:
+                # The child's context is already built; carry the isolation contract on the goal message instead.
+                from tools.subagent_worktree import build_worktree_context_note
+                self.goal = self.goal + build_worktree_context_note(self.worktree_info)
         self.wall_start = time.time()
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
 

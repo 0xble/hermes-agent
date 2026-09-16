@@ -49,7 +49,7 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 
 ## Delegation context modes — source candidate
 
-- **Contract:** [conversation context](../website/docs/user-guide/features/delegation.md#conversation-context-context_mode): overridable fresh/fork independent of capability routing; named owner defaults fork, other roles fresh; native reviews force fresh; same-child resume retains own history. One current outbound-window snapshot, sibling isolation, no archive resurrection/count cap/silent fallback, reference-only portable text and completed tool groups; no parent hierarchy/native replay/permission inheritance. Unsupported media or opaque native checkpoints refuse explicitly.
+- **Contract:** [conversation context](../website/docs/user-guide/features/delegation.md#conversation-context-context_mode): overridable fresh/fork independent of capability routing; each configured named role defaults to its parsed `context_mode` (unset owner still falls back to fork, other unset roles to fresh), while unnamed delegation defaults fresh; invalid role configuration is advertised as unavailable rather than guessed; native reviews force fresh; same-child resume retains own history. One current outbound-window snapshot, sibling isolation, no archive resurrection/count cap/silent fallback, reference-only portable text and completed tool groups; no parent hierarchy/native replay/permission inheritance. Unsupported media or opaque native checkpoints refuse explicitly.
 - **Origin/prior art:** user-approved local role/default policy. Upstream proposal [#91252](https://github.com/NousResearch/hermes-agent/pull/91252) inspected while open at `7e60ebc5d495efa1fba8c25201727c54792ca3cb`; no code adopted. Its transcript-based capped history/fresh fallback does not meet this contract. Retire when released upstream satisfies the complete boundaries, not merely when fork syntax exists.
 - **Verify:** `tests/tools/test_delegation_context_forks.py`, `tests/agent/test_delegation_context_fork_real_loop.py`, existing custom-role, config-schema, review-policy and real SQLite resume suites through `scripts/run_tests.sh`. HTTP tests use a deterministic local SDK transport, not a paid provider.
 - **Rollback/activation:** revert the scoped source change; remove configured context_mode fields before running an older parser. No persisted history rewrite. Landing does not activate an existing gateway; update/restart remains parent-owned and outside this source task.
@@ -139,6 +139,33 @@ This repository tracks `NousResearch/hermes-agent` while carrying a small set of
 - **Regression:** Run `scripts/run_tests.sh tests/tools/test_custom_subagents.py tests/tools/test_delegate.py tests/agent/test_custom_subagent_runtime.py tests/agent/test_delegation_frozen_runtime.py tests/agent/test_moa_reasoning_effort.py tests/agent/test_moa_fanout_cadence.py tests/agent/test_turn_facade_lease.py` plus the full suite before publication.
 - **Rollback:** Revert this extension without changing live profile configuration. Existing unnamed delegation and the original explorer/worker roles remain the compatibility baseline.
 - **Additional historical subjects (optional provenance):** `feat(delegate): freeze named subagent fallback, MoA, and resume runtime`; `fix(delegate): preserve pinned Codex fallback endpoint spelling`.
+
+## September 16 boundary review correction
+
+- Worktree modes: `false` disables isolation; `true` is best effort with explicit
+  state/reason/repo-root receipts; `required` fails closed before child execution.
+  Nonlinked resume workspaces report disabled/skipped/failed respectively; verified
+  linked resumes report resumed. Invalid explicit repository anchors never fall back
+  to unrelated cwd hints. `.worktrees/` is added to Git common `info/exclude`, not to
+  tracked `.gitignore`, including for linked parent worktrees.
+
+- Kanban guidance requires owned task identity, nonblank task marker and tool availability.
+  Both initializer and prompt fallback cache positive **and empty** results; rebuilds
+  do not recompute ambient authority. Tests patch `agent.delegation_context`, the
+  predicate's actual import site.
+- The decision evaluator distinguishes `--roles-source fixture` (fixed generic test
+  roles) from `--roles-source configured` (read-only copy of active nonsecret role
+  policy and defaults, with the runtime's advertised schema retained in receipts).
+  Both use the configured parent model; tools and child results are intercepted.
+  Neither verifies child-provider execution. Previous four fixture passes are not
+  live-role coverage. Configured mode currently supports only the four boundary cases.
+- Boundary cases retain six rounds / 180-second wall limit; legacy cases retain sixteen
+  rounds. Lost dispatch/delegate interception, unaccounted proposals, or unknown bypass
+  tools fail the harness independently of the number of delegations. Provider/deadline
+  failures remain inconclusive. Receipts preserve route, roles_source, catalog, raw
+  proposals/messages, advertised tools and safety verdicts.
+- Regression suites: `test_runtime_boundary_regressions`, `test_kanban_guidance_gate`,
+  `test_delegation_selection_eval` and `tests/scripts/test_eval_delegation_selection.py`.
 
 ## September 15 boundary correction
 

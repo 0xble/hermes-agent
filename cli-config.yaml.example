@@ -1707,6 +1707,8 @@ code_execution:
 # The delegate_task tool spawns child agents with isolated context.
 # Supports single tasks and batch mode (default 3 parallel, configurable).
 delegation:
+  # worktree_isolation: false                     # false/omitted: disabled; true: best effort; "required": fail before child run if unavailable.
+  # worktree_repo_root: "/absolute/repo/path"      # Optional explicit git anchor (supports ~ and $ENV); invalid anchors are never redirected.
   max_iterations: 250                         # Max tool-calling turns per child (default: 250)
   # max_concurrent_children: 10               # Max parallel child agents per batch (default: 10, floor: 1, no ceiling).
                                               # WARNING: values above 10 multiply API cost linearly.

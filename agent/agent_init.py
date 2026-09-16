@@ -1068,11 +1068,19 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     )
 
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static (kanban_show iff HERMES_KANBAN_TASK); resolve once.
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Kanban guidance is session-static: only an owned, nonblank task with kanban_show
+    # may receive it. Keep an existing cache (including "") stable across env changes.
+    # Task-env gate adapted from KoNit-K, upstream PR #112490; also check local ownership.
+    if not hasattr(agent, "_kanban_worker_guidance"):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+        _owned_worker = is_dispatcher_owned_worker_context()
+        _task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+        agent._kanban_worker_guidance = (
+            KANBAN_GUIDANCE
+            if _task_id and _owned_worker and "kanban_show" in agent.valid_tool_names
+            else ""
+        )
     if agent.quiet_mode:
         return
     if agent.tools:
