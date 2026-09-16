@@ -210,9 +210,12 @@ def _post_image_request(
     import httpx
     from agent.codex_headers import codex_cloudflare_headers
 
-    if gateway and api_mode == "images":
-        payload = {"model": API_MODEL, "prompt": prompt, "size": size,
-                   "quality": quality, "n": 1}
+    if gateway:
+        # An OpenAI-compatible gateway (cli-proxy-api) speaks the plain Images API: multipart for
+        # an edit, JSON otherwise, and only the bearer — never Codex's account/Cloudflare headers.
+        # ``api_mode`` is kept for config compatibility; upstream's streaming ``/responses``
+        # transport is gone, so both values resolve to this native images call.
+        form = {"model": API_MODEL, "prompt": prompt, "size": size, "quality": quality, "n": 1}
         with httpx.Client(timeout=300.0) as http:
             headers = {"Authorization": f"Bearer {token}"}
             if input_images:
@@ -222,16 +225,20 @@ def _post_image_request(
                     data, filename = _load_image_bytes(part["image_url"])
                     files.append(("image[]", (filename, data)))
                 response = http.post(f"{base_url}/images/edits", headers=headers,
-                                     data={k: str(v) for k, v in payload.items()}, files=files)
+                                     data={k: str(v) for k, v in form.items()}, files=files)
             else:
-                response = http.post(f"{base_url}/images/generations", headers=headers, json=payload)
-            response.raise_for_status()
-            items = response.json().get("data", [])
-            if items and items[0].get("b64_json"):
-                return {"b64": items[0]["b64_json"], "source": "final"}
-            return None
+                response = http.post(f"{base_url}/images/generations", headers=headers, json=form)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Codex images API returned HTTP {response.status_code}: "
+                f"{_summarize_error_body(response.text)}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Codex images API returned a non-object body")
+        payload["imagegen_request_id"] = response.headers.get("x-codex-imagegen-request-id")
+        return payload
 
-    headers = {} if gateway else codex_cloudflare_headers(token)
+    headers = codex_cloudflare_headers(token)
     headers.update({
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",

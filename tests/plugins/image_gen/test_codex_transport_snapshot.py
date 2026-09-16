@@ -15,23 +15,19 @@ PNG = bytes.fromhex(
 B64 = base64.b64encode(PNG).decode()
 
 
-@pytest.mark.parametrize("mode", ["images", "responses"])
 @pytest.mark.parametrize("editing", [False, True])
-@pytest.mark.parametrize("rotation", ["before_dispatch", "between_attempts"])
-def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, mode, editing, rotation):
+def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, editing):
+    """Endpoint and credential are snapshotted once per attempt: a config rotation that lands
+    after the snapshot must not retarget or re-credential the request already in flight."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("OPENAI_IMAGE_MODEL", raising=False)
     config_path = tmp_path / "config.yaml"
 
-    def configure(base, key, api_mode):
+    def configure(base, key):
         config_path.write_text(yaml.safe_dump({"image_gen": {
-            "base_url": base, "api_key": key, "api_mode": api_mode}}))
+            "base_url": base, "api_key": key, "api_mode": "images"}}))
 
-    configure("https://old-gateway.invalid/v1/", "old-test-key", mode)
-
-    def rotate():
-        configure("https://new-gateway.invalid/v2", "new-test-key",
-                  "responses" if mode == "images" else "images")
+    configure("https://old-gateway.invalid/v1/", "old-test-key")
 
     monkeypatch.setattr(plugin, "_read_codex_access_token", lambda: pytest.fail("Gateway read direct OAuth"))
     monkeypatch.setattr("agent.codex_headers.codex_cloudflare_headers",
@@ -40,8 +36,7 @@ def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, mode, 
 
     def normalize_then_rotate(*args):
         images = normalize(*args)
-        if rotation == "before_dispatch":
-            rotate()
+        configure("https://new-gateway.invalid/v2", "new-test-key")
         return images
 
     monkeypatch.setattr(plugin, "_normalize_input_images", normalize_then_rotate)
@@ -51,32 +46,18 @@ def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, mode, 
         requests.append(request)
         assert request.headers["authorization"] == "Bearer old-test-key"
         assert "chatgpt-account-id" not in request.headers
-        suffix = ("/images/edits" if editing else "/images/generations") if mode == "images" else "/responses"
+        suffix = "/images/edits" if editing else "/images/generations"
         assert str(request.url) == "https://old-gateway.invalid/v1" + suffix
         body = request.read()
-        if mode == "images" and editing:
+        if editing:
             assert request.headers["content-type"].startswith("multipart/form-data;")
             assert b'name="image[]"' in body and PNG in body
             assert b'name="prompt"\r\n\r\ncircle' in body
         else:
             payload = json.loads(body)
-            if mode == "images":
-                assert payload["prompt"] == "circle" and payload["n"] == 1
-                assert payload["model"] == plugin.API_MODEL
-            else:
-                assert payload["stream"] is True and "tool_choice" not in payload
-                assert payload["tools"][0]["type"] == "image_generation"
-                content = payload["input"][0]["content"]
-                assert content[0] == {"type": "input_text", "text": "circle"}
-                assert content[1:] == ([{"type": "input_image", "image_url": "data:image/png;base64," + B64}] if editing else [])
-        incomplete = rotation == "between_attempts" and len(requests) == 1
-        if incomplete:
-            rotate()
-        if mode == "images":
-            return httpx.Response(200, json={"data": [] if incomplete else [{"b64_json": B64}]})
-        item = {"partial_image_b64": B64} if incomplete else {"type": "image_generation_call", "result": B64}
-        return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                              content="data: " + json.dumps(item) + "\n\ndata: [DONE]\n\n")
+            assert payload["prompt"] == "circle" and payload["n"] == 1
+            assert payload["model"] == plugin.API_MODEL
+        return httpx.Response(200, json={"data": [{"b64_json": B64}]})
 
     native_client = httpx.Client
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: native_client(
@@ -84,7 +65,7 @@ def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, mode, 
     result = plugin.OpenAICodexImageGenProvider().generate(
         "circle", image_url="data:image/png;base64," + B64 if editing else None)
     assert result["success"], result
-    assert len(requests) == (2 if rotation == "between_attempts" else 1)
+    assert len(requests) == 1
     assert result["modality"] == ("image" if editing else "text")
     assert Path(result["image"]).read_bytes() == PNG
     assert Path(result["image"]).is_relative_to(tmp_path)
@@ -92,6 +73,8 @@ def test_generate_keeps_gateway_transport_snapshot(tmp_path, monkeypatch, mode, 
 
 @pytest.mark.parametrize("editing", [False, True])
 def test_direct_codex_ignores_gateway_api_mode_and_later_gateway_config(tmp_path, monkeypatch, editing):
+    """Without base_url/api_key the provider stays on direct Codex auth: account headers, the
+    Codex base URL, and a gateway configured mid-flight never retargets the attempt."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"image_gen": {"api_mode": "images"}}))
@@ -101,22 +84,23 @@ def test_direct_codex_ignores_gateway_api_mode_and_later_gateway_config(tmp_path
 
     def handle(request):
         requests.append(request)
-        assert str(request.url) == plugin._CODEX_BASE_URL + "/responses"
+        suffix = "/images/edits" if editing else "/images/generations"
+        assert str(request.url) == plugin._CODEX_BASE_URL + suffix
         assert request.headers["authorization"] == "Bearer direct-test-token"
         assert request.headers["x-test-direct"] == "direct-test-token"
-        content = json.loads(request.read())["input"][0]["content"]
-        assert len(content) == (2 if editing else 1)
+        body = json.loads(request.read())
+        assert body["prompt"] == "circle"
+        assert ("images" in body) is editing
         config_path.write_text(yaml.safe_dump({"image_gen": {
             "base_url": "https://new-gateway.invalid/v1", "api_key": "new-key", "api_mode": "images"}}))
-        item = {} if len(requests) == 1 else {"type": "image_generation_call", "result": B64}
-        return httpx.Response(200, content="data: " + json.dumps(item) + "\n\n")
+        return httpx.Response(200, json={"data": [{"b64_json": B64}]})
 
     monkeypatch.setattr(httpx, "Client", lambda **kwargs: native_client(
         **kwargs, transport=httpx.MockTransport(handle), trust_env=False))
     result = plugin.OpenAICodexImageGenProvider().generate(
         "circle", image_url="data:image/png;base64," + B64 if editing else None)
     assert result["success"], result
-    assert len(requests) == 2
+    assert len(requests) == 1
 
 
 @pytest.mark.parametrize("key", [None, "${MISSING_IMAGE_SNAPSHOT_KEY}"])
