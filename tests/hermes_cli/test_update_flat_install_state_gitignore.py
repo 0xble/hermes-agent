@@ -104,8 +104,11 @@ def flat_install_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     shutil.copyfile(REPO_ROOT / ".gitignore", repo / ".gitignore")
+    # The fork's runtime-compatibility guard refuses to run git against a checkout whose HEAD
+    # declares no capability contract, so this stand-in carries the real one.
+    shutil.copyfile(REPO_ROOT / "runtime-compatibility.json", repo / "runtime-compatibility.json")
     (repo / "app.py").write_text("print('hermes')\n")
-    _run_git(repo, "add", ".gitignore", "app.py")
+    _run_git(repo, "add", ".gitignore", "runtime-compatibility.json", "app.py")
     _run_git(
         repo,
         "-c", "user.email=t@t", "-c", "user.name=t",
