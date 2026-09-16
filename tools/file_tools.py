@@ -725,6 +725,12 @@ def _resolve_write_targets(paths: list[str], task_id: str) -> tuple[dict[str, st
     from agent.delegation_context import is_read_only_knowledge_context
     from tools.knowledge_boundary import _UNEVALUATED
 
+    # Resolving an NT/device-namespace path IS the NTLM-leak vector its guard exists to
+    # prevent, and this binding runs ahead of every sibling guard. Bind nothing for such a
+    # path: _check_sensitive_path still denies the operation on the raw string below, so the
+    # guard keeps firing before any resolve (tests/agent/test_nt_namespace_guard.py).
+    if any(get_nt_namespace_error(path, verb="Write") for path in paths):
+        return {path: None for path in paths}, None
     resolved = {path: _resolve_or_none(path, task_id) for path in paths}
     if is_read_only_knowledge_context() and any(value is None for value in resolved.values()):
         return resolved, _UNEVALUATED

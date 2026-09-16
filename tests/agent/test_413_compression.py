@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.context_compressor import SUMMARY_PREFIX, _DB_PERSISTED_MARKER
 from agent.conversation_compression import (
+    COMPACTION_ABORTED_STATUS,
     COMPACTION_DEFERRED_STATUS,
     COMPACTION_DONE_STATUS,
     COMPACTION_WOULD_GROW_STATUS,
@@ -540,7 +541,10 @@ class TestPreflightCompression:
             pytest.raises(ValueError),
         ):
             agent._compress_context([{"role": "user", "content": "hello"}], "system prompt", approx_tokens=1234)
-        assert events == [("lifecycle", COMPACTION_STATUS), ("compacted", COMPACTION_DONE_STATUS)]
+        # The fork retires the announced phase on its own ``compaction_aborted`` terminal edge
+        # (COMPACTION_ABORTED_STATUS), which upstream does not have; the phase is still retired
+        # exactly once, as the aborted-path tests below also assert.
+        assert events == [("lifecycle", COMPACTION_STATUS), ("compaction_aborted", COMPACTION_ABORTED_STATUS)]
 
     def test_compress_context_emits_one_terminal_status_when_lock_is_unavailable(self, agent):
         """A rejected lock must retire the started desktop compaction phase."""
