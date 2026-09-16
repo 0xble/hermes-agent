@@ -624,3 +624,188 @@ def test_unauthored_empty_fallback_defaults_are_stripped_from_restored_reference
     restored_site = restored[site] if site == "delegation" else restored[site]["vision"]
     assert restored_site == reference
     assert expand_model_presets(restored) == expand_model_presets(authored)
+
+
+def test_reference_site_reasoning_override_retunes_effort_without_forking_the_route():
+    """The narrow override: a site may retune effort; route identity stays preset-owned."""
+    config = routes()
+    config["delegation"] = {"model_preset": "primary", "reasoning_effort": "low"}
+    config["auxiliary"] = {"classification": {"model_preset": "fast", "reasoning_effort": "high"}}
+    expanded = expand_model_presets(config)
+
+    assert expanded["delegation"]["provider"] == "provider-a"
+    assert expanded["delegation"]["model"] == "model-a"
+    assert expanded["delegation"]["reasoning_effort"] == "low"
+    # Preset-owned fallbacks survive the override rather than being flattened away.
+    assert expanded["delegation"]["fallback_providers"][0]["model"] == "model-b"
+    assert expanded["auxiliary"]["classification"]["reasoning_effort"] == "high"
+    # The shared definition is untouched for every other consumer.
+    assert config["model_presets"]["primary"]["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("provider", "provider-z"), ("model", "model-z"), ("base_url", "https://x.invalid"),
+    ("api_key", "k"), ("fallback_providers", [{"provider": "p", "model": "m"}]),
+])
+def test_route_identity_fields_remain_forbidden_beside_a_reference(field, value):
+    """Only reasoning is negotiable: identity/auth overrides would split the route."""
+    config = routes()
+    config["delegation"] = {"model_preset": "primary", field: value}
+    with pytest.raises(ModelPresetError):
+        expand_model_presets(config)
+
+
+def test_reference_site_reasoning_override_is_validated():
+    config = routes()
+    config["delegation"] = {"model_preset": "primary", "reasoning_effort": "turbo"}
+    with pytest.raises(ModelPresetError, match="reasoning_effort"):
+        expand_model_presets(config)
+
+
+def test_save_preserves_an_authored_reference_site_reasoning_override(tmp_path, monkeypatch):
+    """An unrelated save must not silently delete a site's authored reasoning override."""
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model",
+                                    "reasoning_effort": "high"}},
+        "delegation": {"model_preset": "plain", "reasoning_effort": "low"},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+
+    assert c.load_config()["delegation"]["reasoning_effort"] == "low"
+    c.set_config_value("delegation.max_concurrent_children", "3")
+
+    authored = yaml.safe_load(path.read_text())
+    assert authored["delegation"]["model_preset"] == "plain"
+    assert authored["delegation"]["reasoning_effort"] == "low"
+    assert "provider" not in authored["delegation"]
+    assert c.load_config()["delegation"]["reasoning_effort"] == "low"
+
+
+def test_authored_site_reasoning_override_survives_a_real_config_roundtrip(tmp_path, monkeypatch):
+    """An unrelated save must not silently delete a site's authored reasoning override."""
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model",
+                                    "reasoning_effort": "high"}},
+        "delegation": {"model_preset": "plain", "reasoning_effort": "low"},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+    loaded = c.load_config()
+    assert loaded["delegation"]["reasoning_effort"] == "low"
+    loaded["display"]["show_thinking"] = False
+    c.save_config(loaded)
+
+    saved = yaml.safe_load(path.read_text())
+    assert saved["delegation"]["model_preset"] == "plain"
+    assert saved["delegation"]["reasoning_effort"] == "low", saved["delegation"]
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert c.load_config()["delegation"]["reasoning_effort"] == "low"
+
+
+def test_authored_override_survives_roundtrip_at_slot_and_main_sites(tmp_path, monkeypatch):
+    """restore_slot (fallback/MoA) and the main-model branch must also keep an authored override."""
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model",
+                                    "reasoning_effort": "high"}},
+        "model": {"model_preset": "plain", "reasoning_effort": "low"},
+        "fallback_providers": [{"model_preset": "plain", "reasoning_effort": "minimal"}],
+        "moa": {"aggregator": {"model_preset": "plain", "reasoning_effort": "minimal"}},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+    loaded = c.load_config()
+    loaded["display"]["show_thinking"] = False
+    c.save_config(loaded)
+
+    saved = yaml.safe_load(path.read_text())
+    assert saved["fallback_providers"][0].get("reasoning_effort") == "minimal", saved["fallback_providers"]
+    assert saved["moa"]["aggregator"].get("reasoning_effort") == "minimal", saved["moa"]
+    assert saved["model"].get("model_preset") == "plain", saved["model"]
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert c.load_config()["agent"]["reasoning_effort"] == "low"
+
+
+def test_main_site_override_on_a_preset_without_reasoning_roundtrips(tmp_path, monkeypatch):
+    """A site override on a preset that declares no effort must not strand agent.reasoning_effort."""
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}},
+        "model": {"model_preset": "plain", "reasoning_effort": "low"},
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+    loaded = c.load_config()
+    assert loaded["agent"]["reasoning_effort"] == "low"
+    loaded["display"]["show_thinking"] = False
+    c.save_config(loaded)
+
+    saved = yaml.safe_load(path.read_text())
+    assert saved["model"]["model_preset"] == "plain"
+    assert saved["model"].get("reasoning_effort") == "low", saved["model"]
+    # The override must not also be stranded as a global agent pin: reloading would
+    # then raise "preset reasoning_effort cannot be combined with agent.reasoning_effort".
+    assert "reasoning_effort" not in (saved.get("agent") or {}), saved.get("agent")
+
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert c.load_config()["agent"]["reasoning_effort"] == "low"
+
+
+def test_an_edited_site_override_flattens_instead_of_restoring_the_reference():
+    """Negative case: a deliberately changed effort is an edit, not a restorable reference."""
+    from hermes_cli.model_presets import preserve_model_preset_references
+
+    authored = {
+        "model_presets": {"plain": {"provider": "openrouter", "model": "test/model",
+                                    "reasoning_effort": "high"}},
+        "delegation": {"model_preset": "plain", "reasoning_effort": "low"},
+    }
+    actual = expand_model_presets(authored)
+    actual["delegation"]["reasoning_effort"] = "minimal"  # deliberate edit
+    restored = preserve_model_preset_references(actual, authored)
+    assert restored["delegation"]["reasoning_effort"] == "minimal"
+    assert "model_preset" not in restored["delegation"]
+
+
+def test_agent_reasoning_edit_flattens_a_site_override_on_a_preset_without_reasoning(tmp_path, monkeypatch):
+    """`hermes model`'s reasoning step edits agent.reasoning_effort via load/save.
+
+    With model: {model_preset: X, reasoning_effort: Y} and a preset declaring no effort,
+    that edit must flatten the route inline; restoring the reference would leave BOTH
+    model.reasoning_effort and agent.reasoning_effort on disk and the next load would
+    reject them as a preset/agent conflict.
+    """
+    from hermes_cli import config as c
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw = {"model_presets": {"plain": {"provider": "openrouter", "model": "test/model"}},
+           "model": {"model_preset": "plain", "reasoning_effort": "low"}}
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    loaded = c.load_config()
+    assert loaded["agent"]["reasoning_effort"] == "low"
+    loaded["agent"]["reasoning_effort"] = "high"
+    c.save_config(loaded)
+    saved = yaml.safe_load(path.read_text())
+    assert "model_preset" not in saved["model"]
+    assert saved["model"]["default"] == "test/model"
+    c._RAW_CONFIG_CACHE.clear(); c._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert c.load_config()["agent"]["reasoning_effort"] == "high"

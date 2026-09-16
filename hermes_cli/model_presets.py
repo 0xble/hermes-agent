@@ -94,7 +94,14 @@ def _reference(site: Any, path: str, definitions: dict[str, dict[str, Any]], *, 
     if route is None:
         available = ", ".join(definitions) or "(none)"
         raise _error(path, f"unknown preset '{name}'. Available presets: {available}")
-    return deepcopy(route)
+    expanded = deepcopy(route)
+    # Reasoning is the deliberately narrow reference-site policy override. Route identity
+    # (provider/model/fallbacks) stays owned by the preset, so a site can retune effort
+    # without forking a near-duplicate preset or splitting the route.
+    if isinstance(site, dict) and "reasoning_effort" in site:
+        _validate_reasoning(site["reasoning_effort"], path)
+        expanded["reasoning_effort"] = site["reasoning_effort"]
+    return expanded
 
 
 def _fallbacks_disabled(site: Any, path: str) -> bool:
@@ -122,7 +129,7 @@ def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]
     disabled_fallbacks = _fallbacks_disabled(model, "model")
     route = _reference(
         model, "model", definitions,
-        conflicts={"provider", "default", "model", "reasoning_effort", *_MAIN_FORBIDDEN_REFERENCE_FIELDS},
+        conflicts={"provider", "default", "model", *_MAIN_FORBIDDEN_REFERENCE_FIELDS},
     )
     if route is None:
         return
@@ -151,7 +158,7 @@ def _expand_model(config: dict[str, Any], definitions: dict[str, dict[str, Any]]
 def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, Any]]) -> None:
     site = config.get("delegation")
     disabled_fallbacks = _fallbacks_disabled(site, "delegation")
-    route = _reference(site, "delegation", definitions, conflicts={"provider", "model", "base_url", "api_key", "reasoning_effort", "fallback_providers", "fallback_chain"})
+    route = _reference(site, "delegation", definitions, conflicts={"provider", "model", "base_url", "api_key", "fallback_providers", "fallback_chain"})
     if route is not None:
         assert isinstance(site, dict)
         fields = _route_fields({key: value for key, value in route.items() if key != "fallbacks"} if disabled_fallbacks else route, fallback_key="fallback_providers")
@@ -167,7 +174,7 @@ def _expand_delegation(config: dict[str, Any], definitions: dict[str, dict[str, 
         disabled_fallbacks = _fallbacks_disabled(role, path)
         route = _reference(
             role, path, definitions,
-            conflicts={"provider", "model", "reasoning_effort"},
+            conflicts={"provider", "model"},
         )
         if route is None:
             continue
@@ -192,7 +199,7 @@ def _expand_auxiliary(config: dict[str, Any], definitions: dict[str, dict[str, A
     for task, site in list(auxiliary.items()):
         path = f"auxiliary.{task}"
         disabled_fallbacks = _fallbacks_disabled(site, path)
-        route = _reference(site, path, definitions, conflicts={"provider", "model", "base_url", "api_key", "api_mode", "reasoning_effort", "fallback_chain", "fallback_providers"})
+        route = _reference(site, path, definitions, conflicts={"provider", "model", "base_url", "api_key", "api_mode", "fallback_chain", "fallback_providers"})
         if route is not None:
             assert isinstance(site, dict)
             fields = _route_fields({key: value for key, value in route.items() if key != "fallbacks"} if disabled_fallbacks else route, fallback_key="fallback_chain")
@@ -209,7 +216,7 @@ def _expand_fallback_entries(config: dict[str, Any], definitions: dict[str, dict
             continue
         expanded = []
         for index, entry in enumerate(entries):
-            route = _reference(entry, f"{key}[{index}]", definitions, conflicts={"provider", "model", "base_url", "api_key", "key_env", "api_key_env", "reasoning_effort", "fallbacks", "fallback_chain", "fallback_providers"})
+            route = _reference(entry, f"{key}[{index}]", definitions, conflicts={"provider", "model", "base_url", "api_key", "key_env", "api_key_env", "fallbacks", "fallback_chain", "fallback_providers"})
             if route is not None:
                 if "fallbacks" in route:
                     raise _error(f"{key}[{index}]", "a fallback entry cannot reference a preset that declares fallbacks")
@@ -236,7 +243,7 @@ def _expand_moa_slot(
         if site["fallback_models"] != []:
             raise _error(path, "'fallback_models' may only be [] with model_preset (to disable preset fallbacks)")
         disabled_fallbacks = True
-    route = _reference(site, path, definitions, conflicts={"provider", "model", "reasoning_effort"})
+    route = _reference(site, path, definitions, conflicts={"provider", "model"})
     if route is None:
         return site
     if fallback and "fallbacks" in route:
@@ -287,9 +294,13 @@ def resolve_cron_model_preset(site: Any, config: dict[str, Any], *, fleet: bool 
         return None
     path = "cron" if fleet else "cron job"
     conflicts = {"model", "provider", "model_provider", "base_url", "api_key", "api_mode",
-                 "reasoning_effort", "fallback_providers", "fallback_chain"}
+                 "fallback_providers", "fallback_chain"}
+    # A cleared optional field is not a selection: reasoning_effort is an allowed override
+    # rather than a conflict, so an explicit null from `--reasoning-effort ''` must be
+    # dropped here or it would override the preset's effort with None.
+    empties = conflicts | {"reasoning_effort"}
     reference = {key: value for key, value in site.items()
-                 if key not in conflicts or value not in (None, "")}
+                 if key not in empties or value not in (None, "")}
     disabled = _fallbacks_disabled(reference, path)
     route = _reference(reference, path, _definitions(config), conflicts=conflicts)
     assert route is not None
@@ -345,7 +356,7 @@ def _expand_platform_routes(config: dict[str, Any], definitions: dict[str, dict[
             site_path = f"{path}.{name}"
             disabled = _fallbacks_disabled(site, site_path)
             route = _reference(site, site_path, definitions, conflicts={
-                "provider", "model", "reasoning_effort", "fallback_model",
+                "provider", "model", "fallback_model",
                 "fallback_providers", "fallback_chain", *_MAIN_FORBIDDEN_REFERENCE_FIELDS,
             })
             if route is None:
@@ -425,8 +436,11 @@ def preserve_model_preset_references(
             for key in main_inline_fields
         ) if isinstance(actual_model, dict) else True
         preset = _definitions(resolved_authored)[resolved_authored["model"]["model_preset"].strip()]
+        # Expansion routes BOTH a preset effort and an authored site override into
+        # agent.reasoning_effort, so an edit there is a deliberate route change in either
+        # case; restoring the reference then would strand a conflicting agent value.
         reasoning_unchanged = (
-            "reasoning_effort" not in preset
+            not (("reasoning_effort" in preset) or ("reasoning_effort" in raw_model))
             or (result.get("agent") or {}).get("reasoning_effort")
             == (expanded_authored.get("agent") or {}).get("reasoning_effort")
         )
@@ -449,7 +463,11 @@ def preserve_model_preset_references(
             result["model"] = restored_model
             expected_agent = (expanded_authored.get("agent") or {}).get("reasoning_effort")
             raw_agent = authored.get("agent")
-            if ("reasoning_effort" in preset and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
+            # agent.reasoning_effort is expansion output whenever the effort came from the
+            # preset OR from an authored site override; leaving it behind would make the next
+            # load reject the restored reference as a preset/agent conflict.
+            if ((("reasoning_effort" in preset) or ("reasoning_effort" in raw_model))
+                    and not (isinstance(raw_agent, dict) and "reasoning_effort" in raw_agent)
                     and isinstance(result.get("agent"), dict) and result["agent"].get("reasoning_effort") == expected_agent):
                 result["agent"].pop("reasoning_effort", None)
             if (("fallbacks" in preset or "fallbacks" in raw_model)
@@ -468,6 +486,11 @@ def preserve_model_preset_references(
             restored = deepcopy(actual_site)
             for route_key in ("provider", "model", "reasoning_effort"):
                 restored.pop(route_key, None)
+            # An authored site-level reasoning override is a permitted narrow override, not
+            # expansion output: restore it or the save silently reverts the site to the
+            # preset's effort.
+            if "reasoning_effort" in raw_site:
+                restored["reasoning_effort"] = deepcopy(raw_site["reasoning_effort"])
             # same_route treats an absent preset chain and an exposed empty default as equal,
             # so an unauthored empty chain must go too or the reference fails on its next load.
             if fallback_key and (
@@ -546,6 +569,9 @@ def preserve_model_preset_references(
         restored = deepcopy(actual_slot)
         for route_key in ("provider", "model", "reasoning_effort"):
             restored.pop(route_key, None)
+        # An authored slot-level reasoning override is a permitted narrow override.
+        if "reasoning_effort" in raw_slot:
+            restored["reasoning_effort"] = deepcopy(raw_slot["reasoning_effort"])
         if isinstance(expected_slot, dict) and "fallback_models" in expected_slot:
             restored.pop("fallback_models", None)
         for route_key in _EMPTY_DEFAULT_ROUTE_FIELDS:

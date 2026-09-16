@@ -71,7 +71,7 @@ def test_fleet_reference_beats_snapshots_but_job_inline_pin_wins(routes):
     assert jc.cfg.get("agent", {}).get("reasoning_effort") != "medium"
 
 
-@pytest.mark.parametrize("field,value", [("model", "inline"), ("provider", "openrouter"), ("reasoning_effort", "low"), ("base_url", "https://other.invalid/v1")])
+@pytest.mark.parametrize("field,value", [("model", "inline"), ("provider", "openrouter"), ("base_url", "https://other.invalid/v1")])
 def test_store_rejects_mixed_reference_atomically(routes, field, value):
     from cron.jobs import create_job, get_job, update_job
     from hermes_cli.model_presets import ModelPresetError
@@ -262,3 +262,96 @@ def test_disable_preset_fallbacks_and_clear_reference(routes):
     job = update_job(job["id"], {"model_preset": "", "model": "explicit", "provider": "custom:backup"})
     assert not job["model_preset"]
     assert _load_cron_job_config(job, job["id"], job["name"]).model == "explicit"
+
+
+def test_fallback_swap_resolves_reasoning_for_the_model_that_actually_runs(routes, monkeypatch):
+    """Per-model reasoning must key off the swapped-in fallback model, not the primary."""
+    from cron import scheduler
+    from cron.jobs import create_job
+    config, path = routes
+    config["agent"] = {"reasoning_overrides": {"preset-model": "high", "backup-model": "minimal"}}
+    path.write_text(yaml.safe_dump(config))
+
+    job = create_job("harmless fixture", "every 2h", model_preset="main")
+    jc = scheduler._load_cron_job_config(job, job["id"], job["name"])
+    fallback = jc.cfg["fallback_providers"][0]
+
+    primary = scheduler._resolve_job_reasoning_config(job, jc.cfg, "preset-model")
+    swapped = scheduler._resolve_job_reasoning_config(job, jc.cfg, "backup-model", fallback)
+    assert primary != swapped
+    assert swapped["effort"] == "low"
+
+
+def test_adopting_or_clearing_a_preset_never_leaves_a_stale_snapshot(routes):
+    """A preset resolves at fire time; a creation-time snapshot must not outlive the edit."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job("harmless fixture", "every 2h")
+    created = get_job(job["id"])
+    assert created["model_snapshot"], "unpinned job should snapshot the global resolution"
+
+    adopted = update_job(job["id"], {"model_preset": "main"})
+    assert adopted["model_preset"] == "main"
+    assert not adopted.get("model_snapshot") and not adopted.get("provider_snapshot")
+
+    cleared = update_job(job["id"], {"model_preset": None})
+    assert not cleared.get("model_preset")
+    assert cleared["model_snapshot"], "clearing the preset must restore a live snapshot"
+
+
+def test_cron_job_may_retune_reasoning_beside_a_reference(routes):
+    """The narrow override reaches the cron store: effort is editable, identity is not."""
+    from cron.jobs import create_job
+    from cron.scheduler import _load_cron_job_config, _resolve_job_runtime, _resolve_job_reasoning_config
+
+    job = create_job("harmless fixture", "every 2h", model_preset="main", reasoning_effort="minimal")
+    jc = _load_cron_job_config(job, job["id"], job["name"])
+    runtime, model = _resolve_job_runtime(job, job["id"], jc)
+    assert (model, runtime["requested_provider"]) == ("preset-model", "custom:primary")
+    assert _resolve_job_reasoning_config(job, jc.cfg, model)["effort"] == "minimal"
+
+
+def test_fallback_swap_keys_per_model_reasoning_to_the_swapped_in_model(routes, monkeypatch):
+    """At the real setup call site: an auth fallback without its own effort must resolve
+    per-model reasoning for the model that actually runs, not the unreachable primary."""
+    from cron import scheduler
+    from cron.jobs import create_job
+    config, path = routes
+    # The fallback entry deliberately carries NO reasoning_effort, so per-model config decides.
+    config["model_presets"]["main"]["fallbacks"] = [
+        {"provider": "custom:backup", "model": "backup-model"}]
+    config["agent"] = {"reasoning_overrides": {"preset-model": "high", "backup-model": "minimal"}}
+    path.write_text(yaml.safe_dump(config))
+
+    job = create_job("harmless fixture", "every 2h", model_preset="main")
+    jc = scheduler._load_cron_job_config(job, job["id"], job["name"])
+
+    real_runtime = scheduler._resolve_job_runtime
+
+    def swapped(j, job_id, jcfg):
+        runtime, _ = real_runtime(j, job_id, jcfg)
+        runtime["_hermes_fallback_entry"] = {"provider": "custom:backup", "model": "backup-model"}
+        return runtime, "backup-model"
+
+    monkeypatch.setattr(scheduler, "_resolve_job_runtime", swapped)
+    setup = scheduler._resolve_cron_agent_setup(job, job["id"], job["name"], jc)
+
+    assert setup.model == "backup-model"
+    assert setup.reasoning_config == {"enabled": True, "effort": "minimal"}
+
+
+def test_clearing_a_job_reasoning_pin_keeps_the_preset_effort(routes):
+    """`hermes cron edit ... --reasoning-effort ''` stores reasoning_effort: None.
+
+    A cleared optional field is not an inline selection, so the preset's own effort must
+    still govern the run rather than being overridden with None.
+    """
+    from cron.jobs import create_job, update_job
+    from cron.scheduler import _load_cron_job_config, _resolve_job_reasoning_config
+
+    job = create_job("fixture", "every 2h", model_preset="main")
+    job = update_job(job["id"], {"reasoning_effort": ""})
+    assert job["reasoning_effort"] is None
+    jc = _load_cron_job_config(job, job["id"], job["name"])
+    assert jc.cfg["agent"]["reasoning_effort"] == "high"
+    assert _resolve_job_reasoning_config(job, jc.cfg, jc.model) == {"enabled": True, "effort": "high"}
