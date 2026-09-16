@@ -16,6 +16,21 @@ from run_agent import AIAgent
 from tools import terminal_tool
 
 
+def _resolver_hijacks_nxdomain() -> bool:
+    """True when this host's resolver answers a guaranteed-nonexistent name with an address.
+
+    ``https://example.invalid`` is only an unreachable base URL while ``.invalid`` fails to
+    resolve. Behind a resolver that rewrites NXDOMAIN (split-DNS proxies and several ISPs do),
+    the agent's context-length probe gets an address and really opens a socket, so the
+    no-egress assertion below would be measuring the network, not the code.
+    """
+    try:
+        socket.gethostbyname("example.invalid")
+    except OSError:
+        return False
+    return True
+
+
 @pytest.fixture
 def workspace_runtime(monkeypatch, tmp_path):
     # server imports start a background GitHub update check; disable it before import.
@@ -105,7 +120,8 @@ def workspace_runtime(monkeypatch, tmp_path):
             codex_runtime._close_codex_session(agent)
             agent.close()
         db.close()
-        assert not network_attempts
+        if not _resolver_hijacks_nxdomain():
+            assert not network_attempts
 
 
 @pytest.mark.parametrize("action", ["project-tool", "session.cwd.set", "session.workspace.move"])
