@@ -21,7 +21,9 @@ def test_review_changes_skips_remaining_sequential_calls(monkeypatch):
 
     def parse(_agent, call, flatten_probe=True):
         ref = te._ToolCallRef(call.function.name, {}, "task", call.id, [])
-        return SimpleNamespace(parse_error=None, scope_block=None, ref=lambda _task_id: ref)
+        # ``name`` is read by the terminal-approval grouping before dispatch.
+        return SimpleNamespace(name=call.function.name, args={}, parse_error=None,
+                               scope_block=None, ref=lambda _task_id: ref)
 
     def resolve(_agent, ref, _messages):
         return te._SequentialDispatch(lambda _args: executed.append(ref.name) or {"status": "dispatched"})

@@ -587,7 +587,7 @@ def test_native_title_turn_keeps_derived_title_without_second_worker(tmp_path):
         agent._session_db = db
         history = [{"role": "user", "content": "Fix the login button"}]
         # Leave the auxiliary worker unexecuted, as after an initial failure.
-        with patch("agent.title_generator.threading.Thread") as worker:
+        with patch("agent.memory_provider.spawn_context_thread") as worker:
             turn_context._maybe_title_session_at_turn_start(agent, history)
             first_title = db.get_session_title("sess-1")
             assert first_title
