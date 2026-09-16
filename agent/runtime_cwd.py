@@ -36,11 +36,24 @@ def _is_install_tree(p: Path) -> bool:
 
 
 def set_session_cwd(cwd: str | None) -> Token:
-    """Pin the logical cwd for the current context."""
-    return _SESSION_CWD.set((cwd or "").strip())
+    """Pin the logical cwd for the current context.
+
+    ``None`` means this session pins nothing and leaves the binding unset, so ``terminal.cwd``
+    (carried as TERMINAL_CWD and read through the per-turn terminal scope) still applies. An
+    explicit empty string is the opposite: it suppresses any configured directory, the same as
+    ``clear_session_cwd``.
+    """
+    if cwd is None:
+        return _SESSION_CWD.set(_UNSET)
+    return _SESSION_CWD.set(cwd.strip())
 
 
 def clear_session_cwd() -> None:
+    """Suppress any configured directory for this context.
+
+    The empty binding is deliberate and distinct from "never pinned": a session that cleared its
+    cwd must not silently pick up a foreign, unscoped TERMINAL_CWD from the process environment.
+    """
     _SESSION_CWD.set("")
 
 
@@ -72,23 +85,34 @@ def _existing_dir(raw: str, label: str) -> Path | None:
     return None
 
 
-def _resolve_configured_cwd() -> Path | None:
-    """Bound session values never fall through to another scope's directory."""
+def _resolve_configured_cwd(*, override_is_final: bool) -> Path | None:
+    """Session override, then TERMINAL_CWD; each validated as a real directory.
+
+    ``override_is_final``: a set-but-missing session override yields None instead of falling
+    through to TERMINAL_CWD, so context-file discovery can never pick up another scope's tree.
+    An empty override means "this session pins nothing", and TERMINAL_CWD is already read
+    through the per-turn terminal scope, so falling through there is scope-safe.
+    """
     override = _SESSION_CWD.get()
     if override is not _UNSET:
         raw = str(override or "").strip()
-        return _existing_dir(raw, "configured working directory") if raw else None
+        if not raw:
+            # Explicitly suppressed for this context (clear_session_cwd).
+            return None
+        p = _existing_dir(raw, "configured working directory")
+        if p is not None or override_is_final:
+            return p
     raw = scope_terminal_cwd().strip()
     return _existing_dir(raw, "TERMINAL_CWD") if raw else None
 
 
 def resolve_agent_cwd() -> Path:
     """Configured cwd, else the launch dir (os.getcwd()'s OSError on a deleted cwd deliberately propagates)."""
-    return _resolve_configured_cwd() or Path(os.getcwd())
+    return _resolve_configured_cwd(override_is_final=False) or Path(os.getcwd())
 
 
 def resolve_context_cwd() -> Path | None:
     """Configured cwd for context-file discovery, or None (build_context_files_prompt then falls back to the
     launch dir). An existing configured path is honored verbatim — including the Hermes source tree, a
     legitimate workspace when developing Hermes; fallback-directory policy lives in the caller."""
-    return _resolve_configured_cwd()
+    return _resolve_configured_cwd(override_is_final=True)
