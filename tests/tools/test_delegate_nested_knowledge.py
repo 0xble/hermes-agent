@@ -88,6 +88,15 @@ def test_unnamed_descendant_preserves_knowledge_authority(tmp_path, monkeypatch,
                 "skill_exposed": "skill_manage" in self.valid_tool_names,
                 "skill_disabled": "skill_management" in self.disabled_toolsets,
             })
+            # Overwriting an existing file requires this task to have seen its current
+            # content first (the stale-write guard); the authority question under test is
+            # decided before that, so a named child is still refused on the boundary.
+            handle_function_call(
+                "read_file",
+                {"path": str(target)},
+                task_id=kwargs["task_id"],
+                enabled_tools=list(self.valid_tool_names),
+            )
             result = json.loads(
                 handle_function_call(
                     "write_file",

@@ -109,16 +109,20 @@ def test_shell_and_interpreter_bypasses_are_denied(knowledge_home):
 def test_guard_does_not_touch_ordinary_paths_or_the_parent(knowledge_home):
     """The boundary is narrow on purpose: children still do real work."""
     from agent.delegation_context import delegated_child_context
-    from tools.file_tools import write_file_tool
+    from tools.file_tools import read_file_tool, write_file_tool
 
     ordinary = knowledge_home["ordinary"]
     with delegated_child_context("child", read_only_knowledge=True):
+        # Overwriting existing content requires having seen it (the stale-write guard); the
+        # knowledge boundary is decided before that and is what this test pins.
+        read_file_tool(str(ordinary))
         result = write_file_tool(str(ordinary), "CHILD WROTE THIS\n")
     assert "shared knowledge" not in result.lower()
     assert ordinary.read_text(encoding="utf-8") == "CHILD WROTE THIS\n"
 
     # Outside a read-only child context nothing is guarded at all.
     memory = knowledge_home["memory"]
+    read_file_tool(str(memory))
     assert "shared knowledge" not in write_file_tool(str(memory), "PARENT\n").lower()
     assert memory.read_text(encoding="utf-8") == "PARENT\n"
 
