@@ -2,8 +2,21 @@
 
 ## Background
 
-Cutoff `743140cd8221ad04897c4c3e706e0fc8a7613b8e` builds on verified fork
-`134e479eb48b88346f2a1dd794dd8b104b6ce2c6`. Upstream's generated gateway
+Cutoff `a09195b1e8d232e8c83b5430da4261970f62a820` builds on verified fork
+`e5020658fb70931dcbd4d2a9844c32de5d5b85b7` and covers 1261 upstream commits from
+the September 14 cutoff `743140cd8221ad04897c4c3e706e0fc8a7613b8e`. Five fork
+patches retired against released upstream in this integration: the LM Studio
+iteration-summary reasoning helper and `_iteration_summary_chat_kwargs` (the
+summary now builds its kwargs through the shared `_build_api_kwargs`, which
+already reads the fork's current reasoning config); the hand-built API run
+terminal payload (upstream's `terminal_run_status` owns completed / partial /
+interrupted / `pending_steer`); the workspace-aware quality-gate fingerprint
+(upstream removed `workspace_fingerprint` and `GoalGate.last_failed_fingerprint`
+because a porcelain hash replayed stale failures and burned retries); the
+schema-invalid delegation failure (`schema_valid` / `schema_errors` now carry the
+verdict while the fork's `budget_exhausted` status and its icon are preserved);
+and the fork's non-mapping config overwrite message, unified into upstream's
+`_refuse_overwrite`. Upstream's generated gateway
 contracts now own the wire schema. Preserve the fork's admitted, handling and
 result-turn delegation events in that registry rather than retaining the retired
 JSON inventory. Image attachments compose with quoted fork context. Late child
@@ -16,7 +29,7 @@ retain separate run-scoped evidence.
 
 Canonical target: `/Users/brianle/Repos/hermes-agent`, the Brian-owned `0xble/hermes-agent` fork of `NousResearch/hermes-agent`. Upstream remains authoritative for unmodified code; intentional divergence and released-equivalence decisions justify enrollment. Fork `main` is the last candidate that passed fork verification, not evidence of runtime promotion. This root is the sole enrollment and scheduling unit; `maintenance/*.md` extends it without independent enrollment.
 
-The accepted upstream reconciliation cutoffs remain **September 13, 2026** `ee4452991d17534aa561f31ee55596d082aa94e7`, **September 12, 2026** `f364c19775617acb6c16140b790cda9fb05e1906`, and **September 11, 2026** `939e45c91d751fadd94dcd1b873ac3cb44846213`. Immutable source-helper evidence owns each run's test/review/publication status; these observations do not authorize runtime activation. The September 12 integration covered 177 commits from the September 11 cutoff.
+The accepted upstream reconciliation cutoffs are **September 16, 2026** `a09195b1e8d232e8c83b5430da4261970f62a820`, **September 14, 2026** `743140cd8221ad04897c4c3e706e0fc8a7613b8e`, **September 13, 2026** `ee4452991d17534aa561f31ee55596d082aa94e7`, **September 12, 2026** `f364c19775617acb6c16140b790cda9fb05e1906`, and **September 11, 2026** `939e45c91d751fadd94dcd1b873ac3cb44846213`. Immutable source-helper evidence owns each run's test/review/publication status; these observations do not authorize runtime activation. The September 12 integration covered 177 commits from the September 11 cutoff.
 
 Historical accepted history boundaries: Brian approved `1724c48b12a90eb8a76e91e6337eaf2e2965a8e8` on **2026-09-06**; the earlier reconciled boundary was `93455e0d6b40305ac2c9486a06e701d9aef205ca`. They are provenance only: superseded same-commit/duplicate-subject validation claims do not reinstate a gate.
 
