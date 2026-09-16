@@ -965,8 +965,10 @@ async def test_session_chat_stream_emits_interrupt_as_metadata_not_assistant_tex
     assert events["assistant.completed"]["content"] == ""
     assert events["assistant.completed"]["completed"] is False
     assert events["assistant.completed"]["interrupted"] is True
-    assert events["run.completed"]["completed"] is False
-    assert events["run.completed"]["interrupted"] is True
+    # The terminal event name is derived from the result: an interrupted turn is ``cancelled``.
+    assert "run.cancelled" in events and "run.completed" not in events
+    assert events["run.cancelled"]["completed"] is False
+    assert events["run.cancelled"]["interrupted"] is True
 
 
 _CHAT_REPLY = ({"final_response": "ok"}, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})

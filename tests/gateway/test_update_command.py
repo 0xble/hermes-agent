@@ -516,9 +516,13 @@ class TestSendUpdateNotification:
 
 
     @pytest.mark.asyncio
-    async def test_failed_update_notice_says_still_running_and_trims_log(self, tmp_path):
-        """A failed update must tell the chat the old version still runs and where to see the
-        full error; the raw log is quoted only as a short tail, never the whole 3500-char dump."""
+    async def test_failed_update_notice_is_separate_from_the_drained_log(self, tmp_path):
+        """A failed update must say so without claiming an unverified runtime state, and the raw
+        log reaches the chat through the durable output drain rather than inside the notice.
+
+        The fork streams the whole update log on a resumable cursor (an operator diagnosing a
+        failed update needs all of it), so the notice itself stays short and the output travels
+        as its own message."""
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
@@ -532,12 +536,16 @@ class TestSendUpdateNotification:
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._send_update_notification()
 
-        sent_text = mock_adapter.send.call_args[0][1]
-        assert "previous version is still running" in sent_text
-        assert "hermes update" in sent_text and "/update" in sent_text
-        assert "ERROR: pip failed" in sent_text
-        assert len(sent_text) < 1200
-        assert "exit code" not in sent_text.lower()
+        sent = [call[0][1] for call in mock_adapter.send.call_args_list]
+        notice = sent[-1]
+        assert "Update Failed" in notice
+        # No success claim, and no guess about what the runtime is now running.
+        assert "finished successfully" not in notice and "still running" not in notice
+        assert "unverified" in notice
+        assert len(notice) < 1200
+        # The log is delivered, but as its own message rather than inside the notice.
+        assert "ERROR: pip failed" not in notice
+        assert any("ERROR: pip failed" in text for text in sent[:-1])
 
 
 # ---------------------------------------------------------------------------
