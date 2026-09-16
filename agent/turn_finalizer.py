@@ -467,7 +467,8 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         _turn_tool_count, _last_msg_role, len(final_response) if final_response else 0,
         agent.session_id or "none",
     )
-    if _last_msg_role == "tool" and not interrupted:
+    # Native review deliberately yields after its tool receipt; it is not stuck.
+    if _last_msg_role == "tool" and not interrupted and _turn_exit_reason != "review_dispatched":
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
             + _diag_msg + " last_tool=%s",
