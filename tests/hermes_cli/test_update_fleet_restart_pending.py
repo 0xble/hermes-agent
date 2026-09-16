@@ -757,7 +757,7 @@ def test_startup_warn_kept_without_positive_evidence(monkeypatch, capsys, disk_s
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "did not verify fleet restart completion" in capsys.readouterr().err
     assert update_cmd._fleet_restart_pending_marker_path().exists()
 
 
@@ -791,5 +791,5 @@ def test_startup_warn_kept_when_receipt_owed_gateway_is_down(monkeypatch, capsys
 
     update_cmd._warn_pending_fleet_restart_on_startup()
 
-    assert "did not restart running gateways" in capsys.readouterr().err
+    assert "did not verify fleet restart completion" in capsys.readouterr().err
     assert update_cmd._fleet_restart_pending_marker_path().exists()

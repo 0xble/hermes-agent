@@ -240,6 +240,9 @@ def test_cancellation_after_gate_save_discards_the_entire_draft(manager, monkeyp
 
 
 def test_unexpected_stop_wait_cleanup_cannot_overwrite_control(manager, monkeypatch):
+    # wait_on rejects a pid that is not alive on this host; what this test fences is the
+    # cleanup race, so arm the barrier with a stubbed liveness check.
+    monkeypatch.setattr(goals, "_pid_alive", lambda pid: True)
     manager.wait_on(12345, reason="pending")
     entered, release = threading.Event(), threading.Event()
     def pid_alive(pid):
