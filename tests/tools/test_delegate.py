@@ -148,6 +148,20 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
 
+    def test_child_prompt_preserves_parent_goal_boundary_and_end_to_end_execution(self):
+        prompt = _build_child_system_prompt(
+            "Implement the assigned fix",
+            context="Parent standing goal: ship the complete change with all acceptance criteria.",
+        )
+        self.assertIn("Parent-owned goal boundary", prompt)
+        self.assertIn("set_goal", prompt)
+        self.assertIn("unavailable to children", prompt)
+        self.assertIn("parent agent owns the user's standing goal", prompt)
+        self.assertIn("never weaken, omit, reinterpret, or remove a failing criterion", prompt)
+        self.assertIn("Execute autonomously end to end", prompt)
+        self.assertIn("Do not stop after a plan", prompt)
+        self.assertIn("final whole-outcome verification", prompt)
+
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])

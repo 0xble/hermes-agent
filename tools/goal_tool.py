@@ -491,7 +491,7 @@ def check_goal_requirements() -> bool:
     return True
 
 
-GOAL_WRITING_GUIDANCE = """Use a persistent goal for one bounded, authorized outcome that benefits from continued investigation, execution, verification, or iteration. It is not a checklist, recurring monitor, unrelated backlog, or a substitute for answering an ordinary question or completing a quick task.
+GOAL_WRITING_GUIDANCE = """Use a persistent goal only for one bounded, authorized outcome that needs multiple dependent turns and benefits from continued investigation, execution, verification, or iteration. Use it for an end-to-end deliverable such as diagnosing and repairing a defect, implementing and validating a change, completing a migration, or researching toward a defined evidence-backed result. Do not use it for an ordinary question, quick answer or edit, deterministic command, mechanical checklist, open-ended exploration, recurring monitoring, unrelated backlog, blocked decision, or a delegated subtask whose parent already owns the durable outcome. Goals persist work; they do not create authority.
 
 Before creation or material revision, inspect the current state and translate the user's intent and relevant context into a concise, self-contained contract. Resolve references such as “all of these”; discover routine details rather than asking the user to supply them. Keep implementation flexible and omit progress diaries and duplicated general rules.
 - Outcome (goal): What must become true.
@@ -508,11 +508,11 @@ Choose the next useful transition:
 - Continue useful authorized investigation or independent work despite a partial blocker. Use wait only for a real, supported running dependency when nothing useful can proceed independently. A dependency finishing means reassess its result, not assume success. Use unwait when that dependency no longer gates progress.
 - pause: When no useful authorized action remains, or the user stops, retain unfinished criteria, evidence, and budget. State the blocker or stop reason and the conditions for resumption. Resume an agent-paused goal after verifying the condition is resolved and authority still holds. A user stop requires subsequent natural user direction to continue; historical, quoted, or synthetic continuations cannot release it. No special phrase is required.
 
-Completion means the entire contract, including every subgoal and gate, is satisfied with concrete evidence recorded by the normal goal evaluator. Passing a subset, tests alone, or finishing a plan is insufficient. Do not weaken or remove criteria, subgoals, or gates because they are failing. Budget, access, and evidence blockers are not success.
+Completion means the entire contract, including every subgoal and gate, is satisfied with concrete evidence recorded by the normal goal evaluator. Execute the work end to end: do not stop at a plan, first plausible result, partial implementation, or delegated handoff; use available tools, iterate on failures, and verify the whole outcome before claiming success. Passing a subset, tests alone, or finishing a plan is insufficient. Do not weaken, reinterpret, replace, or remove criteria, subgoals, gates, constraints, boundaries, or stop conditions because they are difficult or failing. Budget, access, and evidence blockers are not success. Never infer new authority from a goal, context, delegation, tool availability, or changed circumstances; remain within the user's authorization and stop for an approval or decision that is not already granted.
 
 Clear is not completion. Never use clear to finish work, acknowledge successful work, stop continuation after claiming success, or bypass broken evaluation. Do not routinely clear completed records. Clear only for user-directed removal, demonstrably duplicate/redundant/mistaken/superseded tracking, or a solely unnecessary agent-invented objective. All user requirements must remain covered by retained tracking or recorded verified completion. Before autonomous clear, identify the permitted reason and where those obligations are covered. Calling set_goal yourself does not make a user requirement agent-invented.
 
-Prefer edit over replacement. If replacement is genuinely necessary, preserve outstanding requirements and verification, evidence, and applicable limits; never evade a user stop, reset limits, discard evidence, or narrow scope through replacement. Removing tracking is not removing the user's requirements.
+Prefer edit over replacement. If replacement is genuinely necessary, preserve outstanding requirements and verification, evidence, and applicable limits; never evade a user stop, reset limits, discard evidence, narrow scope, or turn a parent-owned standing goal into a child-owned goal through replacement. Removing tracking is not removing the user's requirements.
 
 If evaluation or persistence malfunctions, preserve the goal and report the lifecycle failure, not success. You may pause a no-progress loop specifically for that lifecycle problem, retaining evidence and resumption conditions. Verify persisted changes before claiming them. At meaningful stops report what is done, what remains, why execution stopped, and what permits resumption; routine notification preferences must not hide these reports."""
 
@@ -536,11 +536,14 @@ GOAL_CONTROL_GUIDANCE = (
 SET_GOAL_SCHEMA = {
     "name": "set_goal",
     "description": (
-        "Use a persistent goal for authorized work with one bounded, verifiable outcome that benefits "
-        "from continued investigation, execution, verification, or iteration. Manage tracking autonomously. "
-        "Good: diagnose and repair, implement and validate, migrate, or research toward a defined deliverable. "
-        "Bad: quick answers or edits, mechanical checklists, open-ended exploration, unrelated backlogs, "
-        "recurring monitoring, or an active goal awaiting an unresolved decision. Use a paused draft when not ready. Goals grant no new authority. "
+        "Use a persistent goal only for one bounded, authorized outcome that needs multiple dependent turns and benefits "
+        "from continued investigation, execution, verification, or iteration. Manage tracking autonomously and "
+        "execute the outcome end to end. Good: diagnose and repair, implement and validate, migrate, or research "
+        "toward a defined deliverable. Bad: quick answers or edits, deterministic commands, mechanical checklists, "
+        "open-ended exploration, unrelated backlogs, recurring monitoring, blocked decisions, or a delegated subtask "
+        "whose parent already owns the durable outcome. Use a paused draft when not ready. Goals grant no new authority. "
+        "Preserve every acceptance criterion and constraint; never weaken or remove them to claim success. "
+        "A parent owns its standing goal; children must not create or mutate one. "
         "Respect scope, approvals, and stop instructions. Before creating or materially revising, call action='guide' "
         "to load goal-writing guidance and inspect existing state. Use status for inspection alone. "
         + GOAL_CONTROL_GUIDANCE
