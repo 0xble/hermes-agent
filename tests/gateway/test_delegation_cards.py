@@ -122,7 +122,7 @@ def test_completed_rows_have_no_subline_without_changing_nested_root_window():
 
 def test_render_card_shows_lightning_only_for_observed_tool_activity():
     card = {"rows": {
-        "root": dict(thread_ref="A", task_label="Run tools", subagent_type="lead",
+        "root": dict(thread_ref="A", task_label="Run tools", subagent_type="owner",
                      state="running", last_tool="delegate_task"),
         "nested": dict(thread_ref="A.1", card_parent_identity="root", task_label="Run code",
                        state="running", last_tool="execute_code"),
@@ -133,7 +133,7 @@ def test_render_card_shows_lightning_only_for_observed_tool_activity():
     lines = render_card(card, now=0).splitlines()
 
     assert lines == [
-        "○ Run tools · Lead", "\u00a0\u00a0↳ ⚡ delegate_task",
+        "○ Run tools · Owner", "\u00a0\u00a0↳ ⚡ delegate_task",
         "\u00a0\u00a0\u00a0\u00a0○ Run code", "\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0↳ ⚡ execute_code",
         "○ Await tool",
         "✓ Await parent",
@@ -209,7 +209,7 @@ async def test_observed_canonical_tool_name_reaches_telegram_send_and_edit(tmp_p
     adapter._bot.send_chat_action = AsyncMock()
     cards = DelegationCards(SimpleNamespace(_adapter_for_source=lambda _: adapter), home=tmp_path, interval=0)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="42")
-    data = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check display", subagent_type="lead", role="orchestrator", owner=dict(
+    data = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check display", subagent_type="owner", role="orchestrator", owner=dict(
         profile="default", session_id="s", session_key="r", chat_id="42", thread_id=""))
     await cards.observe(source, "r", "s", 1, "subagent.start", None, data)
     await cards.observe(source, "r", "s", 1, "subagent.tool", "computer_use", data)
@@ -218,12 +218,12 @@ async def test_observed_canonical_tool_name_reaches_telegram_send_and_edit(tmp_p
     await cards.observe(source, "r", "s", 1, "subagent.tool", "computer_use_multi_step", data)
     await asyncio.gather(*list(cards.pending.values()))
     assert "computer\\_use\\_multi\\_step" in adapter._bot.edit_message_text.call_args.kwargs["text"]
-    assert " · Lead" in adapter._bot.send_message.call_args.kwargs["text"]
-    assert " · Lead" in adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert " · Owner" in adapter._bot.send_message.call_args.kwargs["text"]
+    assert " · Owner" in adapter._bot.edit_message_text.call_args.kwargs["text"]
     restored = DelegationCards(cards.runner, home=tmp_path, interval=0)
     await restored.reconcile()
     await drain_cards(restored)
-    assert " · Lead" in adapter._bot.edit_message_text.call_args.kwargs["text"]
+    assert " · Owner" in adapter._bot.edit_message_text.call_args.kwargs["text"]
     assert "orchestrator" not in adapter._bot.edit_message_text.call_args.kwargs["text"]
 
 
@@ -795,7 +795,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     runner = SimpleNamespace(_adapter_for_source=lambda _: adapter)
     cards = DelegationCards(runner, home=tmp_path, interval=0)
     owner = dict(profile="default", session_id="s", session_key="r", chat_id="42", thread_id="8")
-    a = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check receipt", subagent_type="lead", owner=owner)
+    a = dict(parent_task_id="a" * 32, thread_ref="A", task_label="Check receipt", subagent_type="owner", owner=owner)
     b = dict(parent_task_id="b" * 32, thread_ref="B", task_label="Check display", subagent_type="explorer", owner=owner)
     await cards.observe(source, "r", "s", 1, "subagent.start", None, a)
     await drain_cards(cards)
@@ -804,7 +804,7 @@ async def test_conversation_aggregates_tasks_and_retires_only_delivered_rows(tmp
     adapter.send_delegation_card.assert_awaited_once()
     text = adapter.edit_message.call_args.args[2]
     assert "Check receipt" in text and "Check display" in text
-    assert "Lead" in text and "Explorer" in text
+    assert "Owner" in text and "Explorer" in text
     assert adapter.edit_message.call_args.args[1] == "one"
     await cards.observe(source, "r", "s", 1, "subagent.complete", None, a)
     event = MessageEvent(source=source, text="handled A", internal=True, metadata={

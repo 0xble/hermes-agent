@@ -114,17 +114,43 @@ class GatewayAgentCacheMixin:
         # Fingerprint the FULL credential, not a short prefix: OAuth/JWT-style tokens often share a
         # common prefix (e.g. "eyJhbGci"), so a prefix would give false cache hits across auth switches.
         _api_key = str(runtime.get("api_key", "") or "")
+        def _stable(value):
+            """Return a deterministic JSON-safe form without collapsing typed mapping keys."""
+            if isinstance(value, dict):
+                def _key_token(key):
+                    if isinstance(key, bool):
+                        return ("bool", int(key))
+                    if isinstance(key, int) and not isinstance(key, bool):
+                        return ("int", key)
+                    if isinstance(key, float):
+                        return ("float", repr(key))
+                    if isinstance(key, str):
+                        return ("str", key)
+                    return (type(key).__name__, repr(key))
+                entries = [(_key_token(key), _stable(item)) for key, item in value.items()]
+                return ["dict", [[token[0], token[1], item] for token, item in sorted(entries, key=lambda pair: pair[0])]]
+            # Tag every container: user sequences must not imitate mapping entries
+            # (or the tagged representation itself) and silently reuse stale schemas.
+            if isinstance(value, list):
+                return ["list", [_stable(item) for item in value]]
+            if isinstance(value, tuple):
+                return ["tuple", [_stable(item) for item in value]]
+            if isinstance(value, (set, frozenset)):
+                items = [_stable(item) for item in value]
+                items.sort(key=lambda item: _j.dumps(item, sort_keys=True, default=str))
+                return ["frozenset" if isinstance(value, frozenset) else "set", items]
+            return value
         blob = _j.dumps(
             [
                 model,
                 hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else "",
                 runtime.get("base_url", ""), runtime.get("provider", ""),
                 runtime.get("requested_provider", ""), runtime.get("api_mode", ""),
-                sorted((runtime.get("capabilities") or {}).items()),
+                _stable(runtime.get("capabilities") or {}),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
                 # reasoning_config excluded — set per-message on the cached agent; no prompt/tool effect.
                 ephemeral_prompt or "",
-                sorted((cache_keys or {}).items()),
+                _stable(cache_keys or {}),
                 str(user_id or ""), str(user_id_alt or ""),
                 # skip_context_files changes the agent's frozen system prompt (context files in vs out):
                 # a toggled edit must rebuild the cached agent, not silently reuse it.

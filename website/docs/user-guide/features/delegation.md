@@ -202,6 +202,14 @@ simple work should stay with the parent rather than be delegated at all.
 name instead of warning about an unknown key. A misspelled field is rejected
 with the correct name suggested.
 
+In a running gateway, adding, editing, renaming or removing a role refreshes the
+parent's advertised selector on its next turn. Changes to inherited delegation
+defaults, role preset allowlists and delegation schema limits take effect at the
+same boundary. An unchanged configuration reuses the cached agent. Hermes does
+not rewrite an in-flight agent's tools or system prompt, change already-running
+children's frozen routes, or reset the conversation history. A rename affects
+future selection; it does not rename historical children or their records.
+
 `description` and `instructions` are required. `provider`, `model`, and
 `reasoning_effort` are optional. Set `inherit_parent: true` to make the primary
 route exactly the parent's resolved route. If `fallbacks` is omitted, it also

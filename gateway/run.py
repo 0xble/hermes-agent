@@ -4366,6 +4366,13 @@ class GatewayRunner(
     # cached agent or a mid-gateway edit is silently ignored. Add new baked-in settings here.
     # _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
+        # delegate_task freezes these schema inputs at agent construction, including
+        # role instructions, fallbacks and MoA preset allowlists inside subagents.
+        # Observe edits on the next turn, never by mutating an in-flight tool list.
+        ("delegation", "subagents"), ("delegation", "model"),
+        ("delegation", "provider"), ("delegation", "reasoning_effort"),
+        ("delegation", "max_concurrent_children"), ("delegation", "max_spawn_depth"),
+        ("delegation", "orchestrator_enabled"), ("delegation", "independent_completions"),
         ("model", "context_length"), ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
         ("compression", "model_thresholds"), ("compression", "threshold_tokens"),

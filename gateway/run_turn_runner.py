@@ -18,6 +18,7 @@ import re
 import threading
 import time
 from contextlib import suppress
+from copy import deepcopy
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -90,6 +91,7 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._rebuild_history: Any = None
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._adapter_for_source(ctx.source))
         ctx._status_delivery = self._status_delivery
@@ -1562,6 +1564,7 @@ class TurnRunner:
         agent: Any = None
         reused: bool = False
         evicted: Any = None  # agent evicted under the lock; released off-lock on a daemon thread
+        history: Any = None  # same-session reference; caller detaches it outside the lock
 
     def _skip_context_files(self, platform_key) -> bool:
         """gateway.platforms.<plat>.skip_context_files: messaging platforms may opt out of
@@ -1620,6 +1623,14 @@ class TurnRunner:
         with cache_lock:
             cached = cache.get(ctx.session_key)
             if not (cached and cached[1] == sig):
+                # A schema/config edit must not turn a transient persistence failure
+                # into amnesia. Capture only the transcript reference, never the old
+                # tools/prompt, and never across conversation switches/external writes.
+                if (cached and len(cached) > 3 and ctx.session_id is not None
+                        and cached[3] == ctx.session_id
+                        and getattr(cached[0], "session_id", None) == ctx.session_id
+                        and (cached[2] is None or msg_count is None or cached[2] == msg_count)):
+                    out.history = getattr(cached[0], "_session_messages", None)
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1714,6 +1725,20 @@ class TurnRunner:
         peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
         msg_count = self._current_message_count()
         found = self._lookup_cached_agent(sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count)
+        # Per-session turn serialization keeps this reference stable here. Detach
+        # before building the replacement, outside the global lock: large histories
+        # must not stall other sessions or the idle sweeper.
+        self._rebuild_history = None
+        if found.history is not None:
+            try:
+                self._rebuild_history = deepcopy(found.history)
+            except Exception:
+                # Snapshot recovery is best-effort; never abort an otherwise valid
+                # turn or reuse an aliased/partially copied predecessor transcript.
+                logger.warning(
+                    "Could not detach cached history for session %s; using persisted history",
+                    self._ctx.session_key,
+                )
         agent = found.agent
         # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
@@ -2084,12 +2109,15 @@ class TurnRunner:
             ctx.history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
         # FTS write-corruption guard: if persistence failed silently the reloaded transcript is stale
-        # while the SAME cached agent still holds the live conversation (same-session amnesia). Only
-        # for a reused agent bound to this exact session_id.
+        # while the SAME cached agent still holds the live conversation (same-session amnesia).
+        # A config-driven replacement can also supply a detached same-session snapshot.
         # Replacing the live transcript with that shorter copy causes immediate same-session amnesia. See
         # #50502.
+        live_history = self._rebuild_history
         if reused_cached_agent and getattr(agent, "session_id", None) == ctx.session_id:
-            selected = _select_cached_agent_history(agent_history, getattr(agent, "_session_messages", None))
+            live_history = getattr(agent, "_session_messages", None)
+        if live_history is not None:
+            selected = _select_cached_agent_history(agent_history, live_history)
             if selected is not agent_history:
                 logger.warning(
                     "Persisted transcript lagged live cached history for "

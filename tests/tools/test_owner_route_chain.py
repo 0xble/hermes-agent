@@ -41,9 +41,9 @@ def test_inherited_authority(make_child, tmp_path, monkeypatch, named, provider,
     parent._fallback_chain = [{"provider": "consumed", "model": "never-resolve"}, {"provider": provider, "model": model,
         "base_url": fixture_endpoint, "api_key": "fixture-only", "api_mode": mode}]
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"agent": {"reasoning_effort": "high"}}))
-    cfg = {"provider": "not-inherited", "subagents": {"lead": {
+    cfg = {"provider": "not-inherited", "subagents": {"owner": {
         "description": "Fixture", "instructions": "Fixture", "inherit_parent": True}}}
-    launches, error = _preflight_task_runtime([{"subagent_type": "lead"}], cfg, None, parent, {})
+    launches, error = _preflight_task_runtime([{"subagent_type": "owner"}], cfg, None, parent, {})
     assert error is None
     assert len(launches[0].fallback_routes) == 1
     if named:
@@ -53,7 +53,7 @@ def test_inherited_authority(make_child, tmp_path, monkeypatch, named, provider,
         parent._fallback_index = 0
         monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
                             lambda **kw: pytest.fail("re-resolved frozen authority"))
-        launches, error = _preflight_task_runtime([{"subagent_type": "lead"}], cfg, None, parent, {})
+        launches, error = _preflight_task_runtime([{"subagent_type": "owner"}], cfg, None, parent, {})
         assert error is None
     launch = launches[0]
     parent._fallback_chain[-1]["api_key"] = "mutated"
@@ -89,8 +89,8 @@ def test_explicit_authority_wins(make_child, monkeypatch, fallbacks):
         return {"provider": "custom", "model": "replacement", "base_url": "http://127.0.0.1:9/v1",
                 "api_mode": "chat_completions", "api_key": "fixture"}
     monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
-    cfg = {"subagents": {"lead": {"description": "Fixture", "instructions": "Fixture",
+    cfg = {"subagents": {"owner": {"description": "Fixture", "instructions": "Fixture",
                                   "inherit_parent": True, "fallbacks": fallbacks}}}
-    launches, error = _preflight_task_runtime([{"subagent_type": "lead"}], cfg, None, parent, {})
+    launches, error = _preflight_task_runtime([{"subagent_type": "owner"}], cfg, None, parent, {})
     assert error is None
     assert len(launches[0].fallback_routes) == len(fallbacks)

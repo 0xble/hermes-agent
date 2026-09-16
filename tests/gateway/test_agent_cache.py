@@ -142,6 +142,33 @@ class TestAgentConfigSignature:
         )
         assert sig_a == sig_b
 
+    @pytest.mark.parametrize("left,right", [
+        ({True: "token"}, {"True": "token"}),
+        ({1: "token"}, {"1": "token"}),
+        ({False: "token"}, {"False": "token"}),
+        ({0: "token"}, {"0": "token"}),
+        ({1.0: "token"}, {"1.0": "token"}),
+    ])
+    def test_typed_mapping_keys_never_collide_with_token_like_strings(self, left, right):
+        """Credential/cache dictionaries retain key types during canonicalization."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        assert GatewayRunner._agent_config_signature("m", runtime, [], "", cache_keys=left) != (
+            GatewayRunner._agent_config_signature("m", runtime, [], "", cache_keys=right)
+        )
+
+    def test_nested_mixed_mapping_keys_are_order_independent_and_distinct(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        first = {"outer": {"2": "string", 2: "integer", True: "boolean"}}
+        reordered = {"outer": {True: "boolean", 2: "integer", "2": "string"}}
+        changed = {"outer": {"outer": "string", 2: "integer", True: "boolean"}}
+        sig = lambda value: GatewayRunner._agent_config_signature("m", runtime, [], "", cache_keys=value)
+        assert sig(first) == sig(reordered)
+        assert sig(first) != sig(changed)
+
 
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of

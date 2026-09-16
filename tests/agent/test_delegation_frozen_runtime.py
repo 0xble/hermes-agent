@@ -16,9 +16,9 @@ def test_inherited_role_freezes_ordered_fallbacks(monkeypatch):
         "api_key": "fixture-secret", "api_mode": "codex_responses" if requested == "openai-codex" else "chat_completions"})
     monkeypatch.setattr(providers, "get_provider_profile", lambda _provider: SimpleNamespace(
         supported_reasoning_efforts=lambda _model: {"high"}))
-    role = parse_definitions({"subagents": {"lead": {"description": "Lead", "instructions": "Own it",
+    role = parse_definitions({"subagents": {"owner": {"description": "Owner", "instructions": "Own it",
         "inherit_parent": True, "fallbacks": [{"provider": "openai-codex", "model": "astra-fixture",
-        "reasoning_effort": "high"}]}}})["lead"]
+        "reasoning_effort": "high"}]}}})["owner"]
     routes = freeze_fallback_routes(role, primary_provider="anthropic", primary_model="fable-fixture")
     assert [(r.provider, r.model, r.api_mode) for r in routes] == [("openai-codex", "astra-fixture", "codex_responses")]
     assert "fixture-secret" not in repr(routes)
