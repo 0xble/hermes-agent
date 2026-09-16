@@ -3119,6 +3119,16 @@ def _normalize_empty_agent_response(
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
+        # A dispatched native review owns the next reply. Its empty handoff is
+        # intentional, but must not conceal finalization or persistence errors.
+        if (
+            agent_result.get("turn_exit_reason") == "review_dispatched"
+            and agent_result.get("completed") is not False
+            and not agent_result.get("error")
+            and not agent_result.get("failure_reason")
+            and not agent_result.get("cleanup_errors")
+        ):
+            return response
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again.")
