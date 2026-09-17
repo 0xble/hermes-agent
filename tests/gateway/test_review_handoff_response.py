@@ -15,12 +15,11 @@ from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
 
-def _agent_result(*, persistence_error=False, reason=None):
-    agent = MagicMock()
+def _agent_result(*, persistence_error=False, reason=None, agent=None):
+    agent = agent if agent is not None else MagicMock(session_id="review-handoff")
     agent.model = "test-model"
     agent.provider = "test"
     agent.base_url = "http://unused"
-    agent.session_id = "review-handoff"
     agent.max_iterations = 10
     agent.iteration_budget = SimpleNamespace(used=1, max_total=10, remaining=9)
     agent.context_compressor = SimpleNamespace(last_prompt_tokens=0)

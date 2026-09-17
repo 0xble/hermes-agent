@@ -19,7 +19,7 @@ DEFER_REASON_GUIDANCE = (
 )
 
 
-def _query(agent, results=None, *, include_deferred=False):
+def _query(agent, results=None, *, include_deferred=False, include_handoffs=False, review_handoff=False):
     callback = getattr(agent, "tool_progress_callback", None)
     if not callable(callback):
         return {"missing": []}
@@ -27,7 +27,9 @@ def _query(agent, results=None, *, include_deferred=False):
     answer = callback("subagent.result_turn", actor_session_id=str(agent.session_id),
                       actor_owner=current_delegation_owner(agent),
                       turn_id=agent._delegation_result_turn, results=results,
-                      **({"include_deferred": True} if include_deferred else {}))
+                      **({"include_deferred": True} if include_deferred else {}),
+                      **({"include_handoffs": True} if include_handoffs else {}),
+                      **({"review_handoff": True} if review_handoff else {}))
     # Display-only callbacks on CLI surfaces have no lifecycle ledger. Gateway
     # lifecycle relays return a mapping; wrappers must preserve that return value.
     return answer if isinstance(answer, dict) else {"missing": []}
@@ -38,10 +40,11 @@ def begin_result_turn(agent, metadata=None, *, include_deferred=True):
     agent._delegation_result_tracking_error = False
     agent._delegation_followthrough_done = False
     results = (metadata or {}).get("delegation_results")
-    if results:
+    if results or include_deferred:
         try:
-            answer = _query(agent, results, include_deferred=include_deferred)
-            if include_deferred:
+            answer = _query(agent, results, include_deferred=include_deferred,
+                            include_handoffs=include_deferred)
+            if results and include_deferred:
                 agent._delegation_followthrough_done = True
             return _followthrough(agent, answer)
         except Exception:
@@ -51,9 +54,10 @@ def begin_result_turn(agent, metadata=None, *, include_deferred=True):
 
 
 def _followthrough(agent, answer):
-    if answer.get("deferred"):
+    retained = answer.get("handoffs", []) + answer.get("deferred", [])
+    if retained:
         from agent.delegation_followthrough import retrieve_deferred_context
-        content, presentations = retrieve_deferred_context(agent, answer["deferred"])
+        content, presentations = retrieve_deferred_context(agent, retained)
         if presentations:
             _query(agent, presentations)
         return content
@@ -135,14 +139,19 @@ def finish_result_turn(agent, original, run_turn, system_message, task_id):
     """Run only after the original loop returned, before the host seals delivery."""
     if not isinstance(original, dict) or original.get("interrupted") or original.get("failed"):
         return original
+    # A dispatched review ends the turn at a phase boundary with no assistant answer,
+    # so there is no answer whose disposition could have been omitted and no completed
+    # boundary to correct. Persist exact missing attempts for re-presentation in
+    # the next turn (including after restart). Tracking failures remain reported.
+    review_handoff = original.get("turn_exit_reason") == "review_dispatched"
     try:
-        missing = _query(agent).get("missing", [])
+        missing = _query(agent, review_handoff=review_handoff).get("missing", [])
     except Exception:
         missing = []
         agent._delegation_result_tracking_error = True
     if not missing and not agent._delegation_result_tracking_error:
         return original
-    if missing and not getattr(agent, "_interrupt_requested", False):
+    if missing and not review_handoff and not getattr(agent, "_interrupt_requested", False):
         prompt = (
             "[Internal delegation disposition correction — not a user request]\n"
             "The previous processing turn returned an answer but omitted disposition for the exact results below. "
@@ -174,7 +183,7 @@ def finish_result_turn(agent, original, run_turn, system_message, task_id):
         finally:
             agent.max_iterations = previous_limit
             agent._delegation_disposition_correction = None
-    if missing or agent._delegation_result_tracking_error:
+    if (missing and not review_handoff) or agent._delegation_result_tracking_error:
         warning = ("Some delegated results still need an explicit disposition. They remain visible; "
                    "review them and mark incorporated, report a blocker, or defer with a reason.")
         original = {**original, "delegation_disposition_unresolved": True,

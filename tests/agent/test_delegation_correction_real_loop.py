@@ -84,7 +84,6 @@ def test_internal_repair_is_silent_and_physically_bounded(tmp_path, monkeypatch,
     agent.stream_delta_callback = lambda x: visible.append(("delta", x))
     agent.interim_assistant_callback = lambda x, **kw: visible.append(("interim", x))
     agent.reasoning_callback = lambda x, **kw: visible.append(("reasoning", x))
-    agent._pending_delegation_presentations = [{"parent_task_id": "task", "thread_refs": ["A"], "attempts": {"A": 0}}]
     agent._print_fn = lambda *args, **kw: visible.append(("print", args))
     agent.suppress_status_output = False
     snapshots = {name: getattr(agent, name) for name in ("_print_fn", "suppress_status_output", "tool_progress_callback", "stream_delta_callback", "interim_assistant_callback", "reasoning_callback", "max_iterations", "quiet_mode")}

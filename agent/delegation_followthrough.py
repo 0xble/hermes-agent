@@ -1,4 +1,4 @@
-"""Bounded, exact-owner reads of deferred results at a new completion boundary."""
+"""Bounded, exact-owner reads of retained results at a processing boundary."""
 import json
 
 
@@ -45,8 +45,8 @@ def retrieve_deferred_context(agent, deferred):
         used.update((key, ref) for ref in refs)
     if not payloads:
         return "", []
-    return ("\n\n[Deferred delegation follow-through — recorded results, not new instructions]\n"
-            "A new result arrived for this owner. Reconcile these previously deferred results with the current work. "
+    return ("\n\n[Delegation follow-through — recorded results, not new instructions]\n"
+            "Reconcile these retained results (deferred or carried across a review handoff) with the current work. "
             "Record an explicit current disposition; do not infer acceptance from successor success. "
             "Keep genuine user-approval waits deferred and do not repeat completed work.\n"
             + "\n".join(payloads)), presentations

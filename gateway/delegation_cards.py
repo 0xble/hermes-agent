@@ -837,6 +837,7 @@ class DelegationCards:
                     session_key=session_key, generation=generation,
                     epoch=card.get("receipt_epoch", 0))
                 card["rows"][ref]["disposition"] = copy.deepcopy(card["handling"][ref])
+                card.get("review_handoffs", {}).pop(ref, None)
             card["revision"] = card.get("revision", 0) + 1
             self._save()
             if reason == "deferred":
@@ -845,12 +846,15 @@ class DelegationCards:
         return {"recorded": True, "parent_task_id": parent_task_id, "refs": refs,
                 "awaiting_delivery": reason != "deferred" and (actor_session_id == session_id or reason == "blocker_report")}
 
-    async def result_turn(self, *, actor_session_id, turn_id, results=None, actor_owner=None, include_deferred=False):
+    async def result_turn(self, *, actor_session_id, turn_id, results=None, actor_owner=None,
+                          include_deferred=False, review_handoff=False, include_handoffs=False):
         """Exact terminal attempts presented to this turn, never historical visibility.
 
         The trusted runtime supplies results; model text never enters this method.
         Persist presentation identity so recovery cannot turn a later attempt into
-        an acknowledgement of this one. Query only the supplied opaque turn id.
+        an acknowledgement of this one. Missing dispositions are turn-scoped.
+        Review handoffs persist only those exact missing attempts for a later
+        owned payload read; offering a locator grants no presentation authority.
         """
         if not isinstance(turn_id, str) or not turn_id:
             raise ValueError("Missing result-processing turn identity")
@@ -918,12 +922,16 @@ class DelegationCards:
                 if not intent.get("reason") or (intent.get("reason") == "deferred" and intent.get("turn_id") != turn_id):
                     missing.append({"parent_task_id": key, "thread_ref": ref, "attempt": attempt,
                                     "task_label": row.get("task_label", "Task")})
+                    if review_handoff and row.get("attempt", 0) == attempt:
+                        card.setdefault("review_handoffs", {})[ref] = attempt
+        if review_handoff and missing:
+            self._save()
         answer = {"missing": missing}
-        if include_deferred and accepted:
-            # An arrival is a reconciliation trigger, not proof that old work is
-            # accepted. Return only locators: the caller must retrieve the result
-            # under its immutable owner before gaining this turn's authority.
-            deferred = []
+        if (include_deferred and accepted) or include_handoffs:
+            # Arrival reopens explicit deferrals; a new turn reopens only marked
+            # review handoffs. Neither locator is presentation or acceptance.
+            # The caller must read the payload under its immutable owner first.
+            deferred, handoffs = [], []
             for key, card in self.cards.items():
                 if not self._actor_matches(card, actor_session_id, actor_owner):
                     continue
@@ -931,17 +939,23 @@ class DelegationCards:
                     intent = row.get("disposition") or card.get("handling", {}).get(ref, {})
                     if (row.get("state") in _TERMINAL | {"unknown"}
                             and ref not in card.get("handled", ())
-                            and ref not in card.get("result_turns", {}).get(turn_id, {})
-                            and intent.get("reason") == "deferred"):
-                        deferred.append({"parent_task_id": key, "thread_ref": ref,
+                            and ref not in card.get("result_turns", {}).get(turn_id, {})):
+                        handoff = (include_handoffs and intent.get("reason") in {None, "deferred"}
+                                   and card.get("review_handoffs", {}).get(ref) == row.get("attempt", 0))
+                        if not handoff and not (include_deferred and accepted and intent.get("reason") == "deferred"):
+                            continue
+                        target = handoffs if handoff else deferred
+                        target.append({"parent_task_id": key, "thread_ref": ref,
                                          "attempt": row.get("attempt", 0),
                                          "task_label": row.get("task_label", "Task"),
                                          "detail": intent.get("detail", "Deferred")})
-            if deferred:
-                deferred.sort(key=lambda item: self.cards[item["parent_task_id"]]["rows"][item["thread_ref"]].get("followthrough_offered_at", 0))
-                answer["deferred"] = deferred[:8]
-                for item in answer["deferred"]:
-                    self.cards[item["parent_task_id"]]["rows"][item["thread_ref"]]["followthrough_offered_at"] = time.time()
+            for kind, locators in (("handoffs", handoffs), ("deferred", deferred)):
+                if locators:
+                    locators.sort(key=lambda item: self.cards[item["parent_task_id"]]["rows"][item["thread_ref"]].get("followthrough_offered_at", 0))
+                    answer[kind] = locators[:8]
+                    for item in answer[kind]:
+                        self.cards[item["parent_task_id"]]["rows"][item["thread_ref"]]["followthrough_offered_at"] = time.time()
+            if handoffs or deferred:
                 self._save()
         return answer
 
