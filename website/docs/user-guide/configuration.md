@@ -173,10 +173,12 @@ updates:
   pre_update_backup: quick
 ```
 
-Stable must be a validated ancestor of main: exact-SHA required tests and independent
-review, no blocking findings or known regressions, and at least 24 hours of recorded
-settling. Age alone does not qualify. The existing maintenance owner evaluates
-that evidence before publishing; the updater does not infer eligibility from Git.
+Stable must be a validated ancestor of main: exact-SHA required tests and
+review, with no blocking findings or known regressions. Upstream promotions
+also need at least 24 hours of recorded settling. Local or fork-only patches
+skip that age gate. Age alone does not qualify. The existing maintenance owner
+evaluates that evidence before publishing; the updater does not infer
+eligibility from Git.
 If no candidate qualifies, leave the current runtime and channel unchanged.
 
 `hermes update --branch stable` selects it once without changing config. Explicit

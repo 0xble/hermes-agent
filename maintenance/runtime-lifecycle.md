@@ -11,8 +11,9 @@ requires it on every run and owns shared adoption/publication policy.
 semi-stable eligibility and operational evidence. Main continues syncing upstream;
 stable is only a validated ancestor pointer. The existing pinned updater freezes
 stable once, requires a state snapshot, retains the previous source ref and
-manifest evidence, and refuses implicit downgrade. Independent review and 24-hour
-observed settling are separate from tests; urgent approval skips age only.
+manifest evidence, and refuses implicit downgrade. Review is separate from tests.
+24-hour observed settling applies to upstream promotions, not local or fork-only
+patches. Urgent approval skips upstream age only.
 Regression: `tests/hermes_cli/test_update_stable.py` plus the existing immutable
 revision suites. Configuration/activation is parent-owned and must wait for a
 qualified remote stable ref. No new schedule or runtime activation is included.

@@ -6,37 +6,44 @@ policy creates a scheduler, a second review/CI gate, or automatic rollback.
 
 ## Promotion admission: existing maintenance owner
 
-Use the existing required tests, independent-review receipts, and maintenance
+Use the existing required tests, review receipts, and maintenance
 observation records. The **promotion owner**, not an updater reading a branch
 name, is responsible for proving eligibility. A commit date, a branch name, a
 successful fetch, or an empty blocker list alone is not proof.
+
+Local or fork-only patches and upstream promotions share tests, review, and
+ancestry. They do not share settling time. Review means an accepted review of
+the exact candidate. It does not require a separate reviewer, provider, or
+independence label.
 
 1. Freeze the owned remote `main` SHA. Enumerate its ancestors newest-first with
    `git rev-list --topo-order <main-sha>` (descendants precede ancestors; Git's
    ordering breaks ties between independent histories). Never develop on stable.
 2. Inspect candidates in that order. Select the first whose **exact SHA** has all
-   required tests passing and accepted independent review, with no unresolved
+   required tests passing and accepted review, with no unresolved
    blocking findings. Use original receipts/logs and verify their SHA/tree scope;
    changed files, stale review scope, mismatched SHA, or missing original evidence
    disqualify a candidate. Never manufacture historical eligibility.
-3. Require at least **24 hours of recorded settling with no known regressions**.
-   Retain the observed start/end timestamps and operational evidence in the
-   existing maintenance record. Commit age alone is insufficient. At exactly
-   24 hours, the age condition is satisfied; even one microsecond short is not.
-   Refresh known blocker/regression sources immediately before promotion. A new
-   blocking regression invalidates eligibility regardless of prior green tests.
+3. **Upstream promotions** also require at least **24 hours of recorded settling
+   with no known regressions**. Retain the observed start/end timestamps and
+   operational evidence in the existing maintenance record. Commit age alone is
+   insufficient. At exactly 24 hours, the age condition is satisfied; even one
+   microsecond short is not. Refresh known blocker/regression sources immediately
+   before promotion. A new blocking regression invalidates eligibility regardless
+   of prior green tests. **Local or fork-only patches skip this age gate.** An
+   **explicit urgent authorization naming the validated SHA** may waive settling
+   time for an upstream promotion only.
 4. Hosted CI unavailable because of billing/spending limits is **unavailable**, not
    green. Already-approved equivalent local checks may qualify only with exact
    candidate SHA, commands, complete results, environment, artifacts, and original
    equivalence approval recorded. Skipped tests remain visible gaps; an updater
-   success receipt is not an independent review or CI substitute.
-5. An **explicit urgent authorization naming the validated SHA** may waive only
-   settling time. Tests, independent review, no unresolved blocking findings,
-   current regression checks, and ancestry remain mandatory. Record the authority,
-   reason and waived age in the same maintenance record. `--yes`, `--force`, an
-   update request, or an urgent label without exact-SHA authorization is not this
-   exception. The existing `--revision <SHA>` installs an explicitly approved
-   urgent target without introducing another override switch or approval system.
+   success receipt is not a review or CI substitute.
+5. Urgent authorization never waives tests, review, unresolved blocking findings,
+   current regression checks, or ancestry. Record the authority, reason and waived
+   age in the same maintenance record. `--yes`, `--force`, an update request, or an
+   urgent label without exact-SHA authorization is not this exception. The existing
+   `--revision <SHA>` installs an explicitly approved urgent target without
+   introducing another override switch or approval system.
 6. If no candidate qualifies, preserve the current runtime, report exactly which
    evidence is missing, and do not create or move stable. Do not point live config
    at nonexistent/unqualified stable. An older stable never authorizes downgrading
@@ -133,11 +140,12 @@ rather than a duplicate test/review framework:
   or no candidate; never substitute an arbitrary old commit;
 - stale/mismatched test or review evidence: ineligible until corrected originals
   prove exact-SHA coverage;
-- 23:59:59.999999 settling: ineligible; 24:00:00: age passes only if all other
-  gates pass and observations show no known regressions;
+- local or fork-only patch: tests and review required; 24-hour settling does not apply;
+- 23:59:59.999999 settling on an upstream promotion: ineligible; 24:00:00: age
+  passes only if all other gates pass and observations show no known regressions;
 - new blocking regression after validation: eligibility revoked before promotion;
-- explicit urgent exact-SHA authorization: age may be skipped, never tests,
-  review, blockers, ancestry, or safe installation;
+- explicit urgent exact-SHA authorization: upstream settling age may be skipped,
+  never tests, review, blockers, ancestry, or safe installation;
 - rollback record absent/unreadable or snapshot failure: do not checkout.
 
 Existing scheduler/helper installation, source findings, and real cron
