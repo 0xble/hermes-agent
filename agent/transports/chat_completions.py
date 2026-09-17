@@ -335,6 +335,11 @@ def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:
     if msg.get("role") == "tool" and "name" in msg:
         strip_keys.append("name")
     out_msg = {k: v for k, v in msg.items() if k not in strip_keys}
+    # Older inline tools persisted object results. Project those as JSON text
+    # on the wire, without rewriting history or flattening multimodal lists.
+    object_tool_content = msg.get("role") == "tool" and isinstance(msg.get("content"), dict)
+    if object_tool_content:
+        out_msg["content"] = json.dumps(msg["content"])
     tool_calls = msg.get("tool_calls")
     copied_tool_calls = None
     if msg.get("role") == "assistant" and "tool_calls" in msg and (tool_calls is None or (isinstance(tool_calls, list) and not tool_calls)):
@@ -355,7 +360,7 @@ def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:
                 copied_tool_calls[tc_idx] = {k: v for k, v in tc.items() if k not in keys}
         if copied_tool_calls is not None:
             out_msg["tool_calls"] = copied_tool_calls
-    return out_msg if strip_keys or copied_tool_calls is not None else None
+    return out_msg if strip_keys or copied_tool_calls is not None or object_tool_content else None
 
 
 class ChatCompletionsTransport(ProviderTransport):

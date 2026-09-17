@@ -28,19 +28,23 @@ def test_review_tool_schema_routes_to_parent_context_only():
     assert "parent agent loop" in json.loads(result)["error"]
 
 
-def test_review_tool_dispatches_with_parent_and_candidate():
+@pytest.mark.parametrize("status", ["dispatched", "completed"])
+def test_review_tool_dispatches_with_parent_and_candidate(status):
     parent = SimpleNamespace()
     messages = [{"role": "user", "content": "Review the accepted change"}]
     args = {"repository": "/candidate", "base_revision": "HEAD", "accepted_scope": ["a.py"]}
     candidate = object()
     with patch("agent.review_candidate.capture_review_candidate", return_value=candidate) as capture, patch(
-        "agent.review_engine.start_review", return_value={"status": "dispatched"}
+        "agent.review_engine.start_review", return_value={"status": status}
     ) as dispatch:
         result = INLINE_TOOL_EXECUTORS["review_changes"](
             parent, args, InlineToolContext("parent-task", messages=messages)
         )
-    assert result == {"status": "dispatched"}
-    assert parent._review_yield_requested is True
+    import json
+
+    assert isinstance(result, str)
+    assert json.loads(result) == {"status": status}
+    assert getattr(parent, "_review_yield_requested", False) is (status == "dispatched")
     assert capture.call_args.kwargs["accepted_scope"] == ["a.py"]
     assert dispatch.call_args.kwargs["candidate"] is candidate
     assert dispatch.call_args.kwargs["parent_agent"] is parent

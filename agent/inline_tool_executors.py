@@ -193,7 +193,9 @@ def _review_changes(agent: Any, args: dict, ctx: InlineToolContext) -> Any:
         # The normal durable completion rail owns the next useful turn. Stop
         # this work phase so the parent cannot continue past its own review gate.
         agent._review_yield_requested = True
-    return result
+    return json.dumps(result)
+
+
 def _manage_connections(agent, args: dict, ctx: InlineToolContext) -> Any:
     # The GUI callback lives on the agent; registry dispatch never forwards it.
     from tools.connectors import manage_connections
