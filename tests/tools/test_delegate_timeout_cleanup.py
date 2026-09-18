@@ -31,13 +31,18 @@ class _SlowUnwindingChild:
 
     def run_conversation(self, **_kwargs):
         self.started.set()
-        self.interrupted.wait()
+        # Generous bounds: these gate on events the test sets promptly; a tight bound only
+        # turns a load-starved test thread into a spurious early exit that fires close()
+        # while parent-side timeout accounting is still running. Bounded rather than
+        # unbounded so a never-signalled worker fails the test instead of hanging it.
+        assert self.interrupted.wait(timeout=10)
         # Model the real child turn's finally path: it still performs session
         # activity/SQLite cleanup after the parent requests interruption.
         self.unwinding.set()
-        # Only the test may release this worker. A deadline here can expire
-        # while parent-side timeout accounting is still running on a busy host.
-        self.allow_finish.wait()
+        # Only the test may release this worker; the bound exists solely so a missing
+        # release fails loudly instead of hanging the suite, and is deliberately far
+        # longer than any parent-side timeout accounting on a busy host.
+        assert self.allow_finish.wait(timeout=10)
         self.finished.set()
         return {
             "final_response": "",

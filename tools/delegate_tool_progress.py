@@ -334,6 +334,7 @@ class _ChildProgressRelay:
             subagent_id, parent_id, depth, model, toolsets
         )
         self.batch: List[str] = []
+        self.parent_scope: Any = None  # owning parent agent; set by _build_child_progress_callback
         self.tool_count = 0  # per-subagent running counter
         self._activity_lock = threading.RLock()
         self._activity_sequence = 0
@@ -409,11 +410,20 @@ class _ChildProgressRelay:
         self._waits.clear()
         # Failed child: echo one clean reason line into the CLI tree so the human
         # sees WHY, not just a vanished branch (gateway renders off the relayed event).
+        # The echo is an automatic diagnostic presentation: it goes through the warning
+        # boundary under the parent's turn snapshot. The relayed event (the gateway's
+        # producer, which classifies it) and the child result are never gated here.
         if kwargs.get("status") in SUBAGENT_FAILURE_STATUSES:
-            self._tree_line(format_subagent_failure_line(
-                self.goal_label, kwargs.get("status"), error=kwargs.get("summary") or preview,
-                duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
-            ))
+            from gateway.warning_notifications import render_notification
+            parent = self.parent_scope
+            render_notification(
+                lambda: self._tree_line(format_subagent_failure_line(
+                    self.goal_label, kwargs.get("status"), error=kwargs.get("summary") or preview,
+                    duration_seconds=kwargs.get("duration_seconds"), failure_reason=kwargs.get("failure_reason"),
+                )),
+                platform=getattr(parent, "_notification_platform", getattr(parent, "platform", "cli")),
+                user_config=getattr(parent, "_notification_config", None),
+            )
         self._relay("subagent.complete", preview=preview, **kwargs)
 
     def _on_text(self, tool_name, preview, args, kwargs):
@@ -508,6 +518,8 @@ def _build_child_progress_callback(
     if session_ref is not None:
         # Not an identity kwarg (underscore-prefixed, never relayed); only scopes the batch ordinal.
         session_ref["_parent_scope"] = parent_agent
-    return _ChildProgressRelay(
+    relay = _ChildProgressRelay(
         task_index, goal, spinner, parent_cb, task_count, subagent_id, parent_id, depth, model, toolsets, session_ref,
     )
+    relay.parent_scope = parent_agent
+    return relay

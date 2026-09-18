@@ -15,6 +15,28 @@ from tools.interrupt import set_interrupt as _set_interrupt
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
+# ``interrupt()`` categories that mean a human stopped the turn. Any other ``_tool_interrupt_reason`` was
+# supplied by a system producer via ``tool_reason`` (watchdogs, lease loss, lifecycle cancellation) and is
+# attributed to it in the turn exit reason instead of being booked as a user stop (#112647).
+_REASON_HARD_STOP = "explicit stop requested"
+_REASON_NEW_MESSAGE = "user sent a new message"
+_REASON_USER_INTERRUPT = "user interrupt"
+# The fork names the bare soft-interrupt path distinctly so delegation checkpoints can tell an
+# interruption apart from an explicit user stop. It is still a human-initiated category: every
+# system producer supplies ``tool_reason``, so it belongs in the user set for issuer attribution.
+_REASON_AGENT_INTERRUPT = "agent interrupted"
+USER_INTERRUPT_REASONS = frozenset({
+    _REASON_HARD_STOP, _REASON_NEW_MESSAGE, _REASON_USER_INTERRUPT, _REASON_AGENT_INTERRUPT,
+})
+
+
+def interrupt_issuer(agent) -> Optional[str]:
+    """Slug of the system producer behind the pending interrupt, or ``None`` for a human stop."""
+    reason = getattr(agent, "_tool_interrupt_reason", None)
+    if not reason or reason in USER_INTERRUPT_REASONS:
+        return None
+    return str(reason).strip().replace(" ", "_")
+
 
 def _fence_cancel_before_commit(fence, *, when_in_flight: bool, failure_log: str) -> None:
     """Call ``type(fence).cancel_before_commit(fence)`` when ``commit_in_flight`` matches.
@@ -112,8 +134,8 @@ class InterruptControlMixin:
         # Tool cancellation attribution stays separate from _interrupt_message, which may carry the user's
         # full next message.
         tool_interrupt_reason = tool_reason or (
-            "explicit stop requested" if hard_cancel
-            else "user sent a new message" if message else "agent interrupted"
+            _REASON_HARD_STOP if hard_cancel
+            else _REASON_NEW_MESSAGE if message else _REASON_AGENT_INTERRUPT
         )
 
         def _publish_interrupt_state() -> None:
@@ -121,11 +143,13 @@ class InterruptControlMixin:
             self._interrupt_message = message
             self._tool_interrupt_reason = tool_interrupt_reason
             self._delegation_interrupt_reason = tool_interrupt_reason
-            if tool_interrupt_reason == "explicit stop requested":
+            if tool_interrupt_reason == _REASON_HARD_STOP:
                 # Survives clear_interrupt; a stop is not a continuation grant.
                 self._delegation_user_stopped = True
                 import uuid
                 self._delegation_stop_token = uuid.uuid4().hex
+            # The turn record and the log must agree on WHO asked for the stop (#112647).
+            logger.info("Interrupt requested (%s): %s", "hard" if hard_cancel else "soft", tool_interrupt_reason)
             _hard_event = getattr(self, "_hard_interrupt_requested", None) if hard_cancel else None
             if _hard_event is not None:
                 _hard_event.set()

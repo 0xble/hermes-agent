@@ -17,11 +17,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from agent.delegation_context import owned_kanban_task
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
-    PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, RETRIEVAL_EVIDENCE_GUIDANCE,
-    SEMANTIC_MEMORY_HISTORY_GUIDANCE, SESSION_SEARCH_GUIDANCE,
+    PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
@@ -246,7 +246,7 @@ def _agent_home(agent: Any) -> Optional[Path]:
         pass
     try:
         db_path = getattr(getattr(agent, "_session_db", None), "db_path", None)
-        return Path(db_path).parent if isinstance(db_path, (str, Path)) and db_path else None
+        return Path(db_path).parent if db_path else None
     except Exception:
         return None
 
@@ -284,51 +284,17 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
             skill_manage_available="skill_manage" in names,
         )
     # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
-    # the kanban_show fallback covers code paths that bypass agent_init.
+    # fallback paths must also limit task protocol guidance to dispatcher workers.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance is None:
-        _task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-        from agent.delegation_context import is_dispatcher_owned_worker_context
-        _owned_worker = is_dispatcher_owned_worker_context()
-        _kanban_guidance = KANBAN_GUIDANCE if (
-            _task_id and _owned_worker and "kanban_show" in names) else ""
-        agent._kanban_worker_guidance = _kanban_guidance
-    # session_search is transcript search. When a provider also supplies durable
-    # semantic memory, the model needs the guidance that distinguishes the two —
-    # otherwise it treats consolidated memory as if it were a transcript grep.
-    session_search_guidance = None
-    if "session_search" in names:
-        session_search_guidance = (
-            SEMANTIC_MEMORY_HISTORY_GUIDANCE if _semantic_memory_enabled(agent)
-            else SESSION_SEARCH_GUIDANCE
-        )
+    if _kanban_guidance is None and "kanban_show" in names and owned_kanban_task():
+        _kanban_guidance = KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
-        session_search_guidance,
+        SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
         _kanban_guidance,
     ]
     return " ".join(g for g in tool_guidance if g) or None
-
-
-def _semantic_memory_enabled(agent: Any) -> bool:
-    """Whether a live provider supplies durable semantic cross-session memory.
-
-    Falls back to the tool surface when no manager is attached (agents built
-    without full init), and fails closed on any provider error — emitting
-    transcript-search guidance is always safe, over-claiming semantic memory
-    is not.
-    """
-    manager = getattr(agent, "_memory_manager", None)
-    if manager is None:
-        return any(name in getattr(agent, "valid_tool_names", set())
-                   for name in ("hindsight_recall", "hindsight_reflect"))
-    try:
-        return any(bool(provider.semantic_memory_enabled())
-                   for provider in manager.providers
-                   if hasattr(provider, "semantic_memory_enabled"))
-    except Exception:
-        return False
 
 
 def _skills_prompt(agent: Any) -> str:
@@ -443,48 +409,63 @@ def _active_profile_line(agent: Any) -> str:
     )
 
 
-def platform_hint(agent: Any) -> str:
-    """Built-in/plugin platform hint + Telegram rich-messages opt-in + config
-    override + desktop TUI clarifier."""
-    platform_key = (agent.platform or "").lower().strip()
-    _default_hint = PLATFORM_HINTS.get(platform_key, "")
-    if not _default_hint and platform_key:
+def _default_platform_hint(platform_key: str) -> str:
+    """Built-in hint, else the plugin adapter's ``platform_hint``, else ``""``."""
+    hint = PLATFORM_HINTS.get(platform_key, "")
+    if not hint and platform_key:
         try:
             from gateway.platform_registry import platform_registry
             _entry = platform_registry.get(platform_key)
-            _default_hint = (_entry and _entry.platform_hint) or ""
+            hint = (_entry and _entry.platform_hint) or ""
         except Exception:
             pass
-    if platform_key == "telegram" and _default_hint and _telegram_rich_messages_enabled():
-        _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
-    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_hint)
+    if platform_key == "telegram" and hint and _telegram_rich_messages_enabled():
+        hint = hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+    return hint
+
+
+def _cron_delivery_hint(agent: Any) -> str:
+    """The destination channel's hint (default + its ``platform_hints`` override) for a cron agent.
+
+    A cron agent runs as platform ``cron`` but its final response lands on the job's ``deliver``
+    channel, so without this the model never learns that MEDIA: tags become Slack/Telegram
+    attachments or that tables do not render there — and a user's ``platform_hints.slack.append``
+    never reached scheduled jobs at all. The scheduler publishes the primary auto-deliver target
+    into the session ContextVar before the agent runs (same seam ``send_message`` routes by).
+    """
+    from gateway.session_context import get_session_env
+    deliver_key = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").lower().strip()
+    if not deliver_key or deliver_key == "cron":
+        return ""
+    hint = _resolve_platform_hint(agent, deliver_key, _default_platform_hint(deliver_key))
+    return f"Delivery destination ({deliver_key}): {hint}" if hint else ""
+
+
+def platform_hint(agent: Any) -> str:
+    """Built-in/plugin platform hint + Telegram rich-messages opt-in + config
+    override + desktop TUI clarifier; cron agents also carry their delivery channel's hint."""
+    platform_key = (agent.platform or "").lower().strip()
+    _effective_hint = _resolve_platform_hint(agent, platform_key, _default_platform_hint(platform_key))
     if platform_key == "tui" and _effective_hint:
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
+    if platform_key == "cron":
+        _delivery = _cron_delivery_hint(agent)
+        if _delivery:
+            _effective_hint = f"{_effective_hint}\n\n{_delivery}".strip()
     return _effective_hint
 
 
 def _telegram_rich_messages_enabled() -> bool:
     """``rich_messages`` from the Telegram ``extra`` config; same precedence the
     adapter uses (top-level ``platforms.telegram.extra`` overrides
-    ``gateway.platforms.telegram.extra`` at the leaf). The standalone coercion
-    mirrors the adapter without importing its gateway dependency graph."""
+    ``gateway.platforms.telegram.extra`` at the leaf). False on any read failure."""
     try:
         from hermes_cli.config import load_config_readonly
         _cfg = load_config_readonly()
         _gw = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
         _top = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
         merged = {**(_gw if isinstance(_gw, dict) else {}), **(_top if isinstance(_top, dict) else {})}
-        value = merged.get("rich_messages")
-        if value is None:
-            return True
-        if isinstance(value, (bool, int, float)):
-            return bool(value)
-        normalized = str(value).strip().lower()
-        if normalized in {"never", "off", "false", "0", "no"}:
-            return False
-        # ``auto``, ``always``, compatibility truthy strings, and invalid values
-        # all select the adapter's enabled adaptive/attempting modes.
-        return True
+        return bool(merged.get("rich_messages"))
     except Exception:
         return False
 
@@ -693,7 +674,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # index is built; this slot holds its position.
     _help_guidance_slot = len(stable_parts)
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
-    stable_parts.append(RETRIEVAL_EVIDENCE_GUIDANCE)
     stable_parts.extend(_guidance_parts(agent))
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
@@ -747,7 +727,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     agent._cached_system_prompt_static = parts["stable"]
     # Surface context-file truncation warnings in chat, not only in logs.
     for warning in drain_truncation_warnings():
-        agent._emit_status(warning)
+        agent._emit_diagnostic_status(warning)
     return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
 

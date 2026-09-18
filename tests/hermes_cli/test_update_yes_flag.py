@@ -94,7 +94,6 @@ def _make_run_side_effect(
 class TestUpdateYesConfigMigration:
     """--yes auto-answers the config-migration prompt and skips API-key prompts."""
 
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -109,7 +108,6 @@ class TestUpdateYesConfigMigration:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         mock_run.side_effect = _make_run_side_effect(
@@ -135,7 +133,6 @@ class TestUpdateYesConfigMigration:
         # The "Would you like to configure them now?" prompt text never appears.
         assert "Would you like to configure them now?" not in out
 
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -150,7 +147,6 @@ class TestUpdateYesConfigMigration:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         """Regression guard: without --yes, the TTY prompt path still fires."""
@@ -193,7 +189,6 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
     the exception escape and crash `hermes update` mid-flight.
     """
 
-    @patch("hermes_cli.update_cmd._reload_config_modules")
     @patch("hermes_cli.update_cmd._run_migrate_config_fresh")
     @patch("hermes_cli.update_cmd._run_config_check_fresh", return_value=(1, 2))
     @patch("hermes_cli.config.get_missing_config_fields", return_value=[])
@@ -208,7 +203,6 @@ class TestUnicodeDecodeErrorInUpdatePrompts:
         _mock_missing_cfg,
         _mock_version,
         mock_migrate,
-        _mock_reload,
         capsys,
     ):
         mock_run.side_effect = _make_run_side_effect(

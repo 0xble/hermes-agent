@@ -11,6 +11,7 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 import json
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -280,7 +281,13 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
             worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
             worker.start()
+            # Wait on the worker's own entry signal rather than spinning: a bounded wait
+            # fails loudly instead of hanging if the kernel never attaches. Snapshot the
+            # registry too — the worker inserts concurrently and a live dict iteration
+            # raises "dictionary changed size during iteration".
             self.assertTrue(entered.wait(2))
+            while not any(k.attached for k in list(_REMOTE_KERNELS.values())):
+                time.sleep(0.005)
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
             _run(env, task="settled")
             owners = {key[0] for key in _REMOTE_KERNELS}
