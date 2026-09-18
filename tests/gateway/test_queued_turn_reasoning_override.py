@@ -91,7 +91,9 @@ async def test_queued_followup_does_not_inherit_preceding_turns_override():
     GatewayRunner, runner, turn_ctx, source = _runner_and_ctx(preceding_override=dict(HIGH))
     pending_event = SimpleNamespace(
         source=source, message_id="6002", channel_prompt=None, message_type=None,
-        text="and now this", turn_reasoning_config=None)
+        # ``internal``/``metadata``: the terminal turn reads them to pick the notification
+        # category it records the outer final send under.
+        text="and now this", turn_reasoning_config=None, internal=False, metadata=None)
 
     kwargs = await _run_followup(GatewayRunner, runner, turn_ctx, pending_event)
 

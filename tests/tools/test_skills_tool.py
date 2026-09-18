@@ -1191,11 +1191,15 @@ class TestSameRootDuplicationResolves:
 
 class TestTrustWarningSymlinkAware:
     """The trust check is on the RESOLVED path: a symlink whose target lives under a registered
-    search dir is quiet, a SKILL.md symlinked to a file outside every root still warns."""
+    search dir is quiet, a SKILL.md symlinked to a file outside every root is REFUSED.
+
+    The fork hardened upstream's ``_log_security_warnings`` into ``_check_skill_security``:
+    escaping every configured root loads arbitrary file content into the model's context under
+    a trusted skill name, so it fails closed instead of emitting an advisory warning."""
 
     def _log(self, name, skill_md, all_dirs, active):
-        from tools.skills_tool import _log_security_warnings
-        _log_security_warnings(name, skill_md, "plain body", list(all_dirs), active)
+        from tools.skills_tool import _check_skill_security
+        return _check_skill_security(name, skill_md, "plain body", list(all_dirs), active)
 
     def test_symlink_resolving_under_a_registered_dir_is_trusted(self, tmp_path, caplog):
         lib = tmp_path / "library"
@@ -1210,9 +1214,10 @@ class TestTrustWarningSymlinkAware:
             pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
         with caplog.at_level("WARNING"):
-            self._log("demo", root / "demo" / "SKILL.md", [root, lib], root)
+            refusal = self._log("demo", root / "demo" / "SKILL.md", [root, lib], root)
 
-        assert "outside the trusted" not in caplog.text, caplog.text
+        assert refusal is None, refusal
+        assert "Refusing skill" not in caplog.text, caplog.text
 
     def test_skill_md_symlinked_to_outside_every_root_still_warns(self, tmp_path, caplog):
         """skill_view only ever passes ``<search_dir>/...`` paths, so the symlink-to-outside
@@ -1228,6 +1233,7 @@ class TestTrustWarningSymlinkAware:
             pytest.skip(f"symlinks unavailable in test environment: {exc}")
 
         with caplog.at_level("WARNING"):
-            self._log("sym", root / "sym" / "SKILL.md", [root], root)
+            refusal = self._log("sym", root / "sym" / "SKILL.md", [root], root)
 
-        assert "outside the trusted" in caplog.text, caplog.text
+        assert refusal is not None and "resolves outside configured skill roots" in refusal
+        assert "Refusing skill" in caplog.text, caplog.text

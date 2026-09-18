@@ -88,7 +88,6 @@ def test_restart_verification_waits_for_long_drain_and_finalizes(
     plan = update_inventory.UpdatePlan(profiles=["default"])
     update_inventory._collect_gateway_runtimes(plan, [("default", tmp_path)], set())
     assert [(r.profile, r.pid) for r in plan.runtimes] == [("default", 17178)]
-    monkeypatch.setattr(main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(update_cmd, "_restart_macos_launchd_gateways", lambda: ["ai.hermes.gateway"])
     monkeypatch.setattr(fleet, "_restart_manual_gateways", lambda *args: None)
     monkeypatch.setattr(fleet, "_force_kill_stuck_gateways", lambda *args: None)

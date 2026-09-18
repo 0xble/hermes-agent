@@ -29,7 +29,12 @@ async def test_mutation_receipt_reaches_origin_thread_and_keeps_full_text(tmp_pa
     runner._thread_metadata_for_source = lambda source: {"thread_id": "171859"}
     turn = TurnRunner.__new__(TurnRunner)
     turn._runner = runner
-    turn._ctx = SimpleNamespace(source=source, _status_adapter=adapter, _run_still_current=lambda: True)
+    turn._ctx = SimpleNamespace(
+        source=source, _status_adapter=adapter, _run_still_current=lambda: True,
+        # Notice presentation reads both: a muted diagnostic turn presents nothing, and
+        # the user config decides warning-notification suppression.
+        mute_notification_reply=False, user_config=None,
+    )
     pending = []
     turn._schedule = lambda coro, label: pending.append(asyncio.create_task(coro))
     agent = StatusOutputMixin()

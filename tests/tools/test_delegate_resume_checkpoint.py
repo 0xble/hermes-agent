@@ -1,4 +1,5 @@
 """A rejected resume cannot replace its predecessor's durable checkpoint."""
+import threading
 import json
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -34,7 +35,14 @@ def checkpoint(tmp_path, monkeypatch):
     # Keep orchestration, await/result classification and checkpoint persistence real;
     # replace only the worker execution and unrelated launch/teardown lifecycle.
     monkeypatch.setattr(delegate_tool, "_lease_child_credential", lambda child: (None, None))
-    monkeypatch.setattr(delegate_tool, "_start_heartbeat", lambda *a: SimpleNamespace(start=lambda: None))
+    # The stub carries the real heartbeat's wait contract (#109749): ``await_child`` waits on
+    # ``settled`` and reads ``stale_threshold_seconds`` to name a stale verdict as the cause.
+    monkeypatch.setattr(
+        delegate_tool, "_start_heartbeat",
+        lambda *a: SimpleNamespace(
+            start=lambda: None, settled=threading.Event(), stale_threshold_seconds=None,
+        ),
+    )
     monkeypatch.setattr(delegate_tool, "_register_child", lambda *a, **k: None)
     monkeypatch.setattr(child_run._ChildRun, "seed_workspace", lambda run: setattr(run, "child_task_id", "offline-child"))
     monkeypatch.setattr(child_run._ChildRun, "cleanup", lambda *a, **k: None)

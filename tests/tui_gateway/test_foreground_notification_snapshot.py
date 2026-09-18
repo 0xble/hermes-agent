@@ -113,7 +113,8 @@ def test_cli_real_chat_binds_refreshes_and_restores_snapshot(tmp_path, monkeypat
         def _chat_monitor_agent_thread(self, turn, worker):
             worker.join(5)
             assert not worker.is_alive()
-        def _chat_run_agent(self, turn, message):
+        # The fork threads ``internal_goal_continuation`` into the agent thread.
+        def _chat_run_agent(self, turn, message, internal_goal_continuation=False):
             expected = [initial, not initial][len(seen)]
             configure(not expected)
             self._pending_credit_notices = []

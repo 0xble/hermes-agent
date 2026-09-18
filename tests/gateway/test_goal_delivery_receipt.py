@@ -95,6 +95,8 @@ async def test_receipt_gates_consumption_retry_and_fifo(receipt_context, lane, p
             source=source, session_key="route", run_generation=7,
             stream_consumer_holder=[None], _status_thread_metadata=None,
             _post_delivery_owner=adapter, inbound_message_id="inbound", event_message_id=None,
+            # A muted diagnostic turn short-circuits this delivery; this one is not muted.
+            mute_notification_reply=False,
         )
         # The drain has already popped the queued event before sending.
         adapter._pending_messages.pop("route")

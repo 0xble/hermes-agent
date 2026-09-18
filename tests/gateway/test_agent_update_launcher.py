@@ -34,7 +34,11 @@ def _real_store_with_routes(tmp_path, profile=None, business_connection_id=None)
     """Create a persisted messaging parent and two real delegated descendants."""
     token = set_hermes_home_override(tmp_path)
     if profile:
-        (tmp_path / "profiles" / profile).mkdir(parents=True)
+        profile_home = tmp_path / "profiles" / profile
+        profile_home.mkdir(parents=True)
+        # A bare directory is a ghost shell upstream refuses to resolve; a profile needs an
+        # identity marker (``named_profile_has_identity``) before ``profile_exists`` sees it.
+        (profile_home / "config.yaml").write_text("", encoding="utf-8")
     profile_root = patch("hermes_cli.profiles._get_default_hermes_home", return_value=tmp_path)
     profile_root.start()
     try:

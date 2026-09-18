@@ -74,6 +74,8 @@ def test_gateway_lifecycle_producers_name_a_system_issuer():
         runner = SimpleNamespace(
             _running_agents={"k": stopping_agent}, _interrupt_api_server_runs=lambda reason: 0,
             _interrupt_deferred_agent_workers=lambda reason: 0,
+            # Fork-only third adapter-owned producer the shutdown sweep also interrupts.
+            _interrupt_async_delegations=lambda reason: 0,
         )
         GatewayShutdownMixin._interrupt_running_agents(runner, "Gateway shutting down")
         assert interrupt_issuer(stopping_agent) == "gateway_shutdown"

@@ -1314,7 +1314,8 @@ class TestWindowsLockedProfileCopy:
             src_con.close()
         elapsed = time.monotonic() - started
         assert elapsed < 2.0
-        assert result is False
+        # Refusal is now the reason the snapshot could not be taken, not a bare False.
+        assert result == bc._AUTH_DB_LOCKED
 
     @pytest.mark.parametrize("locked", ["source", "destination"])
     def test_copy_auth_file_bounds_locks_without_overwriting(self, tmp_path, locked):
@@ -1405,7 +1406,7 @@ class TestWindowsLockedProfileCopy:
             # An open connection leaves the WAL uncheckpointed, which is exactly the
             # state upstream's objection is about.
             assert os.path.getsize(src + "-wal") > 0
-            assert bc._copy_auth_file(src, dst) is True
+            assert bc._copy_auth_file(src, dst) is None
             with sqlite3.connect(dst) as check:
                 assert check.execute("select x from cookies").fetchall() == [(1,)]
             check.close()
@@ -1467,11 +1468,11 @@ def test_auth_snapshot_never_reads_spilled_uncommitted_pages(tmp_path, monkeypat
         writer.execute('BEGIN EXCLUSIVE')
         writer.execute("UPDATE t SET v='uncommitted-' || substr(v,5)")
         monkeypatch.setattr(bc, '_AUTH_BACKUP_TIMEOUT_SECONDS', 0.2)
-        assert bc._copy_auth_file(str(source), str(destination)) is False
+        assert bc._copy_auth_file(str(source), str(destination)) == bc._AUTH_DB_LOCKED
     finally:
         writer.rollback()
         writer.close()
-    assert bc._copy_auth_file(str(source), str(destination)) is True
+    assert bc._copy_auth_file(str(source), str(destination)) is None
     with sqlite3.connect(destination) as reader:
         assert reader.execute("SELECT count(*) FROM t WHERE v LIKE 'old-%'").fetchone()[0] == 500
 
