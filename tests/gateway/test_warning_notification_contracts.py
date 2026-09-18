@@ -60,6 +60,9 @@ def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monke
                       _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata={})
     agent = Agent()
     agent.status_callback = TurnRunner(gateway, ctx)._status_callback_sync
+    # The fork's StatusDelivery gates each send on `current_adapter() is adapter`, resolved through
+    # the runner; a bare GatewayRunner resolves None. Bind it to this test's adapter.
+    gateway._adapter_for_source = lambda source: adapter
     monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))
     setattr(agent, empty_response_guard._STREAK_COST_ATTR, Decimal("1.25"))
     messages = []

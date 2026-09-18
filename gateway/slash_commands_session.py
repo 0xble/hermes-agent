@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import dataclasses
 import logging
 import os
@@ -384,7 +385,7 @@ class GatewaySessionCommandsMixin:
             user_originated_turn_view)
 
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -500,7 +501,7 @@ class GatewaySessionCommandsMixin:
         from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
 
         source = event.source
-        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
         except TranscriptReadError:
@@ -784,17 +785,58 @@ class GatewaySessionCommandsMixin:
             return t("gateway.shared.warn_passthrough", error=e)
         if not sanitized:
             return t("gateway.title.empty_after_clean")
+        # Telegram topic labels are platform display names; session titles are resumable
+        # aliases and must stay unique. Let two topics share a visible label by reserving a
+        # unique "#N" session alias instead of rejecting the rename (HERMES-089).
         try:
-            if not await self._session_db.set_session_title(session_id, sanitized):
+            topic_lane_check = getattr(self, "_is_telegram_topic_lane", None)
+            is_telegram_topic = bool(topic_lane_check) and await asyncio.to_thread(
+                topic_lane_check, source)
+            if is_telegram_topic:
+                stored_title = await self._session_db.set_session_title_in_lineage(
+                    session_id, sanitized)
+                title_set = stored_title is not None
+            else:
+                title_set = await self._session_db.set_session_title(session_id, sanitized)
+                stored_title = sanitized if title_set else None
+            if not title_set:
                 return t("gateway.title.not_found")
         except ValueError as e:
             return t("gateway.shared.warn_passthrough", error=e)
         # Mirror the title onto the Telegram forum topic name (auto titles already do this).
-        try:
-            await asyncio.to_thread(self._schedule_telegram_topic_title_rename, source, session_id, sanitized)
-        except Exception:
-            logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
-        return t("gateway.title.set_to", title=sanitized)
+        topic_rename_failed = False
+        rename_now = getattr(self, "_run_telegram_topic_title_request", None)
+        rename_kwargs = {"wait_for_result": True}
+        if not callable(rename_now):
+            rename_now = getattr(self, "_rename_telegram_topic_for_session_title", None)
+            rename_kwargs = {}
+        if is_telegram_topic and callable(rename_now):
+            try:
+                rename_call = rename_now(source, session_id, sanitized, **rename_kwargs)
+                rename_landed = (
+                    await rename_call if inspect.isawaitable(rename_call) else rename_call)
+                # None is an intentional no-op (operator-managed topic renames disabled),
+                # not a failure — only an explicit False means the label did not change.
+                topic_rename_failed = rename_landed is False
+            except Exception:
+                topic_rename_failed = True
+                logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
+        else:
+            # Compatibility fallback for older/third-party runners.
+            schedule_rename = getattr(self, "_schedule_telegram_topic_title_rename", None)
+            if callable(schedule_rename):
+                try:
+                    await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                except Exception:
+                    topic_rename_failed = is_telegram_topic
+                    logger.debug("Failed to rename Telegram topic from /title", exc_info=True)
+        response = t("gateway.title.set_to", title=sanitized)
+        if stored_title != sanitized:
+            response += f"\nInternal session alias: {stored_title}"
+        if topic_rename_failed:
+            response += (
+                "\n⚠️ The session alias was updated, but the Telegram topic name was not changed.")
+        return response
 
     # -------------------------------------------------------------- /resume, /sessions
 
@@ -989,8 +1031,8 @@ class GatewaySessionCommandsMixin:
         if not self._session_db:
             return self._session_db_unavailable_reply()
         source = event.source
-        session_key = self._session_key_for_source(source)
-        current_entry = await self.async_session_store.get_or_create_session(source)
+        session_key = self._session_key_for_event(event)
+        current_entry = await self._session_entry_for_event(event, source=source)
         try:
             history = await self.async_session_store.load_transcript(current_entry.session_id)
         except TranscriptReadError:

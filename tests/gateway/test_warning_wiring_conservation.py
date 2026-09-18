@@ -41,6 +41,10 @@ def test_concrete_gateway_sinks_hide_all_freeform_muted_turn_output():
             user_config={}, mute_notification_reply=muted)
         holder = NS(_ctx=ctx, _status_live=lambda: True,
             _schedule=lambda coro, *args: scheduled.append(coro),
+            # The fork routes status sends through TurnRunner._status_delivery (StatusDelivery
+            # owns the receipt/cleanup lifecycle) instead of calling _send_or_update_status_coro
+            # directly. Stand in for that collaborator; the suppression contract is unchanged.
+            _status_delivery=NS(send=lambda *args: "status-send"),
             _runner=NS(_deliver_platform_notice=lambda *args: "notice-send"))
         with patch("gateway.run._prepare_gateway_status_message", lambda *args: "prepared"), \
              patch("gateway.run._send_or_update_status_coro", lambda *args: "status-send"), \

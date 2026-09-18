@@ -2239,6 +2239,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
+    memory_access_mode: Optional[str] = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2270,8 +2271,16 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    # Delegated children run read-only against shared memory: they may retrieve,
+    # never write. Validated here rather than coerced so a typo fails loudly
+    # instead of silently granting write access.
+    if memory_access_mode not in (None, "read_only"):
+        raise ValueError("memory_access_mode must be None or 'read_only'")
+    agent.memory_access_mode = memory_access_mode
+    agent._memory_read_only = memory_access_mode == "read_only"
     # Skips the end-of-turn review fork (~30K tokens/event); one switch for both review paths.
-    agent.skip_background_review = bool(skip_background_review)
+    # A read-only child has nothing to write back, so its review fork is pure cost.
+    agent.skip_background_review = bool(skip_background_review or agent._memory_read_only)
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Effective base URL for feature detection (prompt caching, reasoning, etc.)
     from hermes_cli.providers import is_actual_route

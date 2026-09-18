@@ -26,7 +26,9 @@ async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, m
     source = SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm", thread_id=META["thread_id"])
     ctx = TurnContext(source=source, user_config=cfg, _run_still_current=lambda: True,
         _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata=dict(META))
-    turn = TurnRunner(SimpleNamespace(), ctx)
+    # The fork's TurnRunner builds a StatusDelivery, which resolves the live adapter through the
+    # runner. Give the stub runner that one collaborator; the composition contract is unchanged.
+    turn = TurnRunner(SimpleNamespace(_adapter_for_source=lambda _s: adapter), ctx)
     loop = asyncio.get_running_loop()
     scheduled = []
     def schedule(coro, *args):

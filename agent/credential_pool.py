@@ -47,6 +47,11 @@ from hermes_cli.auth import (
 
 logger = logging.getLogger(__name__)
 
+# Process-local steering for transient provider failures. Shared by pool
+# instances for the same auth store, but never persisted as credential health.
+_SOFT_COOLDOWNS: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_SOFT_COOLDOWNS_LOCK = threading.Lock()
+
 
 def _load_config_safe() -> Optional[dict]:
     """Load config.yaml read-only, returning None on any error.
@@ -128,6 +133,10 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60
 EXHAUSTED_TTL_429_SECONDS = 60 * 60
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60
+# Process-local steering window after a transient provider failure (overloaded /
+# 5xx / timeout). Not credential health: the entry stays selectable, it is just
+# de-preferred while a sibling account is tried.
+SOFT_COOLDOWN_SECONDS = 60.0
 # When the offending key is the sole non-DEAD entry, an hour-long bench means
 # an hour of hard failures. Throttles (429/403/5xx) reset in seconds, so a sole
 # credential cools down briefly instead.
@@ -1608,6 +1617,61 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # credentials are actually resolved, not on enumeration/selection.
         return False
 
+    # ---- transient soft cooldowns -----------------------------------------
+
+    def _get_soft_cooldown_scope(self) -> str:
+        scope = getattr(self, "_soft_cooldown_scope", None)
+        if not scope:
+            scope = str(auth_mod._auth_file_path().resolve(strict=False))
+            self._soft_cooldown_scope = scope
+        return scope
+
+    def soft_cooldown(
+        self, entry_id: Optional[str], *, reason: str,
+        duration: float = SOFT_COOLDOWN_SECONDS,
+    ) -> Optional[float]:
+        """Temporarily prefer other entries without exhausting this one.
+
+        Process-local steering only: a transient provider failure (overload,
+        5xx, timeout) says nothing about the credential's durable health, so it
+        must not reach ``auth.json``. The entry stays selectable and wins again
+        the moment it is the only usable option.
+        """
+        if not isinstance(entry_id, str) or not entry_id:
+            return None
+        until = time.monotonic() + max(0.0, float(duration))
+        key = (self._get_soft_cooldown_scope(), self.provider, entry_id)
+        with _SOFT_COOLDOWNS_LOCK:
+            _SOFT_COOLDOWNS[key] = (until, str(reason or "transient"))
+        return until
+
+    def soft_cooldown_ids(self) -> Set[str]:
+        """Return currently cooled entry IDs, pruning expired runtime state."""
+        now = time.monotonic()
+        prefix = (self._get_soft_cooldown_scope(), self.provider)
+        with _SOFT_COOLDOWNS_LOCK:
+            expired = [
+                key for key, (until, _reason) in _SOFT_COOLDOWNS.items()
+                if until <= now
+            ]
+            for key in expired:
+                _SOFT_COOLDOWNS.pop(key, None)
+            return {
+                entry_id
+                for (scope, provider, entry_id) in _SOFT_COOLDOWNS
+                if (scope, provider) == prefix
+            }
+
+    def _prefer_not_soft_cooled(
+        self, entries: List[PooledCredential],
+    ) -> List[PooledCredential]:
+        """Prefer entries outside transient cooldown; never empty a usable set."""
+        cooled_ids = self.soft_cooldown_ids()
+        if not cooled_ids:
+            return entries
+        preferred = [entry for entry in entries if entry.id not in cooled_ids]
+        return preferred or entries
+
     # ---- selection ---------------------------------------------------------
 
     def select(self, *, model: Optional[str] = None) -> Optional[PooledCredential]:
@@ -1756,6 +1820,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._log_no_available_entries()
             return None, pending_refresh
 
+        available = self._prefer_not_soft_cooled(available)
+
         # The pool recovered; re-arm the throttle so a later re-exhaustion
         # logs immediately.
         self._last_no_entries_log_at = None
@@ -1782,11 +1848,70 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
 
     def peek(self) -> Optional[PooledCredential]:
         with self._lock:
-            current = self._current_unlocked()
-            if current is not None:
-                return current
             available, _pending = self._available_entries()
-            return available[0] if available else None
+            candidates = self._prefer_not_soft_cooled(available)
+            current = self._current_unlocked()
+            if current is not None and any(entry.id == current.id for entry in candidates):
+                return current
+            return candidates[0] if candidates else None
+
+    def select_alternate(
+        self,
+        *,
+        exclude_id: Optional[str] = None,
+        exclude_runtime_key: Optional[str] = None,
+        exclude_identities: Optional[Set[str]] = None,
+        exclude_soft_cooled: bool = False,
+        model: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        """Select a usable alternate without changing durable credential health.
+
+        Unlike ``select()``, this never marks the excluded entry exhausted: a
+        transient provider failure is not evidence against the credential. With
+        ``exclude_soft_cooled`` the cooled set is a hard filter (one retry
+        sequence must not re-try an account it already burned); otherwise it is
+        only a preference, so a fully cooled pool still yields a candidate.
+        """
+        with self._lock:
+            available, _pending = self._available_entries(
+                clear_expired=True, refresh=False, model=model,
+            )
+            cooled_ids = self.soft_cooldown_ids() if exclude_soft_cooled else set()
+            eligible = [
+                entry
+                for entry in available
+                if (not exclude_id or entry.id != exclude_id)
+                and self._retry_identity(entry) not in (exclude_identities or set())
+                and entry.id not in cooled_ids
+                and (
+                    not exclude_runtime_key
+                    or entry.runtime_api_key != exclude_runtime_key
+                )
+            ]
+            candidates = self._prefer_not_soft_cooled(eligible)
+            return candidates[0] if candidates else None
+
+    def _retry_identity(self, entry: PooledCredential) -> str:
+        """Stable account identity used to deduplicate one retry sequence.
+
+        Two Codex rows can carry different refresh tokens for the SAME ChatGPT
+        account, so the JWT's ``chatgpt_account_id`` — not the pool row id — is
+        what makes "try a different account" actually reach a different account.
+        """
+        if self.provider == "openai-codex":
+            claims = _decode_jwt_claims(entry.access_token)
+            auth_claims = claims.get("https://api.openai.com/auth", {})
+            if isinstance(auth_claims, dict):
+                account_id = auth_claims.get("chatgpt_account_id")
+                if isinstance(account_id, str) and account_id:
+                    return f"account:{account_id}"
+        return entry.id
+
+    def credential_retry_identity(self, credential_id: str) -> str:
+        """Resolve a pool entry ID to its retry-sequence account identity."""
+        with self._lock:
+            entry = next((item for item in self._entries if item.id == credential_id), None)
+            return self._retry_identity(entry) if entry is not None else credential_id
 
     # ---- rotation ----------------------------------------------------------
 
@@ -1956,6 +2081,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             available, pending_refresh = self._available_entries(clear_expired=True, refresh=True)
             if not available:
                 return None, pending_refresh
+            available = self._prefer_not_soft_cooled(available)
 
             below_cap = [e for e in available if self._active_leases.get(e.id, 0) < self._max_concurrent]
             chosen = min(
@@ -2577,6 +2703,161 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         pass
 
     return seed.result
+
+
+def select_alternate_credential(
+    agent: Any,
+    *,
+    exclude_identities: Optional[Set[str]] = None,
+    exclude_soft_cooled: bool = False,
+) -> Optional[PooledCredential]:
+    """Return a healthy same-provider credential distinct from the failed one."""
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return None
+    current_id = getattr(agent, "_credential_pool_entry_id", None)
+    current_key = getattr(agent, "api_key", None)
+    if current_key:
+        try:
+            current_id = pool.entry_id_for_api_key(current_key) or current_id
+        except Exception:
+            logger.debug("Could not rebind alternate selection by API key", exc_info=True)
+    # Scope the eligibility check to the model being retried: an Anthropic 429
+    # cools the credential for ONE model, so a sibling account benched for a
+    # different model is still a valid alternate here (upstream #fb358d4).
+    model = getattr(agent, "model", None)
+    model = model.strip() if isinstance(model, str) else None
+    try:
+        return pool.select_alternate(
+            exclude_id=current_id,
+            exclude_runtime_key=current_key,
+            exclude_identities=exclude_identities,
+            exclude_soft_cooled=exclude_soft_cooled,
+            model=model or None,
+        )
+    except Exception:
+        logger.debug("Could not select alternate credential", exc_info=True)
+        return None
+
+
+_TRANSIENT_ROTATION_REASONS = frozenset({"overloaded", "server_error", "timeout"})
+
+
+def recover_transient_credential(
+    agent: Any,
+    *,
+    classified_reason: Any,
+    attempted_credential_identities: Optional[Set[str]] = None,
+    alternate_credential_attempted: bool = False,
+    transient_retry_available: bool = True,
+) -> bool:
+    """Try an unattempted account after a transient provider failure.
+
+    This is process-local steering, not durable credential health: the failed
+    account is briefly cooled, while billing/auth/rate-limit recovery remains
+    owned by the normal pool recovery path.
+    """
+    reason = str(getattr(classified_reason, "value", classified_reason) or "")
+    if reason not in _TRANSIENT_ROTATION_REASONS:
+        return False
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None or not credential_pool_matches_provider(
+        pool,
+        getattr(agent, "provider", ""),
+        base_url=getattr(agent, "base_url", None),
+    ):
+        return False
+
+    current_key = getattr(agent, "api_key", None)
+    current_id = getattr(agent, "_credential_pool_entry_id", None)
+    try:
+        current_id = pool.entry_id_for_api_key(current_key) or current_id
+    except Exception:
+        logger.debug("Could not attribute transient failure to a pool entry", exc_info=True)
+
+    if alternate_credential_attempted:
+        rotation = getattr(agent, "_last_credential_rotation", None)
+        if rotation:
+            logger.info(
+                "credential_request_outcome event=failure provider=%s entry=%s "
+                "rotated=true rotation_reason=%s from_entry=%s failure_reason=%s",
+                getattr(agent, "provider", None), current_id or "unknown",
+                rotation.get("reason") or "unknown",
+                rotation.get("from_entry") or "unknown", reason,
+            )
+            agent._last_credential_rotation = None
+
+    if current_id:
+        pool.soft_cooldown(current_id, reason=reason)
+    if not transient_retry_available:
+        return False
+
+    attempted = attempted_credential_identities
+    if attempted is None:
+        if alternate_credential_attempted:
+            return False
+        attempted = set()
+    if current_id:
+        attempted.add(pool.credential_retry_identity(current_id))
+    alternate = select_alternate_credential(
+        agent,
+        exclude_identities=attempted,
+        exclude_soft_cooled=True,
+    )
+    if alternate is None:
+        return False
+    rotation = {
+        "from_entry": current_id,
+        "to_entry": alternate.id,
+        "reason": reason,
+    }
+    logger.info(
+        "credential_rotation event=attempt reason=%s provider=%s "
+        "from_entry=%s to_entry=%s before_provider_fallback=true",
+        reason, getattr(agent, "provider", None), current_id or "unknown", alternate.id,
+    )
+    if agent._swap_credential(alternate) is False:
+        return False
+    attempted.add(pool.credential_retry_identity(alternate.id))
+    agent._last_credential_rotation = rotation
+    return True
+
+
+def recover_with_credential_pool(
+    agent: Any,
+    *,
+    status_code: Optional[int],
+    has_retried_429: bool,
+    alternate_credential_attempted: bool = False,
+    attempted_credential_identities: Optional[Set[str]] = None,
+    transient_retry_available: bool = True,
+    classified_reason: Any = None,
+    error_context: Optional[Dict[str, Any]] = None,
+    billing_unverified: bool = False,
+) -> Tuple[bool, bool]:
+    """Compatibility facade combining transient steering with durable recovery."""
+    reason = str(getattr(classified_reason, "value", classified_reason) or "")
+    if reason in _TRANSIENT_ROTATION_REASONS:
+        return (
+            recover_transient_credential(
+                agent,
+                classified_reason=classified_reason,
+                attempted_credential_identities=attempted_credential_identities,
+                alternate_credential_attempted=alternate_credential_attempted,
+                transient_retry_available=transient_retry_available,
+            ),
+            has_retried_429,
+        )
+    from agent.agent_runtime_helpers import recover_with_credential_pool as recover_durable
+
+    return recover_durable(
+        agent,
+        status_code=status_code,
+        has_retried_429=has_retried_429,
+        classified_reason=classified_reason,
+        error_context=error_context,
+        billing_unverified=billing_unverified,
+    )
 
 
 def load_pool(provider: str) -> CredentialPool:

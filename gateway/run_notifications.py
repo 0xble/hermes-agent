@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
-from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
+from gateway.platforms.base import BasePlatformAdapter, SendResult, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_error, _send_failed
@@ -49,6 +49,7 @@ _DURABLE_CLAIM_OPS = {
     "release": ("release_completion_delivery", "Could not release durable completion claim"),
     "defer": ("defer_completion_delivery", "Could not defer unadmitted completion claim"),
     "complete": ("complete_completion_delivery", "Could not acknowledge durable completion claim"),
+    "admit": ("admit_completion_delivery", "Could not record durable completion admission"),
 }
 
 
@@ -68,7 +69,8 @@ class GatewayNotificationsMixin:
 
     # Coalescing keys: process completions (short-window fan-in) and async delegations (+ parent session).
     _COMPLETION_BATCH_KEY_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id")
-    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "task_failure_notice", *_COMPLETION_BATCH_KEY_FIELDS[1:])
+    _ASYNC_GROUP_KEY_FIELDS = ("session_key", "parent_session_id", "parent_task_id", "task_failure_notice",
+                               *_COMPLETION_BATCH_KEY_FIELDS[1:])
 
     @dataclasses.dataclass
     class _UpdatePaths:
@@ -339,14 +341,17 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
-    ) -> None:
-        """Deliver a queued response using the normal text+attachment split.
+    ) -> bool | SendResult:
+        """Deliver a queued response using the normal text+attachment split, and report whether
+        the TEXT actually landed (or return its failed SendResult). The caller gates the queued
+        follow-up on it: answering the next message while the first answer is undelivered buries it.
 
         ``session_key`` lets the text send record a delivery-ledger obligation like the normal final
         send does, keyed on ``inbound_message_id`` (the raw inbound id, distinct from the
         ``event_message_id`` reply anchor); see ``_send_queued_final_text``. Without a key the send
         stays unledgered."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        _delivery_confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -384,18 +389,29 @@ class GatewayNotificationsMixin:
                                 return
                     except Exception as _qe:
                         logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
-                if not _reconciled:
-                    await self._send_queued_final_text(
+                if _reconciled:
+                    _delivery_confirmed = True
+                else:
+                    # Route the send through upstream's ledgered helper so a refused final leaves a
+                    # delivery-ledger row, and still gate the queued follow-up on whether it landed.
+                    _send_result = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id)
+                    _delivery_confirmed = bool(getattr(_send_result, "success", False))
+                    if not _delivery_confirmed:
+                        # Preserve positive partial-delivery evidence for the outer final send.
+                        return _send_result if isinstance(_send_result, SendResult) else False
+            else:
+                _delivery_confirmed = True
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
-            return
+            return _delivery_confirmed
         await self._deliver_media_from_response(
             response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
             thread_metadata=metadata,
         )
+        return _delivery_confirmed
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],
@@ -450,6 +466,7 @@ class GatewayNotificationsMixin:
         profile = str(data.get("profile") or "").strip()
         if profile:
             return profile
+        # Agent-launched updates retain this validated profile lane in session_key.
         from gateway.session import profile_from_session_key_namespace
         parts = str(data.get("session_key") or "").split(":")
         if len(parts) >= 5 and parts[0] == "agent" and parts[1] not in ("main", ""):
@@ -483,49 +500,123 @@ class GatewayNotificationsMixin:
 
     def _pending_marker_metadata(self, platform, chat_id, data: dict, adapter):
         """Thread metadata for a persisted update/restart marker (thread_id/chat_type/message_id keys)."""
-        return self._thread_metadata_for_target(
+        metadata = self._thread_metadata_for_target(
             platform, chat_id, data.get("thread_id"), chat_type=data.get("chat_type"),
             reply_to_message_id=data.get("message_id"), adapter=adapter,
         )
+        if platform == Platform.TELEGRAM and data.get("business_connection_id"):
+            metadata = dict(metadata or {})
+            metadata["telegram_business_connection_id"] = str(data["business_connection_id"])
+        return metadata
 
     async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float) -> None:
-        """Fallback when no adapter/chat can be resolved: wait for the exit code, then notify."""
-        logger.warning("Update watcher: cannot resolve adapter/chat_id, falling back to completion-only")
-        # Poll until _send_update_notification delivers (it returns False while the platform reconnects).
         loop = asyncio.get_running_loop()
         while paths.any_pending() and loop.time() < deadline:
-            if paths.exit_code.exists() and await self._send_update_notification():
+            if await self._send_update_notification():
                 return
             await asyncio.sleep(poll_interval)
-        if paths.any_pending() and not paths.exit_code.exists():
-            paths.exit_code.write_text("124", encoding="utf-8")
-            await self._send_update_notification()
+        await self._send_update_notification(timed_out=True)
 
     @staticmethod
     def _update_exit_code(paths: "_UpdatePaths") -> int:
         return int(paths.exit_code.read_text(encoding="utf-8").strip() or "1")
 
-    @staticmethod
-    def _read_update_output_since(path: Path, offset: int) -> tuple[str, int]:
-        """Read update output defensively; logs may contain invalid UTF-8."""
+    async def _send_update_output(self, target: "_UpdateTarget", text: str) -> bool:
+        """Send one already-sanitized chunk; its caller owns durable acknowledgement."""
         try:
-            data = path.read_bytes()
-        except OSError:
-            return "", offset
-        if len(data) <= offset:
-            return "", len(data)
-        return data[offset:].decode("utf-8", errors="replace"), len(data)
+            return not _send_failed(await target.send(f"```\n{text}\n```"))
+        except Exception:
+            logger.debug("Update stream send failed", exc_info=True)
+            return False
 
-    async def _send_update_output(self, target: "_UpdateTarget", text: str) -> None:
-        """Send buffered update output as fenced chunks that fit message limits (Telegram: 4096)."""
+    async def _drain_update_output(self, target: "_UpdateTarget", paths: "_UpdatePaths", request: str) -> bool:
+        """Resume a frozen raw range with a durable sanitized-character cursor.
+
+        Acceptance followed by a crash before checkpoint remains ambiguous. A saved
+        checkpoint, however, is never replayed merely because a later chunk failed.
+        """
+        import hashlib
+        from gateway.update_notifications import read_pending, request_identity, save_pending
         from tools.ansi_strip import strip_ansi
-        clean = strip_ansi(text).strip()
-        if not clean:
-            return
-        max_chunk = 3500
-        for i in range(0, len(clean), max_chunk):
-            with _log_suppressed(logging.DEBUG, "Update stream send failed: %s"):
-                await target.send(f"```\n{clean[i:i + max_chunk]}\n```")
+
+        lock = getattr(self, "_update_output_send_lock", None)
+        if lock is None:
+            lock = self._update_output_send_lock = asyncio.Lock()
+        async with lock:
+            def current_record():
+                current = read_pending(paths.pending.parent)
+                if current is None or request_identity(current[1]) != request:
+                    raise ValueError("Update output request was replaced")
+                return current
+
+            def frozen_bytes(batch):
+                start, end = batch["start"], batch["end"]
+                if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+                    raise ValueError("Invalid update output range")
+                with paths.output.open("rb") as stream:
+                    stream.seek(start)
+                    raw = stream.read(end - start)
+                if len(raw) != end - start or hashlib.sha256(raw).hexdigest() != batch["sha256"]:
+                    raise ValueError("Frozen update output changed or was truncated")
+                return raw
+
+            try:
+                # Limit this drain to the observed EOF. Later output is another batch.
+                marker, pending = current_record()
+                offset = pending.get("output_offset", 0)
+                if type(offset) is not int or offset < 0:
+                    raise ValueError("Invalid update output offset")
+                batch = pending.get("output_batch")
+                if batch is None:
+                    try:
+                        raw = paths.output.read_bytes()
+                    except FileNotFoundError:
+                        if offset:
+                            raise ValueError("Acknowledged update output disappeared")
+                        return True
+                    if len(raw) < offset:
+                        raise ValueError("Acknowledged update output was truncated")
+                    if len(raw) == offset:
+                        return True
+                    batch = {"version": 1, "request": request, "start": offset, "end": len(raw),
+                             "sha256": hashlib.sha256(raw[offset:]).hexdigest(), "ack": 0}
+                    pending["output_batch"] = batch
+                    save_pending(marker, pending)
+                if (not isinstance(batch, dict) or batch.get("version") != 1
+                        or batch.get("start") != offset or batch.get("request") != request):
+                    raise ValueError("Invalid update output batch")
+                raw = frozen_bytes(batch)
+                clean = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
+                ack = batch["ack"]
+                if type(ack) is not int or not 0 <= ack <= len(clean):
+                    raise ValueError("Invalid update output acknowledgement")
+                while True:
+                    marker, pending = current_record()
+                    if pending.get("output_batch") != batch or pending.get("output_offset", 0) != offset:
+                        raise ValueError("Update output checkpoint changed")
+                    frozen_bytes(batch)
+                    if ack < len(clean):
+                        end = min(ack + 3500, len(clean))
+                        if not await self._send_update_output(target, clean[ack:end]):
+                            return False
+                        # A send can suspend while phases, markers or the source log change.
+                        marker, pending = current_record()
+                        if pending.get("output_batch") != batch or pending.get("output_offset", 0) != offset:
+                            raise ValueError("Update output checkpoint changed during send")
+                        frozen_bytes(batch)
+                        batch = {**batch, "ack": end}
+                        pending["output_batch"] = batch
+                        save_pending(marker, pending)
+                        ack = end
+                        continue
+                    pending["output_offset"] = batch["end"]
+                    pending.pop("output_batch", None)
+                    save_pending(marker, pending)
+                    # Appended data must be drained before a final notice may clear the log.
+                    return paths.output.stat().st_size == batch["end"]
+            except Exception:
+                logger.warning("Update output delivery/checkpoint failed", exc_info=True)
+                return False
 
     async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
@@ -571,39 +662,35 @@ class GatewayNotificationsMixin:
             await self._watch_update_completion_only(paths, deadline, poll_interval)
             return
         session_key = target.session_key
-        bytes_sent = 0
+        from gateway.update_notifications import final_outcome, read_pending, request_identity
+        record = read_pending(paths.pending.parent)
+        if record is None:
+            return
+        request = request_identity(record[1])
         last_stream_time = loop.time()
-        buffer = ""
 
-        async def _flush_buffer() -> None:
-            nonlocal buffer, last_stream_time
-            text, buffer = buffer, ""
-            if text.strip():
-                last_stream_time = loop.time()
-                await self._send_update_output(target, text)
+        async def _flush_output() -> bool:
+            nonlocal last_stream_time
+            drained = await self._drain_update_output(target, paths, request)
+            last_stream_time = loop.time()
+            return drained
 
-        def _read_new_output() -> None:
-            nonlocal buffer, bytes_sent
-            if paths.output.exists():
-                with suppress(OSError):
-                    chunk, bytes_sent = self._read_update_output_since(paths.output, bytes_sent)
-                    buffer += chunk
+        def still_current() -> bool:
+            current = read_pending(paths.pending.parent)
+            return current is not None and request_identity(current[1]) == request
 
         while loop.time() < deadline:
-            if paths.exit_code.exists():
-                _read_new_output()
-                await _flush_buffer()
-                with _log_suppressed(logging.WARNING, "Update final notification failed: %s"):
-                    exit_code = self._update_exit_code(paths)
-                    await target.send(
-                        "✅ Hermes update finished." if exit_code == 0 else _UPDATE_FAILED_NOTICE
-                    )
-                    logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
-                self._clear_update_markers(paths, session_key)
+            if not still_current():
                 return
-            _read_new_output()
-            if buffer.strip() and (loop.time() - last_stream_time) >= stream_interval:
-                await _flush_buffer()
+            if not await self._send_update_phase("updating"):
+                await asyncio.sleep(poll_interval)
+                continue
+            current = read_pending(paths.pending.parent)
+            if current and final_outcome(paths.pending.parent, current[1]) is not None:
+                if await _flush_output() and still_current() and await self._send_update_notification():
+                    return
+            if (loop.time() - last_stream_time) >= stream_interval:
+                await _flush_output()
             # Forward a prompt only when none is pending, else every poll re-forwards the same prompt.
             _pending_state = self._peek_session_state(session_key) if session_key else None
             if paths.prompt.exists() and session_key and not getattr(
@@ -613,82 +700,124 @@ class GatewayNotificationsMixin:
                     prompt_data = json.loads(paths.prompt.read_text(encoding="utf-8"))
                     prompt_text = prompt_data.get("prompt", "")
                     if prompt_text:
-                        await _flush_buffer()  # user sees context before the prompt
-                        await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""))
+                        if await _flush_output() and still_current():  # context precedes the prompt
+                            await self._forward_update_prompt(target, prompt_text, prompt_data.get("default", ""))
                 except (json.JSONDecodeError, OSError) as e:
                     logger.debug("Failed to read update prompt: %s", e)
             await asyncio.sleep(poll_interval)
-        if not paths.exit_code.exists():
-            logger.warning("Update watcher timed out after %.0fs", timeout)
-            paths.exit_code.write_text("124", encoding="utf-8")
-            await _flush_buffer()
-            with suppress(Exception):
-                await target.send("❌ Hermes update timed out after 30 minutes.")
-            self._clear_update_markers(paths, session_key)
+        if await _flush_output() and still_current():
+            await self._send_update_notification(timed_out=True)
 
-    async def _send_update_notification(self) -> bool:
-        """If an update finished, notify the user.
+    async def _send_update_phase(self, phase: str) -> bool:
+        lock = getattr(self, "_update_phase_send_lock", None)
+        if lock is None:
+            lock = self._update_phase_send_lock = asyncio.Lock()
+        async with lock:
+            return await self._send_update_phase_inner(phase)
 
-        False while the update is still running (caller may retry); True after a definitive send/skip.
-        """
-        from gateway.run import _non_conversational_metadata
+    async def _send_update_phase_inner(self, phase: str) -> bool:
+        from gateway.update_notifications import notice, read_pending, request_identity, save_pending
         paths = self._update_paths()
-        if not paths.any_pending():
+        current = read_pending(paths.pending.parent)
+        target = self._resolve_update_target(paths)
+        if not current or target is None:
             return False
-        cleanup = True
-        active_pending_path = paths.claimed
-
-        def _defer(reason: str, *args) -> bool:
-            nonlocal cleanup, active_pending_path
-            logger.info(reason, *args)
-            cleanup = False
-            active_pending_path = paths.pending
-            paths.claimed.replace(paths.pending)
-            return False
-
+        marker, pending = current
+        request = request_identity(pending)
+        flag = phase + "_notified"
+        if pending.get(flag):
+            return True
+        if phase == "restarting":
+            heading = "🔄 Restarting"
+            detail = "The gateway is restarting. If work is interrupted, recovery will be attempted where supported; it is not guaranteed."
+        else:
+            heading = "⬆️ Updating"
+            detail = "The native update was started. Progress follows here."
         try:
-            if paths.pending.exists():
-                try:
-                    paths.pending.replace(paths.claimed)
-                except FileNotFoundError:
-                    if not paths.claimed.exists():
-                        return True
-            elif not paths.claimed.exists():
-                return True
-            pending = json.loads(paths.claimed.read_text(encoding="utf-8"))
-            platform_str = pending.get("platform")
-            chat_id = pending.get("chat_id")
-            if not paths.exit_code.exists():
-                return _defer("Update notification deferred: update still running")
-            exit_code = self._update_exit_code(paths)
-            output = paths.output.read_bytes().decode("utf-8", errors="replace") if paths.output.exists() else ""
-            platform = Platform(platform_str)
-            adapter = self._authorization_adapter(platform, self._marker_profile(pending))
-            if chat_id and not adapter:
-                # Target platform not reconnected yet (common right after the update's restart): keep the
-                # markers for a later retry instead of silently losing the notification.
-                return _defer("Update notification deferred: %s adapter not connected yet", platform_str)
-            if chat_id:
-                metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
-                from tools.ansi_strip import strip_ansi
-                output = strip_ansi(output).strip()
-                if exit_code == 0:
-                    msg = "✅ Hermes update finished successfully."
-                    if output:
-                        msg = f"{msg}\n\n```\n{_update_output_tail(output, 3500)}\n```"
+            if _send_failed(await target.send(notice(heading, pending, detail))):
+                return False
+            current = read_pending(paths.pending.parent)
+            if current is None or request_identity(current[1]) != request:
+                return False
+            marker, pending = current
+            pending[flag] = True
+            save_pending(marker, pending)
+            return True
+        except Exception:
+            logger.warning("Update phase notification failed", exc_info=True)
+            return False
+
+    async def _send_update_notification(self, *, timed_out: bool = False) -> bool:
+        """Return True only after terminal delivery releases admission, never for expiry."""
+        from gateway.update_notifications import (
+            final_outcome, notice, process_completed, read_pending, request_identity, save_pending,
+        )
+        if getattr(self, "_update_final_send_active", False):
+            return False
+        self._update_final_send_active = True
+        try:
+            paths = self._update_paths()
+            current = read_pending(paths.pending.parent)
+            target = self._resolve_update_target(paths)
+            if not current or target is None:
+                return False
+            _, pending = current
+            request = request_identity(pending)
+            outcome = final_outcome(paths.pending.parent, pending)
+            unresolved = (paths.pending.parent / "fleet_restart_pending").exists() or (
+                outcome is None and not process_completed(paths.pending.parent, pending)
+            )
+            known_outcome = outcome is not None
+            if outcome is None:
+                if not timed_out:
+                    return False
+                if unresolved and pending.get("timeout_notified"):
+                    return False
+                outcome = (False, "Update finalization could not be verified before the notification deadline. Runtime state is unknown. Inspect the update output before retrying.")
+            success, detail = outcome
+            if pending.get("notification_version") == 2 and not pending.get("updating_notified"):
+                if not await self._send_update_phase("updating"):
+                    return False
+                current = read_pending(paths.pending.parent)
+                if current is None or request_identity(current[1]) != request:
+                    return False
+                _, pending = current
+            # Startup can reach here without a live watcher; preserve unsent native output.
+            if not await self._drain_update_output(target, paths, request):
+                return False
+            current = read_pending(paths.pending.parent)
+            if current is None or request_identity(current[1]) != request:
+                return False
+            _, pending = current
+            heading = "✅ Update Complete" if success else "❌ Update Failed"
+            delivered_outcome = [success, detail]
+            if not known_outcome or pending.get("final_outcome_notified") != delivered_outcome:
+                result = await target.send(notice(heading, pending, detail))
+                if _send_failed(result):
+                    return False
+            current = read_pending(paths.pending.parent)
+            if current is None or request_identity(current[1]) != request:
+                return False
+            if unresolved:
+                # The bounded watcher may stop, but updater/fleet finalization still
+                # owns admission and every update file, even after a known failure.
+                # Persist only the delivered outcome/timeout ACK so
+                # restart recovery neither replays it nor mistakes it for completion.
+                marker, pending = current
+                if known_outcome:
+                    pending["final_outcome_notified"] = delivered_outcome
                 else:
-                    msg = _UPDATE_FAILED_NOTICE
-                    if output:
-                        msg = f"{msg}\n\nLast lines:\n```\n{_update_output_tail(output, 800)}\n```"
-                await adapter.send(chat_id, msg, metadata=_non_conversational_metadata(metadata, platform=platform))
-                logger.info("Sent post-update notification to %s:%s (exit=%s)", platform_str, chat_id, exit_code)
-        except Exception as e:
-            logger.warning("Post-update notification failed: %s", e)
+                    pending["timeout_notified"] = True
+                save_pending(marker, pending)
+                return False
+            self._clear_update_markers(paths, target.session_key)
+            (paths.pending.parent / ".update_process_exit_code").unlink(missing_ok=True)
+            return True
+        except Exception:
+            logger.warning("Update final notification failed", exc_info=True)
+            return False
         finally:
-            if cleanup:
-                for p in (active_pending_path, paths.claimed, paths.output, paths.exit_code):
-                    p.unlink(missing_ok=True)
-        return True
+            self._update_final_send_active = False
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
         """Notify the chat that initiated /restart that the gateway is back."""
@@ -1118,7 +1247,18 @@ class GatewayNotificationsMixin:
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = self._resolve_injection_adapter(platform_name, source)
+        owner = evt.get("owner") if evt.get("type") == "async_delegation" else None
+        if owner and platform_name == "telegram":
+            # Explicit ownership outranks session-store refreshes and adapter replacement.
+            if (str(source.chat_id) != str(owner.get("chat_id"))
+                    or str(source.thread_id or "") != str(owner.get("thread_id") or "")
+                    or str(evt.get("session_key") or "") != str(owner.get("session_key") or "")
+                    or (source.profile and source.profile != owner.get("profile"))):
+                return False
+            source = dataclasses.replace(source, profile=owner.get("profile"))
+            adapter = self._adapter_for_source(source)
+        else:
+            adapter = self._resolve_injection_adapter(platform_name, source)
         if not adapter:
             return False
         if not adapter_supports_push(adapter):
@@ -1137,6 +1277,18 @@ class GatewayNotificationsMixin:
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if evt.get("type") == "async_delegation" and evt.get("parent_task_id"):
+                metadata["delegation_parent_task_id"] = evt["parent_task_id"]
+                metadata["delegation_owner"] = evt.get("owner")
+                metadata["delegation_thread_refs"] = evt.get("thread_refs", [])
+                metadata["delegation_attempts"] = evt.get("attempts", {})
+            if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
+                # Native review status retirement is tied to this exact durable
+                # completion, never a generic task-card batch or session guess.
+                metadata["delegation_id"] = evt["delegation_id"]
+                metadata["delegation_deliveries"] = list(evt.get("delegation_deliveries") or [{
+                    "delegation_id": evt["delegation_id"], "owner": evt.get("owner"),
+                }])
             synth_event = MessageEvent(
                 text=synth_text, message_type=MessageType.TEXT, source=source, internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None, metadata=metadata,
@@ -1286,6 +1438,44 @@ class GatewayNotificationsMixin:
                 return False
         return True
 
+    async def _completion_delivery_recovery_ready(self, evt: dict) -> bool:
+        """Whether a parked obligation has a live, non-terminal destination at startup.
+
+        ``_completion_delivery_ready`` deliberately treats a terminal parent session as ready so
+        the ordinary preflight can claim and record its honest terminal disposition. A recovery
+        budget must not be spent on that path: it is reserved for a destination that can accept a
+        new completion injection.
+        """
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if parent_session_id and await self._classify_completion_target(parent_session_id) != "deliver":
+            return False
+        return await self._completion_delivery_ready(evt)
+
+    async def _recover_ready_async_delegation_deliveries(self, completion_queue) -> int:
+        """One startup-only recovery pass for exhausted durable deliveries.
+
+        A row is reactivated only after this live gateway can resolve its destination. This is a
+        destination-availability trigger, not a watcher-poll reset: the ledger's compare-and-swap
+        grants at most one additional bounded budget and an unavailable/bad target stays parked.
+        """
+        from tools.async_delegation import recover_completion_delivery, retry_exhausted_completions
+
+        recovered = 0
+        for candidate in retry_exhausted_completions():
+            if not await self._completion_delivery_recovery_ready(candidate):
+                continue
+            delegation_id = str(candidate.get("delegation_id") or "")
+            if not delegation_id:
+                continue
+            event = recover_completion_delivery(delegation_id)
+            if event is not None:
+                event["restored"] = True
+                completion_queue.put(event)
+                recovered += 1
+        if recovered:
+            logger.info("Reactivated %d retry-exhausted async delegation delivery obligation(s)", recovered)
+        return recovered
+
     async def _preflight_completion_delivery(self, evt: dict) -> "_CompletionClaim":
         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
 
@@ -1395,7 +1585,13 @@ class GatewayNotificationsMixin:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
                 identity_claimed = True
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            delivery_events = [evt, *(event for event, _claim_id in sibling_claims)]
+            delivery_receipts = [{
+                "delegation_id": event.get("delegation_id"), "owner": event.get("owner"),
+            } for event in delivery_events if event.get("delegation_id")]
+            injection_evt = {**evt, "delegation_deliveries": delivery_receipts}
+            injection_result = await self._inject_watch_notification(
+                synth_text, injection_evt, raise_not_accepted=True)
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -1410,7 +1606,14 @@ class GatewayNotificationsMixin:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused else "release"
+            # Push adapters acknowledge only a volatile queue slot. The API self-post
+            # path returns after its full request/turn persistence, so preserve that
+            # established non-push completion contract rather than inventing an
+            # unroutable admitted replay with no MessageEvent metadata bridge.
+            operation = (
+                "complete" if accepted and _raw_process_event_session_id(evt)
+                else "admit" if accepted else "defer" if refused else "release"
+            )
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:
@@ -1427,6 +1630,7 @@ class GatewayNotificationsMixin:
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
         from gateway.run import _redact_gateway_user_facing_secrets
+        from tools.process_registry_notifications import PROCESS_NOTIFICATION_NO_REPLY_CONTRACT
         lines = [
             f"[IMPORTANT: {len(entries)} background processes completed for this session.",
             "Treat these results as one completion batch and send at most one "
@@ -1451,7 +1655,9 @@ class GatewayNotificationsMixin:
                 f"\n- … and {omitted} more completion(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
-        lines.append("If a result does not change the current conclusion, absorb it silently.]")
+        # The batch carries the SAME silence contract single completions get, so a
+        # coalesced batch cannot become the one path that provokes a redundant follow-up.
+        lines.append(PROCESS_NOTIFICATION_NO_REPLY_CONTRACT + "]")
         return "\n".join(lines)
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
@@ -1627,6 +1833,19 @@ class GatewayNotificationsMixin:
             "response. If a result does not change the current conclusion, absorb it silently.]"
         )
         consolidated = "\n\n".join([header, *blocks])
+        # A coalesced batch speaks for every sibling, so the primary must carry their thread refs too
+        # (the injected event turns these into ``delegation_thread_refs``); copy first, the queued
+        # originals are requeued verbatim when the primary is not admitted.
+        primary_evt = dict(primary_evt)
+        primary_evt["thread_refs"] = list(dict.fromkeys([
+            *primary_evt.get("thread_refs", []),
+            *(ref for evt, _ in siblings for ref in evt.get("thread_refs", [])),
+        ]))
+        primary_evt["attempts"] = {
+            ref: max(evt.get("attempts", {}).get(ref, -1)
+                     for evt in [primary_evt, *(s for s, _ in siblings)])
+            for ref in primary_evt["thread_refs"]
+        }
         delivered = await self._deliver_completion_notification(
             consolidated, primary_evt, sibling_claims=siblings,
         )
@@ -1663,9 +1882,22 @@ class GatewayNotificationsMixin:
         consumer; both must progress without a later foreground turn.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
+        from gateway.delegation_cards import cards_for
+        with _log_suppressed(logging.WARNING, "Delegation card startup recovery failed: %s"):
+            await cards_for(self).reconcile()
+        from gateway.review_status_migration import retire_legacy_review_statuses
+        with _log_suppressed(logging.WARNING, "Legacy review status recovery failed: %s"):
+            await retire_legacy_review_statuses(self)
         from tools.process_registry import process_registry as _pr
+        # ProcessRegistry restores ordinary pending rows before adapters connect. Do this separate,
+        # one-time pass only after connection so retry-exhausted rows cannot spin on unavailable
+        # destinations and are never reset on each watcher poll.
+        with _log_suppressed(logging.WARNING, "Exhausted delegation recovery failed: %s"):
+            await self._recover_ready_async_delegation_deliveries(_pr.completion_queue)
         while self._running:
             with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
+                from tools.async_delegation import retry_current_owner_terminal_checkpoints
+                await asyncio.to_thread(retry_current_owner_terminal_checkpoints, _pr.completion_queue)
                 # Pattern events also need an idle consumer; foreground turns are optional.
                 await self._drain_watch_notifications(_pr.completion_queue)
                 # Process completions remain owned by their per-process watchers.
