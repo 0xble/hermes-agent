@@ -405,19 +405,24 @@ class TestAutoTitleDuplicateHandling:
             return_value="Debugging Import Error",
         ):
             seen = []
+
+            def title_callback(title, source, *, display_title=None):
+                seen.append((title, source, display_title))
+
             auto_title_session(
                 db,
                 "sess-1",
                 "hi",
-                title_callback=lambda title, _source: seen.append(title),
+                title_callback=title_callback,
             )
         db.get_next_title_in_lineage.assert_called_once_with("Debugging Import Error")
         assert db.set_auto_title.call_args_list[-1][0] == (
             "sess-1",
             "Debugging Import Error #2",
         )
-        # callback fires with the actually-persisted (deduped) title
-        assert seen == ["Debugging Import Error #2"]
+        # The session keeps the unique alias, while consumers receive the
+        # original visible title separately.
+        assert seen == [("Debugging Import Error #2", "llm", "Debugging Import Error")]
 
 
 

@@ -4477,12 +4477,16 @@ class TurnRunner:
             # cost, and Discord's 2-per-10-minutes channel budget can spend
             # itself on the throwaway and drop the one worth showing.
             if self._runner._is_telegram_topic_lane(source):
-                agent._on_session_title = lambda title, title_source: (
-                    title_source == "llm"
-                    and self._runner._schedule_telegram_topic_title_rename(
-                        source, session_id, title,
+                def _schedule_telegram_title(
+                    title, title_source, *, display_title=None
+                ):
+                    if title_source != "llm":
+                        return False
+                    return self._runner._schedule_telegram_topic_title_rename(
+                        source, session_id, display_title or title,
                     )
-                )
+
+                agent._on_session_title = _schedule_telegram_title
             elif self._runner._is_discord_auto_thread_lane(source) or (
                 self._runner._is_relay_discord_channel_lane(source)
             ):

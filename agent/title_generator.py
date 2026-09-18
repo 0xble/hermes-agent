@@ -17,6 +17,7 @@ user typed. That ordering is the industry-standard one — Codex CLI encodes the
 same ``custom > ai > fallback`` precedence in its session importer.
 """
 
+import inspect
 import json
 import logging
 import re
@@ -45,7 +46,21 @@ FailureCallback = Callable[[str, BaseException], None]
 # thread, a Telegram topic — wants ``llm`` only: acting on both burns two calls
 # to end up at the same name, and on Discord (2 renames per 10 minutes per
 # channel) the throwaway one can be what survives.
-TitleCallback = Callable[[str, str], None]
+TitleCallback = Callable[..., None]
+
+
+def _notify_title_callback(callback, persisted_title, source, *, display_title=None):
+    """Notify legacy callbacks without conflating aliases and visible labels."""
+    if display_title is None:
+        callback(persisted_title, source)
+        return
+    try:
+        signature = inspect.signature(callback)
+        signature.bind(persisted_title, source, display_title=display_title)
+    except (TypeError, ValueError):
+        callback(persisted_title, source)
+    else:
+        callback(persisted_title, source, display_title=display_title)
 
 # Validation callback: () -> bool. Called right before the LLM request in
 # generate_title(). Return False to skip — e.g. the user switched models
@@ -496,7 +511,9 @@ def apply_instant_title(
         )
         if persisted and title_callback is not None:
             try:
-                title_callback(persisted, "derived")
+                _notify_title_callback(
+                    title_callback, persisted, "derived", display_title=title
+                )
             except Exception:
                 logger.debug("Instant-title callback failed", exc_info=True)
         return persisted
@@ -626,7 +643,9 @@ def _auto_title_session(
         logger.debug("Auto-generated session title: %s", persisted)
         if title_callback is not None:
             try:
-                title_callback(persisted, source)
+                _notify_title_callback(
+                    title_callback, persisted, source, display_title=title
+                )
             except Exception:
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
