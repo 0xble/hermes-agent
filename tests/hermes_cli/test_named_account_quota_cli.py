@@ -440,18 +440,17 @@ def test_anthropic_unpersisted_rotation_records_terminal(monkeypatch, tmp_path):
     assert pool.refresh_failure_reason(e.id) == "terminal"
 
 
-def test_read_only_root_fallback_and_profile_precedence(monkeypatch, tmp_path):
-    from hermes_cli import auth
+def test_read_only_reads_the_active_store_and_never_writes(monkeypatch, tmp_path):
+    """Profiles are independent islands (upstream #111724): an empty profile store
+    reports no accounts rather than borrowing the root profile's, and the read
+    itself never touches either file."""
     from agent.credential_pool import load_pool_read_only
 
     local = seed(monkeypatch, tmp_path)
-    root = tmp_path / "root.json"
-    root.write_text(local.read_text())
-    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root)
     local.write_text(json.dumps({"credential_pool": {}}))
-    before = (local.read_bytes(), root.read_bytes())
-    assert load_pool_read_only("openai-codex").entries()[0].id == "chosen"
-    assert (local.read_bytes(), root.read_bytes()) == before
+    before = local.read_bytes()
+    assert load_pool_read_only("openai-codex").entries() == []
+    assert local.read_bytes() == before
     local.write_text(
         json.dumps({"credential_pool": {"openai-codex": [entry(id="local").to_dict()]}})
     )

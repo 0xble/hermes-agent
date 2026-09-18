@@ -7612,10 +7612,15 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     transient_reason = _transient_credential_retry_reason(
         first_err, provider=resolved_provider or "", model=route.final_model or "",
     )
-    reason = (
-        "provider overloaded" if transient_reason
-        else next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
-    )
+    # `_transient_credential_retry_reason` flattens overloaded / server_error / timeout into one
+    # same-provider rotation trigger, so it must stay the rotation signal but must NOT name the
+    # failure: it turns a slow local model and an unreachable endpoint alike into "provider
+    # overloaded", which is the confusion #89445 exists to remove. Let the ordered predicates name
+    # the failure first — they resolve a label only for the timeout and connection shapes — and
+    # keep "provider overloaded" for the genuine capacity errors they deliberately leave unnamed.
+    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
+    if reason is None and transient_reason:
+        reason = "provider overloaded"
     is_capacity_error = bool(transient_reason) or any(
         predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
     if reason is None or not (is_auto or is_capacity_error):

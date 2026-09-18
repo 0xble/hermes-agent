@@ -33,8 +33,10 @@ async def test_signal_pacing_producer_keeps_actual_image_delivery(policy, monkey
     adapter._with_target = AsyncMock(side_effect=lambda params, chat: params)
     adapter._rpc = AsyncMock(return_value={"timestamp": 123})
     adapter.send = AsyncMock(return_value=SendResult(success=True))
-    result = await adapter.send_multiple_images("recipient", [(path.as_uri(), "caption")])
-    assert result.success
+    results = await adapter.send_multiple_images("recipient", [(path.as_uri(), "caption")])
+    # Fork contract (HERMES-029): one SendResult per input image, not one aggregate, so a
+    # flood deferral mid-album keeps the ids that already landed.
+    assert [r.success for r in results] == [True]
     assert adapter.send.await_count == (0 if policy else 1)
     if not policy:
         assert "rate limit" in adapter.send.call_args.args[1]

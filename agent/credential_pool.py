@@ -1043,8 +1043,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return entry
         display = spec[0]
         is_codex = self.provider == "openai-codex"
-        sources = ("device_code", "manual:device_code") if is_codex else ("device_code",)
-        if entry.source not in sources:
+        # Manually added Codex rows are independent accounts and must never
+        # adopt the singleton auth-store token pair.
+        if entry.source != "device_code":
             return entry
         try:
             with _auth_store_lock():
@@ -1088,6 +1089,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         except Exception as exc:
             logger.debug("Failed to sync %s entry from auth.json: %s", display, exc)
         return entry
+
+    # Provider-specific compatibility names retained across the shared helper
+    # decomposition; tests and plugins patch these methods directly.
+    _sync_codex_entry_from_auth_store = _sync_entry_from_auth_store
+    _sync_xai_oauth_entry_from_auth_store = _sync_entry_from_auth_store
 
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Nous device_code entry from auth.json ``providers.nous`` if state differs.
@@ -1250,6 +1256,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         So never expose or persist the rotated pair; mark the entry terminally
         so it surfaces as an explicit re-auth requirement.
         """
+        if hasattr(self, "_refresh_failures"):
+            self._refresh_failures[entry.id] = "terminal"
         logger.error(
             "Anthropic %s refresh rotated the single-use token but could not commit it "
             "to %s (%s) — failing closed and quarantining the credential; "
@@ -1470,6 +1478,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # re-seed the revoked credentials, and drop singleton-seeded
             # entries from the pool (mirrors the Nous quarantine path).
             if getattr(auth_mod, terminal_fn_name)(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 # WARNING, not debug: this is the moment a login is lost. At the default log level a
                 # silent quarantine looked like "I logged in once and Hermes keeps failing" (#113023).
                 logger.warning(
@@ -1494,6 +1504,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 logger.debug("Nous refresh skipped: auth store lock busy; not benching entry")
                 return entry
             if auth_mod._is_terminal_nous_refresh_error(exc):
+                if hasattr(self, "_refresh_failures"):
+                    self._refresh_failures[entry.id] = "terminal"
                 logger.warning(
                     "Nous refresh token is terminally invalid (%s); clearing local token state. "
                     "Re-run 'hermes auth add nous' to sign in again.", exc)
@@ -2106,6 +2118,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         with self._lock:
             return self._try_refresh_current_unlocked()
 
+    def refresh_failure_reason(self, credential_id: str) -> Optional[str]:
+        """Sanitized evidence from this pool instance's most recent targeted attempt."""
+        with self._lock:
+            return getattr(self, "_refresh_failures", {}).get(credential_id)
+
     def try_refresh_matching(
         self,
         api_key_hint: Optional[str] = None,
@@ -2120,6 +2137,18 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         with self._lock:
             entry = self._find(lambda e: e.id == credential_id) if credential_id else None
+            if credential_id and entry is None:
+                # The dispatched ID can disappear after a pool reload. Only an
+                # unambiguous failed-request key may recover that identity; a
+                # missing explicit CLI target must never select another account.
+                matches = [e for e in self._entries if api_key_hint and e.runtime_api_key == api_key_hint]
+                if len(matches) != 1:
+                    return None
+                entry = matches[0]
+            if not hasattr(self, "_refresh_failures"):
+                self._refresh_failures = {}
+            if entry is not None:
+                self._refresh_failures.pop(entry.id, None)
             if entry is None:
                 if api_key_hint:
                     entry = self._find(lambda e: e.runtime_api_key == api_key_hint)
@@ -2901,3 +2930,35 @@ def load_pool(provider: str) -> CredentialPool:
             removed_ids=disk_ids - new_ids,
         )
     return CredentialPool(provider, entries)
+
+
+def load_pool_read_only(provider: str) -> CredentialPool:
+    """Read persisted rows without seeding, healing, pruning, or persistence."""
+    provider = (provider or "").strip().lower()
+    _, raw_entries = read_pool_snapshot(provider)
+    entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries if isinstance(payload, dict)]
+    return CredentialPool(provider, entries)
+
+
+def read_pool_snapshot(provider: str):
+    """Return owner path and rows without creating even a corrupt-store backup.
+
+    Active store only. Upstream #111724 made named profiles independent islands
+    and removed the global-root resolver this read used to fall back to, so a
+    profile holding no rows of its own now reports empty instead of borrowing
+    (and then reporting quota for) the root profile's accounts.
+    """
+    import json
+    from hermes_cli import auth as auth_mod
+
+    path = auth_mod._auth_file_path()
+    if path is None or not path.exists():
+        return path, []
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    pool = data.get("credential_pool", {})
+    if not isinstance(pool, dict):
+        raise ValueError("Invalid credential pool")
+    rows = pool.get(provider, [])
+    if not isinstance(rows, list):
+        raise ValueError("Invalid provider entries")
+    return path, rows

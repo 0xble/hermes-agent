@@ -105,8 +105,9 @@ async def test_signal_pacing_owner_scope_keeps_acquisition_and_upload(owners, tm
         source.profile = name
         before = len(warnings)
         with adapter._media_delivery_scope(source):
-            result = await adapter.send_multiple_images("recipient", [(path.as_uri(), "caption")])
-        assert result.success
+            results = await adapter.send_multiple_images("recipient", [(path.as_uri(), "caption")])
+        # Fork contract (HERMES-029): one SendResult per input image, not one aggregate.
+        assert [r.success for r in results] == [True]
         assert len(warnings) - before == (0 if suppressed(name) else 1)
         if not suppressed(name):
             assert warnings[-1] == root / "profiles" / name
