@@ -52,6 +52,10 @@ def test_named_fallback_partial_install_escapes_retry_loop(monkeypatch):
     agent = SimpleNamespace(
         _anthropic_prompt_cache_policy=lambda **kwargs: (False, False),
         _buffer_status=lambda *args: None,
+        # Diagnostic variants of the status surface, which the refusal and invalid-response
+        # branches now use so a muted turn does not present them.
+        _buffer_diagnostic_status=lambda *args: None,
+        _emit_diagnostic_status=lambda *args: None,
         _delegation_runtime_pin=pin,
         _extract_api_error_context=lambda error: {},
         _fallback_activated=False,

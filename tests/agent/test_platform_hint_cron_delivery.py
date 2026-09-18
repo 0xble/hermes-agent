@@ -40,6 +40,12 @@ def test_cron_agent_gets_delivery_channel_hint_with_its_override(deliver_to):
 
 
 def test_delivery_target_only_applies_to_cron_agents(deliver_to):
-    assert platform_hint(_agent("telegram")) == PLATFORM_HINTS["telegram"]
+    # Not plain equality for Telegram: the fork appends its rich-Markdown guidance when
+    # ``rich_messages`` is on (the default). The invariant under test is that a NON-cron
+    # agent never picks up the cron delivery destination's hint.
+    telegram = platform_hint(_agent("telegram"))
+    assert telegram.startswith(PLATFORM_HINTS["telegram"])
+    assert "Delivery destination" not in telegram
+    assert PLATFORM_HINTS["slack"] not in telegram
     _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set("")
     assert platform_hint(_agent("cron")) == PLATFORM_HINTS["cron"]

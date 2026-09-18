@@ -42,8 +42,14 @@ def test_swap_retries_transient_permission_error_then_promotes(tmp_path, monkeyp
     real_rename = os.rename
     locked = {"n": 0}
 
+    live_root = desktop_dir / "release" / _packaged_exe_rel().parts[0]
+
     def scanner_locked_rename(src, dst):
-        if Path(dst) == live_exe.parent and locked["n"] < 2:
+        # The staged -> live rename targets the UNPACKED ROOT, which is the exe's parent only
+        # where the exe sits directly in it (win/linux). On macOS it is several levels up
+        # (mac-arm64/Hermes.app/Contents/MacOS/Hermes), so name the root the way the
+        # give-up test below already does.
+        if Path(dst) == live_root and locked["n"] < 2:
             locked["n"] += 1
             raise PermissionError(32, "being used by another process")
         return real_rename(src, dst)

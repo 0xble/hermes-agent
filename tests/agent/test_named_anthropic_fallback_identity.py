@@ -102,7 +102,9 @@ def test_request_client_keeps_pinned_oauth_authority(monkeypatch, route_kind):
     try:
         client = child._create_request_anthropic_client(reason="pin-regression")
         if route_kind == "unpinned":
-            resolver.assert_called_once_with()
+            # Model-scoped since upstream fb358d4: a token benched for THIS model must not be
+            # handed back to the caller that just saw it rate-limited.
+            resolver.assert_called_once_with(model=route.model)
             assert client.auth_token == ambient
             assert child._anthropic_client is not original
         else:

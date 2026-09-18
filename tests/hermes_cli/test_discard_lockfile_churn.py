@@ -15,6 +15,14 @@ _GIT_ENV = {
     **os.environ,
     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    # The fixture repo must not inherit the developer's excludes. Git reads
+    # ``$XDG_CONFIG_HOME/git/ignore`` (``~/.config/git/ignore``) with no config entry at all, and
+    # ``package-lock.json`` is a very common line there — it would leave the lockfile untracked,
+    # so ``git diff`` never reports the churn this test is about and the assertions would measure
+    # the machine instead of the cleanup. ``GIT_CONFIG_*`` alone does not cover that XDG default.
+    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+    "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.excludesFile",
+    "GIT_CONFIG_VALUE_0": os.devnull,
 }
 
 
