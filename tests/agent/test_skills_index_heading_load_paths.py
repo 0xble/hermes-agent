@@ -115,6 +115,26 @@ class TestEveryRenderedHeadingIsLoadable:
             )
 
 
+class TestSnapshotUpgrade:
+    def test_old_category_snapshot_is_rebuilt_without_skill_edits(self, skills_env):
+        skills, pb, st = skills_env
+        _mk_skill(skills, "root-level")
+        pb.build_skills_system_prompt(available_tools={"skill_view"})
+        path = pb._skills_prompt_snapshot_path()
+        snapshot = json.loads(path.read_text())
+        manifest = snapshot["manifest"]
+        snapshot["version"] = 2  # historical format that derived the wrong category
+        for entry in snapshot["skills"]:
+            entry["category"] = "root-level"
+        path.write_text(json.dumps(snapshot))
+        pb.clear_skills_system_prompt_cache()
+        rendered = pb.build_skills_system_prompt(available_tools={"skill_view"})
+        assert ("general", "root-level") in _entries(rendered)
+        assert ("root-level", "root-level") not in _entries(rendered)
+        assert json.loads(path.read_text())["manifest"] == manifest
+        assert _view(st, "general/root-level")["success"]
+
+
 class TestSyntheticGeneralHeading:
     def test_general_prefix_loads_root_level_skill(self, skills_env):
         skills, pb, st = skills_env
@@ -141,6 +161,32 @@ class TestSyntheticGeneralHeading:
         result = _view(st, "general/real-cat-skill")
         assert result.get("success") is True
         assert result["path"].startswith("general/")
+
+    @pytest.mark.parametrize(
+        ("category", "directory", "frontmatter"),
+        [
+            ("cli", "renamed-cli", "cli-name"),
+            ("devops/nested", "renamed-nested", "nested-name"),
+        ],
+    )
+    def test_category_path_uses_frontmatter_name_without_leaking_scope(
+        self, skills_env, category, directory, frontmatter
+    ):
+        skills, pb, st = skills_env
+        _mk_skill(skills, f"{category}/{directory}", name=frontmatter)
+        _mk_skill(skills, f"other/{directory}", name=frontmatter)
+        result = _view(st, f"{category}/{frontmatter}")
+        assert result.get("success") is True, result.get("error")
+        assert f"{category}/{directory}" in result["_source_path"]
+        assert _view(st, f"wrong/{frontmatter}").get("success") is False
+
+    def test_synthetic_general_wins_only_for_root_skill_when_real_category_collides(
+        self, skills_env
+    ):
+        skills, pb, st = skills_env
+        _mk_skill(skills, "root-dir", name="same", body="root\n")
+        _mk_skill(skills, "general/real-dir", name="same", body="real\n")
+        assert _view(st, "general/same")["_source_path"].endswith("root-dir/SKILL.md")
 
 
 class TestSyntheticOrgHeading:
@@ -254,6 +300,13 @@ class TestHeadingPathsAreNotAnEscapeHatch:
         _mark_active(skills, "acme")
         for name in ("general/nope", "org:acme/nope"):
             assert _view(st, name).get("success") is False
+
+    def test_package_owned_document_cannot_shadow_a_real_skill(self, skills_env):
+        skills, pb, st = skills_env
+        package = _mk_skill(skills, "cli/owner", name="owner")
+        (package / "doc.md").write_text("not a standalone skill\n", encoding="utf-8")
+        result = _view(st, "doc")
+        assert result.get("success") is False
 
 
 class TestParseIndexHeadingPath:

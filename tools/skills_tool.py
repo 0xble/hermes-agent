@@ -324,7 +324,7 @@ def _collect_index_heading_candidates(name: str, all_dirs) -> List[Tuple[Optiona
     scope_rel, bare, recursive = parsed
     # `bare` is joined onto a skills root, so it gets the same traversal/absolute
     # validation the top-level `name` got.
-    if _skill_lookup_path_error(bare):
+    if _skill_lookup_path_error(bare) or (not recursive and "/" in bare):
         return []
     candidates: List[Tuple[Optional[Path], Path]] = []
     seen_md: set = set()
@@ -350,7 +350,8 @@ def _collect_index_heading_candidates(name: str, all_dirs) -> List[Tuple[Optiona
         direct = scope / bare
         if direct.is_dir() and (direct / "SKILL.md").exists():
             _record(direct, direct / "SKILL.md")
-        elif (flat := direct.with_suffix(".md")).exists():
+        elif ((flat := direct.with_suffix(".md")).exists()
+              and not _is_package_owned_markdown(flat, search_dir)):
             _record(None, flat)
         # The index renders the FRONTMATTER name, which may differ from the
         # directory name, so match on both — otherwise the rendered entry is
@@ -413,9 +414,21 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
             _record_direct(search_dir / direct, search_dir)
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
+        # A categorized path may use the frontmatter name for its final segment
+        # (the renderer exposes that name, not necessarily the directory name).
+        # Keep the category prefix as a hard scope: ``cli/renamed`` must not
+        # resolve an unrelated ``devops/renamed`` skill.
+        path_parts = name.split("/")
+        scoped_category = path_parts[:-1] if len(path_parts) > 1 else ()
+        requested_name = path_parts[-1]
         for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-            if (found_skill_md.parent.name == name
-                    or _safe_frontmatter(found_skill_md).get("name") == name):
+            relative_parts = found_skill_md.parent.relative_to(search_dir).parts
+            in_scope = (not scoped_category
+                         or relative_parts[:len(scoped_category)] == tuple(scoped_category))
+            if not in_scope:
+                continue
+            if (found_skill_md.parent.name == requested_name
+                    or _safe_frontmatter(found_skill_md).get("name") == requested_name):
                 _record(found_skill_md.parent, found_skill_md)
         # Legacy flat <name>.md anywhere under the dir. Markdown owned by an ancestor
         # directory skill loads through file_path and must not shadow a real skill.
