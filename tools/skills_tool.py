@@ -339,17 +339,13 @@ def _collect_index_heading_candidates(name: str, all_dirs) -> List[Tuple[Optiona
 
     for search_dir in all_dirs:
         if not scope_rel:
-            # A literal general/<name> wins within this root, not across roots
-            # or project tiers. Keep all roots for the common collision resolver.
-            literal = _collect_skill_candidates(name, None, [search_dir], direct_only=True)
-            if literal:
-                for sd, smd in literal:
-                    _record(sd, smd)
-                continue
-            # With no literal path, a real general category and the synthetic
-            # root alias are peers: different skills must remain ambiguous.
+            # Always collect the real general category: sibling frontmatter
+            # collisions must remain visible to the ordinary ambiguity policy.
             for sd, smd in _collect_skill_candidates(name, None, [search_dir]):
                 _record(sd, smd)
+            # A literal path suppresses only this root's synthetic alias scan.
+            if _collect_skill_candidates(name, None, [search_dir], direct_only=True):
+                continue
         scope = search_dir / scope_rel if scope_rel else search_dir
         if scope_rel.startswith(ORG_MIRROR_DIR_NAME):
             # Token gate: only the `.active_org` mirror may resolve, exactly as the

@@ -1,3 +1,5 @@
+"""Real renderer and skill_view coverage for categorized and synthetic paths."""
+
 import json
 
 import pytest
@@ -261,14 +263,23 @@ class TestHeadingPathsAreNotAnEscapeHatch:
         for name in ("general/nope", "org:acme/nope"):
             assert _view(st, name).get("success") is False
 
-    @pytest.mark.parametrize("heading, rel", [("general", "owner"), ("org:acme", "_org/acme/owner")])
-    def test_package_owned_document_cannot_shadow_a_real_skill(self, skills_env, heading, rel):
+    def test_org_heading_rejects_package_owned_document(self, skills_env):
         skills, pb, st = skills_env
-        package = _mk_skill(skills, rel, name="owner")
+        package = _mk_skill(skills, "_org/acme/owner", name="owner")
         _mark_active(skills, "acme")
         (package / "doc.md").write_text("not a standalone skill\n", encoding="utf-8")
-        result = _view(st, f"{heading}/owner/doc")
+        result = _view(st, "org:acme/owner/doc")
         assert result.get("success") is False
+
+
+@pytest.mark.parametrize("category", ["general", "cli"])
+def test_sibling_frontmatter_collision_is_ambiguous(skills_env, category):
+    skills, pb, st = skills_env
+    _mk_skill(skills, f"{category}/same", body="one\n")
+    _mk_skill(skills, f"{category}/other", name="same", body="other\n")
+    result = _view(st, f"{category}/same")
+    assert not result["success"]
+    assert "Ambiguous" in result["error"]
 
 
 class TestParseIndexHeadingPath:
@@ -326,3 +337,20 @@ def test_literal_general_does_not_hide_cross_root_collision(skills_env, tmp_path
     result = _view(st, "general/same")
     assert not result["success"]
     assert "Ambiguous" in result["error"]
+
+def test_trusted_project_general_skill_beats_local_root_alias(skills_env, tmp_path, monkeypatch):
+    skills, pb, st = skills_env
+    project = tmp_path / "project"
+    project_skills = project / ".hermes" / "skills"
+    project_skills.mkdir(parents=True)
+    (project / ".git").mkdir()
+    _mk_skill(project_skills, "general/x", body="project\n")
+    _mk_skill(skills, "root-x", name="x", body="local\n")
+    (tmp_path / "config.yaml").write_text(
+        f"skills:\n  trusted_project_dirs: [{project}]\n"
+    )
+    monkeypatch.chdir(project)
+    assert project_skills.resolve() in sku.get_project_skills_dirs()
+    result = _view(st, "general/x")
+    assert result["success"], result
+    assert result["_source_path"] == str(project_skills / "general/x/SKILL.md")
