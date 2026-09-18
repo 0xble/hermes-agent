@@ -1396,15 +1396,18 @@ class TurnRunner:
             # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
             # cache at fire time — gating registration on the cache read meant it never registered.
             if runner._is_telegram_topic_lane(source):
-                def _schedule_telegram_title(title: str, title_source: str):
+                def _schedule_telegram_title(
+                    title: str, title_source: str, *, display_title: str | None = None
+                ):
                     if title_source != "llm":
                         return False
+                    visible_title = display_title or title
                     rename_kwargs = {"user_message": getattr(ctx, "message", "") or ""}
                     title_context = getattr(agent, "_opening_title_context", None)
                     if title_context is not None:
                         rename_kwargs["title_context"] = title_context
                     return runner._schedule_telegram_topic_title_rename(
-                        source, session_id, title, **rename_kwargs,
+                        source, session_id, visible_title, **rename_kwargs,
                     )
 
                 agent._on_session_title = _schedule_telegram_title

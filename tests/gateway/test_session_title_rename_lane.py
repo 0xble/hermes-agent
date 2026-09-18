@@ -149,8 +149,11 @@ def test_the_rename_waits_for_the_model_title(lane):
     callback("fix the flaky auth test in log", "derived")
     assert renames == []
 
-    callback("Fix flaky auth test", "llm")
-    assert renames == ["Fix flaky auth test"]
+    if lane == "telegram":
+        callback("Fix flaky auth test #2", "llm", display_title="Fix flaky auth test")
+    else:
+        callback("Fix flaky auth test #2", "llm")
+    assert renames == ["Fix flaky auth test #2" if lane == "discord" else "Fix flaky auth test"]
 
 
 @pytest.mark.anyio

@@ -18,6 +18,7 @@ same ``custom > ai > fallback`` precedence in its session importer.
 """
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -55,9 +56,10 @@ def wait_for_title_upgrades(timeout: float = 10.0) -> None:
 # become visible instead of piling up as NULL session titles.
 FailureCallback = Callable[[str, BaseException], None]
 
-# Callback signature: (title, source) -> None, where source is the provenance
-# the title was persisted under (``derived`` for the instant slice of the user's
-# own words, ``llm`` for the model's upgrade of it).
+# Callback signature: (title, source[, display_title=...]) -> None. ``title`` is the
+# persisted unique session alias. The optional keyword is the cleaned visible label
+# before unique-alias allocation, used by platform lanes that separate display names
+# from resumable session aliases.
 #
 # Titling is two-stage, and the stage matters to the consumer. A local surface
 # wants both, so the sidebar renames instantly and sharpens a second later. A
@@ -65,7 +67,27 @@ FailureCallback = Callable[[str, BaseException], None]
 # thread, a Telegram topic — wants ``llm`` only: acting on both burns two calls
 # to end up at the same name, and on Discord (2 renames per 10 minutes per
 # channel) the throwaway one can be what survives.
-TitleCallback = Callable[[str, str], None]
+TitleCallback = Callable[..., None]
+
+
+def _notify_title_callback(
+    callback: TitleCallback,
+    persisted_title: str,
+    source: str,
+    *,
+    display_title: Optional[str] = None,
+) -> None:
+    """Notify old and new title consumers without conflating aliases and labels."""
+    if display_title is None:
+        callback(persisted_title, source)
+        return
+    try:
+        signature = inspect.signature(callback)
+        signature.bind(persisted_title, source, display_title=display_title)
+    except (TypeError, ValueError):
+        callback(persisted_title, source)
+    else:
+        callback(persisted_title, source, display_title=display_title)
 
 # Validation callback: () -> bool. Called right before the LLM request in
 # generate_title(). Return False to skip — e.g. the user switched models
@@ -1316,6 +1338,18 @@ def choose_topic_icon(
         return selected
 
 
+def _display_title(title: str, *, clean: bool = True) -> str:
+    """Return the visible title before unique session-alias allocation."""
+    if not clean:
+        return title
+    preferences = _title_preferences()
+    return _clean_title(
+        title,
+        preferences.max_characters or _MAX_PERSISTED_TITLE_CHARS,
+        preferences.max_words,
+    ) or ""
+
+
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, clean=True):
     """Persist a title at *source* authority, recovering from name collisions.
 
@@ -1426,7 +1460,12 @@ def apply_instant_title(
         )
         if persisted and title_callback is not None:
             try:
-                title_callback(persisted, "derived")
+                _notify_title_callback(
+                    title_callback,
+                    persisted,
+                    "derived",
+                    display_title=_display_title(title),
+                )
             except Exception:
                 logger.debug("Instant-title callback failed", exc_info=True)
         return persisted
@@ -1605,7 +1644,12 @@ def _auto_title_session(
         logger.debug("Auto-generated session title: %s", persisted)
         if title_callback is not None:
             try:
-                title_callback(persisted, source)
+                _notify_title_callback(
+                    title_callback,
+                    persisted,
+                    source,
+                    display_title=_display_title(title),
+                )
             except Exception:
                 logger.debug("Auto-title callback failed", exc_info=True)
     except Exception as e:
@@ -1727,7 +1771,12 @@ def maybe_auto_title(
                 session_db, session_id, kanban_title, source="llm", clean=False)
             if persisted and title_callback is not None:
                 try:
-                    title_callback(persisted, "llm")
+                    _notify_title_callback(
+                        title_callback,
+                        persisted,
+                        "llm",
+                        display_title=_display_title(kanban_title, clean=False),
+                    )
                 except Exception:
                     logger.debug("Kanban task title callback failed", exc_info=True)
         except Exception:
