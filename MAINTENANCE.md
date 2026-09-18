@@ -2,6 +2,15 @@
 
 ## Background
 
+Cutoff `d177b119e9c56c9ddc0b7379ffce52341ec06584` extends the September 17 cutoff
+`0a8d4caef4650320b31f9c17a906293e680be5df` by nine upstream commits: Bedrock
+context-window caching that records provider-confirmed provenance and memoises probe
+failures, Slack bearer retention across validated Enterprise Grid file redirects and
+task-card reopen when Slack seals a stream mid-turn, directory-plugin identity held
+over a same-name pip entry point, and automatic catalog installation for a configured
+memory provider that left core. All five both-modified files resolved as genuine
+three-way merges; no fork divergence was dropped.
+
 Cutoff `a09195b1e8d232e8c83b5430da4261970f62a820` builds on verified fork
 `e5020658fb70931dcbd4d2a9844c32de5d5b85b7` and covers 1261 upstream commits from
 the September 14 cutoff `743140cd8221ad04897c4c3e706e0fc8a7613b8e`. Five fork
@@ -29,7 +38,7 @@ retain separate run-scoped evidence.
 
 Canonical target: `/Users/brianle/Repos/hermes-agent`, the Brian-owned `0xble/hermes-agent` fork of `NousResearch/hermes-agent`. Upstream remains authoritative for unmodified code; intentional divergence and released-equivalence decisions justify enrollment. Fork `main` is the last candidate that passed fork verification, not evidence of runtime promotion. This root is the sole enrollment and scheduling unit; `maintenance/*.md` extends it without independent enrollment.
 
-The accepted upstream reconciliation cutoffs are **September 17, 2026** `0a8d4caef4650320b31f9c17a906293e680be5df`, **September 16, 2026** `a09195b1e8d232e8c83b5430da4261970f62a820`, **September 14, 2026** `743140cd8221ad04897c4c3e706e0fc8a7613b8e`, **September 13, 2026** `ee4452991d17534aa561f31ee55596d082aa94e7`, **September 12, 2026** `f364c19775617acb6c16140b790cda9fb05e1906`, and **September 11, 2026** `939e45c91d751fadd94dcd1b873ac3cb44846213`. Immutable source-helper evidence owns each run's test/review/publication status; these observations do not authorize runtime activation. The September 17 integration covered 820 commits from the September 16 cutoff; the September 12 integration covered 177 commits from the September 11 cutoff.
+The accepted upstream reconciliation cutoffs are **September 18, 2026** `d177b119e9c56c9ddc0b7379ffce52341ec06584`, **September 17, 2026** `0a8d4caef4650320b31f9c17a906293e680be5df`, **September 16, 2026** `a09195b1e8d232e8c83b5430da4261970f62a820`, **September 14, 2026** `743140cd8221ad04897c4c3e706e0fc8a7613b8e`, **September 13, 2026** `ee4452991d17534aa561f31ee55596d082aa94e7`, **September 12, 2026** `f364c19775617acb6c16140b790cda9fb05e1906`, and **September 11, 2026** `939e45c91d751fadd94dcd1b873ac3cb44846213`. Immutable source-helper evidence owns each run's test/review/publication status; these observations do not authorize runtime activation. The September 18 integration covered 9 commits from the September 17 cutoff; the September 17 integration covered 820 commits from the September 16 cutoff; the September 12 integration covered 177 commits from the September 11 cutoff.
 
 Historical accepted history boundaries: Brian approved `1724c48b12a90eb8a76e91e6337eaf2e2965a8e8` on **2026-09-06**; the earlier reconciled boundary was `93455e0d6b40305ac2c9486a06e701d9aef205ca`. They are provenance only: superseded same-commit/duplicate-subject validation claims do not reinstate a gate.
 
