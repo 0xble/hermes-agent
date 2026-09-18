@@ -1,25 +1,4 @@
-"""Every category heading rendered in the system-prompt skills index must be a
-valid ``skill_view`` load path.
-
-The index groups skills under category headings and instructs the agent to load
-by category path — the name-collision label says so literally ("load via
-category path"). Two of those headings are SYNTHETIC and match no directory:
-
-* ``general:``      — skills sitting directly in a skills root.
-* ``org:<org_id>:`` — org-mirror skills, which live at ``_org/<org_id>/...``.
-
-Before this fix ``skill_view("general/x")`` and ``skill_view("org:acme/x")``
-both returned "not found", so the prompt advertised load paths that could not
-work, and a personal/org name collision was UNRESOLVABLE: the bare name was
-refused as ambiguous and the only path the index offered did not load.
-
-These tests drive the real renderer and the real tool, so they fail if either
-side drifts — a heading that renders without a matching resolver, or a resolver
-whose accepted form no longer matches what is rendered.
-"""
-
 import json
-import re
 
 import pytest
 
@@ -52,22 +31,12 @@ def skills_env(tmp_path, monkeypatch):
 
     skills = tmp_path / "skills"
     skills.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(pb, "get_skills_dir", lambda: skills, raising=True)
-    monkeypatch.setattr(pb, "get_all_skills_dirs", lambda: [skills], raising=True)
-    monkeypatch.setattr(pb, "get_disabled_skill_names", lambda *a, **k: set())
-    monkeypatch.setattr(pb, "_skills_prompt_snapshot_path", lambda: tmp_path / "snap.json")
-    monkeypatch.setattr(st, "SKILLS_DIR", skills, raising=True)
-    monkeypatch.setattr(sku, "get_external_skills_dirs", lambda: [], raising=True)
-    monkeypatch.setattr(sku, "get_project_skills_dirs", lambda: [], raising=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text("skills: {}\n")
     pb.clear_skills_system_prompt_cache()
     st._SKILLS_CACHE.clear()
     return skills, pb, st
-
-
-def _headings(rendered):
-    """Category headings exactly as the index renders them (two-space indent)."""
-    block = rendered[rendered.find("<available_skills>"):rendered.find("</available_skills>")]
-    return [m.group(1) for m in re.finditer(r"^  (\S[^:]*(?::[^:\s]+)?):", block, re.M)]
 
 
 def _entries(rendered):
@@ -88,8 +57,8 @@ def _view(st, name):
     return json.loads(st.skill_view(name))
 
 
-class TestEveryRenderedHeadingIsLoadable:
-    """The contract, asserted against the renderer's own output."""
+class TestUnambiguousRenderedHeadings:
+    """Unambiguous entries resolve; renderer dedup does not guarantee uniqueness."""
 
     def test_every_rendered_category_path_loads(self, skills_env):
         skills, pb, st = skills_env
@@ -113,6 +82,10 @@ class TestEveryRenderedHeadingIsLoadable:
                 f"agent to load skills by category path, but skill_view('{category}/{name}') "
                 f"failed: {result.get('error')}"
             )
+            expected = (skills / "_org/acme/shared-x" if category == "org:acme"
+                        else skills / name if category == "general"
+                        else skills / category / name)
+            assert result["_source_path"] == str(expected / "SKILL.md")
 
 
 class TestSnapshotUpgrade:
@@ -173,20 +146,23 @@ class TestSyntheticGeneralHeading:
         self, skills_env, category, directory, frontmatter
     ):
         skills, pb, st = skills_env
-        _mk_skill(skills, f"{category}/{directory}", name=frontmatter)
+        expected = _mk_skill(skills, f"{category}/{directory}", name=frontmatter)
+        assert (category, frontmatter) in _entries(pb.build_skills_system_prompt(available_tools={"skill_view"}))
         _mk_skill(skills, f"other/{directory}", name=frontmatter)
         result = _view(st, f"{category}/{frontmatter}")
         assert result.get("success") is True, result.get("error")
-        assert f"{category}/{directory}" in result["_source_path"]
+        assert result["_source_path"] == str(expected / "SKILL.md")
         assert _view(st, f"wrong/{frontmatter}").get("success") is False
 
-    def test_synthetic_general_wins_only_for_root_skill_when_real_category_collides(
+    def test_general_alias_collision_is_refused(
         self, skills_env
     ):
         skills, pb, st = skills_env
         _mk_skill(skills, "root-dir", name="same", body="root\n")
         _mk_skill(skills, "general/real-dir", name="same", body="real\n")
-        assert _view(st, "general/same")["_source_path"].endswith("root-dir/SKILL.md")
+        result = _view(st, "general/same")
+        assert not result["success"]
+        assert "Ambiguous" in result["error"]
 
 
 class TestSyntheticOrgHeading:
@@ -250,22 +226,6 @@ class TestCollisionLabelAdviceActuallyWorks:
         # silently served the same file would defeat the disambiguation.
         assert personal["_source_path"] != org["_source_path"]
 
-    def test_scoped_paths_disambiguate_without_changing_bare_name_behavior(self, skills_env):
-        """The scoped paths are ADDITIVE: whatever the bare name did before, it still does.
-
-        This pins the contract that matters here — a personal/org name clash is
-        reachable by the two paths the index renders — without freezing the bare
-        name's own resolution policy, which this change does not touch.
-        """
-        skills, pb, st = skills_env
-        _mk_skill(skills, "cli/deploy", name="deploy")
-        _mk_skill(skills, f"{sku.ORG_MIRROR_DIR_NAME}/acme/deploy", name="deploy")
-        _mark_active(skills, "acme")
-        personal = _view(st, "cli/deploy")
-        org = _view(st, "org:acme/deploy")
-        assert personal.get("success") is True, personal.get("error")
-        assert org.get("success") is True, org.get("error")
-        assert personal["_source_path"] != org["_source_path"]
 
 
 class TestHeadingPathsAreNotAnEscapeHatch:
@@ -301,11 +261,13 @@ class TestHeadingPathsAreNotAnEscapeHatch:
         for name in ("general/nope", "org:acme/nope"):
             assert _view(st, name).get("success") is False
 
-    def test_package_owned_document_cannot_shadow_a_real_skill(self, skills_env):
+    @pytest.mark.parametrize("heading, rel", [("general", "owner"), ("org:acme", "_org/acme/owner")])
+    def test_package_owned_document_cannot_shadow_a_real_skill(self, skills_env, heading, rel):
         skills, pb, st = skills_env
-        package = _mk_skill(skills, "cli/owner", name="owner")
+        package = _mk_skill(skills, rel, name="owner")
+        _mark_active(skills, "acme")
         (package / "doc.md").write_text("not a standalone skill\n", encoding="utf-8")
-        result = _view(st, "doc")
+        result = _view(st, f"{heading}/owner/doc")
         assert result.get("success") is False
 
 
@@ -329,3 +291,38 @@ class TestParseIndexHeadingPath:
     ])
     def test_non_heading_inputs_return_none(self, name):
         assert sku.parse_index_heading_path(name) is None
+
+@pytest.mark.parametrize("deeper", ["cli/github/gh", "cli/github/renamed"])
+def test_explicit_path_not_confused_by_deeper_name(skills_env, deeper):
+    skills, pb, st = skills_env
+    expected = _mk_skill(skills, "cli/gh", body="explicit\n")
+    _mk_skill(skills, deeper, name="gh", body="deeper\n")
+    result = _view(st, "cli/gh")
+    assert result["success"], result
+    assert result["_source_path"] == str(expected / "SKILL.md")
+
+
+def test_missing_intermediate_prefix_does_not_load_deeper_skill(skills_env):
+    skills, pb, st = skills_env
+    _mk_skill(skills, "cli/github/renamed", name="gh")
+    assert not _view(st, "cli/gh")["success"]
+
+
+def test_literal_general_path_precedes_root_alias(skills_env):
+    skills, pb, st = skills_env
+    expected = _mk_skill(skills, "general/same", body="literal\n")
+    _mk_skill(skills, "root-dir", name="same", body="alias\n")
+    result = _view(st, "general/same")
+    assert result["success"], result
+    assert result["_source_path"] == str(expected / "SKILL.md")
+
+@pytest.mark.parametrize("external_rel", ["general/same", "root-alias"])
+def test_literal_general_does_not_hide_cross_root_collision(skills_env, tmp_path, external_rel):
+    skills, pb, st = skills_env
+    _mk_skill(skills, "general/same", body="local\n")
+    external = tmp_path / "external"
+    _mk_skill(external, external_rel, name="same", body="external\n")
+    (tmp_path / "config.yaml").write_text(f"skills:\n  external_dirs: [{external}]\n")
+    result = _view(st, "general/same")
+    assert not result["success"]
+    assert "Ambiguous" in result["error"]

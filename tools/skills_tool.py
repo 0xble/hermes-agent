@@ -338,6 +338,18 @@ def _collect_index_heading_candidates(name: str, all_dirs) -> List[Tuple[Optiona
             candidates.append((sd, smd))
 
     for search_dir in all_dirs:
+        if not scope_rel:
+            # A literal general/<name> wins within this root, not across roots
+            # or project tiers. Keep all roots for the common collision resolver.
+            literal = _collect_skill_candidates(name, None, [search_dir], direct_only=True)
+            if literal:
+                for sd, smd in literal:
+                    _record(sd, smd)
+                continue
+            # With no literal path, a real general category and the synthetic
+            # root alias are peers: different skills must remain ambiguous.
+            for sd, smd in _collect_skill_candidates(name, None, [search_dir]):
+                _record(sd, smd)
         scope = search_dir / scope_rel if scope_rel else search_dir
         if scope_rel.startswith(ORG_MIRROR_DIR_NAME):
             # Token gate: only the `.active_org` mirror may resolve, exactly as the
@@ -384,7 +396,7 @@ def _is_package_owned_markdown(path: Path, search_root: Path) -> bool:
     )
 
 
-def _collect_skill_candidates(name, local_category_name, all_dirs):
+def _collect_skill_candidates(name, local_category_name, all_dirs, *, direct_only=False):
     """ALL (skill_dir, skill_md) candidates across every dir and lookup strategy (direct path,
     recursive by dir / frontmatter name, legacy flat <name>.md), deduped by resolved path.
     Collision detection is the point: silent shadowing of a local skill by a same-named
@@ -412,6 +424,8 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
     for search_dir in all_dirs:
         for direct in filter(None, (name, local_category_name)):  # "p:x" with no plugin p → "p/x"
             _record_direct(search_dir / direct, search_dir)
+        if direct_only:
+            continue
         # Recursive by directory name plus frontmatter `name:` — skills_list()
         # exposes the frontmatter name, so skill_view(name) must accept it too.
         # A categorized path may use the frontmatter name for its final segment
@@ -424,7 +438,7 @@ def _collect_skill_candidates(name, local_category_name, all_dirs):
         for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
             relative_parts = found_skill_md.parent.relative_to(search_dir).parts
             in_scope = (not scoped_category
-                         or relative_parts[:len(scoped_category)] == tuple(scoped_category))
+                         or relative_parts[:-1] == tuple(scoped_category))
             if not in_scope:
                 continue
             if (found_skill_md.parent.name == requested_name
