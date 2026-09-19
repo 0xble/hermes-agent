@@ -559,7 +559,7 @@ class GatewayTopicThreadsMixin:
                     chat_id=str(source.chat_id), thread_id=str(source.thread_id),
                     profile_name=self._telegram_topic_profile_name(source),
                 )
-                if binding and str(binding.get("session_id") or "") != str(session_id):
+                if not binding or str(binding.get("session_id") or "") != str(session_id):
                     return
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
@@ -571,6 +571,8 @@ class GatewayTopicThreadsMixin:
         icon_emoji = None
         icon_state_to_record = None
         icon_history_to_record = None
+        icon_state_owner = "auto"
+        sync_session_db = self._sync_session_db() if session_db is not None else None
         extra = getattr(getattr(getattr(self, "config", None), "platforms", {}).get(source.platform), "extra", {}) or {}
         if is_truthy_value(extra.get("auto_topic_icons")):
             try:
@@ -578,12 +580,12 @@ class GatewayTopicThreadsMixin:
                 profile_name = self._telegram_topic_profile_name(source)
                 recent = (
                     await asyncio.to_thread(
-                        session_db.list_recent_telegram_topic_icons,
+                        sync_session_db.list_recent_telegram_topic_icons,
                         str(source.chat_id),
                         24,
                         profile_name,
                     )
-                    if session_db
+                    if sync_session_db
                     else []
                 )
                 from agent.topic_icons import choose_topic_icon_deterministic, resolve_override
@@ -593,21 +595,37 @@ class GatewayTopicThreadsMixin:
                     None,
                 )
                 icon_custom_emoji_id = selected.get("custom_emoji_id") if selected else None
+                manual_icon_id = None
+                manual_icon_getter = getattr(type(adapter), "get_manual_topic_icon", None)
+                if is_truthy_value(extra.get("preserve_manual_topic_icons", True), default=True) and callable(manual_icon_getter):
+                    manual_icon_id = manual_icon_getter(adapter, str(source.chat_id), str(source.thread_id))
+                if manual_icon_id:
+                    manual_selected = next(
+                        (item for item in options if item.get("custom_emoji_id") == manual_icon_id),
+                        None,
+                    )
+                    icon_custom_emoji_id = None
+                    icon_state_owner = "manual"
+                    icon_state_to_record = (
+                        manual_icon_id,
+                        manual_selected.get("emoji") if manual_selected else None,
+                        profile_name,
+                    )
                 state = (
                     await asyncio.to_thread(
-                        session_db.get_telegram_topic_icon_state,
+                        sync_session_db.get_telegram_topic_icon_state,
                         str(source.chat_id),
                         str(source.thread_id),
                         profile_name,
                     )
-                    if session_db
+                    if sync_session_db
                     else None
                 )
                 if state and state.get("owner") == "manual" and is_truthy_value(
                     extra.get("preserve_manual_topic_icons", True), default=True
                 ):
                     icon_custom_emoji_id = None
-                if session_db and icon_custom_emoji_id:
+                if sync_session_db and icon_custom_emoji_id:
                     icon_state_to_record = (icon_custom_emoji_id, icon_emoji, profile_name)
                     icon_history_to_record = (icon_emoji, icon_custom_emoji_id, profile_name)
             except Exception:
@@ -622,7 +640,7 @@ class GatewayTopicThreadsMixin:
                     thread_id=str(source.thread_id),
                     profile_name=self._telegram_topic_profile_name(source),
                 )
-                if binding and str(binding.get("session_id") or "") != str(session_id):
+                if not binding or str(binding.get("session_id") or "") != str(session_id):
                     return
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before final rename", exc_info=True)
@@ -633,26 +651,29 @@ class GatewayTopicThreadsMixin:
                 kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": topic_name}
                 if icon_custom_emoji_id:
                     kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
-                await rename_topic(**kwargs)
-                if icon_state_to_record and icon_history_to_record and session_db:
+                rename_ok = await rename_topic(**kwargs)
+                if rename_ok is not True:
+                    return
+                if icon_state_to_record and sync_session_db:
                     custom_id, emoji, profile_name = icon_state_to_record
                     await asyncio.to_thread(
-                        session_db.record_telegram_topic_icon_state,
+                        sync_session_db.record_telegram_topic_icon_state,
                         str(source.chat_id),
                         str(source.thread_id),
                         custom_emoji_id=custom_id,
                         emoji=emoji,
-                        owner="auto",
+                        owner=icon_state_owner,
                         profile_name=profile_name,
                     )
-                    history_emoji, history_id, history_profile = icon_history_to_record
-                    await asyncio.to_thread(
-                        session_db.record_telegram_topic_icon_history,
-                        str(source.chat_id),
-                        emoji=history_emoji,
-                        custom_emoji_id=history_id,
-                        profile_name=history_profile,
-                    )
+                    if icon_history_to_record:
+                        history_emoji, history_id, history_profile = icon_history_to_record
+                        await asyncio.to_thread(
+                            sync_session_db.record_telegram_topic_icon_history,
+                            str(source.chat_id),
+                            emoji=history_emoji,
+                            custom_emoji_id=history_id,
+                            profile_name=history_profile,
+                        )
                 return
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
@@ -662,25 +683,26 @@ class GatewayTopicThreadsMixin:
             if icon_custom_emoji_id:
                 kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
             await edit_forum_topic(**kwargs)
-            if icon_state_to_record and icon_history_to_record and session_db:
+            if icon_state_to_record and sync_session_db:
                 custom_id, emoji, profile_name = icon_state_to_record
                 await asyncio.to_thread(
-                    session_db.record_telegram_topic_icon_state,
+                    sync_session_db.record_telegram_topic_icon_state,
                     str(source.chat_id),
                     str(source.thread_id),
                     custom_emoji_id=custom_id,
                     emoji=emoji,
-                    owner="auto",
+                    owner=icon_state_owner,
                     profile_name=profile_name,
                 )
-                history_emoji, history_id, history_profile = icon_history_to_record
-                await asyncio.to_thread(
-                    session_db.record_telegram_topic_icon_history,
-                    str(source.chat_id),
-                    emoji=history_emoji,
-                    custom_emoji_id=history_id,
-                    profile_name=history_profile,
-                )
+                if icon_history_to_record:
+                    history_emoji, history_id, history_profile = icon_history_to_record
+                    await asyncio.to_thread(
+                        sync_session_db.record_telegram_topic_icon_history,
+                        str(source.chat_id),
+                        emoji=history_emoji,
+                        custom_emoji_id=history_id,
+                        profile_name=history_profile,
+                    )
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 

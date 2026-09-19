@@ -133,10 +133,27 @@ class SessionTitlesMixin:
             else:
                 numbers = [int(m.group(2)) for m in (_NUMBERED_TITLE_RE.match(value) for value in used) if m]
                 n = max([1, *numbers]) + 1
-                stored = f"{base} #{n}"
-                while stored in used:
+                all_titles = {
+                    str(row["title"])
+                    for row in conn.execute(
+                        "SELECT title FROM sessions WHERE id != ? AND title IS NOT NULL", (session_id,)
+                    ).fetchall()
+                    if row["title"]
+                }
+                from hermes_state import SessionDB
+                max_length = SessionDB.MAX_TITLE_LENGTH
+                while True:
+                    suffix = f" #{n}"
+                    # Lineage aliases must obey the same title limit as their
+                    # unsuffixed source.  Reserve room for the suffix before
+                    # checking uniqueness; never persist an overlong alias.
+                    alias_base = base[:max_length - len(suffix)].rstrip()
+                    if not alias_base:
+                        raise ValueError("title is too long to reserve a unique lineage alias")
+                    stored = f"{alias_base}{suffix}"
+                    if stored not in all_titles:
+                        break
                     n += 1
-                    stored = f"{base} #{n}"
             current = conn.execute("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,)).fetchone()
             if current is None:
                 raise ValueError(f"session not found: {session_id}")

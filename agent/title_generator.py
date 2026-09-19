@@ -170,10 +170,13 @@ def _restore_name_aliases(title: str, aliases: dict) -> str:
     """Restore configured display names without treating operator text as regex."""
     result = title
     for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
-        parts = [re.escape(part) for part in re.findall(r"[\w]+", alias, flags=re.UNICODE)]
-        if not parts:
+        alias = str(alias)
+        if not alias:
             continue
-        pattern = r"(?<!\w)" + r"[\W_]+".join(parts) + r"(?!\w)"
+        # Match the configured alias literally.  The surrounding word guards
+        # prevent replacing a substring of a larger identifier while allowing
+        # punctuation-bearing names such as C++ and .NET.
+        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
         result = re.sub(pattern, lambda _match, value=canonical: value, result, flags=re.IGNORECASE | re.UNICODE)
     return result
 
@@ -428,9 +431,11 @@ def generate_title(
         if title is None or not any(char.isalnum() for char in title):
             return None
         title = _restore_name_aliases(title, _title_preferences()["name_aliases"])
-        # Answer-shaped output guard: titling is a short noun-phrase task.
-        if len(title.split()) > _MAX_TITLE_WORDS:
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
+        # Answer-shaped output guard: titling is a short noun-phrase task. Respect the
+        # configured ceiling (which is already bounded by _title_preferences()).
+        max_title_words = _title_preferences()["max_words"]
+        if len(title.split()) > max_title_words:
+            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
             return None
         if _is_prompt_example_echo(title):
             logger.debug("Rejecting prompt-example echo title: %r", title)

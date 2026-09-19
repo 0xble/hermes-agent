@@ -623,6 +623,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_offline_text: str = str(extra.get("status_offline", "Offline"))
         self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
         self._forum_topic_icon_options: Optional[List[Dict[str, Any]]] = None
+        # User-selected custom icons observed on incoming topic service messages.
+        # These are kept separately from auto-selection so a later title rename
+        # does not overwrite a manual choice.
+        self._manual_topic_icons: Dict[str, str] = {}
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -2604,10 +2608,10 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to load forum topic icon options", self.name, exc_info=True)
             return []
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> None:
-        """Rename a forum topic in a private (DM) chat."""
+    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> bool:
+        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it."""
         if not self._bot:
-            return
+            return False
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
@@ -2617,6 +2621,7 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         await self._bot.edit_forum_topic(**kwargs)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
+        return True
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int, replace_existing: bool = False) -> None:
         """Save a newly created thread_id back into config.yaml so it survives restarts."""
@@ -6726,6 +6731,17 @@ class TelegramAdapter(BasePlatformAdapter):
             self._dm_topics[cache_key] = int(thread_id)
             logger.info("[%s] Cached DM topic from message: %s -> thread_id=%s", self.name, cache_key, thread_id)
 
+    def _remember_manual_topic_icon(self, chat_id: str, thread_id: str, custom_emoji_id: Any) -> None:
+        if custom_emoji_id:
+            icons = getattr(self, "_manual_topic_icons", None)
+            if icons is None:
+                icons = self._manual_topic_icons = {}
+            icons[f"{chat_id}:{thread_id}"] = str(custom_emoji_id)
+
+    def get_manual_topic_icon(self, chat_id: str, thread_id: str) -> Optional[str]:
+        """Return a custom icon observed from a user topic event, if any."""
+        return getattr(self, "_manual_topic_icons", {}).get(f"{chat_id}:{thread_id}")
+
     @classmethod
     def _flatten_rich_inline_text(cls, value: Any) -> str:
         """Best-effort plaintext flattener for Bot API rich-message inline nodes."""
@@ -6820,6 +6836,16 @@ class TelegramAdapter(BasePlatformAdapter):
                         topic_skill = topic.get("skill")
                         break
                 break
+        # Telegram exposes the icon on topic service messages.  Remember it as
+        # manual ownership so automatic title renames do not replace a user's
+        # choice.  Support both creation and edited-topic update shapes used by
+        # different PTB/Bot API versions.
+        if thread_id_str and chat_type == "dm":
+            for event_name in ("forum_topic_created", "forum_topic_edited"):
+                topic_event = getattr(message, event_name, None)
+                custom_emoji_id = getattr(topic_event, "icon_custom_emoji_id", None) if topic_event else None
+                if custom_emoji_id:
+                    self._remember_manual_topic_icon(str(chat.id), thread_id_str, custom_emoji_id)
         return chat_topic, topic_skill
 
     def _reply_context(self, message: Message) -> tuple:
