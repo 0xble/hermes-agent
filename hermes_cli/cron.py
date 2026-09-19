@@ -218,6 +218,8 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
 def _job_warnings(job: Dict[str, Any]) -> List[str]:
     """Delivery / fire warning lines for one job in ``cron list``."""
     lines = []
+    if skipped_at := job.get("last_skipped_at"):
+        lines.append(f"⚠ Dispatch skipped: {skipped_at} ({job.get('last_skip_reason', 'unknown')})")
     if queued := job.get("last_delivery_queued"):
         lines.append(f"Delivery queued (completion unverified; do not resend): {queued}")
     if job.get("last_delivery_error"):
@@ -452,6 +454,13 @@ def _print_active_jobs_summary(jobs) -> None:
             print(f"    {j.get('id', '?')}  {j.get('name', '(unnamed)')}: "
                   f"scheduled {d.get('scheduled_at', '?')}, ran {d.get('dispatched_at', '?')} "
                   + color(f"({late_by} late)", Colors.YELLOW))
+    skipped = [j for j in jobs if j.get("last_skipped_at")]
+    if skipped:
+        print()
+        print(color(f"  ⚠ {len(skipped)} job(s) have a persisted dispatch skip:", Colors.YELLOW))
+        for j in skipped:
+            print(f"    {j.get('id', '?')}  {j.get('name', '(unnamed)')}: "
+                  f"{j.get('last_skipped_at')} ({j.get('last_skip_reason', 'unknown')})")
 
 
 def _scripts_dir_for_cron() -> Path:

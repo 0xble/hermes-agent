@@ -125,6 +125,22 @@ class TestStatusLateJobsCallout:
 
         assert "fired late" not in capsys.readouterr().out
 
+    def test_contention_skip_called_out(self, capsys):
+        jobs = [{
+            "id": "busy123",
+            "name": "busy job",
+            "next_run_at": "2026-09-02T09:00:00+00:00",
+            "last_skipped_at": "2026-09-01T09:00:00+00:00",
+            "last_skip_reason": "already_running",
+        }]
+
+        _print_active_jobs_summary(jobs)
+
+        out = capsys.readouterr().out
+        assert "persisted dispatch skip" in out
+        assert "busy123" in out
+        assert "already_running" in out
+
 
 class TestDisplayHelpers:
     def test_format_lateness(self):

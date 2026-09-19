@@ -2314,6 +2314,22 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+def note_dispatch_skip(job_id: str, reason: str = "already_running") -> bool:
+    """Persist why the latest scheduled dispatch was skipped before execution began.
+
+    A contention skip is intentionally not an execution: it must not create a ledger row or
+    advance run outcome fields. These two fields make the omission visible to ``cron list`` and
+    survive a restart while keeping the execution state machine unchanged.
+    """
+    def apply(jobs, _i, job):
+        job["last_skipped_at"] = _hermes_now().isoformat()
+        job["last_skip_reason"] = str(reason or "unknown")[:120]
+        save_jobs(jobs)
+        return True
+
+    return _with_job(job_id, apply, False)
+
+
 def _record_run_outcome(
     job: Dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,

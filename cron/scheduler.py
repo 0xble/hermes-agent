@@ -3683,6 +3683,13 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         return None
     if not try_register_running_job(job_id):
         logger.info("Job '%s' already running — skipping", job_label)
+        try:
+            from cron.jobs import note_dispatch_skip
+            note_dispatch_skip(job_id, "already_running")
+        except Exception as skip_err:
+            # Observability must never turn a truthful deduplication skip into a tick failure.
+            logger.warning(
+                "Could not persist dispatch skip for job '%s': %s", job_label, skip_err)
         return None
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     try:
