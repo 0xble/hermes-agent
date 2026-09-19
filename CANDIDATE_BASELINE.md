@@ -192,3 +192,10 @@ The wide-suite failure is `test_ensure_hermes_home_sets_0700`: this host exposes
 that upstream test expects owner-only permissions. The focused changed paths
 are green, and the candidate worktree is clean.
 ```
+
+The owned remote is `git@github.com:0xble/hermes-agent-next.git`. It was already
+present as a public fork of `NousResearch/hermes-agent`, so no duplicate fork
+was created. The candidate branch was pushed and read back at
+`437efe5d0a9baa552e462f87525ed15b30cc0e60`. In a disposable profile,
+`hermes update --plan` reported `Install: git (v0.21.3 @ 437efe5d)` and no
+running Hermes services.
