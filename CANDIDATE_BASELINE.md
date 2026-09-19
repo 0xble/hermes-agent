@@ -302,6 +302,10 @@ Focused bank and identity verification: `3 passed`. After installing the
 candidate's pinned optional `hindsight-client==0.6.1` dependency in the isolated
 worktree environment, the Hindsight provider and multiplex identity suites pass
 `91 passed, 1 skipped`. No production endpoint, bank, or credential was used.
+That figure reproduces only where the client is installed: the shared release venv on
+this host had it absent and showed 8 failures until `uv pip install
+hindsight-client==0.6.1` was run into it on 2026-09-19, after which the provider suite
+reports 88 passed.
 
 ## Post-review repairs, September 19
 
@@ -476,3 +480,43 @@ toolset.
 
 Not proven live: the Astra-to-Opus delegation fallback and the Fable-to-Opus review
 fallback (would need an induced outage), the goal judge, and every gateway path.
+
+## I6 integration review, September 19
+
+The first whole-candidate review ran to completion under the isolated gateway
+(api_server platform on 127.0.0.1:8643, session `api_1789790715_524eb508`,
+delegation `deleg_6f435556`), against the frozen head
+`f0d2799b42a284c7b50043c6b149bc22e2fc0d7b` with upstream tag
+`345cd2b057a452236de401d3534b8502a7465e8d` as base, 63 covered paths. The
+reviewer (`claude-fable-5-1`, no fallback) ran 18 minutes 34 seconds, executed
+the focused suites (428 passed) and a wider selection (2,212 passed, 4 failed),
+and returned `changes_requested` with seven findings. The receipt was written by
+the plugin's `subagent_stop` hook at
+`review_receipts/f0d2799b42a284c7b50043c6b149bc22e2fc0d7b.json` with the
+verdict parsed into data. It is the first receipt produced by the background
+review path, which replaced a synchronous version that had timed out at the
+420-second tool deadline on the first attempt.
+
+The reviewer independently reproduced the failure classification recorded above
+(two SSRF-DNS rows, one `/.dockerenv` chmod row) and corrected one of it: the
+persistence-test failure previously attributed to DNS is a genuine candidate
+regression from the vault cherry-pick (`_post` forwards `allow_redirects`; the
+upstream fixture's fake refuses it). Confirmed by running that file at the
+upstream tag (15 passed) and the frozen head (1 failed).
+
+Disposition of the seven findings, all landed on `candidate/followups` at
+`5a39c6b954f8`:
+
+| # | severity | finding | disposition |
+|---|---|---|---|
+| 1 | high | a timed-out or errored reviewer child (summary `None`) was recorded as reviewed and later callers reused it | fixed: child session id is recorded against the head at `subagent_start` and matched at stop, so a failed child writes `not_reviewed`; test added |
+| 2 | medium | `request_update` spawned the updater but never armed the gateway's completion watcher | fixed: armed in-process through the runner reference `pairing.py` already uses; test added |
+| 3 | medium | `_post` forwarding `allow_redirects` breaks an upstream test fixture | fixed: fixture accepts client kwargs; 29 passed |
+| 4 | low | `routed: False` test flaky under a gateway-launched shell | fixed: the test clears `HERMES_SESSION_*` |
+| 5 | low | README named the wrong receipt directory | fixed |
+| 6 | low | fallback reviewer hard-coded | fixed: reads `auxiliary.review.fallback_providers[0]`; the literals are the last resort; test added |
+| 7 | low | Hindsight test figure named no environment and did not reproduce | corrected above; client installed into the release venv |
+
+A second review against `5a39c6b954f8` is in flight as the gate for these
+fixes (delegation `deleg_f548a034`, 77 covered paths). A receipt on a
+superseded head is evidence of process, not approval of the code that ships.
