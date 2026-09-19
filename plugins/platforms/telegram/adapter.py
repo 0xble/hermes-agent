@@ -3488,7 +3488,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[Dict[str, Any]] = None,
-   ) -> SendResult:
+       ) -> SendResult:
         """Edit a previously sent Telegram message.
 
         Telegram caps a message at 4096 UTF-16 codeunits. Streaming replies that outgrow it must NOT be truncated
@@ -5143,10 +5143,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return _ph(f'*{_escape_mdv2(inner)}*')
 
         text = re.sub(r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE)
-        # 5) Bold **text** → *text*; 6) Italic *text* → _text_ ([^*\n]+ keeps matches on one line, or *
-        # bullet lists corrupt); 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
-        text = re.sub(r'\*\*(.+?)\*\*', _ph_wrap('*', '*'), text)
-        text = re.sub(r'\*([^*\n]+)\*', _ph_wrap('_', '_'), text)
+        # Resolve nested/multiline asterisk emphasis before the final escaping pass.
+        from plugins.platforms.telegram.emphasis import protect_asterisk_emphasis
+
+        # Header/fence placeholders must still interrupt paragraphs during emphasis
+        # parsing. Their replacements have the same line count as their keys.
+        block_source = text
+        for key, value in placeholders.items():
+            if value.startswith(('```', '*')):
+                block_source = block_source.replace(key, '# protected block')
+        text = protect_asterisk_emphasis(text, _ph, _escape_mdv2, block_source=block_source)
+        # 7) Strikethrough ~~text~~ → ~text~; 8) Spoiler ||text|| kept as-is.
         text = re.sub(r'~~(.+?)~~', _ph_wrap('~', '~'), text)
         text = re.sub(r'\|\|(.+?)\|\|', _ph_wrap('||', '||'), text)
         # 9) Blockquotes: protect leading > from escaping; expandable quotes (**> starts, trailing || ends).
