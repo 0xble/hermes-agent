@@ -1184,6 +1184,14 @@ def _copy_quick_snapshot_files(
                         print(f"  ⚠ Snapshot: {rel} looks ZEROED "
                               f"(no SQLite header; {src.stat().st_size} bytes{nuls})")
                     continue
+                integrity = verify_sqlite_integrity(dst, run_pragma=True)
+                if not integrity.get("valid"):
+                    failed_dbs.append(rel)
+                    logger.error("Quick snapshot integrity verification failed for %s: %s",
+                                 rel, integrity.get("message"))
+                    print(f"  ⚠ Snapshot: integrity verification FAILED for {rel} — copy discarded")
+                    dst.unlink(missing_ok=True)
+                    continue
             else:
                 shutil.copy2(src, dst)
             manifest[rel] = dst.stat().st_size
@@ -1331,6 +1339,11 @@ def restore_quick_snapshot(snapshot_id: str, hermes_home: Optional[Path] = None)
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             if dst.suffix == ".db":
+                integrity = verify_sqlite_integrity(src, run_pragma=True)
+                if not integrity.get("valid"):
+                    logger.error("Refusing restore of corrupted snapshot member %s: %s",
+                                 rel, integrity.get("message"))
+                    continue
                 # Through the backup API so live connections see the restored data instead of
                 # stale pages from a replaced inode (#65942).
                 if not _safe_restore_db(src, dst):

@@ -1421,6 +1421,22 @@ class TestQuickSnapshot:
             assert "state.db" not in data.get("files", {})
             assert "state.db" in data.get("failed_dbs", [])
 
+    def test_corrupt_snapshot_db_is_not_restored(self, hermes_home, caplog):
+        """A published snapshot with a damaged SQLite member is not treated as recoverable."""
+        from hermes_cli import backup as backup_mod
+        from hermes_cli.backup import create_quick_snapshot, restore_quick_snapshot
+
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        snap_db = hermes_home / "state-snapshots" / snap_id / "state.db"
+        snap_db.write_bytes(b"not sqlite")
+        live_db = hermes_home / "state.db"
+        before = live_db.read_bytes()
+
+        assert restore_quick_snapshot(snap_id, hermes_home=hermes_home) is True
+        assert live_db.read_bytes() == before
+        assert any("Refusing restore of corrupted snapshot member state.db" in record.message
+                   for record in caplog.records)
+
     def test_restore_refused_db_is_not_counted(self, hermes_home, monkeypatch):
         """A refused live-safe restore (holder detected, backup leg failed) must
         not be counted as a restored file — `hermes import` reports it, and
