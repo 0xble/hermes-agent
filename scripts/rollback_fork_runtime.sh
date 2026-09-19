@@ -61,11 +61,23 @@ reinstall() {
     "$venv/bin/python" -m pip install --quiet --no-deps -e "$checkout"
   fi
 }
-reinstall 2>&1 | tail -3; [[ ${PIPESTATUS[0]} -eq 0 ]] || {
+# Under set -e/pipefail a failing pipeline aborts the script before any recovery that follows it,
+# so the reinstall runs inside an explicit conditional and the restore is verified before exiting.
+if reinstall 2>&1 | tail -3; then
+  :
+else
   say "reinstall failed; restoring $current"
-  git -C "$checkout" checkout --quiet --detach "$current"
+  git -C "$checkout" checkout --quiet --detach "$current" || say "warning: could not switch the checkout back"
+  restored="$(git -C "$checkout" rev-parse HEAD)"
+  [[ "$restored" == "$current" ]] || { say "restore FAILED: checkout is at ${restored:0:12}, expected ${current:0:12}"; exit 2; }
+  if reinstall 2>&1 | tail -3; then
+    say "restored $current and reinstalled it"
+  else
+    say "restore FAILED: checkout is back at ${current:0:12} but its reinstall also failed; the venv may not match"
+    exit 2
+  fi
   exit 1
-}
+fi
 installed="$("$venv/bin/python" -c 'import hermes_cli, os; print(os.path.dirname(os.path.dirname(hermes_cli.__file__)))')"
 [[ "$installed" == "$(cd "$checkout" && pwd -P)" || "$installed" == "$checkout" ]] || say "warning: installed package resolves to $installed, not $checkout"
 say "rolled back to $(git -C "$checkout" rev-parse --short=12 HEAD); recovery ref $recovery_ref"

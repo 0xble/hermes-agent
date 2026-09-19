@@ -226,32 +226,49 @@ _CHILD_HEADS: dict[str, str] = {}  # child_session_id -> head12, from subagent_s
 
 
 def _on_subagent_start(child_session_id: Any = None, child_goal: Any = None, **_: Any) -> None:
-    """Remember which child is reviewing which candidate, keyed by the runtime's own session id.
+    """Bind the dispatched reviewer to its candidate, keyed by the runtime's own child session id.
 
     The stop payload carries no goal, and a child that timed out or errored has no summary at all,
-    so text matching at stop time cannot identify a FAILED reviewer. Recording the link at start
-    is what lets a failed review be written as not_reviewed instead of leaving its marker pending.
+    so nothing at stop time can identify the reviewer except this binding. It is recorded both in
+    memory and on the pending marker, so a gateway restart between start and stop still leaves the
+    marker naming exactly one child that may complete it.
     """
     match = _REVIEW_GOAL.match(str(child_goal or "").strip())
-    if match and child_session_id:
-        _CHILD_HEADS[str(child_session_id)] = match.group(1)
+    if not match or not child_session_id:
+        return
+    head12 = match.group(1)
+    _CHILD_HEADS[str(child_session_id)] = head12
+    try:
+        from hermes_constants import get_hermes_home
+        for marker in (get_hermes_home() / "review_receipts").glob(f"{head12}*.pending.json"):
+            try:
+                pending = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not pending.get("child_session_id"):
+                pending["child_session_id"] = str(child_session_id)
+                _write_json(marker, pending)
+    except Exception:
+        return
 
 
 def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child_session_id: Any = None,
                       parent_session_id: Any = None, **_: Any) -> None:
     """Turn a finished reviewer child into a durable receipt.
 
-    Matched by the child's session id recorded at start; the summary text is a fallback for a
-    runtime that did not fire subagent_start. Fires for every child stop, so it must be cheap and
-    must ignore every child that is not a review it dispatched.
+    Only the child bound at ``subagent_start`` (by session id, in memory or on the marker) may
+    complete a pending review. There is deliberately no fallback on summary text: any child whose
+    output merely mentions the candidate's SHA must not be able to write a ``reviewed`` receipt.
+    Fires for every child stop, so it must be cheap and must ignore every unrelated child.
     """
     try:
         from hermes_constants import get_hermes_home
         pending_dir = get_hermes_home() / "review_receipts"
-        if not pending_dir.is_dir():
+        if not pending_dir.is_dir() or not child_session_id:
             return
+        child = str(child_session_id)
         summary = str(child_summary or "")
-        head12 = _CHILD_HEADS.pop(str(child_session_id), "") if child_session_id else ""
+        head12 = _CHILD_HEADS.pop(child, "")
         for marker in pending_dir.glob("*.pending.json"):
             try:
                 pending = json.loads(marker.read_text(encoding="utf-8"))
@@ -260,8 +277,8 @@ def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child
             head = pending.get("head_sha", "")
             if not head:
                 continue
-            matched = (head12 and head.startswith(head12)) or (not head12 and summary and head[:12] in summary)
-            if not matched:
+            bound = str(pending.get("child_session_id") or "")
+            if not ((head12 and head.startswith(head12)) or (bound and bound == child)):
                 continue
             status = str(child_status or "")
             if status not in ("completed", "success", "ok") or not summary:

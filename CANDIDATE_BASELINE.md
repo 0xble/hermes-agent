@@ -618,11 +618,12 @@ reviewed head, with the two prior heads preserved under `refs/archive/`.
 | gateway identity | pid 20382, `~/.hermes/hermes-agent/venv`, launchd `runs = 1`, never exited |
 | Telegram connect | polling healthy, 60 commands registered |
 | Telegram outbound | `hermes send` delivered message 109040 to the home DM through the candidate's credential path |
-| Telegram inbound round trip | one-shot job `e295e103c0bc` fired on the candidate scheduler at 01:34; the Codex route rate-limited, the turn completed at 01:45 on the configured fallback (`claude-opus-5` via the proxy), `last_status: ok`, delivered to the home DM. The fallback chain proved itself live. |
+| Telegram inbound round trip | **not exercised at cutover.** What ran was a scheduled cron turn on the candidate scheduler (job `e295e103c0bc`, 01:34, completed 01:45 on the fallback route) with outbound Telegram delivery; no message was received through the Telegram poller and handled. Inbound handling is proven only by connect state and by later organic traffic (checked by `verify-hermes-next-cutover-24h`). Earlier wording called this an inbound round trip; it was not. |
 | cron continuity | 94 job ids identical; the candidate completed three scheduled jobs within five minutes, including the one the legacy drain interrupted |
 | memory | add, undo, journal intact; nothing left in MEMORY.md; Hindsight retention indicator active on bank `brianle` |
 | skills | 106 canonical skills resolve from the dotfiles install |
 | Camofox | `brianle` binds; a switch to `meridian` in the same task is refused |
+| Camofox vault fill | **not tested** at cutover |
 | self-update | `hermes update --plan` reports the candidate at `024e077c` and the external-supervised gateway |
 | feature check | OK, 0 problems |
 
@@ -702,3 +703,28 @@ build, so the host is still serving the runtime from the `187fc858` release.
 The model-turn and round-trip rows are gated by the company Codex accounts, not by the runtime.
 `verify-hermes-next-cutover-24h` (2026-09-20 02:40 EDT) and `verify-hermes-next-company-turns` (2026-09-22
 06:10 EDT, after the LPG window resets) re-run these rows and report to Telegram.
+
+### Ledger correction (2026-09-19, after an independent read-only review)
+
+An independent review of `517e6561` found four code defects and one overstatement; all five were
+valid and are fixed at this head:
+
+1. `scripts/rollback_fork_runtime.sh`: under `set -euo pipefail` the failing reinstall pipeline aborted
+   the script before its recovery block, leaving the checkout switched. The reinstall now runs inside a
+   conditional and the restore is verified (and reinstalled) before exiting.
+2. `review-candidate`: the stop hook accepted any child whose summary mentioned the candidate SHA. It now
+   completes a review only for the child bound at `subagent_start` (in memory or on the pending marker);
+   a stranger quoting the SHA is ignored (`test_unrelated_child_quoting_the_sha_cannot_approve`).
+3. `scripts/check_fork_patches.py`: `check_receipt` read `sha`/`code_sha`/`head` keys that native
+   receipts never carry, so partial updates and stale fleets passed. It now requires the native
+   structure, `outcome == success`, `post_update.sha == HEAD`, and no stale fleet rows.
+4. `scripts/curate_skill_observations.py`: `gh pr create` failures were reported as `published` and the
+   observations were retired. A run is now published only when the PR exists; on failure it returns
+   `publish_failed`, keeps the observations, and a rerun recovers the pushed branch by opening the PR.
+5. This ledger overstated the personal cutover: the "inbound Telegram round trip" row was a cron turn,
+   vault fill was never tested, company model turns and round trips were quota-blocked, and slice 18
+   retirement ran before the one-day windows elapsed (under explicit authorization, which is not the
+   same as acceptance). The rows above are corrected; the runtime gaps remain tracked by the scheduled
+   checkpoints (`verify-hermes-next-cutover-24h`, `verify-hermes-next-company-turns`). Recovery artifacts
+   (legacy bundle, per-worktree patches, cutover capture, `hermes-agent.legacy`, the legacy config and
+   jobs copies) are preserved.

@@ -114,6 +114,13 @@ def check_config(home: Path) -> list[str]:
 
 
 def check_receipt(home: Path) -> list[str]:
+    """Compare the last native ``hermes update`` receipt with the checkout and the running fleet.
+
+    Native receipts (``hermes_cli.update_receipt``) carry ``outcome``, ``pre_update``/``post_update``
+    code identities (``sha``, ``short_sha``, ``version``, ``source``), ``steps``, and a ``fleet`` list
+    whose rows record each running profile's ``code_sha`` and a ``state`` of current/stale/unknown.
+    A receipt with none of those is not a native receipt and is reported, not ignored.
+    """
     latest = home / "logs" / "update_receipts" / "latest.json"
     if not latest.is_file():
         return []  # no promotion has happened through hermes update yet; nothing to compare
@@ -121,11 +128,28 @@ def check_receipt(home: Path) -> list[str]:
         receipt = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return [f"update receipt unreadable: {exc}"]
-    recorded = str(receipt.get("sha") or receipt.get("code_sha") or receipt.get("head") or "")
+    if not isinstance(receipt, dict) or not {"outcome", "post_update"} <= set(receipt):
+        return ["update receipt is not a native hermes update receipt (missing outcome/post_update)"]
+    failures: list[str] = []
+    outcome = str(receipt.get("outcome") or "")
+    if outcome != "success":
+        failed = [str(step.get("name")) for step in receipt.get("steps") or [] if isinstance(step, dict) and not step.get("ok", True)]
+        failures.append(f"last update outcome is {outcome or 'missing'!r}" + (f"; failed steps: {', '.join(failed)}" if failed else ""))
+    post = receipt.get("post_update") if isinstance(receipt.get("post_update"), dict) else {}
+    recorded = str(post.get("sha") or "")
     head = _git("rev-parse", "HEAD")
-    if recorded and not head.startswith(recorded) and not recorded.startswith(head[:12]):
-        return [f"update receipt records {recorded[:12]} but the checkout is at {head[:12]}"]
-    return []
+    if not recorded:
+        failures.append("update receipt records no post_update sha")
+    elif recorded != head:
+        failures.append(f"update receipt records post_update {recorded[:12]} but the checkout is at {head[:12]}")
+    for row in receipt.get("fleet") or []:
+        if not isinstance(row, dict):
+            continue
+        state = str(row.get("state") or "unknown")
+        sha = str(row.get("code_sha") or "")
+        if state == "stale" or (sha and sha != head):
+            failures.append(f"running profile {row.get('profile', '?')!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}")
+    return failures
 
 
 def main(argv: list[str] | None = None) -> int:

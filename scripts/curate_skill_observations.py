@@ -138,7 +138,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.publish:
         existing = _git(dotfiles, "ls-remote", "--heads", "origin", branch).stdout.strip()
         if existing:
-            result.update(status="already_published", remote=existing.split()[0])
+            # A previous run pushed this branch. It is only published once a PR exists for it;
+            # otherwise recover by opening the PR now, then retire the observations exactly as a
+            # first-time publication would.
+            pr_url = _existing_pr(dotfiles, branch) or _create_pr(dotfiles, branch, args.base, sorted(accepted), "")
+            result.update(remote=existing.split()[0], pr=pr_url or "")
+            if not pr_url:
+                result["status"] = "publish_failed"
+                return finish(1)
+            _retire_observations(args.observations, processed_dir / today, accepted)
+            result["status"] = "already_published"
             return finish(0)
         _git(dotfiles, "checkout", "-q", "-b", branch, args.base)
     staged = [str(stage(dotfiles, skill, blocks, today).relative_to(dotfiles)) for skill, blocks in accepted.items()]
@@ -165,17 +174,43 @@ def main(argv: list[str] | None = None) -> int:
                f"processed history, staged into MAINTENANCE.md for reviewed incorporation. Digest {digest}.\n")
     _git(dotfiles, "-c", "user.name=Brian Le", "-c", "user.email=brian@brianle.xyz", "commit", "-q", "-m", message)
     _git(dotfiles, "push", "-q", "-u", "origin", branch)
-    pr = subprocess.run(["gh", "pr", "create", "--base", args.base, "--head", branch, "--title",
-                         f"skills: curate observations ({skills})", "--body", message],
-                        cwd=str(dotfiles), capture_output=True, text=True, env={**os.environ, "GH_REPO": ""})
-    result["pr"] = pr.stdout.strip() or pr.stderr.strip()[-300:]
-    stamp = processed_dir / today
-    stamp.mkdir(parents=True, exist_ok=True)
-    for skill in accepted:
-        shutil.move(str(args.observations / f"{skill}.md"), str(stamp / f"{skill}.md"))
+    pr_url = _create_pr(dotfiles, branch, args.base, sorted(accepted), message)
+    result["pr"] = pr_url or ""
     _git(dotfiles, "checkout", "-q", args.base)
+    if not pr_url:
+        # The branch is pushed but nobody was asked to review it. Leave the observations in place
+        # so the next run finds the remote branch and opens the PR instead of reporting success.
+        result["status"] = "publish_failed"
+        return finish(1)
+    _retire_observations(args.observations, processed_dir / today, accepted)
     result["status"] = "published"
     return finish(0)
+
+
+def _existing_pr(dotfiles: Path, branch: str) -> str:
+    run = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url"],
+                         cwd=str(dotfiles), capture_output=True, text=True, env={**os.environ, "GH_REPO": ""})
+    return run.stdout.strip() if run.returncode == 0 else ""
+
+
+def _create_pr(dotfiles: Path, branch: str, base: str, skills: list[str], body: str) -> str:
+    """Open the review request and return its URL only when gh reports success."""
+    run = subprocess.run(["gh", "pr", "create", "--base", base, "--head", branch, "--title",
+                          f"skills: curate observations ({', '.join(skills)})", "--body",
+                          body or f"Staged skill observations for reviewed incorporation ({', '.join(skills)})."],
+                         cwd=str(dotfiles), capture_output=True, text=True, env={**os.environ, "GH_REPO": ""})
+    if run.returncode != 0:
+        return ""
+    url = run.stdout.strip().splitlines()[-1].strip() if run.stdout.strip() else ""
+    return url if url.startswith("https://") else ""
+
+
+def _retire_observations(observations: Path, stamp: Path, accepted: dict[str, list[str]]) -> None:
+    stamp.mkdir(parents=True, exist_ok=True)
+    for skill in accepted:
+        source = observations / f"{skill}.md"
+        if source.is_file():
+            shutil.move(str(source), str(stamp / f"{skill}.md"))
 
 
 if __name__ == "__main__":

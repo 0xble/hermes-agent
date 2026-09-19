@@ -107,6 +107,7 @@ def test_dispatch_returns_pending_and_hook_writes_the_receipt(plugin, tmp_path, 
     assert again["status"] == "pending" and again["reused"] is True
     assert len(attempts) == 1
 
+    plugin._on_subagent_start(child_session_id="child-1", child_goal=f"Review candidate {head[:12]}")
     plugin._on_subagent_stop(child_summary=_reviewer_message(head), child_status="completed",
                              child_session_id="child-1", parent_session_id="parent-1")
     receipt = json.loads(plugin._receipt_path(head).read_text())
@@ -127,16 +128,36 @@ def test_stop_hook_ignores_unrelated_children(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
     _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
     plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
-    plugin._on_subagent_stop(child_summary="I refactored the widget and all tests pass.", child_status="completed")
+    plugin._on_subagent_stop(child_summary="I refactored the widget and all tests pass.", child_status="completed",
+                             child_session_id="other-1")
     assert plugin._pending_path(head).exists()
     assert not plugin._receipt_path(head).exists()
+
+
+def test_unrelated_child_quoting_the_sha_cannot_approve(plugin, tmp_path, monkeypatch):
+    """Identity, not summary text, completes a review: a stranger naming the SHA is ignored."""
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_stop(child_summary=_reviewer_message(head, "approve"), child_status="completed",
+                             child_session_id="stranger-1")
+    assert plugin._pending_path(head).exists()
+    assert not plugin._receipt_path(head).exists()
+    # The bound reviewer still completes it, even after a restart cleared the in-memory table.
+    plugin._on_subagent_start(child_session_id="child-1", child_goal=f"Review candidate {head[:12]}")
+    plugin._CHILD_HEADS.clear()
+    plugin._on_subagent_stop(child_summary=_reviewer_message(head, "approve"), child_status="completed",
+                             child_session_id="child-1")
+    assert json.loads(plugin._receipt_path(head).read_text())["status"] == "reviewed"
 
 
 def test_reviewer_that_ended_badly_is_recorded_as_not_reviewed(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
     _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
     plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
-    plugin._on_subagent_stop(child_summary=f"Reviewing {head[:12]} ... interrupted", child_status="stalled")
+    plugin._on_subagent_start(child_session_id="child-1", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(child_summary=f"Reviewing {head[:12]} ... interrupted", child_status="stalled",
+                             child_session_id="child-1")
     receipt = json.loads(plugin._receipt_path(head).read_text())
     assert receipt["status"] == "not_reviewed"
     assert receipt["error_code"] == "review_incomplete"
@@ -155,7 +176,9 @@ def test_availability_failure_falls_back_once_and_records_the_reason(plugin, tmp
     assert result["reviewer_model"] == "claude-opus-5"
     assert "429" in result["fallback_reason"]
     assert [a["credentials"].get("model") for a in attempts] == ["claude-fable-5-1", "claude-opus-5"]
-    plugin._on_subagent_stop(child_summary=_reviewer_message(head, "approve"), child_status="completed")
+    plugin._on_subagent_start(child_session_id="child-1", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(child_summary=_reviewer_message(head, "approve"), child_status="completed",
+                             child_session_id="child-1")
     receipt = json.loads(plugin._receipt_path(head).read_text())
     assert receipt["reviewer_model"] == "claude-opus-5" and "429" in receipt["fallback_reason"]
 
@@ -200,7 +223,9 @@ def test_unparsable_reviewer_output_is_marked_unparsed(plugin, tmp_path, monkeyp
     base, head = _repo(tmp_path)
     _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
     plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
-    plugin._on_subagent_stop(child_summary=f"Reviewed {head[:12]}: looks fine to me", child_status="completed")
+    plugin._on_subagent_start(child_session_id="child-1", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(child_summary=f"Reviewed {head[:12]}: looks fine to me", child_status="completed",
+                             child_session_id="child-1")
     receipt = json.loads(plugin._receipt_path(head).read_text())
     assert receipt["result"]["verdict"] == "unparsed"
     assert "looks fine" in receipt["result"]["summary"]
