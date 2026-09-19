@@ -48,16 +48,29 @@ _TOPIC_TABLES = (
         "telegram_dm_topic_bindings",
         "profile_name, chat_id, thread_id, user_id, session_key, session_id, managed_mode, linked_at, updated_at",
         """
-                    profile_name TEXT NOT NULL DEFAULT 'default',
-                    chat_id TEXT NOT NULL,
-                    thread_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    session_key TEXT NOT NULL,
+                    profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL, user_id TEXT NOT NULL, session_key TEXT NOT NULL,
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    managed_mode TEXT NOT NULL DEFAULT 'auto',
-                    linked_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
+                    managed_mode TEXT NOT NULL DEFAULT 'auto', linked_at REAL NOT NULL, updated_at REAL NOT NULL,
                     PRIMARY KEY (profile_name, chat_id, thread_id)
+                """,
+    ),
+    (
+        "telegram_topic_icon_state",
+        "profile_name, chat_id, thread_id, custom_emoji_id, emoji, owner, updated_at",
+        """
+                    profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL, custom_emoji_id TEXT, emoji TEXT,
+                    owner TEXT NOT NULL CHECK(owner IN ('auto','manual')), updated_at REAL NOT NULL,
+                    PRIMARY KEY (profile_name, chat_id, thread_id)
+                """,
+    ),
+    (
+        "telegram_topic_icon_history",
+        "profile_name, chat_id, emoji, custom_emoji_id, selected_at",
+        """
+                    profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL, custom_emoji_id TEXT, selected_at REAL NOT NULL
                 """,
     ),
 )
@@ -357,3 +370,36 @@ class SessionTelegramTopicsMixin:
                     _UNLINKED_SELECT_HEAD + _UNLINKED_SELECT_TAIL, (str(user_id), int(limit)),
                 ).fetchall()
         return [self._rich_row(row) for row in rows]
+
+    def get_telegram_topic_icon_state(self, chat_id: str, thread_id: str, profile_name: str = "default") -> Optional[Dict[str, Any]]:
+        row = self._topic_read_one(
+            "SELECT custom_emoji_id, emoji, owner, updated_at FROM telegram_topic_icon_state WHERE profile_name=? AND chat_id=? AND thread_id=?",
+            (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(thread_id)),
+        )
+        return dict(row) if row else None
+
+    def record_telegram_topic_icon_state(self, chat_id: str, thread_id: str, *, custom_emoji_id=None, emoji=None, owner="auto", profile_name="default") -> None:
+        if owner not in {"auto", "manual"}:
+            raise ValueError("owner must be auto or manual")
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
+        now = time.time()
+        self.apply_telegram_topic_migration()
+        self._write_sql("""
+            INSERT INTO telegram_topic_icon_state(profile_name,chat_id,thread_id,custom_emoji_id,emoji,owner,updated_at)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_name,chat_id,thread_id) DO UPDATE SET
+            custom_emoji_id=excluded.custom_emoji_id, emoji=excluded.emoji, owner=excluded.owner, updated_at=excluded.updated_at
+        """, (profile_name, str(chat_id), str(thread_id), custom_emoji_id, emoji, owner, now))
+
+    def record_telegram_topic_icon_history(self, chat_id: str, *, emoji: str, custom_emoji_id=None, profile_name="default") -> None:
+        self.apply_telegram_topic_migration()
+        self._write_sql("INSERT INTO telegram_topic_icon_history(profile_name,chat_id,emoji,custom_emoji_id,selected_at) VALUES(?,?,?,?,?)",
+                        (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(emoji), custom_emoji_id, time.time()))
+
+    def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = 24, profile_name: str = "default") -> List[str]:
+        try:
+            with self._read_ctx() as conn:
+                rows = conn.execute("SELECT emoji FROM telegram_topic_icon_history WHERE profile_name=? AND chat_id=? ORDER BY selected_at DESC LIMIT ?",
+                                    (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), max(1, int(limit)))).fetchall()
+            return [row[0] for row in rows if row[0]]
+        except sqlite3.OperationalError:
+            return []

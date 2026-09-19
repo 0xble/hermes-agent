@@ -528,17 +528,42 @@ class GatewayTopicThreadsMixin:
         if adapter is None:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
+        icon_custom_emoji_id = None
+        icon_emoji = None
+        extra = getattr(getattr(getattr(self, "config", None), "platforms", {}).get(source.platform), "extra", {}) or {}
+        if is_truthy_value(extra.get("auto_topic_icons")):
+            try:
+                options = await adapter.get_forum_topic_icon_options()
+                recent = await asyncio.to_thread(session_db.list_recent_telegram_topic_icons, str(source.chat_id), 24) if session_db else []
+                from agent.topic_icons import choose_topic_icon_deterministic, resolve_override
+                icon_emoji = resolve_override(topic_name, extra.get("topic_icon_overrides"), options) or choose_topic_icon_deterministic(topic_name, "", options, recent)
+                selected = next((item for item in options if item.get("emoji") == icon_emoji), None)
+                icon_custom_emoji_id = selected.get("custom_emoji_id") if selected else None
+                state = await asyncio.to_thread(session_db.get_telegram_topic_icon_state, str(source.chat_id), str(source.thread_id), self._telegram_topic_profile_name(source)) if session_db else None
+                if state and state.get("owner") == "manual" and extra.get("preserve_manual_topic_icons", True):
+                    icon_custom_emoji_id = None
+                if session_db and icon_custom_emoji_id:
+                    await asyncio.to_thread(session_db.record_telegram_topic_icon_state, str(source.chat_id), str(source.thread_id), custom_emoji_id=icon_custom_emoji_id, emoji=icon_emoji, owner="auto", profile_name=self._telegram_topic_profile_name(source))
+                    await asyncio.to_thread(session_db.record_telegram_topic_icon_history, str(source.chat_id), emoji=icon_emoji, custom_emoji_id=icon_custom_emoji_id, profile_name=self._telegram_topic_profile_name(source))
+            except Exception:
+                logger.debug("Failed to select Telegram topic icon", exc_info=True)
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
-                await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name)
+                kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": topic_name}
+                if icon_custom_emoji_id:
+                    kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+                await rename_topic(**kwargs)
                 return
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
             if edit_forum_topic is None:
                 return
+            kwargs = {"chat_id": int(source.chat_id), "message_thread_id": int(source.thread_id), "name": topic_name}
+            if icon_custom_emoji_id:
+                kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
             try:
-                await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
+                await edit_forum_topic(**kwargs)
             except (TypeError, ValueError):
                 await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
         except Exception:

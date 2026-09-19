@@ -622,6 +622,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_online_text: str = str(extra.get("status_online", "Online"))
         self._status_offline_text: str = str(extra.get("status_offline", "Offline"))
         self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
+        self._forum_topic_icon_options: Optional[List[Dict[str, Any]]] = None
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -2583,7 +2584,27 @@ class TelegramAdapter(BasePlatformAdapter):
         self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str) -> None:
+    async def get_forum_topic_icon_options(self) -> List[Dict[str, Any]]:
+        """Return Bot API custom emoji options, cached for this adapter lifetime."""
+        if self._forum_topic_icon_options is not None:
+            return list(self._forum_topic_icon_options)
+        if not self._bot or not callable(getattr(self._bot, "get_forum_topic_icon_stickers", None)):
+            return []
+        try:
+            stickers = await self._bot.get_forum_topic_icon_stickers()
+            options = []
+            for sticker in stickers or []:
+                emoji = getattr(sticker, "emoji", None)
+                custom_id = getattr(sticker, "custom_emoji_id", None)
+                if emoji and custom_id:
+                    options.append({"emoji": str(emoji), "custom_emoji_id": str(custom_id)})
+            self._forum_topic_icon_options = options
+            return list(options)
+        except Exception:
+            logger.debug("[%s] Failed to load forum topic icon options", self.name, exc_info=True)
+            return []
+
+    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> None:
         """Rename a forum topic in a private (DM) chat."""
         if not self._bot:
             return
@@ -2591,7 +2612,10 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        await self._bot.edit_forum_topic(chat_id=chat_id_arg, message_thread_id=int(thread_id), name=name)
+        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id), "name": name}
+        if icon_custom_emoji_id:
+            kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+        await self._bot.edit_forum_topic(**kwargs)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int, replace_existing: bool = False) -> None:
