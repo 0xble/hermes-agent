@@ -215,3 +215,25 @@ media URL tests remain environment-sensitive because this host resolves the
 fixture `example.com` address into `198.18.x.x`, which Hermes SSRF protection
 correctly blocks; the failures are the fixture's blocked-URL path, not a live
 Telegram or delivery failure.
+
+## Slice 8: named Camofox account routing
+
+The upstream design preflight read the current upstream `AGENTS.md` and
+`CONTRIBUTING.md`, which require extending the existing browser boundary and
+searching prior art. Upstream PR #77904 and issue #77273 propose model-supplied
+per-call raw `user_id` on every Camofox tool. The candidate takes the narrower
+plan-approved session-entry route: `browser_navigate` accepts only the
+operator-facing aliases `brianle`, `lpg`, and `meridian`, binds the alias for
+the task, and refuses a later switch. `personal` is deliberately not an alias.
+
+Each alias derives a stable profile-scoped Camofox identity from the existing
+state helper. Raw `userId` values stay internal. Named-account cleanup drops
+Hermes' local task handle and never deletes the Camofox session, preserving
+cookies and sibling tabs. The account field is dynamically advertised only
+when Camofox is selected, so other browser backends retain their schema.
+
+Focused verification: `48 passed` across named-account, Camofox persistence,
+Camofox backend, state, and extension-router tests. The broader browser suite
+passed `770` tests with the existing environment-sensitive failures recorded
+separately; one compatibility issue found during that run was fixed by keeping
+the pre-alias call shape when no account is supplied.

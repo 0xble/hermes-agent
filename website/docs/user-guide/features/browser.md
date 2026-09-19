@@ -391,6 +391,27 @@ If step 5 logs you out, the Camofox server isn't honoring the stable `userId`. D
 
 Hermes derives the stable `userId` from the profile-scoped directory `~/.hermes/browser_auth/camofox/` (or the equivalent under `$HERMES_HOME` for non-default profiles). The actual browser profile data lives on the Camofox server side, keyed by that `userId`. To fully reset a persistent profile, clear it on the Camofox server and remove the corresponding Hermes profile's state directory.
 
+#### Named Camofox accounts
+
+The candidate build supports three operator-facing account aliases on
+`browser_navigate`: `brianle`, `lpg`, and `meridian`.
+
+```text
+browser_navigate(url="https://example.com", account="lpg")
+```
+
+The selected alias is bound to the task on its first navigation. A task cannot
+switch aliases after its browser tab exists, and the `personal` alias is not
+accepted. Each alias maps to a separate stable, profile-scoped Camofox identity;
+the underlying `userId` is never exposed to the model. Ending a named-account
+task drops Hermes' local handle and does not delete the Camofox profile, so its
+cookies remain available to a later task using the same alias.
+
+Account selection is advertised only when Camofox is the active browser backend.
+The aliases are intentionally separate from vault credentials. A vault item can
+be matched to the selected account by its operator-facing label or identifier,
+but browser identity and credential identity remain distinct.
+
 #### Externally managed Camofox sessions
 
 When another app drives the visible Camofox browser (a desktop assistant, a custom integration, another agent), configure Hermes to operate inside that same identity instead of spawning its own isolated profile.

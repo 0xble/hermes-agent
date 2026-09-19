@@ -26,7 +26,11 @@ import requests
 from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from hermes_constants import get_hermes_home_override, hermes_home_key
-from tools.browser_camofox_state import get_camofox_identity
+from tools.browser_camofox_state import (
+    CAMOFOX_ACCOUNT_ALIASES,
+    get_camofox_account_identity,
+    get_camofox_identity,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -258,16 +262,42 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     return session
 
 
-def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
+def _resolve_account(account: Optional[str]) -> Optional[str]:
+    """Validate the model-facing account alias without exposing Camofox IDs."""
+    if account is None:
+        return None
+    alias = str(account).strip().lower()
+    if alias not in CAMOFOX_ACCOUNT_ALIASES:
+        raise ValueError(
+            f"Unknown Camofox account {account!r}; choose one of: {', '.join(CAMOFOX_ACCOUNT_ALIASES)}"
+        )
+    return alias
+
+
+def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[str, Any]:
     """Get or create the task's session. Identity precedence: external override
     (CAMOFOX_USER_ID / config) → profile-scoped identity when managed persistence
     is on → random ephemeral userId."""
     task_id = task_id or "default"
+    account = _resolve_account(account)
     with _sessions_lock:
         if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
+            session = _sessions[task_id]
+            bound_account = session.get("account")
+            if account is not None and bound_account != account:
+                if session.get("tab_id") or bound_account is not None:
+                    raise ValueError(
+                        f"Camofox account is already bound to {bound_account or 'the default identity'} "
+                        f"for this task; cannot switch to {account!r}. Start a new task instead."
+                    )
+                # A read-only preflight may have created an empty local session. Bind it now.
+                _sessions.pop(task_id, None)
+            else:
+                return _adopt_existing_tab(session)
         camofox_cfg = _get_camofox_config()
-        identity = _camofox_identity_override(task_id, camofox_cfg)
+        identity = get_camofox_account_identity(account, task_id) if account is not None else None
+        if identity is None:
+            identity = _camofox_identity_override(task_id, camofox_cfg)
         if identity is None and _managed_persistence_enabled(camofox_cfg):
             identity = get_camofox_identity(task_id)
         if identity is None:
@@ -276,14 +306,14 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
         else:
             managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
         session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
-                   "managed": managed, "adopt_existing_tab": adopt}
+                   "managed": managed, "adopt_existing_tab": adopt, "account": account}
         _sessions[task_id] = session
         return _adopt_existing_tab(session)
 
 
-def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
+def _ensure_tab(task_id: Optional[str], url: str = "about:blank", account: Optional[str] = None) -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
-    session = _get_session(task_id)
+    session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if not session["tab_id"]:
         data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
         session["tab_id"] = data.get("tabId")
@@ -377,11 +407,11 @@ def _fetch_snapshot(session: Dict[str, Any]) -> tuple[str, int]:
     return snapshot, data.get("refsCount", 0)
 
 
-def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, Any], dict]:
+def _navigate_tab(task_id: Optional[str], browser_url: str, account: Optional[str] = None) -> tuple[Dict[str, Any], dict]:
     """Open ``browser_url`` in the task's tab (creating it if missing) and return
     ``(session, navigate_response)``. A 404 on the existing tab means the server
     garbage-collected it — recreate instead of failing."""
-    session = _get_session(task_id)
+    session = _get_session(task_id, account) if account is not None else _get_session(task_id)
     if session["tab_id"]:
         try:
             data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
@@ -392,15 +422,18 @@ def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[Dict[str, A
             logger.warning("Camofox tab %s returned 404 — tab was garbage collected. Creating a fresh tab.",
                            session["tab_id"])
             session["tab_id"] = None
-    return _ensure_tab(task_id, browser_url), {"ok": True, "url": browser_url}
+    session = _ensure_tab(task_id, browser_url) if account is None else _ensure_tab(task_id, browser_url, account)
+    return session, {"ok": True, "url": browser_url}
 
 
-def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
+def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
-        session, data = _navigate_tab(task_id, browser_url)
+        session, data = _navigate_tab(task_id, browser_url, account)
         result = {"success": True, "url": data.get("url", browser_url), "title": data.get("title", "")}
+        if session.get("account") is not None:
+            result["account"] = session["account"]
         if rewrite_info:
             result["requested_url"], result["url_rewrite"] = url, rewrite_info
             result["warning"] = ("Rewrote loopback URL for Docker-hosted Camofox: "
@@ -528,7 +561,9 @@ def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
     try:
         session = _drop_session(task_id)
-        if session:
+        # Named and managed identities own a persistent Camofox profile. Drop
+        # only Hermes' local task handle so sibling tabs and cookies survive.
+        if session and not session.get("managed"):
             _delete(f"/sessions/{session['user_id']}")
         return json.dumps({"success": True, "closed": True})
     except Exception as e:

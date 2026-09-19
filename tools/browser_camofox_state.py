@@ -27,6 +27,26 @@ def get_camofox_identity(task_id: Optional[str] = None) -> Dict[str, str]:
     return {"user_id": f"hermes_{user_digest}", "session_key": f"task_{session_digest}"}
 
 
+CAMOFOX_ACCOUNT_ALIASES = ("brianle", "lpg", "meridian")
+
+
+def get_camofox_account_identity(account: str, task_id: Optional[str] = None) -> Dict[str, str]:
+    """Return a stable identity for one named operator account.
+
+    The alias is part of the profile-scoped derivation, so sibling accounts never
+    share a Camofox userId while tasks using the same account reuse its browser
+    profile. Raw Camofox IDs stay inside the client and are never model-facing.
+    """
+    if account not in CAMOFOX_ACCOUNT_ALIASES:
+        raise ValueError(f"Unknown Camofox account {account!r}; choose one of: {', '.join(CAMOFOX_ACCOUNT_ALIASES)}")
+    scope_root = str(get_camofox_state_dir())
+    user_digest = uuid.uuid5(uuid.NAMESPACE_URL, f"camofox-account:{scope_root}:{account}").hex[:10]
+    session_digest = uuid.uuid5(
+        uuid.NAMESPACE_URL, f"camofox-account-session:{scope_root}:{account}:{task_id or 'default'}"
+    ).hex[:16]
+    return {"user_id": f"hermes_{user_digest}", "session_key": f"{account}_{session_digest}"}
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).

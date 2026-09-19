@@ -702,7 +702,7 @@ def _attach_auto_snapshot(response: Dict[str, Any], nav_session_key: str) -> Non
         logger.debug("Auto-snapshot after navigate failed: %s", e)
 
 
-def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
+def browser_navigate(url: str, task_id: Optional[str] = None, account: Optional[str] = None) -> str:
     """Navigate to ``url``; JSON with title, compact snapshot and, on first nav, stealth features.
     Hybrid routing decides BEFORE the safety checks whether this URL goes to a local sidecar
     (the cloud provider never sees it then, so the private-address checks are relaxed)."""
@@ -719,7 +719,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         return json.dumps(safety_error)
 
     if _is_camofox_mode():
-        return _camofox("camofox_navigate", url, task_id)
+        return _camofox("camofox_navigate", url, task_id, account)
 
     if auto_local_this_nav:
         logger.info("browser_navigate: auto-routing %s to local Chromium sidecar (cloud provider %s stays on "
@@ -1259,6 +1259,24 @@ from tools.browser_extension_router import extension_controller_available, route
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 
+def _camofox_account_schema_override() -> Dict[str, Any]:
+    """Advertise account selection only when Camofox is the active backend."""
+    if not _is_camofox_mode():
+        return {}
+    params = dict(_BROWSER_SCHEMA_MAP["browser_navigate"]["parameters"])
+    properties = dict(params.get("properties", {}))
+    properties["account"] = {
+        "type": "string",
+        "enum": ["brianle", "lpg", "meridian"],
+        "description": (
+            "Optional Camofox account alias. The alias is bound to this task on first navigation "
+            "and cannot be changed within the task."
+        ),
+    }
+    params["properties"] = properties
+    return {"parameters": params}
+
+
 def check_browser_routed_requirements(action: str = "browser_snapshot") -> bool:
     """Availability gate for tools that can use either browser backend."""
     return _install.check_browser_requirements() or extension_controller_available(action)
@@ -1269,6 +1287,11 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
     the function is looked up in module globals at call time so monkeypatching works."""
     def call(args, kw):
         params = {a: args.get(a, d) for a, d in arg_defaults.items()}
+        # Keep the legacy call shape when the optional Camofox-only account is
+        # absent. This also preserves compatibility with extension/test handlers
+        # that implement the pre-alias browser_navigate signature.
+        if fn_name == "browser_navigate" and params.get("account") is None:
+            params.pop("account", None)
         params["task_id"] = kw.get("task_id")
         for k in extra_kw:
             params[k] = kw.get(k)
@@ -1280,7 +1303,7 @@ def _fallback_call(fn_name: str, arg_defaults: Dict[str, Any], extra_kw: tuple =
 # function is the module global of the same name. Routed-through-extension tools (gate None)
 # use the per-action gate; get_images/console/vision keep the plain requirement checks.
 _BROWSER_TOOL_TABLE = (
-    ("browser_navigate", "🌐", None, {"url": ""}),
+    ("browser_navigate", "🌐", None, {"url": "", "account": None}),
     ("browser_snapshot", "📸", None, {"full": False}, ("user_task",)),
     ("browser_click", "👆", None, {"ref": ""}),
     ("browser_type", "⌨️", None, {"ref": "", "text": ""}),
@@ -1313,7 +1336,10 @@ for _name, _emoji, _check_fn, _defaults, *_extra in _BROWSER_TOOL_TABLE:
         _check_fn = globals()[f"check_{_name}_requirements"] = _routed_check_fn(_name)
     registry.register(name=_name, toolset="browser", schema=_BROWSER_SCHEMA_MAP[_name],
                       handler=_routed_handler(_name, _fallback_call(_name, _defaults, *_extra)),
-                      check_fn=_check_fn, emoji=_emoji)
+                      check_fn=_check_fn, emoji=_emoji,
+                      dynamic_schema_overrides=(
+                          _camofox_account_schema_override if _name == "browser_navigate" else None
+                      ))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
