@@ -40,12 +40,12 @@ def choose_topic_icon_deterministic(
         "🐛": {"bug", "error", "fix", "debug", "issue", "test"}, "💻": {"code", "coding", "software", "app"},
         "📊": {"data", "metric", "report", "analytics", "chart"}, "💡": {"idea", "plan", "design"},
         "🔒": {"auth", "security", "password", "login"}, "📚": {"learn", "study", "research", "docs"},
-        "🚀": {"deploy", "release", "launch", "ship"}, "✈️": {"travel", "flight", "trip"},
+        "🚀": {"deploy", "release", "launch", "ship"}, "✈": {"travel", "flight", "trip"},
         "🛒": {"buy", "shopping", "order", "product"}, "💰": {"money", "finance", "budget", "tax"},
     }
     scored = []
     for index, emoji in enumerate(candidates):
-        hints = _tokens(emoji) | semantic_hints.get(emoji, set())
+        hints = _tokens(emoji) | semantic_hints.get(normalize_emoji(emoji), set())
         score = len(signal & hints)
         scored.append((score, -index, emoji))
     if any(score for score, _, _ in scored):
@@ -65,7 +65,7 @@ def resolve_override(title: str, overrides: Mapping[str, Any] | None, allowed: l
     lowered = str(title or "").casefold()
     matches = []
     for key, value in overrides.items():
-        if str(key).casefold() in lowered:
+        if str(key).strip() and str(key).casefold() in lowered:
             candidate = allowed_map.get(normalize_emoji(value))
             if candidate:
                 matches.append((len(str(key)), candidate))

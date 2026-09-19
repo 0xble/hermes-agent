@@ -76,3 +76,23 @@ async def test_forum_topic_edited_records_manual_icon_for_private_chat():
     )
     await TelegramAdapter._handle_forum_topic_service_message(adapter, SimpleNamespace(message=message, edited_message=None), None)
     assert TelegramAdapter.get_manual_topic_icon(adapter, "42", "7") == "manual-id"
+
+
+@pytest.mark.anyio
+async def test_bots_own_topic_edit_echo_is_not_recorded_as_manual():
+    from types import SimpleNamespace
+
+    adapter = object.__new__(TelegramAdapter)
+    adapter._manual_topic_icons = {}
+    adapter._auto_topic_icons_written = {}
+    adapter._bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
+    adapter.platform = type("P", (), {"value": "telegram"})()
+    await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage", icon_custom_emoji_id="auto-id")
+    echo = SimpleNamespace(chat=SimpleNamespace(id=42, type="private"), message_thread_id=7,
+                           forum_topic_edited=SimpleNamespace(icon_custom_emoji_id="auto-id"), forum_topic_created=None)
+    await TelegramAdapter._handle_forum_topic_service_message(adapter, SimpleNamespace(message=echo, edited_message=None), None)
+    assert TelegramAdapter.get_manual_topic_icon(adapter, "42", "7") is None
+    user_pick = SimpleNamespace(chat=SimpleNamespace(id=42, type="private"), message_thread_id=7,
+                                forum_topic_edited=SimpleNamespace(icon_custom_emoji_id="user-id"), forum_topic_created=None)
+    await TelegramAdapter._handle_forum_topic_service_message(adapter, SimpleNamespace(message=user_pick, edited_message=None), None)
+    assert TelegramAdapter.get_manual_topic_icon(adapter, "42", "7") == "user-id"

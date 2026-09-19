@@ -35,10 +35,8 @@ MAX_TITLE_INPUT_CHARS = 1000
 # Cap on the instant derived title; a raw fragment reads worse the longer it runs.
 MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
-# Upper bound on accepted title word count. Titling is a 3-7 word task; a small tiny-model sometimes ignores
-# the task and answers the user's message instead — that answer must never become the session title (see the
-# answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
-# legitimate wordy titles while excluding full-sentence answers.
+# The ceiling is the configured ``max_words`` plus headroom (see generate_title; port of can1357/oh-my-pi#7306).
+_TITLE_WORD_SLACK = 5
 
 # The example titles shown to the model in the prompt, and the echo-guard
 # set: when the opening message carries little topical signal, a small model
@@ -434,7 +432,7 @@ def generate_title(
         title = _restore_name_aliases(title, prefs["name_aliases"])
         # Answer-shaped output guard: titling is a short noun-phrase task. Respect the
         # configured ceiling (already bounded by _title_preferences()).
-        max_title_words = prefs["max_words"]
+        max_title_words = prefs["max_words"] + _TITLE_WORD_SLACK
         if len(title.split()) > max_title_words:
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
             return None

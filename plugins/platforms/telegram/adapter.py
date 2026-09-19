@@ -627,6 +627,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # These are kept separately from auto-selection so a later title rename
         # does not overwrite a manual choice.
         self._manual_topic_icons: Dict[str, str] = {}
+        # Icons Hermes itself last wrote per topic, so the bot's own edit_forum_topic echoing
+        # back as a forum_topic_edited service message is not mistaken for a user choice.
+        self._auto_topic_icons_written: Dict[str, str] = {}
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -2620,6 +2623,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if icon_custom_emoji_id:
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
         await self._bot.edit_forum_topic(**kwargs)
+        if icon_custom_emoji_id:
+            written = getattr(self, "_auto_topic_icons_written", None)
+            if written is None:
+                written = self._auto_topic_icons_written = {}
+            written[f"{chat_id}:{int(thread_id)}"] = str(icon_custom_emoji_id)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
         return True
 
@@ -6761,9 +6769,13 @@ class TelegramAdapter(BasePlatformAdapter):
             for event_name in ("forum_topic_edited", "forum_topic_created"):
                 topic_event = getattr(message, event_name, None)
                 custom_emoji_id = getattr(topic_event, "icon_custom_emoji_id", None) if topic_event else None
-                if custom_emoji_id:
-                    self._remember_manual_topic_icon(str(chat.id), str(thread_id), custom_emoji_id)
-                    return
+                if not custom_emoji_id:
+                    continue
+                key = f"{chat.id}:{thread_id}"
+                if getattr(self, "_auto_topic_icons_written", {}).get(key) == str(custom_emoji_id):
+                    return  # our own edit echoed back; not a user choice
+                self._remember_manual_topic_icon(str(chat.id), str(thread_id), custom_emoji_id)
+                return
         except Exception:
             logger.debug("[%s] forum topic service message ignored", self.name, exc_info=True)
 
@@ -6865,16 +6877,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         topic_skill = topic.get("skill")
                         break
                 break
-        # Telegram exposes the icon on topic service messages.  Remember it as
-        # manual ownership so automatic title renames do not replace a user's
-        # choice.  Support both creation and edited-topic update shapes used by
-        # different PTB/Bot API versions.
-        if thread_id_str and chat_type == "dm":
-            for event_name in ("forum_topic_created", "forum_topic_edited"):
-                topic_event = getattr(message, event_name, None)
-                custom_emoji_id = getattr(topic_event, "icon_custom_emoji_id", None) if topic_event else None
-                if custom_emoji_id:
-                    self._remember_manual_topic_icon(str(chat.id), thread_id_str, custom_emoji_id)
         return chat_topic, topic_skill
 
     def _reply_context(self, message: Message) -> tuple:
