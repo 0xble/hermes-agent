@@ -3744,8 +3744,9 @@ class BasePlatformAdapter(ABC):
         resolve_quick_alias = getattr(self.gateway_runner, "_quick_command_alias_text", None)
         if callable(resolve_quick_alias):
             alias_text = resolve_quick_alias(event, profile_name=getattr(self, "_owner_profile", None))
-            if isinstance(alias_text, str) and alias_text:
-                cmd = alias_text.lstrip("/").split(maxsplit=1)[0]
+            alias_parts = alias_text.lstrip("/").split(maxsplit=1) if isinstance(alias_text, str) else []
+            if alias_parts:
+                cmd = alias_parts[0]
                 is_quick_alias = True
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
         # An alias targeting /stop, /new or /reset stays on ordinary busy semantics: the handoff

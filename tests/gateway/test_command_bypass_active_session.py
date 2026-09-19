@@ -337,6 +337,29 @@ class TestCommandBypassActiveSession:
         assert adapter.sent_responses == []
 
     @pytest.mark.asyncio
+    async def test_quick_alias_with_slash_only_target_is_ignored_while_busy(self):
+        """A misconfigured alias must not crash the busy-path guard."""
+        from gateway.run import GatewayRunner
+
+        adapter = _make_adapter()
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = {
+            "quick_commands": {
+                "bad": {"type": "alias", "target": "/"},
+                "empty": {"type": "alias", "target": ""},
+            },
+        }
+        adapter.gateway_runner = runner
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/bad"))
+        await adapter.handle_message(_make_event("/empty"))
+
+        assert adapter.sent_responses == []
+        assert "/empty" in adapter._pending_messages[sk].text
+
+    @pytest.mark.asyncio
     async def test_help_bypasses_guard(self):
         """/help must bypass so it is not silently dropped as pending slash text."""
         adapter = _make_adapter()

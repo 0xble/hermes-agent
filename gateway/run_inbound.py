@@ -668,6 +668,19 @@ class GatewayInboundMixin:
         qc = (cfg.get("quick_commands") if isinstance(cfg, dict) else getattr(cfg, "quick_commands", None)) or {}
         return qc if isinstance(qc, dict) else {}
 
+    @staticmethod
+    def _normalize_alias_target(qcmd: object) -> Optional[str]:
+        """``/name`` for an alias quick command with a usable target, else ``None``.
+
+        Rejects a bare or slash-only target: a name-less expansion would crash the busy-path
+        guard's ``split()[0]`` and can never resolve to a command anyway."""
+        if not isinstance(qcmd, dict) or qcmd.get("type") != "alias":
+            return None
+        target = str(qcmd.get("target") or "").strip()
+        if not target.lstrip("/").strip():
+            return None
+        return target if target.startswith("/") else f"/{target}"
+
     def _quick_command_alias_text(
         self, event: "MessageEvent", profile_name: Optional[str] = None,
     ) -> Optional[str]:
@@ -677,8 +690,9 @@ class GatewayInboundMixin:
         Built-in dispatch resolves ``resolve_command`` names only, so an alias like ``s`` → ``/steer``
         is invisible to every busy-path guard and gets queued as user text. Both the adapter's
         Level-1 guard and ``_handle_message`` call this BEFORE the running-session split so aliases
-        behave identically idle and mid-run. Routed profiles resolve against their own snapshot
-        (``_snapshot_profile_busy_modes``) and never inherit the primary's aliases."""
+        behave identically idle and mid-run. A routed profile resolves against its own snapshot
+        (``_snapshot_profile_busy_modes``), so it never inherits the primary's aliases; the primary
+        config is consulted only when no snapshot exists for that profile name."""
         get_command = getattr(event, "get_command", None)
         if not callable(get_command):
             return None
@@ -700,28 +714,22 @@ class GatewayInboundMixin:
             quick_commands = self._hm_quick_commands()
         if not isinstance(quick_commands, dict):
             return None
-        qcmd = quick_commands.get(command)
-        if not isinstance(qcmd, dict) or qcmd.get("type") != "alias":
+        target = self._normalize_alias_target(quick_commands.get(command))
+        if target is None:
             return None
-        target = str(qcmd.get("target") or "").strip()
-        if not target:
-            return None
-        target = target if target.startswith("/") else f"/{target}"
         get_command_args = getattr(event, "get_command_args", None)
         raw_args = get_command_args() if callable(get_command_args) else ""
         user_args = raw_args.strip() if isinstance(raw_args, str) else ""
         return f"{target} {user_args}".strip()
 
-    @staticmethod
-    def _hm_expand_alias_quick_command(event: "MessageEvent", qcmd: dict) -> Optional[str]:
+    @classmethod
+    def _hm_expand_alias_quick_command(cls, event: "MessageEvent", qcmd: dict) -> Optional[str]:
         """Rewrite ``event.text`` to an alias quick command's target; returns the new command name."""
-        target = (qcmd.get("target") or "").strip()
-        if not target:
+        target = cls._normalize_alias_target(qcmd)
+        if target is None:
             return None
-        target = target if target.startswith("/") else f"/{target}"
         event.text = f"{target} {event.get_command_args().strip()}".strip()
-        target_command = target.lstrip("/")
-        return target_command.split()[0] if target_command else target_command
+        return target.lstrip("/").split()[0]
 
     async def _hm_command_hooks(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str, canonical: str
