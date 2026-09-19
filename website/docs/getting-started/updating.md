@@ -45,7 +45,7 @@ When you run `hermes update`, the following steps occur:
 
 ### Why the gateway restart can take a while
 
-The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default) so a long-running job is never cut off mid-run. While that wait is in progress the updater prints, every 30 seconds, what the gateway is still holding for — for example:
+The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default). Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...
@@ -55,7 +55,7 @@ The restart is drain-first: the running gateway refuses new turns, then waits fo
      finish or kill the work above to release the drain now; agent.restart_after_turn_timeout in config.yaml caps this wait
 ```
 
-Chat turns show their session key, model and current tool; cron jobs show the job id, name and the process running them (an external restart-safe worker on systemd installs, otherwise the gateway itself). `hermes gateway status` lists the same units while the gateway is draining. To stop waiting, finish or kill the listed work, or lower `agent.restart_after_turn_timeout` in `config.yaml` (`0` enters the forced drain immediately).
+Chat turns show their session key, model and current tool; cron jobs show the job id, name and the process running them (an external restart-safe worker on systemd installs, otherwise the gateway itself). `hermes gateway status` lists the same units while the gateway is draining. To stop waiting, finish or kill the listed work, or lower `agent.restart_after_turn_timeout` in `config.yaml` (`0` skips waiting for non-delegation work). Once neither kind has work within its own budget, the forced drain starts immediately and interrupts any remaining work.
 
 ### Missing Windows updater files
 

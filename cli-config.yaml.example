@@ -1231,6 +1231,9 @@ gateway:
   # Adapter, bridge, and database teardown starts after this many seconds even
   # if an agent has not unwound. Keep it below the service-manager stop budget.
   # signal_interrupt_grace_timeout: 1
+  # In-band restart wait cap for live background delegation units. Default 900 seconds;
+  # set to 0 to enter stop() immediately without waiting for delegations.
+  # restart_delegation_timeout: 900
 
   # Let platform adapters honor HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and
   # SSL_CERT_FILE) from the process environment, plus macOS system-proxy

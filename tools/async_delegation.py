@@ -451,6 +451,16 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
 
 
+def active_records() -> List[Dict[str, Any]]:
+    """Snapshot live async delegation records for shutdown and observability consumers."""
+    with _records_lock:
+        return [
+            {"delegation_id": r.get("delegation_id"), "status": r.get("status"), "dispatched_at": r.get("dispatched_at")}
+            for r in _records.values()
+            if r.get("status") in _LIVE_STATES
+        ]
+
+
 def active_task_count() -> int:
     """Number of running child subagents (a batch of N contributes N; a batch with
     no goal list counts 1) — the truthful observability figure, unlike slots."""

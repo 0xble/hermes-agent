@@ -1932,6 +1932,8 @@ DEFAULT_CONFIG = {
         # Seconds to let a SIGTERM-interrupted gateway agent unwind before adapter/database
         # teardown. Keep short so service-manager shutdowns don't exhaust their stop budget.
         "signal_interrupt_grace_timeout": 1,
+        # In-band restart wait cap for live background delegation units. 0 = do not wait for delegations.
+        "restart_delegation_timeout": 900,
         # Durable delivery-obligation ledger: final responses are recorded in state.db around the
         # platform send; a gateway that died between finalize and platform ACK redelivers on next
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;

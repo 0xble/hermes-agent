@@ -25,6 +25,7 @@ DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT = 5.0
 # In-band restart waits for active turns to finish *before* ``stop()`` begins; distinct from
 # ``restart_drain_timeout``, the force-interrupt budget once ``stop()`` runs (short under TimeoutStopSec).
 DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT = float(DEFAULT_CONFIG["agent"]["restart_after_turn_timeout"])
+DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT = float(DEFAULT_CONFIG["gateway"]["restart_delegation_timeout"])
 
 # Cron-only floor under the ``stop()`` drain. ``restart_drain_timeout`` defaults to 0 because
 # interrupting a *chat* turn is cheap and recoverable (user told, session resume_pending); an
@@ -103,6 +104,11 @@ def parse_restart_after_turn_timeout(raw: object) -> float:
     return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT)
 
 
+def parse_restart_delegation_timeout(raw: object) -> float:
+    """Parse the live-delegation restart wait cap (``0`` = do not wait for delegations)."""
+    return _parse_timeout_keeping_zero(raw, DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT)
+
+
 def parse_cron_drain_timeout(raw: object) -> float:
     """Parse the cron-only drain floor (``0`` = opt out; cron interrupted on the chat budget).
 
@@ -152,7 +158,21 @@ def resolve_systemd_timeout_stop_sec(
     return int(max(_seconds(floor_s), max(drain, cron_budget) + _seconds(headroom_s)))
 
 
-def resolve_restart_exit_wait_budget(drain_timeout: float, after_turn_timeout: float, *, headroom: float = 15.0) -> float:
-    """Seconds a CLI should wait for the gateway PID to exit after SIGUSR1: in-band restart may
-    defer ``stop()`` until turns finish, then spend ``drain_timeout`` inside it — cover both."""
-    return _seconds(drain_timeout) + _seconds(after_turn_timeout) + _seconds(headroom)
+def resolve_restart_exit_wait_budget(
+    drain_timeout: float,
+    after_turn_timeout: float,
+    *,
+    delegation_timeout: float = 0.0,
+    headroom: float = 15.0,
+) -> float:
+    """Seconds a CLI should wait for the gateway PID to exit after SIGUSR1.
+
+    In-band restart may defer ``stop()`` until turns or delegations finish, then spend
+    ``drain_timeout`` inside it. The turn and delegation waits run concurrently, so cover
+    the longer one plus the drain and headroom.
+    """
+    return (
+        _seconds(drain_timeout)
+        + max(_seconds(after_turn_timeout), _seconds(delegation_timeout))
+        + _seconds(headroom)
+    )

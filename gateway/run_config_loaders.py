@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from gateway.config import Platform
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT,
-    DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
+    DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT, DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT,
+    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT, parse_cron_drain_timeout,
-    parse_restart_after_turn_timeout, parse_restart_drain_timeout,
+    parse_restart_after_turn_timeout, parse_restart_delegation_timeout, parse_restart_drain_timeout,
     parse_signal_interrupt_grace_timeout,
 )
 from gateway.session import SessionSource
@@ -352,6 +353,19 @@ class GatewayConfigLoadersMixin:
             "HERMES_RESTART_AFTER_TURN_TIMEOUT", "restart_after_turn_timeout",
             parse_restart_after_turn_timeout, DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
         )
+
+    @classmethod
+    def _load_restart_delegation_timeout(cls) -> float:
+        """Live background-delegation wait cap for in-band restart in seconds."""
+        from gateway.run import _load_gateway_config
+        env_raw = os.getenv("HERMES_RESTART_DELEGATION_TIMEOUT")
+        raw = env_raw if env_raw is not None and str(env_raw).strip() != "" else cfg_get(
+            _load_gateway_config(), "gateway", "restart_delegation_timeout", default=None,
+        )
+        value = parse_restart_delegation_timeout(raw)
+        if raw is not None and str(raw).strip() != "":
+            cls._warn_unparsable_timeout("gateway.restart_delegation_timeout", raw, DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT)
+        return value
 
     @classmethod
     def _load_cron_drain_timeout(cls) -> float:
