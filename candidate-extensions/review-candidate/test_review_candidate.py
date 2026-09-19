@@ -38,25 +38,35 @@ def plugin(tmp_path, monkeypatch):
     return load_plugin()
 
 
-def _stub_review(plugin, monkeypatch, outcomes):
-    """Feed successive delegate results; record the credentials each attempt used."""
+def _stub_dispatch(plugin, monkeypatch, outcomes):
+    """Feed successive dispatch handles; record the credentials each attempt used."""
     attempts = []
 
     def fake(context, head, parent, credentials):
-        attempts.append(dict(credentials or {}))
+        attempts.append({"credentials": dict(credentials or {}), "context": context})
         return outcomes[len(attempts) - 1]
 
-    monkeypatch.setattr(plugin, "_spawn_review", fake)
-    monkeypatch.setattr(plugin, "_load_credentials_for_test", lambda: {"model": "claude-fable-5.1"}, raising=False)
+    monkeypatch.setattr(plugin, "_dispatch_review", fake)
     import sys
     from types import ModuleType
     engine = ModuleType("agent.review_engine")
-    engine._load_review_credentials_cfg = lambda: {"provider": "anthropic", "model": "claude-fable-5.1"}
+    engine._load_review_credentials_cfg = lambda: {"provider": "anthropic", "model": "claude-fable-5-1"}
     lifecycle = ModuleType("agent.subagent_lifecycle")
     lifecycle.get_active_subagent_parent = lambda: object()
     monkeypatch.setitem(sys.modules, "agent.review_engine", engine)
     monkeypatch.setitem(sys.modules, "agent.subagent_lifecycle", lifecycle)
     return attempts
+
+
+DISPATCHED = {"status": "dispatched", "delegation_id": "deleg_test1"}
+
+
+def _reviewer_message(head: str, verdict: str = "changes_requested") -> str:
+    return ("Static review only.\n\n```json\n"
+            + json.dumps({"head_sha": head, "verdict": verdict,
+                          "findings": [{"severity": "high", "path": "file.txt", "line": 1, "message": "bad"}],
+                          "summary": "broken"})
+            + "\n```\n")
 
 
 def test_invalid_candidate_is_not_reviewed(plugin, tmp_path):
@@ -78,63 +88,120 @@ def test_same_commit_is_rejected(plugin, tmp_path):
     assert result["error_code"] == "empty_candidate"
 
 
-def test_review_writes_receipt_per_head_and_is_reused(plugin, tmp_path, monkeypatch):
+def test_dispatch_returns_pending_and_hook_writes_the_receipt(plugin, tmp_path, monkeypatch):
+    """The tool never blocks on the reviewer: it returns a handle and the stop hook finalizes."""
     base, head = _repo(tmp_path)
-    attempts = _stub_review(plugin, monkeypatch, [{"results": {"verdict": "approve"}, "review_model": "claude-fable-5.1"}])
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
     first = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert first["status"] == "reviewed"
-    assert first["reviewer_model"] == "claude-fable-5.1"
-    assert first["fallback_reason"] == ""
+    assert first["status"] == "pending"
+    assert first["delegation_id"] == "deleg_test1"
     assert first["covers"] == ["file.txt"]
-    assert plugin._receipt_path(head).name == f"{head}.json"
-    assert plugin._receipt_path(head).exists()
-    # Second call for the same candidate reuses coverage without spawning another child.
-    second = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert second["reused"] is True
+    assert plugin._pending_path(head).exists()
+    assert not plugin._receipt_path(head).exists()
+    assert "call review_candidate" in attempts[0]["context"] and "head_sha" in attempts[0]["context"]
+
+    # A second request for the same in-flight candidate does not dispatch again.
+    again = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert again["status"] == "pending" and again["reused"] is True
     assert len(attempts) == 1
+
+    plugin._on_subagent_stop(child_summary=_reviewer_message(head), child_status="completed",
+                             child_session_id="child-1", parent_session_id="parent-1")
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["status"] == "reviewed"
+    assert receipt["reviewer_model"] == "claude-fable-5-1"
+    assert receipt["fallback_reason"] == ""
+    assert receipt["result"]["verdict"] == "changes_requested"
+    assert receipt["result"]["findings"][0]["path"] == "file.txt"
+    assert not plugin._pending_path(head).exists()
+
+    # Once reviewed, the receipt is reused without a new dispatch.
+    third = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert third["reused"] is True and third["status"] == "reviewed"
+    assert len(attempts) == 1
+
+
+def test_stop_hook_ignores_unrelated_children(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_stop(child_summary="I refactored the widget and all tests pass.", child_status="completed")
+    assert plugin._pending_path(head).exists()
+    assert not plugin._receipt_path(head).exists()
+
+
+def test_reviewer_that_ended_badly_is_recorded_as_not_reviewed(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_stop(child_summary=f"Reviewing {head[:12]} ... interrupted", child_status="stalled")
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["status"] == "not_reviewed"
+    assert receipt["error_code"] == "review_incomplete"
+    assert not plugin._pending_path(head).exists()
+    # A not_reviewed receipt is not reusable as approval: the next call dispatches again.
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["status"] == "pending" and len(attempts) == 1
 
 
 def test_availability_failure_falls_back_once_and_records_the_reason(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
-    attempts = _stub_review(plugin, monkeypatch, [
-        {"error": "provider returned 429 rate_limit"},
-        {"results": {"verdict": "approve"}},
-    ])
+    attempts = _stub_dispatch(plugin, monkeypatch, [{"error": "provider returned 429 rate_limit"}, DISPATCHED])
     result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert result["status"] == "reviewed"
+    assert result["status"] == "pending"
     assert result["reviewer_model"] == "claude-opus-5"
     assert "429" in result["fallback_reason"]
-    assert [a.get("model") for a in attempts] == ["claude-fable-5.1", "claude-opus-5"]
+    assert [a["credentials"].get("model") for a in attempts] == ["claude-fable-5-1", "claude-opus-5"]
+    plugin._on_subagent_stop(child_summary=_reviewer_message(head, "approve"), child_status="completed")
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["reviewer_model"] == "claude-opus-5" and "429" in receipt["fallback_reason"]
 
 
-def test_started_reviewer_that_times_out_is_never_retried_on_the_fallback(plugin, tmp_path, monkeypatch):
-    """A child that began reviewing and then timed out is 'not reviewed', not re-run elsewhere."""
+def test_non_availability_dispatch_error_is_not_retried_on_the_fallback(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
-    attempts = _stub_review(plugin, monkeypatch, [{"error": "child timed out after 1200s"}])
+    attempts = _stub_dispatch(plugin, monkeypatch, [{"error": "delegation spawning is paused by the operator"}])
     result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert result["status"] == "not_reviewed"
-    assert result["error_code"] == "review_incomplete"
+    assert result["status"] == "not_reviewed" and result["error_code"] == "review_incomplete"
     assert len(attempts) == 1
-    assert not plugin._receipt_path(head).exists()
+    assert not plugin._pending_path(head).exists()
 
 
 def test_both_routes_unavailable_is_not_approval(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
-    _stub_review(plugin, monkeypatch, [{"error": "401 unauthorized"}, {"error": "503 unavailable"}])
+    _stub_dispatch(plugin, monkeypatch, [{"error": "401 unauthorized"}, {"error": "503 unavailable"}])
     result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert result["success"] is False
-    assert result["status"] == "not_reviewed"
+    assert result["success"] is False and result["status"] == "not_reviewed"
     assert result["error_code"] == "review_unavailable"
-    assert not plugin._receipt_path(head).exists()
+    assert not plugin._receipt_path(head).exists() and not plugin._pending_path(head).exists()
 
 
 def test_oversized_candidate_is_refused_not_truncated(plugin, tmp_path, monkeypatch):
     base, head = _repo(tmp_path)
     monkeypatch.setattr(plugin, "_MAX_DIFF_BYTES", 10)
-    attempts = _stub_review(plugin, monkeypatch, [{"results": {}}])
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
     result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
     assert result["error_code"] == "diff_too_large"
     assert attempts == []
+
+
+def test_inline_result_is_finalized_immediately(plugin, tmp_path, monkeypatch):
+    """A runtime that ran the child inline (depth>0) returns results, not a handle."""
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [{"results": [{"status": "completed", "summary": _reviewer_message(head, "approve")}]}])
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["status"] == "reviewed" and result["result"]["verdict"] == "approve"
+    assert plugin._receipt_path(head).exists() and not plugin._pending_path(head).exists()
+
+
+def test_unparsable_reviewer_output_is_marked_unparsed(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_stop(child_summary=f"Reviewed {head[:12]}: looks fine to me", child_status="completed")
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["result"]["verdict"] == "unparsed"
+    assert "looks fine" in receipt["result"]["summary"]
 
 
 def test_availability_classifier_separates_the_two_failure_classes(plugin):
@@ -142,44 +209,3 @@ def test_availability_classifier_separates_the_two_failure_classes(plugin):
         assert plugin._is_availability_failure(availability) is True
     for ran_and_failed in ("child timed out", "status unknown", "interrupted by user", "assertion failed in tests"):
         assert plugin._is_availability_failure(ran_and_failed) is False
-
-
-def test_receipt_carries_the_verdict_as_data_not_prose(plugin, tmp_path, monkeypatch):
-    """The child's fenced JSON is lifted into result.verdict; the raw child blob is kept beside it."""
-    base, head = _repo(tmp_path)
-    prose = ("No terminal here, static review only.\n\n```json\n"
-             '{"verdict": "changes_requested", "findings": [{"severity": "high", "path": "file.txt", '
-             '"line": 1, "message": "bad"}], "summary": "broken"}\n```\n- Blocker: none.')
-    _stub_review(plugin, monkeypatch, [{"results": [{"status": "completed", "summary": prose, "model": "claude-fable-5-1"}]}])
-    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert result["status"] == "reviewed"
-    assert result["result"]["verdict"] == "changes_requested"
-    assert result["result"]["findings"][0]["path"] == "file.txt"
-    assert result["raw_child_result"][0]["summary"] == prose
-
-
-def test_unparsable_reviewer_output_is_marked_unparsed(plugin, tmp_path, monkeypatch):
-    base, head = _repo(tmp_path)
-    _stub_review(plugin, monkeypatch, [{"results": [{"status": "completed", "summary": "looks fine to me"}]}])
-    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
-    assert result["result"]["verdict"] == "unparsed"
-    assert "looks fine" in result["result"]["summary"]
-
-
-def test_reviewer_brief_forbids_recursive_review_calls(plugin, tmp_path, monkeypatch):
-    base, head = _repo(tmp_path)
-    seen = {}
-
-    def fake(context, head_, parent, credentials):
-        seen["context"] = context
-        return {"results": [{"summary": '```json\n{"verdict": "approve"}\n```'}]}
-
-    monkeypatch.setattr(plugin, "_spawn_review", fake)
-    import sys
-    from types import ModuleType
-    engine = ModuleType("agent.review_engine"); engine._load_review_credentials_cfg = lambda: {"model": "m"}
-    lifecycle = ModuleType("agent.subagent_lifecycle"); lifecycle.get_active_subagent_parent = lambda: object()
-    monkeypatch.setitem(sys.modules, "agent.review_engine", engine)
-    monkeypatch.setitem(sys.modules, "agent.subagent_lifecycle", lifecycle)
-    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
-    assert "call review_candidate" in seen["context"] and "parent-only" in seen["context"]

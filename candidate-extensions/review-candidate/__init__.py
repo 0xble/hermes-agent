@@ -116,22 +116,104 @@ def _structured_verdict(result: dict[str, Any]) -> dict[str, Any]:
     return {"verdict": "unparsed", "findings": [], "summary": text[:2000]}
 
 
-def _spawn_review(context: str, head: str, parent: Any, credentials: dict[str, Any] | None) -> dict[str, Any]:
-    """Run one synchronous review child and return its parsed result.
+def _pending_path(head_sha: str) -> Path:
+    """Durable marker for a review in flight: written before dispatch, consumed by the receipt writer."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "review_receipts" / f"{head_sha}.pending.json"
 
-    ``background=False`` is deliberate and is the DIRECT Python-caller contract: the model-facing
-    registry path forces background for top-level delegations, but this tool must have the child's
-    findings in-band to write a receipt at all.
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
+        json.dump(payload, tmp, sort_keys=True, indent=2)
+        tmp.write("\n")
+        tmp_path = Path(tmp.name)
+    os.replace(tmp_path, path)
+
+
+def _dispatch_review(context: str, head: str, parent: Any, credentials: dict[str, Any] | None) -> dict[str, Any]:
+    """Dispatch one review child in the BACKGROUND and return the native handle.
+
+    A full-candidate review is a long task, and the parent's sequential tool deadline (420 s by
+    default) is a ceiling on how long a tool call may block, not on how long a review may take.
+    Running the child synchronously inside this tool both hit that deadline on the first
+    integration review and froze the parent for the duration, which is the opposite of what the
+    delivery gate wants. Background dispatch returns at once with a ``delegation_id``; the child's
+    completion re-enters the parent as a message the way every other delegation does, and the
+    receipt is written by the ``subagent_stop`` hook below when the child finishes.
     """
     from tools.delegate_tool import delegate_task
     raw = delegate_task(
         goal=f"Review candidate {head[:12]}", context=context,
-        background=False, parent_agent=parent, credentials_cfg=credentials,
+        background=True, parent_agent=parent, credentials_cfg=credentials,
     )
     try:
         return json.loads(raw)
     except (TypeError, json.JSONDecodeError):
         return {"error": f"review dispatch returned unparsable output: {str(raw)[:400]}"}
+
+
+def _finalize_receipt(pending: dict[str, Any], result: dict[str, Any], *, reviewer_model: str,
+                      fallback_reason: str) -> dict[str, Any]:
+    receipt = {
+        "status": "reviewed",
+        "repository": pending["repository"],
+        "base_sha": pending["base_sha"],
+        "head_sha": pending["head_sha"],
+        "scope": pending["covers"],
+        "covers": pending["covers"],
+        "reviewer_model": reviewer_model,
+        "fallback_reason": fallback_reason,
+        "result": _structured_verdict(result),
+        "raw_child_result": result.get("results", result),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(_receipt_path(pending["head_sha"]), receipt)
+    return receipt
+
+
+def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child_session_id: Any = None,
+                      parent_session_id: Any = None, **_: Any) -> None:
+    """Turn a finished reviewer child into a durable receipt.
+
+    Matches the child to its pending marker by the goal text the marker recorded
+    (``Review candidate <head12>``) present in the child's kickoff. The hook fires for every child
+    stop, so it must be cheap and must ignore every child that is not a review it dispatched.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        pending_dir = get_hermes_home() / "review_receipts"
+        if not pending_dir.is_dir():
+            return
+        summary = str(child_summary or "")
+        for marker in pending_dir.glob("*.pending.json"):
+            try:
+                pending = json.loads(marker.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            head = pending.get("head_sha", "")
+            # The child's final message quotes the head it reviewed; a marker whose head is absent
+            # from this summary belongs to a different child (or a different review).
+            if not head or head[:12] not in summary:
+                continue
+            status = str(child_status or "")
+            result = {"results": [{"status": status, "summary": summary}]}
+            if status not in ("completed", "success", "ok"):
+                _write_json(_receipt_path(head), {
+                    "status": "not_reviewed", "error_code": "review_incomplete",
+                    "repository": pending["repository"], "base_sha": pending["base_sha"], "head_sha": head,
+                    "reviewer_model": pending.get("reviewer_model", ""),
+                    "error": f"reviewer child ended with status {status!r}",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+            else:
+                _finalize_receipt(pending, result, reviewer_model=pending.get("reviewer_model", ""),
+                                  fallback_reason=pending.get("fallback_reason", ""))
+            marker.unlink(missing_ok=True)
+            return
+    except Exception:
+        # A receipt failure must never break the parent's delegation completion path.
+        return
 
 
 def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
@@ -175,8 +257,9 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
             "commits, or call review_candidate (it is parent-only and you are the reviewer it spawned). "
             "Inspect the repository read-only and run relevant tests when a terminal is available; "
             "if it is not, say so and review the diff statically. Your FINAL message must be a single "
-            "fenced ```json block with keys verdict (approve or changes_requested), findings (array of "
-            "objects with severity, path, line, message), and summary. No prose outside the block.\n\n"
+            "fenced ```json block with keys head_sha (the exact head you reviewed), verdict (approve or "
+            "changes_requested), findings (array of objects with severity, path, line, message), and "
+            "summary. No prose outside the block.\n\n"
             f"Repository: {repo}\nBase: {base_resolved}\nHead: {head_resolved}\n"
             f"Covered paths: {json.dumps(covers)}\nFull diff:\n{diff}"
         )
@@ -191,43 +274,47 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
         credentials = _load_review_credentials_cfg()
         primary_model = str((credentials or {}).get("model") or "")
 
-        result = _spawn_review(context, head_resolved, parent, credentials)
+        pending_marker = _pending_path(head_resolved)
+        if pending_marker.exists():
+            try:
+                pending = json.loads(pending_marker.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pending = {}
+            return _json(success=True, status="pending", reused=True,
+                         delegation_id=pending.get("delegation_id", ""), head_sha=head_resolved,
+                         note="a review of this exact candidate is already in flight; its result will arrive as a delegation completion")
+
+        handle = _dispatch_review(context, head_resolved, parent, credentials)
         reviewer_model, fallback_reason = primary_model, ""
-        if result.get("error"):
-            if not _is_availability_failure(result["error"]):
-                # The reviewer ran and did not finish cleanly. Another model is NOT a substitute.
+        if handle.get("error"):
+            if not _is_availability_failure(handle["error"]):
                 return _json(success=False, status="not_reviewed", error_code="review_incomplete",
                              base_sha=base_resolved, head_sha=head_resolved, reviewer_model=primary_model,
-                             error=str(result["error"]))
-            fallback_reason = str(result["error"])[:500]
+                             error=str(handle["error"]))
+            fallback_reason = str(handle["error"])[:500]
             fallback = dict(credentials or {})
             fallback["provider"], fallback["model"] = _FALLBACK_PROVIDER, _FALLBACK_MODEL
-            result = _spawn_review(context, head_resolved, parent, fallback)
+            handle = _dispatch_review(context, head_resolved, parent, fallback)
             reviewer_model = _FALLBACK_MODEL
-            if result.get("error"):
+            if handle.get("error"):
                 return _json(success=False, status="not_reviewed", error_code="review_unavailable",
                              base_sha=base_resolved, head_sha=head_resolved,
-                             error=f"primary unavailable ({fallback_reason}); fallback failed: {result['error']}")
+                             error=f"primary unavailable ({fallback_reason}); fallback failed: {handle['error']}")
 
-        receipt = {
-            "status": "reviewed",
-            "repository": str(repo),
-            "base_sha": base_resolved,
-            "head_sha": head_resolved,
-            "scope": covers,
-            "covers": covers,
-            "reviewer_model": str(result.get("review_model") or reviewer_model),
-            "fallback_reason": fallback_reason,
-            "result": _structured_verdict(result),
-            "raw_child_result": result.get("results", result),
-            "created_at": datetime.now(timezone.utc).isoformat(),
+        pending = {
+            "repository": str(repo), "base_sha": base_resolved, "head_sha": head_resolved, "covers": covers,
+            "reviewer_model": reviewer_model, "fallback_reason": fallback_reason,
+            "delegation_id": str(handle.get("delegation_id") or ""),
+            "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", dir=receipt_path.parent, delete=False, encoding="utf-8") as tmp:
-            json.dump(receipt, tmp, sort_keys=True, indent=2)
-            tmp.write("\n")
-            tmp_path = Path(tmp.name)
-        os.replace(tmp_path, receipt_path)
+        if handle.get("status") == "dispatched":
+            _write_json(pending_marker, pending)
+            return _json(success=True, status="pending", **pending,
+                         note="review dispatched in the background; the receipt is written when the reviewer finishes "
+                              "and the result re-enters this session as a delegation completion")
+        # A direct (non-background) result: a depth>0 caller or a runtime that ran it inline.
+        receipt = _finalize_receipt(pending, handle, reviewer_model=str(handle.get("review_model") or reviewer_model),
+                                    fallback_reason=fallback_reason)
         return _json(success=True, **receipt)
     except (subprocess.CalledProcessError, OSError, ValueError) as exc:
         return _json(success=False, status="not_reviewed", error_code="candidate_read_failed", error=str(exc))
@@ -238,3 +325,4 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
 def register(ctx: Any) -> None:
     ctx.register_tool(name="review_candidate", toolset="review_candidate",
                       schema=_SCHEMA, handler=review_candidate)
+    ctx.register_hook("subagent_stop", _on_subagent_stop)
