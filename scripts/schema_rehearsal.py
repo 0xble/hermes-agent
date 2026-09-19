@@ -32,7 +32,19 @@ import sys
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+def _resolve_repo() -> Path:
+    """The Hermes checkout this script operates on: the installed hermes_cli package's parent.
+
+    Deriving it from __file__ broke the moment the installer copied this script into
+    $HERMES_HOME/scripts (the cron --script root), where parents[1] is the profile home."""
+    try:
+        import hermes_cli
+        return Path(hermes_cli.__file__).resolve().parents[1]
+    except Exception:
+        return Path(__file__).resolve().parents[1]
+
+
+REPO = _resolve_repo()
 FTS_PROBES = ("hermes", "telegram", "backup")
 
 

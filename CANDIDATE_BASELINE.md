@@ -106,6 +106,7 @@ Verification:
 hermes plugins doctor .../goal-lifecycle --ci    registration passed
 tests: candidate-extensions/goal-lifecycle/test_goal_lifecycle.py
 6 passed in 1.93s
+```
 
 ## Slice 4 review boundary
 
@@ -121,6 +122,7 @@ Verification:
 hermes plugins doctor .../review-candidate --ci    registration passed
 tests: candidate-extensions/review-candidate/test_review_candidate.py
 4 passed in 1.16s, including exact-receipt reuse for an unchanged candidate.
+```
 
 ## Slice 5 memory journal extension
 
@@ -136,6 +138,7 @@ Verification:
 hermes plugins doctor .../memory-journal --ci    registration passed
 tests: candidate-extensions/memory-journal/test_memory_journal.py
 3 passed in 0.29s, including a real built-in `memory` tool write.
+```
 
 ## Slice 11 Telegram emphasis fix
 
@@ -150,8 +153,6 @@ Verification:
 tests/gateway/test_telegram_emphasis.py
 tests/gateway/test_telegram_format.py
 72 passed in 1.42s
-```
-```
 ```
 
 ## Slices 12 through 14 backup, contention, and update evidence
@@ -216,6 +217,7 @@ fixture `example.com` address into `198.18.x.x`, which Hermes SSRF protection
 correctly blocks; the failures are the fixture's blocked-URL path, not a live
 Telegram or delivery failure.
 
+```
 ## Slice 8: named Camofox account routing
 
 The upstream design preflight read the current upstream `AGENTS.md` and
@@ -520,3 +522,32 @@ Disposition of the seven findings, all landed on `candidate/followups` at
 A second review against `5a39c6b954f8` is in flight as the gate for these
 fixes (delegation `deleg_f548a034`, 77 covered paths). A receipt on a
 superseded head is evidence of process, not approval of the code that ships.
+
+## Second I6 review, September 19
+
+Against `5a39c6b954f8` (the head carrying the first review's fixes), delegation
+`deleg_f548a034`, 77 covered paths, reviewer `claude-fable-5-1`, no fallback. It
+verified the seven earlier fixes as sound and pinned by tests, ran 158 plus 308
+tests green, and returned `changes_requested` with nine new findings, all in the
+follow-up tooling rather than the fork patches. Disposition, landed on
+`candidate/followups`:
+
+| # | severity | finding | disposition |
+|---|---|---|---|
+| 1 | high | the installed feature check derived the repository from its own path, so the copy cron runs (under `$HERMES_HOME/scripts`) crashed before any check | fixed: the checkout is the installed `hermes_cli` package's parent; same for the rehearsal script; the sync stage now requires `--repo` |
+| 2 | medium | `request_update` looked for the wrong loop attribute and tools run on an executor thread, so the watcher was never armed in production | fixed: hands the schedule call to `runner._gateway_loop` with `call_soon_threadsafe`; the test now runs the tool from a non-loop thread and asserts the callback ran on the loop thread |
+| 3 | medium | a pending review marker had no staleness bound; a stalled child or gateway crash made a head unreviewable forever | fixed: a marker is live only while its delegation is running and under four hours old; a stale one is recorded as `not_reviewed` and re-dispatched; tests added |
+| 4 | medium | the migration diff reported `monitor_url`, `monitor_state` and `context_from` as lost when the candidate stores them | fixed |
+| 5 | low | media flood refusals escaped voice, image and animation senders as delivery failures | fixed: each answers the typed flood result; test added |
+| 6 | low | a contention skip callout persisted forever | fixed: cleared when a run completes; test added |
+| 7 | low | `create_job` parameter shadowed `datetime.timezone` and no CLI exposes it | renamed `job_timezone`; CLI exposure is still open |
+| 8 | low | memory-journal pending images could pin for the process lifetime | fixed: bounded to 64 entries |
+| 9 | low | unclosed code fences in this file put headings inside code blocks | fixed; fence count even, no heading inside a fence |
+
+Cron suite after the fixes: 1,449 passed, the one failure being the documented
+`/.dockerenv` chmod row. The installed feature check, run from its cron location
+against the live isolated profile, reports OK.
+
+Still open from this review: `hermes cron create/update` and the cron tools do
+not expose `job_timezone`, so the 19 migrated jobs depend on the migrated
+`jobs.json` carrying the field, which the migration copy preserves.

@@ -49,3 +49,11 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
     row = next(item for item in stored["jobs"] if item["id"] == job["id"])
     assert row["last_skip_reason"] == "already_running"
     assert row["last_skipped_at"]
+
+
+def test_completed_run_clears_the_persisted_skip():
+    """The second I6 review: a single contention skip showed the callout forever."""
+    import cron.jobs as jobs
+    job = {"id": "j1", "last_skipped_at": "2026-09-01T09:00:00+00:00", "last_skip_reason": "already_running"}
+    jobs._record_run_outcome(job, True, None, None, None, "2026-09-02T09:00:00+00:00")
+    assert "last_skipped_at" not in job and "last_skip_reason" not in job

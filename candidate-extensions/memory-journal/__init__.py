@@ -191,6 +191,10 @@ def _on_pre_tool_call(tool_name: str = "", args: Any = None, task_id: str = "", 
     call_id = str(kwargs.get("tool_call_id") or kwargs.get("call_id") or "")
     key = _key(task_id, call_id, target)
     with _LOCK:
+        # A call whose post hook never fires (suppressed, cancelled, raised) would otherwise pin its
+        # before-image for the process lifetime. Keep the dict bounded; the oldest entries go first.
+        while len(_PENDING) >= 64:
+            _PENDING.pop(next(iter(_PENDING)))
         _PENDING[key] = {"target": target, "before": _read(_path(target)),
                          "action": args.get("action") or ("batch" if args.get("operations") else ""),
                          "call_id": call_id, "task_id": task_id}

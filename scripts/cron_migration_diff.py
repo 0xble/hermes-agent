@@ -42,6 +42,9 @@ CANDIDATE_READS = frozenset({
     "created_at", "updated_at", "attach_to_session", "failure_deliver", "monitor_script",
     # Read by the candidate's per-job timezone patch (slice 12).
     "timezone",
+    # Normalized and stored by create_job/update_job at this head (cron/jobs.py), so their
+    # semantics survive migration.
+    "monitor_url", "monitor_state", "context_from",
 })
 
 # Legacy-only fields with a known meaning, so the report can say what is lost rather than just
@@ -51,9 +54,6 @@ LEGACY_FIELD_MEANING = {
     "allow_messaging": "legacy per-job messaging permission; candidate uses enabled_toolsets",
     "completion_script": "legacy post-run script; the candidate has no equivalent hook",
     "completion_script_sha256": "checksum for completion_script",
-    "context_from": "legacy context-file source; candidate loads context only from workdir",
-    "monitor_state": "legacy monitor-script state; recreated by the candidate on first run",
-    "monitor_url": "legacy monitor target; not read by the candidate",
     "paused_reason": "informational only; candidate reads paused_at",
 }
 

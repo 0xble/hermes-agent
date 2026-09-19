@@ -89,13 +89,13 @@ class TestValidation:
 
 class TestJobLifecycle:
     def test_create_stores_and_uses_the_zone(self, store):
-        job = jobs.create_job(prompt="la job", schedule="0 8 * * *", timezone="America/Los_Angeles")
+        job = jobs.create_job(prompt="la job", schedule="0 8 * * *", job_timezone="America/Los_Angeles")
         assert job["timezone"] == "America/Los_Angeles"
         assert datetime.fromisoformat(job["next_run_at"]).astimezone(LOS_ANGELES).strftime("%H:%M") == "08:00"
 
     def test_create_rejects_a_bad_zone_before_storing(self, store):
         with pytest.raises(ValueError, match="Invalid IANA timezone"):
-            jobs.create_job(prompt="bad", schedule="0 8 * * *", timezone="Not/AZone")
+            jobs.create_job(prompt="bad", schedule="0 8 * * *", job_timezone="Not/AZone")
         assert jobs.load_jobs() == []
 
     def test_updating_only_the_zone_recomputes_next_run(self, store):

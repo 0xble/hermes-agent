@@ -56,12 +56,18 @@ def test_request_update_arms_the_running_gateways_watcher(monkeypatch, tmp_path)
     spec = importlib.util.spec_from_file_location("request_update", Path(__file__).parent / "__init__.py")
     plugin = importlib.util.module_from_spec(spec); spec.loader.exec_module(plugin)
     armed = []
-    runner = SimpleNamespace(_schedule_update_notification_watch=lambda: armed.append(True))
+    import asyncio, threading
+    loop = asyncio.new_event_loop()
+    runner = SimpleNamespace(_schedule_update_notification_watch=lambda: armed.append(threading.current_thread().name),
+                             _gateway_loop=loop)
     fake_run = ModuleType("gateway.run"); fake_run._gateway_runner_ref = lambda: runner
     monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
-    # Simulate being called from the event-loop thread.
-    import asyncio
-    async def go():
-        return plugin._arm_update_watcher()
-    assert asyncio.run(go()) == "armed"
-    assert armed == [True]
+    # Production context: the tool runs on an executor thread while the gateway loop runs elsewhere.
+    t = threading.Thread(target=loop.run_forever, name="gateway-loop"); t.start()
+    try:
+        result = plugin._arm_update_watcher()  # called from this (non-loop) thread
+        loop.call_soon_threadsafe(loop.stop); t.join(timeout=5)
+    finally:
+        loop.close()
+    assert result == "armed"
+    assert armed == ["gateway-loop"]  # scheduled ON the gateway loop, not the caller's thread

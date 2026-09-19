@@ -152,6 +152,32 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp_path, path)
 
 
+_PENDING_MAX_AGE_SECONDS = 4 * 3600
+
+
+def _pending_is_live(pending: dict[str, Any]) -> bool:
+    """True when a pending marker still describes a running review."""
+    try:
+        dispatched = datetime.fromisoformat(str(pending.get("dispatched_at") or ""))
+        if (datetime.now(timezone.utc) - dispatched).total_seconds() > _PENDING_MAX_AGE_SECONDS:
+            return False
+    except ValueError:
+        return False
+    delegation_id = str(pending.get("delegation_id") or "")
+    if not delegation_id:
+        return False
+    try:
+        from tools.async_delegation import get_durable_delegation, list_async_delegations
+        live = {str(d.get("delegation_id")) for d in list_async_delegations()
+                if str(d.get("status")) in ("running", "stalling", "finalizing")}
+        if delegation_id in live:
+            return True
+        row = get_durable_delegation(delegation_id)
+        return bool(row and row.get("state") == "running")
+    except Exception:
+        return True  # cannot tell; do not re-dispatch on top of a possibly live review
+
+
 def _dispatch_review(context: str, head: str, parent: Any, credentials: dict[str, Any] | None) -> dict[str, Any]:
     """Dispatch one review child in the BACKGROUND and return the native handle.
 
@@ -319,9 +345,20 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                 pending = json.loads(pending_marker.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 pending = {}
-            return _json(success=True, status="pending", reused=True,
-                         delegation_id=pending.get("delegation_id", ""), head_sha=head_resolved,
-                         note="a review of this exact candidate is already in flight; its result will arrive as a delegation completion")
+            if _pending_is_live(pending):
+                return _json(success=True, status="pending", reused=True,
+                             delegation_id=pending.get("delegation_id", ""), head_sha=head_resolved,
+                             note="a review of this exact candidate is already in flight; its result will arrive as a delegation completion")
+            # The stop hook only fires from the normal finalize path; a stalled child or a gateway
+            # crash mid-review leaves the marker behind. A marker whose delegation is no longer live
+            # (or is older than the bound) is stale, and refusing forever would make the head
+            # unreviewable. Record why, then re-dispatch.
+            _write_json(_receipt_path(head_resolved), {
+                "status": "not_reviewed", "error_code": "review_incomplete", "head_sha": head_resolved,
+                "base_sha": base_resolved, "repository": str(repo),
+                "error": "previous review of this head never finished (stale pending marker); re-dispatching",
+                "created_at": datetime.now(timezone.utc).isoformat()})
+            pending_marker.unlink(missing_ok=True)
 
         handle = _dispatch_review(context, head_resolved, parent, credentials)
         reviewer_model, fallback_reason = primary_model, ""

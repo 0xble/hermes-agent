@@ -24,7 +24,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+def _resolve_repo() -> Path:
+    """The Hermes checkout this script operates on: the installed hermes_cli package's parent.
+
+    Deriving it from __file__ broke the moment the installer copied this script into
+    $HERMES_HOME/scripts (the cron --script root), where parents[1] is the profile home."""
+    try:
+        import hermes_cli
+        return Path(hermes_cli.__file__).resolve().parents[1]
+    except Exception:
+        return Path(__file__).resolve().parents[1]
+
+
+REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
 # key -> (expected, or None meaning "must be set")
 EXPECTED_CONFIG = {

@@ -1774,7 +1774,7 @@ def create_job(
     failure_deliver: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
-    timezone: Optional[str] = None,
+    job_timezone: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1786,7 +1786,7 @@ def create_job(
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
-    timezone = normalize_job_timezone(timezone)
+    job_timezone = normalize_job_timezone(job_timezone)
     if paused_reason is not None and not isinstance(paused_reason, str):
         raise ValueError("paused_reason must be a string.")
     if paused_reason is not None and not paused:
@@ -1826,7 +1826,7 @@ def create_job(
     name = name or label_source[:50].strip()
     provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
         provider=f["provider"], model=f["model"], base_url=f["base_url"], no_agent=f["no_agent"])
-    next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "", job_timezone=timezone)
+    next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "", job_timezone=job_timezone)
 
     job = {
         "id": job_id,
@@ -1846,7 +1846,7 @@ def create_job(
         "monitor_state": None,
         "context_from": f["context_from"],
         "schedule": parsed_schedule,
-        "timezone": timezone,
+        "timezone": job_timezone,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {"times": repeat, "completed": 0},  # times None = forever
         "enabled": not paused,
@@ -2382,6 +2382,10 @@ def _record_run_outcome(
 ) -> None:
     """Stamp one completed run onto *job*: status fields, failure streak, alert markers, claims."""
     job["last_run_at"] = now
+    # A run completed, so the last contention skip is history; without this the ⚠ callout in
+    # `cron list` would be permanent after a single skip.
+    job.pop("last_skipped_at", None)
+    job.pop("last_skip_reason", None)
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)

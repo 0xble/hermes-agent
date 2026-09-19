@@ -100,7 +100,9 @@ def test_dispatch_returns_pending_and_hook_writes_the_receipt(plugin, tmp_path, 
     assert not plugin._receipt_path(head).exists()
     assert "call review_candidate" in attempts[0]["context"] and "head_sha" in attempts[0]["context"]
 
-    # A second request for the same in-flight candidate does not dispatch again.
+    # A second request for the same in-flight candidate does not dispatch again (the fake dispatch
+    # registers no live delegation, so liveness is stubbed to what a real running child would report).
+    monkeypatch.setattr(plugin, "_pending_is_live", lambda pending: True)
     again = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
     assert again["status"] == "pending" and again["reused"] is True
     assert len(attempts) == 1
@@ -242,3 +244,31 @@ def test_fallback_reviewer_follows_configured_chain(plugin, monkeypatch):
     monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
     fb = plugin._fallback_credentials({"provider": "custom:claude-proxy", "model": "claude-fable-5-1"})
     assert fb["provider"] == "custom:claude-proxy" and fb["model"] == "claude-opus-5" and fb["base_url"].endswith("/v1")
+
+
+def test_stale_pending_marker_is_recorded_and_redispatched(plugin, tmp_path, monkeypatch):
+    """A marker whose delegation is gone (stalled child, gateway crash) must not refuse forever."""
+    base, head = _repo(tmp_path)
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED, DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    assert len(attempts) == 1
+    monkeypatch.setattr(plugin, "_pending_is_live", lambda pending: False)
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["status"] == "pending" and result.get("reused") is None
+    assert len(attempts) == 2, "stale marker must trigger a fresh dispatch"
+    assert plugin._pending_path(head).exists()
+
+
+def test_live_pending_marker_is_reused(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    attempts = _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    monkeypatch.setattr(plugin, "_pending_is_live", lambda pending: True)
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["reused"] is True and len(attempts) == 1
+
+
+def test_pending_age_bound(plugin):
+    old = {"dispatched_at": "2020-01-01T00:00:00+00:00", "delegation_id": "deleg_x"}
+    assert plugin._pending_is_live(old) is False
+    assert plugin._pending_is_live({}) is False

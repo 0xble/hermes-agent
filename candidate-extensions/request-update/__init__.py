@@ -125,19 +125,13 @@ def _arm_update_watcher() -> str:
         schedule = getattr(runner, "_schedule_update_notification_watch", None)
         if not callable(schedule):
             return "unsupported"
-        loop = getattr(runner, "_loop", None) or getattr(runner, "loop", None)
-        try:
-            import asyncio
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is not None:
-            schedule()
-            return "armed"
-        if loop is not None and hasattr(loop, "call_soon_threadsafe"):
-            loop.call_soon_threadsafe(schedule)
-            return "armed"
-        return "no_loop"
+        # Tools execute on an executor thread, not the gateway's event loop, so the schedule call
+        # (which creates an asyncio task) must be handed to the loop the runner recorded at start.
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None or not hasattr(loop, "call_soon_threadsafe"):
+            return "no_loop"
+        loop.call_soon_threadsafe(schedule)
+        return "armed"
     except Exception as exc:
         return f"error:{type(exc).__name__}"
 

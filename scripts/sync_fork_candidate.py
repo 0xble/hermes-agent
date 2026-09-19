@@ -70,7 +70,7 @@ def patch_series(repo: Path, base: str, head: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
+    ap.add_argument("--repo", type=Path, required=True, help="the fork worktree to sync (never the installed checkout)")
     ap.add_argument("--candidate", default="HEAD", help="ref holding the current patch series")
     ap.add_argument("--current-base", required=True, help="the upstream tag/SHA the series is based on")
     ap.add_argument("--upstream-remote", default="upstream-live")

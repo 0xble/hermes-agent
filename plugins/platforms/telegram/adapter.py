@@ -4952,6 +4952,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     return await self.send_document(
                         chat_id=chat_id, file_path=audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _MediaFloodRefusal as flood:
+            # The platform refused the timing, not the file: answer with the typed flood result
+            # so the delivery ledger schedules redelivery instead of posting a failure notice.
+            return _flood_cap_result(flood.wait)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s", self.name,
@@ -5142,6 +5146,10 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_media(
                 self._bot.send_photo, chat_id, reply_to, metadata, "URL photo", photo=image_url, caption=photo_caption)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _MediaFloodRefusal as flood:
+            # The platform refused the timing, not the file: answer with the typed flood result
+            # so the delivery ledger schedules redelivery instead of posting a failure notice.
+            return _flood_cap_result(flood.wait)
         except Exception as e:
             logger.warning(
                 "[%s] URL-based send_photo failed, trying file upload: %s", self.name, _redact_telegram_error_text(e), exc_info=True)
@@ -5170,6 +5178,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._bot.send_animation, chat_id, reply_to, metadata, "animation", animation=animation_url,
                 caption=self._caption_1024(caption))
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _MediaFloodRefusal as flood:
+            # The platform refused the timing, not the file: answer with the typed flood result
+            # so the delivery ledger schedules redelivery instead of posting a failure notice.
+            return _flood_cap_result(flood.wait)
         except Exception as e:
             logger.error(
                 "[%s] Failed to send Telegram animation, falling back to photo: %s", self.name,

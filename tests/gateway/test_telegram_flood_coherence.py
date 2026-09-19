@@ -175,3 +175,20 @@ async def test_the_window_is_per_chat():
     other = await adapter.send("999", "unrelated chat")
 
     assert other.success is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,kwargs,bot_method", [
+    ("send_animation", {}, "send_animation"),
+])
+async def test_other_media_senders_return_typed_flood_result(tmp_path, monkeypatch, sender, kwargs, bot_method):
+    """The second I6 review: only document/photo files went through _send_local_file, so a flood
+    refusal on voice, animation or image escaped into the generic handlers as a delivery failure."""
+    adapter = _adapter()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
+    setattr(adapter._bot, bot_method, AsyncMock(side_effect=_FloodError(200.0)))
+    path = tmp_path / "clip.gif"
+    path.write_bytes(b"GIF89a")
+    result = await getattr(adapter, sender)("4242", str(path), **kwargs)
+    assert result.success is False
+    assert (result.error or "").startswith("flood_control:"), result.error
