@@ -2277,6 +2277,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     from agent.model_metadata import DEFAULT_FALLBACK_CONTEXT, get_model_context_length
     resolved_model = model or _resolve_gateway_model()
     config_context_length = provider = base_url = api_key = custom_providers = None
+    api_mode = ""
     configured_model = configured_provider = configured_base_url = None
 
     def _read_config() -> None:
@@ -2301,11 +2302,12 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
             custom_providers = data.get("custom_providers")
 
     def _read_runtime() -> None:
-        nonlocal provider, base_url, api_key
+        nonlocal provider, base_url, api_key, api_mode
         runtime = _resolve_runtime_agent_kwargs()
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
+        api_mode = runtime.get("api_mode") or ""
 
     def _pin_still_applies() -> bool:
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
@@ -2328,7 +2330,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     context_length = get_model_context_length(
         resolved_model, base_url=base_url or "", api_key=api_key or "",
         config_context_length=config_context_length, provider=provider or "",
-        custom_providers=custom_providers)
+        custom_providers=custom_providers, api_mode=api_mode)
     context_source = ("config" if config_context_length is not None
                       else "default" if context_length == DEFAULT_FALLBACK_CONTEXT else "detected")
     return _GatewayModelContext(
@@ -4011,6 +4013,7 @@ class GatewayRunner(
         base_url: Optional[str]
         api_key: Optional[str]
         data: Any
+        api_mode: str = ""
 
     @dataclasses.dataclass
     class _HygieneAttempt:
