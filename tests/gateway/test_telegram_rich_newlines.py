@@ -136,6 +136,7 @@ class TestRichMessageStructuralBoundaries:
             "$$\na = 1\n\nb = 2\n$$",
             "\\[\na = 1\n\nb = 2\n\\]",
             "~~~python\na = 1\n\nb = 2\n~~~",
+            "Intro\n\n```py\nx = 1\n\ny = 2\n```\n\nOutro",
         ],
     )
     def test_protected_structural_regions_stay_byte_for_byte_raw(

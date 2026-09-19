@@ -337,30 +337,17 @@ def _rich_materialize_prose_paragraphs(text: str) -> str:
     that boundary one stable visual row without the oversized two-paragraph
     spacer produced by adding more raw blank lines.
 
-    Structural Markdown boundaries stay raw so headings, lists, blockquotes,
-    details, and math keep their block semantics. Fenced code and pipe tables
-    are excluded by the caller's protected-region split.
+    Structural Markdown boundaries stay raw so headings, lists, and blockquotes
+    keep their block semantics. *text* is one prose run between the caller's
+    ``_RICH_PARAGRAPH_PROTECTED_REGION_RE`` matches, so fenced code, tables,
+    details, and display math never reach this function.
     """
     if "\n\n" not in text:
         return text
 
-    protected = [
-        (match.start(), match.end())
-        for match in _RICH_PARAGRAPH_PROTECTED_REGION_RE.finditer(text)
-    ]
-    protected_index = 0
     out: list[str] = []
     cursor = 0
     for match in re.finditer(r"\n{2,}", text):
-        while (
-            protected_index < len(protected)
-            and protected[protected_index][1] <= match.start()
-        ):
-            protected_index += 1
-        inside_protected = (
-            protected_index < len(protected)
-            and protected[protected_index][0] < match.end()
-        )
         previous_start = text.rfind("\n", 0, match.start()) + 1
         next_end = text.find("\n", match.end())
         if next_end < 0:
@@ -368,11 +355,7 @@ def _rich_materialize_prose_paragraphs(text: str) -> str:
         previous_line = text[previous_start : match.start()]
         next_line = text[match.end() : next_end]
         out.append(text[cursor : match.start()])
-        if (
-            not inside_protected
-            and _rich_is_prose_line(previous_line)
-            and _rich_is_prose_line(next_line)
-        ):
+        if _rich_is_prose_line(previous_line) and _rich_is_prose_line(next_line):
             out.append(f"\n{_RICH_VISUAL_PARAGRAPH_SPACER}\n")
         else:
             out.append(match.group(0))
