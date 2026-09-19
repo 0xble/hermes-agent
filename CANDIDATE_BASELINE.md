@@ -267,7 +267,8 @@ configured `skills.external_dirs` roots through the existing skill utility,
 blocks `skill_manage` writes aimed at an externally owned skill, and directs the
 model to `$HERMES_HOME/observations/<skill>.md`. Local profile skills and
 unrelated tools remain unaffected. The guard fails closed if it cannot establish
-the external roots.
+the external roots. `CANDIDATE_SLICE2_CONFIG.yaml` enables the plugin in the
+disposable candidate profile.
 
 Focused verification: `3 passed` in
 `tests/plugins/test_canonical_skill_guard.py`. The separate dotfiles curation
