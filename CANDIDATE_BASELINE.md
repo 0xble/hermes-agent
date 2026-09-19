@@ -360,6 +360,15 @@ once with the delay named instead of churning the timer until the staleness swee
 ledger, so a refused attachment is reported truthfully but not automatically
 redelivered. Slice 10 must not be described as complete.
 
+This is deliberately not patched here. The ledger stores a text `content` column and
+redelivery re-sends that text; an attachment obligation would need the file itself to
+survive until redelivery, which raises questions this candidate cannot answer alone:
+a media path may be a temporary file already cleaned up, or worse, a path that now
+resolves to different content, so a naive re-upload could deliver the wrong bytes
+under an old promise. Closing this needs an explicit decision about attachment
+lifetime (copy into the profile, or expire the obligation with the file) and is a
+better upstream proposal than a fork patch.
+
 ### Camofox aliases scoped per profile
 
 The three operator aliases were hard-coded in two places, so every installation
