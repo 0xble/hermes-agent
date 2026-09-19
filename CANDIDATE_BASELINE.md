@@ -153,4 +153,42 @@ tests/gateway/test_telegram_format.py
 ```
 ```
 ```
+
+## Slices 12 through 14 backup, contention, and update evidence
+
+The candidate records a durable `last_skipped_at` and `last_skip_reason` on a
+per-job contention skip without creating an execution row. `hermes cron list`
+and `hermes cron status` render the persisted skip. Quick snapshots verify copied
+SQLite members before publication and refuse corrupted database members during
+restore. Full backup retention now reports incomplete archives as failures and
+does not prune older complete archives after an incomplete run. The parent-only
+`request_update` extension runs the native read-only update check and, when an
+update exists, starts the native detached `update --gateway` watcher through
+`.update_pending.json`.
+
+Commits:
+
+```text
+f500063ab41  truthful contention skip fields and CLI/status visibility
+291fb7bfbf1  incomplete full-archive exit status
+3880aa94f0d  retain complete archives after incomplete runs
+0c74190b15e  quick-snapshot SQLite verification and restore refusal
+9e178344f1a  parent-only native update request
+```
+
+Verification:
+
+```text
+cron contention + stale-claim tests                 40 passed
+cron and CLI cron tests                              36 passed
+backup and execution-ledger tests                   107 passed, 1 skipped
+backup/update/SQLite guard tests                     98 passed, 1 skipped
+request-update extension tests                      2 passed
+wide cron + CLI cron suite                           1363 passed, 6 skipped, 1 environment-sensitive failure
+```
+
+The wide-suite failure is `test_ensure_hermes_home_sets_0700`: this host exposes
+`/.dockerenv`, so the existing container policy intentionally skips chmod while
+that upstream test expects owner-only permissions. The focused changed paths
+are green, and the candidate worktree is clean.
 ```
