@@ -858,14 +858,31 @@ class TurnRunner:
             # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
             # cache at fire time — gating registration on the cache read meant it never registered.
             if runner._is_telegram_topic_lane(source):
-                lane = "_schedule_telegram_topic_title_rename"
+                def _schedule_telegram_title(
+                    title, title_source, *, display_title=None
+                ):
+                    if title_source != "llm":
+                        return False
+                    visible_title = display_title or title
+                    opening_message = getattr(ctx, "message", "") or ""
+                    if opening_message:
+                        return runner._schedule_telegram_topic_title_rename(
+                            source,
+                            session_id,
+                            visible_title,
+                            user_message=opening_message,
+                        )
+                    return runner._schedule_telegram_topic_title_rename(
+                        source, session_id, visible_title
+                    )
+                agent._on_session_title = _schedule_telegram_title
             elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
                 lane = "_schedule_discord_semantic_thread_rename"
+                agent._on_session_title = lambda title, title_source: (
+                    title_source == "llm" and getattr(runner, lane)(source, session_id, title)
+                )
             else:
                 return
-            agent._on_session_title = lambda title, title_source: (
-                title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-            )
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 

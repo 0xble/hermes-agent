@@ -5,6 +5,7 @@ is called, cannot fail), then an **upgrade** from one small-model call (cheap ti
 JSON-constrained). Storage enforces provenance ``derived < llm < user``: stage 2 only replaces stage 1
 and neither replaces a name the user typed."""
 
+import inspect
 import json
 import logging
 import re
@@ -20,9 +21,10 @@ logger = logging.getLogger(__name__)
 
 # (task_name, exception) -> None; surfaces auxiliary failures so silent drops don't pile up as NULL titles.
 FailureCallback = Callable[[str, BaseException], None]
-# (title, source) -> None; source is the persisted provenance (``derived`` / ``llm``). Consumers paying a
-# rate-limited remote rename per title (Discord thread, Telegram topic) should act on ``llm`` only.
-TitleCallback = Callable[[str, str], None]
+# (title, source[, display_title=...]) -> None. ``title`` is the persisted
+# alias; ``display_title`` is the unsuffixed label for transports such as
+# Telegram that keep visible topic names separate from session aliases.
+TitleCallback = Callable[..., None]
 # () -> bool, called right before the LLM request; False skips (e.g. the user switched models and
 # the request would reload one the runtime already evicted).
 # Validation callback: () -> bool. See #19027.
@@ -301,8 +303,30 @@ def _report_failure(failure_callback: Optional[FailureCallback], exc: BaseExcept
     _safe_callback(failure_callback, ("title generation", exc), "%s failure_callback raised", label)
 
 
-def _notify_title(title_callback: Optional[TitleCallback], title: str, source: str, label: str) -> None:
-    _safe_callback(title_callback, (title, source), "%s callback failed", label)
+def _notify_title(
+    title_callback: Optional[TitleCallback],
+    title: str,
+    source: str,
+    label: str,
+    *,
+    display_title: Optional[str] = None,
+) -> None:
+    """Notify title consumers, preserving compatibility with two-argument callbacks."""
+    if title_callback is None:
+        return
+    try:
+        if display_title is None:
+            title_callback(title, source)
+            return
+        try:
+            signature = inspect.signature(title_callback)
+            signature.bind(title, source, display_title=display_title)
+        except (TypeError, ValueError):
+            title_callback(title, source)
+        else:
+            title_callback(title, source, display_title=display_title)
+    except Exception:
+        logger.debug("%s callback failed", label, exc_info=True)
 
 
 def _is_prompt_example_echo(title: str) -> bool:
@@ -385,7 +409,10 @@ def generate_title(
         payload = None
         if icon_allowed:
             with suppress(Exception):
-                payload = json.loads(str(raw_content).strip().strip("`"))
+                candidate = str(raw_content).strip()
+                fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+                payload = json.loads(fence.group(1) if fence else candidate)
+
         if not any(char.isalnum() for char in str(raw_content)):
             logger.debug("Rejecting title output with no Unicode letters or digits")
             return None
@@ -471,7 +498,9 @@ def apply_instant_title(session_db, session_id: str, user_message: str, title_ca
         title = derive_title(user_message) if is_titleable_user_message(user_message) else None
         persisted = _persist_session_title(session_db, session_id, title, source="derived", dedupe=False) if title else None
         if persisted:
-            _notify_title(title_callback, persisted, "derived", "Instant-title")
+            _notify_title(
+                title_callback, persisted, "derived", "Instant-title", display_title=title
+            )
         return persisted
     except Exception:
         logger.debug("Instant title failed", exc_info=True)
@@ -525,7 +554,9 @@ def auto_title_session(
             return
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
-            _notify_title(title_callback, persisted, source, "Auto-title")
+            _notify_title(
+                title_callback, persisted, source, "Auto-title", display_title=title
+            )
     except Exception as e:
         # WARNING so operators see it in agent.log; names the likely cause.
         logger.warning("Auto-title failed (harmless; if this started after an update, restart the running Hermes process): %s", e)

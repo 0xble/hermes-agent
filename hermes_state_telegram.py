@@ -113,6 +113,8 @@ class SessionTelegramTopicsMixin:
     tables (nobody ran ``/topic``) by returning their empty value; only
     ``enable``/``bind`` run the migration."""
 
+    _TELEGRAM_TOPIC_ICON_HISTORY_LIMIT = 12
+
     def _topic_read_one(self, sql: str, params):
         """``fetchone`` that treats an unmigrated table as None."""
         try:
@@ -392,8 +394,24 @@ class SessionTelegramTopicsMixin:
 
     def record_telegram_topic_icon_history(self, chat_id: str, *, emoji: str, custom_emoji_id=None, profile_name="default") -> None:
         self.apply_telegram_topic_migration()
+        profile_name = _normalize_telegram_topic_profile_name(profile_name)
         self._write_sql("INSERT INTO telegram_topic_icon_history(profile_name,chat_id,emoji,custom_emoji_id,selected_at) VALUES(?,?,?,?,?)",
-                        (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), str(emoji), custom_emoji_id, time.time()))
+                        (profile_name, str(chat_id), str(emoji), custom_emoji_id, time.time()))
+        self._write_sql(
+            """DELETE FROM telegram_topic_icon_history
+               WHERE profile_name=? AND chat_id=? AND rowid NOT IN (
+                   SELECT rowid FROM telegram_topic_icon_history
+                   WHERE profile_name=? AND chat_id=?
+                   ORDER BY selected_at DESC, rowid DESC LIMIT ?
+               )""",
+            (
+                profile_name,
+                str(chat_id),
+                profile_name,
+                str(chat_id),
+                self._TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+            ),
+        )
 
     def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = 24, profile_name: str = "default") -> List[str]:
         try:
