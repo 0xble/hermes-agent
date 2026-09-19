@@ -27,6 +27,43 @@ def _normalize_telegram_topic_profile_name(profile_name: Optional[str] = None) -
 # Per-chat icon rotation window: history rows kept and recent icons the chooser avoids.
 TELEGRAM_TOPIC_ICON_HISTORY_LIMIT = 12
 
+
+def _rebuild_legacy_icon_tables(conn) -> None:
+    """Rebuild icon tables left by the archived fork, whose shapes differ from this one.
+
+    Legacy ``telegram_topic_icon_state`` used ``ownership IN ('auto','manual','default')`` and
+    ``observed_at`` with no ``emoji``; legacy ``telegram_topic_icon_history`` had a NOT NULL
+    ``custom_emoji_id`` in its primary key. ``CREATE TABLE IF NOT EXISTS`` would keep those shapes
+    and every write here would fail on constraints. Manual ownership is the only state worth
+    carrying forward; ``default`` collapses to ``auto`` and history is rebuilt from scratch."""
+    def _columns(table: str) -> set:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
+
+    state_cols = _columns("telegram_topic_icon_state")
+    if state_cols and "owner" not in state_cols:
+        conn.executescript("""
+            CREATE TABLE telegram_topic_icon_state_new (
+                profile_name TEXT NOT NULL DEFAULT 'default', chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL, custom_emoji_id TEXT, emoji TEXT,
+                owner TEXT NOT NULL CHECK(owner IN ('auto','manual')), updated_at REAL NOT NULL,
+                PRIMARY KEY (profile_name, chat_id, thread_id)
+            );
+            INSERT INTO telegram_topic_icon_state_new
+                (profile_name, chat_id, thread_id, custom_emoji_id, emoji, owner, updated_at)
+            SELECT profile_name, chat_id, thread_id, custom_emoji_id, NULL,
+                   CASE WHEN ownership = 'manual' THEN 'manual' ELSE 'auto' END, observed_at
+            FROM telegram_topic_icon_state;
+            DROP TABLE telegram_topic_icon_state;
+            ALTER TABLE telegram_topic_icon_state_new RENAME TO telegram_topic_icon_state;
+        """)
+    history_cols = _columns("telegram_topic_icon_history")
+    if history_cols:
+        notnull = {row[1] for row in conn.execute("PRAGMA table_info('telegram_topic_icon_history')") if row[3]}
+        pk = {row[1] for row in conn.execute("PRAGMA table_info('telegram_topic_icon_history')") if row[5]}
+        if "custom_emoji_id" in notnull or pk:
+            conn.execute("DROP TABLE telegram_topic_icon_history")
+
+
 _TOPIC_TABLES = (
     (
         "telegram_dm_topic_mode",
@@ -133,6 +170,7 @@ class SessionTelegramTopicsMixin:
         See #76423.
         """
         def _do(conn):
+            _rebuild_legacy_icon_tables(conn)
             for table, columns, ddl in _TOPIC_TABLES:
                 conn.execute(f"CREATE TABLE IF NOT EXISTS {table} ({ddl})")
                 have = {row[1] for row in conn.execute(f"PRAGMA table_info('{table}')")}
