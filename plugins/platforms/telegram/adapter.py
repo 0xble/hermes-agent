@@ -5163,6 +5163,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = await self._send_media(
                     self._bot.send_photo, chat_id, reply_to, metadata, "uploaded photo", photo=image_data, caption=photo_caption)
                 return SendResult(success=True, message_id=str(msg.message_id))
+            except _MediaFloodRefusal as flood:
+                return _flood_cap_result(flood.wait)
             except Exception as e2:
                 logger.error("[%s] File upload send_photo also failed: %s", self.name, e2, exc_info=True)
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)

@@ -159,9 +159,11 @@ def _pending_is_live(pending: dict[str, Any]) -> bool:
     """True when a pending marker still describes a running review."""
     try:
         dispatched = datetime.fromisoformat(str(pending.get("dispatched_at") or ""))
+        if dispatched.tzinfo is None:
+            return False  # a hand-edited naive stamp is not one this plugin wrote; treat as stale
         if (datetime.now(timezone.utc) - dispatched).total_seconds() > _PENDING_MAX_AGE_SECONDS:
             return False
-    except ValueError:
+    except (ValueError, TypeError):
         return False
     delegation_id = str(pending.get("delegation_id") or "")
     if not delegation_id:

@@ -52,6 +52,10 @@ def _git(*args: str) -> str:
     return subprocess.run(["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+def _is_git_checkout() -> bool:
+    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+
+
 def check_ledger(baseline: str) -> list[str]:
     failures: list[str] = []
     ledger = REPO / "FORK_PATCHES.md"
@@ -130,6 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--baseline", default="345cd2b057a452236de401d3534b8502a7465e8d")
     ap.add_argument("--skip-config", action="store_true", help="skip the config-key checks (fixture profiles)")
     args = ap.parse_args(argv)
+    if not _is_git_checkout():
+        # A package-managed install has no history to check; say so instead of tracebacking.
+        print(f"FAIL {REPO} is not a git checkout; the ledger and receipt checks need the source checkout")
+        print(f"FAILED: 1 problem(s); install {REPO} home {args.home}")
+        return 1
     failures = check_ledger(args.baseline) + check_extensions(args.home)
     if not args.skip_config:
         failures += check_config(args.home)
