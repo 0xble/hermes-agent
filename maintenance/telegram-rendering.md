@@ -12,8 +12,17 @@ rendering. Top-level platform extras retain their existing precedence.
 The adapter and the model formatting hint share normalization. Final sends and
 finalized edits use the mode. Rich draft previews remain separately configured.
 Capability, client-risk, length, flood, and ambiguous-network-result protections
-remain owned by the native delivery machinery. This unit does not add paragraph
-spacing changes or change any profile's preview preference.
+remain owned by the native delivery machinery. This unit does not change any
+profile's preview preference.
+
+Rich Message prose paragraph breaks (`\n\n` between two ordinary prose lines)
+are materialized as one hard-broken non-breaking-space row because Telegram
+clients, iOS in particular, render raw `\n\n` inside a Rich Message with no
+visible blank row. Headings, lists, blockquotes, fenced code, tables,
+`<details>`, and display math keep their raw boundaries. The normalized payload,
+not the source, is counted against the rich character limit. Runs of three or
+more newlines collapse to the same single spacer, and normalization is
+idempotent.
 
 ## Provenance and adoption
 
@@ -25,6 +34,13 @@ instead extends the existing setting with three modes and shares interpretation
 with prompt construction. Archived fork commit `5c1aec46a93` implemented the
 original three-mode preference. Neither related patch is represented as merged
 upstream or directly cherry-picked here.
+
+Paragraph spacing: own contribution [upstream PR 100686](https://github.com/NousResearch/hermes-agent/pull/100686)
+for [issue 100664](https://github.com/NousResearch/hermes-agent/issues/100664),
+head `7b7ab064752947fd7576d59aa0d028a127f57e8d`, open when adopted on 2026-09-19.
+The fork carries the adapter symbols and regression file at exact AST parity
+with that head so retirement is a hash comparison, not a re-review. The archived
+fork tracked the same behavior as HERMES-095 (archived PRs #32 and #34).
 
 Fork adaptation retains release `v2026.9.14` and its existing client-risk guards.
 It does not import newer upstream approval-header or CJK opt-in changes. On every
@@ -49,7 +65,10 @@ client appearance. Read [runtime ownership](runtime-ownership.md) before promoti
 
 Retire only when a released upstream version preserves this complete contract,
 including existing `always` configuration and prompt/delivery agreement. Keep
-this patch while an equivalent upstream proposal is merely open.
+this patch while an equivalent upstream proposal is merely open. Retire the
+paragraph-spacing part independently when PR 100686 merges and the candidate
+tag contains it: compare the adapter symbols and the regression file against
+that merge, then drop the fork copy.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,
