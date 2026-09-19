@@ -90,3 +90,20 @@ The installed package used for this check was rebuilt in
 `/tmp/hermes-agent-next-release-venv` from this release worktree. Its reported
 install directory is the release worktree, so the source and installed-package
 identities match. No provider request or production profile was used.
+
+## Slice 3 goal lifecycle extension
+
+The candidate extension at `candidate-extensions/goal-lifecycle/` registers
+one parent-only `goal_set` tool. It supports automatic enrollment, status
+inspection, and additive subgoals. Pause, resume, clear, edit, and replacement
+are rejected with `user_control_only`; delegated children are rejected with
+`parent_only`. Persistence is confirmed by reading the goal back from the
+candidate `state.db`.
+
+Verification:
+
+```text
+hermes plugins doctor .../goal-lifecycle --ci    registration passed
+tests: candidate-extensions/goal-lifecycle/test_goal_lifecycle.py
+6 passed in 1.93s
+```
