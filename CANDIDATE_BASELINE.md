@@ -199,3 +199,13 @@ was created. The candidate branch was pushed and read back at
 `437efe5d0a9baa552e462f87525ed15b30cc0e60`. In a disposable profile,
 `hermes update --plan` reported `Install: git (v0.21.3 @ 437efe5d)` and no
 running Hermes services.
+
+Additional slice-10 delivery patches are now on the candidate branch:
+
+```text
+3123777f4d8  Telegram split-send resume, per-chat ordering, and flood cooldown
+c65ac8f9e9e  partial-delivery fallback suppression
+c1c37ad0146  failed-delivery backoff and last-attempt recovery
+```
+
+Focused Telegram and delivery-ledger verification: `133 passed`.
