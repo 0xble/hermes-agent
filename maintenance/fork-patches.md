@@ -33,6 +33,8 @@ absence of a submission as evidence that upstream lacks it. Source rollback is a
 reviewed revert of the affected logical patch and dependent adaptations; installed
 runtime rollback follows the separate runtime owner.
 
+For cron-specific fallback divergence, load [cron fallback routing](cron-fallback-routing.md).
+
 ## Classified commits
 
 | commit | subject | slice | upstream | retire when |
