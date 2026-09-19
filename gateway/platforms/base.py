@@ -3738,8 +3738,21 @@ class BasePlatformAdapter(ABC):
         # Certain commands must bypass the active-session guard and be dispatched directly to the gateway
         # runner. Without this, they are queued as pending messages and either: See #4926.
         cmd = event.get_command()
+        # Resolve a configured quick-command alias BEFORE the bypass test: an alias for /steer is
+        # otherwise unrecognised here and queued as ordinary user text (fork patch).
+        is_quick_alias = False
+        resolve_quick_alias = getattr(self.gateway_runner, "_quick_command_alias_text", None)
+        if callable(resolve_quick_alias):
+            alias_text = resolve_quick_alias(event, profile_name=getattr(self, "_owner_profile", None))
+            if isinstance(alias_text, str) and alias_text:
+                cmd = alias_text.lstrip("/").split(maxsplit=1)[0]
+                is_quick_alias = True
         from hermes_cli.commands import (is_interrupt_then_dispatch, should_bypass_active_session)
-        if should_bypass_active_session(cmd):
+        # An alias targeting /stop, /new or /reset stays on ordinary busy semantics: the handoff
+        # path below is not authorization-aware for aliases, so it must not run the cancellation
+        # lifecycle.
+        alias_requires_lifecycle_handoff = bool(is_quick_alias and cmd and is_interrupt_then_dispatch(cmd))
+        if should_bypass_active_session(cmd) and not alias_requires_lifecycle_handoff:
             try:
                 # /stop, /new, /reset: cancel + response + drain; other bypasses don't cancel.
                 if cmd and is_interrupt_then_dispatch(cmd):
