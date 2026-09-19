@@ -164,4 +164,3 @@ def test_rich_limit_counts_materialized_paragraph_payload(adapter):
         adapter.RICH_MESSAGE_MAX_CHARS
     )
     assert adapter._content_fits_rich_limits(content) is False
-
