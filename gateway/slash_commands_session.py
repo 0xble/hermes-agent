@@ -784,7 +784,11 @@ class GatewaySessionCommandsMixin:
         if not sanitized:
             return t("gateway.title.empty_after_clean")
         try:
-            if not await self._session_db.set_session_title(session_id, sanitized):
+            if self._is_telegram_topic_lane(source) and hasattr(self._session_db, "set_session_title_in_lineage"):
+                stored_title = await self._session_db.set_session_title_in_lineage(session_id, sanitized)
+                if stored_title != sanitized:
+                    logger.info("Telegram topic title %r reserved internal lineage alias %r", sanitized, stored_title)
+            elif not await self._session_db.set_session_title(session_id, sanitized):
                 return t("gateway.title.not_found")
         except ValueError as e:
             return t("gateway.shared.warn_passthrough", error=e)

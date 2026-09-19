@@ -30,8 +30,9 @@ def _attach(lane):
         _is_discord_auto_thread_lane=lambda src: lane == "discord",
         _is_relay_discord_channel_lane=lambda src: False,
         _schedule_telegram_topic_title_rename=(
-            lambda src, sid, title: renames.append(title)
+            lambda src, sid, title, **_kw: renames.append(title)
         ),
+        _telegram_topic_icon_context=lambda src: None,
         _schedule_discord_semantic_thread_rename=(
             lambda src, sid, title: renames.append(title)
         ),

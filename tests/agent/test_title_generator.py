@@ -354,6 +354,7 @@ class TestMaybeAutoTitle:
                 main_runtime=None,
                 title_callback=None,
                 runtime_validator=None,
+                icon_context=None,
             )
 
     def test_writes_instant_title_before_the_model_runs(self, tmp_path):
@@ -508,19 +509,25 @@ class TestAutoTitleDuplicateHandling:
             return_value="Debugging Import Error",
         ):
             seen = []
+
+            def title_callback(title, source, *, display_title=None):
+                seen.append((title, source, display_title))
+
             auto_title_session(
                 db,
                 "sess-1",
                 "hi",
-                title_callback=lambda title, _source: seen.append(title),
+                title_callback=title_callback,
             )
         db.get_next_title_in_lineage.assert_called_once_with("Debugging Import Error")
         assert db.set_auto_title.call_args_list[-1][0] == (
             "sess-1",
             "Debugging Import Error #2",
         )
-        # callback fires with the actually-persisted (deduped) title
-        assert seen == ["Debugging Import Error #2"]
+        # callback receives the persisted alias plus the original visible title
+        assert seen == [
+            ("Debugging Import Error #2", "llm", "Debugging Import Error")
+        ]
 
 
 
@@ -663,3 +670,26 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+class TestForkTitleContracts:
+    def test_configured_case_rule_and_recent_titles_reach_prompt(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "{\"title\": \"1Password Login\"}"
+        cfg = {"auxiliary": {"title_generation": {
+            "min_words": 2, "max_words": 5, "case_style": "title_case",
+            "instructions": "Prefer product names", "name_aliases": {"onepass": "1Password"},
+        }}}
+        with patch("agent.title_generator.call_llm", return_value=response) as call, \
+             patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            assert generate_title("onepass login", recent_titles=["Old Session"], avoid_titles=None) == "1Password Login"
+        prompt = call.call_args.kwargs["messages"][0]["content"]
+        assert "2 to 5 words" in prompt and "Title case" in prompt
+        assert "Sentence case" not in prompt and "Old Session" in prompt
+
+    def test_fence_only_and_length_outputs_are_rejected(self):
+        for content, reason in [("```", "stop"), ("partial", "length")]:
+            response = MagicMock(); response.choices = [MagicMock()]
+            response.choices[0].message.content = content; response.choices[0].finish_reason = reason
+            with patch("agent.title_generator.call_llm", return_value=response):
+                assert generate_title("real user request") is None

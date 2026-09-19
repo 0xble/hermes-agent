@@ -5,6 +5,7 @@ is called, cannot fail), then an **upgrade** from one small-model call (cheap ti
 JSON-constrained). Storage enforces provenance ``derived < llm < user``: stage 2 only replaces stage 1
 and neither replaces a name the user typed."""
 
+import inspect
 import json
 import logging
 import re
@@ -20,9 +21,10 @@ logger = logging.getLogger(__name__)
 
 # (task_name, exception) -> None; surfaces auxiliary failures so silent drops don't pile up as NULL titles.
 FailureCallback = Callable[[str, BaseException], None]
-# (title, source) -> None; source is the persisted provenance (``derived`` / ``llm``). Consumers paying a
-# rate-limited remote rename per title (Discord thread, Telegram topic) should act on ``llm`` only.
-TitleCallback = Callable[[str, str], None]
+# (title, source[, display_title=...]) -> None. ``title`` is the persisted
+# alias; ``display_title`` is the unsuffixed label for transports such as
+# Telegram that keep visible topic names separate from session aliases.
+TitleCallback = Callable[..., None]
 # () -> bool, called right before the LLM request; False skips (e.g. the user switched models and
 # the request would reload one the runtime already evicted).
 # Validation callback: () -> bool. See #19027.
@@ -33,11 +35,8 @@ MAX_TITLE_INPUT_CHARS = 1000
 # Cap on the instant derived title; a raw fragment reads worse the longer it runs.
 MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
-# Upper bound on accepted title word count. Titling is a 3-7 word task; a small tiny-model sometimes ignores
-# the task and answers the user's message instead — that answer must never become the session title (see the
-# answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
-# legitimate wordy titles while excluding full-sentence answers.
-_MAX_TITLE_WORDS = 12
+# The ceiling is the configured ``max_words`` plus headroom (see generate_title; port of can1357/oh-my-pi#7306).
+_TITLE_WORD_SLACK = 5
 
 # The example titles shown to the model in the prompt, and the echo-guard
 # set: when the opening message carries little topical signal, a small model
@@ -63,21 +62,23 @@ _EXAMPLE_ECHO_REJECT = frozenset(
 ) | {_PROMPT_VAGUE_EXAMPLE.lower()}
 
 _TITLE_PROMPT_TEMPLATE = (
-    "You name chat sessions. Given the user's opening message, write a title "
+    "You name chat sessions. Given the user's opening message, write a concise noun-phrase title "
     "that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
-    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
-    "- Name what the user wants DONE, not that they asked a question.\n"
+    "- __WORD_RULE__\n"
+    "- __CASE_RULE__\n"
+    "- Name the subject, artifact, or decision, never an imperative or conditional action.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
     "- Drop filler words: the, this, my, a, an.\n"
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
+    "__INSTRUCTIONS__\n"
+    "__AVOID_TITLES__\n"
     + "".join(f'Good: {{"title": "{t}"}}\n' for t in _PROMPT_GOOD_EXAMPLES)
     + f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
-    'Too long: {"title": "Investigate and fix the issue where the login button '
-    'does not respond on mobile devices"}\n\n'
+    'Contrastive example: use "Postgres connection pool exhaustion", not "Fix the Postgres connection pool".\n\n'
     'Reply with JSON only: {"title": "..."}'
 )
 
@@ -119,13 +120,69 @@ def _title_config() -> dict:
     return ((load_config_readonly() or {}).get("auxiliary") or {}).get("title_generation") or {}
 
 
+def _title_preferences() -> dict:
+    """Return bounded title prompt preferences from the operator config."""
+    cfg = _title_config()
+    try:
+        min_words = max(1, min(12, int(cfg.get("min_words", 3))))
+    except (TypeError, ValueError):
+        min_words = 3
+    try:
+        max_words = max(1, min(12, int(cfg.get("max_words", 7))))
+    except (TypeError, ValueError):
+        max_words = 7
+    if min_words > max_words:
+        min_words = max_words
+    case_style = str(cfg.get("case_style", "sentence_case")).strip().lower()
+    if case_style not in {"sentence_case", "title_case"}:
+        case_style = "sentence_case"
+    instructions = cfg.get("instructions", "")
+    if isinstance(instructions, (list, tuple)):
+        instructions = " ".join(str(item) for item in instructions)
+    instructions = str(instructions or "").strip()[:1000]
+    aliases = cfg.get("name_aliases", {})
+    if not isinstance(aliases, dict):
+        aliases = {}
+    aliases = {str(k): str(v) for k, v in aliases.items() if str(k).strip() and str(v).strip()}
+    return {"min_words": min_words, "max_words": max_words, "case_style": case_style,
+            "instructions": instructions, "name_aliases": aliases}
+
+
+def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None) -> str:
+    prefs = prefs or _title_preferences()
+    case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
+                 if prefs["case_style"] == "title_case" else
+                 "Sentence case: capitalize only the first word and proper nouns; this is the only capitalization rule.")
+    avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
+    avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
+    instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
+    return _TITLE_PROMPT_TEMPLATE.replace("__WORD_RULE__", f"{prefs['min_words']} to {prefs['max_words']} words.") \
+        .replace("__CASE_RULE__", case_rule) \
+        .replace("__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER) \
+        .replace("__INSTRUCTIONS__", instruction_block) \
+        .replace("__AVOID_TITLES__", avoid_block)
+
+
+def _restore_name_aliases(title: str, aliases: dict) -> str:
+    """Restore configured display names without treating operator text as regex."""
+    result = title
+    for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        alias = str(alias)
+        if not alias:
+            continue
+        # Match the configured alias literally.  The surrounding word guards
+        # prevent replacing a substring of a larger identifier while allowing
+        # punctuation-bearing names such as C++ and .NET.
+        pattern = r"(?<!\w)" + re.escape(alias) + r"(?!\w)"
+        result = re.sub(pattern, lambda _match, value=canonical: value, result, flags=re.IGNORECASE | re.UNICODE)
+    return result
+
 def _title_language() -> str:
     """Configured title language, or "" to match the user."""
     try:
         return str(_title_config().get("language", "")).strip()
     except Exception:
         return ""
-
 
 def _auto_title_enabled() -> bool:
     try:
@@ -246,8 +303,33 @@ def _report_failure(failure_callback: Optional[FailureCallback], exc: BaseExcept
     _safe_callback(failure_callback, ("title generation", exc), "%s failure_callback raised", label)
 
 
-def _notify_title(title_callback: Optional[TitleCallback], title: str, source: str, label: str) -> None:
-    _safe_callback(title_callback, (title, source), "%s callback failed", label)
+def _notify_title(
+    title_callback: Optional[TitleCallback],
+    title: str,
+    source: str,
+    label: str,
+    *,
+    display_title: Optional[str] = None,
+    icon: Optional[str] = None,
+) -> None:
+    """Notify title consumers, preserving compatibility with two-argument callbacks. Keyword
+    extras (``display_title``, ``icon``) are passed only when the callback's signature binds them."""
+    if title_callback is None:
+        return
+    try:
+        extras = {k: v for k, v in (("display_title", display_title), ("icon", icon)) if v is not None}
+        if not extras:
+            title_callback(title, source)
+            return
+        try:
+            signature = inspect.signature(title_callback)
+            signature.bind(title, source, **extras)
+        except (TypeError, ValueError):
+            title_callback(title, source)
+        else:
+            title_callback(title, source, **extras)
+    except Exception:
+        logger.debug("%s callback failed", label, exc_info=True)
 
 
 def _is_prompt_example_echo(title: str) -> bool:
@@ -268,6 +350,12 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    avoid_titles=None,
+    recent_titles=None,
+    icon_options=None,
+    recent_icons=None,
+    icon_instructions: str = "",
+    icon_callback: Optional[Callable[[Optional[str], str], None]] = None,
 ) -> Optional[str]:
     """Title from the opening message alone (waiting for the assistant made this slow and bought
     nothing). ``runtime_validator`` runs right before the request; False skips silently.
@@ -289,10 +377,16 @@ def generate_title(
     if not user_snippet.strip():
         return None
     language = _title_language()
-    # str.replace, not str.format: the prompt embeds literal JSON braces.
-    prompt = _TITLE_PROMPT_TEMPLATE.replace(
-        "__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER,
-    )
+    prefs = _title_preferences()
+    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs)
+    icon_allowed = list(icon_options or [])
+    if icon_allowed:
+        from agent.topic_icons import fresh_allowed_icons
+        candidates = fresh_allowed_icons(icon_allowed, recent_icons)
+        prompt += "\n\nAlso select one icon. Reply with JSON only: {\"title\": \"...\", \"icon\": \"...\"}. " \
+            f"Allowed icons: {candidates}."
+        if icon_instructions:
+            prompt += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
     try:
         response = call_llm(
             task="title_generation",
@@ -308,25 +402,41 @@ def generate_title(
             # ("```json") as the session title (#91927).
             reasoning_config={"enabled": False},
         )
-        title = _clean_title(_extract_title_text(response.choices[0].message.content or ""))
-        # Answer-shaped output guard: titling is a 3-7 word task, so a title with many words is a model that
-        # ignored the task and answered the user's message instead ("I don't have context on X — that's not
-        # something I recognize..."). Truncating would store half an assistant blob as the session title,
-        # which is still an assistant blob — reject instead so the caller retries on the next exchange
-        # (maybe_auto_title fires for the first two exchanges). Port of can1357/oh-my-pi#7306.
-        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
-            # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason in {"length", "max_tokens"}:
+            logger.debug("Rejecting truncated title output (finish_reason=%s)", finish_reason)
             return None
-        # Example-echo guard: a title that parrots one of the prompt's own
-        # examples back verbatim says nothing about the session — reject it so
-        # the instant derived title (a slice of the user's actual words)
-        # survives instead. Exact match after wrapper-stripping, deliberately
-        # not fuzzy, so a genuinely topical title that merely resembles an
-        # example still passes. Wrappers are stripped for the comparison only
-        # ("(Fix login button on mobile)" is the same canned echo as the bare
-        # example). Port of QwenLM/qwen-code#9709.
-        if title is not None and _is_prompt_example_echo(title):
+        raw_content = getattr(getattr(choice, "message", None), "content", "") or ""
+        payload = None
+        if icon_allowed:
+            with suppress(Exception):
+                candidate = str(raw_content).strip()
+                fence = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+                payload = json.loads(fence.group(1) if fence else candidate)
+
+        if not any(char.isalnum() for char in str(raw_content)):
+            logger.debug("Rejecting title output with no Unicode letters or digits")
+            return None
+        title_value = payload.get("title") if isinstance(payload, dict) else None
+        title = _clean_title(_extract_title_text(title_value or raw_content))
+        if icon_allowed and icon_callback is not None:
+            from agent.topic_icons import choose_topic_icon_deterministic, validate_model_icon
+            icon = validate_model_icon(payload.get("icon") if isinstance(payload, dict) else None, icon_allowed)
+            if icon is None:
+                icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
+            with suppress(Exception):
+                icon_callback(icon, "llm" if title else "fallback")
+        if title is None or not any(char.isalnum() for char in title):
+            return None
+        title = _restore_name_aliases(title, prefs["name_aliases"])
+        # Answer-shaped output guard: titling is a short noun-phrase task. Respect the
+        # configured ceiling (already bounded by _title_preferences()).
+        max_title_words = prefs["max_words"] + _TITLE_WORD_SLACK
+        if len(title.split()) > max_title_words:
+            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
+            return None
+        if _is_prompt_example_echo(title):
             logger.debug("Rejecting prompt-example echo title: %r", title)
             return None
         return title
@@ -392,7 +502,9 @@ def apply_instant_title(session_db, session_id: str, user_message: str, title_ca
         title = derive_title(user_message) if is_titleable_user_message(user_message) else None
         persisted = _persist_session_title(session_db, session_id, title, source="derived", dedupe=False) if title else None
         if persisted:
-            _notify_title(title_callback, persisted, "derived", "Instant-title")
+            _notify_title(
+                title_callback, persisted, "derived", "Instant-title", display_title=title
+            )
         return persisted
     except Exception:
         logger.debug("Instant title failed", exc_info=True)
@@ -407,6 +519,7 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    icon_context: Optional[dict] = None,
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -426,8 +539,22 @@ def auto_title_session(
         # Same for the accounting context, so the title call's token usage is recorded against this session
         # (task='title_generation', #23270).
         set_accounting_context(session_db, session_id)
+        recent_titles = []
+        with suppress(Exception):
+            list_recent = getattr(session_db, "list_recent_session_titles", None)
+            if callable(list_recent):
+                recent_titles = list_recent(exclude_session_id=session_id, limit=20)
+        chosen_icon: list = []
+        icon_kwargs: dict = {}
+        if isinstance(icon_context, dict) and icon_context.get("options"):
+            icon_kwargs = dict(
+                icon_options=icon_context.get("options"), recent_icons=icon_context.get("recent"),
+                icon_instructions=str(icon_context.get("instructions") or ""),
+                icon_callback=lambda icon, _how: chosen_icon.append(icon),
+            )
         title, source = generate_title(
-            user_message, failure_callback=failure_callback, main_runtime=main_runtime, runtime_validator=runtime_validator,
+            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
+            runtime_validator=runtime_validator, recent_titles=recent_titles, **icon_kwargs,
         ), "llm"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message), "derived"
@@ -440,7 +567,10 @@ def auto_title_session(
             return
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
-            _notify_title(title_callback, persisted, source, "Auto-title")
+            _notify_title(
+                title_callback, persisted, source, "Auto-title", display_title=title,
+                icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
+            )
     except Exception as e:
         # WARNING so operators see it in agent.log; names the likely cause.
         logger.warning("Auto-title failed (harmless; if this started after an update, restart the running Hermes process): %s", e)
@@ -475,6 +605,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    icon_context: Optional[dict] = None,
 ) -> None:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model."""
     if not session_db or not session_id or not user_message:
@@ -491,7 +622,8 @@ def maybe_auto_title(
     threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message),
-        kwargs=dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback, runtime_validator=runtime_validator),
+        kwargs=dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
+                    runtime_validator=runtime_validator, icon_context=icon_context),
         daemon=True,
         name="auto-title",
     ).start()

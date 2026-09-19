@@ -1333,6 +1333,10 @@ If you do not want Hermes to auto-generate titles after the first exchange, set
 `auxiliary.title_generation.enabled: false`. Manual titles still work through
 `/title` and `hermes sessions rename`.
 
+`auxiliary.title_generation.min_words` / `max_words` set the title word budget (defaults 3/7), `case_style` is `sentence_case` or `title_case`, `instructions` adds trusted operator guidance, and `name_aliases` restores configured display spellings (for example `onepass: 1Password`).
+
+For Telegram DM topics, `platforms.telegram.extra.auto_topic_icons` enables Bot API semantic icons. `preserve_manual_topic_icons` defaults to true; `topic_icon_instructions` and `topic_icon_overrides` customize selection. Name and icon are sent in one topic edit, and `/title` reserves a private lineage alias when a visible Telegram label is duplicated.
+
 ### Stream-only endpoints
 
 Some OpenAI-compatible endpoints reject non-streaming chat requests outright (e.g. Tencent Copilot returns HTTP 400 `"Non-stream chat request is currently not supported"`). Interactive chat already streams, but auxiliary tasks (title generation, compression, vision) use non-streaming calls and would fail on every attempt. Hermes always treats `copilot.tencent.com` as stream-only; for any other such endpoint, list a URL substring under `auxiliary.stream_only_base_urls`:

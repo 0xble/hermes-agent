@@ -19,6 +19,7 @@ from gateway.config import Platform
 from gateway.platforms.base import _prefix_within_utf16_limit, utf16_len
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
+from hermes_state_telegram import TELEGRAM_TOPIC_ICON_HISTORY_LIMIT
 from utils import is_truthy_value
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -474,15 +475,48 @@ class GatewayTopicThreadsMixin:
             "Discord semantic thread rename",
         )
 
-    def _schedule_telegram_topic_title_rename(self, source: SessionSource, session_id: str, title: str) -> None:
+    def _schedule_telegram_topic_title_rename(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        *,
+        user_message: str = "",
+        model_icon: Optional[str] = None,
+    ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
             return
         self._schedule_rename_from_title_thread(
             source,
-            lambda copied: self._rename_telegram_topic_for_session_title(copied, session_id, title),
+            lambda copied: self._rename_telegram_topic_for_session_title(
+                copied, session_id, title, user_message=user_message, model_icon=model_icon
+            ),
             "Telegram topic title rename",
         )
+
+    def _telegram_topic_icon_context(self, source: SessionSource) -> Optional[dict]:
+        """Icon inputs for the combined title+icon model call, or None when icons are off or the
+        adapter has not cached Telegram's allowed-icon catalog yet (first topic falls back to the
+        deterministic chooser; the catalog is fetched during the rename and cached after)."""
+        extra = getattr(getattr(getattr(self, "config", None), "platforms", {}).get(source.platform), "extra", {}) or {}
+        if not is_truthy_value(extra.get("auto_topic_icons")):
+            return None
+        adapter = self._adapter_for_source(source)
+        options = getattr(adapter, "_forum_topic_icon_options", None) if adapter is not None else None
+        if not options:
+            return None
+        recent: list = []
+        sync_db = self._sync_session_db()
+        if sync_db is not None and source.chat_id:
+            with suppress(Exception):
+                recent = sync_db.list_recent_telegram_topic_icons(
+                    str(source.chat_id), TELEGRAM_TOPIC_ICON_HISTORY_LIMIT, self._telegram_topic_profile_name(source))
+        return {
+            "options": list(options),
+            "recent": recent,
+            "instructions": str(extra.get("topic_icon_instructions") or ""),
+        }
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """``gateway.platforms.telegram.extra.disable_topic_auto_rename``; default False (auto-rename on)."""
@@ -492,7 +526,39 @@ class GatewayTopicThreadsMixin:
             return False
         return is_truthy_value((getattr(platform_cfg, "extra", None) or {}).get("disable_topic_auto_rename"))
 
-    async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
+    async def _rename_telegram_topic_for_session_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        *,
+        user_message: str = "",
+        model_icon: Optional[str] = None,
+    ) -> None:
+        """Serialize per-chat title/icon selection so recent-history rotation is race-free."""
+        locks = getattr(self, "_telegram_topic_icon_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._telegram_topic_icon_locks = locks
+        key = (
+            self._telegram_topic_profile_name(source),
+            str(source.chat_id or ""),
+        )
+        lock = locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            await self._rename_telegram_topic_for_session_title_unlocked(
+                source, session_id, title, user_message=user_message, model_icon=model_icon
+            )
+
+    async def _rename_telegram_topic_for_session_title_unlocked(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        *,
+        user_message: str = "",
+        model_icon: Optional[str] = None,
+    ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
@@ -520,7 +586,7 @@ class GatewayTopicThreadsMixin:
                     chat_id=str(source.chat_id), thread_id=str(source.thread_id),
                     profile_name=self._telegram_topic_profile_name(source),
                 )
-                if binding and str(binding.get("session_id") or "") != str(session_id):
+                if not binding or str(binding.get("session_id") or "") != str(session_id):
                     return
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
@@ -528,19 +594,126 @@ class GatewayTopicThreadsMixin:
         if adapter is None:
             return
         topic_name = self._sanitize_telegram_topic_title(title)
+        icon_custom_emoji_id = None
+        icon_emoji = None
+        icon_state_to_record = None
+        icon_history_to_record = None
+        icon_state_owner = "auto"
+        sync_session_db = self._sync_session_db() if session_db is not None else None
+        extra = getattr(getattr(getattr(self, "config", None), "platforms", {}).get(source.platform), "extra", {}) or {}
+        if is_truthy_value(extra.get("auto_topic_icons")):
+            try:
+                options = await adapter.get_forum_topic_icon_options()
+                profile_name = self._telegram_topic_profile_name(source)
+                recent = (
+                    await asyncio.to_thread(
+                        sync_session_db.list_recent_telegram_topic_icons,
+                        str(source.chat_id),
+                        TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                        profile_name,
+                    )
+                    if sync_session_db
+                    else []
+                )
+                from agent.topic_icons import choose_topic_icon_deterministic, resolve_override, validate_model_icon
+                icon_emoji = (
+                    resolve_override(topic_name, extra.get("topic_icon_overrides"), options)
+                    or validate_model_icon(model_icon, options)
+                    or choose_topic_icon_deterministic(topic_name, user_message, options, recent)
+                )
+                selected = next(
+                    (item for item in options if item.get("emoji") == icon_emoji),
+                    None,
+                )
+                icon_custom_emoji_id = selected.get("custom_emoji_id") if selected else None
+                manual_icon_id = None
+                manual_icon_getter = getattr(type(adapter), "get_manual_topic_icon", None)
+                if is_truthy_value(extra.get("preserve_manual_topic_icons", True), default=True) and callable(manual_icon_getter):
+                    manual_icon_id = manual_icon_getter(adapter, str(source.chat_id), str(source.thread_id))
+                if manual_icon_id:
+                    manual_selected = next(
+                        (item for item in options if item.get("custom_emoji_id") == manual_icon_id),
+                        None,
+                    )
+                    icon_custom_emoji_id = None
+                    icon_state_owner = "manual"
+                    icon_state_to_record = (
+                        manual_icon_id,
+                        manual_selected.get("emoji") if manual_selected else None,
+                        profile_name,
+                    )
+                state = (
+                    await asyncio.to_thread(
+                        sync_session_db.get_telegram_topic_icon_state,
+                        str(source.chat_id),
+                        str(source.thread_id),
+                        profile_name,
+                    )
+                    if sync_session_db
+                    else None
+                )
+                if state and state.get("owner") == "manual" and is_truthy_value(
+                    extra.get("preserve_manual_topic_icons", True), default=True
+                ):
+                    icon_custom_emoji_id = None
+                if sync_session_db and icon_custom_emoji_id:
+                    icon_state_to_record = (icon_custom_emoji_id, icon_emoji, profile_name)
+                    icon_history_to_record = (icon_emoji, icon_custom_emoji_id, profile_name)
+            except Exception:
+                logger.debug("Failed to select Telegram topic icon", exc_info=True)
+
+        # The binding can change while icon discovery is awaiting Telegram. Recheck
+        # immediately before the write so a stale title/icon cannot cross sessions.
+        if session_db is not None:
+            try:
+                binding = await session_db.get_telegram_topic_binding(
+                    chat_id=str(source.chat_id),
+                    thread_id=str(source.thread_id),
+                    profile_name=self._telegram_topic_profile_name(source),
+                )
+                if not binding or str(binding.get("session_id") or "") != str(session_id):
+                    return
+            except Exception:
+                logger.debug("Failed to verify Telegram topic binding before final rename", exc_info=True)
+                return
+        async def _persist_icon_records() -> None:
+            if not (icon_state_to_record and sync_session_db):
+                return
+            custom_id, emoji, profile_name = icon_state_to_record
+            await asyncio.to_thread(
+                sync_session_db.record_telegram_topic_icon_state,
+                str(source.chat_id), str(source.thread_id),
+                custom_emoji_id=custom_id, emoji=emoji, owner=icon_state_owner, profile_name=profile_name,
+            )
+            if icon_history_to_record:
+                history_emoji, history_id, history_profile = icon_history_to_record
+                await asyncio.to_thread(
+                    sync_session_db.record_telegram_topic_icon_history,
+                    str(source.chat_id), emoji=history_emoji, custom_emoji_id=history_id, profile_name=history_profile,
+                )
+
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
             if rename_topic is not None:
-                await rename_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id), name=topic_name)
+                kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": topic_name}
+                if icon_custom_emoji_id:
+                    kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+                if await rename_topic(**kwargs) is not True:
+                    return
+                await _persist_icon_records()
                 return
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) or getattr(bot, "editForumTopic", None)
             if edit_forum_topic is None:
                 return
+            kwargs = {"name": topic_name}
+            if icon_custom_emoji_id:
+                kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
             try:
-                await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), name=topic_name)
+                await edit_forum_topic(chat_id=int(source.chat_id), message_thread_id=int(source.thread_id), **kwargs)
             except (TypeError, ValueError):
-                await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, name=topic_name)
+                await edit_forum_topic(chat_id=source.chat_id, message_thread_id=source.thread_id, **kwargs)
+            await _persist_icon_records()
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 

@@ -197,6 +197,7 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
             ),
             main_runtime=main_runtime,
             title_callback=getattr(agent, "_on_session_title", None),
+            icon_context=getattr(agent, "_title_icon_context", None),
             runtime_validator=lambda: (
                 getattr(agent, "model", None) == main_runtime["model"]
                 and getattr(agent, "provider", None) == main_runtime["provider"]

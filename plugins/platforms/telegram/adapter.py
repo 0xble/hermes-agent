@@ -622,6 +622,14 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_online_text: str = str(extra.get("status_online", "Online"))
         self._status_offline_text: str = str(extra.get("status_offline", "Offline"))
         self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
+        self._forum_topic_icon_options: Optional[List[Dict[str, Any]]] = None
+        # User-selected custom icons observed on incoming topic service messages.
+        # These are kept separately from auto-selection so a later title rename
+        # does not overwrite a manual choice.
+        self._manual_topic_icons: Dict[str, str] = {}
+        # Icons Hermes itself last wrote per topic, so the bot's own edit_forum_topic echoing
+        # back as a forum_topic_edited service message is not mistaken for a user choice.
+        self._auto_topic_icons_written: Dict[str, str] = {}
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
         # getFile cap: 20MB on the public Bot API, 2GB on a local telegram-bot-api (base_url).
@@ -2583,16 +2591,45 @@ class TelegramAdapter(BasePlatformAdapter):
         self._persist_dm_topic_thread_id(chat_id_int, name, int(thread_id), replace_existing=force_create)
         return str(thread_id)
 
-    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str) -> None:
-        """Rename a forum topic in a private (DM) chat."""
+    async def get_forum_topic_icon_options(self) -> List[Dict[str, Any]]:
+        """Return Bot API custom emoji options, cached for this adapter lifetime."""
+        if self._forum_topic_icon_options is not None:
+            return list(self._forum_topic_icon_options)
+        if not self._bot or not callable(getattr(self._bot, "get_forum_topic_icon_stickers", None)):
+            return []
+        try:
+            stickers = await self._bot.get_forum_topic_icon_stickers()
+            options = []
+            for sticker in stickers or []:
+                emoji = getattr(sticker, "emoji", None)
+                custom_id = getattr(sticker, "custom_emoji_id", None)
+                if emoji and custom_id:
+                    options.append({"emoji": str(emoji), "custom_emoji_id": str(custom_id)})
+            self._forum_topic_icon_options = options
+            return list(options)
+        except Exception:
+            logger.debug("[%s] Failed to load forum topic icon options", self.name, exc_info=True)
+            return []
+
+    async def rename_dm_topic(self, chat_id: int, thread_id: int, name: str, icon_custom_emoji_id: Optional[str] = None) -> bool:
+        """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it."""
         if not self._bot:
-            return
+            return False
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        await self._bot.edit_forum_topic(chat_id=chat_id_arg, message_thread_id=int(thread_id), name=name)
+        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id), "name": name}
+        if icon_custom_emoji_id:
+            kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+        await self._bot.edit_forum_topic(**kwargs)
+        if icon_custom_emoji_id:
+            written = getattr(self, "_auto_topic_icons_written", None)
+            if written is None:
+                written = self._auto_topic_icons_written = {}
+            written[f"{chat_id}:{int(thread_id)}"] = str(icon_custom_emoji_id)
         logger.info("[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'", self.name, chat_id, thread_id, name)
+        return True
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int, replace_existing: bool = False) -> None:
         """Save a newly created thread_id back into config.yaml so it survives restarts."""
@@ -2860,6 +2897,16 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TelegramMessageHandler(
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message))
+        # Forum-topic service messages carry no text/media, so the core handlers never see them;
+        # observe them here to learn user-chosen topic icons (preserve_manual_topic_icons).
+        status = getattr(filters, "StatusUpdate", None)
+        topic_filters = [getattr(status, n, None) for n in ("FORUM_TOPIC_CREATED", "FORUM_TOPIC_EDITED")] if status else []
+        topic_filters = [f for f in topic_filters if f is not None]
+        if topic_filters:
+            combined = topic_filters[0]
+            for extra_filter in topic_filters[1:]:
+                combined = combined | extra_filter
+            app.add_handler(TelegramMessageHandler(combined, self._handle_forum_topic_service_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
@@ -6701,6 +6748,40 @@ class TelegramAdapter(BasePlatformAdapter):
         if cache_key not in self._dm_topics:
             self._dm_topics[cache_key] = int(thread_id)
             logger.info("[%s] Cached DM topic from message: %s -> thread_id=%s", self.name, cache_key, thread_id)
+
+    def _remember_manual_topic_icon(self, chat_id: str, thread_id: str, custom_emoji_id: Any) -> None:
+        if custom_emoji_id:
+            icons = getattr(self, "_manual_topic_icons", None)
+            if icons is None:
+                icons = self._manual_topic_icons = {}
+            icons[f"{chat_id}:{thread_id}"] = str(custom_emoji_id)
+
+    async def _handle_forum_topic_service_message(self, update, context) -> None:
+        """Record a user-chosen topic icon from forum_topic_created/edited service messages."""
+        try:
+            message = getattr(update, "message", None) or getattr(update, "edited_message", None)
+            chat = getattr(message, "chat", None)
+            thread_id = getattr(message, "message_thread_id", None)
+            if message is None or chat is None or not thread_id:
+                return
+            if str(getattr(chat, "type", "")) != "private":
+                return
+            for event_name in ("forum_topic_edited", "forum_topic_created"):
+                topic_event = getattr(message, event_name, None)
+                custom_emoji_id = getattr(topic_event, "icon_custom_emoji_id", None) if topic_event else None
+                if not custom_emoji_id:
+                    continue
+                key = f"{chat.id}:{thread_id}"
+                if getattr(self, "_auto_topic_icons_written", {}).get(key) == str(custom_emoji_id):
+                    return  # our own edit echoed back; not a user choice
+                self._remember_manual_topic_icon(str(chat.id), str(thread_id), custom_emoji_id)
+                return
+        except Exception:
+            logger.debug("[%s] forum topic service message ignored", self.name, exc_info=True)
+
+    def get_manual_topic_icon(self, chat_id: str, thread_id: str) -> Optional[str]:
+        """Return a custom icon observed from a user topic event, if any."""
+        return getattr(self, "_manual_topic_icons", {}).get(f"{chat_id}:{thread_id}")
 
     @classmethod
     def _flatten_rich_inline_text(cls, value: Any) -> str:

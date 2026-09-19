@@ -858,14 +858,29 @@ class TurnRunner:
             # only knowable AFTER delivery, so register eagerly and let the rename lane look up the
             # cache at fire time — gating registration on the cache read meant it never registered.
             if runner._is_telegram_topic_lane(source):
-                lane = "_schedule_telegram_topic_title_rename"
+                # Capture now: _prepare_turn_message may prepend resume/model notes to
+                # ctx.message before the titler fires, and the icon heuristic must score
+                # the user's words, not recovery guidance.
+                opening_message = getattr(ctx, "message", "") or ""
+                if not isinstance(opening_message, str):
+                    opening_message = ""
+
+                def _schedule_telegram_title(title, title_source, *, display_title=None, icon=None):
+                    if title_source != "llm":
+                        return False
+                    return runner._schedule_telegram_topic_title_rename(
+                        source, session_id, display_title or title,
+                        user_message=opening_message, model_icon=icon,
+                    )
+                agent._on_session_title = _schedule_telegram_title
+                agent._title_icon_context = runner._telegram_topic_icon_context(source)
             elif runner._is_discord_auto_thread_lane(source) or runner._is_relay_discord_channel_lane(source):
                 lane = "_schedule_discord_semantic_thread_rename"
+                agent._on_session_title = lambda title, title_source: (
+                    title_source == "llm" and getattr(runner, lane)(source, session_id, title)
+                )
             else:
                 return
-            agent._on_session_title = lambda title, title_source: (
-                title_source == "llm" and getattr(runner, lane)(source, session_id, title)
-            )
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
