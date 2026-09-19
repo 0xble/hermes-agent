@@ -1,0 +1,10 @@
+name: memory-journal
+version: "0.1.0"
+description: "Hash-chained local journal and safe undo for built-in Hermes memory writes."
+author: "0xble"
+provides_tools:
+  - memory_undo
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+

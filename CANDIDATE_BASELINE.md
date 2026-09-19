@@ -121,5 +121,21 @@ Verification:
 hermes plugins doctor .../review-candidate --ci    registration passed
 tests: candidate-extensions/review-candidate/test_review_candidate.py
 4 passed in 1.16s, including exact-receipt reuse for an unchanged candidate.
+
+## Slice 5 memory journal extension
+
+The candidate extension at `candidate-extensions/memory-journal/` observes
+successful built-in `memory` writes, records before/after snapshots in a
+profile-local hash chain, and exposes a parent-only `memory_undo` tool. Failed
+or staged writes are excluded. Undo refuses stale profile state and refuses
+non-latest entries.
+
+Verification:
+
+```text
+hermes plugins doctor .../memory-journal --ci    registration passed
+tests: candidate-extensions/memory-journal/test_memory_journal.py
+2 passed in 0.04s
+```
 ```
 ```
