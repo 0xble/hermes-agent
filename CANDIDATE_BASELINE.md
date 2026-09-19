@@ -618,7 +618,7 @@ reviewed head, with the two prior heads preserved under `refs/archive/`.
 | gateway identity | pid 20382, `~/.hermes/hermes-agent/venv`, launchd `runs = 1`, never exited |
 | Telegram connect | polling healthy, 60 commands registered |
 | Telegram outbound | `hermes send` delivered message 109040 to the home DM through the candidate's credential path |
-| Telegram inbound round trip | one-shot job `e295e103c0bc` fired on the candidate scheduler; its turn is in a 600 s proxy rate-limit backoff at the time of writing (same limit the legacy gateway hit at 01:12) |
+| Telegram inbound round trip | one-shot job `e295e103c0bc` fired on the candidate scheduler at 01:34; the Codex route rate-limited, the turn completed at 01:45 on the configured fallback (`claude-opus-5` via the proxy), `last_status: ok`, delivered to the home DM. The fallback chain proved itself live. |
 | cron continuity | 94 job ids identical; the candidate completed three scheduled jobs within five minutes, including the one the legacy drain interrupted |
 | memory | add, undo, journal intact; nothing left in MEMORY.md; Hindsight retention indicator active on bank `brianle` |
 | skills | 106 canonical skills resolve from the dotfiles install |
