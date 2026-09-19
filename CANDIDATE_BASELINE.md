@@ -285,8 +285,7 @@ endpoint, credentials, and `HERMES_HOME` profile-scoped. Existing multiplex
 coverage verifies that a secondary profile does not inherit the default profile's
 bank or retain-shaping values.
 
-Focused bank and identity verification: `3 passed`. The broader Hindsight
-provider file has eight environment-sensitive failures when the optional
-`hindsight-client` and `hindsight_client_api` packages are absent from the
-candidate environment; those failures are recorded as dependency setup gaps,
-not treated as a pass.
+Focused bank and identity verification: `3 passed`. After installing the
+candidate's pinned optional `hindsight-client==0.6.1` dependency in the isolated
+worktree environment, the Hindsight provider and multiplex identity suites pass
+`91 passed, 1 skipped`. No production endpoint, bank, or credential was used.
