@@ -12,16 +12,21 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - Telegram topic icons use Bot API `get_forum_topic_icon_stickers` options only.
   Name and icon changes share one `edit_forum_topic` call. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
-- `/title X` on a Telegram topic stores `X` or a serialized lineage alias such as
-  `X #2`, while the visible Telegram topic is renamed to unsuffixed `X`. Non-Telegram
-  title collision behavior remains upstream behavior.
+- `/title X` on a Telegram topic stores the user's exact text, or the next free lineage alias
+  such as `X #2` only when that exact text is held by another session; the visible Telegram
+  topic is renamed to the unsuffixed label. Auto-titles that collide likewise keep the visible
+  label unsuffixed while the session row carries the alias. Non-Telegram collision behavior
+  remains upstream behavior.
+- `preserve_manual_topic_icons` relies on a Bot API `StatusUpdate` handler that observes
+  `forum_topic_created`/`forum_topic_edited` service messages in private chats; a user-chosen
+  icon recorded there is never replaced by an automatic rename.
 
 ## Provenance and patches
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
   `slice-16-topic-icons`, and `slice-17-topic-lineage`.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
-  `origin/main` `06004e8e1b0`; source designs are NousResearch/hermes-agent PR
+  `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR
   [#66353](https://github.com/NousResearch/hermes-agent/pull/66353) and the
   single-call title+icon idea in [#35737](https://github.com/NousResearch/hermes-agent/pull/35737).
 - **Surfaces:** `agent/title_generator.py`, `agent/topic_icons.py`,
@@ -32,7 +37,9 @@ its optional icon, and the durable alias can be observed through one Telegram to
   deterministically when the model field is absent or invalid.
 - **Upstream disposition:** source PRs are open design references, not released
   equivalent behavior.
-- **Fork delivery:** local commits are recorded in `maintenance/fork-patches.md`.
+- **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
+  `Fork-Patch:` trailer slices above. The unit row in `maintenance/fork-patches.md` is the ledger
+  entry; `scripts/check_fork_patches.py` verifies the trailer on every post-baseline commit.
 
 ## Update
 
@@ -46,7 +53,7 @@ its ledger rows in the same reviewed change.
 
 Run the focused title, icon, gateway, and state tests through `scripts/run_tests.sh`.
 Run `python scripts/check_fork_patches.py` against the worktree HEAD, `git diff --check`,
-and `ruff check` on changed Python files. If rollback is required, revert the three
-feature commits as a unit and migrate or retain the two icon tables before starting a
-process on the rolled-back code; never edit the operator's live config as part of
-source rollback.
+and `ruff check` on changed Python files. If rollback is required, revert the landed
+squash commit (found by its `Fork-Patch:` trailer) as one unit and retain the two icon tables
+(`telegram_topic_icon_state`, `telegram_topic_icon_history`) before starting a process on the
+rolled-back code; never edit the operator's live config as part of source rollback.
