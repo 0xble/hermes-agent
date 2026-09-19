@@ -92,7 +92,11 @@ def _detach_child(parent_agent: Any, child: Any) -> None:
 def _signal_child_stop(child: Any, *reason: str) -> None:
     """Cooperative interrupt so the child's worker thread can exit cleanly."""
     with _quiet(None):
-        if child is not None and not request_hard_interrupt(child, *reason) and hasattr(child, "_interrupt_requested"):
+        if child is None:
+            return
+        if reason:
+            child._delegation_interrupt_reason = str(reason[0])
+        if not request_hard_interrupt(child, *reason) and hasattr(child, "_interrupt_requested"):
             child._interrupt_requested = True
 
 # ── 0-API-call timeout diagnostic ────────────────────────────────────────────
@@ -527,6 +531,10 @@ def _build_result_entry(
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
+    if status == "interrupted":
+        interrupt_reason = getattr(child, "_delegation_interrupt_reason", None)
+        if isinstance(interrupt_reason, str) and interrupt_reason:
+            entry["interrupt_reason"] = interrupt_reason
     if status == "failed":
         if schema.valid is False and usable_summary:
             # The child DID respond; name the contract violation instead of the generic "no response" error.

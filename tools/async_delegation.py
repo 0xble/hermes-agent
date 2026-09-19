@@ -9,6 +9,7 @@ crash-recovery wiring. Only the async lifecycle lives here; the child run is an 
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -828,12 +829,29 @@ def _sweep_stale_locked(now: float):
     return stalled, expired, any_monitorable
 
 
-def _call_interrupt(fn, msg: str, *args) -> bool:
+def _call_interrupt(fn, msg: str, *args, reason: str | None = None) -> bool:
     """Invoke an ``interrupt_fn``; True on success, else debug-log ``msg`` (+ exc)."""
     if not callable(fn):
         return False
     try:
-        fn()
+        if reason is None:
+            fn()
+        else:
+            try:
+                parameters = inspect.signature(fn).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_reason = any(
+                p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                           inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                           inspect.Parameter.VAR_POSITIONAL)
+                for p in parameters
+            )
+            # Select the legacy ABI before calling; never retry a callback's own TypeError.
+            if accepts_reason:
+                fn(reason)
+            else:
+                fn()
         return True
     except Exception as exc:
         logger.debug(msg, *args, exc)
@@ -950,7 +968,9 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, msg: str) -> int:
     """Call ``interrupt_fn`` on each record; log ``msg`` once; returns how many succeeded."""
     count = sum(
-        _call_interrupt(r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"))
+        _call_interrupt(
+            r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"), reason=reason,
+        )
         for r in targets)
     if count:
         logger.info(msg, count, reason)
