@@ -83,6 +83,39 @@ def _is_availability_failure(error: Any) -> bool:
     return bool(_AVAILABILITY_PATTERN.search(text))
 
 
+def _structured_verdict(result: dict[str, Any]) -> dict[str, Any]:
+    """The reviewer's verdict as data, parsed out of the child's final message.
+
+    The delegate result wraps the child's prose in a summary string; a receipt whose verdict can
+    only be found by a human reading that prose is not reusable by later delivery stages. A fenced
+    ```json block is preferred, then any bare JSON object with a ``verdict`` key. When nothing
+    parses, the verdict is ``unparsed`` and delivery must treat it as changes_requested.
+    """
+    tasks = result.get("results") if isinstance(result.get("results"), list) else [result]
+    text = ""
+    for task in tasks or []:
+        if isinstance(task, dict):
+            text = str(task.get("summary") or task.get("output") or task.get("content") or "")
+            if text:
+                break
+    candidates: list[str] = []
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
+        candidates.append(match.group(1))
+    start = text.find("{")
+    if start >= 0:
+        candidates.append(text[start:text.rfind("}") + 1])
+    for blob in candidates:
+        try:
+            parsed = json.loads(blob)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and "verdict" in parsed:
+            parsed.setdefault("findings", [])
+            parsed.setdefault("summary", "")
+            return parsed
+    return {"verdict": "unparsed", "findings": [], "summary": text[:2000]}
+
+
 def _spawn_review(context: str, head: str, parent: Any, credentials: dict[str, Any] | None) -> dict[str, Any]:
     """Run one synchronous review child and return its parsed result.
 
@@ -138,9 +171,12 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                          error="candidate diff exceeds the review context limit; split the candidate")
 
         context = (
-            "Review this exact candidate in a fresh child. Do not edit files or create commits. "
-            "Run read-only inspection and relevant tests. Return JSON with keys verdict, findings "
-            "(array of severity/path/line/message), and summary.\n\n"
+            "You are the independent reviewer for this exact candidate. Do not edit files, create "
+            "commits, or call review_candidate (it is parent-only and you are the reviewer it spawned). "
+            "Inspect the repository read-only and run relevant tests when a terminal is available; "
+            "if it is not, say so and review the diff statically. Your FINAL message must be a single "
+            "fenced ```json block with keys verdict (approve or changes_requested), findings (array of "
+            "objects with severity, path, line, message), and summary. No prose outside the block.\n\n"
             f"Repository: {repo}\nBase: {base_resolved}\nHead: {head_resolved}\n"
             f"Covered paths: {json.dumps(covers)}\nFull diff:\n{diff}"
         )
@@ -182,7 +218,8 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
             "covers": covers,
             "reviewer_model": str(result.get("review_model") or reviewer_model),
             "fallback_reason": fallback_reason,
-            "result": result.get("results", result),
+            "result": _structured_verdict(result),
+            "raw_child_result": result.get("results", result),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         receipt_path.parent.mkdir(parents=True, exist_ok=True)

@@ -142,3 +142,44 @@ def test_availability_classifier_separates_the_two_failure_classes(plugin):
         assert plugin._is_availability_failure(availability) is True
     for ran_and_failed in ("child timed out", "status unknown", "interrupted by user", "assertion failed in tests"):
         assert plugin._is_availability_failure(ran_and_failed) is False
+
+
+def test_receipt_carries_the_verdict_as_data_not_prose(plugin, tmp_path, monkeypatch):
+    """The child's fenced JSON is lifted into result.verdict; the raw child blob is kept beside it."""
+    base, head = _repo(tmp_path)
+    prose = ("No terminal here, static review only.\n\n```json\n"
+             '{"verdict": "changes_requested", "findings": [{"severity": "high", "path": "file.txt", '
+             '"line": 1, "message": "bad"}], "summary": "broken"}\n```\n- Blocker: none.')
+    _stub_review(plugin, monkeypatch, [{"results": [{"status": "completed", "summary": prose, "model": "claude-fable-5-1"}]}])
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["status"] == "reviewed"
+    assert result["result"]["verdict"] == "changes_requested"
+    assert result["result"]["findings"][0]["path"] == "file.txt"
+    assert result["raw_child_result"][0]["summary"] == prose
+
+
+def test_unparsable_reviewer_output_is_marked_unparsed(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    _stub_review(plugin, monkeypatch, [{"results": [{"status": "completed", "summary": "looks fine to me"}]}])
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}))
+    assert result["result"]["verdict"] == "unparsed"
+    assert "looks fine" in result["result"]["summary"]
+
+
+def test_reviewer_brief_forbids_recursive_review_calls(plugin, tmp_path, monkeypatch):
+    base, head = _repo(tmp_path)
+    seen = {}
+
+    def fake(context, head_, parent, credentials):
+        seen["context"] = context
+        return {"results": [{"summary": '```json\n{"verdict": "approve"}\n```'}]}
+
+    monkeypatch.setattr(plugin, "_spawn_review", fake)
+    import sys
+    from types import ModuleType
+    engine = ModuleType("agent.review_engine"); engine._load_review_credentials_cfg = lambda: {"model": "m"}
+    lifecycle = ModuleType("agent.subagent_lifecycle"); lifecycle.get_active_subagent_parent = lambda: object()
+    monkeypatch.setitem(sys.modules, "agent.review_engine", engine)
+    monkeypatch.setitem(sys.modules, "agent.subagent_lifecycle", lifecycle)
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    assert "call review_candidate" in seen["context"] and "parent-only" in seen["context"]

@@ -420,3 +420,59 @@ production profile, credential, service or schedule has been touched, no company
 host has been inventoried or migrated, no legacy path retired, and no repository
 renamed. Personal, LPG and Meridian compatibility and recovery remain unproven, and
 each cutover move still needs its own authorization.
+
+## Live isolated candidate, September 19
+
+The candidate ran as a live agent for the first time, in a disposable profile
+(`/tmp/hermes-agent-next-live-home`) with no messaging tokens, no Hindsight, no
+cron and no curator. Model routes mirror production through the local
+CLIProxyAPI on `127.0.0.1:8317`, expressed in upstream vocabulary as two named
+`providers` entries (`codex-proxy` with `api_mode: codex_responses`, `claude-proxy`
+with `api_mode: anthropic_messages`, both keyed by `CLIPROXYAPI_API_KEY`). The
+production config's `model_presets` and `providers[].transport` keys are legacy-fork
+vocabulary the candidate does not read; this is the translation.
+
+**Astra availability resolved.** The proxy's model list includes `gpt-6-astra`,
+`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `claude-fable-5-1`, `claude-fable-5`
+and `claude-opus-5`. The plan's largest open item is closed. Note the proxy's
+identifier is `claude-fable-5-1` with a dash, not the `claude-fable-5.1` the plan
+assumed.
+
+Routes as resolved by `hermes config get`: main `custom:claude-proxy` /
+`claude-fable-5-1`; delegation `custom:codex-proxy` / `gpt-6-astra`; review
+`custom:claude-proxy` / `claude-fable-5-1`. The four candidate extensions register
+through real plugin discovery in a fresh process.
+
+Behavioral proofs, each a separate one-shot CLI session:
+
+- **Turn on the main route** (session `20260918_234501_b3de37`): read a fixture file
+  and reported all four candidate tools plus `delegate_task` available.
+- **Slice 2, delegation** (`20260918_234532_c068b6`): the parent delegated once and
+  returned the child's answer verbatim. The persisted delegate result records
+  `"model": "gpt-6-astra"`, so a Codex child runs under an Anthropic-transport
+  parent as the plan's code reading predicted. The child loaded the worktree's
+  `AGENTS.md` from its working directory and truncated it at 20,000 characters; the
+  production profile must set the child working directory deliberately.
+- **Slice 3, goals** (`20260918_234552_d445eb`): the agent enrolled with `goal_set`,
+  did the work, and read status back. The goal persisted under
+  `goal:20260918_234552_d445eb`, the exact key the gateway's `/goal` reads. The judge
+  did not run because a one-shot CLI turn has no post-turn loop; judge behavior is a
+  gateway-path proof still to run.
+- **Slice 4, review** (`20260918_234617_198bd1`): `review_candidate` spawned a Fable
+  child through `delegate_task`, which found the planted defect in a fixture
+  repository (divisor changed to `len(xs) - 1`, silent zero on empty input) and
+  returned `changes_requested`. The receipt landed at
+  `review_receipts/0f49217a3652d6fe558f6680536e778c3edcbceb.json` with
+  `reviewer_model: claude-fable-5-1` and an empty `fallback_reason`.
+
+Two refinements came out of that receipt and are in this commit. The verdict was
+buried inside the child's prose; it is now parsed into `result.verdict` and
+`result.findings`, with the raw child blob kept beside it, and an unparsable answer is
+marked `unparsed` so delivery treats it as changes requested. The child also wasted
+a call trying `review_candidate` itself; the brief now tells it not to. Note that the
+test session gave the parent only the review and delegation toolsets, so the child
+reviewed statically without a terminal; a production parent carries its full
+toolset.
+
+Not proven live: the Astra-to-Opus delegation fallback and the Fable-to-Opus review
+fallback (would need an induced outage), the goal judge, and every gateway path.
