@@ -125,7 +125,7 @@ class SessionTitlesMixin:
         base = match.group(1) if match else clean
 
         def _do(conn):
-            rows = conn.execute("SELECT id, title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\\\')",
+            rows = conn.execute("SELECT id, title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\')",
                                 (session_id, base, f"{_escape_like(base)} #%")).fetchall()
             used = {str(row["title"]) for row in rows}
             if base not in used:
