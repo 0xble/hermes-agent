@@ -302,3 +302,112 @@ Focused bank and identity verification: `3 passed`. After installing the
 candidate's pinned optional `hindsight-client==0.6.1` dependency in the isolated
 worktree environment, the Hindsight provider and multiplex identity suites pass
 `91 passed, 1 skipped`. No production endpoint, bank, or credential was used.
+
+## Post-review repairs, September 19
+
+An independent review of the candidate found two release blockers and several
+overstated claims. All findings reproduced on the exact branch. The repairs below
+are source-complete and isolated; no production profile, service, or repository
+rename was touched.
+
+### Release blockers, closed
+
+- **Invalid tool schemas.** `goal_set`, `review_candidate` and `request_update`
+  built their top-level `description` from a parenthesized comma-separated run of
+  string literals, making it a tuple that serialized as a JSON array. Both major
+  provider APIs reject that, so any session loading these plugins would have failed
+  on its first model call. The plugin tests never rendered a schema and
+  `plugins doctor` does not check the type. Fixed, with a test that asserts the
+  rendered definition through real plugin discovery and the registry, not just the
+  literal.
+- **`request_update` ignored the native watcher contract.** It wrote a marker with
+  only a reason and timestamp, spawned the updater with output discarded, and never
+  produced the exit/output files. Nothing could stream progress, forwarded prompts
+  had nowhere to land, and the watcher would time out to a synthetic failure. It now
+  writes the routing marker from trusted session context, clears stale watcher
+  state, and delegates to Hermes's own `_spawn_detached_update`.
+
+### Review gate rebuilt
+
+`review_candidate` was a single tool-less completion over a diff truncated at
+120,000 characters, writing one receipt file that each later candidate overwrote,
+with no fallback policy. It could report `reviewed` for a candidate the reviewer
+had only partly seen. It now dispatches a real child through `delegate_task` with
+the `auxiliary.review` credentials, the same path `/review` uses, so the reviewer
+can read the repository and run tests. Oversized candidates are refused rather than
+truncated, receipts are keyed by head SHA, and the secondary reviewer is used only
+for provider availability failures: a child that started and then timed out or
+returned unknown is recorded as `not_reviewed`, never re-run elsewhere. Both routes
+unavailable is never approval.
+
+### Slice 10, corrected and partially closed
+
+The ledger's redelivery deadline was already exact. `FLOOD_RETRY_CAP_SECONDS`
+caps how long the timer sleeps, while the row's `retry_not_before` decides
+eligibility, so a 30-minute penalty already produced no send at 15 minutes. That is
+now pinned by test, because the constant reads like a premature-retry bug. The
+earlier claim that this behavior was missing was wrong.
+
+Genuinely missing and now fixed: the per-chat flood window was consulted only by
+the text send path. `edit_message` neither checked nor armed it, `send_typing`
+checked only its own cooldown, the post-send typing re-arm ignored
+`typing_indicator: false`, and media uploads had no RetryAfter handling at all. A
+rate-limited attachment surfaced as a delivery failure and was never retried.
+Uploads now follow the text contract, and a penalty beyond six hours is abandoned
+once with the delay named instead of churning the timer until the staleness sweep.
+
+**Still open in slice 10:** media obligations are not written to the delivery
+ledger, so a refused attachment is reported truthfully but not automatically
+redelivered. Slice 10 must not be described as complete.
+
+### Camofox aliases scoped per profile
+
+The three operator aliases were hard-coded in two places, so every installation
+advertised `brianle`, `lpg` and `meridian` — including the shared company agents,
+which must not offer an identity they do not own. `browser.camofox.accounts` now
+narrows the list per profile, the schema enum derives from the same helper as the
+validator, identity derivation is unchanged so existing profiles keep their Camofox
+state, and config cannot reintroduce the legacy `personal` alias.
+
+### Goal namespace verified
+
+`goal_set` writes under `goal:<session_id>`, the exact key the gateway's own
+`/goal` commands read, and ignores a model-supplied session id in favour of trusted
+scope. Enrolling under a task id would have created a goal no user-facing command
+could see or clear.
+
+### Branch shape
+
+`hermes update --plan` from the candidate reports
+`Install: git (v0.21.3 @ <head>)`, profiles `default`, and no running services. The
+checkout tracks `origin/candidate/release-v2026.9.14`, so the candidate self-updates
+along its own branch. Aligning `main` with the accepted candidate belongs to the
+repository transition, which is separately gated; nothing here rewrites a published
+branch.
+
+### Verification
+
+Focused matrix green on this host: review gate and schema contracts 11 passed,
+candidate extensions plus schema contracts 36 passed, flood coherence 9 passed,
+delivery ledger 42 passed, the combined Telegram/delivery/emphasis set 146 passed,
+Camofox account and vault 15 passed. A wide `tests/gateway` selection ran
+1855 passed, 6 failed.
+
+Every one of those six is the environment-sensitive class already recorded above,
+confirmed directly: this host resolves public hostnames into the 198.18.0.0/15
+range (`example.com` to `198.18.33.64`, `files.slack.com` to `198.18.28.48`, and
+`github.com` to `198.18.1.87`), so Hermes's SSRF guard correctly refuses the
+fixture URLs before the mocked client is reached. Five are the documented Slack and
+Telegram media rows; `test_remote_media_fetch.py` passes in isolation and fails only
+inside the large selection, so it is test-ordering sensitivity, not a defect. Two
+browser-routing tests fail the same way for the same reason. None of these are
+repaired here: weakening the SSRF guard to satisfy a hijacked resolver would be the
+wrong trade.
+
+### Not done, and still gating
+
+No I6 integration review has been run against the integrated candidate. No
+production profile, credential, service or schedule has been touched, no company
+host has been inventoried or migrated, no legacy path retired, and no repository
+renamed. Personal, LPG and Meridian compatibility and recovery remain unproven, and
+each cutover move still needs its own authorization.
