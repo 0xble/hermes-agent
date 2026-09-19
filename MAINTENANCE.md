@@ -22,6 +22,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - Source checkout, installed personal checkout, and signed company releases are
   distinct identities. A source merge is not deployment or acceptance evidence.
 
+## Maintenance units
+
+| Unit | Required behavior | Load when | Contract |
+|---|---|---|---|
+| Telegram rendering | Preserve rich mode selection and prompt/delivery agreement | Telegram rendering changes and every upstream sync; also load runtime ownership before promotion | [Telegram rendering](maintenance/telegram-rendering.md) |
+
 ## Update
 
 Every run loads [fork patch provenance](maintenance/fork-patches.md). Its separate
