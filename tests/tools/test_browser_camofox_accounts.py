@@ -105,3 +105,63 @@ def test_account_schema_is_gated_to_camofox(monkeypatch):
     with patch.object(browser_tool, "_is_camofox_mode", return_value=True):
         schema = browser_tool._camofox_account_schema_override()
     assert schema["parameters"]["properties"]["account"]["enum"] == ["brianle", "lpg", "meridian"]
+
+
+def test_company_profile_narrows_advertised_aliases(tmp_path, monkeypatch):
+    """A shared company agent must not advertise another owner's alias.
+
+    ``browser.camofox.accounts`` scopes the operator aliases per profile; a Meridian host
+    offering ``brianle`` would let one turn open a session under the wrong identity.
+    """
+    import tools.browser_camofox_state as state
+    import tools.browser_tool as browser_tool
+    from tools.browser_camofox import _resolve_account
+
+    monkeypatch.setattr(state, "load_config", None, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"browser": {"camofox": {"accounts": ["meridian"]}}},
+    )
+    assert state.get_camofox_account_aliases() == ("meridian",)
+    assert _resolve_account("meridian") == "meridian"
+    with pytest.raises(ValueError) as exc:
+        _resolve_account("brianle")
+    assert "meridian" in str(exc.value)
+    with patch.object(browser_tool, "_is_camofox_mode", return_value=True):
+        schema = browser_tool._camofox_account_schema_override()
+    assert schema["parameters"]["properties"]["account"]["enum"] == ["meridian"]
+
+
+def test_config_cannot_reintroduce_the_legacy_personal_alias(monkeypatch):
+    """The replacement is a hard cutover from ``personal`` to ``brianle``, with no fallback."""
+    import tools.browser_camofox_state as state
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"browser": {"camofox": {"accounts": ["personal", "brianle"]}}},
+    )
+    assert state.get_camofox_account_aliases() == ("brianle",)
+
+
+@pytest.mark.parametrize("bad", [[], ["  "], "brianle", None, [123]])
+def test_malformed_alias_config_falls_back_to_defaults(monkeypatch, bad):
+    """A profile is never left with no browser identity by a malformed list."""
+    import tools.browser_camofox_state as state
+
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda *a, **k: {"browser": {"camofox": {"accounts": bad}}})
+    assert state.get_camofox_account_aliases() == state.CAMOFOX_ACCOUNT_ALIASES
+
+
+def test_configured_aliases_keep_distinct_stable_identities(tmp_path, monkeypatch):
+    """Narrowing the alias list must not change an existing alias's derived identity."""
+    import tools.browser_camofox_state as state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch.object(state, "get_hermes_home", return_value=tmp_path):
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: {})
+        default_identity = state.get_camofox_account_identity("meridian", "t1")
+        monkeypatch.setattr("hermes_cli.config.load_config",
+                            lambda *a, **k: {"browser": {"camofox": {"accounts": ["meridian"]}}})
+        narrowed_identity = state.get_camofox_account_identity("meridian", "t1")
+    assert default_identity == narrowed_identity

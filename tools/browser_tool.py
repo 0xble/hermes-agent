@@ -1265,9 +1265,10 @@ def _camofox_account_schema_override() -> Dict[str, Any]:
         return {}
     params = dict(_BROWSER_SCHEMA_MAP["browser_navigate"]["parameters"])
     properties = dict(params.get("properties", {}))
+    from tools.browser_camofox_state import get_camofox_account_aliases
     properties["account"] = {
         "type": "string",
-        "enum": ["brianle", "lpg", "meridian"],
+        "enum": list(get_camofox_account_aliases()),
         "description": (
             "Optional Camofox account alias. The alias is bound to this task on first navigation "
             "and cannot be changed within the task."

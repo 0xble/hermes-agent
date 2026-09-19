@@ -27,7 +27,7 @@ from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from hermes_constants import get_hermes_home_override, hermes_home_key
 from tools.browser_camofox_state import (
-    CAMOFOX_ACCOUNT_ALIASES,
+    get_camofox_account_aliases,
     get_camofox_account_identity,
     get_camofox_identity,
 )
@@ -267,9 +267,10 @@ def _resolve_account(account: Optional[str]) -> Optional[str]:
     if account is None:
         return None
     alias = str(account).strip().lower()
-    if alias not in CAMOFOX_ACCOUNT_ALIASES:
+    allowed = get_camofox_account_aliases()
+    if alias not in allowed:
         raise ValueError(
-            f"Unknown Camofox account {account!r}; choose one of: {', '.join(CAMOFOX_ACCOUNT_ALIASES)}"
+            f"Unknown Camofox account {account!r}; choose one of: {', '.join(allowed)}"
         )
     return alias
 

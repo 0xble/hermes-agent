@@ -60,3 +60,39 @@ def test_delegated_child_is_parent_only(plugin):
         "success": False,
     }
 
+
+
+def test_enrollment_lands_in_the_slash_command_namespace(plugin, monkeypatch):
+    """The tool must write the goal the gateway's own /goal commands read.
+
+    model_tools passes ``session_id`` and ``task_id`` to every tool handler. Goals are keyed
+    ``goal:<session_id>`` in SessionDB state_meta, so enrolling under ``task_id`` (a delegation
+    id in some paths) would create a goal no user-facing command can see or clear.
+    """
+    from hermes_cli.goals import GoalManager, load_goal
+
+    result = json.loads(plugin.goal_set(
+        {"action": "set", "goal": "Namespace check", "verification": "load_goal returns it"},
+        session_id="session-abc", task_id="task-zzz",
+    ))
+    assert result["success"] is True
+
+    # The exact loader the slash command uses.
+    persisted = load_goal("session-abc")
+    assert persisted is not None and persisted.goal == "Namespace check"
+    assert GoalManager("session-abc").has_goal() is True
+    # Nothing was written under the task id.
+    assert load_goal("task-zzz") is None
+
+
+def test_session_scope_is_required_and_never_model_supplied(plugin):
+    """No trusted scope means refusal, and a model-supplied session id is ignored."""
+    refused = json.loads(plugin.goal_set({"action": "set", "goal": "no scope"}))
+    assert refused["error_code"] == "missing_session_scope"
+
+    spoofed = json.loads(plugin.goal_set(
+        {"action": "set", "goal": "spoofed", "session_id": "attacker"}, session_id="real-session"))
+    assert spoofed["success"] is True
+    from hermes_cli.goals import load_goal
+    assert load_goal("attacker") is None
+    assert load_goal("real-session") is not None
