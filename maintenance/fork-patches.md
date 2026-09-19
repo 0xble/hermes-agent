@@ -1,9 +1,39 @@
-# Fork patch ledger
+# Fork patch provenance
 
-Every commit on the candidate branch above upstream tag `v2026.9.14` (`345cd2b057a452236de401d3534b8502a7465e8d`),
-with the slice it serves, the upstream PR it tracks, and the condition under which it retires.
-Commits that landed without a `Fork-Patch:` trailer are classified here from their content;
-the trailer is required on every new commit and `scripts/check_fork_patches.py` enforces both.
+Read on every maintenance run and whenever a fork patch changes. This support file
+belongs to [the root contract](../MAINTENANCE.md), which owns baseline selection
+and publication. The register preserves the pre-contract commit classifications
+because `scripts/check_fork_patches.py` uses them to recognize older untrailered
+commits. Evidence-only rows are compatibility records, not additional patches.
+
+## Update and proof
+
+Compare each retained behavior with the selected upstream release before replaying
+its commits. Keep source attribution and retirement conditions when adapting a
+patch. New commits need `Fork-Patch:` trailers and material behavior changes need
+an updated record here. A trailer proves classification, not functional coverage.
+Use the repository test runner on the affected surfaces below and verify that the
+ledger check recognizes the full series. Retire a patch only after its regression
+passes on the selected upstream release without the local implementation.
+
+| Responsibility | Source / proof surface | Contribution and current limits |
+|---|---|---|
+| Goal, review, memory journal, update request | `candidate-extensions/` and its tests; plugin schema/discovery tests | Personal plugins, retained locally. Review completion must bind to the dispatched child; request-update uses native spawn/watch. |
+| Canonical skills | `plugins/canonical-skill-guard/`, `scripts/curate_skill_observations.py` | Personal ownership policy. Curation publication must verify PR success before treating observations as processed. |
+| Camofox accounts and vault | browser account/vault tests and `tests/agent/test_vault_connect.py` | Account aliases are profile-specific. Adopted source: [upstream PR 114414](https://github.com/NousResearch/hermes-agent/pull/114414), open at `d8a374630aef825ad3d86c1e41defa57a4874247` on 2026-09-19. Fork adaptation is delivered; upstream merge is separate. |
+| Telegram emphasis | `tests/gateway/test_telegram_emphasis.py` | Own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906), open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. |
+| Telegram flood recovery | `tests/gateway/test_telegram_flood_coherence.py`, split-send and delivery-ledger tests | Adopted commits are pinned below. Media rate limits are classified but attachments are not durable redelivery obligations. |
+| Cron | per-job-timezone and contention-skip tests under `tests/cron/` | Local narrow patches pending equivalent released behavior. Preserve civil-time scheduling and truthful skip results. |
+| Backup and state | `tests/hermes_cli/test_backup.py`, `scripts/schema_rehearsal.py` | Adopted backup fixes plus local integrity/rehearsal tooling. Verify on copies, including fork-only rows. |
+| Maintenance tooling | `scripts/{sync_fork_candidate,check_fork_patches,install_candidate_extensions}.py`, `scripts/rollback_fork_runtime.sh` | Fork-specific tooling, not an upstream runtime feature. Exercise rollback failure recovery and native update receipt checks before promotion. |
+
+For rows without a linked contribution, no upstream submission is recorded here.
+Reassess the contribution route when changing that behavior rather than treating
+absence of a submission as evidence that upstream lacks it. Source rollback is a
+reviewed revert of the affected logical patch and dependent adaptations; installed
+runtime rollback follows the separate runtime owner.
+
+## Classified commits
 
 | commit | subject | slice | upstream | retire when |
 |---|---|---|---|---|
@@ -64,3 +94,6 @@ the trailer is required on every new commit and `scripts/check_fork_patches.py` 
 | `5a39c6b954f8` | fix(candidate): address all seven I6 review findings | slice-4-review-gate | none | when upstream /review accepts a ref and records a receipt |
 | `42308cb106bf` | docs(candidate): record the I6 review, its disposition, and the corrected Hindsight claim | evidence | none | not a patch; evidence/config record |
 | `91993b5452cd` | fix(candidate): address all nine findings of the second I6 review | candidate-tooling | none | when the extensions ship as packaged plugins |
+| `5fc72d8161e9` | docs: record the company overlay decisions taken at cutover | evidence | none | compatibility record, not a runtime patch |
+| `7004e57bda8d` | docs(candidate): record the company cutovers and slice 18 retirement | evidence | none | compatibility record, not a runtime patch |
+| `517e6561974f` | docs(candidate): record the company acceptance evidence and the quota-gated rows | evidence | none | compatibility record, not a runtime patch |

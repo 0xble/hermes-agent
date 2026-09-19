@@ -19,7 +19,7 @@ import yaml
 
 EXTENSIONS = ("goal-lifecycle", "memory-journal", "request-update", "review-candidate")
 # Cron --script jobs resolve scripts under $HERMES_HOME/scripts. These are the candidate's
-# scheduled procedures (see candidate-profile/CANDIDATE_JOBS.md); copied, never symlinked, so a
+# scheduled procedures (see maintenance/runtime-ownership.md); copied, never symlinked, so a
 # checkout move or worktree removal cannot break a scheduled job.
 CRON_SCRIPTS = (
     ("scripts", "sync_fork_candidate.py"),

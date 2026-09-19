@@ -4,7 +4,7 @@
 Run once after a promotion, from the installed checkout, against the profile that was upgraded.
 Asserts the things a successful ``hermes update`` does not itself prove:
 
-- every commit above the upstream baseline is accounted for in ``FORK_PATCHES.md``, and every
+- every commit above the upstream baseline is accounted for in ``maintenance/fork-patches.md``, and every
   commit newer than the ledger carries a ``Fork-Patch:`` trailer (so a sync cannot silently drop a
   patch, and a new patch cannot land unclassified);
 - the candidate extensions are installed in the profile and register through real plugin discovery;
@@ -58,9 +58,9 @@ def _is_git_checkout() -> bool:
 
 def check_ledger(baseline: str) -> list[str]:
     failures: list[str] = []
-    ledger = REPO / "FORK_PATCHES.md"
+    ledger = REPO / "maintenance/fork-patches.md"
     if not ledger.is_file():
-        return ["FORK_PATCHES.md is missing"]
+        return ["maintenance/fork-patches.md is missing"]
     listed = set(re.findall(r"^\| `([0-9a-f]{12})`", ledger.read_text(encoding="utf-8"), re.M))
     commits = _git("rev-list", "--reverse", f"{baseline}..HEAD").split()
     for sha in commits:
@@ -69,7 +69,7 @@ def check_ledger(baseline: str) -> list[str]:
             continue
         body = _git("log", "-1", "--format=%B", sha)
         if not _TRAILER.search(body):
-            failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) is neither in FORK_PATCHES.md nor trailered")
+            failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) is neither in maintenance/fork-patches.md nor trailered")
     return failures
 
 
