@@ -27,9 +27,12 @@ against; nothing here infers that a company policy should change to match the pe
 
 ## What the table does not settle
 
-- **Meridian lineage.** The running release resolves in `0xble/meridian-next`, while
-  `0xble/meridian-agent` pins a different runtime. Which repository owns the next build is the
-  slice 17 blocker and is not a config question.
+- **Meridian lineage: settled by ancestry, 2026-09-19.** The running Agent release commit
+  `7b30a730` is on `0xble/meridian-next` `origin/main` (pinned 2026-09-05, "chore(agent): pin
+  reviewed Hermes runtime"). The standalone `0xble/meridian-agent` head `d80e5eef` (2026-08-10)
+  appears nowhere in `meridian-next`'s 225-commit history, so the two share no lineage. The
+  monorepo owns the next build; `meridian-agent` is an earlier, separate line to preserve, not a
+  successor. Its unique history still needs classifying before any cleanup.
 - **LPG restore evidence.** The Hindsight PostgreSQL backup and isolated restore passed on
   September 18. Complete Hermes profile recovery (sessions, cron, pending work) is still the
   slice 13 rehearsal, on a copy, under host authority.
