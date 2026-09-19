@@ -1,0 +1,6 @@
+name: goal-lifecycle
+version: "0.1.0"
+description: "Restricted model-callable goal enrollment and additive subgoal tracking for the Hermes Agent Next candidate."
+author: "0xble"
+provides_tools:
+  - goal_set
