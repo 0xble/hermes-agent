@@ -39,7 +39,6 @@ MAX_DERIVED_TITLE_CHARS = 48
 # the task and answers the user's message instead — that answer must never become the session title (see the
 # answer-shaped output guard in generate_title; port of can1357/oh-my-pi#7306). 12 leaves headroom for
 # legitimate wordy titles while excluding full-sentence answers.
-_MAX_TITLE_WORDS = 12
 
 # The example titles shown to the model in the prompt, and the echo-guard
 # set: when the opening message carries little topical signal, a small model
@@ -151,8 +150,8 @@ def _title_preferences() -> dict:
             "instructions": instructions, "name_aliases": aliases}
 
 
-def _title_prompt(*, language: str, recent_titles=None) -> str:
-    prefs = _title_preferences()
+def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None) -> str:
+    prefs = prefs or _title_preferences()
     case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
                  if prefs["case_style"] == "title_case" else
                  "Sentence case: capitalize only the first word and proper nouns; this is the only capitalization rule.")
@@ -380,15 +379,14 @@ def generate_title(
     if not user_snippet.strip():
         return None
     language = _title_language()
-    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles)
+    prefs = _title_preferences()
+    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs)
     icon_allowed = list(icon_options or [])
     if icon_allowed:
-        from agent.topic_icons import normalize_emoji
-        recent = {normalize_emoji(item) for item in (recent_icons or [])}
-        fresh = [item for item in icon_allowed if normalize_emoji(item) not in recent]
-        candidates = fresh if len(fresh) >= 8 else icon_allowed
+        from agent.topic_icons import fresh_allowed_icons
+        candidates = fresh_allowed_icons(icon_allowed, recent_icons)
         prompt += "\n\nAlso select one icon. Reply with JSON only: {\"title\": \"...\", \"icon\": \"...\"}. " \
-            f"Allowed icons: {[str(item.get('emoji', item)) if isinstance(item, dict) else str(item) for item in candidates]}."
+            f"Allowed icons: {candidates}."
         if icon_instructions:
             prompt += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
     try:
@@ -433,10 +431,10 @@ def generate_title(
                 icon_callback(icon, "llm" if title else "fallback")
         if title is None or not any(char.isalnum() for char in title):
             return None
-        title = _restore_name_aliases(title, _title_preferences()["name_aliases"])
+        title = _restore_name_aliases(title, prefs["name_aliases"])
         # Answer-shaped output guard: titling is a short noun-phrase task. Respect the
-        # configured ceiling (which is already bounded by _title_preferences()).
-        max_title_words = _title_preferences()["max_words"]
+        # configured ceiling (already bounded by _title_preferences()).
+        max_title_words = prefs["max_words"]
         if len(title.split()) > max_title_words:
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
             return None

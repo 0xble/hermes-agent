@@ -20,7 +20,8 @@ def _tokens(text: str) -> set[str]:
     return {token.lower() for token in re.findall(r"[\w]+", str(text or ""), flags=re.UNICODE) if len(token) > 1}
 
 
-def _fresh_allowed(allowed_emojis: Iterable[Any], recent_emojis: Iterable[Any] | None) -> list[str]:
+def fresh_allowed_icons(allowed_emojis: Iterable[Any], recent_emojis: Iterable[Any] | None) -> list[str]:
+    """Allowed emojis not in recent history, unless that leaves fewer than 8 (then the full list)."""
     allowed = [_emoji_value(item) for item in allowed_emojis if _emoji_value(item)]
     recent = {normalize_emoji(item) for item in (recent_emojis or [])}
     fresh = [item for item in allowed if normalize_emoji(item) not in recent]
@@ -31,7 +32,7 @@ def choose_topic_icon_deterministic(
     title: str, user_message: str, allowed_emojis: list[Any], recent_emojis: Optional[list[Any]] = None,
 ) -> Optional[str]:
     """Choose a stable semantic candidate, rotating away from recent icons when possible."""
-    candidates = _fresh_allowed(allowed_emojis, recent_emojis)
+    candidates = fresh_allowed_icons(allowed_emojis, recent_emojis)
     if not candidates:
         return None
     signal = _tokens(title) | _tokens(user_message)

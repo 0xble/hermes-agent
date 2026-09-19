@@ -24,6 +24,9 @@ def _normalize_telegram_topic_profile_name(profile_name: Optional[str] = None) -
 
 # (table, column list, DDL body). profile_name leads the PK: a private chat_id is the
 # user id, identical across bots sharing one state.db.
+# Per-chat icon rotation window: history rows kept and recent icons the chooser avoids.
+TELEGRAM_TOPIC_ICON_HISTORY_LIMIT = 12
+
 _TOPIC_TABLES = (
     (
         "telegram_dm_topic_mode",
@@ -112,8 +115,6 @@ class SessionTelegramTopicsMixin:
     """Telegram DM topic-mode tables, bindings and lookups. Read paths tolerate absent
     tables (nobody ran ``/topic``) by returning their empty value; only
     ``enable``/``bind`` run the migration."""
-
-    _TELEGRAM_TOPIC_ICON_HISTORY_LIMIT = 12
 
     def _topic_read_one(self, sql: str, params):
         """``fetchone`` that treats an unmigrated table as None."""
@@ -409,11 +410,11 @@ class SessionTelegramTopicsMixin:
                 str(chat_id),
                 profile_name,
                 str(chat_id),
-                self._TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
+                TELEGRAM_TOPIC_ICON_HISTORY_LIMIT,
             ),
         )
 
-    def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = 24, profile_name: str = "default") -> List[str]:
+    def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = TELEGRAM_TOPIC_ICON_HISTORY_LIMIT, profile_name: str = "default") -> List[str]:
         try:
             with self._read_ctx() as conn:
                 rows = conn.execute("SELECT emoji FROM telegram_topic_icon_history WHERE profile_name=? AND chat_id=? ORDER BY selected_at DESC, rowid DESC LIMIT ?",

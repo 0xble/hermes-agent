@@ -117,50 +117,39 @@ class SessionTitlesMixin:
         return self._execute_write(_do) > 0
 
     def set_session_title_in_lineage(self, session_id: str, title: str) -> str:
-        """Reserve a user title or its next ``#N`` alias atomically and return stored text."""
+        """Store the user's exact title, or the next free ``<title> #N`` alias when that exact text
+        is held by another session. Returns the stored text. Each attempt goes through
+        ``_set_session_title`` so the canonical Bot Chat guard, compression-ancestor transfer and
+        compare-and-swap all apply; only a uniqueness collision advances to the next alias."""
         clean = self.sanitize_title(title)
         if not clean:
             raise ValueError("title cannot be empty")
-        match = _NUMBERED_TITLE_RE.match(clean)
-        base = match.group(1) if match else clean
-
-        def _do(conn):
-            rows = conn.execute("SELECT id, title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\')",
-                                (session_id, base, f"{_escape_like(base)} #%")).fetchall()
-            used = {str(row["title"]) for row in rows}
-            if base not in used:
-                stored = base
-            else:
-                numbers = [int(m.group(2)) for m in (_NUMBERED_TITLE_RE.match(value) for value in used) if m]
-                n = max([1, *numbers]) + 1
-                all_titles = {
-                    str(row["title"])
-                    for row in conn.execute(
-                        "SELECT title FROM sessions WHERE id != ? AND title IS NOT NULL", (session_id,)
-                    ).fetchall()
-                    if row["title"]
-                }
-                from hermes_state import SessionDB
-                max_length = SessionDB.MAX_TITLE_LENGTH
-                while True:
-                    suffix = f" #{n}"
-                    # Lineage aliases must obey the same title limit as their
-                    # unsuffixed source.  Reserve room for the suffix before
-                    # checking uniqueness; never persist an overlong alias.
-                    alias_base = base[:max_length - len(suffix)].rstrip()
-                    if not alias_base:
-                        raise ValueError("title is too long to reserve a unique lineage alias")
-                    stored = f"{alias_base}{suffix}"
-                    if stored not in all_titles:
-                        break
-                    n += 1
-            current = conn.execute("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            if current is None:
-                raise ValueError(f"session not found: {session_id}")
-            conn.execute("UPDATE sessions SET title = ?, title_source = ? WHERE id = ?", (stored, self.TITLE_SOURCE_USER, session_id))
-            return stored
-
-        return self._execute_write(_do)
+        from hermes_state import SessionDB
+        max_length = SessionDB.MAX_TITLE_LENGTH
+        candidate = clean
+        for _attempt in range(50):
+            try:
+                if not self._set_session_title(session_id, candidate, source=self.TITLE_SOURCE_USER):
+                    raise ValueError(f"session not found: {session_id}")
+                return candidate
+            except ValueError as exc:
+                if "already in use" not in str(exc):
+                    raise
+            # Collision: strip any existing " #N" from the requested text, then pick the next number.
+            match = _NUMBERED_TITLE_RE.match(candidate)
+            base = match.group(1) if match else candidate
+            n = int(match.group(2)) + 1 if match else 2
+            rows = self._read_all(
+                "SELECT title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\')",
+                (session_id, base, f"{_escape_like(base)} #%"))
+            numbers = [int(m.group(2)) for m in (_NUMBERED_TITLE_RE.match(str(r["title"])) for r in rows) if m]
+            n = max([n, *[k + 1 for k in numbers]])
+            suffix = f" #{n}"
+            alias_base = base[:max_length - len(suffix)].rstrip()
+            if not alias_base:
+                raise ValueError("title is too long to reserve a unique lineage alias")
+            candidate = f"{alias_base}{suffix}"
+        raise ValueError(f"could not reserve a unique lineage alias for {clean!r}")
 
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set a title on the user's behalf (``user`` provenance). Empty clears it. Raises

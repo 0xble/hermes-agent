@@ -2889,6 +2889,16 @@ class TelegramAdapter(BasePlatformAdapter):
         app.add_handler(TelegramMessageHandler(
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
             self._handle_media_message))
+        # Forum-topic service messages carry no text/media, so the core handlers never see them;
+        # observe them here to learn user-chosen topic icons (preserve_manual_topic_icons).
+        status = getattr(filters, "StatusUpdate", None)
+        topic_filters = [getattr(status, n, None) for n in ("FORUM_TOPIC_CREATED", "FORUM_TOPIC_EDITED")] if status else []
+        topic_filters = [f for f in topic_filters if f is not None]
+        if topic_filters:
+            combined = topic_filters[0]
+            for extra_filter in topic_filters[1:]:
+                combined = combined | extra_filter
+            app.add_handler(TelegramMessageHandler(combined, self._handle_forum_topic_service_message))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
         # Inline command picker; inert until the owner enables inline mode via BotFather /setinline.
         app.add_handler(InlineQueryHandler(self._handle_inline_query))
@@ -6737,6 +6747,25 @@ class TelegramAdapter(BasePlatformAdapter):
             if icons is None:
                 icons = self._manual_topic_icons = {}
             icons[f"{chat_id}:{thread_id}"] = str(custom_emoji_id)
+
+    async def _handle_forum_topic_service_message(self, update, context) -> None:
+        """Record a user-chosen topic icon from forum_topic_created/edited service messages."""
+        try:
+            message = getattr(update, "message", None) or getattr(update, "edited_message", None)
+            chat = getattr(message, "chat", None)
+            thread_id = getattr(message, "message_thread_id", None)
+            if message is None or chat is None or not thread_id:
+                return
+            if str(getattr(chat, "type", "")) != "private":
+                return
+            for event_name in ("forum_topic_edited", "forum_topic_created"):
+                topic_event = getattr(message, event_name, None)
+                custom_emoji_id = getattr(topic_event, "icon_custom_emoji_id", None) if topic_event else None
+                if custom_emoji_id:
+                    self._remember_manual_topic_icon(str(chat.id), str(thread_id), custom_emoji_id)
+                    return
+        except Exception:
+            logger.debug("[%s] forum topic service message ignored", self.name, exc_info=True)
 
     def get_manual_topic_icon(self, chat_id: str, thread_id: str) -> Optional[str]:
         """Return a custom icon observed from a user topic event, if any."""

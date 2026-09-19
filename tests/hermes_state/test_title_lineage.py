@@ -29,3 +29,18 @@ def test_icon_history_is_profile_scoped_and_bounded(db):
         *(f"e{index}" for index in range(13, 1, -1))
     ]
     assert db.list_recent_telegram_topic_icons("chat", 24, "profile-b") == ["other"]
+
+
+def test_user_typed_numbered_title_is_kept_when_free(db):
+    db.create_session("a", source="telegram")
+    assert db.set_session_title_in_lineage("a", "Sprint #3") == "Sprint #3"
+    assert db.get_session("a")["title"] == "Sprint #3"
+    assert db.get_session_title_source("a") == SessionDB.TITLE_SOURCE_USER
+
+
+def test_lineage_alias_respects_canonical_bot_chat_guard(db):
+    db.create_session("bot", source="cli")
+    db.set_session_title("bot", SessionDB.CANONICAL_BOT_CHAT_TITLE)
+    db._write_sql("UPDATE sessions SET hidden = 1 WHERE id = ?", ("bot",))
+    with pytest.raises(ValueError, match="canonical Bot Chat"):
+        db.set_session_title_in_lineage("bot", "Renamed")
