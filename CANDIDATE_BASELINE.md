@@ -136,6 +136,21 @@ Verification:
 hermes plugins doctor .../memory-journal --ci    registration passed
 tests: candidate-extensions/memory-journal/test_memory_journal.py
 3 passed in 0.29s, including a real built-in `memory` tool write.
+
+## Slice 11 Telegram emphasis fix
+
+Applied upstream PR #106906 (`37f872bad17`) to the release candidate. The
+candidate now resolves nested and multiline legacy MarkdownV2 emphasis while
+preserving code, links, lists, quotes, literals, and the existing fallback
+path.
+
+Verification:
+
+```text
+tests/gateway/test_telegram_emphasis.py
+tests/gateway/test_telegram_format.py
+72 passed in 1.42s
+```
 ```
 ```
 ```
