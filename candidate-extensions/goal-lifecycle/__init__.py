@@ -45,6 +45,20 @@ def _state_payload(manager: GoalManager) -> dict[str, Any] | None:
     return json.loads(state.to_json()) if state is not None else None
 
 
+def format_goal_notice(action: str, state: Any, *, subgoal: str | None = None) -> str:
+    """Human receipt for a committed agent mutation, rendered from the persisted read-back
+    state (never from the tool args) so the user sees exactly what was stored."""
+    if action == "set":
+        text = f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}"
+        if state.has_contract():
+            text += "\nCompletion contract:\n" + state.contract.render_block()
+        return text
+    if action == "subgoal_add":
+        index = len(state.subgoals)
+        return f"✓ Subgoal added ({index}): {subgoal}\nGoal: {state.goal}"
+    return ""
+
+
 def goal_set(args: dict[str, Any], **kwargs: Any) -> str:
     """Handle the restricted goal lifecycle surface without raising."""
     try:
@@ -81,7 +95,8 @@ def goal_set(args: dict[str, Any], **kwargs: Any) -> str:
             if persisted is None or persisted.to_json() != state.to_json():
                 return _result(success=False, error_code="goal_persistence_failed",
                                error="goal read-back did not match")
-            return _result(success=True, action=action, persisted=True, state=_state_payload(manager))
+            return _result(success=True, action=action, persisted=True, state=_state_payload(manager),
+                           notice=format_goal_notice(action, persisted))
         text = str(args.get("text") or "").strip()
         if not text:
             return _result(success=False, error_code="invalid_subgoal", error="text is required")
@@ -92,7 +107,8 @@ def goal_set(args: dict[str, Any], **kwargs: Any) -> str:
         if persisted is None or text not in persisted.subgoals:
             return _result(success=False, error_code="goal_persistence_failed",
                            error="subgoal read-back did not match")
-        return _result(success=True, action=action, persisted=True, state=_state_payload(manager))
+        return _result(success=True, action=action, persisted=True, state=_state_payload(manager),
+                       notice=format_goal_notice(action, persisted, subgoal=text))
     except Exception as exc:
         return _result(success=False, error_code="goal_tool_error", error=str(exc))
 

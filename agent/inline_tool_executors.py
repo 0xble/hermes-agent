@@ -26,6 +26,54 @@ def tool_hook_ids(agent, effective_task_id: str, tool_call_id: Optional[str]) ->
     }
 
 
+GOAL_RECEIPT_NOTICE_KEY = "goal.receipt"
+
+
+def _goal_receipt_text(function_name: str, result: Any) -> str:
+    """The user-facing receipt carried by a committed ``goal_set`` mutation, else ``""``.
+
+    Fork patch: the goal-lifecycle plugin has no send path of its own, so the receipt rides on the
+    tool result and is surfaced here at the moment the change commits. Gated on the persisted
+    read-back (``success`` and ``persisted``) so a failed or read-only call never announces."""
+    if function_name != "goal_set":
+        return ""
+    try:
+        from hermes_cli.config import load_config_readonly
+        if not (load_config_readonly().get("goals") or {}).get("auto_notices", True):
+            return ""
+        receipt = json.loads(result) if isinstance(result, str) else result
+    except Exception:
+        return ""
+    if not isinstance(receipt, dict) or receipt.get("success") is not True or receipt.get("persisted") is not True:
+        return ""
+    notice = receipt.get("notice")
+    return notice.strip() if isinstance(notice, str) else ""
+
+
+def _emit_goal_receipt(agent, function_name: str, result: Any) -> None:
+    text = _goal_receipt_text(function_name, result)
+    if not text:
+        return
+    try:
+        from agent.credits_tracker import AgentNotice, CREDITS_RESTORED_TTL_MS
+        if getattr(agent, "notice_callback", None):
+            # Finite TTL plus a stable key so the receipt expires and is clearable instead of sitting
+            # in the single-slot TUI notice lane forever (that lane is latest-wins, so a sticky
+            # credits notice fired in the same turn can still be superseded; pre-existing spine limit).
+            # The multi-line receipt is intentional for messaging (one bubble with the committed
+            # goal and contract); single-line drivers show only the headline.
+            agent._emit_notice(AgentNotice(
+                text=text, level="info", kind="ttl", ttl_ms=CREDITS_RESTORED_TTL_MS,
+                key=GOAL_RECEIPT_NOTICE_KEY, id=GOAL_RECEIPT_NOTICE_KEY,
+            ))
+        else:
+            agent._vprint(text, force=True)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("goal receipt delivery failed", exc_info=True)
+
+
+
 def emit_terminal_post_tool_call(
     agent,
     *,
@@ -41,6 +89,9 @@ def emit_terminal_post_tool_call(
     middleware_trace: Optional[list] = None,
 ) -> None:
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
+    # goal_set is not parallel-safe, so it always reaches this sequential terminal hook. Listing it
+    # in ``_PARALLEL_SAFE_TOOLS`` would route its post hook through ``model_tools`` and drop the receipt.
+    _emit_goal_receipt(agent, function_name, result)
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(

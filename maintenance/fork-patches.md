@@ -18,7 +18,7 @@ passes on the selected upstream release without the local implementation.
 
 | Responsibility | Source / proof surface | Contribution and current limits |
 |---|---|---|
-| Goal, review, memory journal, update request | `candidate-extensions/` and its tests; plugin schema/discovery tests | Personal plugins, retained locally. Review completion must bind to the dispatched child; request-update uses native spawn/watch. |
+| Goal, review, memory journal, update request | `candidate-extensions/` and its tests; plugin schema/discovery tests; `tests/agent/test_goal_set_receipt_notice.py` | Personal plugins, retained locally. Review completion must bind to the dispatched child; request-update uses native spawn/watch. Committed `goal_set` mutations carry a `notice` receipt that `agent/inline_tool_executors.py` surfaces through the agent notice lane (`goals.auto_notices`); format after retired fork commit `6985104`. |
 | Canonical skills | `plugins/canonical-skill-guard/`, `scripts/curate_skill_observations.py` | Personal ownership policy. Curation publication must verify PR success before treating observations as processed. |
 | Camofox accounts and vault | browser account/vault tests and `tests/agent/test_vault_connect.py` | Account aliases are profile-specific. Adopted source: [upstream PR 114414](https://github.com/NousResearch/hermes-agent/pull/114414), open at `d8a374630aef825ad3d86c1e41defa57a4874247` on 2026-09-19. Fork adaptation is delivered; upstream merge is separate. |
 | Telegram emphasis | `tests/gateway/test_telegram_emphasis.py` | Own contribution: [upstream PR 106906](https://github.com/NousResearch/hermes-agent/pull/106906), open at `37f872bad1706c6c50ccdccb825fc4d5ffd2c246` on 2026-09-19. |

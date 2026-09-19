@@ -33,14 +33,36 @@ def test_set_additive_subgoal_status_and_persistence(plugin):
     assert result["success"] is True
     assert result["persisted"] is True
     assert result["state"]["status"] == "active"
+    budget = result["state"]["max_turns"]
+    assert result["notice"] == (
+        f"⊙ Goal set ({budget}-turn budget): Prove goal lifecycle\n"
+        "Completion contract:\n"
+        "- Verification: Plugin test passes\n"
+        "- Constraints: No production effects"
+    )
 
     result = call(plugin, {"action": "subgoal_add", "text": "Read back state"})
     assert result["success"] is True
     assert result["state"]["subgoals"] == ["Read back state"]
+    assert result["notice"] == "✓ Subgoal added (1): Read back state\nGoal: Prove goal lifecycle"
 
     result = call(plugin, {"action": "status"})
     assert result["state"]["goal"] == "Prove goal lifecycle"
     assert result["state"]["subgoals"] == ["Read back state"]
+    assert "notice" not in result
+
+
+def test_set_without_contract_has_no_contract_block(plugin):
+    result = call(plugin, {"action": "set", "goal": "Plain goal"})
+    assert result["success"] is True
+    assert result["notice"] == f"⊙ Goal set ({result['state']['max_turns']}-turn budget): Plain goal"
+
+
+def test_rejected_and_failed_results_carry_no_notice(plugin):
+    assert "notice" not in call(plugin, {"action": "set", "goal": ""})
+    call(plugin, {"action": "set", "goal": "first"})
+    assert "notice" not in call(plugin, {"action": "set", "goal": "second"})
+    assert "notice" not in call(plugin, {"action": "subgoal_add", "text": ""})
 
 
 @pytest.mark.parametrize("action", ["pause", "resume", "clear", "edit"])
