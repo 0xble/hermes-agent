@@ -37,7 +37,7 @@ upstream or directly cherry-picked here.
 
 Paragraph spacing: own contribution [upstream PR 100686](https://github.com/NousResearch/hermes-agent/pull/100686)
 for [issue 100664](https://github.com/NousResearch/hermes-agent/issues/100664),
-head `7b7ab064752947fd7576d59aa0d028a127f57e8d`, open when adopted on 2026-09-19.
+head `c90504124b06c12b24ba9c9d0dca6a3ca479a764`, open when adopted on 2026-09-19.
 The fork carries the adapter symbols and regression file at exact AST parity
 with that head so retirement is a hash comparison, not a re-review. The archived
 fork tracked the same behavior as HERMES-095 (archived PRs #32 and #34).
