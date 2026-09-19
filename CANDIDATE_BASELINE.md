@@ -682,3 +682,23 @@ build, so the host is still serving the runtime from the `187fc858` release.
   `com.brianle.promote-hermes-fork` retired in dotfiles (`chore/retire-promote-hermes-fork`).
   Ten legacy worktrees outside the checkout (`~/Repos/.worktrees/hermes-*`, `/private/tmp/...`)
   are orphaned, not deleted. `verify-hermes-next-cutover-24h` runs 2026-09-20 02:40 EDT.
+
+### Company acceptance evidence (2026-09-19 07:00-07:40Z)
+
+| check | Meridian (`0dd10c9c` / `43b0f76d…-prod-slack-hindsight`) | LPG (`4e557d61` / `43b0f76d…-r4-prod`) |
+|---|---|---|
+| gateway identity | `agent.service` active, one `hermes gateway` process from the release venv | same |
+| platform connect | Slack Socket Mode authenticated as @agent (T06Q2A02M27) at 06:27:55Z | Slack @io (T0BJSRH9TCM) + Telegram connected at 06:33:53Z |
+| inbound round trip | **unproven**: no inbound message since deploy (search:read for the bot's messages after deploy: 0); the operator's Slack user token is read-only | **unproven**: same (0 bot messages since deploy) |
+| model turn | **blocked**: `hermes chat -q` from the agent user → HTTP 429 "usage limit has been reached" on `openai-codex` | **blocked**: 429 "Codex provider quota exhausted; retry after 244373s" (≈2026-09-22 03:28Z); the legacy gateway logged the same exhaustion on 2026-09-15, so it predates the cutover. `fallback: None` by company policy |
+| memory | provider `hindsight`, bank `meridian`, `write_approval: true`; recall through a model turn blocked as above | provider `hindsight`, bank `lpg`; recall blocked as above |
+| reverted write | n/a: `memory-journal` is not shipped on company hosts | n/a |
+| skills discovery | `hermes skills list`: bookingkoala, draft, google-workspace, humanize, quo, slack (6 local from `/opt/agent/current/skills`) + builtins | airtable, demio, fathom, gohighlevel, google-workspace, lpg, meta-ads, slack, smartlead, supabase (+1) from the release library |
+| Camofox | `browser.camofox.accounts: [meridian]` in the live config; no browser backend configured, vault fill n/a | `[lpg]`; no browser backend, n/a |
+| cron identities | no `cron/jobs.json` on this host (nothing to preserve) | 3 jobs, 2 enabled, 0 duplicate ids, 0 duplicate enabled schedules |
+| self-update | `hermes update --plan` shows "Install: git (v0.21.3 @ 43b0f76d)" and exits; `/opt/hermes/current` unchanged | "Install: unknown (v0.21.3)"; unchanged |
+| feature check | not run on-host (script is personal-profile tooling) | same |
+
+The model-turn and round-trip rows are gated by the company Codex accounts, not by the runtime.
+`verify-hermes-next-cutover-24h` (2026-09-20 02:40 EDT) and `verify-hermes-next-company-turns` (2026-09-22
+06:10 EDT, after the LPG window resets) re-run these rows and report to Telegram.
