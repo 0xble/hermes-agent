@@ -631,3 +631,28 @@ a user-attended acceptance. The one-day sustained window starts at activation
 (01:20 EDT, 2026-09-19). Rollback remains available: bootout, restore the
 capture, restore the legacy config, rename `hermes-agent.legacy` back, bootstrap
 the legacy plist.
+
+## Slice 13 rehearsals on the real company databases, September 19
+
+Consistent copies were taken on each host with SQLite's backup API under the
+service account (read-only on the live file; both `agent.service` units stayed
+active), pulled here, and opened with the candidate:
+
+| host | copy | schema | sessions / messages | verdict | notes |
+|---|---|---|---|---|---|
+| LPG | 383,836,160 bytes | 30 | 394 / 50,698 | compatible | nothing dropped or added; all probes identical; fork-only rows: 2 delegation parent tasks, 2 DM topic bindings |
+| Meridian | 3,764,224 bytes | 30 | 31 / 425 | compatible | the candidate adds `display_identity` and `display_order` to `messages` (0.21.0 to 0.21.3 declarative reconcile); no row changed, all probes identical |
+
+Reports: `candidate-profile/SCHEMA_REHEARSAL_{LPG,MERIDIAN}_20260919.json`.
+
+Live host configs were read back and match the repository overlays recorded
+in `COMPANY_OVERLAY_DIFF.md`, with two additions: LPG runs `service_tier:
+normal` and has no plugins enabled; Meridian runs `service_tier: fast`, enables
+`disk-cleanup` and `security-guidance`, and pins its Slack home channel in
+`platforms.slack`. Meridian's deployed manifest has `runtime_repository: null`,
+so its runtime provenance is the artifact id alone.
+
+LPG's current deployed Agent release is `fde22d731d06`, newer than the
+inventory's `187fc858`; the two most recent `deploy-agent` runs (`fde22d73`,
+`8948ad13`) failed at "Upload the isolated runtime artifact" after a successful
+build, so the host is still serving the runtime from the `187fc858` release.
