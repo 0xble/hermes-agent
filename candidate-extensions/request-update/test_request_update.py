@@ -21,8 +21,9 @@ def test_request_update_checks_then_spawns(monkeypatch, tmp_path):
     spec = importlib.util.spec_from_file_location("request_update", Path(__file__).parent / "__init__.py")
     plugin = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(plugin)
-    pending = tmp_path / ".update_pending.json"
-    monkeypatch.setattr(plugin, "_pending_path", lambda: pending)
+    home = tmp_path
+    pending = home / ".update_pending.json"
+    monkeypatch.setattr(plugin, "_home", lambda: home)
     monkeypatch.setattr(plugin, "_is_child", lambda: False)
 
     class Result:
@@ -32,9 +33,14 @@ def test_request_update_checks_then_spawns(monkeypatch, tmp_path):
 
     calls = []
     monkeypatch.setattr(plugin.subprocess, "run", lambda *a, **k: (calls.append((a, k)) or Result()))
-    monkeypatch.setattr(plugin.subprocess, "Popen", lambda *a, **k: type("P", (), {"pid": 42})())
+    spawned = []
+    import gateway.run as gateway_run
+    import gateway.slash_commands as slash_commands
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(slash_commands, "_spawn_detached_update", lambda *a: spawned.append(a))
 
     result = json.loads(plugin.request_update({"reason": "candidate patch"}))
-    assert result == {"pid": 42, "reason": "candidate patch", "status": "accepted", "success": True}
+    assert result == {"reason": "candidate patch", "routed": False, "status": "accepted", "success": True}
     assert json.loads(pending.read_text())["reason"] == "candidate patch"
+    assert spawned and spawned[0][0] == ["hermes"]
     assert len(calls) == 1

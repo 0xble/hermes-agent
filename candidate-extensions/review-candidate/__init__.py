@@ -11,11 +11,7 @@ from typing import Any
 
 _SCHEMA = {
     "name": "review_candidate",
-    "description": (
-        "Review an exact Git candidate once. Supply repository, base_sha, head_sha, and",
-        "an optional repository-relative scope. The tool records a durable receipt and",
-        "never edits the candidate.",
-    ),
+    "description": "Review an exact Git candidate once. Supply repository, base_sha, head_sha, and an optional repository-relative scope. The tool records a durable receipt and never edits the candidate.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -12,10 +12,7 @@ from typing import Any
 
 _SCHEMA = {
     "name": "request_update",
-    "description": (
-        "Request the native Hermes update flow for a concrete reason. The update check is read-only;",
-        "when an update exists, the gateway-owned detached watcher performs the normal update and restart.",
-    ),
+    "description": "Request the native Hermes update flow for a concrete reason. The update check is read-only; when an update exists, the gateway-owned detached watcher performs the normal update and restart.",
     "parameters": {
         "type": "object",
         "properties": {"reason": {"type": "string", "description": "Why the update is needed."}},
@@ -28,9 +25,21 @@ def _json(**fields: Any) -> str:
     return json.dumps(fields, sort_keys=True)
 
 
-def _pending_path() -> Path:
+def _home() -> Path:
     from hermes_constants import get_hermes_home
-    return get_hermes_home() / ".update_pending.json"
+    return get_hermes_home()
+
+
+def _session_value(name: str, kwargs: dict[str, Any]) -> str:
+    """Read gateway routing context without making the model supply it."""
+    value = str(kwargs.get(name) or "").strip()
+    if value:
+        return value
+    try:
+        from gateway.session_context import get_session_env
+        return str(get_session_env(f"HERMES_SESSION_{name.upper()}", "") or "").strip()
+    except Exception:
+        return ""
 
 
 def _is_child() -> bool:
@@ -41,7 +50,7 @@ def _is_child() -> bool:
         return False
 
 
-def request_update(args: dict[str, Any], **_: Any) -> str:
+def request_update(args: dict[str, Any], **kwargs: Any) -> str:
     if _is_child():
         return _json(success=False, status="refused", error_code="parent_only",
                      error="request_update is available only to the owning parent session")
@@ -49,7 +58,8 @@ def request_update(args: dict[str, Any], **_: Any) -> str:
     if not reason:
         return _json(success=False, status="refused", error_code="reason_required",
                      error="request_update requires a non-empty reason")
-    pending = _pending_path()
+    home = _home()
+    pending = home / ".update_pending.json"
     if pending.exists():
         return _json(success=False, status="refused", error_code="update_pending",
                      error="an update request is already pending")
@@ -65,20 +75,39 @@ def request_update(args: dict[str, Any], **_: Any) -> str:
     if "already up to date" in output.casefold():
         return _json(success=False, status="refused", error_code="no_update",
                      error="the native update check found no update")
+    output = home / ".update_output.txt"
+    exit_code = home / ".update_exit_code"
+    pending_data = {
+        "platform": _session_value("platform", kwargs),
+        "chat_id": _session_value("chat_id", kwargs),
+        "chat_type": _session_value("chat_type", kwargs),
+        "user_id": _session_value("user_id", kwargs),
+        "session_key": _session_value("key", kwargs) or _session_value("session_key", kwargs),
+        "profile": _session_value("profile", kwargs),
+        "thread_id": _session_value("thread_id", kwargs),
+        "message_id": _session_value("message_id", kwargs),
+        "reason": reason,
+        "source": "request_update",
+        "timestamp": datetime.now().isoformat(),
+    }
     pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text(json.dumps({"reason": reason, "source": "request_update",
-                                   "timestamp": datetime.now().isoformat()}) + "\n",
-                       encoding="utf-8")
+    pending.write_text(json.dumps({k: v for k, v in pending_data.items() if v}) + "\n", encoding="utf-8")
+    exit_code.unlink(missing_ok=True)
+    (home / ".update_prompt.json").unlink(missing_ok=True)
+    (home / ".update_response").unlink(missing_ok=True)
     try:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True, env=os.environ.copy(),
-        )
+        from gateway.run import _resolve_hermes_bin
+        from gateway.slash_commands import _spawn_detached_update
+        hermes_cmd = _resolve_hermes_bin()
+        if not hermes_cmd:
+            raise RuntimeError("Hermes executable could not be resolved")
+        _spawn_detached_update(hermes_cmd, output, exit_code)
     except Exception as exc:
         pending.unlink(missing_ok=True)
+        output.unlink(missing_ok=True)
+        exit_code.unlink(missing_ok=True)
         return _json(success=False, status="refused", error_code="spawn_failed", error=str(exc))
-    return _json(success=True, status="accepted", pid=process.pid, reason=reason)
+    return _json(success=True, status="accepted", reason=reason, routed=bool(pending_data.get("platform") and pending_data.get("chat_id")))
 
 
 def register(ctx: Any) -> None:

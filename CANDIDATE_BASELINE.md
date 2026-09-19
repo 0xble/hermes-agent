@@ -281,6 +281,13 @@ the installed directory. The real discovery E2E proves the installed tools
 register in a fresh profile. Focused installer and guard/update verification:
 `33 passed`. This does not activate any production profile.
 
+The candidate extension E2E also now validates the tool-schema boundary and the
+native update watcher handoff. `goal_set`, `review_candidate`, and
+`request_update` expose string descriptions, and `request_update` persists the
+same routing fields and output/exit marker contract as the `/update` command
+before calling the shared detached watcher. The repair-focused tests pass
+`6 passed`.
+
 
 ## Slice 7: Hindsight bank isolation
 

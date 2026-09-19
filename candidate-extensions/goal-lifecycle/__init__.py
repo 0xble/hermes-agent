@@ -14,11 +14,7 @@ from hermes_cli.goals import GoalContract, GoalManager, load_goal
 
 _SCHEMA = {
     "name": "goal_set",
-    "description": (
-        "Enroll or inspect the current standing goal for this session. Use action=set for a",
-        "substantial authorized task, status to inspect it, and subgoal_add only to add",
-        "acceptance criteria. Pause, resume, clear, and replacement are user-only controls.",
-    ),
+    "description": "Enroll or inspect the current standing goal for this session. Use action=set for a substantial authorized task, status to inspect it, and subgoal_add only to add acceptance criteria. Pause, resume, clear, and replacement are user-only controls.",
     "parameters": {
         "type": "object",
         "properties": {
