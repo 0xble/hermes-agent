@@ -135,7 +135,7 @@ Verification:
 ```text
 hermes plugins doctor .../memory-journal --ci    registration passed
 tests: candidate-extensions/memory-journal/test_memory_journal.py
-2 passed in 0.04s
+3 passed in 0.29s, including a real built-in `memory` tool write.
 ```
 ```
 ```

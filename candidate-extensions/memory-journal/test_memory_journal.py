@@ -34,3 +34,18 @@ def test_failed_write_is_not_journaled(tmp_path, monkeypatch):
     plugin._on_post_tool_call("memory", {"action": "add", "target": "memory"}, '{"success": false}', "s", tool_call_id="1")
     assert plugin._last() is None
 
+
+def test_real_memory_tool_write_is_journaled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    plugin = load_plugin()
+    from tools.memory_tool import MemoryStore, memory_tool
+    store = MemoryStore(); store.load_from_disk()
+    args = {"action": "add", "target": "memory", "content": "real path"}
+    plugin._on_pre_tool_call("memory", args, "real", tool_call_id="real-1")
+    result = memory_tool(store=store, **args)
+    plugin._on_post_tool_call("memory", args, result, "real", tool_call_id="real-1")
+    decoded = json.loads(result)
+    assert decoded["success"] is True
+    entry = plugin._last()
+    assert entry and entry["action"] == "add" and entry["after_hash"] != entry["before_hash"]
+
