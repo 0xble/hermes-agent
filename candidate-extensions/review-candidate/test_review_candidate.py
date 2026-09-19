@@ -209,3 +209,36 @@ def test_availability_classifier_separates_the_two_failure_classes(plugin):
         assert plugin._is_availability_failure(availability) is True
     for ran_and_failed in ("child timed out", "status unknown", "interrupted by user", "assertion failed in tests"):
         assert plugin._is_availability_failure(ran_and_failed) is False
+
+
+def test_failed_reviewer_with_no_summary_is_recorded_not_reviewed(plugin, tmp_path, monkeypatch):
+    """The I6 review's high finding: a timed-out child has summary None and status 'timeout'.
+
+    Before, nothing could match such a child to its marker (matching was by summary text), so the
+    marker stayed pending forever and a later caller would reuse it as an in-flight review.
+    """
+    base, head = _repo(tmp_path)
+    _stub_dispatch(plugin, monkeypatch, [DISPATCHED])
+    plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head})
+    plugin._on_subagent_start(child_session_id="child-9", child_goal=f"Review candidate {head[:12]}")
+    plugin._on_subagent_stop(child_summary=None, child_status="timeout", child_session_id="child-9")
+    receipt = json.loads(plugin._receipt_path(head).read_text())
+    assert receipt["status"] == "not_reviewed" and receipt["error_code"] == "review_incomplete"
+    assert "no summary" in receipt["error"]
+    assert not plugin._pending_path(head).exists()
+
+
+def test_start_hook_ignores_children_that_are_not_reviews(plugin):
+    plugin._on_subagent_start(child_session_id="other", child_goal="Refactor the widget")
+    assert "other" not in plugin._CHILD_HEADS
+
+
+def test_fallback_reviewer_follows_configured_chain(plugin, monkeypatch):
+    import sys
+    from types import ModuleType
+    cfg = ModuleType("hermes_cli.config")
+    cfg.load_config_readonly = lambda: {"auxiliary": {"review": {"fallback_providers": [
+        {"provider": "custom:claude-proxy", "model": "claude-opus-5", "base_url": "http://127.0.0.1:8317/v1"}]}}}
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", cfg)
+    fb = plugin._fallback_credentials({"provider": "custom:claude-proxy", "model": "claude-fable-5-1"})
+    assert fb["provider"] == "custom:claude-proxy" and fb["model"] == "claude-opus-5" and fb["base_url"].endswith("/v1")

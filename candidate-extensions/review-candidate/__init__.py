@@ -43,8 +43,29 @@ _AVAILABILITY_PATTERN = re.compile(
 )
 _NON_AVAILABILITY_PATTERN = re.compile(r"\b(timeout|timed out|unknown|interrupted|cancell?ed)\b", re.IGNORECASE)
 
+# Secondary reviewer, used only on a dispatch-time availability failure. Read from
+# ``auxiliary.review.fallback_providers[0]`` (same entry shape as the delegation chain) so the
+# route follows the profile's provider naming; these literals are the last resort.
 _FALLBACK_PROVIDER = "anthropic"
 _FALLBACK_MODEL = "claude-opus-5"
+
+
+def _fallback_credentials(primary: dict[str, Any] | None) -> dict[str, Any]:
+    fallback = dict(primary or {})
+    provider, model = _FALLBACK_PROVIDER, _FALLBACK_MODEL
+    try:
+        from hermes_cli.config import load_config_readonly
+        chain = ((load_config_readonly().get("auxiliary") or {}).get("review") or {}).get("fallback_providers") or []
+        first = next((e for e in chain if isinstance(e, dict) and e.get("model")), None)
+        if first:
+            provider, model = str(first.get("provider") or provider), str(first["model"])
+            for key in ("base_url", "api_key", "api_mode"):
+                if first.get(key):
+                    fallback[key] = str(first[key])
+    except Exception:
+        pass
+    fallback["provider"], fallback["model"] = provider, model
+    return fallback
 
 
 def _json(**fields: Any) -> str:
@@ -172,13 +193,29 @@ def _finalize_receipt(pending: dict[str, Any], result: dict[str, Any], *, review
     return receipt
 
 
+_REVIEW_GOAL = re.compile(r"^Review candidate ([0-9a-f]{12})$")
+_CHILD_HEADS: dict[str, str] = {}  # child_session_id -> head12, from subagent_start
+
+
+def _on_subagent_start(child_session_id: Any = None, child_goal: Any = None, **_: Any) -> None:
+    """Remember which child is reviewing which candidate, keyed by the runtime's own session id.
+
+    The stop payload carries no goal, and a child that timed out or errored has no summary at all,
+    so text matching at stop time cannot identify a FAILED reviewer. Recording the link at start
+    is what lets a failed review be written as not_reviewed instead of leaving its marker pending.
+    """
+    match = _REVIEW_GOAL.match(str(child_goal or "").strip())
+    if match and child_session_id:
+        _CHILD_HEADS[str(child_session_id)] = match.group(1)
+
+
 def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child_session_id: Any = None,
                       parent_session_id: Any = None, **_: Any) -> None:
     """Turn a finished reviewer child into a durable receipt.
 
-    Matches the child to its pending marker by the goal text the marker recorded
-    (``Review candidate <head12>``) present in the child's kickoff. The hook fires for every child
-    stop, so it must be cheap and must ignore every child that is not a review it dispatched.
+    Matched by the child's session id recorded at start; the summary text is a fallback for a
+    runtime that did not fire subagent_start. Fires for every child stop, so it must be cheap and
+    must ignore every child that is not a review it dispatched.
     """
     try:
         from hermes_constants import get_hermes_home
@@ -186,28 +223,30 @@ def _on_subagent_stop(child_summary: Any = None, child_status: Any = None, child
         if not pending_dir.is_dir():
             return
         summary = str(child_summary or "")
+        head12 = _CHILD_HEADS.pop(str(child_session_id), "") if child_session_id else ""
         for marker in pending_dir.glob("*.pending.json"):
             try:
                 pending = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
             head = pending.get("head_sha", "")
-            # The child's final message quotes the head it reviewed; a marker whose head is absent
-            # from this summary belongs to a different child (or a different review).
-            if not head or head[:12] not in summary:
+            if not head:
+                continue
+            matched = (head12 and head.startswith(head12)) or (not head12 and summary and head[:12] in summary)
+            if not matched:
                 continue
             status = str(child_status or "")
-            result = {"results": [{"status": status, "summary": summary}]}
-            if status not in ("completed", "success", "ok"):
+            if status not in ("completed", "success", "ok") or not summary:
                 _write_json(_receipt_path(head), {
                     "status": "not_reviewed", "error_code": "review_incomplete",
                     "repository": pending["repository"], "base_sha": pending["base_sha"], "head_sha": head,
                     "reviewer_model": pending.get("reviewer_model", ""),
-                    "error": f"reviewer child ended with status {status!r}",
+                    "error": f"reviewer child ended with status {status!r}" + ("" if summary else " and no summary"),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 })
             else:
-                _finalize_receipt(pending, result, reviewer_model=pending.get("reviewer_model", ""),
+                _finalize_receipt(pending, {"results": [{"status": status, "summary": summary}]},
+                                  reviewer_model=pending.get("reviewer_model", ""),
                                   fallback_reason=pending.get("fallback_reason", ""))
             marker.unlink(missing_ok=True)
             return
@@ -292,10 +331,9 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
                              base_sha=base_resolved, head_sha=head_resolved, reviewer_model=primary_model,
                              error=str(handle["error"]))
             fallback_reason = str(handle["error"])[:500]
-            fallback = dict(credentials or {})
-            fallback["provider"], fallback["model"] = _FALLBACK_PROVIDER, _FALLBACK_MODEL
+            fallback = _fallback_credentials(credentials)
             handle = _dispatch_review(context, head_resolved, parent, fallback)
-            reviewer_model = _FALLBACK_MODEL
+            reviewer_model = fallback["model"]
             if handle.get("error"):
                 return _json(success=False, status="not_reviewed", error_code="review_unavailable",
                              base_sha=base_resolved, head_sha=head_resolved,
@@ -325,4 +363,5 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
 def register(ctx: Any) -> None:
     ctx.register_tool(name="review_candidate", toolset="review_candidate",
                       schema=_SCHEMA, handler=review_candidate)
+    ctx.register_hook("subagent_start", _on_subagent_start)
     ctx.register_hook("subagent_stop", _on_subagent_stop)

@@ -5,4 +5,5 @@ author: "0xble"
 provides_tools:
   - review_candidate
 provides_hooks:
+  - subagent_start
   - subagent_stop

@@ -101,7 +101,9 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None, headers=None):
+        def _capture_post(url, json=None, timeout=None, headers=None, **_kwargs):
+            # The Camofox client passes allow_redirects on every POST since the vault path
+            # landed; a fake with a fixed signature would refuse it and read as a client bug.
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": f"tab-{len(requests_seen)}", "url": "https://example.com"}

@@ -107,7 +107,39 @@ def request_update(args: dict[str, Any], **kwargs: Any) -> str:
         output.unlink(missing_ok=True)
         exit_code.unlink(missing_ok=True)
         return _json(success=False, status="refused", error_code="spawn_failed", error=str(exc))
-    return _json(success=True, status="accepted", reason=reason, routed=bool(pending_data.get("platform") and pending_data.get("chat_id")))
+    # The slash command arms the gateway's completion watcher after spawning; without that, progress
+    # and prompts are only picked up if the gateway restarts under the update. Tools run inside the
+    # gateway process, so arm it the same way through the runner reference pairing.py already uses.
+    watcher = _arm_update_watcher()
+    return _json(success=True, status="accepted", reason=reason, watcher=watcher,
+                 routed=bool(pending_data.get("platform") and pending_data.get("chat_id")))
+
+
+def _arm_update_watcher() -> str:
+    """Ask the running gateway to watch this update; returns what happened, never raises."""
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return "no_gateway"
+        schedule = getattr(runner, "_schedule_update_notification_watch", None)
+        if not callable(schedule):
+            return "unsupported"
+        loop = getattr(runner, "_loop", None) or getattr(runner, "loop", None)
+        try:
+            import asyncio
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            schedule()
+            return "armed"
+        if loop is not None and hasattr(loop, "call_soon_threadsafe"):
+            loop.call_soon_threadsafe(schedule)
+            return "armed"
+        return "no_loop"
+    except Exception as exc:
+        return f"error:{type(exc).__name__}"
 
 
 def register(ctx: Any) -> None:
