@@ -1383,6 +1383,28 @@ class TestBankIdTemplate:
         assert p._bank_id == "hermes-coder"
         assert p._bank_id_template == "hermes-{profile}"
 
+    def test_disposable_profiles_derive_distinct_banks(self, tmp_path, monkeypatch):
+        config = {
+            "mode": "cloud",
+            "apiKey": "fixture-key",
+            "api_url": "http://fixture",
+            "bank_id": "hermes",
+            "bank_id_template": "hermes-{profile}",
+        }
+        home = tmp_path / "hindsight"
+        home.mkdir()
+        (home / "config.json").write_text(json.dumps(config))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        banks = []
+        for profile in ("personal-fixture", "lpg-fixture"):
+            p = HindsightMemoryProvider()
+            p.initialize(session_id="s1", hermes_home=str(tmp_path), platform="cli", agent_identity=profile)
+            banks.append(p._bank_id)
+
+        assert banks == ["hermes-personal-fixture", "hermes-lpg-fixture"]
+        assert len(set(banks)) == 2
+
 
 # ---------------------------------------------------------------------------
 # Availability tests

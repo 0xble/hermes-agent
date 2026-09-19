@@ -274,6 +274,21 @@ Focused verification: `3 passed` in
 workflow and generated-install read-only enforcement remain outstanding parts of
 Slice 6.
 
+## Slice 7: Hindsight bank isolation
+
+The candidate records the per-profile Hindsight bank contract in
+`CANDIDATE_HINDSIGHT_BANKS.md`. Disposable profiles use the existing
+`bank_id_template` surface, producing distinct sanitized banks while keeping
+endpoint, credentials, and `HERMES_HOME` profile-scoped. Existing multiplex
+coverage verifies that a secondary profile does not inherit the default profile's
+bank or retain-shaping values.
+
+Focused bank and identity verification: `3 passed`. The broader Hindsight
+provider file has eight environment-sensitive failures when the optional
+`hindsight-client` and `hindsight_client_api` packages are absent from the
+candidate environment; those failures are recorded as dependency setup gaps,
+not treated as a pass.
+
 ## Slice 6: canonical skill write guard
 
 The candidate now includes the `canonical-skill-guard` plugin. It resolves the
