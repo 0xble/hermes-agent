@@ -68,6 +68,13 @@ FLOOD_RETRY_DEFAULT_SECONDS = 60.0
 FLOOD_RETRY_CAP_SECONDS = 15 * 60.0
 FLOOD_RETRY_SLACK_SECONDS = 2.0
 
+# A penalty this long is not a wait to sit out: the reply would land hours after it was useful, and
+# a row parked on that deadline keeps waking the redelivery timer until the staleness sweep drops it
+# with no explanation. Such a row is abandoned immediately and visibly instead, so the operator sees
+# one bounded failure naming the delay rather than silence. Note this bounds AUTOMATIC redelivery
+# only; the ledger row is still recorded and the content is still recoverable.
+FLOOD_ABSURD_WAIT_SECONDS = 6 * 60 * 60
+
 # The canonical prefix above is what the adapters produce for a flood they decide not to sleep. It is
 # not the only shape that reaches this ledger. PTB raises ``RetryAfter``, whose own text reads
 # "Flood control exceeded. Retry in 185 seconds", and that text is what lands in ``last_error``
@@ -127,6 +134,11 @@ def flood_retry_delay(seconds: Any) -> float:
     return min(max(wait, 0.0), FLOOD_RETRY_CAP_SECONDS) + FLOOD_RETRY_SLACK_SECONDS
 
 
+def flood_wait_is_absurd(last_error: Any) -> bool:
+    """True when a flood row asks for a delay too long to sit out (see FLOOD_ABSURD_WAIT_SECONDS)."""
+    return is_flood_error(last_error) and flood_wait_seconds(last_error) > FLOOD_ABSURD_WAIT_SECONDS
+
+
 def _failed_stamp(updated_at: Any) -> float:
     try:
         return float(updated_at or 0.0)
@@ -149,6 +161,8 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     the timer abandoned would be lost for good; leaving one attempt keeps it recoverable by the boot
     sweep after a restart, which is a real recovery signal."""
     if is_flood_error(last_error):
+        if flood_wait_is_absurd(last_error):
+            return None
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
     if text in _RUNTIME_RETRYABLE_ERRORS:
@@ -435,10 +449,23 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
             due = retry_not_before(updated_at, last_error, attempts)
-            if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started
-                    or due is None):
+            if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started):
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
+            if due is None and flood_wait_is_absurd(last_error):
+                # Bounded failure, stated once: a multi-hour penalty is not a wait to sit out, and
+                # leaving the row to churn the timer until the staleness sweep would hide it.
+                logger.warning(
+                    "Delivery %s abandoned: flood penalty of %.0fs exceeds the automatic redelivery bound",
+                    oid, flood_wait_seconds(last_error))
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?
+                       WHERE obligation_id=? AND state='failed'
+                         AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                continue
+            if due is None:
+                continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
                 conn.execute(
                     """UPDATE delivery_obligations

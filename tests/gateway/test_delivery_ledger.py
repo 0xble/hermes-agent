@@ -746,3 +746,62 @@ class TestOwnerAlivePidProbe:
 
         monkeypatch.setattr(status, "_pid_exists", boom)
         assert dl._owner_alive(12345, 999) is False
+
+
+class TestFloodDeadlineExactness:
+    """Redelivery happens at the platform's own deadline, and absurd penalties are bounded."""
+
+    def test_long_penalty_is_never_sent_before_the_servers_deadline(self):
+        """The 15-minute timer cap is a WAKE interval, not an eligibility grant.
+
+        A 30-minute penalty must not produce a send at 15 minutes: retrying inside the window is a
+        fresh violation that can extend the penalty. The timer may wake early and re-sleep; the row's
+        own deadline decides.
+        """
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", "flood_control:1800")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=1000.0 WHERE obligation_id='ob-1'")
+
+        # Anywhere inside the penalty: no claim.
+        for elapsed in (0, 60, 900, 1799):
+            assert dl.sweep_failed_for_runtime("telegram", now=1000.0 + elapsed) == [], f"sent at {elapsed}s"
+            assert _row("ob-1")["state"] == "failed"
+
+        # The timer keeps the exact deadline available so it can re-arm rather than drop the row.
+        assert dl.pending_retries(now=1000.0 + 900) == [
+            {"platform": "telegram", "profile": "default", "not_before": 1000.0 + 1800}]
+
+        claimed = dl.sweep_failed_for_runtime("telegram", now=1000.0 + 1801)
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+
+    def test_absurd_penalty_is_abandoned_once_instead_of_churning(self):
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", f"flood_control:{dl.FLOOD_ABSURD_WAIT_SECONDS + 60}")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=1000.0 WHERE obligation_id='ob-1'")
+
+        assert dl.pending_retries(now=1000.0) == []
+        assert dl.sweep_failed_for_runtime("telegram", now=1000.0) == []
+        assert _row("ob-1")["state"] == "abandoned"
+
+    def test_a_long_but_sane_penalty_is_still_retried(self):
+        """The bound must not swallow an ordinary multi-minute penalty."""
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", f"flood_control:{dl.FLOOD_ABSURD_WAIT_SECONDS - 60}")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=1000.0 WHERE obligation_id='ob-1'")
+
+        assert _row("ob-1")["state"] == "failed"
+        claimed = dl.sweep_failed_for_runtime("telegram", now=1000.0 + dl.FLOOD_ABSURD_WAIT_SECONDS)
+        assert [row["obligation_id"] for row in claimed] == ["ob-1"]
+
+    def test_raw_platform_wording_keeps_the_same_deadline(self):
+        """A row carrying PTB's own text states its delay as precisely as the canonical prefix."""
+        _record(platform="telegram")
+        dl.mark_failed("ob-1", "Flood control exceeded. Retry in 900 seconds")
+        with dl._connect() as conn:
+            conn.execute("UPDATE delivery_obligations SET updated_at=1000.0 WHERE obligation_id='ob-1'")
+
+        assert dl.sweep_failed_for_runtime("telegram", now=1000.0 + 899) == []
+        assert [r["obligation_id"] for r in dl.sweep_failed_for_runtime("telegram", now=1000.0 + 901)] == ["ob-1"]

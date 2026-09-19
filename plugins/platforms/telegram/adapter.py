@@ -157,6 +157,32 @@ def _flood_cap_result(wait: float) -> "SendResult":
     return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
 
 
+class _MediaFloodRefusal(Exception):
+    """A media send the platform refused (or we refused locally) for flood control.
+
+    Media had no RetryAfter handling at all: every refusal fell through to a generic "couldn't
+    deliver the file attachment" notice, which is both untruthful (the platform never rejected the
+    file, it rejected the timing) and unrecoverable (nothing arms a redelivery). Raising a typed
+    refusal lets the shared media shell answer with the same ``flood_control:<s>`` contract the
+    text path uses, so the delivery ledger reads it identically.
+    """
+
+    def __init__(self, wait: float):
+        super().__init__(f"flood_control:{wait}")
+        self.wait = float(wait)
+
+
+def _telegram_retry_after(error: Exception) -> Optional[float]:
+    """The platform's requested wait for a flood refusal, or None when this is not one."""
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None:
+        try:
+            return float(retry_after)
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0 if "retry after" in str(error).lower() else None
+
+
 _TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 _TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
 
@@ -3369,8 +3395,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _retrigger_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> None:
         """Re-arm typing after an intermediate send (Telegram clears it when a message lands). Skipped on
-        the FINAL reply (``metadata["notify"]``): the refresh loop is gone and no API cancels the bubble."""
+        the FINAL reply (``metadata["notify"]``): the refresh loop is gone and no API cancels the bubble.
+
+        Also skipped when the operator turned the indicator off. The re-arm used to ignore
+        ``typing_indicator: false`` entirely, so a profile that had disabled typing still emitted a
+        sendChatAction after every intermediate send — an unlogged per-chat request source that is a
+        documented flood contributor (upstream 7c10c249ce)."""
         if (metadata or {}).get("notify"):
+            return
+        if not getattr(self.config, "typing_indicator", True):
             return
         with contextlib.suppress(Exception):
             await self.send_typing(chat_id, metadata=metadata)
@@ -3571,6 +3604,16 @@ class TelegramAdapter(BasePlatformAdapter):
         continuations, and return the final chunk's id as the next edit target."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        # Same per-chat flood window ``send()`` honours. An edit is a request against the same chat:
+        # firing it inside a known penalty lengthens the penalty that is already delaying a real
+        # answer. The typed ``flood_control:<s>`` result is what the delivery ledger recognises, so
+        # refusing locally keeps redelivery timing identical to a server refusal without the request.
+        _edit_cooldown = self._send_flood_cooldown_remaining(chat_id)
+        if _edit_cooldown is not None:
+            logger.warning(
+                "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing edit without an API call",
+                self.name, chat_id, _edit_cooldown)
+            return _flood_cap_result(_edit_cooldown)
         # Rich finalize (Bot API 10.1): edit the preview IN PLACE via rich_message — no fresh send + delete.
         # Before the 4,096 pre-flight because the rich cap is 32,768; falls back to legacy on rejection.
         # Rich finalize (Bot API 10.1): when the completed content has constructs the legacy MarkdownV2 edit
@@ -3645,7 +3688,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.warning(
                         "[%s] Telegram flood control, refusing edit (retry_after %.1fs > %.0fs inline cap)",
                         self.name, wait, _FLOOD_INLINE_WAIT_CAP_SECS)
-                    return _flood_cap_result(wait)
+                    # Arm the shared window: an edit refusal proves the chat is penalised, and the
+                    # very next send would otherwise spend another request discovering the same thing.
+                    return self._record_send_flood_cooldown(chat_id, wait)
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 await asyncio.sleep(wait)
                 try:
@@ -3660,8 +3705,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         # first refusal asked for. Fail closed canonically so the ledger arms its
                         # timer on this delay rather than storing the platform's raw wording, which
                         # it would read as an ordinary failure and never redeliver.
-                        return _flood_cap_result(
-                            float(retry_wait) if retry_wait is not None else wait)
+                        return self._record_send_flood_cooldown(
+                            chat_id, float(retry_wait) if retry_wait is not None else wait)
                     return SendResult(success=False, error=safe_retry_error)
             safe_error = _redact_telegram_error_text(e)
             # Transient network errors must not permanently disable progress-message editing.
@@ -4796,10 +4841,42 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _send_media(
         self, send_fn: Any, chat_id: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]], media_label: str,
         reset_media: Optional[Any] = None, **media_kwargs: Any) -> Any:
-        """Send one native media payload with thread routing + DM-topic anchor retry."""
+        """Send one native media payload with thread routing, DM-topic anchor retry, and the same
+        flood-control contract as text.
+
+        Upstream gives media no RetryAfter handling: a 429 surfaces as a generic delivery notice and
+        nothing schedules another attempt. Here a short wait is slept once (matching the text path's
+        inline cap) and anything longer arms the shared per-chat window and raises a typed refusal,
+        so the caller can answer with ``flood_control:<s>`` instead of claiming the file failed.
+        """
         reply_to_id, kwargs = self._media_send_kwargs(chat_id, reply_to, metadata)
-        return await self._send_with_dm_topic_reply_anchor_retry(
-            send_fn, {**kwargs, **media_kwargs}, metadata, reply_to_id, media_label, reset_media=reset_media)
+        cooldown = self._send_flood_cooldown_remaining(chat_id)
+        if cooldown is not None:
+            logger.warning(
+                "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
+                self.name, chat_id, cooldown, media_label)
+            raise _MediaFloodRefusal(cooldown)
+        send_kwargs = {**kwargs, **media_kwargs}
+        for attempt in range(2):
+            try:
+                return await self._send_with_dm_topic_reply_anchor_retry(
+                    send_fn, send_kwargs, metadata, reply_to_id, media_label, reset_media=reset_media)
+            except Exception as err:
+                wait = _telegram_retry_after(err)
+                if wait is None:
+                    raise
+                if wait > _FLOOD_INLINE_WAIT_CAP_SECS or attempt:
+                    logger.warning(
+                        "[%s] Telegram flood control on %s upload (retry_after=%.1fs); failing closed so the "
+                        "delivery ledger owns the wait", self.name, media_label, wait)
+                    self._record_send_flood_cooldown(chat_id, wait)
+                    raise _MediaFloodRefusal(wait) from err
+                logger.warning(
+                    "[%s] Telegram flood control on %s upload, retrying in %.1fs", self.name, media_label, wait)
+                if reset_media is not None:
+                    reset_media()
+                await asyncio.sleep(wait)
+        raise _MediaFloodRefusal(_FLOOD_INLINE_WAIT_CAP_SECS)
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
@@ -5016,6 +5093,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     getattr(self._bot, f"send_{media_key}"), chat_id, reply_to, metadata, media_key,
                     reset_media=lambda: f.seek(0), **build_kwargs(f))
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _MediaFloodRefusal as flood:
+            # Not a delivery failure: the platform refused the timing. Answer with the shared typed
+            # contract so the ledger schedules redelivery instead of posting "couldn't deliver".
+            return _flood_cap_result(flood.wait)
         except Exception as e:
             return await on_error(e)
 
@@ -5182,6 +5263,11 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Send typing indicator."""
         if not self._bot or self._typing_in_cooldown(chat_id):
+            return
+        # A chat inside a known flood window gets no cosmetic traffic. sendChatAction is a request
+        # like any other: spending it during a penalty risks lengthening the penalty that is already
+        # delaying a real answer, and a typing bubble is never worth that.
+        if self._send_flood_cooldown_remaining(chat_id) is not None:
             return
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
