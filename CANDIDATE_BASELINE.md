@@ -67,3 +67,26 @@ configuration and instruction contract for delegation, goals, and the single
 review gate, while production profiles and the legacy installation remain
 untouched.
 
+## Slice 2 configuration check
+
+The credential-free profile example in `CANDIDATE_SLICE2_CONFIG.yaml` was
+loaded under `HERMES_HOME=/tmp/hermes-agent-next-slice2-home` with an empty
+process environment. `hermes config check` exited 0, and resolved reads
+returned:
+
+```text
+model.default                         anthropic/claude-fable-5.1
+model.provider                        anthropic
+delegation.provider                   openai-codex
+delegation.model                      gpt-6-astra
+delegation.reasoning_effort           high
+delegation.max_spawn_depth            2
+delegation.max_concurrent_children    10
+auxiliary.review.provider             anthropic
+auxiliary.review.model                claude-fable-5.1
+```
+
+The installed package used for this check was rebuilt in
+`/tmp/hermes-agent-next-release-venv` from this release worktree. Its reported
+install directory is the release worktree, so the source and installed-package
+identities match. No provider request or production profile was used.
