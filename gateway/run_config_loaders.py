@@ -278,6 +278,10 @@ class GatewayConfigLoadersMixin:
         )
         self.__dict__.setdefault("_busy_input_modes_by_profile", {})[profile_name] = input_mode
         self.__dict__.setdefault("_busy_text_modes_by_profile", {})[profile_name] = text_mode
+        # Quick-command aliases are resolved per routed profile on the busy path, so a
+        # secondary must never borrow (or be shadowed by) the primary's ``quick_commands``.
+        qc = config.get("quick_commands") if isinstance(config, dict) else getattr(config, "quick_commands", None)
+        self.__dict__.setdefault("_quick_commands_by_profile", {})[profile_name] = qc if isinstance(qc, dict) else {}
 
     def _busy_profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Return the routed profile whose busy policy applies, if any."""
