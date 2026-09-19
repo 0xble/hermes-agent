@@ -1,0 +1,69 @@
+# Hermes Agent Next candidate baseline
+
+This file records the reproducible baseline for the deployment candidate
+before local capability work. It is evidence, not a claim that the candidate is
+ready for runtime promotion.
+
+## Candidate identity
+
+- Source: upstream release tag `v2026.9.14`
+- Source SHA: `345cd2b057a452236de401d3534b8502a7465e8d`
+- Candidate worktree: `candidate/release-v2026.9.14`
+- Python: `3.13.5`
+- Test interpreter: `/tmp/hermes-agent-next-step1-venv/bin/python`
+- Package pins checked: pytest `9.1.1`, anthropic `0.87.0`, httpx2 `2.7.0`
+- Production credentials and messaging tokens: absent from the disposable test profile
+
+The test interpreter is outside the checkout because Hermes update tests mutate
+the repository virtual environment. Test commands use `env -u PYTHONPATH` so a
+different worktree cannot be imported accidentally.
+
+## Bootstrap checks
+
+The isolated release candidate passed:
+
+```text
+Hermes Agent v0.21.3 (2026.9.14)
+hermes config check: exit 0
+```
+
+The candidate also passed the focused capability checks used to begin Slice 2:
+
+```text
+tests/tools/test_delegate_request_overrides.py
+tests/tools/test_delegate_control_actions.py       59 passed
+tests/hermes_cli/test_goals.py
+tests/hermes_cli/test_goal_gates.py
+tests/hermes_cli/test_goal_judge_delegations.py    63 passed
+tests/agent/test_background_review.py
+tests/agent/test_review_engine.py                  41 passed
+```
+
+These tests verify existing native delegation, goal, and review plumbing. No
+runtime patch is justified by this slice's deterministic baseline.
+
+## Remaining focused failures
+
+The release candidate focused run had six failures:
+
+| Area | Result | Classification |
+| --- | ---: | --- |
+| `tests/computer_use/test_cua_no_overlay.py` | 9 passed, 1 failed, 5 skipped | Host prerequisite absent. The test exercises macOS `CuaDriver.app` resolution, and this machine has no installed app. |
+| Slack media tests in `tests/gateway/test_media_download_retry.py` | 11 passed, 3 failed | Host fixture environment. `files.slack.com` resolves here to `198.18.28.48`, which the candidate's SSRF guard correctly rejects before the mocked HTTP client is reached. |
+| Telegram media tests in `tests/gateway/test_telegram_media_read_timeout.py` | 2 failed | Same host fixture condition. `example.com` resolves here to `198.18.33.64` and is rejected by the SSRF guard; the later `MagicMock` await error is the test's error path after that refusal. |
+
+These are recorded as environment-sensitive baseline exceptions. They are not
+fixed in the candidate because weakening SSRF protection or silently treating
+an absent macOS application as installed would move the implementation away
+from the required behavior. A future host with ordinary public DNS, or tests
+that inject a safe resolver result, should re-run these rows.
+
+## Baseline decision
+
+`v2026.9.14` remains the deployment candidate. Native Slice 2 behavior is
+usable and has focused evidence. The six failures stay visible as explicit
+environment limitations. The next implementation work begins with the
+configuration and instruction contract for delegation, goals, and the single
+review gate, while production profiles and the legacy installation remain
+untouched.
+
