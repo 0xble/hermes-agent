@@ -288,3 +288,25 @@ async def test_stop_during_sentinel_force_cleans_session():
 # Test 7: Shutdown skips sentinel entries
 # ------------------------------------------------------------------
     # Should not have raised on the sentinel
+
+
+def test_deferred_commands_keep_fifo_order_separate_from_prompt_queue():
+    """Deferred slash commands retain command identity and order ahead of queued text."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def send(self, *args, **kwargs): pass
+        async def get_chat_info(self, *args, **kwargs): return None
+
+    adapter = object.__new__(_Adapter)
+    adapter._deferred_commands = {}
+    source = _make_event("/undo").source
+    first = _make_event("/undo 1")
+    second = _make_event("/compress")
+    assert adapter.defer_command_until_idle("session", first) == 1
+    assert adapter.defer_command_until_idle("session", second) == 2
+    assert adapter._pop_deferred_command("session") is first
+    assert adapter._pop_deferred_command("session") is second
+    assert adapter._pop_deferred_command("session") is None
