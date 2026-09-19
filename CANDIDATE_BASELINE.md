@@ -656,3 +656,29 @@ LPG's current deployed Agent release is `fde22d731d06`, newer than the
 inventory's `187fc858`; the two most recent `deploy-agent` runs (`fde22d73`,
 `8948ad13`) failed at "Upload the isolated runtime artifact" after a successful
 build, so the host is still serving the runtime from the `187fc858` release.
+
+## Company cutovers and retirement (2026-09-19)
+
+- **Meridian**: released through the signed route twice, `7ad8c9f3` (runtime repoint) then
+  `0dd10c9c` (`browser.camofox.accounts: [meridian]`). Agent release active, Hermes runtime
+  `43b0f76d…-prod-slack-hindsight`, Slack Socket Mode authenticated as @agent in Host & Home,
+  bank `meridian`, BookingKoala read-only canary true. The first attempt was rejected because a
+  stray `deploy/__pycache__` (written 2026-09-07) sat in the active release; removed with sudo.
+  Live Slack round trip: connection proven, inbound traffic left to the 24h checkpoint.
+- **LPG**: PR #128 merged (`f42e748`); release `4e557d61` deployed with a host-built runtime
+  archive (Actions artifact storage is quota-blocked). `/opt/hermes/current` →
+  `43b0f76d…-r4-prod`, Slack (@io) and Telegram connected, bank `lpg`,
+  `browser.camofox.accounts: [lpg]`.
+- **Neither company host runs candidate extensions** (see COMPANY_OVERLAY_DIFF.md).
+- **Personal**: production checkout stays at `024e077c` (fork `main` is `5fc72d81`, lock and
+  docs only); advance with `hermes update` after the 24h window.
+- **Slice 18**: legacy fork archived at `~/Repos/archive/hermes-agent-legacy-20260919/`
+  (bundle 699,485,794 bytes, sha256 `a7c6390e…`, `git bundle verify` + restore clone passed,
+  plus tracked-change patches for 13 dirty worktrees); legacy checkout trashed; GitHub
+  `0xble/hermes-agent` → `hermes-agent-archived` (archived) and `hermes-agent-next` →
+  `hermes-agent`; replacement checkout moved to `~/Repos/hermes-agent` (worktrees repaired,
+  `.worktrees/sync` added); `sync-hermes-fork`, six `verify-hermes-fork-*` one-shots and
+  `monitor-hermes-maintenance-qa` removed; the four CANDIDATE_JOBS.md jobs installed;
+  `com.brianle.promote-hermes-fork` retired in dotfiles (`chore/retire-promote-hermes-fork`).
+  Ten legacy worktrees outside the checkout (`~/Repos/.worktrees/hermes-*`, `/private/tmp/...`)
+  are orphaned, not deleted. `verify-hermes-next-cutover-24h` runs 2026-09-20 02:40 EDT.
