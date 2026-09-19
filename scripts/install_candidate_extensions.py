@@ -18,6 +18,17 @@ import yaml
 
 
 EXTENSIONS = ("goal-lifecycle", "memory-journal", "request-update", "review-candidate")
+# Cron --script jobs resolve scripts under $HERMES_HOME/scripts. These are the candidate's
+# scheduled procedures (see candidate-profile/CANDIDATE_JOBS.md); copied, never symlinked, so a
+# checkout move or worktree removal cannot break a scheduled job.
+CRON_SCRIPTS = (
+    ("scripts", "sync_fork_candidate.py"),
+    ("scripts", "check_fork_patches.py"),
+    ("scripts", "curate_skill_observations.py"),
+    ("scripts", "cron_migration_diff.py"),
+    ("scripts", "schema_rehearsal.py"),
+    ("candidate-profile", "snapshot_profile_state.sh"),
+)
 
 
 def _repo_root() -> Path:
@@ -70,7 +81,16 @@ def install(home: Path, source: Path | None = None) -> list[str]:
             enabled.append(name)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
-    return list(EXTENSIONS)
+    scripts_dir = home / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    root = _repo_root()
+    for subdir, name in CRON_SCRIPTS:
+        src = root / subdir / name
+        if not src.is_file():
+            raise SystemExit(f"candidate cron script is missing: {src}")
+        shutil.copy2(src, scripts_dir / name)
+        (scripts_dir / name).chmod(0o700)
+    return list(EXTENSIONS) + [f"scripts/{name}" for _, name in CRON_SCRIPTS]
 
 
 def main() -> int:
