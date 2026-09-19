@@ -124,3 +124,22 @@ class TestJobLifecycle:
         recomputed = jobs.compute_next_run(jobs.get_job(job["id"])["schedule"],
                                            None, jobs.get_job(job["id"]).get("timezone"))
         assert datetime.fromisoformat(recomputed).astimezone(LOS_ANGELES).strftime("%H:%M") == "08:00"
+
+
+class TestSurfaces:
+    def test_tool_create_and_update_carry_the_zone(self, store, monkeypatch):
+        from tools.cronjob_tools import cronjob
+        import json as _json
+        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda: None, raising=False)
+        out = _json.loads(cronjob(action="create", prompt="zoned", schedule="0 8 * * *", job_timezone="America/Los_Angeles"))
+        assert out.get("success", True), out
+        jid = out.get("job_id") or out.get("job", {}).get("id") or out.get("id")
+        assert jobs.get_job(jid)["timezone"] == "America/Los_Angeles"
+        out = _json.loads(cronjob(action="update", job_id=jid, job_timezone=""))
+        assert jobs.get_job(jid).get("timezone") is None
+
+    def test_cli_flags_are_forwarded(self):
+        from hermes_cli.cron import _JOB_ARG_FIELDS, _job_api_kwargs
+        from types import SimpleNamespace
+        assert ("job_timezone", "job_timezone") in _JOB_ARG_FIELDS
+        assert _job_api_kwargs(SimpleNamespace(job_timezone="Asia/Manila"))["job_timezone"] == "Asia/Manila"
