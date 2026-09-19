@@ -48,9 +48,6 @@ def _check_vault_available() -> bool:
     # built-in surface); the vault serves both stacks.
     return bool(is_browser_use_cli_mode() or check_browser_requirements())
 
-_check_vault_available = no_cache_check_fn(_check_vault_available)
-
-
 # ---------------------------------------------------------------------------
 # JS evaluation plumbing (server-side; results never carry secret values)
 # ---------------------------------------------------------------------------
@@ -469,20 +466,26 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
-    page_origin = _focus_bound_origin(effective_task_id, str(meta.origin), meta.kind) or _current_page_origin(effective_task_id)
+    allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
+    page_origin = None
+    for candidate in allowed:
+        page_origin = _focus_bound_origin(effective_task_id, candidate, meta.kind)
+        if page_origin:
+            break
+    page_origin = page_origin or _current_page_origin(effective_task_id)
     if not page_origin:
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
-    if page_origin != meta.origin:
+    if page_origin not in allowed:
         return json.dumps(
             {
                 "success": False,
                 "error_type": "origin_mismatch",
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
-                    f"the vault item's bound origin ({meta.origin}). Vault fills "
-                    "only run on the exact origin the credential was saved for."
+                    f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
+                    "only run on an exact origin the credential was saved for."
                 ),
             }
         )
@@ -713,6 +716,8 @@ def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
 
 
 from tools.registry import no_cache_check_fn, registry  # noqa: E402
+
+_check_vault_available = no_cache_check_fn(_check_vault_available)
 
 registry.register(
     name="browser_vault_list",

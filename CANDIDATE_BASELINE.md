@@ -237,3 +237,25 @@ Camofox backend, state, and extension-router tests. The broader browser suite
 passed `770` tests with the existing environment-sensitive failures recorded
 separately; one compatibility issue found during that run was fixed by keeping
 the pre-alias call shape when no account is supplied.
+
+## Slice 9: vault autofill through Camofox
+
+PR #114414 was cherry-picked with provenance across six commits (`68bda7c5a7d`,
+`a8141c26d2d`, `4193fb8f343`, `d3ed9196f45`, `e59e49b7a12`, and
+`d8a374630ae`). The candidate required two tag-drift adaptations: the
+`no_cache_check_fn` decorator is applied after the registry import, and the
+multi-origin metadata helpers and `VaultItemMeta.allowed_origins` field are
+restored because this candidate tag predates those upstream base changes.
+
+The resulting path uses Camofox's loopback/HTTPS-only evaluate endpoint for
+secret-bearing JavaScript, wraps page exceptions with a generic response,
+refuses redirects, requires a `current-password` control for login fills,
+revalidates the exact allowed origin inside the page, and redacts resolved
+values before any result can reach the model. Connect reads use scoped
+credentials, refuse partial or redirected configuration, and mint TOTP codes
+locally only from usable fields. Browser identity remains the Slice 8 alias;
+vault identity remains a separate handle and origin mapping.
+
+Vault and browser verification: `72 passed, 4 skipped` across the vault,
+OnePassword, Camofox, browser-vault, and TUI vault suites. No real vault or
+account credentials were used.

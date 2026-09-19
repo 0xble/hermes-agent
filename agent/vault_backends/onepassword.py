@@ -255,3 +255,22 @@ def _first_origin(urls: List[str]) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+def _web_origins(origins: List[str]) -> tuple:
+    """Keep app URIs from widening the set of browser fill targets."""
+    web = tuple(o for o in origins if o.startswith(("http://", "https://")))
+    return web or (origins[0],)
+
+
+def _all_origins(urls: List[str]) -> List[str]:
+    """Normalize, deduplicate, and preserve every origin on a Login item."""
+    out: List[str] = []
+    for url in urls:
+        try:
+            origin = normalize_origin(url)
+        except Exception:
+            continue
+        if origin not in out:
+            out.append(origin)
+    return out

@@ -167,6 +167,8 @@ class VaultItemMeta:
     identifier_type: Optional[str] = None
     identifier: Optional[str] = None
     has_otp: bool = False  # a TOTP seed is stored: 2FA codes can be minted without asking the user
+    # External password managers may bind one credential to several exact web origins.
+    allowed_origins: tuple = ()
 
     def to_dict(self) -> Dict[str, Any]:
         out = {
@@ -181,6 +183,8 @@ class VaultItemMeta:
             out["identifier_type"] = self.identifier_type
         if self.has_otp:
             out["has_otp"] = True
+        if len(self.allowed_origins) > 1:
+            out["allowed_origins"] = list(self.allowed_origins)
         return out
 
 
@@ -408,6 +412,7 @@ class VaultStore:
             identifier_type=rec.get("identifier_type") if identifier else None,
             identifier=identifier or None,
             has_otp=bool((rec.get("secret") or {}).get("otp_secret")),
+            allowed_origins=tuple(rec.get("allowed_origins") or ()),
         )
 
 
