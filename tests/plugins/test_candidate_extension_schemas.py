@@ -21,9 +21,12 @@ def _module(name: str):
 
 def test_candidate_tool_descriptions_are_json_strings():
     for name in ("goal-lifecycle", "review-candidate", "request-update", "memory-journal"):
-        schema = _module(name)._SCHEMA
-        assert isinstance(schema["description"], str)
-        assert isinstance(json.loads(json.dumps(schema))["description"], str)
+        module = _module(name)
+        schemas = [v for k, v in vars(module).items() if k.endswith("_SCHEMA") and isinstance(v, dict)]
+        assert schemas, name
+        for schema in schemas:
+            assert isinstance(schema["description"], str), (name, schema.get("name"))
+            assert isinstance(json.loads(json.dumps(schema))["description"], str)
 
 
 def test_installed_candidate_tool_definitions_have_string_descriptions(tmp_path, monkeypatch):
@@ -34,7 +37,7 @@ def test_installed_candidate_tool_definitions_have_string_descriptions(tmp_path,
     plugins_mod._plugin_manager = plugins_mod.PluginManager()
     plugins_mod.discover_plugins(force=True)
     from tools.registry import registry
-    for tool_name in ("goal_set", "review_candidate", "request_update", "memory_undo"):
+    for tool_name in ("goal_set", "review_candidate", "request_update", "memory_undo", "memory_journal_list"):
         entry = registry.get_entry(tool_name)
         assert entry is not None
         assert isinstance(entry.schema["description"], str)

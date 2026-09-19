@@ -4,6 +4,7 @@ description: "Hash-chained local journal and safe undo for built-in Hermes memor
 author: "0xble"
 provides_tools:
   - memory_undo
+  - memory_journal_list
 provides_hooks:
   - pre_tool_call
   - post_tool_call
