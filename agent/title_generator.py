@@ -144,7 +144,7 @@ def _title_preferences() -> dict:
     aliases = cfg.get("name_aliases", {})
     if not isinstance(aliases, dict):
         aliases = {}
-    aliases = {str(k): str(v) for k, v in aliases.items() if str(k).strip() and str(v).strip()} 
+    aliases = {str(k): str(v) for k, v in aliases.items() if str(k).strip() and str(v).strip()}
     return {"min_words": min_words, "max_words": max_words, "case_style": case_style,
             "instructions": instructions, "name_aliases": aliases}
 

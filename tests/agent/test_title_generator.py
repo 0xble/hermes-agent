@@ -664,7 +664,6 @@ class TestModelSwitchMarkerNotTitleable:
             "南京市秦淮区 小时级天气预报"
         )
 
-
 class TestForkTitleContracts:
     def test_configured_case_rule_and_recent_titles_reach_prompt(self):
         response = MagicMock()
@@ -687,4 +686,3 @@ class TestForkTitleContracts:
             response.choices[0].message.content = content; response.choices[0].finish_reason = reason
             with patch("agent.title_generator.call_llm", return_value=response):
                 assert generate_title("real user request") is None
-

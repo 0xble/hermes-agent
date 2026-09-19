@@ -21,10 +21,10 @@ def test_override_and_variation_selector_validation():
 
 @pytest.mark.anyio
 async def test_adapter_renames_name_and_icon_in_one_bot_call():
-    adapter = object.__new__(TelegramAdapter)
+    adapter = type("FakeAdapter", (), {})()
     adapter._bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
     adapter.name = "test"
-    await adapter.rename_dm_topic(42, 7, "Bug triage", icon_custom_emoji_id="bug-id")
+    await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage", icon_custom_emoji_id="bug-id")
     adapter._bot.edit_forum_topic.assert_awaited_once_with(
         chat_id=42, message_thread_id=7, name="Bug triage", icon_custom_emoji_id="bug-id"
     )
