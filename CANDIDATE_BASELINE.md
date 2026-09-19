@@ -551,3 +551,29 @@ against the live isolated profile, reports OK.
 Still open from this review: `hermes cron create/update` and the cron tools do
 not expose `job_timezone`, so the 19 migrated jobs depend on the migrated
 `jobs.json` carrying the field, which the migration copy preserves.
+
+## Slice 13 rehearsal on the real personal database, September 19
+
+A consistent copy of the live `state.db` was taken with SQLite's backup API
+while the production gateway kept running (51 seconds, 33,758,023,680 bytes,
+`schema_version` 31, 16,897 sessions, 4,322,986 messages). The candidate opened
+it under a scratch home in 0.42 seconds and the rehearsal verdict is
+**compatible**: no table dropped or added, no column added, every row count
+identical before and after, and all seven read probes identical (sessions,
+messages, delivery ledger states `delivered 500`, delegation states
+`completed 273 / error 50 / unknown 14`, FTS hits for three phrases). Full
+report in `candidate-profile/SCHEMA_REHEARSAL_PERSONAL_20260919.json`. The copy
+was modified only by the bookkeeping keys an open stamps into `state_meta`.
+
+Fork-only tables holding rows that the candidate will leave inert: 
+`delegation_parent_tasks` 2,690, `telegram_dm_topic_bindings` 1,994,
+`delegation_thread_counters` 492, `telegram_topic_icon_state` 413,
+`telegram_topic_icon_history` 24, `restart_inbox` 3 (all terminal),
+`side_message_bindings` 2, `telegram_dm_topic_mode` 1. Note that
+`telegram_dm_topic_bindings` (1,994 rows) is a live feature of the legacy
+fork's Telegram DM topics; the candidate has its own binding table under the
+same name only if upstream shipped it, which this rehearsal does not test. That
+is a cutover acceptance item, not a schema one.
+
+`PRAGMA integrity_check` was not run on the copy (hours on 34 GB); the
+candidate's own open-time checks passed.
