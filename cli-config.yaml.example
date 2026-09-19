@@ -845,6 +845,11 @@ prompt_caching:
 #     model: ""
 #     timeout: 30
 #     language: ""           # empty = match the user's language; or e.g. "English"
+#     min_words: 3
+#     max_words: 7
+#     case_style: sentence_case # sentence_case or title_case
+#     instructions: ""         # trusted operator guidance appended to the prompt
+#     name_aliases: {}          # model spelling -> canonical display spelling
 #
 #   # Session search — summarizes matching past sessions
 #   session_search:
@@ -1312,6 +1317,10 @@ platform_toolsets:
 #     extra:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #       rich_messages: false          # always | auto | never; true=auto, false=never (default). Rich drafts are separate.
+#       auto_topic_icons: false       # semantic Bot API topic icons for Telegram DM topics
+#       preserve_manual_topic_icons: true
+#       topic_icon_instructions: ""
+#       topic_icon_overrides: {}      # title substring/exact text -> allowed emoji
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames
 #       command_menu:
 #         # Telegram allows up to 100 BotCommands; Hermes defaults to 60 so

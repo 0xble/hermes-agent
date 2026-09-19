@@ -116,6 +116,35 @@ class SessionTitlesMixin:
 
         return self._execute_write(_do) > 0
 
+    def set_session_title_in_lineage(self, session_id: str, title: str) -> str:
+        """Reserve a user title or its next ``#N`` alias atomically and return stored text."""
+        clean = self.sanitize_title(title)
+        if not clean:
+            raise ValueError("title cannot be empty")
+        match = _NUMBERED_TITLE_RE.match(clean)
+        base = match.group(1) if match else clean
+
+        def _do(conn):
+            rows = conn.execute("SELECT id, title FROM sessions WHERE id != ? AND (title = ? OR title LIKE ? ESCAPE '\\\\')",
+                                (session_id, base, f"{_escape_like(base)} #%")).fetchall()
+            used = {str(row["title"]) for row in rows}
+            if base not in used:
+                stored = base
+            else:
+                numbers = [int(m.group(2)) for m in (_NUMBERED_TITLE_RE.match(value) for value in used) if m]
+                n = max([1, *numbers]) + 1
+                stored = f"{base} #{n}"
+                while stored in used:
+                    n += 1
+                    stored = f"{base} #{n}"
+            current = conn.execute("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if current is None:
+                raise ValueError(f"session not found: {session_id}")
+            conn.execute("UPDATE sessions SET title = ?, title_source = ? WHERE id = ?", (stored, self.TITLE_SOURCE_USER, session_id))
+            return stored
+
+        return self._execute_write(_do)
+
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set a title on the user's behalf (``user`` provenance). Empty clears it. Raises
         ValueError on conflict or validation failure."""
@@ -131,6 +160,20 @@ class SessionTitlesMixin:
         """Get the title for a session, or None."""
         row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
         return row["title"] if row else None
+
+    def list_recent_session_titles(self, exclude_session_id: Optional[str] = None, limit: int = 20):
+        """Return recent non-empty titles, newest first, excluding the active session."""
+        params = []
+        where = "title IS NOT NULL AND TRIM(title) != ''"
+        if exclude_session_id:
+            where += " AND id != ?"
+            params.append(str(exclude_session_id))
+        params.append(max(1, min(100, int(limit))))
+        rows = self._read_all(
+            f"SELECT title FROM sessions WHERE {where} ORDER BY started_at DESC LIMIT ?",
+            tuple(params),
+        )
+        return [row["title"] for row in rows if row["title"]]
 
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""

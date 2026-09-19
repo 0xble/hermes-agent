@@ -63,21 +63,23 @@ _EXAMPLE_ECHO_REJECT = frozenset(
 ) | {_PROMPT_VAGUE_EXAMPLE.lower()}
 
 _TITLE_PROMPT_TEMPLATE = (
-    "You name chat sessions. Given the user's opening message, write a title "
+    "You name chat sessions. Given the user's opening message, write a concise noun-phrase title "
     "that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
-    "- 3 to 7 words, sentence case (capitalize only the first word and proper nouns).\n"
-    "- Name what the user wants DONE, not that they asked a question.\n"
+    "- __WORD_RULE__\n"
+    "- __CASE_RULE__\n"
+    "- Name the subject, artifact, or decision, never an imperative or conditional action.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
     "- Drop filler words: the, this, my, a, an.\n"
     "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
+    "__INSTRUCTIONS__\n"
+    "__AVOID_TITLES__\n"
     + "".join(f'Good: {{"title": "{t}"}}\n' for t in _PROMPT_GOOD_EXAMPLES)
     + f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
-    'Too long: {"title": "Investigate and fix the issue where the login button '
-    'does not respond on mobile devices"}\n\n'
+    'Contrastive example: use "Postgres connection pool exhaustion", not "Fix the Postgres connection pool".\n\n'
     'Reply with JSON only: {"title": "..."}'
 )
 
@@ -119,13 +121,66 @@ def _title_config() -> dict:
     return ((load_config_readonly() or {}).get("auxiliary") or {}).get("title_generation") or {}
 
 
+def _title_preferences() -> dict:
+    """Return bounded title prompt preferences from the operator config."""
+    cfg = _title_config()
+    try:
+        min_words = max(1, min(12, int(cfg.get("min_words", 3))))
+    except (TypeError, ValueError):
+        min_words = 3
+    try:
+        max_words = max(1, min(12, int(cfg.get("max_words", 7))))
+    except (TypeError, ValueError):
+        max_words = 7
+    if min_words > max_words:
+        min_words = max_words
+    case_style = str(cfg.get("case_style", "sentence_case")).strip().lower()
+    if case_style not in {"sentence_case", "title_case"}:
+        case_style = "sentence_case"
+    instructions = cfg.get("instructions", "")
+    if isinstance(instructions, (list, tuple)):
+        instructions = " ".join(str(item) for item in instructions)
+    instructions = str(instructions or "").strip()[:1000]
+    aliases = cfg.get("name_aliases", {})
+    if not isinstance(aliases, dict):
+        aliases = {}
+    aliases = {str(k): str(v) for k, v in aliases.items() if str(k).strip() and str(v).strip()} 
+    return {"min_words": min_words, "max_words": max_words, "case_style": case_style,
+            "instructions": instructions, "name_aliases": aliases}
+
+
+def _title_prompt(*, language: str, recent_titles=None) -> str:
+    prefs = _title_preferences()
+    case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
+                 if prefs["case_style"] == "title_case" else
+                 "Sentence case: capitalize only the first word and proper nouns; this is the only capitalization rule.")
+    avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
+    avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
+    instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
+    return _TITLE_PROMPT_TEMPLATE.replace("__WORD_RULE__", f"{prefs['min_words']} to {prefs['max_words']} words.") \
+        .replace("__CASE_RULE__", case_rule) \
+        .replace("__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER) \
+        .replace("__INSTRUCTIONS__", instruction_block) \
+        .replace("__AVOID_TITLES__", avoid_block)
+
+
+def _restore_name_aliases(title: str, aliases: dict) -> str:
+    """Restore configured display names without treating operator text as regex."""
+    result = title
+    for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        parts = [re.escape(part) for part in re.findall(r"[\w]+", alias, flags=re.UNICODE)]
+        if not parts:
+            continue
+        pattern = r"(?<!\w)" + r"[\W_]+".join(parts) + r"(?!\w)"
+        result = re.sub(pattern, lambda _match, value=canonical: value, result, flags=re.IGNORECASE | re.UNICODE)
+    return result
+
 def _title_language() -> str:
     """Configured title language, or "" to match the user."""
     try:
         return str(_title_config().get("language", "")).strip()
     except Exception:
         return ""
-
 
 def _auto_title_enabled() -> bool:
     try:
@@ -268,6 +323,12 @@ def generate_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    avoid_titles=None,
+    recent_titles=None,
+    icon_options=None,
+    recent_icons=None,
+    icon_instructions: str = "",
+    icon_callback: Optional[Callable[[Optional[str], str], None]] = None,
 ) -> Optional[str]:
     """Title from the opening message alone (waiting for the assistant made this slow and bought
     nothing). ``runtime_validator`` runs right before the request; False skips silently.
@@ -289,10 +350,17 @@ def generate_title(
     if not user_snippet.strip():
         return None
     language = _title_language()
-    # str.replace, not str.format: the prompt embeds literal JSON braces.
-    prompt = _TITLE_PROMPT_TEMPLATE.replace(
-        "__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER,
-    )
+    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles)
+    icon_allowed = list(icon_options or [])
+    if icon_allowed:
+        from agent.topic_icons import normalize_emoji
+        recent = {normalize_emoji(item) for item in (recent_icons or [])}
+        fresh = [item for item in icon_allowed if normalize_emoji(item) not in recent]
+        candidates = fresh if len(fresh) >= 8 else icon_allowed
+        prompt += "\n\nAlso select one icon. Reply with JSON only: {\"title\": \"...\", \"icon\": \"...\"}. " \
+            f"Allowed icons: {[str(item.get('emoji', item)) if isinstance(item, dict) else str(item) for item in candidates]}."
+        if icon_instructions:
+            prompt += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
     try:
         response = call_llm(
             task="title_generation",
@@ -308,25 +376,36 @@ def generate_title(
             # ("```json") as the session title (#91927).
             reasoning_config={"enabled": False},
         )
-        title = _clean_title(_extract_title_text(response.choices[0].message.content or ""))
-        # Answer-shaped output guard: titling is a 3-7 word task, so a title with many words is a model that
-        # ignored the task and answered the user's message instead ("I don't have context on X — that's not
-        # something I recognize..."). Truncating would store half an assistant blob as the session title,
-        # which is still an assistant blob — reject instead so the caller retries on the next exchange
-        # (maybe_auto_title fires for the first two exchanges). Port of can1357/oh-my-pi#7306.
-        if title is not None and len(title.split()) > _MAX_TITLE_WORDS:
-            # Answer-shaped output: reject (not truncate) so the caller retries next exchange.
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason in {"length", "max_tokens"}:
+            logger.debug("Rejecting truncated title output (finish_reason=%s)", finish_reason)
+            return None
+        raw_content = getattr(getattr(choice, "message", None), "content", "") or ""
+        payload = None
+        if icon_allowed:
+            with suppress(Exception):
+                payload = json.loads(str(raw_content).strip().strip("`"))
+        if not any(char.isalnum() for char in str(raw_content)):
+            logger.debug("Rejecting title output with no Unicode letters or digits")
+            return None
+        title_value = payload.get("title") if isinstance(payload, dict) else None
+        title = _clean_title(_extract_title_text(title_value or raw_content))
+        if icon_allowed and icon_callback is not None:
+            from agent.topic_icons import choose_topic_icon_deterministic, validate_model_icon
+            icon = validate_model_icon(payload.get("icon") if isinstance(payload, dict) else None, icon_allowed)
+            if icon is None:
+                icon = choose_topic_icon_deterministic(title or "", user_snippet, icon_allowed, recent_icons)
+            with suppress(Exception):
+                icon_callback(icon, "llm" if title else "fallback")
+        if title is None or not any(char.isalnum() for char in title):
+            return None
+        title = _restore_name_aliases(title, _title_preferences()["name_aliases"])
+        # Answer-shaped output guard: titling is a short noun-phrase task.
+        if len(title.split()) > _MAX_TITLE_WORDS:
             logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), _MAX_TITLE_WORDS)
             return None
-        # Example-echo guard: a title that parrots one of the prompt's own
-        # examples back verbatim says nothing about the session — reject it so
-        # the instant derived title (a slice of the user's actual words)
-        # survives instead. Exact match after wrapper-stripping, deliberately
-        # not fuzzy, so a genuinely topical title that merely resembles an
-        # example still passes. Wrappers are stripped for the comparison only
-        # ("(Fix login button on mobile)" is the same canned echo as the bare
-        # example). Port of QwenLM/qwen-code#9709.
-        if title is not None and _is_prompt_example_echo(title):
+        if _is_prompt_example_echo(title):
             logger.debug("Rejecting prompt-example echo title: %r", title)
             return None
         return title
@@ -426,8 +505,14 @@ def auto_title_session(
         # Same for the accounting context, so the title call's token usage is recorded against this session
         # (task='title_generation', #23270).
         set_accounting_context(session_db, session_id)
+        recent_titles = []
+        with suppress(Exception):
+            list_recent = getattr(session_db, "list_recent_session_titles", None)
+            if callable(list_recent):
+                recent_titles = list_recent(exclude_session_id=session_id, limit=20)
         title, source = generate_title(
-            user_message, failure_callback=failure_callback, main_runtime=main_runtime, runtime_validator=runtime_validator,
+            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
+            runtime_validator=runtime_validator, recent_titles=recent_titles,
         ), "llm"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message), "derived"
