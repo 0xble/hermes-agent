@@ -106,4 +106,20 @@ Verification:
 hermes plugins doctor .../goal-lifecycle --ci    registration passed
 tests: candidate-extensions/goal-lifecycle/test_goal_lifecycle.py
 6 passed in 1.93s
+
+## Slice 4 review boundary
+
+The candidate extension at `candidate-extensions/review-candidate/` registers a
+parent-only, read-only `review_candidate` tool. It requires explicit base and
+head commits, validates both with Git, constrains the diff to the requested
+scope, routes through `auxiliary.review`, and records a receipt under the active
+profile. Unavailable review routes return `not_reviewed`, never approval.
+
+Verification:
+
+```text
+hermes plugins doctor .../review-candidate --ci    registration passed
+tests: candidate-extensions/review-candidate/test_review_candidate.py
+3 passed in 0.56s
+```
 ```
