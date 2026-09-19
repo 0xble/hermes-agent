@@ -275,6 +275,7 @@ Focused verification: `3 passed` in
 workflow and generated-install read-only enforcement remain outstanding parts of
 Slice 6.
 
+
 ## Slice 7: Hindsight bank isolation
 
 The candidate records the per-profile Hindsight bank contract in
@@ -289,17 +290,3 @@ provider file has eight environment-sensitive failures when the optional
 `hindsight-client` and `hindsight_client_api` packages are absent from the
 candidate environment; those failures are recorded as dependency setup gaps,
 not treated as a pass.
-
-## Slice 6: canonical skill write guard
-
-The candidate now includes the `canonical-skill-guard` plugin. It resolves the
-configured `skills.external_dirs` roots through the existing skill utility,
-blocks `skill_manage` writes aimed at an externally owned skill, and directs the
-model to `$HERMES_HOME/observations/<skill>.md`. Local profile skills and
-unrelated tools remain unaffected. The guard fails closed if it cannot establish
-the external roots.
-
-Focused verification: `3 passed` in
-`tests/plugins/test_canonical_skill_guard.py`. The separate dotfiles curation
-workflow and generated-install read-only enforcement remain outstanding parts of
-Slice 6.
