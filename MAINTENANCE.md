@@ -22,6 +22,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - Source checkout, installed personal checkout, and signed company releases are
   distinct identities. A source merge is not deployment or acceptance evidence.
 
+## Maintenance units
+
+| Unit | Purpose | Load when | Contract |
+|---|---|---|---|
+| Cron fallback routing | Keep scheduled agents' backup chain independent of interactive routing | Changing cron/provider resolution or evaluating an upstream release | [Cron fallback routing](maintenance/cron-fallback-routing.md) |
+
 ## Update
 
 Every run loads [fork patch provenance](maintenance/fork-patches.md). Its separate
