@@ -55,3 +55,12 @@ the trailer is required on every new commit and `scripts/check_fork_patches.py` 
 | `ee900244de91` | feat(cron): per-job IANA timezone and a migration dry-run diff | slice-12-per-job-timezone | none | when upstream adds a per-job timezone |
 | `d076883f6aa1` | fix(candidate): run candidate reviews in the background, receipt on child stop | slice-4-review-gate | none | when upstream /review accepts a ref and records a receipt |
 | `53f9d4be8094` | feat(candidate): verify the memory journal chain and bound its growth | slice-5-memory-journal | none | when upstream adds a memory ledger comparable to skill_ledger.py |
+| `087a66723ba7` | feat(candidate): fork patch ledger, sync stage, feature check, and rollback | slice-14-self-update | none | when the fork carries zero patches |
+| `474aea279b9b` | feat(candidate): schema-compatibility rehearsal for copied legacy state | slice-13-schema-rehearsal | none | never (migration tooling) |
+| `f85ebdeadd8a` | feat(candidate): skill curation stage and the candidate's scheduled jobs | slice-6-skill-curation | none | if upstream adds an observation channel and an external-dir-aware curator |
+| `557efe2ea9af` | feat(candidate): install cron scripts with the extensions; company overlay diff | candidate-tooling | none | when the extensions ship as packaged plugins |
+| `296aea1844d9` | docs(candidate): personal cutover runbook; Meridian lineage settled by ancestry | evidence | none | not a patch |
+| `8ca0e1a627da` | feat(candidate): verified archive of the legacy fork's complete history | slice-18-archive | none | never (migration tooling) |
+| `5a39c6b954f8` | fix(candidate): address all seven I6 review findings | slice-4-review-gate | none | when upstream /review accepts a ref and records a receipt |
+| `42308cb106bf` | docs(candidate): record the I6 review, its disposition, and the corrected Hindsight claim | evidence | none | not a patch; evidence/config record |
+| `91993b5452cd` | fix(candidate): address all nine findings of the second I6 review | candidate-tooling | none | when the extensions ship as packaged plugins |
