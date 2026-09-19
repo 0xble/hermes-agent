@@ -30,4 +30,6 @@ auxiliary:
     model: claude-fable-5.1
 updates:
   check: false
-
+plugins:
+  enabled:
+    - canonical-skill-guard
