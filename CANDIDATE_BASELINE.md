@@ -273,7 +273,13 @@ disposable candidate profile.
 Focused verification: `3 passed` in
 `tests/plugins/test_canonical_skill_guard.py`. The separate dotfiles curation
 workflow and generated-install read-only enforcement remain outstanding parts of
-Slice 6.
+Slice 6. The candidate extension installer now copies the four candidate
+extensions (`goal-lifecycle`, `memory-journal`, `request-update`, and
+`review-candidate`) into a profile's normal `$HERMES_HOME/plugins` directory,
+updates `plugins.enabled` idempotently, and stages each copy before replacing
+the installed directory. The real discovery E2E proves the installed tools
+register in a fresh profile. Focused installer and guard/update verification:
+`33 passed`. This does not activate any production profile.
 
 
 ## Slice 7: Hindsight bank isolation
