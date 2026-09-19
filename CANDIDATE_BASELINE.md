@@ -577,3 +577,57 @@ is a cutover acceptance item, not a schema one.
 
 `PRAGMA integrity_check` was not run on the copy (hours on 34 GB); the
 candidate's own open-time checks passed.
+
+## Personal cutover, September 19
+
+Authorized by Brian ("no dont hold off even on irreversible actions"). Executed
+as the runbook's three moves; the timeline is in
+`candidate-profile/PERSONAL_CUTOVER_20260919.log`.
+
+**Gates before move 1.** Third integration review on `9ea61c1012e3` returned
+`approve` (delegation `deleg_647dd963`, five low notes, three fixed in
+`024e077c7ef6`). Slice 13 rehearsal on the real copied database: `compatible`.
+Migration diff on the live job file: one decision (`maintain-targets` pinned to
+the main route), one legal duplicate interval left alone, no overdue rows.
+Secrets: all 92 production secrets resolve under the candidate once
+`secrets.onepassword.account` is set (the candidate's `op` needs an explicit
+account on a machine with three).
+
+**Move 1, freeze and capture.** 13 legacy maintenance crons paused;
+`promote-hermes-fork` booted out; `hindsight-hermes` left running because it is
+the Hindsight service on port 9177, not a profile writer. Quiescence verified: no
+running delegations, no in-flight cron executions, live database unwritten for 25
+minutes. Capture at `/Users/brianle/.hermes-cutover-capture-20260919T050807Z` (32 GB, 3,246 files checksummed); readback of
+`schema_version`, sessions and messages matched live exactly. The legacy gateway
+was booted out and drained on its own SIGTERM path (one in-flight cron marked
+interrupted, later re-run by the candidate).
+
+**Move 2, activate one owner.** Managed checkout swapped: `~/.hermes/hermes-agent`
+is now a clone of `origin/main` at `024e077c7ef6` with its own venv; the legacy
+checkout `c6b02aee9675` is preserved at `~/.hermes/hermes-agent.legacy`.
+`config.yaml` replaced by the translation (legacy copy beside it); `jobs.json`
+replaced by the migrated copy (legacy beside it); extensions and cron scripts
+installed; `hermes gateway install` rewrote the launchd definition to the new
+venv with `--external-supervisor`. The fork's `origin/main` was moved to the
+reviewed head, with the two prior heads preserved under `refs/archive/`.
+
+**Move 3, acceptance on the real profile.**
+
+| check | result |
+|---|---|
+| gateway identity | pid 20382, `~/.hermes/hermes-agent/venv`, launchd `runs = 1`, never exited |
+| Telegram connect | polling healthy, 60 commands registered |
+| Telegram outbound | `hermes send` delivered message 109040 to the home DM through the candidate's credential path |
+| Telegram inbound round trip | one-shot job `e295e103c0bc` fired on the candidate scheduler; its turn is in a 600 s proxy rate-limit backoff at the time of writing (same limit the legacy gateway hit at 01:12) |
+| cron continuity | 94 job ids identical; the candidate completed three scheduled jobs within five minutes, including the one the legacy drain interrupted |
+| memory | add, undo, journal intact; nothing left in MEMORY.md; Hindsight retention indicator active on bank `brianle` |
+| skills | 106 canonical skills resolve from the dotfiles install |
+| Camofox | `brianle` binds; a switch to `meridian` in the same task is refused |
+| self-update | `hermes update --plan` reports the candidate at `024e077c` and the external-supervised gateway |
+| feature check | OK, 0 problems |
+
+Vault fill is not exercised: no disposable vault item exists and a real login is
+a user-attended acceptance. The one-day sustained window starts at activation
+(01:20 EDT, 2026-09-19). Rollback remains available: bootout, restore the
+capture, restore the legacy config, rename `hermes-agent.legacy` back, bootstrap
+the legacy plist.

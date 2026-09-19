@@ -1,0 +1,11 @@
+2026-09-19T05:07:22Z paused 13 legacy maintenance crons
+2026-09-19T05:07:22Z booted out promote-hermes-fork and hindsight-hermes
+2026-09-19T05:07:51Z hindsight-hermes left running: it is the Hindsight service (port 9177), not a profile writer
+2026-09-19T05:15:38Z capture written to /Users/brianle/.hermes-cutover-capture-20260919T050807Z
+2026-09-19T05:15:51Z capture readback: schema/sessions/messages match live
+2026-09-19T05:16:08Z legacy gateway booted out
+2026-09-19T05:19:07Z checkout swapped: hermes-agent -> 024e077c (legacy c6b02aee kept at hermes-agent.legacy)
+2026-09-19T05:19:12Z config + jobs.json replaced (legacy copies beside), extensions installed
+2026-09-19T05:20:12Z candidate gateway service installed and bootstrapped
+2026-09-19T05:26:25Z resumed 6 maintenance jobs; kept 7 legacy sync/watch/fork jobs paused
+2026-09-19T05:29:04Z isolated api_server gateway (pid 88896) stopped
