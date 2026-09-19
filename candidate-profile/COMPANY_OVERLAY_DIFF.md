@@ -38,3 +38,19 @@ against; nothing here infers that a company policy should change to match the pe
   slice 13 rehearsal, on a copy, under host authority.
 - **Signed release route.** Both companies build through `apps/agent/release`. The candidate
   engine enters those pipelines as a pinned source SHA; this document does not change how.
+
+## Decisions taken at the company cutovers (2026-09-19)
+
+- `browser.camofox.accounts`: set to `[meridian]` (meridian-next `main`) and `[lpg]` (LPG
+  `hermes-next-runtime`, PR #128). Both overlays carry the rationale inline.
+- Candidate extensions on company hosts: **not installed.** Neither release repository ships
+  Hermes plugins (no plugin handling in `apply-profile.py`, `install-host.sh`, or
+  `build-release.py`, and no `plugins/` directory under either agent home). `request-update`
+  is meaningless on a signed-release host, LPG forbids review and delegation, and agent-set
+  goals on LPG remain a company policy question that the migration does not need to answer.
+  Adding plugin shipping to two release contracts is out of the migration's scope; the runtime
+  itself is what the company hosts adopt.
+- `auxiliary.background_review.enabled` on Meridian: left unset (upstream default), consistent
+  with its `memory.write_approval: true`.
+- Scheduled candidate jobs (sync, feature check, curation, snapshot): none on company hosts,
+  as recorded above.
