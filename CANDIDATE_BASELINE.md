@@ -259,3 +259,31 @@ vault identity remains a separate handle and origin mapping.
 Vault and browser verification: `72 passed, 4 skipped` across the vault,
 OnePassword, Camofox, browser-vault, and TUI vault suites. No real vault or
 account credentials were used.
+
+## Slice 6: canonical skill write guard
+
+The candidate now includes the `canonical-skill-guard` plugin. It resolves the
+configured `skills.external_dirs` roots through the existing skill utility,
+blocks `skill_manage` writes aimed at an externally owned skill, and directs the
+model to `$HERMES_HOME/observations/<skill>.md`. Local profile skills and
+unrelated tools remain unaffected. The guard fails closed if it cannot establish
+the external roots.
+
+Focused verification: `3 passed` in
+`tests/plugins/test_canonical_skill_guard.py`. The separate dotfiles curation
+workflow and generated-install read-only enforcement remain outstanding parts of
+Slice 6.
+
+## Slice 6: canonical skill write guard
+
+The candidate now includes the `canonical-skill-guard` plugin. It resolves the
+configured `skills.external_dirs` roots through the existing skill utility,
+blocks `skill_manage` writes aimed at an externally owned skill, and directs the
+model to `$HERMES_HOME/observations/<skill>.md`. Local profile skills and
+unrelated tools remain unaffected. The guard fails closed if it cannot establish
+the external roots.
+
+Focused verification: `3 passed` in
+`tests/plugins/test_canonical_skill_guard.py`. The separate dotfiles curation
+workflow and generated-install read-only enforcement remain outstanding parts of
+Slice 6.

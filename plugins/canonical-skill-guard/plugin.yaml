@@ -1,0 +1,6 @@
+name: canonical-skill-guard
+version: "0.1.0"
+description: "Keep externally owned canonical skills read-only and route improvement notes to the profile observation channel."
+author: "0xble"
+hooks:
+  - pre_tool_call
