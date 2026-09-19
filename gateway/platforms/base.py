@@ -1835,6 +1835,11 @@ class BasePlatformAdapter(ABC):
         # could drop a newer guard.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Commands accepted while a turn is active but requiring a committed session boundary.
+        # Kept separate from ordinary follow-up text so a deferred mutation cannot be merged into
+        # or displaced by the one-slot prompt queue.
+        self._deferred_commands: Dict[str, List[MessageEvent]] = {}
+
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
@@ -1872,6 +1877,25 @@ class BasePlatformAdapter(ABC):
         # Per-chat status phrase; the regular _keep_typing refresh renders it (no extra API calls).
         self._status_text: Dict[str, str] = {}
 
+    def defer_command_until_idle(self, session_key: str, event: MessageEvent) -> int:
+        """Record a command for execution after the active session turn commits.
+
+        Returns the 1-based queue depth. Deferred commands are deliberately separate from
+        ``_pending_messages``: ordinary follow-up text is a prompt, while a deferred command
+        must retain its command identity and execute before that prompt.
+        """
+        queue = self._deferred_commands.setdefault(session_key, [])
+        queue.append(event)
+        return len(queue)
+
+    def _pop_deferred_command(self, session_key: str) -> Optional[MessageEvent]:
+        queue = self._deferred_commands.get(session_key)
+        if not queue:
+            return None
+        event = queue.pop(0)
+        if not queue:
+            self._deferred_commands.pop(session_key, None)
+        return event
     @property
     def message_len_fn(self) -> Callable[[str], int]:
         """Length function for message size; override where the platform counts
@@ -4116,7 +4140,15 @@ class BasePlatformAdapter(ABC):
         drop: re-queue it if another task already owns the session (drain handoff), else spawn the
         drain task and leave it the guard. Nothing pending: release the guard only if we still own
         it."""
+        # Deferred control commands run before ordinary queued text, against the committed
+        # transcript/context produced by this turn. Keep any ordinary follow-up in its slot.
+        deferred = self._pop_deferred_command(session_key)
         late_pending = self._pending_messages.pop(session_key, None)
+        if deferred is not None:
+            if late_pending is not None:
+                self._pending_messages[session_key] = late_pending
+            self._spawn_drain_task(deferred, session_key)
+            return
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
