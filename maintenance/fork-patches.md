@@ -42,9 +42,9 @@ For cron-specific fallback divergence, load [cron fallback routing](cron-fallbac
 
 | commit | subject | slice | upstream | retire when |
 |---|---|---|---|---|
-| `f0784a5201c` | feat(titles): configurable concise session titles | slice-15-title-config | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
-| `58d0fb04d84` | feat(telegram): semantic Bot API topic icons with one-call renames | slice-16-topic-icons | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
-| `0a60d961914` | feat(telegram): duplicate topic labels via lineage aliases | slice-17-topic-lineage | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
+| `e05696e5f5fa` | feat(titles): configurable concise session titles | slice-15-title-config | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
+| `c32ca10fb223` | feat(telegram): semantic Bot API topic icons with one-call renames | slice-16-topic-icons | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
+| `2f826182bb71` | feat(telegram): duplicate topic labels via lineage aliases | slice-17-topic-lineage | NousResearch/hermes-agent PR #66353; PR #35737 | when a released upstream tag provides equivalent behavior |
 | `664eeb3baabd` | docs: record release candidate baseline | evidence | none | not a patch; evidence/config record |
 | `ba626698191d` | docs: record legacy migration references | evidence | none | not a patch; evidence/config record |
 | `22a5a538246c` | feat: add isolated slice 2 routing profile | evidence | none | not a patch; evidence/config record |

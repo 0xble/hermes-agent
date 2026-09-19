@@ -1319,7 +1319,7 @@ platform_toolsets:
 #       rich_messages: false          # always | auto | never; true=auto, false=never (default). Rich drafts are separate.
 #       auto_topic_icons: false       # semantic Bot API topic icons for Telegram DM topics
 #       preserve_manual_topic_icons: true
-#       topic_icon_instructions: ""
+#       topic_icon_instructions: ""  # guidance for the combined title+icon model call
 #       topic_icon_overrides: {}      # title substring/exact text -> allowed emoji
 #       rich_drafts: false            # Experimental rich draft previews during Telegram DM streaming; default false because Telegram Desktop/macOS can visually overlay draft frames
 #       command_menu:

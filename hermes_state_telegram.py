@@ -416,7 +416,7 @@ class SessionTelegramTopicsMixin:
     def list_recent_telegram_topic_icons(self, chat_id: str, limit: int = 24, profile_name: str = "default") -> List[str]:
         try:
             with self._read_ctx() as conn:
-                rows = conn.execute("SELECT emoji FROM telegram_topic_icon_history WHERE profile_name=? AND chat_id=? ORDER BY selected_at DESC LIMIT ?",
+                rows = conn.execute("SELECT emoji FROM telegram_topic_icon_history WHERE profile_name=? AND chat_id=? ORDER BY selected_at DESC, rowid DESC LIMIT ?",
                                     (_normalize_telegram_topic_profile_name(profile_name), str(chat_id), max(1, int(limit)))).fetchall()
             return [row[0] for row in rows if row[0]]
         except sqlite3.OperationalError:

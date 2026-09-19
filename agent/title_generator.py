@@ -313,21 +313,24 @@ def _notify_title(
     label: str,
     *,
     display_title: Optional[str] = None,
+    icon: Optional[str] = None,
 ) -> None:
-    """Notify title consumers, preserving compatibility with two-argument callbacks."""
+    """Notify title consumers, preserving compatibility with two-argument callbacks. Keyword
+    extras (``display_title``, ``icon``) are passed only when the callback's signature binds them."""
     if title_callback is None:
         return
     try:
-        if display_title is None:
+        extras = {k: v for k, v in (("display_title", display_title), ("icon", icon)) if v is not None}
+        if not extras:
             title_callback(title, source)
             return
         try:
             signature = inspect.signature(title_callback)
-            signature.bind(title, source, display_title=display_title)
+            signature.bind(title, source, **extras)
         except (TypeError, ValueError):
             title_callback(title, source)
         else:
-            title_callback(title, source, display_title=display_title)
+            title_callback(title, source, **extras)
     except Exception:
         logger.debug("%s callback failed", label, exc_info=True)
 
@@ -520,6 +523,7 @@ def auto_title_session(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    icon_context: Optional[dict] = None,
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
@@ -544,9 +548,17 @@ def auto_title_session(
             list_recent = getattr(session_db, "list_recent_session_titles", None)
             if callable(list_recent):
                 recent_titles = list_recent(exclude_session_id=session_id, limit=20)
+        chosen_icon: list = []
+        icon_kwargs: dict = {}
+        if isinstance(icon_context, dict) and icon_context.get("options"):
+            icon_kwargs = dict(
+                icon_options=icon_context.get("options"), recent_icons=icon_context.get("recent"),
+                icon_instructions=str(icon_context.get("instructions") or ""),
+                icon_callback=lambda icon, _how: chosen_icon.append(icon),
+            )
         title, source = generate_title(
             user_message, failure_callback=failure_callback, main_runtime=main_runtime,
-            runtime_validator=runtime_validator, recent_titles=recent_titles,
+            runtime_validator=runtime_validator, recent_titles=recent_titles, **icon_kwargs,
         ), "llm"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message), "derived"
@@ -560,7 +572,8 @@ def auto_title_session(
         if persisted is not None:
             logger.debug("Auto-generated session title: %s", persisted)
             _notify_title(
-                title_callback, persisted, source, "Auto-title", display_title=title
+                title_callback, persisted, source, "Auto-title", display_title=title,
+                icon=(chosen_icon[0] if chosen_icon and source == "llm" else None),
             )
     except Exception as e:
         # WARNING so operators see it in agent.log; names the likely cause.
@@ -596,6 +609,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    icon_context: Optional[dict] = None,
 ) -> None:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model."""
     if not session_db or not session_id or not user_message:
@@ -612,7 +626,8 @@ def maybe_auto_title(
     threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message),
-        kwargs=dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback, runtime_validator=runtime_validator),
+        kwargs=dict(failure_callback=failure_callback, main_runtime=main_runtime, title_callback=title_callback,
+                    runtime_validator=runtime_validator, icon_context=icon_context),
         daemon=True,
         name="auto-title",
     ).start()

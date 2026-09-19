@@ -481,6 +481,7 @@ class GatewayTopicThreadsMixin:
         title: str,
         *,
         user_message: str = "",
+        model_icon: Optional[str] = None,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source) or self._telegram_topic_auto_rename_disabled(source):
@@ -488,10 +489,33 @@ class GatewayTopicThreadsMixin:
         self._schedule_rename_from_title_thread(
             source,
             lambda copied: self._rename_telegram_topic_for_session_title(
-                copied, session_id, title, user_message=user_message
+                copied, session_id, title, user_message=user_message, model_icon=model_icon
             ),
             "Telegram topic title rename",
         )
+
+    def _telegram_topic_icon_context(self, source: SessionSource) -> Optional[dict]:
+        """Icon inputs for the combined title+icon model call, or None when icons are off or the
+        adapter has not cached Telegram's allowed-icon catalog yet (first topic falls back to the
+        deterministic chooser; the catalog is fetched during the rename and cached after)."""
+        extra = getattr(getattr(getattr(self, "config", None), "platforms", {}).get(source.platform), "extra", {}) or {}
+        if not is_truthy_value(extra.get("auto_topic_icons")):
+            return None
+        adapter = self._adapter_for_source(source)
+        options = getattr(adapter, "_forum_topic_icon_options", None) if adapter is not None else None
+        if not options:
+            return None
+        recent: list = []
+        sync_db = self._sync_session_db()
+        if sync_db is not None and source.chat_id:
+            with suppress(Exception):
+                recent = sync_db.list_recent_telegram_topic_icons(
+                    str(source.chat_id), 24, self._telegram_topic_profile_name(source))
+        return {
+            "options": list(options),
+            "recent": recent,
+            "instructions": str(extra.get("topic_icon_instructions") or ""),
+        }
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """``gateway.platforms.telegram.extra.disable_topic_auto_rename``; default False (auto-rename on)."""
@@ -508,6 +532,7 @@ class GatewayTopicThreadsMixin:
         title: str,
         *,
         user_message: str = "",
+        model_icon: Optional[str] = None,
     ) -> None:
         """Serialize per-chat title/icon selection so recent-history rotation is race-free."""
         locks = getattr(self, "_telegram_topic_icon_locks", None)
@@ -521,7 +546,7 @@ class GatewayTopicThreadsMixin:
         lock = locks.setdefault(key, asyncio.Lock())
         async with lock:
             await self._rename_telegram_topic_for_session_title_unlocked(
-                source, session_id, title, user_message=user_message
+                source, session_id, title, user_message=user_message, model_icon=model_icon
             )
 
     async def _rename_telegram_topic_for_session_title_unlocked(
@@ -531,6 +556,7 @@ class GatewayTopicThreadsMixin:
         title: str,
         *,
         user_message: str = "",
+        model_icon: Optional[str] = None,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
@@ -588,8 +614,12 @@ class GatewayTopicThreadsMixin:
                     if sync_session_db
                     else []
                 )
-                from agent.topic_icons import choose_topic_icon_deterministic, resolve_override
-                icon_emoji = resolve_override(topic_name, extra.get("topic_icon_overrides"), options) or choose_topic_icon_deterministic(topic_name, user_message, options, recent)
+                from agent.topic_icons import choose_topic_icon_deterministic, resolve_override, validate_model_icon
+                icon_emoji = (
+                    resolve_override(topic_name, extra.get("topic_icon_overrides"), options)
+                    or validate_model_icon(model_icon, options)
+                    or choose_topic_icon_deterministic(topic_name, user_message, options, recent)
+                )
                 selected = next(
                     (item for item in options if item.get("emoji") == icon_emoji),
                     None,
