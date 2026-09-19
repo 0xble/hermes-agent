@@ -120,6 +120,6 @@ Verification:
 ```text
 hermes plugins doctor .../review-candidate --ci    registration passed
 tests: candidate-extensions/review-candidate/test_review_candidate.py
-3 passed in 0.56s
+4 passed in 1.16s, including exact-receipt reuse for an unchanged candidate.
 ```
 ```

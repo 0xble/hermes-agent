@@ -44,6 +44,17 @@ def _receipt_path() -> Path:
     return get_hermes_home() / "reviews" / "review-candidate.json"
 
 
+def _existing_receipt(path: Path, *, base_sha: str, head_sha: str, scope: list[str]) -> dict[str, Any] | None:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if (receipt.get("status") == "reviewed" and receipt.get("base_sha") == base_sha
+            and receipt.get("head_sha") == head_sha and receipt.get("scope") == scope):
+        return receipt
+    return None
+
+
 def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -67,6 +78,11 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
         if not diff:
             return _json(success=False, status="not_reviewed", error_code="empty_scope",
                          error="candidate scope has no diff")
+        receipt_path = _receipt_path()
+        existing = _existing_receipt(receipt_path, base_sha=base_resolved,
+                                      head_sha=head_resolved, scope=scope)
+        if existing is not None:
+            return _json(success=True, reused=True, **existing)
         prompt = (
             "You are reviewing an exact code candidate. Read the supplied diff only. "
             "Return JSON with keys verdict (approve or changes_requested), findings (array of "
@@ -93,7 +109,7 @@ def review_candidate(args: dict[str, Any], **kwargs: Any) -> str:
             "status": "reviewed", "repository": str(repo), "base_sha": base_resolved,
             "head_sha": head_resolved, "scope": scope, "reviewer_model": model, "result": findings,
         }
-        path = _receipt_path()
+        path = receipt_path
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
             json.dump(receipt, tmp, sort_keys=True, indent=2)

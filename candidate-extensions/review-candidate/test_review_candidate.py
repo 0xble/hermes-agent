@@ -43,3 +43,25 @@ def test_same_commit_is_rejected(tmp_path, monkeypatch):
     result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": sha, "head_sha": sha}, task_id="parent"))
     assert result["error_code"] == "empty_candidate"
 
+
+def test_matching_receipt_is_reused(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    plugin = load_plugin()
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    (tmp_path / "file.txt").write_text("one")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "one"], check=True)
+    base = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+    (tmp_path / "file.txt").write_text("two")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "file.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "two"], check=True)
+    head = subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True).strip()
+    path = plugin._receipt_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"status": "reviewed", "base_sha": base, "head_sha": head, "scope": [], "result": {"verdict": "approve"}}))
+    result = json.loads(plugin.review_candidate({"repository": str(tmp_path), "base_sha": base, "head_sha": head}, task_id="parent"))
+    assert result["reused"] is True
+
