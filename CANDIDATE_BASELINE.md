@@ -209,3 +209,9 @@ c1c37ad0146  failed-delivery backoff and last-attempt recovery
 ```
 
 Focused Telegram and delivery-ledger verification: `133 passed`.
+
+Broader Telegram and delivery verification: `776 passed, 2 skipped`. Two
+media URL tests remain environment-sensitive because this host resolves the
+fixture `example.com` address into `198.18.x.x`, which Hermes SSRF protection
+correctly blocks; the failures are the fixture's blocked-URL path, not a live
+Telegram or delivery failure.
