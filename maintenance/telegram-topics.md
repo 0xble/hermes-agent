@@ -31,7 +31,7 @@ its optional icon, and the durable alias can be observed through one Telegram to
 ## Provenance and patches
 
 - **Identity and status:** active fork adaptations `slice-15-title-config`,
-  `slice-16-topic-icons`, and `slice-17-topic-lineage`.
+  `slice-16-topic-icons`, `slice-17-topic-lineage`, and `slice-9-telegram-topic-edit`.
 - **Source / fork refs:** baseline upstream release `v2026.9.14`, fork base
   `origin/main` `a0f8f3996dae`; source designs are NousResearch/hermes-agent PR
   [#66353](https://github.com/NousResearch/hermes-agent/pull/66353) and the
