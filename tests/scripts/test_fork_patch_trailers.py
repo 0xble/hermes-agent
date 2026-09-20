@@ -146,6 +146,21 @@ def test_stale_floor_object_after_a_rebase_is_not_treated_as_the_floor(tmp_path,
     assert len(failures) == 1 and "not an ancestor" in failures[0]
 
 
+def test_merge_commits_need_no_trailer(tmp_path, monkeypatch):
+    """A merge commit has no patch content; its parents are classified individually."""
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    trunk = git("rev-parse", "--abbrev-ref", "HEAD")
+    git("checkout", "-qb", "topic")
+    git("commit", "--allow-empty", "-qm", "patch\n\nFork-Patch: fixture")
+    git("checkout", "-q", trunk)
+    git("commit", "--allow-empty", "-qm", "other\n\nFork-Patch: fixture")
+    git("merge", "-q", "--no-ff", "-m", "Merge pull request #1 from topic", "topic")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base) == []
+
+
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger")

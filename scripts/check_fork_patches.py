@@ -4,7 +4,7 @@
 Run once after a promotion, from the installed checkout, against the profile that was upgraded.
 Asserts the things a successful ``hermes update`` does not itself prove:
 
-- every commit above the trailer floor carries a ``Fork-Patch:`` trailer, and every trailer's patch
+- every non-merge commit above the trailer floor carries a ``Fork-Patch:`` trailer, and every trailer's patch
   identity is owned by a maintenance unit under ``maintenance/`` or the root ``MAINTENANCE.md`` (so a
   sync cannot silently drop a patch, and a new patch cannot land without a documented owner);
 - the candidate extensions are installed in the profile and register through real plugin discovery;
@@ -131,7 +131,8 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             return [failure]
     failures: list[str] = []
     unowned: dict[str, str] = {}
-    for sha in _git("rev-list", "--reverse", f"{start}..HEAD").split():
+    # Merge commits carry no patch content of their own; their parents are classified individually.
+    for sha in _git("rev-list", "--reverse", "--no-merges", f"{start}..HEAD").split():
         short = sha[:12]
         body = _git("log", "-1", "--format=%B", sha)
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
