@@ -344,7 +344,8 @@ class TestSendUpdateNotification:
         mock_adapter.send.assert_called_once()
         call_args = mock_adapter.send.call_args
         assert call_args[0][0] == "67890"  # chat_id
-        assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
+        assert "✅ Update Complete" in call_args[0][1]
+        assert "Hermes update completed" in call_args[0][1]
 
 
     @pytest.mark.asyncio
@@ -453,7 +454,8 @@ class TestSendUpdateNotification:
         assert second is True
         mock_adapter.send.assert_called_once()
         sent_text = mock_adapter.send.call_args[0][1]
-        assert "Update complete" in sent_text
+        assert "✅ Update Complete" in sent_text
+        assert "Hermes update finished" not in sent_text
         # Now everything is cleaned up — no duplicate deliveries possible.
         assert not pending_path.exists()
         assert not output_path.exists()
@@ -484,10 +486,8 @@ class TestSendUpdateNotification:
         assert delivered is True
         mock_adapter.send.assert_called_once()
         sent_text = mock_adapter.send.call_args[0][1]
-        assert "ok before" in sent_text
-        assert "invalid byte" in sent_text
-        assert "continued after" in sent_text
-        assert "Hermes update finished" in sent_text
+        assert "✅ Update Complete" in sent_text
+        assert "ok before" not in sent_text
         assert not pending_path.exists()
         assert not output_path.exists()
         assert not exit_code_path.exists()
@@ -542,5 +542,6 @@ class TestWatchUpdateProgress:
         sent = "\n".join(call.args[1] for call in mock_adapter.send.call_args_list)
         assert "ok before" in sent
         assert "continued after" in sent
-        assert "Hermes update finished" in sent
+        assert "✅ Update Complete" in sent
+        assert "Hermes update finished" not in sent
         assert not (hermes_home / ".update_pending.json").exists()

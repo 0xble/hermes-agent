@@ -504,6 +504,28 @@ class GatewayNotificationsMixin:
             return "", len(data)
         return data[offset:].decode("utf-8", errors="replace"), len(data)
 
+    @staticmethod
+    def _update_result_heading(home: Path, pending: dict, exit_code: int) -> tuple[str, str]:
+        """Return a truthful terminal label and detail for a completed update."""
+        if exit_code:
+            return "❌ Update Failed", f"The updater exited with code {exit_code}. Runtime state is unverified."
+        try:
+            receipt_path = home / "logs" / "update_receipts" / "latest.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            pre_sha = str((receipt.get("pre_update") or {}).get("sha") or "")
+            post_sha = str((receipt.get("post_update") or {}).get("sha") or "")
+            if pre_sha and post_sha and pre_sha == post_sha:
+                short_sha = post_sha[:12]
+                return "ℹ️ Already Latest", (
+                    f"Hermes is already running revision {short_sha}. "
+                    "No changes were applied, and the gateway was not restarted."
+                )
+            if post_sha:
+                return "✅ Update Complete", f"Hermes updated successfully to revision {post_sha[:12]}."
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return "✅ Update Complete", "Hermes update completed successfully."
+
     async def _send_update_output(self, target: "_UpdateTarget", text: str) -> None:
         """Send buffered update output as fenced chunks that fit message limits (Telegram: 4096)."""
         from tools.ansi_strip import strip_ansi
@@ -551,6 +573,7 @@ class GatewayNotificationsMixin:
         Polls ``.update_output.txt`` for new content and sends chunks to the user periodically;
         detects ``.update_prompt.json`` (written when the update process needs input) and forwards it.
         """
+        from gateway.run import _hermes_home
         paths = self._update_paths()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -583,10 +606,8 @@ class GatewayNotificationsMixin:
                 await _flush_buffer()
                 with _log_suppressed(logging.WARNING, "Update final notification failed: %s"):
                     exit_code = self._update_exit_code(paths)
-                    await target.send(
-                        "✅ Hermes update finished." if exit_code == 0
-                        else "❌ Hermes update failed (exit code {}).".format(exit_code)
-                    )
+                    heading, detail = self._update_result_heading(_hermes_home, {}, exit_code)
+                    await target.send(f"{heading}\n\n{detail}")
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 self._clear_update_markers(paths, session_key)
                 return
@@ -620,7 +641,7 @@ class GatewayNotificationsMixin:
 
         False while the update is still running (caller may retry); True after a definitive send/skip.
         """
-        from gateway.run import _non_conversational_metadata
+        from gateway.run import _hermes_home, _non_conversational_metadata
         paths = self._update_paths()
         if not paths.any_pending():
             return False
@@ -660,17 +681,12 @@ class GatewayNotificationsMixin:
             if chat_id:
                 metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
                 from tools.ansi_strip import strip_ansi
+                from gateway.run import _hermes_home
                 output = strip_ansi(output).strip()
-                if output:
-                    if len(output) > 3500:
-                        output = "…" + output[-3500:]
-                    status = "✅ Hermes update finished." if exit_code == 0 else "❌ Hermes update failed."
-                    msg = f"{status}\n\n```\n{output}\n```"
-                else:
-                    msg = (
-                        "✅ Hermes update finished successfully." if exit_code == 0 else
-                        "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
-                    )
+                heading, detail = self._update_result_heading(_hermes_home, {}, exit_code)
+                msg = f"{heading}\n\n{detail}"
+                if output and exit_code:
+                    msg += f"\n\n```\n{output[-3500:]}\n```"
                 await adapter.send(chat_id, msg, metadata=_non_conversational_metadata(metadata, platform=platform))
                 logger.info("Sent post-update notification to %s:%s (exit=%s)", platform_str, chat_id, exit_code)
         except Exception as e:
