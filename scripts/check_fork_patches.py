@@ -225,8 +225,9 @@ def check_receipt(home: Path) -> list[str]:
     # on the new code moments later. The live fleet is the truth for "is the running code current";
     # the receipt only says what the updater saw. So a stale (or down) row fails only when the live
     # fleet does not prove that profile current at the checkout HEAD. A ``partial`` outcome is excused
-    # only when such a row was re-verified live AND the receipt records no other reason for the
-    # demotion (failed restart units, an incomplete restart phase, an unaccounted runtime).
+    # only when such a row was re-verified live AND the receipt's restart bookkeeping records no other
+    # cause (failed restart units, an incomplete restart phase, an unaccounted runtime). Causes the
+    # updater does not write into the receipt (desktop rebuild, SQLite remediation) cannot be seen here.
     needs_live = [row for row in receipt.get("fleet") or [] if isinstance(row, dict)
                   and (str(row.get("state") or "") in ("stale", "down") or (row.get("code_sha") and str(row.get("code_sha")) != head))]
     live = _live_fleet() if needs_live else {}
@@ -253,8 +254,9 @@ def check_receipt(home: Path) -> list[str]:
 
 
 def _other_partial_causes(receipt: dict) -> list[str]:
-    """Reasons besides a stale fleet row that the updater demotes an outcome to partial, none of which
-    are recorded as steps: restart units that failed, an incomplete restart phase, unaccounted runtimes."""
+    """Partial causes the receipt's restart bookkeeping records (none are steps): failed restart units,
+    an incomplete restart phase, unaccounted runtimes. Not exhaustive: a failed desktop rebuild or
+    SQLite remediation also yields partial but leaves no trace in the receipt."""
     causes: list[str] = []
     restart = receipt.get("gateway_restart")
     restart = restart if isinstance(restart, dict) else {}
