@@ -30,6 +30,9 @@ class LoginBackend(ABC):
     display_name: str        # user-facing
     prefix: str              # handle prefix ("vault_", "op:", "bw:")
     needs_unlock: bool = False
+    # Cards from an external manager have no site of their own: the browser fill binds them to the page it
+    # is on and the user confirms that origin per fill. Local-vault cards keep their saved-origin binding.
+    binds_cards_to_page: bool = False
 
     def owns(self, handle: str) -> bool:
         return handle.startswith(self.prefix)

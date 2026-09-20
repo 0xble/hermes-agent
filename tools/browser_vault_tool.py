@@ -260,7 +260,9 @@ def browser_vault_list() -> str:
             continue
         for meta in metas:
             entry = {"handle": meta.id, "backend": backend.name, "label": meta.label, "kind": meta.kind,
-                     "origin": meta.origin, "available": meta.kind == "login" or bool(meta.origin)}
+                     "origin": meta.origin,
+                     # A manager's card has no origin of its own; it binds to the current page at fill time.
+                     "available": meta.kind == "login" or bool(meta.origin) or (meta.kind == "payment" and backend.binds_cards_to_page)}
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
@@ -458,8 +460,18 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             }
         )
     if meta.kind != "login" and not meta.origin:
-        return json.dumps({"success": False, "error_type": "no_origin",
-                           "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
+        if meta.kind != "payment" or not backend.binds_cards_to_page:
+            return json.dumps({"success": False, "error_type": "no_origin",
+                               "error": f"Vault item {handle!r} has no bound origin; {meta.kind} items are filled only on the site they were saved for."})
+        # A password manager's card has no site of its own. Bind it to the checkout tab (the supervisor's
+        # default session may be the daemon's blank tab), so the confirmation below names the exact origin
+        # the card would be written to.
+        from dataclasses import replace
+        _focus_bound_origin(effective_task_id, "", "payment")
+        page_origin = _current_page_origin(effective_task_id)
+        if not page_origin:
+            return json.dumps({"success": False, "error": "Could not determine the current page origin. Navigate to the checkout page first."})
+        meta = replace(meta, origin=page_origin, allowed_origins=(page_origin,))
     if meta.kind == "payment" and not _confirm_payment_fill(meta.label, str(meta.origin)):
         return json.dumps({"success": False, "error_type": "payment_declined",
                            "error": "The user did not confirm filling this payment card. Do not retry; ask them instead."})
@@ -605,7 +617,8 @@ BROWSER_VAULT_LIST_SCHEMA = {
     "description": (
         "ALWAYS call this first when a page asks for a password, card or address. Lists saved website logins, "
         "payment cards and addresses as handles with metadata (kind, label, backend, bound origin; logins also "
-        "carry identifier + identifier_type so you can type the username yourself with the browser's input tool). "
+        "carry identifier + identifier_type so you can type the username yourself with the browser's input tool; "
+        "a password manager's card carries its last four digits as identifier and no origin). "
         "Secret values are NEVER returned. Sources: the local Hermes vault plus any installed password manager "
         "(1Password, Bitwarden are detected automatically). A locked manager appears under `locked`; call "
         "browser_vault_unlock (the user is prompted for their master password, you never see it) or, when it says "
@@ -639,7 +652,8 @@ BROWSER_VAULT_FILL_SCHEMA = {
         "the password field (type the identifier/username yourself first with the browser's input tool); a "
         "payment item fills card number/name/expiry/CVC after the user confirms in their UI; an address item "
         "fills the address fields. Values are resolved server-side and never appear in the conversation. "
-        "Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
+        "A password manager's card has no bound origin: it is bound to the current page and that origin is shown "
+        "in the user's confirmation. Refused unless the page origin exactly matches the item's bound origin (re-checked atomically at "
         "fill time). If a password manager is locked the user is prompted to unlock first. Never retry a "
         "payment_declined result."
     ),

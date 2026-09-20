@@ -8,7 +8,7 @@ from agent.vault_backends.onepassword import OnePasswordLoginBackend
 
 
 def item(item_id="item-a", vault: object = "vault-a"):
-    return {"id": item_id, "title": "Example", "vault": {"id": vault},
+    return {"id": item_id, "title": "Example", "category": "LOGIN", "vault": {"id": vault},
             "urls": [{"href": "https://example.com/login"}]}
 
 
@@ -34,7 +34,7 @@ def test_legacy_handles_resolve_each_items_vault(backend, method, flags, value):
         backend._run.side_effect = [json.dumps(records), value + "\r\n"]
         assert getattr(backend, method)("op:" + item_id) == value
         assert backend._run.call_args_list[0].args == (
-            "item", "list", "--categories", "Login", "--format", "json")
+            "item", "list", "--categories", "Login,Credit Card", "--format", "json")
         assert backend._run.call_args_list[1].args == (
             "item", "get", item_id, "--vault", vault_id, *flags)
 

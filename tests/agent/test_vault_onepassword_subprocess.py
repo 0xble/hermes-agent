@@ -61,14 +61,20 @@ with (root / "audit.jsonl").open("a") as stream:
 if identity is None or record["unexpected_env"]:
     print("authentication rejected", file=sys.stderr)
     sys.exit(1)
-if args == ["item", "list", "--categories", "Login", "--format", "json"]:
-    records = [{"id": "item-a", "title": "First", "vault": {"id": "vault-a"},
+if args == ["item", "list", "--categories", "Login,Credit Card", "--format", "json"]:
+    records = [{"id": "item-a", "title": "First", "category": "LOGIN", "vault": {"id": "vault-a"},
                 "urls": [{"href": "https://first.example/login"}]},
-               {"id": "item-b", "title": "Second", "vault": {"id": state["vault"]},
+               {"id": "item-b", "title": "Second", "category": "LOGIN", "vault": {"id": state["vault"]},
                 "urls": [{"href": "https://second.example/login"}]}]
+    records.append({"id": "card-c", "title": "Card", "category": "CREDIT_CARD", "vault": {"id": "vault-c"},
+                    "additional_information": "4111 **** 1111"})
     if state["mode"] == "ambiguous":
         records.append(dict(records[1], vault={"id": "wrong-vault"}))
     print(json.dumps(records))
+elif args == ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"]:
+    print(json.dumps({"id": "card-c", "category": "CREDIT_CARD", "fields": [
+        {"id": "ccnum", "value": "4111 1111 1111 1111"}, {"id": "cvv", "value": "dummy-cvv-9876"},
+        {"id": "expiry", "value": "202907"}, {"id": "cardholder", "value": "A User"}]}))
 elif args[:3] == ["item", "get", "item-b"] and args[3:5] == ["--vault", state["vault"]]:
     if state["mode"] == "error":
         # Secret-bearing stdout from a failed command must not become diagnostics.
@@ -115,7 +121,8 @@ def assert_no_secret_diagnostics(capfd, caplog, *diagnostics):
     captured = capfd.readouterr()
     text = captured.out + captured.err + caplog.text + repr(diagnostics)
     for secret in ("dummy-profile-a-token", "dummy-profile-b-token", "dummy-launch-token",
-                   "dummy-launch-connect-token", "dummy-launch-session", "dummy-password"):
+                   "dummy-launch-connect-token", "dummy-launch-session", "dummy-password",
+                   "dummy-cvv-9876", "4111111111111111"):
         assert secret not in text
 
 
@@ -127,8 +134,15 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
     profile, calls, state = fake_op
     with profile("a") as backend:
         metadata = backend.list_items()
-        assert [item.id for item in metadata] == ["op:item-a", "op:item-b"]
+        assert [item.id for item in metadata] == ["op:item-a", "op:item-b", "op:card-c"]
         assert backend.get_meta("op:item-b").origin == "https://second.example"
+        card = backend.get_meta("op:card-c")
+        assert card.kind == "payment" and card.origin is None and card.identifier == "1111"
+        card_secret = backend.resolve_secret("op:card-c")
+        assert card_secret["card_number"] == "4111111111111111" and card_secret["cvc"] == "dummy-cvv-9876"
+        assert (card_secret["exp_month"], card_secret["exp_year"]) == ("07", "2029")
+        with pytest.raises(RuntimeError):
+            backend.resolve_password("op:card-c")  # a card handle is never a login
         assert backend.resolve_password("op:item-b") == "dummy-password"
         # An already-issued handle must use newly listed metadata, not a cached vault.
         state.write_text(json.dumps({"mode": "ok", "vault": "vault-moved"}))
@@ -146,6 +160,7 @@ def test_real_subprocess_selects_fresh_vault_and_keeps_secrets_private(fake_op, 
     rows = calls()
     gets = [row["argv"] for row in rows if row["argv"][1] == "get"]
     assert gets == [
+        ["item", "get", "card-c", "--vault", "vault-c", "--format", "json", "--reveal"],
         ["item", "get", "item-b", "--vault", "vault-b", "--fields", "label=password", "--reveal"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--otp"],
         ["item", "get", "item-b", "--vault", "vault-moved", "--fields", "label=password", "--reveal"],

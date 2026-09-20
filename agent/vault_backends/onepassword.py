@@ -1,11 +1,13 @@
-"""1Password Login items as a vault backend (``op`` CLI).
+"""1Password Login and Credit Card items as a vault backend (``op`` CLI).
 
 Unlock: ``op signin --raw`` with the master password on stdin (desktop-app
 integration or account-level auth) mints an ``OP_SESSION_<account>`` token.
 A configured service-account token skips the prompt entirely (headless).
-List: ``op item list --categories Login --format json`` → title, urls,
-username. Resolve: ``op item get <id> --vault <vault-id> ...``, selecting the
-item's vault from fresh listing metadata (required for service accounts).
+List: ``op item list --categories Login,"Credit Card" --format json`` → title,
+urls, username / masked card number. Resolve: ``op item get <id> --vault
+<vault-id> ...``, selecting the item's vault from fresh listing metadata
+(required for service accounts). Cards carry no origin: the browser fill
+binds them to the page it is on and the user confirms that origin per fill.
 """
 
 from __future__ import annotations
@@ -26,6 +28,32 @@ from agent.vault_store import VaultItemMeta, normalize_origin, normalize_otp_sec
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30.0
+_CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vault selector
+
+# 1Password Credit Card field ids → local-vault PAYMENT_FIELDS keys (agent/vault_store.py).
+# ``expiry`` is YYYYMM and is split below; ZIP has no stable id so it is matched by label.
+_CARD_FIELD_IDS = {"ccnum": "card_number", "cardholder": "cardholder_name", "cvv": "cvc"}
+
+
+def _card_secret(fields) -> Dict[str, str]:
+    """Map a Credit Card item's fields onto the PAYMENT_FIELDS shape; digits only for the number."""
+    out: Dict[str, str] = {}
+    for field in fields if isinstance(fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        if not isinstance(value, str) or not value.strip():
+            continue
+        fid, label = str(field.get("id") or ""), str(field.get("label") or "").strip().lower()
+        if fid in _CARD_FIELD_IDS:
+            out[_CARD_FIELD_IDS[fid]] = "".join(ch for ch in value if ch.isdigit()) if fid == "ccnum" else value.strip()
+        elif fid == "expiry":
+            digits = "".join(ch for ch in value if ch.isdigit())
+            if len(digits) == 6:  # YYYYMM as op emits it
+                out["exp_year"], out["exp_month"] = digits[:4], digits[4:]
+        elif label in ("zip", "zip code", "postal code", "postcode") and "billing_postal_code" not in out:
+            out["billing_postal_code"] = value.strip()
+    return out
 
 
 class OnePasswordLoginBackend(LoginBackend):
@@ -33,6 +61,7 @@ class OnePasswordLoginBackend(LoginBackend):
     display_name = "1Password"
     prefix = "op:"
     needs_unlock = True
+    binds_cards_to_page = True
 
     def __init__(self, cfg: Optional[Dict] = None):
         self.cfg = cfg or {}
@@ -106,13 +135,13 @@ class OnePasswordLoginBackend(LoginBackend):
             raise ValueError("Invalid Connect login handle")
         return match.groups()
 
-    def _connect_item(self, handle: str):
+    def _connect_item(self, handle: str, categories=("LOGIN",)):
         vault_id, item_id = self._connect_ids(handle)
         item = self._connect_get(f"/v1/vaults/{vault_id}/items/{item_id}")
         if (not isinstance(item, dict) or item.get("id") != item_id or
                 (item.get("vault") or {}).get("id") != vault_id or
-                item.get("category") != "LOGIN" or item.get("state", "ACTIVE") != "ACTIVE"):
-            raise RuntimeError("Connect login identity mismatch")
+                item.get("category") not in categories or item.get("state", "ACTIVE") != "ACTIVE"):
+            raise RuntimeError("Connect item identity mismatch")
         return item
 
     @staticmethod
@@ -144,6 +173,9 @@ class OnePasswordLoginBackend(LoginBackend):
     def _connect_meta(item, vault_id):
         handle = f"op:connect:{vault_id}:{item.get('id')}"
         OnePasswordLoginBackend._connect_ids(handle)
+        if item.get("category") == "CREDIT_CARD":
+            return _card_meta(handle, item, str(item.get("createdAt") or ""),
+                              _card_last4(_card_secret(item.get("fields", [])).get("card_number", "")))
         origins = _all_origins([u.get("href", "") for u in item.get("urls", [])])
         if not origins:
             return None
@@ -200,54 +232,66 @@ class OnePasswordLoginBackend(LoginBackend):
                 vault_id = vault["id"]
                 self._connect_ids(f"op:connect:{vault_id}:{vault_id}")
                 for item in self._connect_get(f"/v1/vaults/{vault_id}/items"):
-                    if item.get("category") == "LOGIN" and item.get("state", "ACTIVE") == "ACTIVE":
+                    if item.get("category") in ("LOGIN", "CREDIT_CARD") and item.get("state", "ACTIVE") == "ACTIVE":
                         meta = self._connect_meta(item, vault_id)
                         if meta:
                             out.append(meta)
             return out
-        raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
+        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
         out: List[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
+            handle = f"{self.prefix}{item.get('id')}"
+            created = str(item.get("created_at") or "")
+            if item.get("category") == "CREDIT_CARD":
+                # The listing exposes only the masked number ("3767 **** 2009"), never the PAN.
+                out.append(_card_meta(handle, item, created, _card_last4(str(item.get("additional_information") or ""))))
+                continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
             origin = _first_origin(urls)
             if not origin:
                 continue
             username = str(item.get("additional_information") or "").strip() or None
             out.append(VaultItemMeta(
-                id=f"{self.prefix}{item.get('id')}", kind="login", label=str(item.get("title") or origin),
-                origin=origin, created_at=str(item.get("created_at") or ""),
+                id=handle, kind="login", label=str(item.get("title") or origin),
+                origin=origin, created_at=created,
                 identifier_type="username" if username else None, identifier=username))
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
         if self._connect_credentials()[1]:
-            item = self._connect_item(handle)
+            item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
             return self._connect_meta(item, item["vault"]["id"])
         return next((m for m in self.list_items() if m.id == handle), None)
 
-    def _item_selector(self, handle: str) -> List[str]:
+    def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
+        return self._locate(handle, categories)[0]
+
+    def _locate(self, handle: str, categories) -> tuple:
+        """``([item_id, "--vault", vault_id], category)`` for a CLI handle, from fresh listing metadata."""
         # Keep existing op:<item-id> handles valid, including across backend instances.
         # Resolve from fresh metadata rather than caching a vault or guessing the first one.
         if not handle.startswith(self.prefix):
-            raise ValueError("Invalid 1Password login handle")
+            raise ValueError("Invalid 1Password item handle")
         item_id = handle[len(self.prefix):]
         if not item_id or not item_id[0].isalnum() or not all(
             c.isascii() and (c.isalnum() or c == "-") for c in item_id
         ):
-            raise ValueError("Invalid 1Password login handle")
-        raw = json.loads(self._run("item", "list", "--categories", "Login", "--format", "json") or "[]")
+            raise ValueError("Invalid 1Password item handle")
+        raw = json.loads(self._run("item", "list", "--categories", _CATEGORIES, "--format", "json") or "[]")
         if not isinstance(raw, list):
-            raise RuntimeError("Invalid 1Password login metadata")
-        matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id]
+            raise RuntimeError("Invalid 1Password item metadata")
+        matches = [item for item in raw if isinstance(item, dict) and item.get("id") == item_id
+                   and item.get("category") in categories]
         if len(matches) != 1:
-            raise RuntimeError("1Password login is missing or ambiguous; list logins again")
+            raise RuntimeError("1Password item is missing or ambiguous; list items again")
+        category = str(matches[0].get("category") or "")
         vault = matches[0].get("vault")
         vault_id = vault.get("id") if isinstance(vault, dict) else None
         if isinstance(vault_id, str) and vault_id:
-            return [item_id, "--vault", vault_id]
+            return [item_id, "--vault", vault_id], category
         if self._service_token:
-            raise RuntimeError("1Password login metadata is missing its vault ID; list logins again")
-        return [item_id]
+            raise RuntimeError("1Password item metadata is missing its vault ID; list items again")
+        return [item_id], category
 
     def resolve_password(self, handle: str) -> str:
         if self._connect_credentials()[1]:
@@ -256,8 +300,10 @@ class OnePasswordLoginBackend(LoginBackend):
             if len(passwords) != 1 or not isinstance(passwords[0], str) or not passwords[0]:
                 raise RuntimeError("Connect login requires one password field")
             return passwords[0]
-        return self._run("item", "get", *self._item_selector(handle),
-                         "--fields", "label=password", "--reveal").rstrip("\r\n")
+        return self._read_password(self._item_selector(handle))
+
+    def _read_password(self, selector: List[str]) -> str:
+        return self._run("item", "get", *selector, "--fields", "label=password", "--reveal").rstrip("\r\n")
 
     def resolve_otp(self, handle: str) -> Optional[str]:
         if self._connect_credentials()[1]:
@@ -271,6 +317,35 @@ class OnePasswordLoginBackend(LoginBackend):
         except Exception:
             return None
         return code if code.isdigit() else None
+
+    def resolve_secret(self, handle: str) -> Dict[str, str]:
+        """Full payload for a Credit Card item (PAYMENT_FIELDS shape); logins keep the password-only shape."""
+        if self._connect_credentials()[1]:
+            item = self._connect_item(handle, ("LOGIN", "CREDIT_CARD"))
+            if item.get("category") != "CREDIT_CARD":
+                return {"password": self.resolve_password(handle)}
+            fields = item.get("fields", [])
+        else:
+            selector, category = self._locate(handle, ("LOGIN", "CREDIT_CARD"))
+            if category != "CREDIT_CARD":
+                return {"password": self._read_password(selector)}
+            item = json.loads(self._run("item", "get", *selector, "--format", "json", "--reveal") or "{}")
+            fields = item.get("fields", []) if isinstance(item, dict) else []
+        secret = _card_secret(fields)
+        if not all(secret.get(k) for k in ("card_number", "exp_month", "exp_year", "cvc")):
+            raise RuntimeError("1Password card is missing its number, expiry, or verification number")
+        return secret
+
+
+def _card_last4(masked: str) -> Optional[str]:
+    digits = "".join(ch for ch in masked if ch.isdigit())
+    return digits[-4:] if len(digits) >= 4 else None
+
+
+def _card_meta(handle: str, item, created_at: str, last4: Optional[str]) -> VaultItemMeta:
+    # No origin: the fill binds the card to the page it is on, and the user confirms that origin.
+    return VaultItemMeta(id=handle, kind="payment", label=str(item.get("title") or "Card"), origin=None,
+                         created_at=created_at, identifier_type="card_last4" if last4 else None, identifier=last4)
 
 
 def _first_origin(urls: List[str]) -> Optional[str]:
