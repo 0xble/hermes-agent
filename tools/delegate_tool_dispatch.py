@@ -359,9 +359,9 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     from tools.async_delegation import dispatch_async_delegation_batch
     child_agents = [c for (_, _, c) in unit.children]
 
-    def _interrupt():
+    def _interrupt(reason: str = "Async delegation cancelled"):
         for c in child_agents:
-            _signal_child_stop(c, "Async delegation cancelled")
+            _signal_child_stop(c, reason)
 
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.

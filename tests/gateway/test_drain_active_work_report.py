@@ -10,7 +10,7 @@ import time
 import cron.scheduler as sched
 from gateway.run import GatewayRunner
 from gateway.session_state import SessionState
-from hermes_cli.update_cmd_drain_report import drain_progress_reporter
+from hermes_cli.update_cmd_drain_report import drain_progress_reporter, describe_active_work_unit
 
 
 class _FakeAgent:
@@ -57,14 +57,20 @@ def test_drain_progress_reporter_prints_holder_and_config_knob(tmp_path, monkeyp
     (tmp_path / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "job-a", "name": "nightly-scout"}]}))
     (tmp_path / "gateway_state.json").write_text(json.dumps({
         "pid": 1, "gateway_state": "draining",
-        "active_work": [{"kind": "cron", "job_id": "job-a", "pid": 4242, "external": True, "elapsed_s": 95}],
+        "active_work": [
+            {"kind": "cron", "job_id": "job-a", "pid": 4242, "external": True, "elapsed_s": 95},
+            {"kind": "delegation", "delegation_id": "deleg_x", "pid": 4343, "elapsed_s": 12},
+        ],
     }))
     out = []
     tick = drain_progress_reporter(tmp_path, budget_s=600, interval_s=0.0, emit=out.append)
     tick()
     report = out[0]
     assert "nightly-scout" in report and "job-a" in report and "pid 4242" in report and "1m35s" in report
-    assert "restart_after_turn_timeout" in report
+    assert "delegation deleg_x (12s)" in report
+    assert "agent.restart_after_turn_timeout caps turn/cron waits" in report
+    assert "gateway.restart_delegation_timeout caps delegation waits" in report
+    assert describe_active_work_unit({"kind": "delegation", "delegation_id": "deleg_y", "elapsed_s": 7}) == "delegation deleg_y (7s)"
 
     # Pre-fix gateway (no active_work field): the wait still explains itself instead of going silent.
     (tmp_path / "gateway_state.json").write_text(json.dumps({"pid": 1, "gateway_state": "draining"}))

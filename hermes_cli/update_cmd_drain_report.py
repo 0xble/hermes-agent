@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-# Progress cadence: the gateway refreshes ``active_work`` every 30s; printing faster only repeats it.
+# Progress cadence: the gateway refreshes ``active_work`` every 10s; printing faster only repeats it.
 DRAIN_REPORT_INTERVAL_S = 30.0
 
 
@@ -64,6 +64,10 @@ def describe_active_work_unit(unit: dict, home: Optional[Path] = None) -> str:
         tool = unit.get("current_tool")
         detail = ", ".join(p for p in (f"model {model}" if model else "", f"tool {tool}" if tool else "") if p)
         return f"chat turn {session}{pid_part}{elapsed_part}" + (f" [{detail}]" if detail else "")
+    if kind == "delegation":
+        delegation_id = str(unit.get("delegation_id") or "?")
+        elapsed_text = f" ({_fmt_elapsed(elapsed)})" if elapsed is not None else ""
+        return f"delegation {delegation_id}{elapsed_text}"
     return f"{kind} run{pid_part}{elapsed_part}"
 
 
@@ -90,7 +94,8 @@ def format_drain_report(work: Optional[list], *, remaining_s: float, home: Optio
         lines.append(f"     waiting on {len(work)} active work unit(s):")
         lines.extend(f"       • {describe_active_work_unit(u, home)}" for u in work)
         lines.append("     finish or kill the work above to release the drain now; "
-                     "agent.restart_after_turn_timeout in config.yaml caps this wait")
+                     "agent.restart_after_turn_timeout caps turn/cron waits, and "
+                     "gateway.restart_delegation_timeout caps delegation waits")
     return "\n".join(lines)
 
 

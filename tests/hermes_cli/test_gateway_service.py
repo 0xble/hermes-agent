@@ -19,6 +19,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT,
     resolve_systemd_timeout_stop_sec,
 )
 
@@ -270,6 +271,36 @@ class TestGetCronDrainTimeout:
             lambda: {"agent": {"cron_drain_timeout": 90}},
         )
         assert gateway_cli._get_cron_drain_timeout() == 45.0
+
+
+class TestRestartExitWaitBudget:
+    def _set_clean_timeout_env(self, monkeypatch):
+        for env_var in (
+            "HERMES_RESTART_DRAIN_TIMEOUT",
+            "HERMES_RESTART_AFTER_TURN_TIMEOUT",
+            "HERMES_RESTART_DELEGATION_TIMEOUT",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+
+    def test_default_delegation_timeout_extends_cli_wait(self, monkeypatch):
+        self._set_clean_timeout_env(monkeypatch)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"agent": {"restart_drain_timeout": 5, "restart_after_turn_timeout": 30}},
+        )
+        budget = gateway_cli._get_restart_exit_wait_budget()
+        assert budget == 5 + DEFAULT_GATEWAY_RESTART_DELEGATION_TIMEOUT + 15
+        assert budget >= 5 + 900 + 15
+
+    def test_after_turn_timeout_still_dominates_delegation_timeout(self, monkeypatch):
+        self._set_clean_timeout_env(monkeypatch)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"agent": {"restart_drain_timeout": 5, "restart_after_turn_timeout": 1800}},
+        )
+        assert gateway_cli._get_restart_exit_wait_budget() == 5 + 1800 + 15
 
 
 class TestGeneratedSystemdUnits:

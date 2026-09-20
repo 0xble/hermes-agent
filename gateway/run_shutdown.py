@@ -168,6 +168,10 @@ class GatewayShutdownMixin:
             + self._active_cron_job_count()
             + self._active_api_run_count()
             + self._active_deferred_agent_worker_count()
+            # Delegations count as busy in gateway_state.json/status and restart waits.
+            # _drain_active_agents()/_drain_work_counts() deliberately exclude them
+            # so stop() still reaches the delegation interrupt path.
+            + self._active_async_delegation_count()
         )
 
     @staticmethod
@@ -227,6 +231,25 @@ class GatewayShutdownMixin:
         if not isinstance(workers, dict):
             return 0
         return sum(1 for future in list(workers) if not future.done())
+
+    @staticmethod
+    def _active_async_delegation_count() -> int:
+        """Live detached delegation units, including queued/finalizing work but not terminal history."""
+        try:
+            from tools.async_delegation import active_count
+            return max(0, int(active_count()))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _active_async_delegation_records() -> list[dict]:
+        """Snapshot live detached delegation records for restart-drain diagnostics."""
+        try:
+            from tools.async_delegation import active_records
+            records = active_records()
+            return records if isinstance(records, list) else []
+        except Exception:
+            return []
 
     def _track_deferred_agent_worker(self, future: asyncio.Future, agent: Any) -> None:
         """Expose an executor worker to drain/interrupt until it really exits."""
@@ -1380,8 +1403,9 @@ class GatewayShutdownMixin:
         (``hermes update``, ``hermes gateway status``) can name it instead of printing a bare count.
 
         ``kind`` ∈ ``chat`` (session turn), ``cron`` (job id + external worker pid when the run was
-        handed to a restart-safe scope), ``api`` / ``deferred`` (count only — those sources expose
-        no identity). Best-effort: a source that can't be read is omitted, never raises.
+        handed to a restart-safe scope), ``delegation`` (delegation_id, elapsed_s, pid),
+        ``api`` / ``deferred`` (count only — those sources expose no identity). Best-effort: a source
+        that can't be read is omitted, never raises.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         now = time.time()
@@ -1409,6 +1433,13 @@ class GatewayShutdownMixin:
                               "pid": job["worker_pid"] or os.getpid(), "external": bool(job["worker_pid"])})
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        for record in self._active_async_delegation_records():
+            dispatched_at = record.get("dispatched_at")
+            elapsed = round(max(0.0, now - float(dispatched_at)), 1) if dispatched_at else 0.0
+            units.append({
+                "kind": "delegation", "delegation_id": record.get("delegation_id"),
+                "elapsed_s": elapsed, "pid": os.getpid(),
+            })
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
@@ -1420,43 +1451,67 @@ class GatewayShutdownMixin:
         active = self._active_work_count()
         if active <= 0:
             return True
-        if self._awaitable_work_count() <= 0:
+        delegation_timeout = float(getattr(self, "_restart_delegation_timeout", 0.0) or 0.0)
+        turn_timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
+        delegation_count = self._active_async_delegation_count()
+        non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
+        loop = asyncio.get_running_loop()
+        wait_started = loop.time()
+        turn_deadline = (
+            wait_started + turn_timeout if non_delegation_awaitable > 0 and turn_timeout > 0 else None
+        )
+        # Per-kind deadlines are fixed from entry counts; units arriving after entry get no in-band
+        # budget and are covered only by stop()'s drain (cron_drain_timeout floor).
+        delegation_deadline = (
+            wait_started + delegation_timeout if delegation_count > 0 and delegation_timeout > 0 else None
+        )
+        if turn_deadline is None and delegation_deadline is None:
             logger.warning(
-                "Restart requested with %d active work unit(s), all wedged "
-                "past the inactivity timeout; skipping the after-turn wait "
-                "and proceeding to stop()/drain which will interrupt them", active,
-            )
-            return False
-        timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
-        if timeout <= 0:
-            logger.info(
-                "Restart requested with %d active work unit(s); "
-                "restart_after_turn_timeout=0 — entering stop()/drain immediately", active,
+                "Restart requested with %d active work unit(s), but no work has a configured wait budget; "
+                "proceeding to stop()/drain", active,
             )
             return False
         logger.info(
-            "Restart requested with %d active work unit(s); "
-            "deferring stop() until they finish (cap=%.0fs) so in-flight "
-            "turns are not amputated (#77184)", active, timeout,
+            "Restart requested with %d active work unit(s); deferring stop() "
+            "with independent turn and delegation wait budgets (#77184)", active,
         )
         self._scale_to_zero_status("draining", "restart wait: status mark failed")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        last_status_at = 0.0
-        while self._awaitable_work_count() > 0:
+        last_status_at = wait_started - 10.0
+        while True:
+            delegation_count = self._active_async_delegation_count()
+            non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
             now = loop.time()
-            if now >= deadline:
-                logger.warning(
-                    "Restart after-turn wait timed out after %.0fs with %d "
-                    "still active; proceeding to stop()/drain which may "
-                    "interrupt remaining work (#77184)", timeout, self._active_work_count(),
-                )
-                return False
-            if (now - last_status_at) >= 30.0:
+            if turn_deadline is not None and now >= turn_deadline:
+                if non_delegation_awaitable:
+                    logger.warning(
+                        "Restart turn wait timed out after %.0fs with %d still active; "
+                        "remaining turns will be interrupted by stop()/drain (#77184)",
+                        turn_timeout, non_delegation_awaitable,
+                    )
+                turn_deadline = None
+            if delegation_deadline is not None and now >= delegation_deadline:
+                if delegation_count:
+                    logger.warning(
+                        "Restart delegation wait timed out after %.0fs with %d still active; "
+                        "remaining delegations will be interrupted by stop()/drain",
+                        delegation_timeout, delegation_count,
+                    )
+                delegation_deadline = None
+            turn_waitable = non_delegation_awaitable if turn_deadline is not None else 0
+            delegation_waitable = delegation_count if delegation_deadline is not None else 0
+            awaitable = turn_waitable + delegation_waitable
+            if awaitable <= 0:
+                break
+            if (now - last_status_at) >= 10.0:
+                budgets = []
+                if turn_waitable and turn_deadline is not None:
+                    budgets.append("turns %.0fs left" % (turn_deadline - now))
+                if delegation_waitable and delegation_deadline is not None:
+                    budgets.append("delegations %.0fs left" % (delegation_deadline - now))
                 logger.info(
                     "Restart deferred: waiting on %d active work unit(s) "
-                    "(%d wedged and excluded; %.0fs remaining before force drain): %s",
-                    self._awaitable_work_count(), self._wedged_agent_count(), deadline - now,
+                    "(%d wedged and excluded; %s); active work: %s",
+                    awaitable, self._wedged_agent_count(), ", ".join(budgets),
                     self._describe_active_work(),
                 )
                 self._scale_to_zero_status("draining", "restart wait: status mark failed")
@@ -1464,11 +1519,11 @@ class GatewayShutdownMixin:
             await asyncio.sleep(0.1)
         if self._active_work_count() > 0:
             logger.warning(
-                "Restart deferred wait: %d wedged work unit(s) remain; "
+                "Restart deferred wait: %d work unit(s) remain outside configured wait budgets; "
                 "proceeding to stop()/drain which will interrupt them", self._active_work_count(),
             )
             return False
-        logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
+        logger.info("Restart deferred wait complete - active work drained; proceeding to stop()")
         return True
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:

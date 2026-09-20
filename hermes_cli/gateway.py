@@ -41,6 +41,7 @@ from gateway.restart import (
     is_gateway_supervisor_process,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
+    parse_restart_delegation_timeout,
     parse_restart_drain_timeout,
     resolve_restart_exit_wait_budget,
     resolve_systemd_timeout_stop_sec,
@@ -3180,6 +3181,18 @@ def _agent_timeout_setting(env_var: str, key: str, parse) -> float:
     return parse(None)
 
 
+def _gateway_timeout_setting(env_var: str, key: str, parse) -> float:
+    """``parse(env)`` when the env var is non-empty, else ``parse(gateway.<key>)`` (None if unset)."""
+    env_raw = os.getenv(env_var)
+    if env_raw is not None and str(env_raw).strip() != "":
+        return parse(env_raw)
+    cfg = read_raw_config()
+    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg, dict) else {}
+    if isinstance(gateway_cfg, dict) and key in gateway_cfg:
+        return parse(gateway_cfg.get(key))
+    return parse(None)
+
+
 def _get_cron_drain_timeout() -> float:
     """Return the configured cron-only drain floor in seconds.
 
@@ -3198,6 +3211,9 @@ def _get_restart_exit_wait_budget() -> float:
         _get_restart_drain_timeout(),
         _agent_timeout_setting(
             "HERMES_RESTART_AFTER_TURN_TIMEOUT", "restart_after_turn_timeout", parse_restart_after_turn_timeout
+        ),
+        delegation_timeout=_gateway_timeout_setting(
+            "HERMES_RESTART_DELEGATION_TIMEOUT", "restart_delegation_timeout", parse_restart_delegation_timeout
         ),
     )
 
