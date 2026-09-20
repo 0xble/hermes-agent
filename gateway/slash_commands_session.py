@@ -645,6 +645,9 @@ class GatewaySessionCommandsMixin:
         args = event.get_command_args().strip()
         if args.lower() in {"help", "?", "-h", "--help"}:
             return self._telegram_topic_help_text()
+        command, _, command_args = args.partition(" ")
+        if command.lower() == "edit":
+            return await self._edit_telegram_topic_metadata(event, command_args.strip())
         if args.lower() in {"off", "disable", "stop"}:
             return await self._disable_telegram_topic_mode_for_chat(source)
         if args:
@@ -694,7 +697,70 @@ class GatewaySessionCommandsMixin:
         return t("gateway.topic.bound_status", label=title or t("gateway.topic.untitled_session"),
                  session_id=session_id)
 
-    # ------------------------------------------------------------------ /save, /title
+    async def _edit_telegram_topic_metadata(self, event: MessageEvent, raw_args: str) -> str:
+        """Explicitly edit the current Telegram topic's visible name and/or native icon."""
+        source = event.source
+        if not source.thread_id:
+            return "Run /topic edit inside a Telegram topic, not the root chat."
+        try:
+            parts = shlex.split(raw_args)
+        except ValueError as exc:
+            return f"Invalid /topic edit syntax: {exc}"
+        title = None
+        icon = None
+        i = 0
+        while i < len(parts):
+            flag = parts[i]
+            if flag in {"--title", "-t"}:
+                if i + 1 >= len(parts):
+                    return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
+                title = parts[i + 1].strip()
+                i += 2
+            elif flag in {"--icon", "-i"}:
+                if i + 1 >= len(parts):
+                    return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
+                icon = parts[i + 1].strip()
+                i += 2
+            else:
+                return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
+        if not title and not icon:
+            return "Usage: /topic edit [--title \"Name\"] [--icon EMOJI]"
+        adapter = self._adapter_for_source(source)
+        if adapter is None or not callable(getattr(adapter, "rename_dm_topic", None)):
+            return "Telegram topic editing is unavailable right now."
+        if not title:
+            session_entry = await self.async_session_store.get_or_create_session(source)
+            title = await self._session_db.get_session_title(session_entry.session_id) if self._session_db else None
+        if not title:
+            return "A title is required when this topic has no saved session title."
+        title = self._sanitize_telegram_topic_title(title)
+        icon_id = None
+        if icon:
+            options = await adapter.get_forum_topic_icon_options()
+            selected = next((item for item in options if item.get("emoji") == icon), None)
+            if selected is None:
+                choices = " ".join(str(item.get("emoji")) for item in options if item.get("emoji"))
+                return f"Unsupported topic icon {icon!r}. Available icons: {choices or 'none'}"
+            icon_id = selected.get("custom_emoji_id")
+        kwargs = {"chat_id": str(source.chat_id), "thread_id": str(source.thread_id), "name": title}
+        if icon_id:
+            kwargs["icon_custom_emoji_id"] = icon_id
+        try:
+            if await adapter.rename_dm_topic(**kwargs) is not True:
+                return "Telegram rejected the topic edit."
+            sync_db = self._sync_session_db()
+            if icon_id and sync_db is not None:
+                profile = self._telegram_topic_profile_name(source)
+                sync_db.record_telegram_topic_icon_state(
+                    str(source.chat_id), str(source.thread_id), custom_emoji_id=icon_id,
+                    emoji=icon, owner="manual", profile_name=profile)
+                sync_db.record_telegram_topic_icon_history(
+                    str(source.chat_id), emoji=icon, custom_emoji_id=icon_id, profile_name=profile)
+            return f"Topic updated: {title}" + (f" {icon}" if icon else "")
+        except Exception as exc:
+            logger.warning("Telegram topic edit failed: %s", exc)
+            return "Telegram rejected the topic edit."
+
 
     async def _handle_save_command(self, event: MessageEvent) -> str:
         """Handle /save — export the current session and send it as a document."""

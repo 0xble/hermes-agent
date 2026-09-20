@@ -160,6 +160,7 @@ class GatewayTopicThreadsMixin:
             "  /topic             Enable topic mode, or show status if already on\n"
             "  /topic help        Show this message\n"
             "  /topic off         Disable topic mode and clear topic bindings\n"
+            "  /topic edit --title \"Name\" --icon EMOJI  Edit this topic's visible name/icon\n"
             "  /topic <id>        Inside a topic: restore a previous session by ID\n"
             "\n"
             "How it works:\n"
