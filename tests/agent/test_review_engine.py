@@ -166,6 +166,23 @@ def test_load_review_credentials_cfg_translates_ordered_fallback_chain(monkeypat
     assert _resolve_child_fallback_chain(parent, cfg, pinned=True) == chain
 
 
+def test_load_review_credentials_cfg_warns_on_internal_fallback_key(monkeypatch, caplog):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "anthropic",
+            "model": "claude-fable-5-1",
+            "fallback_providers": [{"provider": "anthropic", "model": "claude-opus-4-6"}],
+        }}},
+    )
+
+    cfg = re_mod._load_review_credentials_cfg()
+
+    assert cfg is not None
+    assert "fallback_providers" not in cfg
+    assert "use auxiliary.review.fallback_chain" in caplog.text
+
+
 def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",

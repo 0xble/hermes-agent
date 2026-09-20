@@ -164,6 +164,10 @@ def _load_review_credentials_cfg() -> Optional[Dict[str, Any]]:
             normalized_chain = get_fallback_chain({"fallback_providers": chain})
             if normalized_chain:
                 cfg["fallback_providers"] = normalized_chain
+    elif "fallback_providers" in review:
+        logger.warning(
+            "auxiliary.review.fallback_providers is ignored; use auxiliary.review.fallback_chain"
+        )
     if not (cfg["provider"] or cfg["model"] or cfg["base_url"] or cfg.get("fallback_providers")):
         return None
     return cfg
