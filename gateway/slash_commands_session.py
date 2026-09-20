@@ -732,6 +732,11 @@ class GatewaySessionCommandsMixin:
             session_entry = await self.async_session_store.get_or_create_session(source)
             title = await self._session_db.get_session_title(session_entry.session_id) if self._session_db else None
         if not title:
+            topic_info = getattr(adapter, "_get_dm_topic_info", lambda *_args: None)(
+                str(source.chat_id), str(source.thread_id)
+            )
+            title = topic_info.get("name") if isinstance(topic_info, dict) else None
+        if not title:
             return "A title is required when this topic has no saved session title."
         title = self._sanitize_telegram_topic_title(title)
         icon_id = None
