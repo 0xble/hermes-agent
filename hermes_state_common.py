@@ -544,7 +544,17 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     -- async_delegations shapes depending on whether the delegation tool had
     -- ever run, breaking rebuild/replay pipelines that reconstruct state.db
     -- from the canonical schema (#94691).
-    origin_session_id TEXT NOT NULL DEFAULT ''
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    -- Explicit parent-driven recovery of an interrupted single-task delegation
+    -- (tools/delegation_resume.py). 'none' = never claimed; 'claimed' = a parent
+    -- took the one allowed recovery brief for this row. The claim is durable and
+    -- one-shot on purpose: a row may hand out recovery guidance at most once, so
+    -- a crash loop (or two consumers racing after a restart) cannot re-run the
+    -- same interrupted work repeatedly. Nothing here re-spawns a child.
+    resume_state TEXT NOT NULL DEFAULT 'none',
+    resume_attempts INTEGER NOT NULL DEFAULT 0,
+    resume_claim TEXT,
+    resume_claimed_at REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);

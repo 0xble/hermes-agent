@@ -422,8 +422,8 @@ def delegate_task(
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
-    list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
-    (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
+    list/steer/stop/resume run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is
+    legacy (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
     dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
@@ -432,7 +432,7 @@ def delegate_task(
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(normalized_action, subagent_id, message, parent_agent)
     if normalized_action and normalized_action != "spawn":
-        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, or stop.")
+        return tool_error(f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or resume.")
 
     # Operator kill switch (TUI / delegation.pause RPC): blocks NEW spawns only.
     if is_spawn_paused():
@@ -673,10 +673,17 @@ DELEGATE_TASK_SCHEMA = {
                 "course-correction text into one child (subagent_id + "
                 "message) without stopping it; 'stop' = end one child "
                 "early (subagent_id; partial result still returns). "
+                "'resume' = for a background delegation that was INTERRUPTED (unknown/interrupted/stalled "
+                "outcome), claim its one-shot recovery brief (subagent_id = its delegation_id); it returns "
+                "a 'recovery_context' to pass as the context of a normal spawn — it does NOT spawn anything. "
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
-                enum=["spawn", "list", "steer", "stop"],
+                enum=["spawn", "list", "steer", "stop", "resume"],
             ),
-            "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
+            "subagent_id": _p(
+                "string",
+                "Target for action='steer'/'stop' (ids from the spawn response or action='list'), or the "
+                "delegation_id for action='resume'.",
+            ),
             "message": _p(
                 "string",
                 "For action='steer': the course correction, appended to "
