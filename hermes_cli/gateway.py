@@ -6393,6 +6393,34 @@ def _cmd_list(args):
     _gateway_list()
 
 
+def _cmd_update(args) -> int:
+    """Forward an agent's update handoff to its owning gateway only."""
+    from gateway.update_launcher import validate_agent_update_reason
+
+    try:
+        reason = validate_agent_update_reason(getattr(args, "reason", None))
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 2
+    from gateway.session_context import get_session_env
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
+    if not session_id:
+        print("Error: update requests require a durable messaging session route")
+        return 2
+    from gateway.control_socket import query_gateway_control
+    result = query_gateway_control(get_hermes_home(), "agent-update", payload={
+        "reason": reason, "session_id": session_id,
+    })
+    if not result:
+        print("Error: gateway update handoff unavailable")
+        return 1
+    if not result.get("accepted"):
+        print(f"Error: {result.get('error') or 'gateway refused update handoff'}")
+        return 1
+    print(result["handoff"])
+    return 0
+
+
 def _cmd_migrate_legacy(args):
     """Stop, disable, and remove legacy Hermes gateway unit files (e.g. hermes.service)."""
     dry_run = getattr(args, "dry_run", False)
@@ -6411,14 +6439,14 @@ def _cmd_migrate(args):
 _GATEWAY_SUBCOMMANDS = {
     None: _cmd_run, "run": _cmd_run, "setup": _cmd_setup, "install": _cmd_install,
     "uninstall": _cmd_uninstall, "start": _cmd_start, "stop": _cmd_stop, "restart": _cmd_restart,
-    "status": _cmd_status, "list": _cmd_list, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
+    "status": _cmd_status, "list": _cmd_list, "update": _cmd_update, "migrate-legacy": _cmd_migrate_legacy, "migrate": _cmd_migrate,
 }
 
 
 def _gateway_command_inner(args):
     handler = _GATEWAY_SUBCOMMANDS.get(getattr(args, "gateway_command", None))
     if handler is not None:
-        handler(args)
+        return handler(args)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

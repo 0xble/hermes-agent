@@ -953,6 +953,12 @@ class GatewayShutdownMixin:
 
         Called at the start of stop() while adapters are connected; send failures never block shutdown.
         """
+        from gateway.update_notifications import notice, read_pending
+        update_record = read_pending(self._update_paths().pending.parent) if self._restart_requested else None
+        update_notified = False
+        if update_record:
+            await self._send_update_phase("updating")
+            update_notified = await self._send_update_phase("restarting")
         restart_source = self._restart_command_source if self._restart_requested else None
         msg = "⚠️ Gateway shutting down — Your current task will be interrupted."
         if self._restart_requested:
@@ -960,6 +966,11 @@ class GatewayShutdownMixin:
                 "⚠️ Gateway restarting — Your current task will be interrupted. "
                 "Send any message after restart and I'll try to resume where you left off."
             )
+        if update_record:
+            # The reason belongs to the exact originating conversation only; other active chats
+            # receive the ordinary restart notice without private context.
+            msg = notice("🔄 Restarting", {}, "Your current task may be interrupted. "
+                         "Send any message after restart and I'll try to resume where you left off.")
         restart_key = None
         if restart_source is not None:
             with suppress(Exception):
@@ -967,11 +978,18 @@ class GatewayShutdownMixin:
                     restart_source.platform.value, restart_source.chat_id, restart_source.thread_id
                 )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        if update_notified and update_record:
+            data = update_record[1]
+            notified.add(_notice_target_key(str(data.get("platform") or ""), str(data.get("chat_id") or ""), data.get("thread_id")))
         for session_key in self._snapshot_running_agents():
             target = await self._shutdown_notification_target(session_key)
             if target is None:
                 continue
-            source, platform_str, chat_id, thread_id, profile = target
+            if len(target) == 4:
+                source, platform_str, chat_id, thread_id = target
+                profile = None
+            else:
+                source, platform_str, chat_id, thread_id, profile = target
             dedup_key = _notice_target_key(platform_str, chat_id, thread_id)
             if dedup_key in notified:
                 continue

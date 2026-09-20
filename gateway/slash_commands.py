@@ -118,19 +118,43 @@ def _restart_notify_payload(event: MessageEvent) -> dict:
     return data
 
 
+def _systemd_scope_wrap_if_supervised(argv: list) -> tuple[list, dict | None]:
+    """Place an updater outside the gateway service cgroup when systemd supervises us."""
+    try:
+        if sys.platform == "win32":
+            return argv, None
+        supervised = bool(os.environ.get("INVOCATION_ID"))
+        if not supervised:
+            try:
+                from tools.process_registry import _is_supervised_gateway_process
+                supervised = bool(_is_supervised_gateway_process())
+            except Exception:
+                supervised = False
+        if not supervised:
+            return argv, None
+        from tools.process_registry import _systemd_run_user_scope_available, systemd_user_bus_env
+        if not _systemd_run_user_scope_available():
+            return argv, None
+        import shutil
+        binary = shutil.which("systemd-run")
+        if not binary:
+            return argv, None
+        return [binary, "--user", "--scope", "--quiet", "--collect",
+                "--unit", "hermes-gateway-update.scope", "--", *argv], systemd_user_bus_env()
+    except Exception:
+        return argv, None
+
+
 def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
     """Spawn ``hermes update --gateway`` detached so it survives the gateway restart it may trigger.
-    setsid is portable (works where ``systemd-run --user`` lacks a D-Bus session); ``--gateway``
-    enables file-based IPC so interactive prompts are forwarded; PYTHONUNBUFFERED lets the gateway
-    stream output live.  Windows has no setsid: an inline helper runs the updater as a module under
-    this interpreter (not venv\\Scripts\\hermes.exe — that shim holds its own file open, and the
-    update must replace it), redirects both outputs to one file and writes the exit code."""
+    ``--gateway`` enables file-based IPC and the process-exit marker lets the watcher distinguish
+    updater completion from a stale legacy exit file."""
     import shutil
     import subprocess
     if sys.platform == "win32":
         from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
         subprocess.Popen(
-            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path),
+            [sys.executable, "-c", _WINDOWS_UPDATE_HELPER, str(output_path), str(exit_code_path.parent / ".update_process_exit_code"),
              sys.executable, "-m", "hermes_cli.main", "update", "--gateway"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **windows_detach_popen_kwargs())
         return
@@ -140,12 +164,19 @@ def _spawn_detached_update(hermes_cmd, output_path, exit_code_path) -> None:
         f" > {shlex.quote(str(output_path))} 2>&1; "
         # Avoid `status=$?`: `status` is read-only in zsh and this template is reused in
         # macOS/zsh operator wrappers, so keep it zsh-safe even though bash runs it here.
-        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path))}")
+        f"rc=$?; printf '%s' \"$rc\" > {shlex.quote(str(exit_code_path.parent / '.update_process_exit_code'))}; "
+        f"rm -f {shlex.quote(str(exit_code_path))}")
     # Preferred: setsid creates a new session, fully detached; fallback start_new_session=True
     # calls os.setsid() in the child.
     setsid_bin = shutil.which("setsid")
     argv = [setsid_bin, "bash", "-c", update_cmd] if setsid_bin else ["bash", "-c", update_cmd]
-    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    scoped_argv, scoped_env = _systemd_scope_wrap_if_supervised(argv)
+    if scoped_env is not None:
+        subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env=scoped_env)
+    else:
+        subprocess.Popen(scoped_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
 
 def _home_thread_from_source(source) -> Optional[str]:
