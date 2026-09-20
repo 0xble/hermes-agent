@@ -33,10 +33,30 @@ and `US$` prose are left untouched. `&#36;`/`&#x24;` outside code are decoded
 to `$` on send, edit, and draft before route selection so an HTML-escaped
 amount never reaches the user literally.
 
+Telegram's Rich Message parser accepts a block-start `#` run as a heading
+without the whitespace standard Markdown requires, so a reply opening with
+`#426 review clean…` (or a list item or blockquote starting with `#89`) renders
+as a heading. `plugins/platforms/telegram/rich_markdown.py`
+(`escape_literal_hash_prefixes`) escapes only such block-start hashes on the
+rich path, including inside list-item and blockquote prefixes. Real headings
+(`# Title`), inline `#89`, URL anchors, already-escaped `\#`, inline code,
+fenced code (including an unfinished fence in a streaming draft), and display
+math stay untouched. The escape runs first in `_rich_message_payload`, before
+currency protection and linebreak normalization, and is idempotent.
+
+Telegram only renders HTTP(S) and `tg://` link targets as clickable text. Models
+can emit Desktop-only `@session:` links or schemeless `[Title](Title)` links,
+which Telegram otherwise exposes as raw Markdown. `_degrade_unsupported_markdown_links`
+scrubs unsupported targets on both the legacy MarkdownV2 formatter and the rich
+payload builder, covering send, finalized edit, and draft. It preserves
+supported links, literal code/fenced-code/table regions, and explicitly
+bracketed numeric citation markers such as `[[3](https://example.com)]`.
+Ordinary numeric commit or PR links are not converted into citation markers.
+
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
-  `telegram-rich-currency`.
+  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -63,6 +83,21 @@ head `ad2c2da0eb638d90913721ec200f699a09665478`, based on upstream main
 `8b42b6e020c3`, open when recorded on 2026-09-20. The upstream head carries the
 same adapter symbols; its tests route through tables because upstream has no
 `always` mode.
+
+Literal hash escaping: own contribution [upstream PR 105487](https://github.com/NousResearch/hermes-agent/pull/105487)
+for [issue 105483](https://github.com/NousResearch/hermes-agent/issues/105483),
+head `9bcf0ff987a680731e48167a064af0995dd099d3`, open when adopted on 2026-09-20.
+`rich_markdown.py` is byte-identical to that head; the archived fork shipped the
+same helper as HERMES-127 (archived commit `6a2dfadcc70d`). The fork adds one
+regression for `always`-mode prose opening with a PR number, which upstream
+cannot express without an `always` mode.
+
+Telegram unsupported link targets: adopted from the archived fork's HERMES-065
+implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
+and its focused regressions. The behavior corresponds to upstream issue #97497 and
+open PRs #97514/#97535, neither released as of 2026-09-20. The fork intentionally
+keeps session-link producer behavior unchanged because this change owns only the
+Telegram delivery boundary.
 
 Fork adaptation retains release `v2026.9.14` and its existing client-risk guards.
 It does not import newer upstream approval-header or CJK opt-in changes. On every
@@ -93,6 +128,9 @@ tag contains it: compare the adapter symbols and the regression file against
 that merge, then drop the fork copy. Retire the currency part when a released
 upstream `_rich_message_payload` passes the currency regression cases in
 `tests/gateway/test_telegram_rich_messages.py` without the fork functions.
+Retire the literal-hash part when PR 105487 merges and the candidate tag
+contains it: compare `rich_markdown.py` and the hash regression tests against
+that merge, then drop the fork copy.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,

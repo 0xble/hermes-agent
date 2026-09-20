@@ -85,6 +85,70 @@ def _rich_api_kwargs(adapter):
     return call.kwargs["api_kwargs"]
 
 
+# --- Literal hash prefixes: Telegram's rich parser accepts "#89" as a heading without a space ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit", "draft"])
+async def test_rich_delivery_keeps_literal_hash_references(operation):
+    adapter = _make_adapter({"rich_drafts": True})
+    content = (
+        "#89 remains open.\n\n- #181 reported a problem.\n\n> #tag is literal.\n\n"
+        "## Real heading\n\n- [x] rich delivery\n\n`#89` stays code."
+    )
+    if operation == "send":
+        result = await adapter.send("12345", content)
+        assert result.success
+    elif operation == "edit":
+        result = await adapter.edit_message("12345", "123", content, finalize=True)
+        assert result.success
+    else:
+        assert await adapter.send_draft("12345", 123, content)
+    assert adapter._bot is not None
+    payload = adapter._bot.do_api_request.call_args.kwargs["api_kwargs"]["rich_message"]
+    assert r"\#89 remains open." in payload["markdown"]
+    assert r"- \#181 reported a problem." in payload["markdown"]
+    assert r"> \#tag is literal." in payload["markdown"]
+    assert "## Real heading" in payload["markdown"]
+    assert "`#89` stays code." in payload["markdown"]
+    adapter._bot.send_message.assert_not_called()
+    adapter._bot.edit_message_text.assert_not_called()
+    adapter._bot.send_message_draft.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_always_mode_prose_starting_with_pr_number_is_not_a_heading():
+    """The reported symptom: plain prose (no rich-only construct) opening with ``#426`` rendered as a
+    heading because ``always`` mode routes every reply through the rich endpoint."""
+    adapter = _make_adapter({"rich_messages": "always"})
+    content = "#426 review clean (0.9) on the new head; #430's review is in progress."
+    assert (await adapter.send("12345", content)).success
+    markdown = _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert markdown.startswith(r"\#426 review clean")
+    assert "; #430's review" in markdown  # inline reference stays untouched
+
+
+@pytest.mark.parametrize("content", [
+    "# Heading\n\n## Heading 2\n\n###### Heading 6",
+    "Use #89 and https://example.com/#anchor inline.",
+    r"\#89 is already escaped.",
+    "`code\n#89\ncode`",
+    "``code ` #89``",
+    "```python\n#89 is a comment\n```",
+    "~~~python\n#89 is a comment\n~~~",
+    "````markdown\n```\n#89\n```\n````",
+    "```python\n#89 unfinished fence",
+    "$$\n#89\n$$",
+])
+def test_literal_hash_normalization_preserves_markdown_regions(content):
+    from plugins.platforms.telegram.rich_markdown import escape_literal_hash_prefixes
+
+    assert escape_literal_hash_prefixes(content) == content
+    escaped = escape_literal_hash_prefixes("1. #89\n\n> - ##tag\n\n#release")
+    assert escaped == "1. \\#89\n\n> - \\#\\#tag\n\n\\#release"
+    assert escape_literal_hash_prefixes(escaped) == escaped
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()
