@@ -33,6 +33,7 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: {})  # nothing running
     _receipt(tmp_path)
     assert mod.check_receipt(tmp_path) == []
     _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}])
@@ -45,6 +46,34 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     _receipt(tmp_path, sha=head)  # the legacy shape the old check accepted
     (tmp_path / "logs/update_receipts/latest.json").write_text(json.dumps({"sha": head}), encoding="utf-8")
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_receipt_trusts_the_live_fleet_over_a_stale_snapshot(tmp_path, monkeypatch, capsys):
+    """A gateway that drained past the updater's settle window is recorded stale and the outcome
+    partial, but launchd relaunched it on the new code: the live fleet, not the snapshot, decides."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    stale_row = {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"}
+    _receipt(tmp_path, outcome="partial", fleet=[stale_row])
+
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    assert mod.check_receipt(tmp_path) == []
+    out = capsys.readouterr().out
+    assert "live gateway pid 9 verified current" in out and "outcome is 'partial'" in out
+
+    # Live gateway on a different SHA, or none for that profile, or probe unavailable: still stale.
+    for live in ({"default": {"pid": 9, "code_sha": "c" * 40, "state": "current"}}, {"other": {"pid": 9, "code_sha": head}}, {}, None):
+        monkeypatch.setattr(mod, "_live_fleet", lambda home, live=live: live)
+        problems = mod.check_receipt(tmp_path)
+        assert any("state stale" in p for p in problems), live
+        assert any("outcome is 'partial'" in p for p in problems), live
+
+    # A failed step is a real failure regardless of the live fleet.
+    _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}], fleet=[stale_row])
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    problems = mod.check_receipt(tmp_path)
+    assert len(problems) == 1 and "reinstall" in problems[0]
 
 
 def _fake_gh(tmp_path: Path, exit_code: int, stdout: str = "") -> Path:

@@ -206,10 +206,6 @@ def check_receipt(home: Path) -> list[str]:
     if not isinstance(receipt, dict) or not {"outcome", "post_update"} <= set(receipt):
         return ["update receipt is not a native hermes update receipt (missing outcome/post_update)"]
     failures: list[str] = []
-    outcome = str(receipt.get("outcome") or "")
-    if outcome != "success":
-        failed = [str(step.get("name")) for step in receipt.get("steps") or [] if isinstance(step, dict) and not step.get("ok", True)]
-        failures.append(f"last update outcome is {outcome or 'missing'!r}" + (f"; failed steps: {', '.join(failed)}" if failed else ""))
     post = receipt.get("post_update") if isinstance(receipt.get("post_update"), dict) else {}
     recorded = str(post.get("sha") or "")
     head = _git("rev-parse", "HEAD")
@@ -217,14 +213,48 @@ def check_receipt(home: Path) -> list[str]:
         failures.append("update receipt records no post_update sha")
     elif recorded != head:
         failures.append(f"update receipt records post_update {recorded[:12]} but the checkout is at {head[:12]}")
+    outcome = str(receipt.get("outcome") or "")
+    failed_steps = [str(step.get("name")) for step in receipt.get("steps") or [] if isinstance(step, dict) and not step.get("ok", True)]
+    if failed_steps:
+        failures.append(f"last update outcome is {outcome or 'missing'!r}; failed steps: {', '.join(failed_steps)}")
+    # The receipt's fleet rows are a snapshot taken inside the updater's settle window. A gateway that
+    # drained an in-flight turn past that window is recorded ``stale`` even though launchd relaunched it
+    # on the new code moments later. The live fleet is the truth for "is the running code current";
+    # the receipt only says what the updater saw. So a stale row fails only when the live fleet does not
+    # prove that profile current at the checkout HEAD.
+    live = _live_fleet(home)
     for row in receipt.get("fleet") or []:
         if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "unknown")
         sha = str(row.get("code_sha") or "")
-        if state == "stale" or (sha and sha != head):
-            failures.append(f"running profile {row.get('profile', '?')!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}")
+        if state != "stale" and (not sha or sha == head):
+            continue
+        profile = str(row.get("profile") or "?")
+        live_row = live.get(profile) if live is not None else None
+        if live_row is not None and str(live_row.get("code_sha") or "") == head:
+            print(f"note receipt row for profile {profile!r} is stale (pid {row.get('pid', '?')}, settle window expired); "
+                  f"live gateway pid {live_row.get('pid', '?')} verified current at {head[:12]}")
+            continue
+        failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}")
+    if outcome != "success" and not failed_steps and not failures:
+        print(f"note last update outcome is {outcome!r} with no failed steps; live fleet verified current")
+    elif outcome != "success" and not failed_steps:
+        failures.append(f"last update outcome is {outcome or 'missing'!r}")
     return failures
+
+
+def _live_fleet(home: Path) -> dict[str, dict] | None:
+    """Running gateways by profile from the installed CLI's own fleet probe; None when unavailable."""
+    try:
+        from hermes_cli.update_receipt import collect_fleet_versions
+    except Exception:
+        return None
+    try:
+        rows = collect_fleet_versions()
+    except Exception:
+        return None
+    return {str(r.get("profile") or "?"): r for r in rows if isinstance(r, dict) and r.get("state") == "current"}
 
 
 def main(argv: list[str] | None = None) -> int:
