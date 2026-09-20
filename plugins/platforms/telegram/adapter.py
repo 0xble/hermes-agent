@@ -1504,9 +1504,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _rich_message_payload(self, content: str, *, skip_entity_detection: bool = False) -> Dict[str, Any]:
         """``InputRichMessage`` from RAW markdown — never ``format_message(content)``, whose MarkdownV2
-        escaping destroys table pipes. Currency pairs are backticked first so they cannot pair into
+        escaping destroys table pipes. Block-start ``#89``-style references are escaped first because
+        Telegram's rich parser accepts them as headings without the whitespace standard Markdown requires
+        (``escape_literal_hash_prefixes``); currency pairs are then backticked so they cannot pair into
         inline LaTeX (``_protect_rich_currency``)."""
-        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(_protect_rich_currency(content))}
+        from .rich_markdown import escape_literal_hash_prefixes
+
+        payload: Dict[str, Any] = {
+            "markdown": _rich_normalize_linebreaks(_protect_rich_currency(escape_literal_hash_prefixes(content)))
+        }
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
