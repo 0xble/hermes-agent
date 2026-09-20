@@ -4,9 +4,9 @@
 Run once after a promotion, from the installed checkout, against the profile that was upgraded.
 Asserts the things a successful ``hermes update`` does not itself prove:
 
-- every commit above the upstream baseline is accounted for in ``maintenance/fork-patches.md``, and every
-  commit newer than the ledger carries a ``Fork-Patch:`` trailer (so a sync cannot silently drop a
-  patch, and a new patch cannot land unclassified);
+- every commit above the trailer floor carries a ``Fork-Patch:`` trailer, and every trailer's patch
+  identity is owned by a maintenance unit under ``maintenance/`` or the root ``MAINTENANCE.md`` (so a
+  sync cannot silently drop a patch, and a new patch cannot land without a documented owner);
 - the candidate extensions are installed in the profile and register through real plugin discovery;
 - the configuration keys the slices depend on resolve to the expected values;
 - the newest update receipt, when present, records the same source SHA the checkout is at.
@@ -45,7 +45,17 @@ EXPECTED_CONFIG = {
     "delegation.model": None,
     "auxiliary.review.model": None,
 }
-_TRAILER = re.compile(r"^Fork-Patch:\s*\S", re.M)
+# Upstream release baseline the fork is built on (v2026.9.14).
+DEFAULT_BASELINE = "345cd2b057a452236de401d3534b8502a7465e8d"
+# Last commit of the pre-contract migration history (fork PR #4). Everything the fork carried up to
+# here was classified by the maintenance units when the central ledger was retired; every commit
+# after it must carry its own ``Fork-Patch:`` trailer.
+DEFAULT_TRAILER_FLOOR = "06004e8e1b067dd846d5ea0286e8744eb5753532"
+# Trailer identities that name records rather than runtime patches; they need no unit owner.
+RECORD_IDENTITIES = frozenset({"evidence"})
+_TRAILER = re.compile(r"^Fork-Patch:\s*(?P<identity>[^;\n]+?)\s*(?:;.*)?$", re.M)
+MAINTENANCE_ROOT = "MAINTENANCE.md"
+MAINTENANCE_DIR = "maintenance"
 
 
 def _git(*args: str) -> str:
@@ -56,20 +66,38 @@ def _is_git_checkout() -> bool:
     return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
 
 
-def check_ledger(baseline: str) -> list[str]:
+def _maintenance_text() -> str | None:
+    root = REPO / MAINTENANCE_ROOT
+    units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
+    if not root.is_file() and not units:
+        return None
+    parts = [p.read_text(encoding="utf-8") for p in [root, *units] if p.is_file()]
+    return "\n".join(parts)
+
+
+def check_trailers(baseline: str, floor: str | None = None) -> list[str]:
+    """Every commit above ``floor`` (default: ``baseline``) is trailered and its identity has a unit owner."""
     failures: list[str] = []
-    ledger = REPO / "maintenance/fork-patches.md"
-    if not ledger.is_file():
-        return ["maintenance/fork-patches.md is missing"]
-    listed = set(re.findall(r"^\| `([0-9a-f]{12})`", ledger.read_text(encoding="utf-8"), re.M))
-    commits = _git("rev-list", "--reverse", f"{baseline}..HEAD").split()
+    owners = _maintenance_text()
+    if owners is None:
+        return [f"{MAINTENANCE_ROOT} and {MAINTENANCE_DIR}/ are missing; patch identities have no owner"]
+    start = floor or baseline
+    commits = _git("rev-list", "--reverse", f"{start}..HEAD").split()
+    unowned: dict[str, str] = {}
     for sha in commits:
         short = sha[:12]
-        if short in listed:
-            continue
         body = _git("log", "-1", "--format=%B", sha)
-        if not _TRAILER.search(body):
-            failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) is neither in maintenance/fork-patches.md nor trailered")
+        match = _TRAILER.search(body)
+        if not match:
+            failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) has no Fork-Patch trailer")
+            continue
+        identity = match.group("identity").strip()
+        if identity in RECORD_IDENTITIES or identity in unowned:
+            continue
+        if identity not in owners:
+            unowned[identity] = short
+    for identity, short in unowned.items():
+        failures.append(f"patch identity {identity!r} (first seen at {short}) is not owned by {MAINTENANCE_ROOT} or any {MAINTENANCE_DIR}/*.md unit")
     return failures
 
 
@@ -155,15 +183,17 @@ def check_receipt(home: Path) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
-    ap.add_argument("--baseline", default="345cd2b057a452236de401d3534b8502a7465e8d")
+    ap.add_argument("--baseline", default=DEFAULT_BASELINE, help="upstream release baseline commit")
+    ap.add_argument("--trailer-floor", default=DEFAULT_TRAILER_FLOOR,
+                    help="last commit whose history is classified by the maintenance units; later commits need trailers")
     ap.add_argument("--skip-config", action="store_true", help="skip the config-key checks (fixture profiles)")
     args = ap.parse_args(argv)
     if not _is_git_checkout():
         # A package-managed install has no history to check; say so instead of tracebacking.
-        print(f"FAIL {REPO} is not a git checkout; the ledger and receipt checks need the source checkout")
+        print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
         print(f"FAILED: 1 problem(s); install {REPO} home {args.home}")
         return 1
-    failures = check_ledger(args.baseline) + check_extensions(args.home)
+    failures = check_trailers(args.baseline, args.trailer_floor) + check_extensions(args.home)
     if not args.skip_config:
         failures += check_config(args.home)
     failures += check_receipt(args.home)

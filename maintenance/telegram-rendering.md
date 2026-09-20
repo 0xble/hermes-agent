@@ -26,6 +26,8 @@ idempotent.
 
 ## Provenance and adoption
 
+Fork patch identities: `telegram-rich-modes` and `telegram-paragraph-spacing`.
+
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
 `29bc6343d37`. Open when adopted on 2026-09-19. Related design: [PR 54986](https://github.com/NousResearch/hermes-agent/pull/54986)

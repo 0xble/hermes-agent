@@ -45,8 +45,8 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - **Upstream disposition:** source PRs are open design references, not released
   equivalent behavior.
 - **Fork delivery:** landed on fork `main` as one squash-merged PR whose commit carries the
-  `Fork-Patch:` trailer slices above. The unit row in `maintenance/fork-patches.md` is the ledger
-  entry; `scripts/check_fork_patches.py` verifies the trailer on every post-baseline commit.
+  `Fork-Patch:` trailer slices above. This unit is the owner of those identities;
+  `scripts/check_fork_patches.py` verifies the trailer on every commit after the floor.
 
 ## Update
 
