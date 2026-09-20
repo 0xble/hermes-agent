@@ -1124,10 +1124,17 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
 
 def create_quick_snapshot(
     label: Optional[str] = None, hermes_home: Optional[Path] = None, keep: Optional[int] = None,
-    max_file_size: Optional[int] = None) -> Optional[str]:
-    """Create one atomic quick snapshot while holding the shared backup slot."""
+    max_file_size: Optional[int] = None, lock_timeout_seconds: Optional[float] = None) -> Optional[str]:
+    """Create one atomic quick snapshot while holding the shared backup slot.
+
+    ``lock_timeout_seconds`` overrides how long to wait for that slot. Callers whose
+    snapshot is someone's only recovery point should wait rather than take the default
+    fail-fast grab, which loses the snapshot to any concurrent backup.
+    """
     home = hermes_home or get_hermes_home()
-    with _backup_operation_lock(home):
+    lock = (_backup_operation_lock(home) if lock_timeout_seconds is None
+            else _backup_operation_lock(home, timeout_seconds=lock_timeout_seconds))
+    with lock:
         return _create_quick_snapshot_locked(label, home, keep, max_file_size)
 
 

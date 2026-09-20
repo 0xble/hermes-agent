@@ -273,3 +273,62 @@ class TestRefusalIsNotFailure:
         assert payload["steps"][0]["name"] == "windows_preflight"
         assert payload["steps"][0]["ok"] is False
         assert payload["outcome"] == "refused"
+
+
+class TestPreUpdateBackupIsHonest:
+    """A lost rollback point must be distinguishable from a declined one.
+
+    The receipt recorded both an explicit opt-out and a crashed snapshot as the same
+    failed step with the detail "disabled or failed", and the underlying exception was
+    swallowed at debug level. A scheduled backup holding the shared lock therefore cost
+    every concurrent update its rollback point, silently, while the run still reported
+    success.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, snapshot):
+        import hermes_cli.update_cmd_maint as maint
+
+        monkeypatch.setattr(maint, "_resolve_pre_update_backup_mode", lambda _a: "quick")
+        monkeypatch.setattr(maint, "_run_quick_snapshots", snapshot)
+        ur.begin_update_receipt()
+        result = maint._run_pre_update_backup(object())
+        return result, ur._current.data
+
+    def test_failed_snapshot_records_the_real_reason(self, receipt_home, monkeypatch):
+        from hermes_cli.backup import BackupInProgressError
+
+        def _boom():
+            raise BackupInProgressError("another Hermes backup is already running")
+
+        result, data = self._run(monkeypatch, _boom)
+
+        assert result is None
+        step = next(s for s in data["steps"] if s["name"] == "pre_update_backup")
+        assert step["ok"] is False
+        assert "BackupInProgressError" in step["detail"]
+        assert "another Hermes backup is already running" in step["detail"]
+        assert "disabled" not in step["detail"], "a failure must not read as an opt-out"
+
+    def test_opt_out_is_a_skip_not_a_failed_step(self, receipt_home, monkeypatch):
+        import hermes_cli.update_cmd_maint as maint
+
+        monkeypatch.setattr(maint, "_resolve_pre_update_backup_mode", lambda _a: "off")
+        ur.begin_update_receipt()
+
+        assert maint._run_pre_update_backup(object()) is None
+        data = ur._current.data
+        assert not any(s["name"] == "pre_update_backup" for s in data["steps"])
+        skip = next(s for s in data["skips"] if s["name"] == "pre_update_backup")
+        assert "disabled by" in skip["reason"]
+
+
+def test_pre_update_snapshot_waits_for_the_shared_backup_slot():
+    """The update's only rollback point must not lose a race to a scheduled backup.
+
+    The shared slot defaults to a 0.25s fail-fast grab, which is right for an
+    interactive backup and wrong here: a routine backup holds it for far longer.
+    """
+    import hermes_cli.update_cmd_maint as maint
+
+    assert maint._PRE_UPDATE_SNAPSHOT_LOCK_WAIT >= 30.0

@@ -46,6 +46,13 @@ _PRE_UPDATE_SNAPSHOT_KEEP = 1
 # small hard-to-regenerate state, not a multi-GB state.db (24 GB cost ~60s + 24 GB/update).
 _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE = 1 << 30  # 1 GiB
 
+# The shared backup slot defaults to a 0.25s grab, which is right for an interactive
+# `hermes backup` that should fail fast rather than hang. A pre-update snapshot is the
+# update's only rollback point, so it waits: a scheduled backup routinely holds the slot,
+# and giving up a quarter of a second in silently cost every update in that window its
+# rollback point. Still bounded — a long backup ends in a loud, recorded failure.
+_PRE_UPDATE_SNAPSHOT_LOCK_WAIT = 90.0
+
 _SQLITE_WAL_BUG_DETAIL = "SQLite {} still has the WAL-reset corruption bug"
 
 
@@ -748,6 +755,7 @@ def _run_quick_snapshots() -> Optional[str]:
     from hermes_cli.backup import create_quick_snapshot
     snapshot_id = create_quick_snapshot(
         label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        lock_timeout_seconds=_PRE_UPDATE_SNAPSHOT_LOCK_WAIT,
     )
     if snapshot_id:
         _verify_state_db_after_snapshot(snapshot_id)
@@ -830,19 +838,42 @@ def _run_pre_update_backup(args) -> Optional[str]:
     ``full`` — quick snapshot PLUS a zip of HERMES_HOME under ``backups/`` (``hermes import``).
 
     Explicit user opt-out is honored fully. See #34600.
+
+    Records its own receipt entry, because only this function can tell an opt-out apart
+    from a failure — the caller sees ``None`` for both and used to report them identically.
     """
+    from hermes_cli.update_cmd import _record_update_skip, _record_update_step
+
     mode = _resolve_pre_update_backup_mode(args)
 
     if mode == "off":
+        source = "--no-backup" if getattr(args, "no_backup", False) else "updates.pre_update_backup"
         if getattr(args, "no_backup", False):
             print("◆ Pre-update backup: skipped (--no-backup)")
             print()
         # Config-level off is silent: the user opted out.
+        _record_update_skip("pre_update_backup", f"disabled by {source}")
         return None
 
     snapshot_id = None
-    with _best_effort('Pre-update snapshot failed: %s'):
+    try:
         snapshot_id = _run_quick_snapshots()
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never kill an update
+        # Loud, and with the real reason. This used to be swallowed at debug level and
+        # recorded as "disabled or failed", so an update that silently lost its rollback
+        # point was indistinguishable from one the user had opted out of.
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("Pre-update snapshot failed — this update has no rollback point: %s", reason)
+        print(f"  ⚠ Pre-update snapshot FAILED: {exc}")
+        print("    This update has no rollback point. Re-run when the other backup finishes,")
+        print("    or pass --no-backup to acknowledge the risk explicitly.")
+        print()
+        _record_update_step("pre_update_backup", False, reason)
+        return None
+
+    _record_update_step(
+        "pre_update_backup", snapshot_id is not None,
+        f"snapshot={snapshot_id}" if snapshot_id else "quick snapshot produced no id")
 
     if mode != "full":
         if snapshot_id:
