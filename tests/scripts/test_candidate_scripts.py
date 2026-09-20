@@ -33,6 +33,7 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
     _receipt(tmp_path)
     assert mod.check_receipt(tmp_path) == []
     _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}])
@@ -45,6 +46,109 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     _receipt(tmp_path, sha=head)  # the legacy shape the old check accepted
     (tmp_path / "logs/update_receipts/latest.json").write_text(json.dumps({"sha": head}), encoding="utf-8")
     assert any("not a native" in p for p in mod.check_receipt(tmp_path))
+
+
+def test_check_receipt_trusts_the_live_fleet_over_a_stale_snapshot(tmp_path, monkeypatch, capsys):
+    """A gateway that drained past the updater's settle window is recorded stale and the outcome
+    partial, but launchd relaunched it on the new code: the live fleet, not the snapshot, decides."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    stale_row = {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"}
+    _receipt(tmp_path, outcome="partial", fleet=[stale_row])
+
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    assert mod.check_receipt(tmp_path) == []
+    out = capsys.readouterr().out
+    assert "live gateway pid 9 verified current" in out and "outcome is 'partial'" in out
+
+    # Live gateway on a different SHA, or none for that profile, or probe unavailable: still stale.
+    for live in ({"default": {"pid": 9, "code_sha": "c" * 40, "state": "current"}}, {"other": {"pid": 9, "code_sha": head}}, {}, None):
+        monkeypatch.setattr(mod, "_live_fleet", lambda live=live: live)
+        problems = mod.check_receipt(tmp_path)
+        assert any("state stale" in p for p in problems), live
+        assert any("outcome is 'partial'" in p for p in problems), live
+
+    # A failed step is a real failure regardless of the live fleet.
+    _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}], fleet=[stale_row])
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    problems = mod.check_receipt(tmp_path)
+    assert len(problems) == 1 and "reinstall" in problems[0]
+
+
+def test_check_receipt_only_excuses_partial_when_a_row_was_verified_live(tmp_path, monkeypatch, capsys):
+    """The outcome downgrade is limited to the settle-window case: a ``partial`` whose only evidence
+    is a stale/down row the live fleet disproves. Nothing else non-success passes, even with no step
+    records and a healthy live fleet."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    healthy = {"default": {"pid": 9, "code_sha": head, "state": "current"}}
+    monkeypatch.setattr(mod, "_live_fleet", lambda: healthy)
+
+    for outcome in ("failed", "refused", "running", "partial", ""):
+        _receipt(tmp_path, outcome=outcome)  # no steps, no fleet rows: nothing was verified live
+        problems = mod.check_receipt(tmp_path)
+        assert len(problems) == 1 and f"outcome is {outcome or 'missing'!r}" in problems[0], outcome
+    assert "verified current" not in capsys.readouterr().out
+
+    # A down row (updater killed it, nothing replaced it) is treated like stale: live fleet decides.
+    down_row = {"profile": "default", "pid": 7, "code_sha": None, "state": "down"}
+    _receipt(tmp_path, outcome="partial", fleet=[down_row])
+    assert mod.check_receipt(tmp_path) == []
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    problems = mod.check_receipt(tmp_path)
+    assert any("state down" in p for p in problems) and any("outcome is 'partial'" in p for p in problems)
+
+    # Probe unavailable is said so, not silently treated as verified.
+    monkeypatch.setattr(mod, "_live_fleet", lambda: None)
+    problems = mod.check_receipt(tmp_path)
+    assert any("live fleet probe unavailable" in p for p in problems)
+
+    # Two stale rows, only one verified live: the unverified profile still fails, and so does the outcome.
+    monkeypatch.setattr(mod, "_live_fleet", lambda: healthy)
+    _receipt(tmp_path, outcome="partial", fleet=[
+        {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"},
+        {"profile": "lpg", "pid": 8, "code_sha": "a" * 40, "state": "stale"},
+    ])
+    problems = mod.check_receipt(tmp_path)
+    assert any("'lpg'" in p and "state stale" in p for p in problems)
+    assert any("outcome is 'partial'" in p for p in problems)
+    assert not any("'default'" in p for p in problems)
+
+
+def test_check_receipt_success_ignores_opted_out_steps(tmp_path, monkeypatch):
+    """The updater records an opted-out backup as ``ok: false`` and still finalizes success."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: (_ for _ in ()).throw(AssertionError("probe must not run without stale rows")))
+    _receipt(tmp_path, outcome="success", steps=[{"name": "pre_update_backup", "ok": False, "detail": "disabled or failed"}],
+             fleet=[{"profile": "default", "pid": 9, "code_sha": head, "state": "current"}])
+    assert mod.check_receipt(tmp_path) == []
+
+
+def test_check_receipt_partial_with_other_causes_is_not_excused(tmp_path, monkeypatch):
+    """A live-verified stale row cannot mask the receipt's other partial causes, which are not steps."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    monkeypatch.setattr(mod, "_live_fleet", lambda: {"default": {"pid": 9, "code_sha": head, "state": "current"}})
+    stale_row = {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"}
+    cases = {
+        "failed restart units: ai.hermes.gateway-lpg": {"gateway_restart": {"failed_units": ["ai.hermes.gateway-lpg"]}},
+        "restart phase incomplete (boom)": {"gateway_restart": {"incomplete": True, "phase_error": "boom"}},
+        "unaccounted runtimes: lpg": {"runtime_outcomes": [{"kind": "gateway", "profile": "lpg", "outcome": "unaccounted"}]},
+    }
+    for expected, extra in cases.items():
+        _receipt(tmp_path, outcome="partial", fleet=[stale_row], **extra)
+        problems = mod.check_receipt(tmp_path)
+        assert len(problems) == 1 and "outcome is 'partial'" in problems[0] and expected in problems[0], expected
+    # The clean bookkeeping the settle-window case actually produces still passes.
+    _receipt(tmp_path, outcome="partial", fleet=[stale_row],
+             gateway_restart={"failed_units": [], "incomplete": False, "phase_error": ""},
+             runtime_outcomes=[{"kind": "gateway", "profile": "default", "outcome": "restarted"}])
+    assert mod.check_receipt(tmp_path) == []
 
 
 def _fake_gh(tmp_path: Path, exit_code: int, stdout: str = "") -> Path:
