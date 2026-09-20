@@ -220,27 +220,32 @@ def check_receipt(home: Path) -> list[str]:
     # The receipt's fleet rows are a snapshot taken inside the updater's settle window. A gateway that
     # drained an in-flight turn past that window is recorded ``stale`` even though launchd relaunched it
     # on the new code moments later. The live fleet is the truth for "is the running code current";
-    # the receipt only says what the updater saw. So a stale row fails only when the live fleet does not
-    # prove that profile current at the checkout HEAD.
+    # the receipt only says what the updater saw. So a stale (or down) row fails only when the live
+    # fleet does not prove that profile current at the checkout HEAD, and a ``partial`` outcome is
+    # excused only when such a row was actually re-verified live; any other non-success outcome fails.
     live = _live_fleet(home)
+    live_verified: list[str] = []
     for row in receipt.get("fleet") or []:
         if not isinstance(row, dict):
             continue
         state = str(row.get("state") or "unknown")
         sha = str(row.get("code_sha") or "")
-        if state != "stale" and (not sha or sha == head):
+        if state not in ("stale", "down") and (not sha or sha == head):
             continue
         profile = str(row.get("profile") or "?")
-        live_row = live.get(profile) if live is not None else None
+        live_row = live.get(profile) if live else None
         if live_row is not None and str(live_row.get("code_sha") or "") == head:
-            print(f"note receipt row for profile {profile!r} is stale (pid {row.get('pid', '?')}, settle window expired); "
+            print(f"note receipt row for profile {profile!r} is {state} (pid {row.get('pid', '?')}, settle window expired); "
                   f"live gateway pid {live_row.get('pid', '?')} verified current at {head[:12]}")
+            live_verified.append(profile)
             continue
-        failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}")
-    if outcome != "success" and not failed_steps and not failures:
-        print(f"note last update outcome is {outcome!r} with no failed steps; live fleet verified current")
-    elif outcome != "success" and not failed_steps:
-        failures.append(f"last update outcome is {outcome or 'missing'!r}")
+        failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}"
+                        + ("" if live is not None else " (live fleet probe unavailable)"))
+    if outcome != "success" and not failed_steps:
+        if outcome == "partial" and live_verified and not failures:
+            print(f"note last update outcome is 'partial' only because of the settle window; live fleet verified current for {', '.join(live_verified)}")
+        else:
+            failures.append(f"last update outcome is {outcome or 'missing'!r}")
     return failures
 
 

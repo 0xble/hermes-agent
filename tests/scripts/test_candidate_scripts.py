@@ -76,6 +76,47 @@ def test_check_receipt_trusts_the_live_fleet_over_a_stale_snapshot(tmp_path, mon
     assert len(problems) == 1 and "reinstall" in problems[0]
 
 
+def test_check_receipt_only_excuses_partial_when_a_row_was_verified_live(tmp_path, monkeypatch, capsys):
+    """The outcome downgrade is limited to the settle-window case: a ``partial`` whose only evidence
+    is a stale/down row the live fleet disproves. Nothing else non-success passes, even with no step
+    records and a healthy live fleet."""
+    mod = _load("check_fork_patches")
+    head = "b" * 40
+    monkeypatch.setattr(mod, "_git", lambda *args: head)
+    healthy = {"default": {"pid": 9, "code_sha": head, "state": "current"}}
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: healthy)
+
+    for outcome in ("failed", "refused", "running", "partial", ""):
+        _receipt(tmp_path, outcome=outcome)  # no steps, no fleet rows: nothing was verified live
+        problems = mod.check_receipt(tmp_path)
+        assert len(problems) == 1 and f"outcome is {outcome or 'missing'!r}" in problems[0], outcome
+    assert "verified current" not in capsys.readouterr().out
+
+    # A down row (updater killed it, nothing replaced it) is treated like stale: live fleet decides.
+    down_row = {"profile": "default", "pid": 7, "code_sha": None, "state": "down"}
+    _receipt(tmp_path, outcome="partial", fleet=[down_row])
+    assert mod.check_receipt(tmp_path) == []
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: {})
+    problems = mod.check_receipt(tmp_path)
+    assert any("state down" in p for p in problems) and any("outcome is 'partial'" in p for p in problems)
+
+    # Probe unavailable is said so, not silently treated as verified.
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: None)
+    problems = mod.check_receipt(tmp_path)
+    assert any("live fleet probe unavailable" in p for p in problems)
+
+    # Two stale rows, only one verified live: the unverified profile still fails, and so does the outcome.
+    monkeypatch.setattr(mod, "_live_fleet", lambda home: healthy)
+    _receipt(tmp_path, outcome="partial", fleet=[
+        {"profile": "default", "pid": 7, "code_sha": "a" * 40, "state": "stale"},
+        {"profile": "lpg", "pid": 8, "code_sha": "a" * 40, "state": "stale"},
+    ])
+    problems = mod.check_receipt(tmp_path)
+    assert any("'lpg'" in p and "state stale" in p for p in problems)
+    assert any("outcome is 'partial'" in p for p in problems)
+    assert not any("'default'" in p for p in problems)
+
+
 def _fake_gh(tmp_path: Path, exit_code: int, stdout: str = "") -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
