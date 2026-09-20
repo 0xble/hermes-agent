@@ -3005,7 +3005,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         if evt_type in {
             "watch_match", "watch_disabled", "watch_overflow_tripped", "watch_overflow_released"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "delegation_auto_resume"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:

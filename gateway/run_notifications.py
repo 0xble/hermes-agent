@@ -1597,6 +1597,55 @@ class GatewayNotificationsMixin:
             if restored:
                 logger.info("Restored %d undelivered async completion(s) for profile %r", restored, profile_name)
 
+    async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
+        """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
+        async with self._completion_event_scope(evt):
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            if parent_session_id:
+                verdict = await self._classify_completion_target(parent_session_id)
+                if verdict == "terminal":
+                    # The original owner is gone; durably suppress future boot notices rather
+                    # than waking a replacement session on every subsequent gateway start.
+                    from tools.delegation_resume import (
+                        claim_auto_resume_trigger, complete_auto_resume_trigger,
+                    )
+                    record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
+                    if reason is None and record is not None:
+                        complete_auto_resume_trigger(
+                            str(evt.get("delegation_id") or ""),
+                            str(record.get("auto_resume_claim") or ""),
+                        )
+                    return True
+                if verdict != "deliver":
+                    return False
+            if not await self._completion_delivery_ready(evt):
+                return False
+            from tools.delegation_resume import (
+                claim_auto_resume_trigger, complete_auto_resume_trigger,
+                release_auto_resume_trigger,
+            )
+            record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
+            if reason is not None or record is None:
+                # Includes an explicit resume claim racing this notice, or another gateway
+                # already owning/finishing the boot notice.
+                return True
+            claim_id = str(record.get("auto_resume_claim") or "")
+            accepted = False
+            try:
+                injected = await self._inject_watch_notification(
+                    str(evt.get("text") or ""), evt, raise_not_accepted=True,
+                )
+                accepted = injected is True
+                return injected
+            except Exception:
+                logger.debug("Boot auto-resume notice injection failed", exc_info=True)
+                return False
+            finally:
+                if accepted:
+                    complete_auto_resume_trigger(str(evt.get("delegation_id") or ""), claim_id)
+                else:
+                    release_auto_resume_trigger(str(evt.get("delegation_id") or ""), claim_id)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async completions and pattern notifications even while sessions are idle.
 
@@ -1612,12 +1661,18 @@ class GatewayNotificationsMixin:
                 # Process completions remain owned by their per-process watchers.
                 requeue = []
                 async_events = []
+                auto_resume_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
+                    if evt.get("type") == "async_delegation":
+                        async_events.append(evt)
+                    elif evt.get("type") == "delegation_auto_resume":
+                        auto_resume_events.append(evt)
+                    else:
+                        requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
                 # A fan-out finishing together yields N completions for one session; group by full route +
@@ -1639,6 +1694,14 @@ class GatewayNotificationsMixin:
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                for evt in auto_resume_events:
+                    try:
+                        delivered = await self._deliver_auto_resume_notice(evt)
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                    except Exception:
+                        _pr.completion_queue.put(evt)
+                        logger.debug("Boot auto-resume notice error", exc_info=True)
             await asyncio.sleep(interval)
 
     @staticmethod

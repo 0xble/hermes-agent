@@ -554,7 +554,13 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     resume_state TEXT NOT NULL DEFAULT 'none',
     resume_attempts INTEGER NOT NULL DEFAULT 0,
     resume_claim TEXT,
-    resume_claimed_at REAL
+    resume_claimed_at REAL,
+    -- One-shot boot notice claim. This is separate from resume_state: boot only
+    -- tells the live parent to invoke the explicit resume action; it never claims
+    -- or reconstructs the child itself.
+    auto_resume_state TEXT NOT NULL DEFAULT 'none',
+    auto_resume_claim TEXT,
+    auto_resume_claimed_at REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);

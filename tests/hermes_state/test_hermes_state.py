@@ -2022,6 +2022,9 @@ class TestAsyncDelegationsSchemaAgreement:
             "resume_attempts",
             "resume_claim",
             "resume_claimed_at",
+            "auto_resume_state",
+            "auto_resume_claim",
+            "auto_resume_claimed_at",
         ):
             legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.M)
         legacy_sql = legacy_sql.replace(

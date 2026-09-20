@@ -12,7 +12,8 @@ Contract pinned here:
   claim is spent.
 * The returned brief requires state verification and never spawns anything.
 * No credentials are read from or written to the ledger.
-* Boot auto-trigger stays disabled.
+* Boot auto-trigger queues one parent-facing notice for eligible rows, but
+  never claims ``resume_state`` or starts a child itself.
 """
 
 from __future__ import annotations
@@ -326,6 +327,48 @@ def test_resume_does_not_consume_the_spawn_cap():
     assert _subagent_spawn_count({"action": "resume", "subagent_id": "deleg_x"}) == 0
 
 
-def test_boot_auto_trigger_is_disabled():
-    """Slice 3 (automatic re-spawn at boot) is deliberately NOT wired."""
-    assert dr.AUTO_RESUME_ON_BOOT is False
+def test_boot_auto_trigger_is_enabled_but_parent_only():
+    assert dr.AUTO_RESUME_ON_BOOT is True
+
+
+def test_boot_candidates_keep_explicit_resume_eligible_rows_narrow():
+    good = _dispatch_row("deleg_boot_good")
+    _mark(good, "unknown")
+    batch = _dispatch_row("deleg_boot_batch", is_batch=True)
+    _mark(batch, "unknown")
+    partial = _dispatch_row("deleg_boot_partial")
+    _mark(partial, "unknown", result={"results": [{"task_index": 0, "status": "completed"}]})
+    stateless = _dispatch_row("deleg_boot_stateless", parent_session_id=None, origin_session_id="")
+    _mark(stateless, "unknown")
+
+    candidates = dr.list_boot_candidates()
+    assert [row["delegation_id"] for row in candidates] == [good]
+
+
+def test_boot_trigger_is_one_shot_and_does_not_spend_resume_claim():
+    did = _dispatch_row("deleg_boot_claim")
+    _mark(did, "unknown")
+
+    record, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert record is not None
+    assert record["auto_resume_state"] == dr.AUTO_RESUME_STATE_CLAIMED
+    assert record["resume_state"] == dr.RESUME_STATE_NONE
+    assert dr.complete_auto_resume_trigger(did, record["auto_resume_claim"]) is True
+
+    _, second_reason = dr.claim_auto_resume_trigger(did)
+    assert second_reason == "already_triggered"
+    assert dr.claim_resume(did)[1] is None
+
+
+def test_boot_notice_is_parent_instruction_without_task_context_or_credentials():
+    did = _dispatch_row("deleg_boot_notice", context="secret context must not be copied")
+    _mark(did, "unknown")
+    record, reason = dr.claim_auto_resume_trigger(did)
+    assert reason is None
+    assert record is not None
+    text = dr.build_auto_resume_notice(record)
+    assert did in text
+    assert "action='resume'" in text
+    assert "secret context" not in text
+    assert "do not execute the original task directly" in text.lower()

@@ -22,11 +22,9 @@ Scope (deliberately narrow — see ``maintenance/delegation-restart.md`` slice 2
 * No credentials are read or persisted here. The durable row's ``task_json``
   carries only goal/context/role/model metadata written at dispatch; the resumed
   spawn resolves its own credentials through the normal delegation config path.
-
-Boot auto-trigger is deliberately NOT wired (``AUTO_RESUME_ON_BOOT`` is False and
-has no call site): automatic re-spawning of abandoned work at process start is a
-separate, riskier slice and stays out until this explicit path has field
-evidence.
+* Boot auto-resume only emits a parent-facing notice. It never claims
+  ``resume_state`` and never starts a child; the parent must call the explicit
+  resume action through the normal tool gates.
 """
 
 from __future__ import annotations
@@ -37,10 +35,14 @@ import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
 
-# Boot-time automatic resume is not implemented. Kept as an explicit, greppable
-# marker so a future slice has one obvious place to flip, and so nothing today
-# silently behaves as if it existed.
-AUTO_RESUME_ON_BOOT = False
+# Boot-time automatic resume is a parent-facing trigger only. It is deliberately
+# kept behind one explicit feature flag so deployments can disable the notice
+# without changing the one-shot explicit resume action.
+AUTO_RESUME_ON_BOOT = True
+AUTO_RESUME_CLAIM_TTL_SECONDS = 300.0
+AUTO_RESUME_STATE_NONE = "none"
+AUTO_RESUME_STATE_CLAIMED = "claimed"
+AUTO_RESUME_STATE_DELIVERED = "delivered"
 
 # Durable states that mean "the owner stopped without a trustworthy terminal
 # result". 'unknown' is what recover_abandoned_delegations() writes when the
@@ -69,7 +71,8 @@ def _ad():
 
 _SELECT = """SELECT delegation_id, origin_session, origin_ui_session_id, parent_session_id,
        state, dispatched_at, completed_at, task_json, result_json,
-       origin_session_id, resume_state, resume_attempts
+       origin_session_id, resume_state, resume_attempts,
+       auto_resume_state, auto_resume_claim, auto_resume_claimed_at
 FROM async_delegations WHERE delegation_id=?"""
 
 
@@ -97,6 +100,9 @@ def _row_to_record(row) -> Dict[str, Any]:
         "origin_session_id": row[9] or "",
         "resume_state": row[10] or RESUME_STATE_NONE,
         "resume_attempts": int(row[11] or 0),
+        "auto_resume_state": row[12] or AUTO_RESUME_STATE_NONE,
+        "auto_resume_claim": row[13] or "",
+        "auto_resume_claimed_at": row[14],
     }
 
 
@@ -146,6 +152,122 @@ def inspect_resumable(delegation_id: str) -> Tuple[Optional[Dict[str, Any]], Opt
         return None, INELIGIBLE_NO_ROW
     record = _row_to_record(row)
     return record, _eligibility(record)
+
+
+def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
+    """Return bounded, single-task rows eligible for a parent-facing boot notice.
+
+    This is read-only. The durable trigger claim is taken later, immediately before
+    injection, after the gateway has proved that the original parent is live and
+    routable. Repeated gateways therefore cannot manufacture duplicate notices.
+    """
+    if not AUTO_RESUME_ON_BOOT:
+        return []
+    ad = _ad()
+    now = time.time()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id, parent_session_id,
+                      state, dispatched_at, completed_at, task_json, result_json,
+                      origin_session_id, resume_state, resume_attempts,
+                      auto_resume_state, auto_resume_claim, auto_resume_claimed_at
+               FROM async_delegations
+              WHERE state IN ('unknown', 'interrupted', 'stalled')
+                AND parent_session_id IS NOT NULL AND parent_session_id != ''
+                AND (auto_resume_state='none' OR
+                     (auto_resume_state='claimed' AND auto_resume_claimed_at < ?))
+              ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""",
+            (now - AUTO_RESUME_CLAIM_TTL_SECONDS, max(0, int(limit))),
+        ).fetchall()
+    candidates = []
+    for row in rows:
+        record = _row_to_record(row)
+        # Keep the explicit action's narrow eligibility as the single source of truth.
+        if _eligibility(record) is not None:
+            continue
+        # A boot notice needs a parent route. API sessions use origin_session_id;
+        # messaging sessions use origin_session/session_key.
+        if not (record["session_key"] or record["origin_session_id"]):
+            continue
+        candidates.append(record)
+    return candidates
+
+
+def claim_auto_resume_trigger(record_or_id: Dict[str, Any] | str,
+                              consumer: str = "gateway-boot") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Take the one durable claim for a boot notice, never the explicit resume claim."""
+    ad = _ad()
+    delegation_id = (record_or_id.get("delegation_id") if isinstance(record_or_id, dict)
+                     else str(record_or_id or ""))
+    if not delegation_id:
+        return None, INELIGIBLE_NO_ROW
+    claim_id = f"{consumer}:{os.getpid()}:{uuid.uuid4().hex}"
+    now = time.time()
+    stale_before = now - AUTO_RESUME_CLAIM_TTL_SECONDS
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(_SELECT, (delegation_id,)).fetchone()
+        if row is None:
+            return None, INELIGIBLE_NO_ROW
+        record = _row_to_record(row)
+        reason = _eligibility(record)
+        if reason is not None:
+            return record, reason
+        if not record["parent_session_id"] or not (record["session_key"] or record["origin_session_id"]):
+            return record, INELIGIBLE_STATELESS
+        changed = conn.execute(
+            """UPDATE async_delegations
+                  SET auto_resume_state=?, auto_resume_claim=?, auto_resume_claimed_at=?, updated_at=?
+                WHERE delegation_id=?
+                  AND (auto_resume_state=? OR
+                       (auto_resume_state=? AND auto_resume_claimed_at < ?))""",
+            (AUTO_RESUME_STATE_CLAIMED, claim_id, now, now, delegation_id,
+             AUTO_RESUME_STATE_NONE, AUTO_RESUME_STATE_CLAIMED, stale_before),
+        ).rowcount
+        if changed != 1:
+            if record["auto_resume_state"] == AUTO_RESUME_STATE_DELIVERED:
+                return record, "already_triggered"
+            return record, "already_triggered"
+    record["auto_resume_state"] = AUTO_RESUME_STATE_CLAIMED
+    record["auto_resume_claim"] = claim_id
+    record["auto_resume_claimed_at"] = now
+    return record, None
+
+
+def release_auto_resume_trigger(delegation_id: str, claim_id: str) -> bool:
+    """Refund a boot trigger when parent admission fails."""
+    ad = _ad()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            """UPDATE async_delegations SET auto_resume_state=?, auto_resume_claim=NULL,
+                      auto_resume_claimed_at=NULL, updated_at=?
+                WHERE delegation_id=? AND auto_resume_state=? AND auto_resume_claim=?""",
+            (AUTO_RESUME_STATE_NONE, time.time(), delegation_id,
+             AUTO_RESUME_STATE_CLAIMED, claim_id),
+        ).rowcount == 1
+
+
+def complete_auto_resume_trigger(delegation_id: str, claim_id: str) -> bool:
+    """Make an accepted boot notice terminal so later boots do not repeat it."""
+    ad = _ad()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            """UPDATE async_delegations SET auto_resume_state=?, updated_at=?
+                WHERE delegation_id=? AND auto_resume_state=? AND auto_resume_claim=?""",
+            (AUTO_RESUME_STATE_DELIVERED, time.time(), delegation_id,
+             AUTO_RESUME_STATE_CLAIMED, claim_id),
+        ).rowcount == 1
+
+
+def build_auto_resume_notice(record: Dict[str, Any]) -> str:
+    """Build a bounded parent instruction; never include task context or credentials."""
+    delegation_id = str(record.get("delegation_id") or "")
+    return (
+        "[IMPORTANT: An interrupted single-task background delegation is eligible for conservative recovery. "
+        f"Delegation ID: {delegation_id}. Do not execute the original task directly and do not assume it is "
+        "safe to rerun. First call delegate_task with action='resume' and this exact subagent_id; the normal "
+        "one-shot recovery gate will verify eligibility and provide a state-verification brief. If that action "
+        "is refused, report the refusal rather than spawning a replacement yourself.]"
+    )
 
 
 def claim_resume(delegation_id: str, consumer: str = "delegate_task") -> Tuple[Optional[Dict[str, Any]], Optional[str]]:

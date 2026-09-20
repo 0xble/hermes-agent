@@ -61,10 +61,12 @@ or how an interrupted child reports why it stopped.
   have completed side effects its lost summary never reported. No credentials are
   read or persisted; `task_json` holds only goal/context/role/model metadata and
   the resumed spawn resolves credentials through the normal delegation path.
-- Boot auto-trigger (slice 3) stays DISABLED: `AUTO_RESUME_ON_BOOT` is `False`
-  with no call site, and `recover_abandoned_delegations()` is unchanged. Automatic
-  re-spawning of abandoned work at process start waits for field evidence from
-  this explicit path.
+- Boot auto-trigger (slice 3) is now a conservative parent-facing notice: after
+  gateway startup, eligible single-task rows are bounded and queued for the existing
+  async-delegation watcher. The watcher requires the original parent session to be
+  live/routable, takes a separate durable one-shot notice claim, and injects a
+  synthetic turn that asks the parent to call the explicit `resume` action. It never
+  reconstructs a child directly; unavailable/closed parents are suppressed.
 
 ## Provenance and patches
 
@@ -132,11 +134,9 @@ Review lows deliberately left out of the reviewed head:
 
 Planned, not started:
 
-- Slice 3: on boot, `recover_abandoned_delegations()` re-spawns via the explicit
-  recovery path when the owner session exists and the transcript is intact, retry
-  cap 1. Deliberately NOT implemented (`AUTO_RESUME_ON_BOOT = False`, no call
-  site): it needs field evidence that the explicit path produces correct resumes
-  before anything re-spawns without a parent asking.
+- Direct boot-time child reconstruction remains deliberately NOT implemented. The
+  shipped slice only emits the parent-facing notice above; the parent must invoke
+  `delegate_task(action='resume', ...)` through the explicit recovery gates.
 - The recovery brief is seeded from the durable goal/context only, not from the
   persisted child transcript. Transcript seeding is a follow-up; the archived
   fork's `delegate_tool_checkpoint.py` / `resume_authorization` system had a P1
