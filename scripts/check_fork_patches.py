@@ -49,7 +49,7 @@ _TRAILER = re.compile(r"^Fork-Patch:\s*\S", re.M)
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["git", "-C", str(REPO), *args], check=True, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
 
 
 def _is_git_checkout() -> bool:
@@ -86,7 +86,7 @@ def check_extensions(home: Path) -> list[str]:
     )
     env = {**os.environ, "HERMES_HOME": str(home)}
     env.pop("PYTHONPATH", None)
-    run = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180)
+    run = subprocess.run([sys.executable, "-c", probe], cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
     if run.returncode != 0:
         return [f"plugin discovery probe failed: {run.stderr.strip()[-400:]}"]
     try:
@@ -103,7 +103,7 @@ def check_config(home: Path) -> list[str]:
     env.pop("PYTHONPATH", None)
     for key, expected in EXPECTED_CONFIG.items():
         run = subprocess.run([sys.executable, "-m", "hermes_cli.main", "config", "get", key], cwd=str(REPO), env=env,
-                             capture_output=True, text=True, timeout=120)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         value = (run.stdout.strip().splitlines() or [""])[-1].strip()
         if expected is None:
             if run.returncode != 0 or not value or value.lower() in ("none", "null", ""):
