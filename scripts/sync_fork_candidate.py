@@ -48,7 +48,7 @@ class SyncError(Exception):
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def newest_release_tag(repo: Path, remote: str) -> str:
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
         result["rebased_head"] = rebased_head
         tests = subprocess.run(
             [args.python, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--no-header", *FORK_TESTS],
-            cwd=str(repo), capture_output=True, text=True, timeout=3600,
+            cwd=str(repo), capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600,
         )
         summary = (tests.stdout.strip().splitlines() or [""])[-1]
         result["tests"] = {"exit": tests.returncode, "summary": summary}

@@ -115,7 +115,7 @@ def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     )
     env = {**os.environ, "HERMES_HOME": str(scratch_home), "HERMES_STATE_DB_GUARD_BYPASS": "1"}
     env.pop("PYTHONPATH", None)
-    run = subprocess.run([python, "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True, timeout=3600)
+    run = subprocess.run([python, "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
     try:
         result = json.loads(run.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
