@@ -873,7 +873,12 @@ def _stale_monitor_loop() -> None:
                            delegation_id, quiet_for, in_tool, _STALL_GRACE_SECONDS)
             with _records_lock:
                 fn = (_records.get(delegation_id) or {}).get("interrupt_fn")
-            _call_interrupt(fn, "Async delegation %s stall interrupt failed: %s", delegation_id)
+            _call_interrupt(
+                fn,
+                "Async delegation %s stall interrupt failed: %s",
+                delegation_id,
+                reason=f"stalled: no progress for {quiet_for:.0f}s",
+            )
         for delegation_id in expired:
             _finalize(delegation_id, lambda rec, d=delegation_id: _stalled_result(d, rec), "stalled")
         if not any_monitorable:
