@@ -214,24 +214,26 @@ def check_receipt(home: Path) -> list[str]:
     elif recorded != head:
         failures.append(f"update receipt records post_update {recorded[:12]} but the checkout is at {head[:12]}")
     outcome = str(receipt.get("outcome") or "")
-    failed_steps = [str(step.get("name")) for step in receipt.get("steps") or [] if isinstance(step, dict) and not step.get("ok", True)]
+    # Steps are only evidence on a non-success receipt: the updater records an opted-out backup as
+    # ``ok: false`` and still finalizes ``success``.
+    failed_steps = [] if outcome == "success" else [
+        str(step.get("name")) for step in receipt.get("steps") or [] if isinstance(step, dict) and not step.get("ok", True)]
     if failed_steps:
         failures.append(f"last update outcome is {outcome or 'missing'!r}; failed steps: {', '.join(failed_steps)}")
     # The receipt's fleet rows are a snapshot taken inside the updater's settle window. A gateway that
     # drained an in-flight turn past that window is recorded ``stale`` even though launchd relaunched it
     # on the new code moments later. The live fleet is the truth for "is the running code current";
     # the receipt only says what the updater saw. So a stale (or down) row fails only when the live
-    # fleet does not prove that profile current at the checkout HEAD, and a ``partial`` outcome is
-    # excused only when such a row was actually re-verified live; any other non-success outcome fails.
-    live = _live_fleet(home)
+    # fleet does not prove that profile current at the checkout HEAD. A ``partial`` outcome is excused
+    # only when such a row was re-verified live AND the receipt records no other reason for the
+    # demotion (failed restart units, an incomplete restart phase, an unaccounted runtime).
+    needs_live = [row for row in receipt.get("fleet") or [] if isinstance(row, dict)
+                  and (str(row.get("state") or "") in ("stale", "down") or (row.get("code_sha") and str(row.get("code_sha")) != head))]
+    live = _live_fleet() if needs_live else {}
     live_verified: list[str] = []
-    for row in receipt.get("fleet") or []:
-        if not isinstance(row, dict):
-            continue
+    for row in needs_live:
         state = str(row.get("state") or "unknown")
         sha = str(row.get("code_sha") or "")
-        if state not in ("stale", "down") and (not sha or sha == head):
-            continue
         profile = str(row.get("profile") or "?")
         live_row = live.get(profile) if live else None
         if live_row is not None and str(live_row.get("code_sha") or "") == head:
@@ -242,15 +244,36 @@ def check_receipt(home: Path) -> list[str]:
         failures.append(f"running profile {profile!r} (pid {row.get('pid', '?')}) reports code {sha[:12] or 'unknown'}, state {state}; checkout is {head[:12]}"
                         + ("" if live is not None else " (live fleet probe unavailable)"))
     if outcome != "success" and not failed_steps:
-        if outcome == "partial" and live_verified and not failures:
+        other = _other_partial_causes(receipt)
+        if outcome == "partial" and live_verified and not failures and not other:
             print(f"note last update outcome is 'partial' only because of the settle window; live fleet verified current for {', '.join(live_verified)}")
         else:
-            failures.append(f"last update outcome is {outcome or 'missing'!r}")
+            failures.append(f"last update outcome is {outcome or 'missing'!r}" + (f"; {'; '.join(other)}" if other else ""))
     return failures
 
 
-def _live_fleet(home: Path) -> dict[str, dict] | None:
-    """Running gateways by profile from the installed CLI's own fleet probe; None when unavailable."""
+def _other_partial_causes(receipt: dict) -> list[str]:
+    """Reasons besides a stale fleet row that the updater demotes an outcome to partial, none of which
+    are recorded as steps: restart units that failed, an incomplete restart phase, unaccounted runtimes."""
+    causes: list[str] = []
+    restart = receipt.get("gateway_restart")
+    restart = restart if isinstance(restart, dict) else {}
+    failed_units = [str(u) for u in restart.get("failed_units") or []]
+    if failed_units:
+        causes.append(f"failed restart units: {', '.join(failed_units)}")
+    if restart.get("incomplete"):
+        causes.append("restart phase incomplete" + (f" ({restart.get('phase_error')})" if restart.get("phase_error") else ""))
+    unaccounted = [str(o.get("profile") or o.get("pid") or "?") for o in receipt.get("runtime_outcomes") or []
+                   if isinstance(o, dict) and str(o.get("outcome") or "") == "unaccounted"]
+    if unaccounted:
+        causes.append(f"unaccounted runtimes: {', '.join(unaccounted)}")
+    return causes
+
+
+def _live_fleet() -> dict[str, dict] | None:
+    """Running gateways by profile from the installed CLI's own fleet probe; None when unavailable.
+
+    The probe is machine-wide (every profile the installed CLI knows), independent of ``--home``."""
     try:
         from hermes_cli.update_receipt import collect_fleet_versions
     except Exception:
