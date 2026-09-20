@@ -1131,6 +1131,10 @@ class GatewayStartupMixin:
         """Apply connect outcomes to shared state single-threaded (exactly as the original serial
         loop did); returns the connected adapter count."""
         connected_count = 0
+        # Fatal error codes behind the non-retryable bucket. The exit-code decision needs the
+        # codes, not just the rendered messages, to tell an absent credential apart from an
+        # ownership conflict.
+        self._startup_nonretryable_codes: set[str] = set()
         for _item in _raw:
             if isinstance(_item, Exception):
                 # Unexpected escape from _connect_one_startup (shouldn't happen); log and skip.
@@ -1178,17 +1182,48 @@ class GatewayStartupMixin:
             )
             target = startup_retryable_errors if _retryable else startup_nonretryable_errors
             target.append(f"{platform.value}: {adapter.fatal_error_message}")
+            if not _retryable:
+                self._startup_nonretryable_codes.add(adapter.fatal_error_code or "")
             if _retryable:
                 self._failed_platforms[platform] = self._startup_retry_entry(
                     platform, adapter, platform_config, queued=False
                 )
         return connected_count
 
+    def _missing_credentials_blamed_on_secrets(self) -> bool:
+        """True when every non-retryable startup failure is an absent credential AND the
+        last secret-source apply lost a source to a slow or unreachable backend.
+
+        Both halves are required. An ownership conflict (a live foreign token holder, a
+        polling lock) is a real single-writer conflict that restarting cannot resolve, so
+        it must keep the fatal-config exit even when the secrets backend was also unwell —
+        that conflation is what sank the previous attempt at this fix upstream.
+        """
+        codes = getattr(self, "_startup_nonretryable_codes", set())
+        if not codes or any(code != "missing_credentials" for code in codes):
+            return False
+        try:
+            from agent.secret_sources.registry import last_apply_had_transient_failure
+
+            return last_apply_had_transient_failure()
+        except Exception:  # noqa: BLE001 — never let this probe block the exit path
+            return False
+
     def _startup_fail_fatal_config(self, reason: str) -> None:
         """Record a fatal-config startup failure (exit 78) and request a clean exit."""
         from gateway.run import _write_runtime_status_quiet
         _write_runtime_status_quiet(gateway_state="startup_failed", exit_reason=reason)
         self._exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
+        self._request_clean_exit(reason)
+        self._startup_restore_in_progress = False
+
+    def _startup_fail_retryable(self, reason: str) -> None:
+        """Record a startup failure every supervisor should retry, and request a clean
+        exit. Same shutdown path as :meth:`_startup_fail_fatal_config`, but deliberately
+        NOT the fatal-config exit code, which systemd is told to never restart from."""
+        from gateway.run import _write_runtime_status_quiet
+        _write_runtime_status_quiet(gateway_state="startup_failed", exit_reason=reason)
+        self._exit_code = 1
         self._request_clean_exit(reason)
         self._startup_restore_in_progress = False
 
@@ -1233,6 +1268,22 @@ class GatewayStartupMixin:
             return False
         if startup_nonretryable_errors and not startup_retryable_errors:
             reason = "; ".join(startup_nonretryable_errors)
+            if self._missing_credentials_blamed_on_secrets():
+                # A secret source blew its fetch budget or could not reach its backend, so
+                # the whole source was dropped and its credentials never reached the
+                # environment. Downstream that is indistinguishable from a token the user
+                # never configured, and the adapters mark it non-retryable. Exiting 78 here
+                # would tell systemd (RestartPreventExitStatus) to keep the gateway down
+                # permanently over a slow backend. Exit restartably instead: the next boot
+                # re-runs the fetch, which is the only thing that can repopulate the token.
+                logger.error(
+                    "Gateway has no usable platform credentials (%s), but a secret source "
+                    "failed transiently this boot — its secrets never reached the "
+                    "environment. Exiting for supervisor restart instead of parking as a "
+                    "fatal configuration fault.", reason,
+                )
+                self._startup_fail_retryable(reason)
+                return True
             logger.error("Gateway hit a non-retryable startup conflict: %s", reason)
             self._startup_fail_fatal_config(reason)
             return True

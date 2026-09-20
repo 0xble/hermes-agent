@@ -36,6 +36,27 @@ _SCOPED_SOURCES: Dict[str, Dict[str, SecretSource]] = {}
 _BUILTINS_LOADED = False
 _REGISTRY_LOCK = threading.RLock()
 
+# Failure kinds a later attempt can plausibly resolve. The taxonomy in ``base`` already
+# singles these two out ("stale-cache fallback on NETWORK/TIMEOUT, never AUTH_FAILED");
+# the rest (NOT_CONFIGURED, BINARY_MISSING, AUTH_FAILED, REF_INVALID, ...) describe a
+# genuine configuration fault that restarting will not repair.
+_TRANSIENT_ERROR_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT})
+
+# Set by apply_all(): did an enabled source fail transiently on the most recent pass?
+_LAST_APPLY_TRANSIENT_FAILURE = False
+
+
+def last_apply_had_transient_failure() -> bool:
+    """True when the most recent :func:`apply_all` had an enabled source fail for a
+    reason a retry could fix (backend slow or unreachable), so its secrets are missing
+    from the environment through no fault of the user's configuration.
+
+    Callers that would otherwise treat an absent credential as a permanent
+    configuration fault must consult this first: a blown fetch budget drops the whole
+    source, which is indistinguishable downstream from a credential the user never set.
+    """
+    return _LAST_APPLY_TRANSIENT_FAILURE
+
 # (module, class, label) for the bundled sources, in registration order.
 _BUILTIN_SOURCES = (
     ("agent.secret_sources.bitwarden", "BitwardenSource", "Bitwarden"),
@@ -204,7 +225,8 @@ def _ensure_builtin_sources() -> None:
 
 
 def _reset_registry_for_tests() -> None:
-    global _BUILTINS_LOADED
+    global _BUILTINS_LOADED, _LAST_APPLY_TRANSIENT_FAILURE
+    _LAST_APPLY_TRANSIENT_FAILURE = False
     with _REGISTRY_LOCK:
         _SOURCES.clear()
         _SOURCE_ORIGINS.clear()
@@ -383,11 +405,13 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     1. 2. 3. 4. See #58073.
     See #51447.
     """
+    global _LAST_APPLY_TRANSIENT_FAILURE
     env = environ if environ is not None else os.environ
     report = ApplyReport()
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
     enabled = _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path))
     if not enabled:
+        _LAST_APPLY_TRANSIENT_FAILURE = False
         return report
 
     preserve_raw = secrets_cfg.get("preserve_existing")
@@ -409,6 +433,10 @@ def apply_all(secrets_cfg: dict, home_path: Path,
                 protected.setdefault(var, source.name)
         except Exception:  # noqa: BLE001
             pass
+
+    _LAST_APPLY_TRANSIENT_FAILURE = any(
+        r.error_kind in _TRANSIENT_ERROR_KINDS for _, _, r in fetches if not r.ok
+    )
 
     # An alias never shadows a var some source supplies by its real name.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}

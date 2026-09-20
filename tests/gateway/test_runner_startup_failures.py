@@ -575,3 +575,82 @@ async def test_token_lock_plus_retryable_peer_stays_alive(monkeypatch, tmp_path)
         assert state["platforms"]["discord"]["state"] == "retrying"
     finally:
         await runner.stop()
+
+
+class _MissingCredentialAdapter(BasePlatformAdapter):
+    """An adapter whose bot token never reached the environment."""
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token=""), Platform.DISCORD)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+async def _run_startup(monkeypatch, tmp_path, adapter_factory, *, secrets_degraded: bool):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "agent.secret_sources.registry.last_apply_had_transient_failure",
+        lambda: secrets_degraded,
+    )
+    config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda p, pc: adapter_factory())
+    await runner.start()
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_transient_secret_failure_does_not_claim_a_fatal_config_fault(monkeypatch, tmp_path):
+    """A secrets backend that timed out must not be reported as broken configuration.
+
+    The fetch budget drops the WHOLE source, so its credentials never reach the
+    environment and the adapter marks itself non-retryable. Exiting with the
+    fatal-config code tells systemd (RestartPreventExitStatus) to keep the gateway down
+    permanently over a slow backend, when only a restart can refetch the token.
+    """
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code != GATEWAY_FATAL_CONFIG_EXIT_CODE, (
+        "a transient secrets failure must stay restartable under every supervisor"
+    )
+    assert runner.exit_code != 0
+    assert read_runtime_status()["gateway_state"] == "startup_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "adapter_factory, secrets_degraded, why",
+    [
+        (_MissingCredentialAdapter, False, "secrets healthy: an absent token IS misconfiguration"),
+        (_NonRetryableFailureAdapter, True, "an ownership conflict is not fixed by restarting"),
+    ],
+)
+async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_factory,
+                                              secrets_degraded, why):
+    """The transient-secrets escape hatch must not swallow genuine fatal conflicts.
+
+    The second case is the one that sank the previous upstream attempt at this change:
+    a live foreign token holder stayed fatal only because the classifier refused to
+    generalise from 'credentials missing' to 'any non-retryable failure'.
+    """
+    runner = await _run_startup(
+        monkeypatch, tmp_path, adapter_factory, secrets_degraded=secrets_degraded
+    )
+
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE, why
