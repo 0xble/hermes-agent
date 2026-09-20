@@ -24,9 +24,19 @@ not the source, is counted against the rich character limit. Runs of three or
 more newlines collapse to the same single spacer, and normalization is
 idempotent.
 
+Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
+two currency amounts in a sentence render as an unwrapped italic formula with
+the spaces stripped and the next `$` consumed. On the rich path only, any line
+carrying two or more `$amount` tokens has each amount wrapped in inline code.
+Closed math (`$x^2$`, `$$…$$`), existing code spans/fences, tickers (`$AAPL`),
+and `US$` prose are left untouched. `&#36;`/`&#x24;` outside code are decoded
+to `$` on send, edit, and draft before route selection so an HTML-escaped
+amount never reaches the user literally.
+
 ## Provenance and adoption
 
-Fork patch identities: `telegram-rich-modes` and `telegram-paragraph-spacing`.
+Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
+  `telegram-rich-currency`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -43,6 +53,13 @@ head `c90504124b06c12b24ba9c9d0dca6a3ca479a764`, open when adopted on 2026-09-19
 The fork carries the adapter symbols and regression file at exact AST parity
 with that head so retirement is a hash comparison, not a re-review. The archived
 fork tracked the same behavior as HERMES-095 (archived PRs #32 and #34).
+
+Currency protection: ported from the archived fork's `_protect_rich_currency`
+and `_normalize_dollar_entities` (archived commit `41d3a9dc81`, "fix(output):
+compose and protect final responses" series) with its regression cases. No
+upstream issue or PR covered it when adopted on 2026-09-19; upstream `main`
+`eeb85107f9` still has the defect. A separate upstream contribution is worth
+opening.
 
 Fork adaptation retains release `v2026.9.14` and its existing client-risk guards.
 It does not import newer upstream approval-header or CJK opt-in changes. On every
@@ -70,7 +87,9 @@ including existing `always` configuration and prompt/delivery agreement. Keep
 this patch while an equivalent upstream proposal is merely open. Retire the
 paragraph-spacing part independently when PR 100686 merges and the candidate
 tag contains it: compare the adapter symbols and the regression file against
-that merge, then drop the fork copy.
+that merge, then drop the fork copy. Retire the currency part when a released
+upstream `_rich_message_payload` passes the currency regression cases in
+`tests/gateway/test_telegram_rich_messages.py` without the fork functions.
 
 To disable rich rendering, use the supported config command to set this mode to
 `never` and restart the gateway. Before rolling back to a boolean-only release,
