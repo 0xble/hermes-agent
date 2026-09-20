@@ -693,3 +693,18 @@ class TestForkTitleContracts:
             response.choices[0].message.content = content; response.choices[0].finish_reason = reason
             with patch("agent.title_generator.call_llm", return_value=response):
                 assert generate_title("real user request") is None
+
+    def test_icon_request_precedes_examples_and_title_contract_closes_the_prompt(self):
+        """The icon block rides inside the rules so the title examples and reply contract stay last;
+        examples are rendered in the configured case style as Bad/Good pairs."""
+        response = MagicMock(); response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title": "Hermes Topic Icons", "icon": "🧪"}'
+        cfg = {"auxiliary": {"title_generation": {"case_style": "title_case"}}}
+        with patch("agent.title_generator.call_llm", return_value=response) as call, \
+             patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            generate_title("testing topic icons", icon_options=["🧪", "📊"], icon_callback=lambda *_: None)
+        prompt = call.call_args.kwargs["messages"][0]["content"]
+        assert prompt.index("pick one icon") < prompt.index("Bad: {") < prompt.index("Reply with JSON only")
+        assert prompt.rstrip().endswith('{"title": "...", "icon": "..."}')
+        assert 'Good: {"title": "iCloud+ 2TB Subscription Review"}' in prompt
+        assert "subscription review" not in prompt  # sentence-case pairs are not mixed in

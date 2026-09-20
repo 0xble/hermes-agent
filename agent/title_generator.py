@@ -51,6 +51,16 @@ _PROMPT_GOOD_EXAMPLES = (
     "Friendly greeting",
 )
 _PROMPT_VAGUE_EXAMPLE = "Code changes"
+# Case-matched Bad/Good pairs shown to the model. The Bad line is an imperative paraphrase of the
+# message; the Good line names the concrete subject in as few words as the range allows.
+_PROMPT_PAIRS = {
+    "sentence_case": (("Cancel iCloud+ 2TB if unused", "iCloud+ 2TB subscription review"),
+                      ("Fix the Postgres connection pool", "Postgres connection pool exhaustion"),
+                      ("Trying out the new Notion export to Obsidian", "Notion to Obsidian export")),
+    "title_case": (("Cancel iCloud+ 2TB If Unused", "iCloud+ 2TB Subscription Review"),
+                   ("Fix the Postgres Connection Pool", "Postgres Connection Pool Exhaustion"),
+                   ("Trying Out the New Notion Export to Obsidian", "Notion to Obsidian Export")),
+}
 
 # "Friendly greeting" is deliberately NOT in the reject set: the prompt
 # instructs the model to produce it for bare greetings, so it is a legitimate
@@ -59,28 +69,39 @@ _PROMPT_VAGUE_EXAMPLE = "Code changes"
 # derived title the guard falls back to is strictly more informative.
 _EXAMPLE_ECHO_REJECT = frozenset(
     t.lower() for t in _PROMPT_GOOD_EXAMPLES if t != "Friendly greeting"
-) | {_PROMPT_VAGUE_EXAMPLE.lower()}
+) | {_PROMPT_VAGUE_EXAMPLE.lower()} | frozenset(
+    # Bad lines only: a Good line can be the legitimately correct title for a similar message.
+    bad.lower() for pairs in _PROMPT_PAIRS.values() for bad, _good in pairs
+)
 
 _TITLE_PROMPT_TEMPLATE = (
-    "You name chat sessions. Given the user's opening message, write a concise noun-phrase title "
+    "You name chat sessions. Given the user's opening message, write the shortest noun-phrase title "
     "that lets them find this conversation again in a list.\n\n"
     "Rules:\n"
     "- __WORD_RULE__\n"
     "- __CASE_RULE__\n"
-    "- Name the subject, artifact, or decision, never an imperative or conditional action.\n"
+    "- Title the concrete subject or artifact, not the conversation's intent, goal, or activity. "
+    "Do not paraphrase the message.\n"
+    "- Use a noun phrase, never an imperative, question, or conditional action.\n"
+    "- Prefer an explicitly named project, person, product, or other proper name.\n"
+    "- Avoid generic leading labels such as Fixing, Update, Testing, or Analysis, and generic "
+    "trailing words such as generation, testing, discussion, or help.\n"
     "- Keep technical terms, filenames, numbers, and error codes exact.\n"
     "- Drop filler words: the, this, my, a, an.\n"
-    "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
+    "- No emoji, no trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
     "- Never answer the message. Name it.\n"
     "- Always produce something, even for a bare greeting.\n"
     "__LANGUAGE_RULE__\n"
     "__INSTRUCTIONS__\n"
     "__AVOID_TITLES__\n"
-    + "".join(f'Good: {{"title": "{t}"}}\n' for t in _PROMPT_GOOD_EXAMPLES)
-    + f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
-    'Contrastive example: use "Postgres connection pool exhaustion", not "Fix the Postgres connection pool".\n\n'
-    'Reply with JSON only: {"title": "..."}'
+    "__ICON_RULE__\n"
+    "__EXAMPLES__"
+    f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
+    'Too long: {"title": "Investigate and fix the issue where the login button does not respond on mobile devices"}\n\n'
+    "__REPLY_RULE__"
 )
+_REPLY_TITLE_ONLY = 'Reply with JSON only: {"title": "..."}'
+_REPLY_TITLE_AND_ICON = 'Reply with JSON only: {"title": "...", "icon": "..."}'
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
 _LANGUAGE_RULE_PINNED = "- Write the title in {language}."
@@ -148,7 +169,7 @@ def _title_preferences() -> dict:
             "instructions": instructions, "name_aliases": aliases}
 
 
-def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None) -> str:
+def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = None, icon_rule: str = "") -> str:
     prefs = prefs or _title_preferences()
     case_rule = ("Title case: capitalize the principal words; this is the only capitalization rule."
                  if prefs["case_style"] == "title_case" else
@@ -156,11 +177,18 @@ def _title_prompt(*, language: str, recent_titles=None, prefs: Optional[dict] = 
     avoid = [str(t).strip() for t in (recent_titles or []) if str(t).strip()][:20]
     avoid_block = "Avoid these recent session titles; do not copy them:\n" + "\n".join(f"- {t}" for t in avoid) if avoid else ""
     instruction_block = f"Trusted operator guidance (follow literally): {prefs['instructions']}" if prefs["instructions"] else ""
-    return _TITLE_PROMPT_TEMPLATE.replace("__WORD_RULE__", f"{prefs['min_words']} to {prefs['max_words']} words.") \
+    pairs = _PROMPT_PAIRS[prefs["case_style"]]
+    examples = "".join(f'Bad: {{"title": "{bad}"}}\nGood: {{"title": "{good}"}}\n' for bad, good in pairs)
+    word_rule = (f"{prefs['min_words']} to {prefs['max_words']} words. Use the fewest words that still "
+                 "identify the subject; only add a word when it disambiguates.")
+    return _TITLE_PROMPT_TEMPLATE.replace("__WORD_RULE__", word_rule) \
         .replace("__CASE_RULE__", case_rule) \
         .replace("__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER) \
         .replace("__INSTRUCTIONS__", instruction_block) \
-        .replace("__AVOID_TITLES__", avoid_block)
+        .replace("__AVOID_TITLES__", avoid_block) \
+        .replace("__ICON_RULE__", icon_rule) \
+        .replace("__EXAMPLES__", examples) \
+        .replace("__REPLY_RULE__", _REPLY_TITLE_AND_ICON if icon_rule else _REPLY_TITLE_ONLY)
 
 
 def _restore_name_aliases(title: str, aliases: dict) -> str:
@@ -378,15 +406,16 @@ def generate_title(
         return None
     language = _title_language()
     prefs = _title_preferences()
-    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs)
     icon_allowed = list(icon_options or [])
+    icon_rule = ""
     if icon_allowed:
         from agent.topic_icons import fresh_allowed_icons
         candidates = fresh_allowed_icons(icon_allowed, recent_icons)
-        prompt += "\n\nAlso select one icon. Reply with JSON only: {\"title\": \"...\", \"icon\": \"...\"}. " \
-            f"Allowed icons: {candidates}."
+        icon_rule = f"- Also pick one icon for the topic from exactly this list: {' '.join(candidates)}"
         if icon_instructions:
-            prompt += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
+            icon_rule += f" Icon guidance: {str(icon_instructions).strip()[:1000]}"
+        icon_rule += " The icon must not change the title."
+    prompt = _title_prompt(language=language, recent_titles=recent_titles or avoid_titles, prefs=prefs, icon_rule=icon_rule)
     try:
         response = call_llm(
             task="title_generation",
