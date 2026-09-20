@@ -9,6 +9,13 @@ its optional icon, and the durable alias can be observed through one Telegram to
 - `auxiliary.title_generation` controls word budget, casing, trusted instructions,
   and literal name-alias restoration. Recent titles are supplied as avoidance context;
   malformed or truncated model output leaves the instant derived title intact.
+- The title prompt keeps three shortness rules the archived fork had and the first rebuild
+  lost: title the concrete subject rather than the message's intent, prefer a proper name,
+  and avoid generic leading or trailing labels (Testing, Analysis, generation, help). Examples
+  are case-matched Bad/Good pairs, the word rule biases toward the low end of the configured
+  range, and the icon request sits inside the rules so the title examples and reply contract
+  close the prompt. Dropping any of these measurably lengthens titles; verify prompt changes by
+  sampling the configured model on a few real opening messages, not by unit tests alone.
 - Telegram topic icons use Bot API `get_forum_topic_icon_stickers` options only.
   Name and icon changes share one `edit_forum_topic` call. Manual icon ownership is
   preserved when configured, and successful automatic writes record state and history.
