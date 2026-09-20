@@ -58,8 +58,11 @@ DEFAULT_TRAILER_FLOOR_SUBJECT = (
 RECORD_IDENTITIES = frozenset({"evidence"})
 # One trailer per line; a commit may carry several. The identity is the text before the first ``;``.
 _TRAILER = re.compile(r"^Fork-Patch:[ \t]*(?P<identity>[^;\s][^;\n]*?)[ \t]*(?:;.*)?$", re.M)
-# A unit owns an identity by naming it as a backticked token, e.g. ``identity: `slice-9-vault-camofox```.
+# A unit owns an identity by naming it as a backticked token on an identity line: a line whose text
+# before the first backtick mentions "identit" (``Fork patch identity:``, ``identities:`` ...) or a
+# continuation line of such a list. Ordinary code spans (paths, config keys, commands) do not own.
 _OWNED_TOKEN = re.compile(r"`([^`\n]+)`")
+_IDENTITY_LINE = re.compile(r"identit", re.I)
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
 
@@ -73,7 +76,7 @@ def _is_git_checkout() -> bool:
 
 
 def _owned_identities() -> set[str] | None:
-    """Backticked tokens named anywhere in the root contract or a maintenance unit; None when neither exists."""
+    """Backticked tokens on identity lines of the root contract or a maintenance unit; None when neither exists."""
     root = REPO / MAINTENANCE_ROOT
     units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
     files = [p for p in [root, *units] if p.is_file()]
@@ -81,13 +84,28 @@ def _owned_identities() -> set[str] | None:
         return None
     owned: set[str] = set()
     for path in files:
-        owned.update(t.strip() for t in _OWNED_TOKEN.findall(path.read_text(encoding="utf-8")))
+        in_identity_block = False
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            continuation = bool(stripped) and line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
+            if not continuation:
+                # A blank line, heading, new list item, table row, or unindented paragraph ends the block.
+                in_identity_block = _IDENTITY_LINE.search(stripped.split("`", 1)[0]) is not None
+            if in_identity_block:
+                owned.update(t.strip() for t in _OWNED_TOKEN.findall(stripped))
     return owned
 
 
+def _is_ancestor(sha: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(REPO), "merge-base", "--is-ancestor", sha, "HEAD"], capture_output=True,
+    ).returncode == 0
+
+
 def _resolve_floor(floor: str, baseline: str, subject: str | None) -> tuple[str | None, str | None]:
-    """Return ``(sha, failure)``. A rebase rewrites the floor SHA; fall back to its exact subject."""
-    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{floor}^{{commit}}"], capture_output=True).returncode == 0:
+    """Return ``(sha, failure)``. The floor must be reachable from HEAD: after a sync rebase the old
+    object may still exist in the store, so existence is not enough. Fall back to the exact subject."""
+    if _is_ancestor(floor):
         return floor, None
     if subject:
         by_subject = [
@@ -97,8 +115,8 @@ def _resolve_floor(floor: str, baseline: str, subject: str | None) -> tuple[str 
         if len(by_subject) == 1:
             return by_subject[0], None
     return None, (
-        f"trailer floor {floor[:12]} does not resolve in this history (rewritten by a sync?) and no single "
-        f"commit above the baseline has its subject; pass --trailer-floor <sha> for the last pre-contract commit")
+        f"trailer floor {floor[:12]} is not an ancestor of HEAD (rewritten by a sync?) and no single commit "
+        f"above the baseline has its subject; pass --trailer-floor <sha> for the last pre-contract commit")
 
 
 def check_trailers(baseline: str, floor: str | None = None, floor_subject: str | None = None) -> list[str]:
@@ -222,7 +240,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
         print(f"FAILED: 1 problem(s); install {REPO} home {args.home}")
         return 1
-    failures = check_trailers(args.baseline, args.trailer_floor, DEFAULT_TRAILER_FLOOR_SUBJECT) + check_extensions(args.home)
+    # The subject fallback belongs to the default floor only; a custom --trailer-floor must resolve as given.
+    floor_subject = DEFAULT_TRAILER_FLOOR_SUBJECT if args.trailer_floor == DEFAULT_TRAILER_FLOOR else None
+    failures = check_trailers(args.baseline, args.trailer_floor, floor_subject) + check_extensions(args.home)
     if not args.skip_config:
         failures += check_config(args.home)
     failures += check_receipt(args.home)

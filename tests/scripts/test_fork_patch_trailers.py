@@ -77,17 +77,25 @@ def test_every_trailer_on_a_multi_trailer_commit_is_checked(tmp_path, monkeypatc
     assert len(failures) == 1 and "never-documented" in failures[0]
 
 
-def test_ownership_requires_the_exact_backticked_token(tmp_path, monkeypatch):
-    """Prose containing the identity as a substring, or a longer backticked token, does not own it."""
+def test_ownership_requires_the_exact_backticked_token_on_an_identity_line(tmp_path, monkeypatch):
+    """Prose substrings, longer tokens, and code spans outside identity lines do not own."""
     git = _repo(tmp_path)
     base = git("rev-parse", "HEAD")
-    git("commit", "--allow-empty", "-qm", "a\n\nFork-Patch: slice")
-    git("commit", "--allow-empty", "-qm", "b\n\nFork-Patch: e")
-    git("commit", "--allow-empty", "-qm", "c\n\nFork-Patch: slice-9-vault")
-    _units(tmp_path, "slice-9-vault-camofox", prose="The slice is maintained here; see the evidence.\n")
+    for identity in ("slice", "e", "slice-9-vault", "/new", "scripts/x.py", "continued", "wrapped"):
+        git("commit", "--allow-empty", "-qm", f"x\n\nFork-Patch: {identity}")
+    _units(
+        tmp_path, "slice-9-vault-camofox",
+        prose=(
+            "The slice is maintained here; see the evidence.\n"
+            "- `/new` keeps busy semantics; run `scripts/x.py`.\n"
+            "- Fork patch identities: `owned-a`,\n"
+            "  `continued` (upstream `deadbeef`).\n"
+            "- Other item mentioning `wrapped`.\n"
+        ),
+    )
     checker = _checker(tmp_path, monkeypatch)
     failures = checker.check_trailers(base)
-    assert sorted(f.split("'")[1] for f in failures) == ["e", "slice", "slice-9-vault"]
+    assert sorted(f.split("'")[1] for f in failures) == ["/new", "e", "scripts/x.py", "slice", "slice-9-vault", "wrapped"]
 
 
 def test_blank_trailer_is_not_a_classification(tmp_path, monkeypatch):
@@ -112,9 +120,30 @@ def test_rewritten_floor_sha_is_located_by_subject_or_fails_clearly(tmp_path, mo
     assert checker.check_trailers(base, gone, "pre-contract floor commit") == []
     # No subject match: one clear failure, no traceback.
     failures = checker.check_trailers(base, gone, "not a subject in this history")
-    assert len(failures) == 1 and "does not resolve" in failures[0]
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
     failures = checker.check_trailers(base, gone)
-    assert len(failures) == 1 and "does not resolve" in failures[0]
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
+
+
+def test_stale_floor_object_after_a_rebase_is_not_treated_as_the_floor(tmp_path, monkeypatch):
+    """After a sync rebase the old floor object still exists in the store; only ancestry counts."""
+    git = _repo(tmp_path)
+    trunk = git("rev-parse", "--abbrev-ref", "HEAD")
+    git("checkout", "-qb", "fork")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor commit")
+    old_floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "later\n\nFork-Patch: fixture")
+    git("checkout", "-q", trunk)
+    git("commit", "--allow-empty", "-qm", "upstream v2 commit A")
+    new_base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "fork")
+    git("rebase", "-q", new_base)
+    assert git("cat-file", "-t", old_floor) == "commit"  # the stale object survives the rebase
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(new_base, old_floor, "pre-contract floor commit") == []
+    failures = checker.check_trailers(new_base, old_floor)
+    assert len(failures) == 1 and "not an ancestor" in failures[0]
 
 
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
