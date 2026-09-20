@@ -894,20 +894,30 @@ class GatewayNotificationsMixin:
         """
         from gateway.run import _parse_session_key
         session_key = str(evt.get("session_key") or "").strip()
+        event_profile = str(evt.get("profile") or "").strip() or None
+
+        def _stamp_profile(source):
+            if source is None or not event_profile or getattr(source, "profile", None) == event_profile:
+                return source
+            try:
+                return dataclasses.replace(source, profile=event_profile)
+            except Exception:
+                return source
+
         derived = {}
         if session_key:
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    return _stamp_profile(entry.origin)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             cached_source = self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return cached_source
+                return _stamp_profile(cached_source)
             derived = _parse_session_key(session_key) or {}
-        profile = derived.get("profile")
+        profile = event_profile or derived.get("profile")
         platform_name = str(evt.get("platform") or derived.get("platform") or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived.get("chat_type") or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived.get("chat_id") or "").strip()
@@ -1048,7 +1058,8 @@ class GatewayNotificationsMixin:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
             raw_sid = _raw_process_event_session_id(evt)
             if raw_sid:
-                adapter = self.adapters.get(Platform.API_SERVER)
+                profile = str(evt.get("profile") or "").strip() or None
+                adapter = self._adapters_for_profile(profile).get(Platform.API_SERVER)
                 if adapter is not None and not adapter_supports_push(adapter):
                     return await self._self_post_api_server(adapter, synth_text, raw_sid, evt)
                 logger.debug(
@@ -1212,7 +1223,9 @@ class GatewayNotificationsMixin:
             adapter = self._resolve_injection_adapter(platform, source)
         else:
             raw_sid = _raw_process_event_session_id(evt)
-            adapter = self.adapters.get(Platform.API_SERVER) if raw_sid else None
+            profile = str(evt.get("profile") or "").strip() or None
+            adapters = self._adapters_for_profile(profile)
+            adapter = adapters.get(Platform.API_SERVER) if raw_sid else None
             if adapter is not None and adapter_supports_push(adapter):
                 return False
         if adapter is None:
@@ -1302,9 +1315,23 @@ class GatewayNotificationsMixin:
         from gateway.run import _async_profile_runtime_scope
         from hermes_constants import get_hermes_home_override
         source = self._build_process_event_source(evt)
-        if source is None or not getattr(source, "profile", None):
+        profile_name = getattr(source, "profile", None) if source is not None else None
+        profile_name = str(profile_name or evt.get("profile") or "").strip() or None
+        if source is None and profile_name and profile_name != "default":
+            try:
+                from hermes_cli.profiles import get_profile_dir, profile_exists
+                if profile_exists(profile_name):
+                    profile_home = get_profile_dir(profile_name)
+                else:
+                    logger.warning("Completion event references unknown profile %r; leaving ambient scope", profile_name)
+                    return contextlib.nullcontext()
+            except Exception:
+                logger.warning("Could not resolve completion event profile %r", profile_name, exc_info=True)
+                return contextlib.nullcontext()
+        elif source is None:
             return contextlib.nullcontext()
-        profile_home = self._resolve_profile_home_for_source(source)
+        else:
+            profile_home = self._resolve_profile_home_for_source(source)
         if get_hermes_home_override() == str(profile_home):
             return contextlib.nullcontext()
         return _async_profile_runtime_scope(profile_home)
@@ -1601,29 +1628,44 @@ class GatewayNotificationsMixin:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         async with self._completion_event_scope(evt):
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            from tools.delegation_resume import (
+                claim_auto_resume_trigger, complete_auto_resume_trigger,
+                release_auto_resume_trigger,
+            )
+
+            async def _suppress_claimed_notice() -> bool:
+                """Terminally consume a notice that must not be retried."""
+                record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
+                if reason is None and record is not None:
+                    complete_auto_resume_trigger(
+                        str(evt.get("delegation_id") or ""),
+                        str(record.get("auto_resume_claim") or ""),
+                    )
+                return True
+
+            # Internal adapter admission bypasses the normal inbound authorization gate. Re-run the
+            # current live-transport authorization before spending the one-shot claim; an unauthorized
+            # destination is terminal for this boot notice, never a retry loop.
+            source = await asyncio.to_thread(self._build_process_event_source, evt)
+            if source is not None:
+                try:
+                    authorized = self._is_user_authorized_for_source(source)
+                except Exception:
+                    logger.warning("Could not authorize boot auto-resume target; suppressing notice", exc_info=True)
+                    authorized = False
+                if not authorized:
+                    return await _suppress_claimed_notice()
+
             if parent_session_id:
                 verdict = await self._classify_completion_target(parent_session_id)
                 if verdict == "terminal":
                     # The original owner is gone; durably suppress future boot notices rather
                     # than waking a replacement session on every subsequent gateway start.
-                    from tools.delegation_resume import (
-                        claim_auto_resume_trigger, complete_auto_resume_trigger,
-                    )
-                    record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
-                    if reason is None and record is not None:
-                        complete_auto_resume_trigger(
-                            str(evt.get("delegation_id") or ""),
-                            str(record.get("auto_resume_claim") or ""),
-                        )
-                    return True
+                    return await _suppress_claimed_notice()
                 if verdict != "deliver":
                     return False
             if not await self._completion_delivery_ready(evt):
                 return False
-            from tools.delegation_resume import (
-                claim_auto_resume_trigger, complete_auto_resume_trigger,
-                release_auto_resume_trigger,
-            )
             record, reason = claim_auto_resume_trigger(evt.get("delegation_id", ""))
             if reason is not None or record is None:
                 # Includes an explicit resume claim racing this notice, or another gateway

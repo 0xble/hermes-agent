@@ -569,19 +569,22 @@ class GatewayStartupMixin:
         the parent session and current route, takes the separate one-shot boot-notice
         claim, and injects a synthetic turn; no child process is recreated here.
         """
-        from tools.delegation_resume import AUTO_RESUME_ON_BOOT, build_auto_resume_notice, list_boot_candidates
-        if not AUTO_RESUME_ON_BOOT:
+        from tools.delegation_resume import build_auto_resume_notice, list_boot_candidates
+        if not getattr(self.config, "auto_resume_on_boot", True):
             return 0
         from tools.process_registry import process_registry
+        from hermes_cli.profiles import get_active_profile_name
         scheduled = 0
 
         def _queue_current_profile() -> None:
             nonlocal scheduled
+            profile_name = get_active_profile_name() or "default"
             for record in list_boot_candidates():
                 process_registry.completion_queue.put({
                     "type": "delegation_auto_resume",
                     "delegation_id": record["delegation_id"],
                     "session_key": record["session_key"],
+                    "profile": profile_name,
                     "origin_ui_session_id": record.get("origin_ui_session_id", ""),
                     "origin_session_id": record.get("origin_session_id", ""),
                     "parent_session_id": record.get("parent_session_id", ""),

@@ -580,6 +580,9 @@ class GatewayConfig:
     # default (interactive asks, event platforms continue). Per-platform
     # ``extra.restart_resume_policy`` wins over this global value.
     restart_resume_policy: Optional[str] = None
+    # Queue parent-facing notices for eligible interrupted delegations at gateway boot. The notice
+    # is still subject to live-route and current-authorization checks before its durable one-shot claim.
+    auto_resume_on_boot: bool = True
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
     filter_silence_narration: bool = True
@@ -623,6 +626,7 @@ class GatewayConfig:
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "restart_resume_policy",
+        "auto_resume_on_boot",
     )
 
     def __post_init__(self) -> None:
@@ -777,6 +781,7 @@ class GatewayConfig:
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), {"pair", "ignore"}, "pair"),
             restart_resume_policy=pick("restart_resume_policy"),
+            auto_resume_on_boot=_coerce_bool(pick("auto_resume_on_boot"), True),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),

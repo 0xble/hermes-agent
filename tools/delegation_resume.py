@@ -35,10 +35,9 @@ import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
 
-# Boot-time automatic resume is a parent-facing trigger only. It is deliberately
-# kept behind one explicit feature flag so deployments can disable the notice
-# without changing the one-shot explicit resume action.
-AUTO_RESUME_ON_BOOT = True
+# Boot-time automatic resume is a parent-facing trigger only. The gateway reads
+# ``gateway.auto_resume_on_boot`` from the active profile before queueing notices;
+# the explicit one-shot resume action is independent of that setting.
 AUTO_RESUME_CLAIM_TTL_SECONDS = 300.0
 AUTO_RESUME_STATE_NONE = "none"
 AUTO_RESUME_STATE_CLAIMED = "claimed"
@@ -161,8 +160,6 @@ def list_boot_candidates(limit: int = 32) -> list[Dict[str, Any]]:
     injection, after the gateway has proved that the original parent is live and
     routable. Repeated gateways therefore cannot manufacture duplicate notices.
     """
-    if not AUTO_RESUME_ON_BOOT:
-        return []
     ad = _ad()
     now = time.time()
     with ad._DB_LOCK, ad._transaction() as conn:

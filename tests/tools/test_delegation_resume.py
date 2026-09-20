@@ -328,7 +328,9 @@ def test_resume_does_not_consume_the_spawn_cap():
 
 
 def test_boot_auto_trigger_is_enabled_but_parent_only():
-    assert dr.AUTO_RESUME_ON_BOOT is True
+    from gateway.config import GatewayConfig
+
+    assert GatewayConfig.from_dict({}).auto_resume_on_boot is True
 
 
 def test_boot_candidates_keep_explicit_resume_eligible_rows_narrow():

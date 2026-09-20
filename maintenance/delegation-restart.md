@@ -66,7 +66,8 @@ or how an interrupted child reports why it stopped.
   async-delegation watcher. The watcher requires the original parent session to be
   live/routable, takes a separate durable one-shot notice claim, and injects a
   synthetic turn that asks the parent to call the explicit `resume` action. It never
-  reconstructs a child directly; unavailable/closed parents are suppressed.
+  reconstructs a child directly; unavailable/closed parents are suppressed. Set
+  `gateway.auto_resume_on_boot: false` to disable this queueing path.
 
 ## Provenance and patches
 
