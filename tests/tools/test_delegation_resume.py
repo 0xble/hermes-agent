@@ -287,6 +287,39 @@ def test_resume_routes_through_delegate_task_entrypoint():
     assert out["delegation_id"] == did
 
 
+def test_real_single_task_dispatch_keeps_scalar_recovery_shape(monkeypatch):
+    """A production one-goal background dispatch must remain resumable as scalar work."""
+    import threading
+    from tools import async_delegation as ad
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def runner():
+        started.set()
+        release.wait(2)
+        return {"summary": "done", "api_calls": 0, "duration_seconds": 0.1}
+
+    handle = ad.dispatch_async_delegation_batch(
+        goals=["port the widget"], context="original ctx", toolsets=None,
+        role="leaf", model="m", session_key="telegram:dm:1",
+        parent_session_id="sess-owner", origin_session_id="sess-owner",
+        delegation_id="deleg_real_single", runner=runner,
+        max_async_children=1,
+    )
+    assert handle["status"] == "dispatched"
+    assert started.wait(1)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT state, task_json FROM async_delegations WHERE delegation_id=?",
+            ("deleg_real_single",),
+        ).fetchone()
+    task = json.loads(row[1])
+    assert row[0] == "running"
+    assert task.get("is_batch") is True and task.get("goals") == ["port the widget"]
+    release.set()
+
+
 def test_resume_does_not_consume_the_spawn_cap():
     from agent.tool_guardrails import _subagent_spawn_count
 

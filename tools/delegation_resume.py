@@ -105,7 +105,15 @@ def _eligibility(record: Dict[str, Any]) -> Optional[str]:
     if record["state"] not in RESUMABLE_STATES:
         return INELIGIBLE_STATE
     task = record["task"]
-    if task.get("is_batch") or task.get("goals") or task.get("task_indexes"):
+    # Production background units retain batch metadata for completion formatting
+    # even when the original call has one goal. That scalar case is resumable
+    # when it is the complete call, but split fan-out units remain ineligible.
+    if task.get("is_batch") or task.get("goals"):
+        goals = task.get("goals")
+        if not (task.get("is_batch") and isinstance(goals, list) and len(goals) == 1
+                and not task.get("task_indexes")):
+            return INELIGIBLE_BATCH
+    if task.get("task_indexes"):
         return INELIGIBLE_BATCH
     if record["result"].get("results"):
         # A unit that recorded per-child results needs reconciliation, not a
