@@ -57,9 +57,12 @@ fork tracked the same behavior as HERMES-095 (archived PRs #32 and #34).
 Currency protection: ported from the archived fork's `_protect_rich_currency`
 and `_normalize_dollar_entities` (archived commit `41d3a9dc81`, "fix(output):
 compose and protect final responses" series) with its regression cases. No
-upstream issue or PR covered it when adopted on 2026-09-19; upstream `main`
-`eeb85107f9` still has the defect. A separate upstream contribution is worth
-opening.
+upstream issue or PR covered it when adopted on 2026-09-19. Own contribution:
+[upstream PR 116642](https://github.com/NousResearch/hermes-agent/pull/116642),
+head `ad2c2da0eb638d90913721ec200f699a09665478`, based on upstream main
+`8b42b6e020c3`, open when recorded on 2026-09-20. The upstream head carries the
+same adapter symbols; its tests route through tables because upstream has no
+`always` mode.
 
 Fork adaptation retains release `v2026.9.14` and its existing client-risk guards.
 It does not import newer upstream approval-header or CJK opt-in changes. On every
