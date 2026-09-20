@@ -49,11 +49,17 @@ EXPECTED_CONFIG = {
 DEFAULT_BASELINE = "345cd2b057a452236de401d3534b8502a7465e8d"
 # Last commit of the pre-contract migration history (fork PR #4). Everything the fork carried up to
 # here was classified by the maintenance units when the central ledger was retired; every commit
-# after it must carry its own ``Fork-Patch:`` trailer.
+# after it must carry its own ``Fork-Patch:`` trailer. A sync rebases the series onto a new upstream
+# tag and rewrites this SHA, so the floor is also located by its exact subject when the SHA is gone.
 DEFAULT_TRAILER_FLOOR = "06004e8e1b067dd846d5ea0286e8744eb5753532"
+DEFAULT_TRAILER_FLOOR_SUBJECT = (
+    "fix(context): Codex OAuth window on proxies + 256K compression cap (upstream ports) (#4)")
 # Trailer identities that name records rather than runtime patches; they need no unit owner.
 RECORD_IDENTITIES = frozenset({"evidence"})
-_TRAILER = re.compile(r"^Fork-Patch:\s*(?P<identity>[^;\n]+?)\s*(?:;.*)?$", re.M)
+# One trailer per line; a commit may carry several. The identity is the text before the first ``;``.
+_TRAILER = re.compile(r"^Fork-Patch:[ \t]*(?P<identity>[^;\s][^;\n]*?)[ \t]*(?:;.*)?$", re.M)
+# A unit owns an identity by naming it as a backticked token, e.g. ``identity: `slice-9-vault-camofox```.
+_OWNED_TOKEN = re.compile(r"`([^`\n]+)`")
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
 
@@ -66,36 +72,58 @@ def _is_git_checkout() -> bool:
     return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
 
 
-def _maintenance_text() -> str | None:
+def _owned_identities() -> set[str] | None:
+    """Backticked tokens named anywhere in the root contract or a maintenance unit; None when neither exists."""
     root = REPO / MAINTENANCE_ROOT
     units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
-    if not root.is_file() and not units:
+    files = [p for p in [root, *units] if p.is_file()]
+    if not files:
         return None
-    parts = [p.read_text(encoding="utf-8") for p in [root, *units] if p.is_file()]
-    return "\n".join(parts)
+    owned: set[str] = set()
+    for path in files:
+        owned.update(t.strip() for t in _OWNED_TOKEN.findall(path.read_text(encoding="utf-8")))
+    return owned
 
 
-def check_trailers(baseline: str, floor: str | None = None) -> list[str]:
-    """Every commit above ``floor`` (default: ``baseline``) is trailered and its identity has a unit owner."""
-    failures: list[str] = []
-    owners = _maintenance_text()
-    if owners is None:
+def _resolve_floor(floor: str, baseline: str, subject: str | None) -> tuple[str | None, str | None]:
+    """Return ``(sha, failure)``. A rebase rewrites the floor SHA; fall back to its exact subject."""
+    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{floor}^{{commit}}"], capture_output=True).returncode == 0:
+        return floor, None
+    if subject:
+        by_subject = [
+            sha for sha in _git("rev-list", "--reverse", f"{baseline}..HEAD").split()
+            if _git("log", "-1", "--format=%s", sha) == subject
+        ]
+        if len(by_subject) == 1:
+            return by_subject[0], None
+    return None, (
+        f"trailer floor {floor[:12]} does not resolve in this history (rewritten by a sync?) and no single "
+        f"commit above the baseline has its subject; pass --trailer-floor <sha> for the last pre-contract commit")
+
+
+def check_trailers(baseline: str, floor: str | None = None, floor_subject: str | None = None) -> list[str]:
+    """Every commit above ``floor`` (default: ``baseline``) carries only owned ``Fork-Patch`` identities."""
+    owned = _owned_identities()
+    if owned is None:
         return [f"{MAINTENANCE_ROOT} and {MAINTENANCE_DIR}/ are missing; patch identities have no owner"]
-    start = floor or baseline
-    commits = _git("rev-list", "--reverse", f"{start}..HEAD").split()
+    start = baseline
+    if floor:
+        start, failure = _resolve_floor(floor, baseline, floor_subject)
+        if failure:
+            return [failure]
+    failures: list[str] = []
     unowned: dict[str, str] = {}
-    for sha in commits:
+    for sha in _git("rev-list", "--reverse", f"{start}..HEAD").split():
         short = sha[:12]
         body = _git("log", "-1", "--format=%B", sha)
-        match = _TRAILER.search(body)
-        if not match:
+        identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
+        if not identities:
             failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) has no Fork-Patch trailer")
             continue
-        identity = match.group("identity").strip()
-        if identity in RECORD_IDENTITIES or identity in unowned:
-            continue
-        if identity not in owners:
-            unowned[identity] = short
+        for identity in identities:
+            if identity in RECORD_IDENTITIES or identity in owned:
+                continue
+            unowned.setdefault(identity, short)
     for identity, short in unowned.items():
         failures.append(f"patch identity {identity!r} (first seen at {short}) is not owned by {MAINTENANCE_ROOT} or any {MAINTENANCE_DIR}/*.md unit")
     return failures
@@ -185,7 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
     ap.add_argument("--baseline", default=DEFAULT_BASELINE, help="upstream release baseline commit")
     ap.add_argument("--trailer-floor", default=DEFAULT_TRAILER_FLOOR,
-                    help="last commit whose history is classified by the maintenance units; later commits need trailers")
+                    help="last commit whose history is classified by the maintenance units; later commits need "
+                         "trailers. Located by exact subject when a sync has rewritten the SHA.")
     ap.add_argument("--skip-config", action="store_true", help="skip the config-key checks (fixture profiles)")
     args = ap.parse_args(argv)
     if not _is_git_checkout():
@@ -193,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
         print(f"FAILED: 1 problem(s); install {REPO} home {args.home}")
         return 1
-    failures = check_trailers(args.baseline, args.trailer_floor) + check_extensions(args.home)
+    failures = check_trailers(args.baseline, args.trailer_floor, DEFAULT_TRAILER_FLOOR_SUBJECT) + check_extensions(args.home)
     if not args.skip_config:
         failures += check_config(args.home)
     failures += check_receipt(args.home)

@@ -39,9 +39,11 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
 condition; there is no central ledger. Every commit after the trailer floor recorded in
-`scripts/check_fork_patches.py` carries a `Fork-Patch: <identity>; ...` trailer, and every
-identity must appear in the root contract or a unit under `maintenance/`. Commits whose
-identity is `evidence` are records, not patches. A trailer proves classification, not
+`scripts/check_fork_patches.py` carries one `Fork-Patch: <identity>; ...` trailer per
+identity, and every identity must be named as a backticked token in this contract or a
+unit under `maintenance/`. Commits whose identity is `evidence` are records, not patches.
+This contract owns `maintenance-contract`. A sync rebase rewrites the floor SHA; the
+checker then locates the floor by its exact subject and fails clearly if that is gone. A trailer proves classification, not
 functional coverage. Retire a patch only after its regression passes on the selected
 upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing

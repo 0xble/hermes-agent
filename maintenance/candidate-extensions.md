@@ -36,7 +36,7 @@ the extension installer, or the personal skill curation procedure. The
 `tests/plugins/test_candidate_extension_schemas.py`,
 `tests/plugins/test_candidate_extensions_install.py`,
 `tests/plugins/test_canonical_skill_guard.py`,
-`tests/plugins/memory/test_hindsight_root_guard.py`, and
+`tests/plugins/test_hindsight_root_guard.py`, and
 `tests/agent/test_goal_set_receipt_notice.py`. `scripts/check_fork_patches.py` proves the
 installed profile registers every extension tool through discovery.
 
