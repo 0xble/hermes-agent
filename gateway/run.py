@@ -995,26 +995,49 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def resolve_restart_resume_policy(config: Any, adapter: Any) -> str:
+    """Resolve platform override, then global preference, then the adapter-safe default.
+
+    Non-interactive adapters (``interactive_resume = False``) always get ``continue``: nobody is
+    there to answer, so an ``ask`` note would strand the interrupted work behind an
+    acknowledgement that goes nowhere (#57056). Otherwise a per-platform
+    ``extra.restart_resume_policy`` beats the global ``gateway.restart_resume_policy``, which in
+    turn beats the upstream default ``ask``.
+    """
+    if not bool(getattr(adapter, "interactive_resume", True)):
+        return "continue"
+    extra = getattr(getattr(adapter, "config", None), "extra", {})
+    if isinstance(extra, dict) and "restart_resume_policy" in extra:
+        return str(extra["restart_resume_policy"])
+    configured = getattr(config, "restart_resume_policy", None)
+    return str(configured) if configured is not None else "ask"
+
+
 def build_resume_recovery_note(
-    reason: Optional[str], message: str = "", *, interactive: bool = True) -> str:
+    reason: Optional[str], message: str = "", *, interactive: Optional[bool] = None,
+    restart_resume_policy: Optional[str] = None) -> str:
     """Build the resume-pending recovery system note for an interrupted turn (empty ``message`` = auto-resume).
 
-    Interactive platforms report the restore and ask what next; non-interactive ones finish the work.
+    Under ``ask`` the note reports the restore and asks what next; under ``continue`` it finishes the work.
 
-    On non-interactive event platforms (webhook, API server — adapters with ``interactive_resume = False``)
-    nobody can answer; the resumed turn must instead complete the interrupted work, or the task is silently
-    abandoned behind a "restored" acknowledgement that goes nowhere (#57056).
+    ``restart_resume_policy`` is the resolved policy from ``resolve_restart_resume_policy``. When omitted
+    the adapter-derived default applies: non-interactive platforms (webhook, API server — adapters with
+    ``interactive_resume = False``) continue, everything else asks (#57056). The continue guidance is
+    platform-neutral because an interactive platform can opt into ``continue``.
     """
     reason_phrase = (
         "a gateway restart" if reason == "restart_timeout"
         else "a gateway shutdown" if reason == "shutdown_timeout" else "a gateway interruption")
+    policy = restart_resume_policy or ("continue" if interactive is False else "ask")
+    if policy not in ("ask", "continue"):
+        raise ValueError("restart_resume_policy must be 'ask' or 'continue'")
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
         )
-    elif interactive:
+    elif policy == "ask":
         resume_guidance = (
             "Report to the user that the session was restored "
             "successfully and ask what they would like to do next.")
@@ -1023,9 +1046,9 @@ def build_resume_recovery_note(
         )
     else:
         resume_guidance = (
-            "No user is present on this non-interactive platform, "
+            "No new user message is attached to this recovery turn, "
             "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
+            "or ask what to do next. Review the conversation history and "
             "CONTINUE the interrupted task to completion.")
         tail_guidance = (
             "Do NOT re-run tool calls whose results already "
@@ -1039,7 +1062,8 @@ def build_resume_recovery_note(
 
 
 def _prepare_resume_pending_message(
-    reason: Optional[str], message: Optional[str], *, interactive: bool = True) -> tuple[str, str]:
+    reason: Optional[str], message: Optional[str], *, interactive: Optional[bool] = None,
+    restart_resume_policy: Optional[str] = None) -> tuple[str, str]:
     """Return the recovery message and the user text to persist.
 
     Empty original: persist the note (a "" user row trips the pre-call sanitizer). Real text: persist clean.
@@ -1051,7 +1075,8 @@ def _prepare_resume_pending_message(
     words: the transcript stays scaffold-free (the model still receives the wrapped note), and a non-empty
     row never trips the sanitizer.
     """
-    recovery_message = build_resume_recovery_note(reason, message or "", interactive=interactive)
+    recovery_message = build_resume_recovery_note(
+        reason, message or "", interactive=interactive, restart_resume_policy=restart_resume_policy)
     persist_message = message if isinstance(message, str) and message.strip() else recovery_message
     return recovery_message, persist_message
 

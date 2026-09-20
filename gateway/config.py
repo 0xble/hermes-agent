@@ -163,6 +163,25 @@ def _normalize_choice(value: Any, choices: set, default: str) -> str:
     return normalized if normalized in choices else default
 
 
+_RESTART_RESUME_POLICIES = frozenset({"ask", "continue"})
+
+
+def _normalize_restart_resume_policy(value: Any, *, allow_none: bool, key: str) -> Optional[str]:
+    """Validate the restart recovery policy without silently changing intent.
+
+    Unlike ``_normalize_choice``, an unrecognized value RAISES instead of falling back: a
+    typo'd policy must fail loudly at config construction, not silently resume with the
+    opposite behavior after a restart.
+    """
+    if value is None and allow_none:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _RESTART_RESUME_POLICIES:
+            return normalized
+    raise ValueError(f"{key} must be 'ask' or 'continue'")
+
+
 def _dict_slot(container: dict, key: str) -> dict:
     """Get-or-create ``container[key]`` as a dict, replacing a non-dict value with ``{}``."""
     value = container.setdefault(key, {})
@@ -556,6 +575,11 @@ class GatewayConfig:
     # config.yaml to stop producing the file.
     write_sessions_json: bool = True
     always_log_local: bool = True  # Always save cron outputs to local files
+    # Empty-message restart recovery policy for interactive adapters: ``ask`` reports the restore
+    # and waits, ``continue`` finishes the interrupted work. None keeps each adapter's native
+    # default (interactive asks, event platforms continue). Per-platform
+    # ``extra.restart_resume_policy`` wins over this global value.
+    restart_resume_policy: Optional[str] = None
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
     filter_silence_narration: bool = True
@@ -598,10 +622,17 @@ class GatewayConfig:
         "max_concurrent_sessions", "multiplex_profiles",
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
-        "loop_watchdog_max_strikes", "unauthorized_dm_behavior",
+        "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "restart_resume_policy",
     )
 
     def __post_init__(self) -> None:
+        self.restart_resume_policy = _normalize_restart_resume_policy(
+            self.restart_resume_policy, allow_none=True, key="restart_resume_policy")
+        for platform, platform_config in self.platforms.items():
+            if "restart_resume_policy" in platform_config.extra:
+                platform_config.extra["restart_resume_policy"] = _normalize_restart_resume_policy(
+                    platform_config.extra.get("restart_resume_policy"), allow_none=False,
+                    key=f"platforms.{platform.value}.extra.restart_resume_policy")
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
 
     def get_connected_platforms(self) -> List[Platform]:
@@ -745,6 +776,7 @@ class GatewayConfig:
             loop_watchdog_max_strikes=max_strikes,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=_normalize_choice(data.get("unauthorized_dm_behavior"), {"pair", "ignore"}, "pair"),
+            restart_resume_policy=pick("restart_resume_policy"),
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
