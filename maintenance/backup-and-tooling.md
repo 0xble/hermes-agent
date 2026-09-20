@@ -27,7 +27,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `slice-13-schema-rehearsal`, `slice-14-self-update`, `slice-18-archive`,
   `slice-12-per-job-timezone`, `slice-12 truthful-contention` (the space is the trailer's
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
-  `maintenance-tooling`, `evidence` (records, not patches). `maintenance-contract` is owned
+  `maintenance-tooling`, `update-lifecycle`, `evidence` (records, not patches). `maintenance-contract` is owned
   by the root contract.
 - Upstream contribution: none recorded for the local patches. The two adopted backup
   fixes retire when the candidate release retains them.
