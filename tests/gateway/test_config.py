@@ -26,6 +26,13 @@ from gateway.config import (
 )
 
 
+class TestGatewayConfig:
+    def test_auto_resume_on_boot_supports_nested_gateway_disable(self):
+        config = GatewayConfig.from_dict({"gateway": {"auto_resume_on_boot": False}})
+        assert config.auto_resume_on_boot is False
+        assert GatewayConfig.from_dict({}).auto_resume_on_boot is True
+
+
 class TestHomeChannelRoundtrip:
     def test_to_dict_from_dict(self):
         hc = HomeChannel(

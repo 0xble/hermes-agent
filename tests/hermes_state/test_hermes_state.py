@@ -2004,15 +2004,30 @@ class TestAsyncDelegationsSchemaAgreement:
             ref.close()
 
     def _legacy_db(self, db_path):
-        """A database created before origin_session_id existed, carrying a
-        pre-existing delegation row that must survive every opening order."""
+        """A database created before origin_session_id and the resume-claim
+        columns existed, carrying a pre-existing delegation row that must
+        survive every opening order."""
+        import re
         import sqlite3
 
         from hermes_state_common import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
+        # Drop every column added after the legacy shape, then re-close the
+        # column list on whatever column now comes last. Matching by name
+        # keeps this fixture working as new columns are appended.
+        legacy_sql = SCHEMA_SQL
+        for column in (
+            "origin_session_id",
+            "resume_state",
+            "resume_attempts",
+            "resume_claim",
+            "resume_claimed_at",
+            "auto_resume_state",
+            "auto_resume_claim",
+            "auto_resume_claimed_at",
+        ):
+            legacy_sql = re.sub(rf"^ +{column} [^\n]*\n", "", legacy_sql, flags=re.M)
+        legacy_sql = legacy_sql.replace(
             "    delivery_claimed_at REAL,\n",
             "    delivery_claimed_at REAL\n",
         )

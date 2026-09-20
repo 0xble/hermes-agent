@@ -378,6 +378,11 @@ def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     """
     _fast_stale_monitor(monkeypatch, grace=5.0)
     interrupted = threading.Event()
+    interrupt_reason = {}
+
+    def interrupt_fn(reason=None):
+        interrupt_reason["value"] = reason
+        interrupted.set()
 
     def runner():
         # "Wedged" until interrupted, then unwinds and reports partial work.
@@ -391,7 +396,7 @@ def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     res = ad.dispatch_async_delegation(
         goal="responsive child", context=None, toolsets=None, role="leaf",
         model="m", session_key="", runner=runner,
-        interrupt_fn=interrupted.set, max_async_children=1,
+        interrupt_fn=interrupt_fn, max_async_children=1,
         progress_fn=lambda: ((3, None), False),
     )
     assert res["status"] == "dispatched"
@@ -401,6 +406,10 @@ def test_stalling_runner_that_honors_interrupt_keeps_its_result(monkeypatch):
     assert evt["status"] == "interrupted"
     assert evt["summary"] == "partial work saved"
     assert evt["api_calls"] == 3
+    reason = interrupt_reason["value"]
+    assert reason.startswith("stalled: no progress for ")
+    assert reason.endswith("s")
+    assert reason[len("stalled: no progress for "):-1].isdigit()
     assert ad.active_count() == 0
 
 

@@ -195,7 +195,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "resume"})
 
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Tip of a session id's compression lineage via the parent's live SessionDB (best-effort; input unchanged when
@@ -261,11 +261,113 @@ def _list_payload(parent_agent: Any) -> Dict[str, Any]:
         )
     return payload
 
+def _owns_durable_delegation(record: Dict[str, Any], parent_agent: Any) -> bool:
+    """True when *parent_agent*'s conversation owns a DURABLE delegation row.
+
+    Same durable spine as :func:`_owns_subagent_record` tier 2 (the live weakref
+    chain is gone by definition — the child is dead), comparing the row's
+    ``parent_session_id`` / ``origin_session_id`` against the caller's session id
+    after resolving compression-rotation lineage on both sides. Fails closed when
+    either side has no durable id, so a session that cannot prove ownership can
+    never claim another conversation's interrupted work.
+    """
+    parent_sid = str(getattr(parent_agent, "session_id", "") or "")
+    if not parent_sid:
+        return False
+    parent_tip = _resolve_session_lineage(parent_sid, parent_agent)
+    for key in ("parent_session_id", "origin_session_id"):
+        owner_sid = str(record.get(key) or "")
+        if not owner_sid:
+            continue
+        if owner_sid == parent_sid:
+            return True
+        if _resolve_session_lineage(owner_sid, parent_agent) in {parent_sid, parent_tip}:
+            return True
+    return False
+
+
+# Refusal token -> prose shown to the model. Every refusal is truthful about WHY
+# the interrupted work is not safe to resume automatically.
+_RESUME_REFUSALS = {
+    "no_such_delegation": (
+        "No durable record for delegation '{sid}'. Only background delegations dispatched by this "
+        "installation are recoverable, and terminal records are pruned after a retention window."
+    ),
+    "not_interrupted": (
+        "Delegation '{sid}' is not an interrupted single-task delegation awaiting recovery (it is "
+        "still running, already reported a terminal result, or has no recorded goal). Nothing to resume."
+    ),
+    "batch_delegation": (
+        "Delegation '{sid}' is a multi-task batch. Batch recovery is out of scope: re-delegate the "
+        "specific tasks you can show are unfinished, after checking their results."
+    ),
+    "partial_results_recorded": (
+        "Delegation '{sid}' recorded partial per-child results. Those need reconciliation, not a "
+        "blind re-run — read the recorded results and delegate only the proven gap."
+    ),
+    "stateless_origin": (
+        "Delegation '{sid}' was dispatched from a stateless origin (cron or a one-shot run) with no "
+        "conversation to own a recovery. Re-run it from a session that can receive the result."
+    ),
+    "already_claimed": (
+        "Delegation '{sid}' has already been claimed for recovery once. Recovery is one-shot per "
+        "delegation by design; if the work is still unfinished, spawn a fresh task describing the "
+        "verified current state yourself."
+    ),
+}
+
+
+def _handle_resume_action(subagent_id: Optional[str], parent_agent: Any) -> str:
+    """action='resume': hand back a ONE-SHOT recovery brief for an interrupted delegation.
+
+    This never re-spawns anything. It durably claims the row (at most one claim per
+    delegation, ever) and returns the exact ``context`` the parent must pass to a
+    normal ``delegate_task`` spawn — so the replacement child goes through every
+    existing spawn gate and shows up in the parent's own transcript.
+    """
+    from tools.delegation_resume import build_recovery_instruction, claim_resume, inspect_resumable
+
+    sid = (subagent_id or "").strip()
+    if not sid:
+        return tool_error(
+            "action='resume' requires subagent_id set to the delegation_id of the interrupted "
+            "background delegation (it appears in its completion message)."
+        )
+    record, reason = inspect_resumable(sid)
+    if reason is None and record is not None and not _owns_durable_delegation(record, parent_agent):
+        # Ownership is checked BEFORE the claim so a foreign caller cannot burn
+        # the one recovery claim belonging to another conversation.
+        return tool_error(
+            f"Delegation '{sid}' does not belong to this conversation. Only the session that "
+            "dispatched a delegation can recover it."
+        )
+    if reason is None:
+        record, reason = claim_resume(sid)
+    if reason is not None or record is None:
+        return tool_error(_RESUME_REFUSALS.get(reason or "", _RESUME_REFUSALS["not_interrupted"]).format(sid=sid))
+    return json.dumps({
+        "action": "resume",
+        "delegation_id": sid,
+        "status": "recovery_claimed",
+        "goal": (record.get("task") or {}).get("goal"),
+        "recovery_context": build_recovery_instruction(record),
+        "note": (
+            "This claim is one-shot and already spent — no second recovery brief will be issued for "
+            "this delegation. Nothing has been spawned. To act on it, call delegate_task normally "
+            "with the original goal and pass 'recovery_context' verbatim as the task's context. The "
+            "replacement subagent must verify current workspace and external state before doing any "
+            "new work: the interrupted run may have completed side effects it never reported."
+        ),
+    }, ensure_ascii=False)
+
+
 def _handle_control_action(action: str, subagent_id: Optional[str], message: Optional[str], parent_agent: Any) -> str:
-    """Synchronous control plane for delegate_task: list/steer/stop. Runs in-turn (never backgrounded) over the same
-    registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
+    """Synchronous control plane for delegate_task: list/steer/stop/resume. Runs in-turn (never backgrounded) over the
+    same registry the TUI overlay drives, scoped so a conversation can only control its own spawn tree."""
     if action == "list":
         return json.dumps(_list_payload(parent_agent), ensure_ascii=False)
+    if action == "resume":
+        return _handle_resume_action(subagent_id, parent_agent)
 
     # steer / stop need a resolvable, owned target.
     sid = (subagent_id or "").strip()

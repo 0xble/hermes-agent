@@ -30,14 +30,53 @@ or how an interrupted child reports why it stopped.
   callback's own `TypeError`.
 - Composes with [Restart continuation](restart-continuation.md): the restart first
   waits for children under this unit, then the parent turn resumes under
-  `gateway.restart_resume_policy`. Neither unit resumes a killed child; that is
-  parked as slice 2 below.
+  `gateway.restart_resume_policy`. Neither unit resumes a killed child
+  automatically; explicit parent-driven recovery is the section below.
+
+## Explicit one-shot recovery (slice 2, narrow form)
+
+- `delegate_task(action='resume', subagent_id=<delegation_id>)` is a control
+  action on the existing synchronous control path (`_handle_control_action`), not
+  a new tool and not a spawn. It hands back a `recovery_context` string; the
+  parent then spawns normally, so every existing spawn gate (pause switch, depth,
+  capacity, guardrail spawn cap) still applies and the resumed run is visible in
+  the parent's own transcript. `resume` counts 0 against the spawn cap because it
+  spawns nothing.
+- Eligibility is durable and deliberately minimal (`tools/delegation_resume.py`):
+  a SINGLE-task row in state `unknown`/`interrupted`/`stalled`, with a recorded
+  goal, a routable origin, and no recorded per-child partial results. Batches,
+  partial-result units, and stateless (cron/one-shot) origins are refused with a
+  distinct truthful reason rather than guessed at.
+- The claim is durable and ONE-SHOT: `async_delegations.resume_state` /
+  `resume_attempts` / `resume_claim` / `resume_claimed_at`, taken by a guarded
+  `UPDATE ... WHERE resume_state='none' AND resume_attempts=0` inside the same
+  transaction as the eligibility re-check. A restart loop, a re-delivered
+  completion, or two racing consumers yield at most one recovery brief per
+  delegation, ever. An ineligible row never spends its attempt.
+- Ownership is checked BEFORE the claim, over the same durable spine as
+  `_owns_subagent_record` tier 2 (`parent_session_id`/`origin_session_id` with
+  compression-lineage resolution, failing closed with no session id), so a foreign
+  conversation can neither read another's brief nor burn its single claim.
+- The brief always requires state verification first: the interrupted child may
+  have completed side effects its lost summary never reported. No credentials are
+  read or persisted; `task_json` holds only goal/context/role/model metadata and
+  the resumed spawn resolves credentials through the normal delegation path.
+- Boot auto-trigger (slice 3) is now a conservative parent-facing notice: after
+  gateway startup, eligible single-task rows are bounded and queued for the existing
+  async-delegation watcher. The watcher requires the original parent session to be
+  live/routable, takes a separate durable one-shot notice claim, and injects a
+  synthetic turn that asks the parent to call the explicit `resume` action. It never
+  reconstructs a child directly; unavailable/closed parents are suppressed. Set
+  `gateway.auto_resume_on_boot: false` to disable this queueing path.
 
 ## Provenance and patches
 
 - Fork patch identities: `restart-delegation-drain` (gateway wait, CLI budget, drain
-  report) and `delegation-interrupt-reason` (reason plumbing). Both are upstream
-  contribution candidates; no upstream PR filed. Upstream's documented position is
+  report), `delegation-interrupt-reason` (reason plumbing),
+  `delegation-stall-reason` (truthful stall reason on the stale-monitor interrupt),
+  and `delegation-explicit-resume` (one-shot recovery claim and the
+  `action='resume'` control path). All are upstream contribution candidates; no
+  upstream PR filed. Upstream's documented position is
   that a process restart does not resume a running child (`delegation.md`), which
   this unit does not change.
 - Origin: 2026-09-19, a `hermes update` from one Telegram topic killed a fix worker
@@ -57,7 +96,11 @@ or how an interrupted child reports why it stopped.
   `hermes_cli/config_defaults.py`, `tools/async_delegation.py` (`active_records`,
   `_call_interrupt`, `_interrupt_records`), `tools/delegate_tool_child_run.py`
   (`_signal_child_stop`, `_build_result_entry`), `tools/delegate_tool_dispatch.py`,
-  `tools/process_registry_notifications.py`.
+  `tools/process_registry_notifications.py`, `tools/delegation_resume.py`,
+  `tools/delegate_tool_registry.py` (`_handle_resume_action`,
+  `_owns_durable_delegation`), `tools/delegate_tool.py` (schema + action routing),
+  `agent/tool_guardrails.py` (`_subagent_spawn_count`), `hermes_state_common.py`
+  (`async_delegations` resume columns).
 
 ## Verification
 
@@ -65,6 +108,8 @@ or how an interrupted child reports why it stopped.
 tests/gateway/test_restart_drain.py tests/gateway/test_cron_active_work_drain.py
 tests/gateway/test_drain_active_work_report.py
 tests/tools/test_delegate_interrupt_reason.py tests/tools/test_async_delegation.py
+tests/tools/test_delegation_resume.py tests/tools/test_delegate_control_actions.py
+tests/hermes_state/test_hermes_state.py -k AsyncDelegations
 tests/hermes_cli/test_gateway_service.py tests/hermes_cli/test_update_wedged_gateway.py`.
 
 After promotion, prove it live: start a throwaway delegation, run `hermes update`
@@ -90,18 +135,20 @@ Review lows deliberately left out of the reviewed head:
 
 Planned, not started:
 
-- Slice 2: `delegate_task(action='resume', subagent_id=...)` seeded from the
-  persisted child transcript plus one synthetic "you were interrupted at X for
-  reason Y, re-verify workspace state" turn. Scope fresh; the archived fork's
-  `delegate_tool_checkpoint.py` / `resume_authorization` system had a P1
-  registry-pruning defect and was dropped in v2026.9.14.
-- Slice 3: on boot, `recover_abandoned_delegations()` re-spawns via slice 2 when the
-  owner session exists and the transcript is intact, retry cap 1. Crash-only once
-  this unit makes planned restarts wait.
+- Direct boot-time child reconstruction remains deliberately NOT implemented. The
+  shipped slice only emits the parent-facing notice above; the parent must invoke
+  `delegate_task(action='resume', ...)` through the explicit recovery gates.
+- The recovery brief is seeded from the durable goal/context only, not from the
+  persisted child transcript. Transcript seeding is a follow-up; the archived
+  fork's `delegate_tool_checkpoint.py` / `resume_authorization` system had a P1
+  registry-pruning defect and was dropped in v2026.9.14, so it is not a source.
 
 ## Retirement and rollback
 
 Retire when a released upstream version waits for background delegations on
-restart with an independent budget and surfaces the interrupt reason. Roll back by
-reverting the two fork commits and removing `gateway.restart_delegation_timeout`
-from configuration; no schema or persistent-data change is involved.
+restart with an independent budget, surfaces the interrupt reason, and offers an
+equivalent explicit recovery path. Roll back by reverting the fork commits and
+removing `gateway.restart_delegation_timeout` from configuration. The resume
+columns on `async_delegations` are additive with safe defaults
+(`resume_state='none'`, `resume_attempts=0`); leaving them in place after a
+rollback is harmless and avoids a destructive table rebuild.

@@ -562,6 +562,57 @@ class GatewayStartupMixin:
             logger.info("Scheduled auto-resume for %d restart-interrupted session(s)", scheduled)
         return scheduled
 
+    def _schedule_auto_resume_delegations(self) -> int:
+        """Queue bounded parent notices for eligible abandoned single-task rows.
+
+        This is intentionally only a queueing step. The async-delegation watcher checks
+        the parent session and current route, takes the separate one-shot boot-notice
+        claim, and injects a synthetic turn; no child process is recreated here.
+        """
+        from tools.delegation_resume import build_auto_resume_notice, list_boot_candidates
+        if not getattr(self.config, "auto_resume_on_boot", True):
+            return 0
+        from tools.process_registry import process_registry
+        from hermes_cli.profiles import get_active_profile_name
+        scheduled = 0
+
+        def _queue_current_profile() -> None:
+            nonlocal scheduled
+            profile_name = get_active_profile_name() or "default"
+            for record in list_boot_candidates():
+                process_registry.completion_queue.put({
+                    "type": "delegation_auto_resume",
+                    "delegation_id": record["delegation_id"],
+                    "session_key": record["session_key"],
+                    "profile": profile_name,
+                    "origin_ui_session_id": record.get("origin_ui_session_id", ""),
+                    "origin_session_id": record.get("origin_session_id", ""),
+                    "parent_session_id": record.get("parent_session_id", ""),
+                    "text": build_auto_resume_notice(record),
+                    "message_id": f"auto-resume:{record['delegation_id']}",
+                    **{key: record["task"].get(key, "") for key in ("scope_id", "user_id", "user_name")},
+                })
+                scheduled += 1
+
+        try:
+            _queue_current_profile()
+            from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
+            from hermes_cli.profiles import get_active_profile_name
+            active = get_active_profile_name() or "default"
+            for profile_name, profile_home in _multiplex_profile_homes(self.config):
+                if profile_name == active:
+                    continue
+                try:
+                    with _profile_runtime_scope(Path(profile_home), {}):
+                        _queue_current_profile()
+                except Exception:
+                    logger.warning("Could not queue boot auto-resume notices for profile %r", profile_name, exc_info=True)
+        except Exception:
+            logger.warning("Could not queue boot auto-resume notices", exc_info=True)
+        if scheduled:
+            logger.info("Queued %d parent-facing boot auto-resume notice(s)", scheduled)
+        return scheduled
+
     def _startup_should_abort(self) -> bool:
         return self._restart_requested or self._draining or self._shutdown_event.is_set()
 
@@ -1281,6 +1332,10 @@ class GatewayStartupMixin:
         # auto-resume stays visible on the next user message.
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
+        # Queue bounded parent-facing recovery notices after adapters/session restore are ready.
+        # The async delegation watcher performs the route/authorization preflight and durable
+        # trigger claim; this startup hook never reconstructs a child process.
+        self._schedule_auto_resume_delegations()
         # Surface state.db init failures to messaging platforms before the user loses data.
         # See #88235.
         await self._send_session_db_warning_notifications()

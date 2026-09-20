@@ -95,7 +95,11 @@ processes are killed at its teardown and their notices are suppressed in the par
 (`process_registry.transfer_ownership`) so the completion routes and reaps by the new owner; un-handed leftovers land on
 the result as `orphaned_processes`, exited-but-never-read notify processes as `unread_completions` (`_ChildRun.account_background_processes`, before `cleanup` kills them). **Durability:** background
 delegation is process-local; work that must survive restart uses `cronjob` or
-`terminal(background=True, notify_on_complete=True)`. API: `website/docs/developer-guide/subagent-lifecycle-api.md`.
+`terminal(background=True, notify_on_complete=True)`. An INTERRUPTED background delegation is not
+auto-resumed; `action='resume'` (`tools/delegation_resume.py`) hands the parent a one-shot, durably
+claimed recovery brief for a single-task row, which the parent then spawns normally — it re-spawns
+nothing itself (fork unit `maintenance/delegation-restart.md`).
+API: `website/docs/developer-guide/subagent-lifecycle-api.md`.
 
 ## Tests
 
