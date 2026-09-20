@@ -47,13 +47,13 @@ EXPECTED_CONFIG = {
 }
 # Upstream release baseline the fork is built on (v2026.9.14).
 DEFAULT_BASELINE = "345cd2b057a452236de401d3534b8502a7465e8d"
-# Last commit of the pre-contract migration history (fork PR #4). Everything the fork carried up to
-# here was classified by the maintenance units when the central ledger was retired; every commit
-# after it must carry its own ``Fork-Patch:`` trailer. A sync rebases the series onto a new upstream
-# tag and rewrites this SHA, so the floor is also located by its exact subject when the SHA is gone.
-DEFAULT_TRAILER_FLOOR = "06004e8e1b067dd846d5ea0286e8744eb5753532"
-DEFAULT_TRAILER_FLOOR_SUBJECT = (
-    "fix(context): Codex OAuth window on proxies + 256K compression cap (upstream ports) (#4)")
+# Last published commit whose fork behavior is documented by a maintenance unit. The commit
+# predates the trailer contract but its ``busy-command-dispatch`` patch is documented in
+# ``maintenance/gateway-commands.md``. Every later commit must carry its own ``Fork-Patch:``
+# trailer. A sync may rewrite this SHA, so the floor is also located by its exact subject when
+# the SHA is gone.
+DEFAULT_TRAILER_FLOOR = "1c51acfce85cd1d04214f1dc3477c91a91cf5744"
+DEFAULT_TRAILER_FLOOR_SUBJECT = "Fix safe slash commands during active turns"
 # Trailer identities that name records rather than runtime patches; they need no unit owner.
 RECORD_IDENTITIES = frozenset({"evidence"})
 # One trailer per line; a commit may carry several. The identity is the text before the first ``;``.
