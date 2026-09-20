@@ -5049,6 +5049,9 @@ async def _start_gateway_start_control_socket(runner):
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
         from gateway.control_socket import GatewayControlServer
+        from gateway.update_launcher import make_agent_update_handler
+        from gateway.slash_commands import _spawn_detached_update
+        from hermes_cli.config import is_managed
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
         # pause-for-update (#92091 step 2): the updater asks this gateway to drain in-flight turns and exit
@@ -5094,9 +5097,16 @@ async def _start_gateway_start_control_socket(runner):
             except concurrent.futures.TimeoutError:
                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
 
+        _agent_update_handler = make_agent_update_handler(
+            runner=runner, home=_hermes_home, main_loop=_main_loop,
+            resolve_hermes_bin=_resolve_hermes_bin, spawn=_spawn_detached_update, is_managed=is_managed,
+        )
+
         _control_server = GatewayControlServer(
+            home=_hermes_home,
             verb_handlers={"pause-for-update": _pause_for_update_handler,
-                           "rescan-profiles": _rescan_profiles_handler})
+                           "rescan-profiles": _rescan_profiles_handler,
+                           "agent-update": _agent_update_handler})
         if not await _control_server.start():
             _control_server = None
         else:

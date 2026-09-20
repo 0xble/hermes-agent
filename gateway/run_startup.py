@@ -217,6 +217,7 @@ class GatewayStartupMixin:
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
+            self._schedule_update_notification_watch()
             if planned_restart_notification_pending:
                 try:
                     await self._send_home_channel_startup_notifications(skip_targets=None)
