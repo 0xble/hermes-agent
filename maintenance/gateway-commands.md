@@ -22,6 +22,11 @@ Load this unit when changing the adapter active-session guard, the runner busy f
   patch-equivalent to own contribution [upstream PR 116295](https://github.com/NousResearch/hermes-agent/pull/116295)
   at `9c133fd14aa5`, open on 2026-09-19.
 
+- Follow-up patch identity: `busy-command-dispatch`. Moves the five immediate
+  handlers into the shared idle/busy dispatch table. Registry policy alone did not
+  make them reachable. Regression exercises `_handle_message` with an active agent
+  and verifies handler invocation without interruption or queueing.
+
 ## Verification
 
 `scripts/run_tests.sh` on `tests/gateway/test_command_bypass_active_session.py`,
