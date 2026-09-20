@@ -80,6 +80,12 @@ def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
 
 
+# Rejected or lapsed credentials must never leave values in the cache: the identity that
+# resolved them is no longer trusted. Slow or unreachable backends are a different class
+# and do not invalidate anything (see the ErrorKind docstring in ``base``).
+_AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
+
+
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
     """``(valid_refs, warnings)``: keep valid env names bound to stripped ``op://`` strings."""
     valid: Dict[str, str] = {}
@@ -169,8 +175,11 @@ def fetch_onepassword_secrets(
     """Resolve ``references`` (name → ``op://…``) to ``(secrets, warnings)``.
 
     Raises ``RuntimeError`` only when no ``op`` binary is available; per-ref
-    failures become warnings. Only a complete, error-free pull is cached, so a
-    transient auth failure isn't frozen in for the whole TTL window.
+    failures become warnings. Only *resolved* values are cached: a reference that
+    failed is simply absent from the entry, so it is retried on the next call
+    rather than frozen in for the whole TTL window. A partial entry is still
+    reused for the references it does cover, so one flaky reference cannot force
+    a full cold pull of every reference on each startup.
     """
     valid, warnings = _validate_references(references)
     if not valid:
@@ -180,10 +189,17 @@ def fetch_onepassword_secrets(
     cache_key: _CacheKey = (_auth_fingerprint(token_env), account or "",
                             str(home_path) if home_path is not None else "", _refs_fingerprint(valid))
 
+    # Values carried over from a fresh-but-incomplete cache entry, and the fetch time
+    # they were recorded under (reused so carried-over values never get a fresh lease).
+    prefetched: Dict[str, str] = {}
+    prefetched_at: Optional[float] = None
     if use_cache:
         cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
         if cached is not None:
-            return dict(cached.secrets), warnings
+            if all(name in cached.secrets for name in valid):
+                return dict(cached.secrets), warnings
+            prefetched = {n: v for n, v in cached.secrets.items() if n in valid}
+            prefetched_at = cached.fetched_at
 
     op = binary or find_op(binary_path)
     if op is None:
@@ -191,17 +207,26 @@ def fetch_onepassword_secrets(
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: Dict[str, str] = {}
-    read_errors = 0
+    secrets: Dict[str, str] = dict(prefetched)
+    failure_kinds: List[ErrorKind] = []
     for name in sorted(valid):
+        if name in secrets:
+            continue  # carried over from the cache entry; don't pay for it again
         try:
             secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
         except RuntimeError as exc:
             warnings.append(str(exc))
-            read_errors += 1
+            failure_kinds.append(_classify_op_error(str(exc)))
 
-    if use_cache and not read_errors and secrets:
-        _STORE.store(cache_key, CachedFetch(secrets=dict(secrets), fetched_at=time.time()),
+    # Classify across EVERY failure, not just the first: a run that mixes a timeout with a
+    # rejected credential must be judged by the credential, never by whichever failed first.
+    auth_failed = any(k in _AUTH_ERROR_KINDS for k in failure_kinds)
+
+    if use_cache and secrets and not auth_failed:
+        # Age the entry from the oldest value it carries, so reusing a partial entry
+        # cannot extend a carried-over value past the configured TTL.
+        fetched_at = prefetched_at if prefetched and prefetched_at is not None else time.time()
+        _STORE.store(cache_key, CachedFetch(secrets=dict(secrets), fetched_at=fetched_at),
                      cache_ttl_seconds, home_path)
 
     return secrets, warnings

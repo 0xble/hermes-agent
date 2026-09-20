@@ -297,5 +297,91 @@ def test_apply_never_overrides_token_var(monkeypatch, tmp_path):
     assert calls["n"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Partial-pull caching
+# ---------------------------------------------------------------------------
 
 
+def _entry(tmp_path, refs, ttl=300):
+    key = (op._auth_fingerprint(op._DEFAULT_TOKEN_ENV), "", str(tmp_path), op._refs_fingerprint(refs))
+    return op._STORE.disk.read(key, ttl, tmp_path)
+
+
+def test_partial_pull_caches_resolved_refs_and_retries_only_the_failure(monkeypatch, tmp_path):
+    """One failing reference must not suppress caching of the ones that resolved.
+
+    A single slow ``op read`` out of N suppressed the cache write for all of them, so
+    every process start paid a full serial pull. The resolved values must be reused and
+    only the failed reference re-read — and reuse must not extend their TTL, or a
+    perpetually flaky reference would keep carried-over values alive forever.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"GOOD": "op://V/good/F", "FLAKY": "op://V/flaky/F"}
+    reads: list[str] = []
+    flaky_fails = {"on": True}
+
+    def fake_run(argv, *a, **k):
+        name = "FLAKY" if "flaky" in argv[-1] else "GOOD"
+        reads.append(name)
+        if name == "FLAKY" and flaky_fails["on"]:
+            return _err(1, "op: context deadline exceeded")
+        return _ok(f"value-{name}")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+
+    first, warnings = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert first == {"GOOD": "value-GOOD"}
+    assert any("flaky" in w for w in warnings)
+    assert sorted(reads) == ["FLAKY", "GOOD"]
+    first_stamp = _entry(tmp_path, refs).fetched_at
+
+    reads.clear()
+    op._CACHE.clear()  # force the on-disk path
+    time.sleep(0.01)
+    second, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert reads == ["FLAKY"], "references that already resolved must not be re-read"
+    assert second == {"GOOD": "value-GOOD"}
+    assert _entry(tmp_path, refs).fetched_at == first_stamp, "reuse must not renew the TTL"
+
+    # Once the flaky reference recovers, the entry completes.
+    flaky_fails["on"] = False
+    op._CACHE.clear()
+    third, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert third == {"GOOD": "value-GOOD", "FLAKY": "value-FLAKY"}
+
+
+def test_auth_failure_never_leaves_values_in_the_cache(monkeypatch, tmp_path):
+    """A rejected credential must invalidate the pull, even mixed with a timeout.
+
+    Caching the subset that resolved is safe for a slow backend, never for an identity
+    the backend refused — and the verdict must come from every failure, not whichever
+    one happened to be read first.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"SLOW": "op://V/slow/F", "DENIED": "op://V/denied/F", "GOOD": "op://V/good/F"}
+
+    def fake_run(argv, *a, **k):
+        ref = argv[-1]
+        if "slow" in ref:
+            return _err(1, "op: context deadline exceeded")
+        if "denied" in ref:
+            return _err(1, "[ERROR] 2026/09/20 18:58:28 account is not signed in")
+        return _ok("value-GOOD")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
+    )
+    assert secrets == {"GOOD": "value-GOOD"}  # still returned to this caller
+    assert _entry(tmp_path, refs) is None, "an auth failure must not persist any value"
