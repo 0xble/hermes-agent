@@ -44,10 +44,19 @@ fenced code (including an unfinished fence in a streaming draft), and display
 math stay untouched. The escape runs first in `_rich_message_payload`, before
 currency protection and linebreak normalization, and is idempotent.
 
+Telegram only renders HTTP(S) and `tg://` link targets as clickable text. Models
+can emit Desktop-only `@session:` links or schemeless `[Title](Title)` links,
+which Telegram otherwise exposes as raw Markdown. `_degrade_unsupported_markdown_links`
+scrubs unsupported targets on both the legacy MarkdownV2 formatter and the rich
+payload builder, covering send, finalized edit, and draft. It preserves
+supported links, literal code/fenced-code/table regions, and explicitly
+bracketed numeric citation markers such as `[[3](https://example.com)]`.
+Ordinary numeric commit or PR links are not converted into citation markers.
+
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
-  `telegram-rich-currency`, `telegram-literal-hash`.
+  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
@@ -82,6 +91,13 @@ head `9bcf0ff987a680731e48167a064af0995dd099d3`, open when adopted on 2026-09-20
 same helper as HERMES-127 (archived commit `6a2dfadcc70d`). The fork adds one
 regression for `always`-mode prose opening with a PR number, which upstream
 cannot express without an `always` mode.
+
+Telegram unsupported link targets: adopted from the archived fork's HERMES-065
+implementation (commits `8c4f3b73129d` and `326aed0f3d21`, scoped citation brackets)
+and its focused regressions. The behavior corresponds to upstream issue #97497 and
+open PRs #97514/#97535, neither released as of 2026-09-20. The fork intentionally
+keeps session-link producer behavior unchanged because this change owns only the
+Telegram delivery boundary.
 
 Fork adaptation retains release `v2026.9.14` and its existing client-risk guards.
 It does not import newer upstream approval-header or CJK opt-in changes. On every

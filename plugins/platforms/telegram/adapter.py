@@ -469,6 +469,106 @@ def _rich_normalize_linebreaks(text: str) -> str:
     return ''.join(out)
 
 
+# Link-target shaping for both delivery paths. Telegram renders only http(s):// and tg:// targets as
+# clickable; anything else (a bare title, an ``@session:`` reference) shows raw ``[label](target)``
+# syntax to the user (#97497). Code spans/blocks and pipe tables are left verbatim.
+_MD_LINK_RE = re.compile(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)')
+# Grounded citations deliberately carry an *extra* authored bracket pair:
+# ``[[1](https://source)]``. That syntax, not a numeric link label by itself,
+# identifies a citation marker at the Telegram presentation boundary.
+_EXPLICIT_NUMERIC_CITATION_RE = re.compile(r'\[\[(\d+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)\]')
+_SUPPORTED_LINK_TARGET_RE = re.compile(r'(?i)^(?:https?://|tg://)\S+$')
+# Regions where link syntax is literal content: inline code spans (any backtick run, multi-line included),
+# every rich structural region, and indented code blocks.
+_INLINE_CODE_SPAN_RE = re.compile(r'(?<!`)(?P<inline_code_ticks>`+)(?!`)[\s\S]+?(?<!`)(?P=inline_code_ticks)(?!`)')
+_LINK_SCRUB_PROTECT_RE = re.compile(
+    _INLINE_CODE_SPAN_RE.pattern
+    + r'|'
+    + _RICH_PARAGRAPH_PROTECTED_REGION_RE.pattern
+    + r'|(?:^(?: {4}|\t)[^\n]*(?:\n(?: {4}|\t)[^\n]*)*)',
+    re.MULTILINE)
+
+
+def _tg_link_target_supported(target: str) -> bool:
+    """True if Telegram can render *target* as a clickable link target."""
+    return bool(_SUPPORTED_LINK_TARGET_RE.match(target.strip()))
+
+
+def _markdown_link_target(destination: str) -> str:
+    """Separate an optional CommonMark title from the actual URL.
+
+    Keep bare targets byte-for-byte for the existing escaping path. Parse the
+    whole destination before accepting title syntax, so arbitrary whitespace
+    or trailing text cannot turn an invalid target into a clickable prefix.
+    """
+    if not any(char.isspace() for char in destination) and not destination.startswith('<'):
+        return destination
+    from markdown_it.helpers import parseLinkDestination, parseLinkTitle
+
+    source = destination.strip()
+    parsed = parseLinkDestination(source, 0, len(source))
+    if not parsed.ok:
+        return ''
+    remainder = source[parsed.pos:]
+    if remainder:
+        if not remainder[0].isspace():
+            return ''
+        title = remainder.lstrip()
+        parsed_title = parseLinkTitle(title, 0, len(title))
+        if not parsed_title.ok or title[parsed_title.pos:].strip():
+            return ''
+    return parsed.str
+
+
+def _degrade_unsupported_markdown_links(text: str, *, preserve_citation_brackets: bool = True) -> str:
+    """Degrade markdown links Telegram cannot render to their display text.
+
+    Models sometimes emit ``[Title](Title)`` or ``[Title](@session:p/id)`` when referencing
+    session-search results; Telegram then shows the raw bracket-and-parenthesis syntax instead of
+    readable prose (#97497). HTTP(S)/tg:// targets stay clickable; every other target degrades to
+    the label text. Code spans/blocks and table blocks are left verbatim. Explicit numeric citation
+    brackets are preserved when requested for rich delivery, while the legacy formatter handles them
+    natively.
+    """
+    if '[' not in text:
+        return text
+
+    def _degrade(m):
+        display, target = m.group(1), _markdown_link_target(m.group(2))
+        if not _tg_link_target_supported(target):
+            return display
+        return m.group(0)
+
+    def _degrade_segment(segment: str) -> str:
+        # Stash explicit numeric citations so the outer link matcher does not
+        # consume their inner numeric link after citation handling.
+        citations: list[str] = []
+
+        def stash_citation(m):
+            display, target = m.group(1), _markdown_link_target(m.group(2))
+            if not _tg_link_target_supported(target):
+                return display
+            if not preserve_citation_brackets:
+                return m.group(0)
+            citations.append(f'[\\[{display}\\]]({target})')
+            return f'\x00HERMES_CITATION_{len(citations) - 1}\x00'
+
+        segment = _EXPLICIT_NUMERIC_CITATION_RE.sub(stash_citation, segment)
+        result = _MD_LINK_RE.sub(_degrade, segment)
+        for index, citation in enumerate(citations):
+            result = result.replace(f'\x00HERMES_CITATION_{index}\x00', citation)
+        return result
+
+    out: list[str] = []
+    pos = 0
+    for m in _LINK_SCRUB_PROTECT_RE.finditer(text):
+        out.append(_degrade_segment(text[pos : m.start()]))
+        out.append(m.group(0))  # protected region kept verbatim
+        pos = m.end()
+    out.append(_degrade_segment(text[pos:]))
+    return ''.join(out)
+
+
 # Internal safety bounds (not user knobs): no reconnect/teardown path may hang on a dead CLOSE-WAIT
 # socket PTB's polling task is blocked on in epoll.
 _UPDATER_STOP_TIMEOUT = 15.0  # `await updater.stop()`, applied identically at every site
@@ -1511,7 +1611,11 @@ class TelegramAdapter(BasePlatformAdapter):
         from .rich_markdown import escape_literal_hash_prefixes
 
         payload: Dict[str, Any] = {
-            "markdown": _rich_normalize_linebreaks(_protect_rich_currency(escape_literal_hash_prefixes(content)))
+            "markdown": _rich_normalize_linebreaks(
+                _protect_rich_currency(
+                    escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content))
+                )
+            )
         }
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
@@ -5553,7 +5657,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 0) GFM pipe tables → Telegram-friendly row groups, before the MarkdownV2 conversions.
         text = _wrap_markdown_tables(content)
-        # 1) Protect fenced code blocks; per MarkdownV2 spec \ and ` inside pre/code must be escaped.
+        # 1) Protect fenced code blocks; per MarkdownV2 spec \\ and ` inside pre/code must be escaped.
         def _protect_fenced(m):
             raw = m.group(0)
             open_end = raw.index('\n') + 1 if '\n' in raw[3:] else 3  # opening ``` (+ optional language)
@@ -5564,11 +5668,22 @@ class TelegramAdapter(BasePlatformAdapter):
         # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
         text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
-        def _convert_link(m):
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
-            return _ph(f'[{_escape_mdv2(m.group(1))}]({url})')
+        text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
 
-        text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
+        def _convert_citation(m):
+            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[\\[{_escape_mdv2(m.group(1))}\\]]({url})')
+
+        text = _EXPLICIT_NUMERIC_CITATION_RE.sub(_convert_citation, text)
+
+        def _convert_link(m):
+            display = _escape_mdv2(m.group(1))
+            if not _tg_link_target_supported(m.group(2)):
+                return _ph(display)
+            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[{display}]({url})')
+
+        text = _MD_LINK_RE.sub(_convert_link, text)
         # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
         def _convert_header(m):
             inner = re.sub(r'\*\*(.+?)\*\*', r'\1', m.group(1).strip())
