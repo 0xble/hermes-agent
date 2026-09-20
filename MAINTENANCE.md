@@ -29,11 +29,25 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Telegram rendering | Preserve rich mode selection and prompt/delivery agreement | Telegram rendering changes and every upstream sync; also load runtime ownership before promotion | [Telegram rendering](maintenance/telegram-rendering.md) |
 | Telegram topic titles and icons | Preserve configurable title generation, semantic Bot API topic icons, and duplicate visible labels via lineage aliases | Topic title/icon changes and every upstream sync touching title, Telegram, or session state | [Telegram topic titles and icons](maintenance/telegram-topics.md) |
 | Cron fallback routing | Keep scheduled agents' backup chain independent of interactive routing | Changing cron/provider resolution or evaluating an upstream release | [Cron fallback routing](maintenance/cron-fallback-routing.md) |
+| Telegram delivery | Preserve flood coherence, split-send recovery, and legacy emphasis | Telegram send/edit/typing, delivery ledger, or emphasis changes | [Telegram delivery](maintenance/telegram-delivery.md) |
+| Gateway commands while busy | Preserve alias expansion and defer-until-idle on the busy path | Busy-session guards, `quick_commands`, or slash-command admission changes | [Gateway commands](maintenance/gateway-commands.md) |
+| Camofox accounts and vault | Preserve named accounts, Connect/secret-safe fills, shadow-DOM login forms | Browser account, vault, or 1Password backend changes | [Camofox and vault](maintenance/camofox-vault.md) |
+| Candidate extensions and skills | Keep the personal plugins registering through discovery and skill ownership enforced | Extension, installer, skill guard, or curation changes | [Candidate extensions](maintenance/candidate-extensions.md) |
+| Backup, state, and tooling | Truthful backups, schema rehearsal, per-job timezone, fork maintenance scripts | Backup, cron scheduling, context ports, or maintenance script changes | [Backup and tooling](maintenance/backup-and-tooling.md) |
 
 ## Update
 
-Every run loads [fork patch provenance](maintenance/fork-patches.md). Its separate
-responsibility is retained divergence, source attribution, and patch retirement.
+Each maintenance unit owns its patches' provenance, proof surface, and retirement
+condition; there is no central ledger. Every commit after the trailer floor recorded in
+`scripts/check_fork_patches.py` carries one `Fork-Patch: <identity>; ...` trailer per
+identity. A unit owns an identity by naming it as a backticked token on an identity line
+(a line, or its indented continuation, that says "identity" or "identities" before the
+first backtick); other code spans do not own. Commits whose identity is `evidence` are
+records, not patches. This contract's own patch identity: `maintenance-contract`. A sync
+rebase rewrites the floor SHA; the checker requires the floor to be an ancestor of HEAD,
+locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
+A trailer proves classification, not functional coverage. Retire a patch only after its
+regression passes on the selected upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing
 installation, update/rollback tooling, scheduled procedures, or recovery evidence.
 These are support files for this contract, not independently scheduled targets.
@@ -49,13 +63,13 @@ currency. Preserve this release policy when applying generic maintenance guidanc
 
 ## Verify
 
-- Run `scripts/run_tests.sh` for every affected patch's proof surface in the
-  provenance register, including plugin discovery when extension code changes.
+- Run `scripts/run_tests.sh` for every affected patch's proof surface in its
+  maintenance unit, including plugin discovery when extension code changes.
 - If media or browser fixtures fail on this host, check for synthetic `198.18.0.0/15`
   DNS answers before attributing a regression. Preserve the SSRF guard; verify
   the environment cause instead of blanket-skipping failures.
 - Run `scripts/check_fork_patches.py` against the intended source/profile pair.
-  Its commit classification and registration checks do not establish runtime
+  Its trailer, unit-ownership, and registration checks do not establish runtime
   acceptance; verify native update receipts and running identities as well.
 - Prove selected-tag ancestry, review the remaining fork diff, and read back the
   published `origin/main` SHA. Record a failed stage instead of reporting current.

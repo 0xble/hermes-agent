@@ -32,7 +32,7 @@ when changing a procedure. A Git update alone does not refresh these copies.
 | Job | Canonical procedure | Invocation contract and verification |
 |---|---|---|
 | `sync-fork-candidate` | `scripts/sync_fork_candidate.py` | Host wrapper supplies `--repo`, `--candidate`, and `--current-base`. Use a dedicated sync worktree. Inspect rebased SHA and tests; `--publish` publishes only a candidate. |
-| `check-fork-patches` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect classification and registration results plus actual runtime evidence. |
+| `check-fork-patches` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect trailer, unit-ownership, and registration results plus actual runtime evidence. |
 | `curate-skill-observations` | `scripts/curate_skill_observations.py` | Host wrapper supplies a dedicated `--dotfiles` worktree. Without `--publish`, it validates then restores staging. That is not a published curation change. |
 | `snapshot-profile-state` | `candidate-profile/snapshot_profile_state.sh` | Verify the output manifest and isolated restoration. This small-state procedure does not establish a full `state.db` backup. |
 
