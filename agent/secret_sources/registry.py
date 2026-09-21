@@ -443,7 +443,11 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     # must not hide a bot token that a retry would have fetched.
     _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = any(
         (r.error_kind in _TRANSIENT_ERROR_KINDS) if not r.ok
-        else bool(_TRANSIENT_ERROR_KINDS & r.degraded_kinds)
+        # .intersection(... or ()) rather than `&`: degraded_kinds is part of the public
+        # secret-source API, so a third-party source may hand back a list or None, and `&`
+        # would raise TypeError there. apply_all does not catch it and the env_loader
+        # callers swallow it by returning {}, which would silently drop every secret.
+        else bool(_TRANSIENT_ERROR_KINDS.intersection(r.degraded_kinds or ()))
         for _, _, r in fetches
     )
 

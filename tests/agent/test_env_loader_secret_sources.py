@@ -778,3 +778,31 @@ def test_home_scoped_reset_preserves_sibling_snapshot(tmp_path, monkeypatch, _fr
     assert env_loader.get_secret_source_values(home) == {}
     assert env_loader.get_secret_source_values(sibling) == {"GLM_API_KEY": "vault-b"}
     assert str(sibling.resolve()) in env_loader._APPLIED_HOMES
+
+
+def test_a_source_returning_a_non_set_degraded_kinds_cannot_drop_every_secret(tmp_path):
+    """degraded_kinds is public API, so a third-party source may hand back a list or None.
+
+    `&` raises TypeError on those, apply_all does not catch it, and the env_loader callers
+    swallow the exception by returning {} — silently dropping every secret for that home.
+    """
+    from agent.secret_sources import registry
+    from agent.secret_sources.base import ErrorKind, FetchResult, SecretSource
+
+    class _Sloppy(SecretSource):
+        name, label, shape = "sloppy", "Sloppy", "mapped"
+
+        def fetch(self, cfg, home_path):
+            result = FetchResult(secrets={"KEPT": "value"})
+            result.degraded_kinds = [ErrorKind.TIMEOUT]  # a list, not a frozenset
+            return result
+
+    registry._reset_registry_for_tests()
+    registry.register_source(_Sloppy())
+    env: dict = {}
+    report = registry.apply_all({"sloppy": {"enabled": True}}, tmp_path, environ=env)
+
+    assert env.get("KEPT") == "value", "a sloppy source must not cost us every secret"
+    assert report.applied_any
+    assert registry.last_apply_had_transient_failure(tmp_path) is True
+    registry._reset_registry_for_tests()
