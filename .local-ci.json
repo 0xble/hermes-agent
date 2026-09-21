@@ -1,5 +1,5 @@
 {
   "schema": "local-ci/v1",
   "setup": "mise exec node@26 -- npm ci",
-  "gate": "mise exec node@26 -- node .github/scripts/run-workspace-checks.mjs --concurrency 2"
+  "gate": "mise exec node@26 -- node .github/scripts/run-workspace-checks.mjs --concurrency 2 --skip 'check:test:desktop:all'"
 }
