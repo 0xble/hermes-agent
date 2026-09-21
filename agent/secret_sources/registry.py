@@ -36,6 +36,31 @@ _SCOPED_SOURCES: Dict[str, Dict[str, SecretSource]] = {}
 _BUILTINS_LOADED = False
 _REGISTRY_LOCK = threading.RLock()
 
+# Failure kinds a later attempt can plausibly resolve. The taxonomy in ``base`` already
+# singles these two out ("stale-cache fallback on NETWORK/TIMEOUT, never AUTH_FAILED");
+# the rest (NOT_CONFIGURED, BINARY_MISSING, AUTH_FAILED, REF_INVALID, ...) describe a
+# genuine configuration fault that restarting will not repair.
+_TRANSIENT_ERROR_KINDS = frozenset({ErrorKind.NETWORK, ErrorKind.TIMEOUT})
+
+# Homes whose most recent apply_all() lost secrets to a retryable condition. Keyed by
+# home, NOT a bare flag: a multiplexing gateway hydrates each secondary profile through
+# apply_all() during startup, so a single global would be overwritten by whichever
+# profile happened to hydrate last and answer for a home it knows nothing about.
+_TRANSIENT_FAILURE_HOMES: Dict[str, bool] = {}
+
+
+def last_apply_had_transient_failure(home_path: Optional[Path] = None) -> bool:
+    """True when the most recent :func:`apply_all` FOR THIS HOME had an enabled source
+    fail for a reason a retry could fix (backend slow or unreachable), so its secrets are
+    missing from the environment through no fault of the user's configuration.
+
+    Callers that would otherwise treat an absent credential as a permanent configuration
+    fault must consult this first: a blown fetch budget drops the whole source, and a
+    per-entry timeout drops one value, both indistinguishable downstream from a
+    credential the user never set.
+    """
+    return _TRANSIENT_FAILURE_HOMES.get(hermes_home_key(home_path), False)
+
 # (module, class, label) for the bundled sources, in registration order.
 _BUILTIN_SOURCES = (
     ("agent.secret_sources.bitwarden", "BitwardenSource", "Bitwarden"),
@@ -205,6 +230,7 @@ def _ensure_builtin_sources() -> None:
 
 def _reset_registry_for_tests() -> None:
     global _BUILTINS_LOADED
+    _TRANSIENT_FAILURE_HOMES.clear()
     with _REGISTRY_LOCK:
         _SOURCES.clear()
         _SOURCE_ORIGINS.clear()
@@ -388,6 +414,7 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     secrets_cfg = secrets_cfg if isinstance(secrets_cfg, dict) else {}
     enabled = _ordered_enabled_sources(secrets_cfg, scope=hermes_home_key(home_path))
     if not enabled:
+        _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = False
         return report
 
     preserve_raw = secrets_cfg.get("preserve_existing")
@@ -409,6 +436,20 @@ def apply_all(secrets_cfg: dict, home_path: Path,
                 protected.setdefault(var, source.name)
         except Exception:  # noqa: BLE001
             pass
+
+    # A whole-source failure AND a per-entry failure both cost us secrets; only the first
+    # sets error_kind, so consult degraded_kinds too or a single slow reference is missed.
+    # ANY transient failure counts: one unrelated non-transient failure in the same run
+    # must not hide a bot token that a retry would have fetched.
+    _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = any(
+        (r.error_kind in _TRANSIENT_ERROR_KINDS) if not r.ok
+        # .intersection(... or ()) rather than `&`: degraded_kinds is part of the public
+        # secret-source API, so a third-party source may hand back a list or None, and `&`
+        # would raise TypeError there. apply_all does not catch it and the env_loader
+        # callers swallow it by returning {}, which would silently drop every secret.
+        else bool(_TRANSIENT_ERROR_KINDS.intersection(r.degraded_kinds or ()))
+        for _, _, r in fetches
+    )
 
     # An alias never shadows a var some source supplies by its real name.
     supplied_directly = {v for _, _, r in fetches if r.ok for v in r.secrets if isinstance(v, str)}
