@@ -49,6 +49,13 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 
 ## Verification
 
+Published commit `e5d121dfd63d` omitted its trailer during squash merge. Its
+desktop fixture portability fix and local CI declaration are owned by
+`maintenance-tooling`. This exact stable patch ID backfills only that content,
+including after a release rebase. It does not advance the trailer floor.
+
+Fork-Patch-Backfill: f0a3bb8be8b611d30a990bb83db46aeaed37c39a; maintenance-tooling
+
 `scripts/run_tests.sh` on `tests/hermes_cli/test_backup.py`,
 `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`,
 `tests/scripts/test_fork_patch_trailers.py`, `tests/cron/test_per_job_timezone.py`,
@@ -56,6 +63,16 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 `tests/cron/test_contention_skip_observability.py`, `tests/agent/test_model_metadata.py`,
 and `tests/agent/test_context_compressor.py`. Exercise rollback failure recovery and the
 native update receipt check before promotion.
+
+Source sync refreshes fork `main`, selects release tags from upstream only, proves
+release ancestry, and runs the canonical isolated runner over maintained proof
+surfaces before candidate publication. Source-only ownership verification keeps
+unpromoted candidate checks separate from installed update receipts.
+`tests/scripts/test_sync_fork_candidate.py` exercises local Git remotes, stale refs,
+new releases, candidate-only publication, failure refusal, and worktree recovery.
+`tests/plugins/test_candidate_extensions_install.py` verifies maintenance entry
+points follow promoted code without changing config. These repairs belong to the
+existing `maintenance-tooling` identity and remain local fork automation.
 
 ## Retirement and rollback
 

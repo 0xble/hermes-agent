@@ -67,6 +67,25 @@ def test_trailer_identity_without_a_unit_owner_fails(tmp_path, monkeypatch):
     assert "orphan-slice" in failures[0] and "not owned" in failures[0]
 
 
+def test_published_backfill_covers_only_the_reviewed_patch_content(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "fix").write_text("reviewed content")
+    git("add", "fix")
+    git("commit", "-qm", "published without trailer")
+    patch_id = subprocess.run(["git", "patch-id", "--stable"],
+                              input=git("show", "--pretty=format:", "HEAD"), text=True,
+                              capture_output=True, check=True).stdout.split()[0]
+    _units(tmp_path, "fixture", prose=f"Fork-Patch-Backfill: {patch_id}; fixture\n")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_trailers(base) == []
+    (tmp_path / "fix").write_text("different content")
+    git("add", "fix")
+    git("commit", "-qm", "unreviewed without trailer")
+    failures = checker.check_trailers(base)
+    assert len(failures) == 1 and "unreviewed without trailer" in failures[0]
+
+
 def test_every_trailer_on_a_multi_trailer_commit_is_checked(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     base = git("rev-parse", "HEAD")

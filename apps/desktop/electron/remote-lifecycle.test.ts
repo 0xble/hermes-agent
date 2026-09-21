@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -580,11 +580,11 @@ test.skipIf(process.platform === 'win32')(
     const pythonLink = path.join(venvBin, 'python')
     const entrypoint = path.join(installDir, 'hermes')
     const launcher = path.join(temp, 'hermes launcher')
-    const python = (await exec('command -v python3')).stdout.trim()
     const tokenPath = path.join(os.homedir(), spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE).replace(/^~\//, ''))
 
-    await mkdir(venvBin, { recursive: true })
-    await symlink(python, pythonLink)
+    // A bare link to a copied venv interpreter loses its standard-library prefix.
+    // Build the minimal real venv metadata that an installed launcher relies on.
+    await promisify(execFileCallback)('python3', ['-m', 'venv', '--without-pip', path.join(installDir, 'venv')])
     await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
     await writeFile(launcher, `#!/bin/bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)

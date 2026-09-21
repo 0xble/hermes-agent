@@ -89,22 +89,22 @@ describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
 
   it("settles immediately on 'exit' when resolveOnExit is true, regardless of daemon stdio", async () => {
     const pidFile = join(scriptDir, 'sleeper-exit.pid')
-    const start = Date.now()
+    const heldPipeScript = join(scriptDir, 'held-pipe.sh')
+    writeFileSync(heldPipeScript, '#!/bin/sh\nsleep 30 &\necho $! > "$1"\nexit 0\n')
+    chmodSync(heldPipeScript, 0o755)
 
-    const result = await execFileNoThrow(daemonScript, [pidFile], {
-      timeout: 2000,
+    const result = await execFileNoThrow(heldPipeScript, [pidFile], {
+      timeout: 4000,
       resolveOnExit: true
     })
 
     trackSleeperPid(pidFile)
 
-    const elapsed = Date.now() - start
-
-    // The shell exits in a few ms. resolveOnExit lets us return on exit
-    // (code 0) instead of waiting for the orphaned sleeper to release
-    // stdio. Should be well under 200ms even on slow CI.
+    // Success while the pipe-holding child is still alive proves exit-based
+    // completion without assuming that process startup takes under 500 ms.
     expect(result.code).toBe(0)
-    expect(elapsed).toBeLessThan(500)
+    expect(sleeperPids).toHaveLength(1)
+    expect(() => process.kill(sleeperPids[0], 0)).not.toThrow()
   })
 
   it("still surfaces the right code when resolveOnExit'd child exits non-zero", async () => {
