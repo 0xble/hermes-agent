@@ -385,3 +385,57 @@ def test_auth_failure_never_leaves_values_in_the_cache(monkeypatch, tmp_path):
     )
     assert secrets == {"GOOD": "value-GOOD"}  # still returned to this caller
     assert _entry(tmp_path, refs) is None, "an auth failure must not persist any value"
+
+
+def test_per_reference_timeout_is_visible_to_the_orchestrator(monkeypatch, tmp_path):
+    """A reference lost to a slow read must not look like one the user never configured.
+
+    Per-reference failures are warnings, not a source error, so ``ok`` stays True and the
+    resolved values still apply. Without a separate signal the orchestrator cannot tell
+    that a value is missing for a reason a retry would fix.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    fake_op.chmod(0o755)  # a pinned binary_path must be executable to resolve
+
+    def fake_run(argv, *a, **k):
+        if "slow" in argv[-1]:
+            return _err(1, "op: request timed out")
+        return _ok("value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+    src = op.OnePasswordSource()
+    result = src.fetch(
+        {"enabled": True, "cache_ttl_seconds": 0, "binary_path": str(fake_op),
+         "env": {"GOOD": "op://V/good/F", "SLOW": "op://V/slow/F"}},
+        tmp_path,
+    )
+
+    assert result.ok, "the references that resolved must still be applied"
+    assert "GOOD" in result.secrets and "SLOW" not in result.secrets
+    assert result.degraded_kind is op.ErrorKind.TIMEOUT
+
+
+def test_degraded_kind_reports_the_worst_failure_not_the_first(monkeypatch, tmp_path):
+    """A refused credential alongside a timeout is an auth problem, not a transient one."""
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    fake_op.chmod(0o755)
+
+    def fake_run(argv, *a, **k):
+        ref = argv[-1]
+        if "aslow" in ref:
+            return _err(1, "op: request timed out")
+        return _err(1, "[ERROR] account is not signed in")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+    src = op.OnePasswordSource()
+    result = src.fetch(
+        {"enabled": True, "cache_ttl_seconds": 0, "binary_path": str(fake_op),
+         "env": {"ASLOW": "op://V/aslow/F", "ZDENIED": "op://V/zdenied/F"}},
+        tmp_path,
+    )
+
+    assert result.degraded_kind is op.ErrorKind.AUTH_FAILED

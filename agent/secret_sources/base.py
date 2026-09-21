@@ -111,6 +111,11 @@ class FetchResult:
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
     error_kind: Optional[ErrorKind] = None
+    #: Set when the source returned USABLE results but some individual entries failed.
+    #: ``error``/``error_kind`` stay None so the resolved values are still applied, which
+    #: means a per-entry failure is otherwise invisible to the orchestrator. Carries the
+    #: worst kind across those failures, never the first one seen.
+    degraded_kind: Optional[ErrorKind] = None
     # Helper binary used (CLI-driven sources); surfaced by status commands.
     binary_path: Optional[Path] = None
 

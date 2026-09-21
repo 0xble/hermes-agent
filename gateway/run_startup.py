@@ -1190,9 +1190,22 @@ class GatewayStartupMixin:
                 )
         return connected_count
 
+    @staticmethod
+    def _is_missing_credential_code(code: str) -> bool:
+        """Does this fatal code mean "the credential never arrived"?
+
+        Matched as a FAMILY, like :func:`is_global_startup_conflict`. Adapters spell it
+        differently — ``missing_credentials``, ``MISSING_CREDENTIALS``, and per-platform
+        prefixes such as ``yuanbao_missing_credentials`` — so an exact literal would cover
+        only two of them and would silently drop coverage the moment a second platform
+        with a different spelling was enabled alongside.
+        """
+        lowered = (code or "").lower()
+        return "missing_credential" in lowered or "missing_bot_token" in lowered
+
     def _missing_credentials_blamed_on_secrets(self) -> bool:
-        """True when every non-retryable startup failure is an absent credential AND the
-        last secret-source apply lost a source to a slow or unreachable backend.
+        """True when every non-retryable startup failure is an absent credential AND this
+        home's last secret-source apply lost secrets to a slow or unreachable backend.
 
         Both halves are required. An ownership conflict (a live foreign token holder, a
         polling lock) is a real single-writer conflict that restarting cannot resolve, so
@@ -1200,12 +1213,15 @@ class GatewayStartupMixin:
         that conflation is what sank the previous attempt at this fix upstream.
         """
         codes = getattr(self, "_startup_nonretryable_codes", set())
-        if not codes or any(code != "missing_credentials" for code in codes):
+        if not codes or not all(self._is_missing_credential_code(c) for c in codes):
             return False
         try:
             from agent.secret_sources.registry import last_apply_had_transient_failure
+            from hermes_cli.config import get_hermes_home
 
-            return last_apply_had_transient_failure()
+            # This gateway's OWN home: secondary-profile hydration runs between the connect
+            # results and this decision, and answers only for the home it hydrated.
+            return last_apply_had_transient_failure(get_hermes_home())
         except Exception:  # noqa: BLE001 — never let this probe block the exit path
             return False
 

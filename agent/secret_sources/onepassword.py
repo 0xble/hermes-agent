@@ -80,10 +80,30 @@ def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
 
 
-# Rejected or lapsed credentials must never leave values in the cache: the identity that
-# resolved them is no longer trusted. Slow or unreachable backends are a different class
-# and do not invalidate anything (see the ErrorKind docstring in ``base``).
+# A rejected or lapsed credential must not EXTEND the cache: the identity that resolved
+# those values is no longer trusted, so the entry is left to age out on its existing TTL
+# rather than being rewritten. Values already inside a fresh entry are still served for
+# the remainder of that TTL, exactly as a plain cache hit would serve them — narrowing
+# that window is a TTL decision, not this function's. Slow or unreachable backends are a
+# different class and invalidate nothing (see the ErrorKind docstring in ``base``).
 _AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
+
+
+#: Worst-first. A run that mixes a refused credential with a slow one is an auth problem,
+#: never a transient one, so auth outranks everything a retry could fix.
+_ERROR_KIND_SEVERITY = (
+    ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED, ErrorKind.REF_INVALID,
+    ErrorKind.BINARY_MISSING, ErrorKind.EMPTY_VALUE, ErrorKind.TIMEOUT, ErrorKind.NETWORK,
+)
+
+
+def _worst_error_kind(messages: List[str]) -> Optional[ErrorKind]:
+    """Worst kind across every failure message, never merely the first one seen."""
+    kinds = {_classify_op_error(m) for m in messages}
+    for kind in _ERROR_KIND_SEVERITY:
+        if kind in kinds:
+            return kind
+    return ErrorKind.INTERNAL if kinds else None
 
 
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
@@ -350,6 +370,12 @@ class OnePasswordSource(SecretSource):
 
         result.secrets = secrets
         result.warnings.extend(fetch_warnings)
+        # Per-reference failures are warnings, not a source error, so the resolved values
+        # still apply. Surface the worst kind among them: without this a reference that
+        # timed out is indistinguishable from one the user never configured.
+        missing = [n for n in valid if n not in secrets]
+        if missing:
+            result.degraded_kind = _worst_error_kind(fetch_warnings)
         return result
 
 

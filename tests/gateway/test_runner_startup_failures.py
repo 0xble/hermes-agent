@@ -600,7 +600,7 @@ async def _run_startup(monkeypatch, tmp_path, adapter_factory, *, secrets_degrad
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(
         "agent.secret_sources.registry.last_apply_had_transient_failure",
-        lambda: secrets_degraded,
+        lambda *_a, **_k: secrets_degraded,
     )
     config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="")},
@@ -654,3 +654,51 @@ async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_fac
     )
 
     assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE, why
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("missing_credentials", True),
+        ("MISSING_CREDENTIALS", True),          # Teams, Photon
+        ("yuanbao_missing_credentials", True),  # per-platform prefix
+        ("missing_bot_token", True),
+        ("discord-bot-token_lock", False),      # ownership conflict, must stay fatal
+        ("missing_dependency", False),          # a real config fault, not a lost secret
+        ("", False),
+    ],
+)
+def test_missing_credential_codes_are_matched_as_a_family(code, expected):
+    """Adapters spell the absent-credential code differently.
+
+    An exact literal covered only two of them, and a second platform with a different
+    spelling silently removed coverage the first one would have had alone.
+    """
+    assert GatewayRunner._is_missing_credential_code(code) is expected
+
+
+@pytest.mark.asyncio
+async def test_two_platforms_missing_credentials_keep_coverage(monkeypatch, tmp_path):
+    """Differently-spelled missing-credential codes must not cancel each other out."""
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+    runner._startup_nonretryable_codes = {"missing_credentials", "MISSING_CREDENTIALS"}
+    assert runner._missing_credentials_blamed_on_secrets() is True
+
+
+def test_transient_failure_signal_is_owned_by_a_home(tmp_path):
+    """A multiplexing gateway hydrates each secondary profile through apply_all during
+    startup, so a bare global would be answered by whichever profile hydrated last."""
+    from agent.secret_sources import registry
+
+    registry._reset_registry_for_tests()
+    primary, secondary = tmp_path / "primary", tmp_path / "secondary"
+    from hermes_constants import hermes_home_key
+
+    registry._TRANSIENT_FAILURE_HOMES[hermes_home_key(primary)] = True
+    registry._TRANSIENT_FAILURE_HOMES[hermes_home_key(secondary)] = False
+
+    assert registry.last_apply_had_transient_failure(primary) is True
+    assert registry.last_apply_had_transient_failure(secondary) is False
+    registry._reset_registry_for_tests()
