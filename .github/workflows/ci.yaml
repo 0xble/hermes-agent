@@ -15,6 +15,12 @@ name: CI
 # main-only automation uses protected environments in its own workflows.
 
 on:
+  workflow_dispatch:
+    inputs:
+      full_python:
+        description: Run the complete Python suite
+        type: boolean
+        default: true
   pull_request:
   push:
     branches: [main]
@@ -62,8 +68,6 @@ jobs:
         id: classify
         uses: ./.github/actions/detect-changes
         with:
-          sparse-checkout: scripts/ci/classify_changes.py
-          sparse-checkout-cone-mode: false
           github-token: ${{ github.token }}
 
   # ─────────────────────────────────────────────────────────────────────
@@ -75,6 +79,8 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
+    with:
+      fork_scope: ${{ github.repository == '0xble/hermes-agent' && !(github.event_name == 'workflow_dispatch' && inputs.full_python) }}
 
   # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
   # the OS-marked tests it collects are skipped there by design (see the
