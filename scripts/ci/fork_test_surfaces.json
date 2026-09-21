@@ -89,6 +89,8 @@
     "tests/gateway/test_telegram_split_send_flood.py"
   ],
   "fork-ci": [
+    "tests/agent/test_codex_aux_no_progress_timeout.py",
+    "tests/agent/test_codex_aux_timeout_fd_ownership.py",
     "tests/agent/test_memory_session_switch.py",
     "tests/computer_use/test_cua_no_overlay.py",
     "tests/conformance/test_vector_generator.py",
