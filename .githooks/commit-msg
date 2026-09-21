@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Require a Fork-Patch trailer on fork commits, at the moment the message is written.
+#
+# scripts/check_fork_patches.py already enforces this, but it runs hourly from a cron. That
+# gap is not theoretical: on 2026-09-21 two patches shipped unowned an hour apart, the second
+# one landing while the first was being fixed. Sixteen more accumulated over a single day and
+# were written off by advancing the floor, because backfilling would have meant rewriting
+# published commits on a branch automation merges into.
+#
+# The checker stays the authority — it also verifies that each identity has an owning
+# maintenance unit, which needs the repository, not one message. This only closes the window
+# where a missing trailer is cheap to fix.
+#
+# Reached through ~/.config/git/hooks/commit-msg, which dispatches here after the global
+# rules. core.hooksPath is global, so this file is inert unless that dispatch exists.
+#
+# Skipped for commits the contract does not cover: merges, fixups, squashes, reverts, and
+# any message that is empty or entirely comments (an aborted commit).
+set -euo pipefail
+
+MSG_FILE="${1:?commit-msg hook requires the message file}"
+[ -f "$MSG_FILE" ] || exit 0
+
+# A merge in progress: the contract covers non-merge commits only.
+git_dir="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+[ -e "$git_dir/MERGE_HEAD" ] && exit 0
+
+# Strip comments, then check for any content at all. `git commit` aborts on an empty message
+# anyway, and rejecting one here would report the wrong reason.
+body="$(grep -v '^#' "$MSG_FILE" 2>/dev/null || true)"
+case "$(printf '%s' "$body" | tr -d '[:space:]')" in "") exit 0 ;; esac
+
+subject="$(printf '%s\n' "$body" | grep -v '^[[:space:]]*$' | head -1)"
+case "$subject" in
+  fixup!*|squash!*|amend!*) exit 0 ;;   # carries the target's trailer when it lands
+  Revert*|revert*)          exit 0 ;;   # undoes a patch rather than adding one
+  Merge\ *)                 exit 0 ;;   # merge commit written by hand
+esac
+
+# Same shape scripts/check_fork_patches.py accepts: identity first, optional "; detail".
+if printf '%s\n' "$body" | grep -qE '^Fork-Patch:[ \t]*[^;[:space:]][^;]*$|^Fork-Patch:[ \t]*[^;[:space:]][^;]*;'; then
+  exit 0
+fi
+
+cat >&2 <<'EOF'
+Commit rejected: no Fork-Patch trailer.
+
+  Every non-merge commit above the trailer floor carries one, so each patch names the
+  maintenance unit that owns it. Without it the patch is unowned, and the only remedies
+  later are rewriting published history or writing the record off.
+
+  Add a trailer line, identity first:
+
+      Fork-Patch: HERMES-123
+      Fork-Patch: telegram-rendering; narrow follow-up to the rich-mode selector
+
+  The identity must be named by MAINTENANCE.md or a maintenance/*.md unit. Use `evidence`
+  for a record that is not a runtime patch.
+
+  Not covered, and skipped automatically: merges, fixup!/squash!, and reverts.
+  To bypass deliberately: git commit --no-verify
+EOF
+exit 1
