@@ -810,7 +810,7 @@ def _run_quick_snapshots() -> Optional[str]:
 def _run_full_backup() -> None:
     """Zip HERMES_HOME under ``backups/`` (restorable via ``hermes import``). Never raises."""
     try:
-        from hermes_cli.backup import create_pre_update_backup
+        from hermes_cli.backup import BackupInProgressError, create_pre_update_backup
     except Exception as exc:
         print(f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update.")
         print()
@@ -825,6 +825,18 @@ def _run_full_backup() -> None:
     t0 = _time.monotonic()
     try:
         out_path = create_pre_update_backup(keep=int(_keep))
+    except BackupInProgressError:
+        # Not a fault, and not worth waiting out: the backup slot is a cross-process lock held
+        # for as long as a full archive takes (tens of minutes), against a 0.25s acquire timeout.
+        # Blocking the update on it would be worse than proceeding. What matters is that the
+        # user is told the update has NO rollback point, rather than reading "backup failed"
+        # and assuming a broken backup they can fix.
+        print("  ⚠ Another Hermes backup is running, so this update has no pre-update backup.")
+        print("    The update is proceeding. If it goes wrong, `hermes import` has nothing from")
+        print("    just before it — recover from the previous archive under backups/ instead.")
+        print("    To get one: wait for the running backup to finish, then update again.")
+        print()
+        return
     except Exception as exc:  # defensive — helper already swallows, but just in case
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")

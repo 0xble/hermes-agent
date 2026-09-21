@@ -380,3 +380,42 @@ def test_no_sibling_profiles_is_not_a_sibling_failure(
 
     recorded = [s for s in ur._current.data["steps"] if s["name"] == "sibling_profile_snapshots"]
     assert bool(recorded) is expect_failure_recorded
+
+
+def test_concurrent_backup_is_reported_as_a_missing_rollback_point(monkeypatch, capsys):
+    """A held backup slot is not a broken backup, and the difference is actionable.
+
+    `create_pre_update_backup` raises BackupInProgressError while another backup owns the
+    cross-process slot — a lock held for as long as a full archive takes (measured at 77 and
+    105 minutes on a real host) against a 0.25s acquire. Reporting that as "Backup failed"
+    sent the reader looking for a broken backup to repair, when the true consequence is
+    narrower and worse: the update is proceeding with no rollback point.
+    """
+    import hermes_cli.update_cmd_maint as maint
+    from hermes_cli.backup import BackupInProgressError
+
+    def _busy(**_kwargs):
+        raise BackupInProgressError("another Hermes backup is already running")
+
+    monkeypatch.setattr("hermes_cli.backup.create_pre_update_backup", _busy)
+    maint._run_full_backup()
+
+    out = capsys.readouterr().out
+    assert "no pre-update backup" in out
+    assert "hermes import" in out, "must say what recovery is actually available"
+    assert "Backup failed" not in out, "a held lock is not a failure"
+
+
+def test_a_real_backup_failure_still_reads_as_a_failure(monkeypatch, capsys):
+    """The new branch must not swallow genuine faults into the softer message."""
+    import hermes_cli.update_cmd_maint as maint
+
+    def _broken(**_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("hermes_cli.backup.create_pre_update_backup", _broken)
+    maint._run_full_backup()
+
+    out = capsys.readouterr().out
+    assert "Backup failed" in out and "disk full" in out
+    assert "no pre-update backup" not in out
