@@ -30,6 +30,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -221,7 +222,7 @@ def assess(path: Path, before: dict, after: dict, pre: dict, post: dict,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("copy", type=Path, help="a DISPOSABLE copy of state.db")
-    ap.add_argument("--scratch-home", type=Path, default=Path("/tmp/hn-schema-rehearsal-home"))
+    ap.add_argument("--scratch-home", type=Path, help="scratch profile directory (default: a unique temporary directory)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--integrity", action="store_true", help="run PRAGMA integrity_check on the copy first (slow)")
     ap.add_argument("--report", type=Path)
@@ -245,7 +246,9 @@ def main(argv: list[str] | None = None) -> int:
                         "legacy_only_tables": legacy_only,
                         "legacy_only_rows": sum(v for v in legacy_only.values() if isinstance(v, int))}
     report["probes_before"] = probes(copy)
-    report["open"] = open_with_candidate(copy, args.scratch_home, args.python)
+    scratch_home = args.scratch_home or Path(tempfile.mkdtemp(prefix="hn-schema-rehearsal-"))
+    report["scratch_home"] = str(scratch_home)
+    report["open"] = open_with_candidate(copy, scratch_home, args.python)
     after = snapshot(copy)
     report["after"] = {"size": after["size"], "schema_version": after["schema_version"], "tables": len(after["tables"])}
     report["probes_after"] = probes(copy)

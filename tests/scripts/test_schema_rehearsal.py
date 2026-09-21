@@ -94,3 +94,36 @@ def test_declared_tables_filters_relative_directories(rehearsal, tmp_path, monke
         (directory / 'hidden.py').write_text('SQL = "CREATE TABLE excluded_records(id TEXT)"')
     monkeypatch.setattr(rehearsal, 'REPO', root)
     assert rehearsal.declared_tables() == {'canonical_records'}
+
+
+def test_default_scratch_profiles_are_unique_and_use_temp_root(rehearsal, tmp_path, monkeypatch):
+    copy = tmp_path / 'copy.db'
+    copy.touch()
+    monkeypatch.setattr(rehearsal.tempfile, 'tempdir', str(tmp_path))
+    monkeypatch.setattr(rehearsal, 'snapshot', lambda _: {
+        'size': 0, 'schema_version': 31, 'tables': {},
+    })
+    monkeypatch.setattr(rehearsal, 'declared_tables', set)
+    monkeypatch.setattr(rehearsal, 'probes', lambda _: {})
+    homes = []
+
+    def open_copy(path, home, python):
+        assert path == copy and home.is_dir()
+        homes.append(home)
+        return {'opened': True, 'exit': 0}
+
+    monkeypatch.setattr(rehearsal, 'open_with_candidate', open_copy)
+    monkeypatch.setattr(rehearsal, 'assess', lambda *args: {'ok': True})
+    for _ in range(2):
+        assert rehearsal.main([str(copy)]) == 0
+    assert homes[0] != homes[1]
+    assert all(home.parent == tmp_path for home in homes)
+
+
+def test_invalid_copy_does_not_allocate_scratch_home(rehearsal, tmp_path, monkeypatch):
+    def unexpected_allocation(**kwargs):
+        pytest.fail('invalid input allocated a scratch profile')
+
+    monkeypatch.setattr(rehearsal.tempfile, 'mkdtemp', unexpected_allocation)
+    with pytest.raises(SystemExit, match='not a file'):
+        rehearsal.main([str(tmp_path / 'missing.db')])
