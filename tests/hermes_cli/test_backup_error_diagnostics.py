@@ -7,7 +7,7 @@ from argparse import Namespace
 from hermes_cli import backup
 
 
-def test_full_backup_logs_every_missing_entry_and_preserves_last_good(
+def test_full_backup_logs_every_unreadable_entry_and_preserves_last_good(
     tmp_path, monkeypatch, caplog, capsys,
 ):
     home = tmp_path / "home"
@@ -21,8 +21,15 @@ def test_full_backup_logs_every_missing_entry_and_preserves_last_good(
 
     def walk(*args):
         yield from entries
-        for path in missing:
-            path.unlink()
+
+    write = zipfile.ZipFile.write
+
+    def denied_write(archive, filename, *args, **kwargs):
+        if filename in missing:
+            raise PermissionError(f"cannot read {filename}")
+        return write(archive, filename, *args, **kwargs)
+
+    monkeypatch.setattr(zipfile.ZipFile, "write", denied_write)
 
     monkeypatch.setattr(backup, "_iter_backup_files", walk)
     monkeypatch.setattr(backup, "_collect_external_entries", lambda: ([], []))

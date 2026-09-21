@@ -17,6 +17,7 @@ import pytest
 
 from tools.computer_use import cua_backend
 from tools.computer_use import cua_backend_driver
+from tools.computer_use import cua_backend_daemon
 
 
 class TestNoOverlayFlag:
@@ -227,7 +228,8 @@ class TestMcpArgsOverlayFlag:
 
 
 class TestEmbeddedDaemonOverlayFlag:
-    def test_serve_process_disables_overlay_when_policy_requires_it(self):
+    @staticmethod
+    def _spawn_overlay_daemon():
         daemon = cua_backend._EmbeddedCuaDaemon("/usr/bin/cua-driver", "unrestricted")
         process = MagicMock()
         process.poll.return_value = None
@@ -245,9 +247,22 @@ class TestEmbeddedDaemonOverlayFlag:
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,
-        ), patch.object(cua_backend.threading, "Thread"):
+        ), patch.object(cua_backend.threading, "Thread"), patch.object(
+            cua_backend_daemon, "_resolve_cua_driver_app_path", return_value="/Applications/CuaDriver.app",
+        ), patch.object(cua_backend_daemon, "_validate_cua_driver_app_signature"):
             daemon.start()
 
-        command = popen.call_args.args[0]
+        return popen.call_args.args[0]
+
+    @pytest.mark.linux_only
+    def test_serve_process_disables_overlay_when_policy_requires_it(self):
+        command = self._spawn_overlay_daemon()
         assert command[:2] == ["/usr/bin/cua-driver", "serve"]
+        assert "--no-overlay" in command
+
+    @pytest.mark.macos_only
+    def test_app_launch_preserves_overlay_policy(self):
+        command = self._spawn_overlay_daemon()
+        assert command[:6] == ["/usr/bin/open", "-n", "-g", "-a", "/Applications/CuaDriver.app", "--args"]
+        assert command[6] == "serve"
         assert "--no-overlay" in command

@@ -2,6 +2,11 @@ name: Tests
 
 on:
   workflow_call:
+    inputs:
+      fork_scope:
+        description: Select maintained fork surfaces, failing open on unclassified changes
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,10 +30,14 @@ jobs:
     # cost experiment, can select a different size without editing this file.
     # Keep vars.HERMES_TEST_WORKERS matched to the runner's core count.
     runs-on: ${{ vars.HERMES_RUNNER_PYTHON || 'ubuntu-latest-96-core' }}
-    timeout-minutes: 30
+    # The fork uses a four-core runner, not upstream's 96-core runner.
+    # Full discovery measured 62-81% complete at the former 30-minute cap.
+    timeout-minutes: ${{ github.repository == '0xble/hermes-agent' && 90 || 30 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: ${{ inputs.fork_scope && '0' || '1' }}
 
       - name: Install ripgrep (prebuilt binary)
         run: |
@@ -116,8 +125,15 @@ jobs:
         # set is identical to the list the removed matrix job used to pass in.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          if [[ "$FORK_SCOPE" == "true" ]]; then
+            python scripts/ci/run_fork_tests.py
+          elif [[ "$GITHUB_REPOSITORY" == "0xble/hermes-agent" ]]; then
+            scripts/run_tests.sh tests candidate-extensions
+          else
+            scripts/run_tests.sh
+          fi
         env:
+          FORK_SCOPE: ${{ inputs.fork_scope }}
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
           # from a single ThreadPoolExecutor, so this value IS the limit. The

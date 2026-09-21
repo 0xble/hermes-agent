@@ -372,7 +372,7 @@ def test_profile_call_cannot_retarget_ticker_store_mid_write(
     monkeypatch.setattr(
         cron_jobs,
         "compute_next_run",
-        lambda _schedule, _last_run_at=None: "2026-07-10T00:00:00+00:00",
+        lambda _schedule, _last_run_at=None, _timezone=None: "2026-07-10T00:00:00+00:00",
     )
 
     ticker_loaded = threading.Event()

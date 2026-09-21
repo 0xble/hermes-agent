@@ -390,6 +390,17 @@ class TestSlackAttachmentDiagnostics:
 # SlackAdapter._download_slack_file
 # ---------------------------------------------------------------------------
 
+@pytest.fixture
+def slack_file_dns(monkeypatch):
+    """HTTP is mocked below; DNS must also stay independent of host routing."""
+    def resolve(host, port, *args, **kwargs):
+        assert host == "files.slack.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+@pytest.mark.usefixtures("slack_file_dns")
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
 
@@ -452,6 +463,7 @@ class TestSlackDownloadSlackFile:
 # SlackAdapter._download_slack_file_bytes
 # ---------------------------------------------------------------------------
 
+@pytest.mark.usefixtures("slack_file_dns")
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 

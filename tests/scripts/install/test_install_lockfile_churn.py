@@ -66,7 +66,7 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     _git(repo, "init")
     (repo / "package.json").write_text('{"dependencies":{"a":"1"}}\n')
     (repo / "package-lock.json").write_text('{"lock":"old"}\n')
-    _git(repo, "add", "package.json", "package-lock.json")
+    _git(repo, "add", "-f", "package.json", "package-lock.json")
     _git(repo, "commit", "-m", "init")
 
     (repo / "package-lock.json").write_text('{"lock":"runtime-churn"}\n')
@@ -105,7 +105,10 @@ def test_install_sh_keeps_root_lockfile_for_dirty_workspace_manifest(
     (repo / "package-lock.json").write_text('{"lock":"old"}\n')
     (repo / "apps" / "desktop" / "package.json").write_text("{}\n")
     (repo / "vendor" / "foo" / "package.json").write_text("{}\n")
-    _git(repo, "add", ".")
+    # Host global ignores may exclude lockfiles or vendor paths. Every fixture
+    # manifest/lockfile must be tracked for diff/checkout to exercise the guard.
+    _git(repo, "add", "-f", "package.json", "package-lock.json",
+         "apps/desktop/package.json", "vendor/foo/package.json")
     _git(repo, "commit", "-m", "init")
     script = (
         'log_info() { echo "INFO: $*"; }\n'

@@ -15,6 +15,11 @@
 //
 // This also runs on a laptop: `node .github/scripts/run-workspace-checks.mjs`.
 // `--concurrency N` sets the limit. `--list` prints the units and exits.
+// `--skip SUBSTRING` drops every unit whose "pkg :: script" label contains
+// SUBSTRING, and may be repeated. CI passes no --skip and so runs everything.
+// It exists for gates that must not do release work: packaging a signed
+// desktop build is not merge-gate work, and it cannot run against a detached
+// checkout because the build stamp has no branch to record.
 
 import { execFileSync, spawn } from 'node:child_process'
 import { availableParallelism } from 'node:os'
@@ -76,7 +81,17 @@ function runUnit(unit) {
 
 async function main() {
   const argv = process.argv.slice(2)
-  const units = discoverUnits()
+  const skips = argv.flatMap((arg, i) => (arg === '--skip' ? [argv[i + 1]] : [])).filter(Boolean)
+  const discovered = discoverUnits()
+  const units = discovered.filter((u) => !skips.some((s) => `${u.pkg} :: ${u.script}`.includes(s)))
+
+  for (const skip of skips) {
+    if (!discovered.some((u) => `${u.pkg} :: ${u.script}`.includes(skip))) {
+      console.error(`::error::--skip ${skip} matched no check unit; refusing to skip nothing silently.`)
+      process.exit(1)
+    }
+  }
+  if (skips.length > 0) console.log(`skipping ${discovered.length - units.length} unit(s): ${skips.join(', ')}`)
 
   if (units.length === 0) {
     console.error(

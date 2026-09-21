@@ -1,6 +1,7 @@
 """Perplexity web backend — search + snippets dispatch through the real tools."""
 
 import asyncio
+import socket
 import json
 import os
 from unittest.mock import MagicMock, patch
@@ -60,9 +61,13 @@ def test_search_dispatch_maps_search_api_shape():
     }
 
 
-def test_extract_dispatch_snippets_per_url_and_missing_key():
+def test_extract_dispatch_snippets_per_url_and_missing_key(monkeypatch):
     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
     a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
+    def public_dns(host, port, *args, **kwargs):
+        assert host in ['tokio.rs', 'docs.rs']
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+    monkeypatch.setattr(socket, "getaddrinfo", public_dns)
     import tools.web_tools as wt
 
     register_all_web_providers()

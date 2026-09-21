@@ -58,6 +58,7 @@ def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     runner = GatewayRunner(GatewayConfig())
     adapter = SimpleNamespace(send=AsyncMock(), handle_message=AdmittingHandler())

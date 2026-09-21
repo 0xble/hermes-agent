@@ -195,6 +195,9 @@ class TestProbeLaunchdDomainForLabel:
 
 class TestGetServicePidsScoping:
     def _wire(self, monkeypatch):
+        # Service discovery is synthetic, including the fallback prefix scan
+        # and descendants of these fixture PIDs.
+        monkeypatch.setattr(gw, "_gateway_descendants_of", lambda pid: set())
         monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
         # The all_profiles branch also runs a real ``launchctl list`` prefix scan; a developer
         # box with a live ai.hermes.gateway* fleet would leak its PIDs into the assertion.
