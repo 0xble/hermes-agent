@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Source-sync stage (slice 14, step 2): rebase the fork patch series onto the newest upstream tag.
+"""Source-sync stage (slice 14, step 2): merge the fork patch series with the newest upstream tag.
 
 Runs in a dedicated worktree, never in the installed checkout, and never touches a running
 runtime. It replaces the legacy prompt-driven sync job with a plain, inspectable procedure:
 
 1. fetch upstream tags and pick the newest release tag (``vYYYY.M.D``);
 2. refresh the fork and prove its release ancestry; --verify-current tests even a current release;
-3. rebase the patch series onto the tag in a throwaway branch; on conflict, abort, name the
-   conflicting commits, and stop with ``[CRON_FAILURE]``;
+3. merge the release tag into a throwaway branch without rewriting published fork history;
+   on conflict, abort, name the conflicting files, and stop with ``[CRON_FAILURE]``;
 4. run the fork patch tests plus the slice test set; on red, stop with ``[CRON_FAILURE]``;
-5. write the result as JSON; with ``--publish`` also push the rebased branch as
+5. write the result as JSON; with ``--publish`` also push the merged branch as
    ``candidate/<tag>`` (review remains the delivery gate: a pushed candidate is not promoted).
 
 Exit 0 on ``up_to_date`` or ``candidate_ready``, 1 on failure. The first line of stdout carries the
@@ -69,7 +69,7 @@ def newest_release_tag(repo: Path, remote: str) -> str:
     return max(dated)[1]
 
 
-def verify_candidate(repo: Path, python: str = sys.executable) -> dict:
+def verify_candidate(repo: Path, python: str = sys.executable, baseline: str | None = None) -> dict:
     """Use the same isolated runner as development, including current maintenance contracts."""
     paths = set(FORK_TESTS)
     for contract in sorted((repo / "maintenance").glob("*.md")):
@@ -84,7 +84,7 @@ def verify_candidate(repo: Path, python: str = sys.executable) -> dict:
     output = run.stdout + run.stderr
     if run.returncode == 0:
         ownership = subprocess.run([python, "scripts/check_fork_patches.py", "--repo", str(repo),
-                                    "--source-only"], cwd=repo, capture_output=True, text=True, timeout=120)
+                                    "--source-only", *(["--baseline", baseline] if baseline else [])], cwd=repo, capture_output=True, text=True, timeout=120)
         output += ownership.stdout + ownership.stderr
         if ownership.returncode:
             return {"exit": ownership.returncode, "paths": sorted(paths), "output": output[-16000:],
@@ -131,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--upstream-remote", default="upstream-live")
     ap.add_argument("--origin-remote", default="origin")
     ap.add_argument("--python", default=sys.executable)
-    ap.add_argument("--publish", action="store_true", help="push the rebased series as candidate/<tag>")
+    ap.add_argument("--publish", action="store_true", help="push the verified candidate as candidate/<tag>")
     ap.add_argument("--verify-current", action="store_true", help="test and publish a candidate even when the release baseline is current")
     ap.add_argument("--result", type=Path, help="write the JSON result here as well as stdout")
     args = ap.parse_args(argv)
@@ -180,24 +180,23 @@ def main(argv: list[str] | None = None) -> int:
             work = f"sync/{tag}-{uuid.uuid4().hex[:10]}"
             git(repo, "branch", work, head_sha)
             git(repo, "checkout", "--quiet", work)
-            rebase = git(repo, "rebase", "--onto", tag_sha, base_sha, work, check=False)
-            if rebase.returncode != 0:
+            merge = git(repo, "-c", "rerere.enabled=false", "merge", "--no-edit", "--no-ff",
+                        "-m", f"Merge upstream release {tag}", tag_sha, check=False)
+            if merge.returncode != 0:
                 conflicting = git(repo, "diff", "--name-only", "--diff-filter=U", check=False).stdout.split()
-                stopped_at = git(repo, "rev-parse", "REBASE_HEAD", check=False).stdout.strip()
-                git(repo, "rebase", "--abort", check=False)
+                git(repo, "-c", "rerere.enabled=false", "merge", "--abort", check=False)
                 git(repo, "checkout", "--quiet", "--detach", head_sha)
                 git(repo, "branch", "-D", work, check=False)
-                return finish("rebase_conflict", 1, conflicting_files=conflicting,
-                              conflicting_commit=stopped_at,
-                              conflicting_subject=git(repo, "log", "-1", "--format=%s", stopped_at, check=False).stdout.strip() if stopped_at else "")
-            rebased_head = git(repo, "rev-parse", "HEAD").stdout.strip()
-            result["rebased_head"] = rebased_head
-            git(repo, "merge-base", "--is-ancestor", tag_sha, rebased_head)
-            result["tests"] = verify_candidate(repo, python=args.python)
+                return finish("merge_conflict", 1, conflicting_files=conflicting,
+                              error=merge.stderr[-800:])
+            candidate_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+            result["candidate_head"] = candidate_head
+            git(repo, "merge-base", "--is-ancestor", tag_sha, candidate_head)
+            result["tests"] = verify_candidate(repo, python=args.python, baseline=tag_sha)
             if result["tests"]["exit"] != 0:
                 git(repo, "checkout", "--quiet", "--detach", head_sha)
                 return finish("tests_failed", 1)
-            if git(repo, "status", "--porcelain").stdout.strip() or git(repo, "rev-parse", "HEAD").stdout.strip() != rebased_head:
+            if git(repo, "status", "--porcelain").stdout.strip() or git(repo, "rev-parse", "HEAD").stdout.strip() != candidate_head:
                 raise SyncError("candidate changed during verification")
             if args.publish:
                 fork_now = git(repo, "ls-remote", args.origin_remote, "refs/heads/main").stdout.split()
@@ -211,9 +210,9 @@ def main(argv: list[str] | None = None) -> int:
                 git(repo, "push", f"--force-with-lease={target}:{expected}", args.origin_remote, f"{work}:{target}")
                 remote = git(repo, "ls-remote", args.origin_remote, f"refs/heads/candidate/{tag}").stdout.split()
                 result["published"] = {"branch": f"candidate/{tag}", "sha": remote[0] if remote else ""}
-                if not remote or remote[0] != rebased_head:
+                if not remote or remote[0] != candidate_head:
                     return finish("publish_readback_mismatch", 1)
-                git(repo, "checkout", "--quiet", "--detach", rebased_head)
+                git(repo, "checkout", "--quiet", "--detach", candidate_head)
                 git(repo, "branch", "-d", work)
             return finish("candidate_ready", 0, branch=work)
     except (SyncError, subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:

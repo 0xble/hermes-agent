@@ -75,14 +75,15 @@ class TestCodexAuxiliaryTimeoutFdOwnership:
 
         shutdown_signal = threading.Event()
 
-        def _stalled():
+        def _one_keepalive_then_block():
             # Block until the watchdog proves it ran. This keeps the owner from
             # winning the same deadline race through a keepalive event.
+            yield SimpleNamespace(type="response.in_progress")
             assert shutdown_signal.wait(5.0), "watchdog did not signal socket shutdown"
             yield SimpleNamespace(type="response.in_progress")
 
         adapter, events = _adapter_with_recording_client(
-            _stalled(), shutdown_signal=shutdown_signal
+            _one_keepalive_then_block(), shutdown_signal=shutdown_signal
         )
         owner_tid = threading.get_ident()
 

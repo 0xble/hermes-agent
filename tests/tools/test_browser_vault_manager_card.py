@@ -76,8 +76,8 @@ def _run_fill(page_url, decision="accept", focused=None):
         secret_exprs.append(expression)
         return {"success": True, "result": json.dumps({"filled": 3})}
 
-    def consent(title, body, **kw):
-        prompts.append(title)
+    def consent(message, description, **kw):
+        prompts.append(message)
         return decision
 
     backend = _Manager()

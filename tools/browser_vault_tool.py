@@ -32,6 +32,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.vault_login_classifier import build_form_probe_js
+from tools.registry import no_cache_check_fn
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ def _check_vault_available() -> bool:
     # check_browser_requirements() is False by design in Browser Use mode (browser_exec replaces the
     # built-in surface); the vault serves both stacks.
     return bool(is_browser_use_cli_mode() or check_browser_requirements())
+
+_check_vault_available = no_cache_check_fn(_check_vault_available)
 
 # ---------------------------------------------------------------------------
 # JS evaluation plumbing (server-side; results never carry secret values)
@@ -263,6 +266,8 @@ def browser_vault_list() -> str:
                      "origin": meta.origin,
                      # A manager's card has no origin of its own; it binds to the current page at fill time.
                      "available": meta.kind == "login" or bool(meta.origin) or (meta.kind == "payment" and backend.binds_cards_to_page)}
+            if len(meta.allowed_origins) > 1:
+                entry["allowed_origins"] = list(meta.allowed_origins)
             if meta.has_otp or backend.needs_unlock:
                 entry["two_factor"] = "automatic" if meta.has_otp else "automatic if the manager stores a TOTP seed, else the user is asked"
             if meta.identifier:
@@ -478,6 +483,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
+    # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
+    # every saved origin is a valid fill target. Matching stays exact-origin —
+    # nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
     page_origin = None
     for candidate in allowed:
@@ -497,7 +505,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
                     f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
-                    "only run on an exact origin the credential was saved for."
+                    "only run on the exact origin(s) the credential was saved for."
                 ),
             }
         )
@@ -553,7 +561,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
 
     try:
         fill_result = _eval_js_secret(
-            effective_task_id, build_fill_js(fills, expected_origin=str(meta.origin), nonce=nonce)
+            effective_task_id, build_fill_js(fills, expected_origin=page_origin, nonce=nonce)
         )
     except Exception as exc:
         # Strip any secret material from exception text before surfacing.
@@ -577,7 +585,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
                 "error_type": "origin_changed",
                 "error": (
                     "Refused: the page navigated away from the bound origin "
-                    f"({meta.origin}) before the fill could run "
+                    f"({page_origin}) before the fill could run "
                     f"(now on {parsed.get('found') or 'unknown'}). "
                     "Nothing was written."
                 ),
@@ -586,7 +594,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     filled = parsed.get("filled", 0) if isinstance(parsed, dict) else 0
 
     out = {"success": bool(filled), "filled_fields": int(filled), "backend": backend.name,
-           "kind": meta.kind, "origin": meta.origin}
+           "kind": meta.kind, "origin": page_origin}
     if meta.kind == "login":
         out["next"] = ("Submit. If the site then asks for a verification code, call browser_vault_enter_code with this handle"
                        + (" (a code will be generated automatically)." if meta.has_otp else "."))
@@ -605,7 +613,7 @@ def _confirm_payment_fill(label: str, origin: str) -> bool:
         f"Fill payment card '{label}' on {origin}",
         "The agent wants to enter your saved card details into this checkout page. The card number and "
         "CVC never enter the conversation. Approve only if you intend to pay here.",
-        surface="vault-payment") == "accept"
+        surface="vault-payment", title="Confirm payment card fill?") == "accept"
 
 
 # ---------------------------------------------------------------------------
@@ -729,9 +737,7 @@ def _handle_vault_fill(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
-from tools.registry import no_cache_check_fn, registry  # noqa: E402
-
-_check_vault_available = no_cache_check_fn(_check_vault_available)
+from tools.registry import registry  # noqa: E402
 
 registry.register(
     name="browser_vault_list",

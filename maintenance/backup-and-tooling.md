@@ -8,7 +8,10 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
 - Incomplete backup archives are reported as failures; complete archives survive
   retention; SQLite snapshot members are verified before a quick snapshot is trusted.
 - `scripts/schema_rehearsal.py` proves a copied legacy database opens, migrates, and keeps
-  row counts, search results, and fork-only rows. A successful open alone is insufficient.
+  canonical row counts, metadata, and fork-only rows. Search changes from the upstream
+  FTS v2-to-v3 migration require independent canonical-projection and rank-1 index
+  integrity checks. Unexpected differences and query errors fail the rehearsal.
+  A successful open alone is insufficient.
 - `scripts/sync_fork_candidate.py` builds candidates only; `scripts/check_fork_patches.py`
   proves trailers, unit ownership, extension registration, config keys, and the native
   update receipt; `scripts/rollback_fork_runtime.sh` reaches recovery when reinstall fails.
@@ -79,6 +82,7 @@ Fork-Patch-Backfill: f0a3bb8be8b611d30a990bb83db46aeaed37c39a; maintenance-tooli
 
 `scripts/run_tests.sh` on `tests/hermes_cli/test_backup.py`,
 `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`,
+`tests/scripts/test_schema_rehearsal.py`,
 `tests/scripts/test_fork_patch_trailers.py`, `tests/cron/test_per_job_timezone.py`,
 `tests/cron/test_cron_timezone_migration_catchup.py`,
 `tests/cron/test_contention_skip_observability.py`, `tests/agent/test_model_metadata.py`,

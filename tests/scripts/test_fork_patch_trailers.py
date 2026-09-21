@@ -186,3 +186,23 @@ def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     checker = _checker(tmp_path, monkeypatch)
     failures = checker.check_trailers(git("rev-parse", "HEAD"))
     assert failures and "missing" in failures[0]
+
+
+def test_release_merge_excludes_upstream_but_keeps_all_fork_commits_after_floor(tmp_path, monkeypatch):
+    git = _repo(tmp_path)
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "fork")
+    git("commit", "--allow-empty", "-qm", "pre-contract floor")
+    floor = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-qm", "owned patch\n\nFork-Patch: fixture")
+    git("commit", "--allow-empty", "-qm", "forgotten fork trailer")
+    git("checkout", "-qb", "release", base)
+    git("commit", "--allow-empty", "-qm", "upstream release without fork metadata")
+    release = git("rev-parse", "HEAD")
+    git("checkout", "-q", "fork")
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert "not an ancestor" in checker.check_trailers(release, floor)[0]
+    git("merge", "--no-ff", "-m", "adopt release", release)
+    failures = checker.check_trailers(release, floor)
+    assert len(failures) == 1 and "forgotten fork trailer" in failures[0]

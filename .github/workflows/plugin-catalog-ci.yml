@@ -105,14 +105,17 @@ jobs:
             echo "repo=$REPO sha=$SHA subdir=$SUBDIR"
 
             CLONE_DIR=$(mktemp -d)
-            # Full clone (no --depth 1): the pinned sha may not be the branch tip.
-            if ! git clone "$REPO" "$CLONE_DIR"; then
+            # The pinned sha may not be the branch tip, but full history is unnecessary and can
+            # hang on large community repositories. Fetch a blobless shallow tip, then fetch only
+            # the exact object being admitted.
+            if ! timeout 5m git clone --filter=blob:none --no-checkout --depth 1 "$REPO" "$CLONE_DIR"; then
               echo "::error file=$entry::clone failed for $REPO"
               FAILED=1; echo "::endgroup::"; continue
             fi
 
             # SUPPLY-CHAIN GATE: the pinned sha must be reachable in the repo.
-            if ! git -C "$CLONE_DIR" checkout --detach "$SHA"; then
+            if ! timeout 2m git -C "$CLONE_DIR" fetch --no-tags origin "$SHA" || \
+               ! git -C "$CLONE_DIR" checkout --detach "$SHA"; then
               echo "::error file=$entry::pinned sha $SHA is not reachable in $REPO"
               FAILED=1; echo "::endgroup::"; continue
             fi
@@ -126,12 +129,23 @@ jobs:
             fi
 
             # Manifest schema + declared-vs-registered capability check.
-            if hermes plugins validate "$PLUGIN_DIR"; then
-              echo "✅ PASS: $entry"
-            else
+            if ! hermes plugins validate --install-deps "$PLUGIN_DIR"; then
               echo "::error file=$entry::hermes plugins validate failed"
-              FAILED=1
+              FAILED=1; echo "::endgroup::"; continue
             fi
+
+            # SELF-UPDATER GATE (README rule 3): the pin is the only update path.
+            # A desktop bundle that both fetches from GitHub AND writes/renames
+            # plugin files is a self-updater; either half alone is fine (a
+            # plugin may read the API, or manage its own data files).
+            SELF_UPDATE=$(grep -rlE 'releases/latest|raw\.githubusercontent\.com' \
+                --include='*.js' --include='*.mjs' --include='*.cjs' --include='*.ts' "$PLUGIN_DIR" \
+              | xargs -r grep -lE 'writeTextFile|renamePath|writeFile\(' || true)
+            if [ -n "$SELF_UPDATE" ]; then
+              echo "::error file=$entry::self-updating code in catalog build (fetches GitHub AND writes plugin files): $SELF_UPDATE"
+              FAILED=1; echo "::endgroup::"; continue
+            fi
+            echo "✅ PASS: $entry"
             echo "::endgroup::"
           done <<< "$CHANGED_FILES"
 

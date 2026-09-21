@@ -45,8 +45,8 @@ EXPECTED_CONFIG = {
     "delegation.model": None,
     "auxiliary.review.model": None,
 }
-# Upstream release baseline the fork is built on (v2026.9.14).
-DEFAULT_BASELINE = "345cd2b057a452236de401d3534b8502a7465e8d"
+# Upstream release baseline the fork is built on (v2026.9.21).
+DEFAULT_BASELINE = "d337b736aa1e8ebecfab043842d13e4a2d2f48a3"
 # Last published commit whose fork behavior is documented by a maintenance unit. Every later
 # commit must carry its own ``Fork-Patch:`` trailer. A sync may rewrite this SHA, so the floor
 # is also located by its exact subject when the SHA is gone.
@@ -139,6 +139,8 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
     owned = _owned_identities()
     if owned is None:
         return [f"{MAINTENANCE_ROOT} and {MAINTENANCE_DIR}/ are missing; patch identities have no owner"]
+    if not _is_ancestor(baseline):
+        return [f"release baseline {baseline} is not an ancestor of HEAD"]
     start = baseline
     if floor:
         start, failure = _resolve_floor(floor, baseline, floor_subject)
@@ -152,8 +154,9 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
     for unit in sorted((REPO / MAINTENANCE_DIR).glob("*.md")):
         for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", unit.read_text(encoding="utf-8"), re.M):
             backfills[patch_id] = identity.strip()
-    # Merge commits carry no patch content of their own; their parents are classified individually.
-    for sha in _git("rev-list", "--reverse", "--no-merges", f"{start}..HEAD").split():
+    # Classify fork commits after the floor, excluding the verified upstream release
+    # ancestry. A release merge introduces upstream commits without fork trailers.
+    for sha in _git("rev-list", "--reverse", "--no-merges", "HEAD", f"^{start}", f"^{baseline}").split():
         short = sha[:12]
         body = _git("log", "-1", "--format=%B", sha)
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]

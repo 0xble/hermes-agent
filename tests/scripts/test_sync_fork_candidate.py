@@ -11,7 +11,7 @@ def git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True, encoding="utf-8", errors="replace").strip()
 
 
-@pytest.mark.parametrize("new_release", [False, True])
+@pytest.mark.parametrize("new_release", [False, True, "conflict"])
 def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypatch, new_release):
     spec = importlib.util.spec_from_file_location("sync", Path(__file__).parents[2] / "scripts/sync_fork_candidate.py")
     sync = importlib.util.module_from_spec(spec)
@@ -40,10 +40,14 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     git(source, "config", "user.name", "Test")
     # Advance the fork after cloning: relying on cached origin/main loses this patch.
     (fork / "patch").write_text("preserve me", encoding="utf-8")
+    if new_release == "conflict":
+        (fork / "base").write_text("fork edit\n", encoding="utf-8")
     git(fork, "add", ".")
     git(fork, "commit", "-m", "fork patch")
     fork_head = git(fork, "rev-parse", "HEAD")
     if new_release:
+        if new_release == "conflict":
+            (upstream / "base").write_text("upstream edit\n", encoding="utf-8")
         (upstream / "release").write_text("new release", encoding="utf-8")
         git(upstream, "add", ".")
         git(upstream, "commit", "-m", "next release")
@@ -59,6 +63,17 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     receipt = tmp_path / "result.json"
     args = ["--repo", str(target), "--source-repo", str(source), "--candidate", "origin/main",
             "--publish", "--verify-current", "--result", str(receipt)]
+    if new_release == "conflict":
+        assert sync.main(args) == 1
+        result = json.loads(receipt.read_text(encoding="utf-8"))
+        assert result["status"] == "merge_conflict"
+        assert result["conflicting_files"] == ["base"]
+        assert observed == []
+        assert git(target, "rev-parse", "HEAD") == fork_head
+        assert git(target, "status", "--porcelain") == ""
+        assert git(fork, "rev-parse", "HEAD") == fork_head
+        assert git(fork, "for-each-ref", "refs/heads/candidate/") == ""
+        return
     assert sync.main(args) == 0
     result = json.loads(receipt.read_text(encoding="utf-8"))
     assert result["newest_tag"] == expected_tag
@@ -68,6 +83,7 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     assert git(fork, "rev-parse", "HEAD") == fork_head  # candidate publication never promotes main
     assert git(source, "rev-parse", "HEAD") != fork_head  # preserve the coordination checkout
     assert git(target, "merge-base", "--is-ancestor", result["tag_sha"], observed[0]) == ""
+    assert git(target, "merge-base", "--is-ancestor", fork_head, observed[0]) == ""
     # Repeated scheduled runs reuse the dedicated worktree safely.
     assert sync.main(args) == 0
     published = git(fork, "rev-parse", f"refs/heads/candidate/{expected_tag}")

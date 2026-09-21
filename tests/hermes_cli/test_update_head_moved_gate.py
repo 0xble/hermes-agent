@@ -10,6 +10,7 @@ and fails loudly when the update was a no-op.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -107,58 +108,38 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
-    # Short-circuit the long tail: dependency install + desktop build.
-    monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
-    monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
-    monkeypatch.setattr(main_install_repair, "_clear_update_incomplete_marker", lambda: None)
-    # Gateway restart path (called after a successful update).
-    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
-    monkeypatch.setattr(update_cmd, "_purge_stale_hermes_modules", lambda: None)
-    monkeypatch.setattr(update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None)
-    # Keep the (now surfaced — #78574) gateway auto-restart phase away from
-    # this machine's real gateways: discovery returns nothing, systemd is
-    # unsupported, so the phase is a clean no-op for both snapshots.
-    import hermes_cli.gateway as hermes_gateway
-
-    monkeypatch.setattr(
-        hermes_gateway, "get_launchd_plist_path", lambda: tmp_path / "absent.plist"
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "launchd_gateway_labels_for_install", lambda: []
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "supports_systemd_services", lambda: False
-    )
-    monkeypatch.setattr(
-        hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []
-    )
+    # This gate precedes the fresh-interpreter handoff. Stop at that boundary,
+    # rather than mocking helpers removed by the post-swap updater refactor.
+    handoff = Mock()
+    monkeypatch.setattr(update_cmd, "_hand_off_post_swap", handoff)
+    return handoff
 
 
 def test_update_success_when_head_moves(monkeypatch, tmp_path, capsys):
     """When the pull advances HEAD, the update proceeds normally."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
+    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_moved_side_effect())
 
     hermes_main.cmd_update(args)  # completes normally (no SystemExit)
 
     out = capsys.readouterr().out
-    assert "✓ Code updated!" in out
     assert "Code did not move" not in out
+    handoff.assert_called_once()
+    assert handoff.call_args.kwargs["swap"] == "git"
+    assert handoff.call_args.kwargs["pre_pull_sha"] == "abc123"
 
 
 def test_update_fails_loudly_when_head_pinned(monkeypatch, tmp_path, capsys):
     """A detached/pinned HEAD that never moves must fail loudly, not print
     '✓ Code updated!' against the stale tree."""
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
-    _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect())
+    handoff = _patch_update_deps(monkeypatch, tmp_path, _make_head_pinned_side_effect())
 
     with pytest.raises(SystemExit) as exc_info:
         hermes_main.cmd_update(args)
 
     assert exc_info.value.code == 1
+    handoff.assert_not_called()
     out = capsys.readouterr().out
     assert "Code did not move" in out
     assert "✓ Code updated!" not in out

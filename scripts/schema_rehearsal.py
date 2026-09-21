@@ -15,8 +15,9 @@ the legacy gateway runs), this script:
    phrases, delivery ledger states, async delegation states;
 5. optionally runs ``PRAGMA integrity_check`` (slow on a 30 GB file; opt in with ``--integrity``).
 
-Exit 0 when the candidate opened the copy without dropping any table or row, and the read probes
-match before and after. Exit 1 otherwise, with the differences printed. The copy is modified by
+Exit 0 when the candidate opened cleanly without canonical table/row/column loss, preserved
+metadata, and retained read probes. A v2->v3 base FTS migration may change derived rows/search
+only after canonical projection and rank-1 integrity verification. Exit 1 otherwise. The copy is modified by
 step 3 (that is the point of a rehearsal), so pass a disposable copy.
 """
 
@@ -29,6 +30,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -53,7 +55,7 @@ def declared_tables() -> set[str]:
     # Core tables use bare CREATE TABLE; auxiliary ones use IF NOT EXISTS; FTS uses VIRTUAL TABLE.
     pattern = re.compile(r"CREATE (?:VIRTUAL )?TABLE (?:IF NOT EXISTS )?\"?([A-Za-z_][A-Za-z0-9_]*)", re.I)
     for path in REPO.rglob("*.py"):
-        if "/tests/" in str(path) or "/.venv/" in str(path) or "/.worktrees/" in str(path):
+        if {"tests", ".venv", "venv", ".worktrees"}.intersection(path.relative_to(REPO).parts[:-1]):
             continue
         try:
             names.update(pattern.findall(path.read_text(encoding="utf-8", errors="ignore")))
@@ -81,7 +83,11 @@ def snapshot(path: Path) -> dict:
             version = [r[0] for r in c.execute("SELECT version FROM schema_version")]
         except sqlite3.DatabaseError:
             version = []
-        return {"size": path.stat().st_size, "schema_version": version, "tables": info}
+        meta = dict(c.execute("SELECT key, value FROM state_meta")) if "state_meta" in info else {}
+        ddl = dict(c.execute("SELECT name, sql FROM sqlite_master WHERE name IN ('messages_fts', 'messages_fts_src')"))
+        shadows = {r[1] for r in c.execute("PRAGMA table_list") if r[2] == "shadow"}
+        return {"size": path.stat().st_size, "schema_version": version, "tables": info,
+                "meta": meta, "fts_ddl": ddl, "shadows": sorted(shadows)}
 
 
 def probes(path: Path) -> dict:
@@ -125,10 +131,98 @@ def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     return result
 
 
+
+def verify_aligned_fts(path: Path) -> dict:
+    """Verify the declared projection AND actual index on the disposable copy, never rebuild it."""
+    from hermes_state_common import FTS_TOOL_CONTENT_PREFIX_CHARS
+    try:
+        with sqlite3.connect(str(path)) as c:
+            expected = ("CASE WHEN m.role='tool' THEN substr(COALESCE(m.content,''),1,"
+                        f"{FTS_TOOL_CONTENT_PREFIX_CHARS}) ELSE m.content END")
+            # NULL-safe joined comparisons avoid sorting multi-GB message bodies.
+            mismatch = c.execute(f"""SELECT 1 FROM messages m
+                LEFT JOIN messages_fts_src v ON v.id=m.id
+                WHERE v.id IS NULL OR v.content IS NOT ({expected})
+                   OR v.tool_name IS NOT m.tool_name OR v.tool_calls IS NOT m.tool_calls
+                LIMIT 1""").fetchone()
+            extra = c.execute("""SELECT 1 FROM messages_fts_src v
+                LEFT JOIN messages m ON m.id=v.id WHERE m.id IS NULL LIMIT 1""").fetchone()
+            duplicate = c.execute("""SELECT id FROM messages_fts_src
+                GROUP BY id HAVING COUNT(*) != 1 LIMIT 1""").fetchone()
+            if mismatch or extra or duplicate:
+                return {"ok": False, "error": "base FTS source differs from canonical projection"}
+            c.execute("BEGIN")
+            try:
+                c.execute("INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)")
+            finally:
+                c.rollback()
+        return {"ok": True, "projection": "canonical", "integrity": "rank=1"}
+    except sqlite3.DatabaseError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def assess(path: Path, before: dict, after: dict, pre: dict, post: dict,
+           opened: dict, integrity: dict | None = None) -> dict:
+    """Keep canonical checks strict; only independently verified v2->v3 derived changes are expected."""
+    errors = []
+    for label, snap, probe in (("before", before, pre), ("after", after, post)):
+        errors.extend(f"{label}: {name}: {v['rows']}" for name, v in snap["tables"].items()
+                      if not isinstance(v["rows"], int))
+        errors.extend(f"{label}: {name}: {value}" for name, value in probe.items()
+                      if isinstance(value, str))
+    dropped = sorted(set(before["tables"]) - set(after["tables"]))
+    added = sorted(set(after["tables"]) - set(before["tables"]))
+    common = before["tables"].keys() & after["tables"].keys()
+    rows = {t: (before["tables"][t]["rows"], after["tables"][t]["rows"]) for t in common
+            if before["tables"][t]["rows"] != after["tables"][t]["rows"] and t != "state_meta"}
+    columns_removed = {t: sorted(set(before["tables"][t]["columns"]) - set(after["tables"][t]["columns"])) for t in common}
+    columns_added = {t: sorted(set(after["tables"][t]["columns"]) - set(before["tables"][t]["columns"])) for t in common}
+    mismatch = {k: (pre.get(k), post.get(k)) for k in pre.keys() | post.keys() if pre.get(k) != post.get(k)}
+    bm, am = before["meta"], after["meta"]
+    removed_meta = sorted(bm.keys() - am.keys())
+    changed_meta = {k: (bm[k], am[k]) for k in bm.keys() & am.keys() if bm[k] != am[k]}
+    # These existing bookkeeping keys may be refreshed by opening a copied store.
+    for key in ("store_instance_id", "db_file_generation"):
+        changed_meta.pop(key, None)
+    transition = (bm.get("fts_storage_version") == "2" and am.get("fts_storage_version") == "3"
+                  and bool(re.search(r"content\s*=\s*['\"]messages['\"]", before["fts_ddl"].get("messages_fts", ""), re.I))
+                  and bool(re.search(r"content\s*=\s*['\"]messages_fts_src['\"]", after["fts_ddl"].get("messages_fts", ""), re.I)))
+    proof = verify_aligned_fts(path) if transition else {"ok": False, "reason": "not the supported v2->v3 transition"}
+    expected = {"rows_changed": {}, "probe_mismatch": {}, "metadata_removed": [], "metadata_changed": {}}
+    if transition and proof["ok"]:
+        base_shadows = {"messages_fts_" + suffix for suffix in ("data", "idx", "content", "docsize", "config")}
+        allowed = base_shadows & set(before["shadows"]) & set(after["shadows"])
+        for name in list(rows):
+            if name in allowed:
+                expected["rows_changed"][name] = rows.pop(name)
+        for name in list(mismatch):
+            if name in {"fts:" + phrase for phrase in FTS_PROBES}:
+                expected["probe_mismatch"][name] = mismatch.pop(name)
+        for key in ("fts_tool_full_content_high_water", "fts_rebuild_high_water", "fts_rebuild_progress"):
+            if key in removed_meta:
+                removed_meta.remove(key)
+                expected["metadata_removed"].append(key)
+        if "fts_storage_version" in changed_meta:
+            expected["metadata_changed"]["fts_storage_version"] = changed_meta.pop("fts_storage_version")
+    elif transition:
+        errors.append("v2->v3 validation failed: " + str(proof.get("error")))
+    if integrity is not None and integrity.get("result") not in ([["ok"]], [("ok",)]):
+        errors.append("requested SQLite integrity_check failed")
+    diff = {"tables_dropped": dropped, "tables_added": added,
+            "columns_added": {k: v for k, v in columns_added.items() if v},
+            "columns_removed": {k: v for k, v in columns_removed.items() if v},
+            "rows_changed": rows, "metadata_removed": removed_meta, "metadata_changed": changed_meta}
+    ok = (opened.get("opened") is True and opened.get("exit") == 0 and not errors
+          and not dropped and not rows and not diff["columns_removed"]
+          and not removed_meta and not changed_meta and not mismatch)
+    return {"ok": ok, "diff": diff, "probe_mismatch": mismatch,
+            "expected_derived_changes": expected, "fts_transition_validation": proof, "errors": errors}
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("copy", type=Path, help="a DISPOSABLE copy of state.db")
-    ap.add_argument("--scratch-home", type=Path, default=Path("/tmp/hn-schema-rehearsal-home"))
+    ap.add_argument("--scratch-home", type=Path, help="scratch profile directory (default: a unique temporary directory)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--integrity", action="store_true", help="run PRAGMA integrity_check on the copy first (slow)")
     ap.add_argument("--report", type=Path)
@@ -152,30 +246,17 @@ def main(argv: list[str] | None = None) -> int:
                         "legacy_only_tables": legacy_only,
                         "legacy_only_rows": sum(v for v in legacy_only.values() if isinstance(v, int))}
     report["probes_before"] = probes(copy)
-    report["open"] = open_with_candidate(copy, args.scratch_home, args.python)
+    scratch_home = args.scratch_home or Path(tempfile.mkdtemp(prefix="hn-schema-rehearsal-"))
+    report["scratch_home"] = str(scratch_home)
+    report["open"] = open_with_candidate(copy, scratch_home, args.python)
     after = snapshot(copy)
     report["after"] = {"size": after["size"], "schema_version": after["schema_version"], "tables": len(after["tables"])}
     report["probes_after"] = probes(copy)
 
-    dropped = sorted(set(before["tables"]) - set(after["tables"]))
-    added = sorted(set(after["tables"]) - set(before["tables"]))
-    columns_added = {t: sorted(set(after["tables"][t]["columns"]) - set(before["tables"][t]["columns"]))
-                     for t in before["tables"] if t in after["tables"]}
-    columns_added = {t: c for t, c in columns_added.items() if c}
-    # Opening a store legitimately stamps bookkeeping keys (store_instance_id, db_file_generation)
-    # into state_meta; that is not data loss. Every other table must hold exactly what it held.
-    rows_changed = {t: (before["tables"][t]["rows"], after["tables"][t]["rows"]) for t in before["tables"]
-                    if t in after["tables"] and before["tables"][t]["rows"] != after["tables"][t]["rows"]
-                    and t != "state_meta"}
-    meta_before = before["tables"].get("state_meta", {}).get("rows")
-    meta_after = after["tables"].get("state_meta", {}).get("rows")
-    if isinstance(meta_before, int) and isinstance(meta_after, int) and meta_after < meta_before:
-        rows_changed["state_meta"] = (meta_before, meta_after)
-    report["diff"] = {"tables_dropped": dropped, "tables_added": added, "columns_added": columns_added, "rows_changed": rows_changed}
-    probe_mismatch = {k: (report["probes_before"][k], report["probes_after"][k])
-                      for k in report["probes_before"] if report["probes_before"][k] != report["probes_after"][k]}
-    report["probe_mismatch"] = probe_mismatch
-    ok = bool(report["open"].get("opened")) and not dropped and not rows_changed and not probe_mismatch
+    assessment = assess(copy, before, after, report["probes_before"], report["probes_after"],
+                        report["open"], report.get("integrity_check"))
+    ok = assessment.pop("ok")
+    report.update(assessment)
     report["verdict"] = "compatible" if ok else "incompatible"
     text = json.dumps(report, indent=2, default=str)
     print(text)
