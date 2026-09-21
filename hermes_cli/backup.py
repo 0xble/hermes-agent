@@ -571,14 +571,36 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
         tmp_db.unlink(missing_ok=True)
 
 
+#: Above this share of the scan going missing mid-write, the archive is still usable
+#: (every file in it is intact) but it no longer covers what the last good archives do,
+#: so it must not rotate them out. Routine churn is a handful of per-run cron files out
+#: of hundreds of thousands, four orders of magnitude below this.
+_MAX_VANISHED_SHARE_FOR_PRUNE = 0.01
+
+def _is_critical_state(rel_path: Path) -> bool:
+    """Is *rel_path* something a restore cannot do without?
+
+    Matched on the RELATIVE path against the module's own criticality list, not on
+    basename: ``plugins/x/.env`` is an ordinary file that may legitimately rotate,
+    while ``.env`` at the root is not. _QUICK_STATE_FILES entries may name a file or
+    a directory, so a prefix match covers ``kanban/boards`` and ``platforms/pairing``.
+    _SECRET_FILE_NAMES is deliberately NOT used here: its own comment says it exists so
+    restore can chmod 0600, which is a permissions question, not a criticality one.
+    """
+    posix = rel_path.as_posix()
+    return any(posix == entry or posix.startswith(f"{entry}/") for entry in _QUICK_STATE_FILES)
+
+
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: List[Tuple[Path, Path]], out_path: Path,
-    *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
+    *, on_db_failure, on_error, on_progress, track_bytes: bool, on_vanished=None) -> int:
     """Add every ``(abs_path, rel_path)`` to *zf*, WAL-safe for ``*.db``; return bytes archived.
 
     ``on_db_failure(rel_path)`` runs when a SQLite snapshot fails (may raise to abort);
     ``on_error(rel_path, exc)`` records a read failure; ``on_progress(i)`` fires every 500 files;
     ``track_bytes`` stats plain files for the size total.
+    ``on_vanished(rel_path)`` records a file that no longer exists; when omitted such a
+    file is reported through ``on_error`` as before.
     """
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
@@ -593,6 +615,27 @@ def _write_zip_entries(
                 zf.write(abs_path, arcname=str(rel_path))
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
+        except FileNotFoundError as exc:
+            # The file list is built up front and the archive takes minutes to tens of
+            # minutes on a large home, during which a running agent keeps rotating its
+            # own files (per-run cron output is the usual source). A path that no longer
+            # exists was not lost by the backup and does not make the archive incomplete.
+            #
+            # Re-check rather than trusting the errno: a path that IS still there when we
+            # look means a real read fault, not a deletion, and must stay an error.
+            # os.path.exists, not Path.exists: on 3.11 and 3.12 the latter re-raises any
+            # OSError it does not recognise (EACCES on a parent, EIO/ESTALE on a network
+            # mount), which would escape this handler and kill the whole run — strictly
+            # worse than the incomplete archive being fixed here, and invisible on 3.13.
+            #
+            # A file the restore cannot do without is never "merely absent": losing it
+            # silently would let a complete-looking archive rotate the last good one out.
+            if (on_vanished is None or _is_critical_state(rel_path)
+                    or os.path.exists(abs_path)):
+                on_error(rel_path, exc)
+            else:
+                on_vanished(rel_path)
+            continue
         except (PermissionError, OSError, ValueError) as exc:
             on_error(rel_path, exc)
             continue
@@ -697,6 +740,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
     errors = []
+    vanished: List[str] = []  # names only; both loops append str
     t0 = time.monotonic()
 
     def _progress(i: int) -> None:
@@ -708,21 +752,28 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
-            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
+            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
+            on_vanished=lambda rel: vanished.append(str(rel)))
         # External memory-provider state never includes ``.db`` files in practice, so a
         # straight zf.write is fine.
         for abs_path, arcname in external_to_add:
             try:
                 zf.write(abs_path, arcname=arcname)
                 total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                if os.path.exists(abs_path):
+                    errors.append(f"{arcname}: {exc}")
+                else:
+                    vanished.append(arcname)
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"{arcname}: {exc}")
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
-    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
-                elapsed * 1000, file_count, len(errors), zip_size)
+    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d "
+                "vanished=%d bytes=%d",
+                elapsed * 1000, file_count, len(errors), len(vanished), zip_size)
     print(f"\nBackup {'incomplete' if errors else 'complete'}: {out_path}\n"
-          f"  Files:       {file_count}\n"
+          f"  Files:       {file_count - len(vanished) - len(errors)}\n"
           f"  Original:    {_format_size(total_bytes)}\n"
           f"  Compressed:  {_format_size(zip_size)}\n"
           f"  Time:        {elapsed:.1f}s")
@@ -733,6 +784,12 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
               "(not portable):\n" + "\n".join(f"    {p}" for p in sorted(skipped_external)[:10]))
     if skipped_dirs:
         print("\n  Excluded directories:\n" + "\n".join(f"    {d}/" for d in sorted(skipped_dirs)))
+    for name in vanished:
+        logger.warning("backup archive=%s entry_vanished=%s", out_path, json.dumps(name))
+    if vanished:
+        _print_capped(
+            f"\n  Skipped {len(vanished)} file(s) removed while the archive was being written:",
+            vanished, "  ")
     if errors:
         # Console previews are capped; retain every failure in the profile log
         # so an incomplete archive can be diagnosed without another full export.
@@ -744,7 +801,13 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     # Prune only after a complete archive: a timer hitting the same unreadable file every run must
     # not rotate the last good backups out in favour of incomplete ones.
     keep = getattr(args, "keep", 0)  # 0 / absent: never prune (non-CLI callers)
-    if keep and not errors and out_path.name.startswith(_RUN_BACKUP_PREFIX):
+    mass_vanish = file_count and len(vanished) > file_count * _MAX_VANISHED_SHARE_FOR_PRUNE
+    if mass_vanish and keep:
+        print(f"\n  Not pruning: {len(vanished)} of {file_count} files disappeared while the "
+              "archive was being written, so it may not cover what older archives do.")
+        logger.warning("backup archive=%s prune_withheld vanished=%d of %d",
+                       out_path, len(vanished), file_count)
+    if keep and not errors and not mass_vanish and out_path.name.startswith(_RUN_BACKUP_PREFIX):
         pruned = _prune_prefixed_zips(out_path.parent, _RUN_BACKUP_PREFIX, keep, "backup")
         if pruned:
             print(f"  Pruned {pruned} older {_RUN_BACKUP_PREFIX}*.zip (keeping {keep}).")

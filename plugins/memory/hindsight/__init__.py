@@ -336,11 +336,6 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
         self._bank_mission, self._bank_retain_mission = "", None
         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
-        # get_tool_schemas() reads this, and MemoryManager.add_provider() calls that BEFORE
-        # initialize() runs — so the cron value set there arrives too late for the first read.
-        # Defaulting to False here keeps a pre-initialize call on the non-cron path (retain tool
-        # offered), which is what every provider gets until initialize() says otherwise.
-        self._cron_skipped = False
         self._prefetch_method = "recall"  # "recall" or "reflect"
         for name in _SESSION_KWARGS:
             setattr(self, f"_{name}", "")
