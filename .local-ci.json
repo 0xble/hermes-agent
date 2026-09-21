@@ -1,5 +1,5 @@
 {
   "schema": "local-ci/v1",
-  "setup": "mise exec node@26 -- npm ci",
-  "gate": "mise exec node@26 -- node .github/scripts/run-workspace-checks.mjs --concurrency 2 --skip 'check:test:desktop:all'"
+  "setup": "mise exec node@26 -- npm ci && uv sync --locked --python 3.11",
+  "gate": "PATH=\"$PWD/.venv/bin:$PATH\" mise exec node@26 -- node .github/scripts/run-workspace-checks.mjs --concurrency 2 --skip 'check:test:desktop:all'"
 }
