@@ -48,7 +48,7 @@ def install_maintenance(home: Path) -> list[str]:
             "sys.path.insert(0, str(root))\n"
             f"runpy.run_path(str(root / 'scripts' / {name!r}), run_name='__main__')\n"
         )
-        with tempfile.NamedTemporaryFile(mode="w", dir=scripts, delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=scripts, delete=False) as tmp:
             tmp.write(content)
         Path(tmp.name).chmod(0o700)
         os.replace(tmp.name, scripts / name)
