@@ -51,7 +51,14 @@ def main() -> int:
     for unit, tests in surfaces.items():
         if not tests or any(not (ROOT / test).is_file() for test in tests):
             raise ValueError(f"Missing fork test surface for {unit}")
-    selected = select_tests(changed, surfaces)
+    manual_smoke = (
+        os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and str(event.get("inputs", {}).get("full_python", True)).lower() == "false"
+    )
+    selected = (
+        sorted({test for tests in surfaces.values() for test in tests})
+        if manual_smoke else select_tests(changed, surfaces)
+    )
     print(f"Fork selection: {len(selected)} files" if selected else "Unclassified change: running full Python suite", flush=True)
     return subprocess.call(["bash", "scripts/run_tests.sh", *(selected or [])], cwd=ROOT)
 

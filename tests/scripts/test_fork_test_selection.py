@@ -23,7 +23,7 @@ def test_changed_test_is_added_to_all_maintained_surfaces():
     assert set(selected) == {changed} | {path for tests in surfaces.values() for path in tests}
 
 
-@pytest.mark.parametrize("event_kind", ["pull_request", "push"])
+@pytest.mark.parametrize("event_kind", ["pull_request", "push", "manual_smoke", "missing_context"])
 def test_workflow_diff_respects_branch_history(tmp_path, monkeypatch, event_kind):
     import subprocess
     from scripts.ci import run_fork_tests
@@ -59,15 +59,22 @@ def test_workflow_diff_respects_branch_history(tmp_path, monkeypatch, event_kind
         {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}}
         if event_kind == "pull_request" else {"before": common}
     )
+    if event_kind == "manual_smoke":
+        event = {"inputs": {"full_python": "false"}}
+    elif event_kind == "missing_context":
+        event = {}
     event_path = tmp_path / "event.json"
     event_path.write_text(json.dumps(event), encoding="utf-8")
     monkeypatch.setattr(run_fork_tests, "ROOT", tmp_path)
     monkeypatch.setattr(run_fork_tests, "MANIFEST", manifest)
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event_path))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch" if event_kind == "manual_smoke" else event_kind)
     monkeypatch.setenv("GITHUB_SHA", base)
     commands = []
     monkeypatch.setattr(run_fork_tests.subprocess, "call", lambda command, **kw: commands.append(command) or 0)
 
     assert run_fork_tests.main() == 0
     expected = ["tests/test_added.py", "tests/test_maintained.py"] if event_kind == "pull_request" else []
+    if event_kind == "manual_smoke":
+        expected = ["tests/test_maintained.py"]
     assert commands == [["bash", "scripts/run_tests.sh", *expected]]

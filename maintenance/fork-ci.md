@@ -10,7 +10,9 @@ pass for smoke coverage. `scripts/ci/fork_test_surfaces.json` owns the explicit 
 list. Update it when adding or moving a maintenance unit or its proof surface.
 
 `CI` supports manual `workflow_dispatch` with `full_python: true`, selecting the
-complete suite regardless of the diff. `scripts/run_tests.sh` remains the canonical
+complete suite regardless of the diff. Explicit `full_python: false` dispatch runs
+the maintained proof manifest without inferring any change scope. Missing PR/push
+context still runs the full suite. `scripts/run_tests.sh` remains the canonical
 complete local gate. Neither path skips failing tests. There is no new schedule.
 
 The fork's configured runner is `ubuntu-latest` with four test workers. Full Python
