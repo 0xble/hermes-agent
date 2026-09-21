@@ -921,6 +921,40 @@ class TestRecallStatus:
 
 
 class TestSyncTurn:
+    def test_cron_context_does_not_auto_retain(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(session_id="cron_job-1", platform="cron")
+        p._client = _make_mock_client()
+
+        p.sync_turn("scheduled input", "scheduled result")
+
+        assert p._retain_queue.empty()
+        p._client.aretain_batch.assert_not_called()
+
+    def test_cron_context_keeps_recall_tools_but_hides_retain_tool(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(session_id="cron_job-1", platform="cron")
+        p._client = _make_mock_client()
+
+        tool_names = {schema["name"] for schema in p.get_tool_schemas()}
+        assert tool_names == {"hindsight_recall", "hindsight_reflect"}
+
+        result = p.handle_tool_call("hindsight_retain", {"content": "do not store this"})
+
+        assert "disabled in cron context" in result
+        p._client.aretain_batch.assert_not_called()
+
+    def test_cron_context_does_not_flush_buffered_turns_on_session_switch(self, provider_with_config):
+        p = provider_with_config()
+        p.initialize(session_id="cron_job-1", platform="cron")
+        p._client = _make_mock_client()
+        p._session_turns = ["buffered cron turn"]
+
+        p.on_session_switch("cron_job-2")
+
+        assert p._retain_queue.empty()
+        p._client.aretain_batch.assert_not_called()
+
     def test_sync_turn_retains_metadata_rich_turn(self, provider_with_config, monkeypatch):
         event_time = datetime(2026, 8, 10, 11, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
         monkeypatch.setattr("plugins.memory.hindsight._hermes_now", lambda: event_time)
