@@ -398,7 +398,7 @@ class TestTranscribeLocalExtended:
 
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment], mock_info)
-        mock_whisper_cls = MagicMock(return_value=mock_model)
+        mock_model_loader = MagicMock(return_value=mock_model)
 
         fake_config = {
             "local": {
@@ -408,7 +408,7 @@ class TestTranscribeLocalExtended:
         }
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
-             patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_local_whisper_model", mock_model_loader), \
              patch("tools.transcription_tools._local_model", None), \
              patch("tools.transcription_tools._local_model_name", None), \
              patch("tools.transcription_tools._load_stt_config", return_value=fake_config):
@@ -416,8 +416,17 @@ class TestTranscribeLocalExtended:
             result = _transcribe_local(str(audio), "base")
 
         assert result["success"] is True
-        mock_whisper_cls.assert_called_once_with("base", device="cpu", compute_type="float32")
+        mock_model_loader.assert_called_once_with("base", device="cpu", compute_type="float32")
 
+    @pytest.mark.macos_only
+    def test_native_apple_silicon_load_keeps_cpu_safety_policy(self):
+        import platform
+        if platform.machine().lower() not in {"arm64", "aarch64"}:
+            pytest.skip("requires native Apple Silicon")
+        from tools.transcription_local import _load_local_whisper_model
+        with patch("faster_whisper.WhisperModel") as model:
+            _load_local_whisper_model("base", device="cpu", compute_type="float32")
+        model.assert_called_once_with("base", device="cpu", compute_type="int8")
 
     def test_cuda_out_of_memory_does_not_trigger_cpu_fallback(self, tmp_path):
         """'CUDA out of memory' is a real error, not a missing lib — surface it."""

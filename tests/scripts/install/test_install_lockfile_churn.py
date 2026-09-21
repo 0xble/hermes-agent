@@ -66,7 +66,7 @@ def test_install_sh_discards_runtime_lockfile_churn_before_stash(
     _git(repo, "init")
     (repo / "package.json").write_text('{"dependencies":{"a":"1"}}\n')
     (repo / "package-lock.json").write_text('{"lock":"old"}\n')
-    _git(repo, "add", "package.json", "package-lock.json")
+    _git(repo, "add", "-f", "package.json", "package-lock.json")
     _git(repo, "commit", "-m", "init")
 
     (repo / "package-lock.json").write_text('{"lock":"runtime-churn"}\n')

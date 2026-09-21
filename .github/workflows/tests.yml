@@ -111,6 +111,8 @@ jobs:
           source .venv/bin/activate
           if [[ "$FORK_SCOPE" == "true" ]]; then
             python scripts/ci/run_fork_tests.py
+          elif [[ "$GITHUB_REPOSITORY" == "0xble/hermes-agent" ]]; then
+            scripts/run_tests.sh tests candidate-extensions
           else
             scripts/run_tests.sh
           fi

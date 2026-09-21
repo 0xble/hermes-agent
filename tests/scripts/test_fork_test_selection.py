@@ -16,6 +16,7 @@ def test_changed_test_is_added_to_all_maintained_surfaces():
     units = {path.stem for path in (ROOT / "maintenance").glob("*.md")}
     # Runtime ownership is an activation contract, not a source proof unit.
     assert set(surfaces) == units - {"runtime-ownership"}
+    assert {str(path.relative_to(ROOT)) for path in (ROOT / "candidate-extensions").glob("*/test_*.py")} <= set(surfaces["candidate-extensions"])
     assert all(tests for tests in surfaces.values())
     assert all((ROOT / path).is_file() for tests in surfaces.values() for path in tests)
     changed = "tests/test_utils_truthy_values.py"
@@ -74,7 +75,7 @@ def test_workflow_diff_respects_branch_history(tmp_path, monkeypatch, event_kind
     monkeypatch.setattr(run_fork_tests.subprocess, "call", lambda command, **kw: commands.append(command) or 0)
 
     assert run_fork_tests.main() == 0
-    expected = ["tests/test_added.py", "tests/test_maintained.py"] if event_kind == "pull_request" else []
+    expected = ["tests/test_added.py", "tests/test_maintained.py"] if event_kind == "pull_request" else ["tests", "candidate-extensions"]
     if event_kind == "manual_smoke":
         expected = ["tests/test_maintained.py"]
     assert commands == [["bash", "scripts/run_tests.sh", *expected]]

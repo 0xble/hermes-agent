@@ -12,7 +12,7 @@ class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = str(Path(tempfile.mkdtemp()).resolve())
         self.cron_dir = Path(self.tmpdir) / "cron"
         self.output_dir = self.cron_dir / "output"
 
@@ -78,7 +78,7 @@ class TestConfigFilePermissions(unittest.TestCase):
     """Verify config files get secure permissions."""
 
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
+        self.tmpdir = str(Path(tempfile.mkdtemp()).resolve())
 
     def tearDown(self):
         import shutil

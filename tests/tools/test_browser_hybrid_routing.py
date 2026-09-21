@@ -12,6 +12,7 @@ The downstream session creation is covered by test_browser_cloud_fallback.py.
 """
 from unittest.mock import Mock
 
+import socket
 import pytest
 
 import tools.browser_tool as browser_tool
@@ -41,6 +42,10 @@ class TestNavigationSessionKey:
 
     def test_public_url_uses_bare_task_id(self, monkeypatch):
         """Public URL with cloud provider configured → bare task_id (cloud)."""
+        def public_dns(host, port, *args, **kwargs):
+            assert host in ['github.com']
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+        monkeypatch.setattr(socket, "getaddrinfo", public_dns)
         monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: Mock())
         key = browser_tool._navigation_session_key("default", "https://github.com/x/y")
         assert key == "default"

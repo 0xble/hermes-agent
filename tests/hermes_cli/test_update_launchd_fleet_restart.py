@@ -197,6 +197,10 @@ class TestProbeLaunchdDomainForLabel:
 
 class TestGetServicePidsScoping:
     def _wire(self, monkeypatch):
+        # Service discovery is synthetic, including the fallback prefix scan
+        # and descendants of these fixture PIDs.
+        monkeypatch.setattr(gw.subprocess, "run", lambda *a, **k: _completed())
+        monkeypatch.setattr(gw, "_gateway_descendants_of", lambda pid: set())
         monkeypatch.setattr(gw, "is_macos", lambda: True)
         monkeypatch.setattr(gw, "supports_systemd_services", lambda: False)
         monkeypatch.setattr(gw, "get_launchd_label", lambda: "ai.hermes.gateway")
@@ -642,12 +646,14 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
+    @pytest.mark.skipif(sys.platform != "darwin", reason="native macOS recovery hint")
     def test_launchd_labels_get_launchctl_hint(self, capsys):
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
-        assert "launchctl kickstart -k" in out
+        assert "launchctl bootstrap" in out
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="native Linux recovery hint")
     def test_systemd_units_keep_systemctl_hint(self, capsys):
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out

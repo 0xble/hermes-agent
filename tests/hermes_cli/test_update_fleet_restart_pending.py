@@ -343,7 +343,17 @@ def test_stale_fleet_matrix_on_latest_receipt_is_pending(monkeypatch):
     assert update_cmd._pending_fleet_restart_needed() is True
 
 
-def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
+def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        update_cmd_fleet.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.get_launchd_plist_path", lambda: tmp_path / "absent.plist"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway.launchd_gateway_labels_for_install", lambda: []
+    )
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **k: []
     )

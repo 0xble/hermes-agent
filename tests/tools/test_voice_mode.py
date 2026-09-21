@@ -2,6 +2,7 @@
 
 import os
 import struct
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -121,10 +122,19 @@ def fake_clock(monkeypatch):
 # ============================================================================
 
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
+    @pytest.fixture
+    def pulse_dir(self):
+        # Unix socket names have a 104-byte limit on macOS. Pytest's full
+        # per-test directory can exceed it before the socket is appended.
+        with tempfile.TemporaryDirectory(
+            prefix="hp-", dir="/tmp" if os.name == "posix" else None
+        ) as directory:
+            yield Path(directory)
+
+    def test_stale_socket_file_not_reachable(self, monkeypatch, pulse_dir):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = pulse_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -132,14 +142,14 @@ class TestPulseSocketReachable:
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(pulse_dir))
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
+    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, pulse_dir):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = pulse_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path))
@@ -147,7 +157,7 @@ class TestPulseSocketReachable:
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(pulse_dir))
             from tools.voice_mode import _pulse_socket_reachable
             assert _pulse_socket_reachable() is True
         finally:
@@ -1408,6 +1418,7 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.linux_only
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 

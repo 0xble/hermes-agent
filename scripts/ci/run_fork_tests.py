@@ -2,7 +2,7 @@
 """Bounded fork proof surfaces, plus changed tests. Unknown code runs the full suite.
 
 The manifest covers each maintenance unit. This is a hosted smoke gate, not a
-claim of complete-suite coverage. Use scripts/run_tests.sh for the complete gate.
+claim of complete-suite coverage. Use scripts/run_tests.sh tests candidate-extensions for the complete gate.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def main() -> int:
         if manual_smoke else select_tests(changed, surfaces)
     )
     print(f"Fork selection: {len(selected)} files" if selected else "Unclassified change: running full Python suite", flush=True)
-    return subprocess.call(["bash", "scripts/run_tests.sh", *(selected or [])], cwd=ROOT)
+    return subprocess.call(["bash", "scripts/run_tests.sh", *(selected if selected is not None else ["tests", "candidate-extensions"])], cwd=ROOT)
 
 
 if __name__ == "__main__":

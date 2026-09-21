@@ -15,6 +15,7 @@ that actually reaches the Bot API.
 
 from __future__ import annotations
 
+import socket
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,7 +25,12 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    def resolve(host, port, *args, **kwargs):
+        assert host == "example.com"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._metadata_thread_id = lambda metadata: None

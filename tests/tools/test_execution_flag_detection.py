@@ -37,10 +37,10 @@ def test_real_read_tool_binaries_confirm_option_ownership(
     [
         ("rg", ["--pre", "-payload-marker", "needle", "{input}"], None, False),
         ("rg", ["--hostname-bin=-payload-marker", "needle", "{input}"], None, False),
-        ("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False),
-        ("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True),
-        ("man", ["--pager", "-payload-marker", "ls"], None, True),
-        ("man", ["-P", "-payload-marker", "ls"], None, True),
+        pytest.param("sort", ["--buffer-size=1K", "--compress-program", "-payload-marker"], "{bulk}", False, marks=pytest.mark.linux_only),
+        pytest.param("ag", ["--pager=-payload-marker", "needle", "{input}"], None, True, marks=pytest.mark.linux_only),
+        pytest.param("man", ["--pager", "-payload-marker", "ls"], None, True, marks=pytest.mark.linux_only),
+        pytest.param("man", ["-P", "-payload-marker", "ls"], None, True, marks=pytest.mark.linux_only),
     ],
 )
 def test_real_binaries_execute_leading_dash_program_payload(
@@ -69,6 +69,7 @@ def test_real_binaries_execute_leading_dash_program_payload(
         "TERM": "xterm",
     }
     argv = [tool, *resolved_args]
+    # GNU script flags below and GNU sort compression are Linux contracts.
     if needs_tty:
         argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
