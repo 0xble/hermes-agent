@@ -3,7 +3,10 @@
 ## Required behavior
 
 The routine fork Python lane runs every maintained unit's proof surface plus changed
-Python test files when the change is limited to tests or documentation. Production,
+canonical `test_*.py` modules when the change is limited to those tests or inert
+Markdown under `maintenance/`, `docs/`, or `website/docs/`, plus root README and
+MAINTENANCE. Runtime skills, prompts, AGENTS instructions, helper modules, and
+executable files under documentation roots still require full discovery. Production,
 shared fixtures, workflows, dependencies, deleted tests, missing diff context, and
 other unclassified changes run full discovery. Selection never reports a full-suite
 pass for smoke coverage. `scripts/ci/fork_test_surfaces.json` owns the explicit file
@@ -21,7 +24,14 @@ The fork's configured runner is `ubuntu-latest` with four test workers. Full Pyt
 jobs previously timed out at 30 minutes after 62–81% of coverage. Allow 90 minutes
 for a complete run on this runner. Upstream's 96-core lane retains its 30-minute
 limit. A longer timeout is capacity headroom, not proof of a passing full suite.
-No protection rule or required status is removed. Other CI lanes are unchanged.
+No protection rule or required status is removed. Other hosted CI lanes are unchanged.
+
+The existing PR #50 correction is reused with original attribution and a fork
+trailer: the isolated local Node merge gate excludes signed desktop packaging,
+whose stamp requires a branch and cannot truthfully describe a detached checkout.
+All nine nonrelease workspace checks remain. Hosted workspace validation supplies
+no skip option and retains all ten units. Unknown skip labels fail, preventing
+silent narrowing through a typo. This changes neither runtime nor release behavior.
 
 ## Provenance and disposition
 

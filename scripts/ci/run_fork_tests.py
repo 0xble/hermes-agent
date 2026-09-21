@@ -22,13 +22,23 @@ def select_tests(changed: list[str], surfaces: dict[str, list[str]]) -> list[str
     selected = {test for tests in surfaces.values() for test in tests}
     for path in changed:
         if path.startswith("tests/") and path.endswith(".py"):
-            # Shared fixtures and deleted tests require full discovery.
-            if Path(path).name == "conftest.py" or not (ROOT / path).is_file():
+            # Only canonical test modules have bounded scope. Helpers, package
+            # initializers, shared fixtures, and deleted tests require discovery.
+            if not Path(path).name.startswith("test_") or not (ROOT / path).is_file():
                 return None
             selected.add(path)
-        elif path.startswith(("maintenance/", "website/", "docs/")) or path.endswith(".md"):
+        elif (
+            path in {"README.md", "MAINTENANCE.md"}
+            or (
+                path.startswith(("maintenance/", "website/docs/", "docs/"))
+                and path.endswith(".md")
+                and Path(path).name not in {"AGENTS.md", "SKILL.md"}
+            )
+        ):
+            # Runtime skills, prompts, instructions, and executable docs files
+            # are not inert documentation, even when written as Markdown.
             continue
-        elif path.startswith("tests/conformance/vectors/"):
+        elif path.startswith("tests/conformance/vectors/") and path.endswith(".json"):
             selected.add("tests/conformance/test_vector_generator.py")
         else:
             # Do not guess the dependency fan-out of production, packaging,

@@ -11,6 +11,31 @@ def test_unclassified_or_shared_changes_run_complete_suite(changed):
     assert select_tests(changed, {"unit": ["tests/test_utils_truthy_values.py"]}) is None
 
 
+@pytest.mark.parametrize("path", [
+    "tests/helpers.py", "tests/__init__.py", "tests/pkg/_fixtures.py",
+    "tests/conftest.py", "tests/example_test.py",
+    "skills/example/SKILL.md", "AGENTS.md", "docs/AGENTS.md",
+    "docs/SKILL.md", "prompts/system.md", "candidate-extensions/example/README.md",
+    "website/src/runtime.ts", "website/docs/generator.py", "docs/generator.py",
+    "maintenance/helper.py", "tests/conformance/vectors/generator.js",
+])
+def test_existing_shared_or_runtime_input_runs_complete_suite(tmp_path, monkeypatch, path):
+    from scripts.ci import run_fork_tests
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("", encoding="utf-8")
+    monkeypatch.setattr(run_fork_tests, "ROOT", tmp_path)
+    assert select_tests([path], {"unit": ["tests/test_proof.py"]}) is None
+
+
+@pytest.mark.parametrize("path", [
+    "README.md", "MAINTENANCE.md", "maintenance/fork-ci.md",
+    "docs/guide.md", "website/docs/guide.md",
+])
+def test_inert_documentation_keeps_maintained_proofs(path):
+    assert select_tests([path], {"unit": ["tests/test_proof.py"]}) == ["tests/test_proof.py"]
+
+
 def test_changed_test_is_added_to_all_maintained_surfaces():
     surfaces = json.loads(MANIFEST.read_text(encoding="utf-8"))
     units = {path.stem for path in (ROOT / "maintenance").glob("*.md")}
