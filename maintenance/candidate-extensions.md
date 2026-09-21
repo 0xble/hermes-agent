@@ -13,6 +13,9 @@ the extension installer, or the personal skill curation procedure. The
   Committed `goal_set` mutations carry a `notice` receipt that
   `agent/inline_tool_executors.py` surfaces through the agent notice lane
   (`goals.auto_notices`).
+  New goals inherit the active profile's `goals.max_turns`, with the native
+  default for absent or invalid values. Model arguments cannot override that
+  policy. Reading or extending an existing goal preserves its stored budget.
 - The memory journal is hash-chained, verifiable, and growth-bounded.
 - `plugins/canonical-skill-guard/` enforces personal skill ownership on canonical external
   skill writes. `scripts/curate_skill_observations.py` must verify PR success before treating

@@ -10,7 +10,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from hermes_cli.goals import GoalContract, GoalManager, load_goal
+from hermes_cli.goals import DEFAULT_MAX_TURNS, GoalContract, GoalManager, load_goal
 
 _SCHEMA = {
     "name": "goal_set",
@@ -43,6 +43,17 @@ def _session_id(kwargs: Mapping[str, Any]) -> str:
 def _state_payload(manager: GoalManager) -> dict[str, Any] | None:
     state = manager.state
     return json.loads(state.to_json()) if state is not None else None
+
+
+def _configured_max_turns() -> int:
+    """Use the active profile's policy, never model-supplied tool arguments."""
+    from hermes_cli.config import load_config
+
+    try:
+        value = int(((load_config() or {}).get("goals") or {}).get("max_turns") or DEFAULT_MAX_TURNS)
+        return value if value > 0 else DEFAULT_MAX_TURNS
+    except (TypeError, ValueError, AttributeError):
+        return DEFAULT_MAX_TURNS
 
 
 def format_goal_notice(action: str, state: Any, *, subgoal: str | None = None) -> str:
@@ -90,7 +101,8 @@ def goal_set(args: dict[str, Any], **kwargs: Any) -> str:
                 for key in ("verification", "constraints", "boundaries", "stop_when")
                 if str(args.get(key) or "").strip()
             }
-            state = manager.set(goal, contract=GoalContract.from_dict(contract_data))
+            state = manager.set(goal, max_turns=_configured_max_turns(),
+                                contract=GoalContract.from_dict(contract_data))
             persisted = load_goal(sid)
             if persisted is None or persisted.to_json() != state.to_json():
                 return _result(success=False, error_code="goal_persistence_failed",
