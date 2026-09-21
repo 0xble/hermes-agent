@@ -24,7 +24,7 @@ the migration overlay snapshot is historical evidence, not current authority.
 
 ## Scheduled procedures
 
-The personal profile's script jobs use regular files under `$HERMES_HOME/scripts`.
+The personal profile's script jobs and optional sync helper use regular files under `$HERMES_HOME/scripts`.
 `scripts/install_candidate_extensions.py --maintenance-only --home <profile>` installs
 sync/verifier forwarding entry points without changing plugins or configuration.
 They execute procedures in `<profile>/hermes-agent/scripts`, so native promotion
@@ -38,19 +38,55 @@ It checks these imports before beginning and records each result under
 
 | Job | Canonical procedure | Invocation contract and verification |
 |---|---|---|
-| `sync-hermes-fork` | `scripts/sync_fork_candidate.py` | The versioned host wrapper supplies `--repo`, `--source-repo`, `--candidate origin/main`, `--verify-current`, and `--publish`. Release ancestry determines the current base. Missing dedicated sync worktrees are recreated and locked against cleanup. Inspect tested SHA and remote candidate readback. |
+| `sync-hermes-fork` | Agent-owned source maintenance, with optional `scripts/sync_fork_candidate.py` helper | Use `gpt-6-astra`, `custom:codex-proxy`, low reasoning, agent mode, and no automatic script pre-run. In a dedicated linked worktree, integrate the selected upstream release, resolve conflicts, repair relevant failures, obtain required independent review, and land through the protected fork PR route. Inspect tested candidate, review evidence, and published `origin/main` readback. |
 | `verify-hermes-fork` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect trailer, unit-ownership, registration, and native receipt results plus actual runtime evidence. |
 | `curate-skill-observations` | `scripts/curate_skill_observations.py` | Host wrapper supplies a dedicated `--dotfiles` worktree. Without `--publish`, it validates then restores staging. That is not a published curation change. |
 | `snapshot-profile-state` | `candidate-profile/snapshot_profile_state.sh` | Verify the output manifest and isolated restoration. This small-state procedure does not establish a full `state.db` backup. |
 
 Schedules, delivery targets, and enabled state live in the profile's cron store.
-Do not recreate jobs from this document or add a competing scheduler. Sync tests
-even a current release and publishes only `candidate/<tag>`. Conflicts and failed
-tests stop publication. Fork `main` and runtime promotion remain separate reviewed
-actions. A source-only check does not establish runtime health. Manually promote
-reviewed fork `main` through `hermes update --yes`, retaining quick snapshots, then
-check the native receipt, live identity, and a real model round trip.
+Edit the existing job through the supported cron interface. Do not recreate jobs
+from this document or add a competing scheduler. The agent owns diagnosis and
+repair even when the optional candidate builder stops on a conflict or failed test.
+Helper publication to `candidate/<tag>` is not protected landing on fork `main`.
+Release selection and ancestry follow the root contract. The main agent's low
+reasoning pin does not override the independent review route's effort policy.
+
+Source landing and runtime promotion remain separate. A source-only check does
+not establish runtime health. Manually promote reviewed fork `main` through
+`hermes update --yes` only with activation authority, retaining quick snapshots,
+then check the native receipt, live identity, and a real model round trip.
 Company updates continue through their signed release owners, not these personal jobs.
+
+### Progress and failure handling
+
+- Resume the existing candidate and inspect prior receipts, live process handles,
+  and locks before starting work. Preserve unfinished conflict resolutions and
+  valid exact-candidate test/review evidence. Do not reset progress each day.
+- Record immutable release and candidate SHAs. Reconcile moving `origin/main`
+  explicitly and revalidate affected evidence. Do not make unrelated changes to
+  the primary checkout's HEAD invalidate a dedicated candidate, or restore the
+  retired fork's guard/verifier machinery.
+- Preflight credentials, test dependencies, and disk headroom before expensive
+  work. Diagnose environmental failures separately from regressions. Confirm an
+  upstream failure on the frozen release when needed, without weakening backup
+  reserves, security checks, or branch protection to obtain a pass.
+- Run long tests through the canonical runner using tracked background execution
+  and a bounded completion budget. Keep process identity, logs, and exit status.
+  A short foreground terminal timeout can kill the process tree. Dispatch or
+  a surviving log file is not evidence of completion.
+- When the same blocker recurs, inspect what changed before repeating expensive
+  work. Change the diagnosis or repair strategy, or report the precise external
+  prerequisite and next action. Keep the candidate checkpoint and failed evidence
+  visible instead of producing an unchanged daily restart loop.
+- Write a per-fire receipt under `<profile>/maintenance/fork-sync/` with run and
+  candidate identity, completed stages, actual checks/review, remote readback,
+  and unresolved blockers. Receipts are evidence, not a separate completion
+  verifier. A blocked, deferred, or incomplete run must begin its final response
+  with the exact standalone line `[CRON_FAILURE]`, followed by the diagnosis and
+  next action. The native scheduler recognizes that first-line marker and records
+  failure status and streaks. Do not hide an incomplete run with silence or a
+  success summary. An already-current result still requires fresh release and
+  remote identity checks.
 
 ## Recovery and acceptance
 
