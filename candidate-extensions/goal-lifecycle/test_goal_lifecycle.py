@@ -58,6 +58,34 @@ def test_set_without_contract_has_no_contract_block(plugin):
     assert result["notice"] == f"⊙ Goal set ({result['state']['max_turns']}-turn budget): Plain goal"
 
 
+@pytest.mark.parametrize("configured, expected", [(100, 100), (7, 7), ("35", 35)])
+def test_set_uses_profile_budget_and_preserves_existing_budget(plugin, monkeypatch, configured, expected):
+    from hermes_cli import config
+    from hermes_cli.goals import load_goal
+
+    monkeypatch.setattr(config, "load_config", lambda: {"goals": {"max_turns": configured}})
+    result = call(plugin, {"action": "set", "goal": "Configured budget", "max_turns": 999})
+    assert result["success"] is True
+    assert result["state"]["max_turns"] == expected
+    assert load_goal("slice3-test").max_turns == expected
+    assert f"({expected}-turn budget)" in result["notice"]
+    monkeypatch.setattr(config, "load_config", lambda: {"goals": {"max_turns": 123}})
+    assert call(plugin, {"action": "status"})["state"]["max_turns"] == expected
+    assert call(plugin, {"action": "subgoal_add", "text": "Keep budget"})["state"]["max_turns"] == expected
+
+
+@pytest.mark.parametrize("settings", [{}, {"goals": None}, {"goals": {"max_turns": "bad"}},
+                                    {"goals": {"max_turns": 0}}, {"goals": {"max_turns": -1}}])
+def test_set_falls_back_for_missing_or_invalid_budget(plugin, monkeypatch, settings):
+    from hermes_cli import config
+    from hermes_cli.goals import DEFAULT_MAX_TURNS
+
+    monkeypatch.setattr(config, "load_config", lambda: settings)
+    result = call(plugin, {"action": "set", "goal": "Default budget"})
+    assert result["success"] is True
+    assert result["state"]["max_turns"] == DEFAULT_MAX_TURNS
+
+
 def test_rejected_and_failed_results_carry_no_notice(plugin):
     assert "notice" not in call(plugin, {"action": "set", "goal": ""})
     call(plugin, {"action": "set", "goal": "first"})
