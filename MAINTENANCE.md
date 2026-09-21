@@ -6,7 +6,7 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 [`0xble/hermes-agent`](https://github.com/0xble/hermes-agent), branch `main`.
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
-`v2026.9.14`, `345cd2b057a452236de401d3534b8502a7465e8d`.
+`v2026.9.21`, `d337b736aa1e8ebecfab043842d13e4a2d2f48a3`.
 This replacement fork was established on 2026-09-19. The former fork is preserved
 as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
@@ -48,8 +48,8 @@ condition; there is no central ledger. Every non-merge commit after the trailer 
 identity. A unit owns an identity by naming it as a backticked token on an identity line
 (a line, or its indented continuation, that says "identity" or "identities" before the
 first backtick); other code spans do not own. Commits whose identity is `evidence` are
-records, not patches. This contract's own patch identity: `maintenance-contract`. A sync
-rebase rewrites the floor SHA; the checker requires the floor to be an ancestor of HEAD,
+records, not patches. This contract's own patch identity: `maintenance-contract`. Upstream release ancestry is excluded from fork trailer classification. Historical
+rebases can rewrite the floor SHA; the checker requires the floor to be an ancestor of HEAD,
 locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
 A maintenance unit may repair missing published metadata with an explicit
 `Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only
@@ -65,7 +65,7 @@ Fetch `origin/main` and upstream release tags, select the newest upstream releas
 and reconcile each logical patch against it in an isolated worktree. Compare
 upstream `main` separately for unreleased fixes worth explicit temporary backports.
 Use `scripts/sync_fork_candidate.py` only as a candidate builder: a successful
-rebase or published candidate does not authorize promotion. Refresh release-tag
+release merge or published candidate does not authorize promotion. Refresh release-tag
 selection before reporting current and prove the selected tag is an ancestor of
 the proposed fork head. Report upstream-main divergence separately from release
 currency. Preserve this release policy when applying generic maintenance guidance.
@@ -85,3 +85,9 @@ currency. Preserve this release policy when applying generic maintenance guidanc
 - For separately authorized activation, use the runtime support file's host-specific
   acceptance and recovery requirements. Preserve unresolved acceptance gaps until
   demonstrated behavior closes them.
+
+Release adoption preserves published fork history with a merge commit. The maintained
+branch must allow merges while retaining its required App-bound local CI, strict checks,
+admin enforcement, and prohibition on force pushes. Conflict resolution and review happen
+on a candidate branch before normal protected landing. Unattended sync disables rerere
+so unreviewed remembered resolutions cannot silently resolve a new release conflict.

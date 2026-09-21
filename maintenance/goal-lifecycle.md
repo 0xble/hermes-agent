@@ -55,3 +55,7 @@ negative admission and failure paths. They do not contact Telegram or a live LLM
 Retire each patch when the accepted upstream release includes equivalent behavior
 and passes its regressions. Revert its source change to roll back. No schema or
 goal migration is introduced. Landing is not runtime promotion or activation.
+
+The v2026.9.21 integration preserves trusted user-turn admission across upstream
+prompt metadata and compute-host changes. Title previews remain presentation data,
+and hidden or relayed turns do not acquire user authority.
