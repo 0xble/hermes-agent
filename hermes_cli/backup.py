@@ -734,6 +734,10 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     if skipped_dirs:
         print("\n  Excluded directories:\n" + "\n".join(f"    {d}/" for d in sorted(skipped_dirs)))
     if errors:
+        # Console previews are capped; retain every failure in the profile log
+        # so an incomplete archive can be diagnosed without another full export.
+        for error in errors:
+            logger.warning("backup archive=%s entry_failure=%s", out_path, json.dumps(error))
         _print_capped(f"\n  Archive kept, but {len(errors)} file(s) could not be added:", errors, "  ")
     else:
         print(f"\nRestore with: hermes import {out_path.name}")
