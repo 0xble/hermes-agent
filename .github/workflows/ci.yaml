@@ -186,6 +186,11 @@ jobs:
     needs: detect
     uses: ./.github/workflows/case-collision-check.yml
 
+  fork-patch-check:
+    name: Check Fork-Patch trailers
+    needs: detect
+    uses: ./.github/workflows/fork-patch-check.yml
+
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
@@ -245,6 +250,7 @@ jobs:
       - contributor-check
       - uv-lockfile
       - case-collision-check
+      - fork-patch-check
       - lockfile-diff
       - docker-lint
       - profile-artifact-check
@@ -277,13 +283,22 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # A job result is success, failure, cancelled or skipped. Counting only
+          # 'failure' let 'cancelled' through as a pass, and a job that exceeds
+          # timeout-minutes is recorded as cancelled -- so a suite that ran out of
+          # time reported green with most of it never executed. Observed on #42,
+          # #51 and #53, each cancelled at exactly the 30-minute cap while this
+          # gate said All required checks pass. Only 'skipped' is a real pass
+          # here; the conditional job graph relies on it.
+          blocked = [name for name, info in needs.items()
+                     if info['result'] not in ('success', 'skipped')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if blocked:
+              detail = ', '.join(f'{n}={needs[n][\"result\"]}' for n in blocked)
+              print(f'::error::{len(blocked)} job(s) did not pass: {detail}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

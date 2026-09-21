@@ -35,7 +35,17 @@ silent narrowing through a typo. This changes neither runtime nor release behavi
 
 ## Provenance and disposition
 
-Fork patch identity: `fork-ci-reliability`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+
+`ci-gate-cancelled-blocks` makes the required-checks gate reject a result that is not a
+pass, and makes the Fork-Patch contract a required check rather than an honour system.
+The gate counted only `failure`, so `cancelled` fell through to success -- and a job that
+exceeds `timeout-minutes` is recorded as cancelled, which is how #42, #51 and #53 each
+reported all checks passing after being cut off mid-suite at the 30-minute cap this unit
+raises. The trailer rule landed in #47 as a client-side commit-msg hook, which a squash
+merge composes past; #48 merged one commit later with no trailer (repaired in #55 via
+`Fork-Patch-Backfill`). Retire either half if the gate stops being assembled in
+`ci.yaml`, or if trailer enforcement moves into the merge queue.
 Upstream design checked at `0ddeaf9334ff232a01612a51520a043db2cab77b` on 2026-09-21.
 Root AGENTS and CONTRIBUTING require the canonical isolated runner and behavioral
 regressions. The upstream runner assumes 96 cores; replicating that hosted cost

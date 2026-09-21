@@ -31,12 +31,33 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `slice-12-per-job-timezone`, `slice-12 truthful-contention` (the space is the trailer's
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
-  `backup-zip-timestamps`, `evidence` (records, not patches). `maintenance-contract` is owned
-  by the root contract.
+  `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
+  `evidence` (records, not patches). `maintenance-contract` is owned by the root contract.
 - `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
   one cross-process slot, which is the fix the message exists to compensate for.
+- `vanished-entry-test-contract`: test-only, on top of the diagnostics rewrite in #54.
+  Adds the one assertion #38 never made: `entry_vanished=` is recorded in the profile log.
+  #38 is NOT uncovered -- `fc45821e1f` shipped four tests pinning the return value, the
+  critical-file exception, the nested-basename case and the mass-vanish ceiling -- but all
+  four read the console and the filesystem, and the console preview is capped, so a run
+  diagnosed days later has only the log.
+  Also renames the fixture's archives to timestamps. `_newest_first` orders by NAME, so
+  `previous` sorted above `current` and a regressed prune gate would have deleted the NEW
+  archive with the preservation assertion still passing. Both additions are mutation-proven:
+  dropping `not errors` from the prune gate, and routing vanished entries back to `on_error`,
+  each fail exactly one of them.
+  Retire it if the two classifications are ever merged back into one.
+- `snapshot-prune-latch`: a file omitted for size is a standing property of that file, so it
+  must not latch the snapshot prune off forever. A capture failure still blocks the prune; a
+  size skip prunes while protecting any snapshot that still holds a file this run omitted, so
+  the only copy is never the one deleted. The same pass reclaims abandoned `.partial` staging
+  directories, which `_snapshot_dirs` excludes by design and nothing else ever removed. It runs
+  under the caller's exclusive backup lock. The just-published snapshot is excluded from the
+  prune because ordering is by name, not mtime, and recycled ids can sort the newest first.
+  Retire it if snapshot retention moves to an age-based policy that no longer consults
+  per-file omission state.
 - Upstream contribution: none recorded for the local patches. The two adopted backup
   fixes retire when the candidate release retains them.
 - `backup-zip-timestamps`: both full ZIP writers use the standard library's timestamp

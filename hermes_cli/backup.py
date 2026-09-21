@@ -1265,8 +1265,9 @@ def _copy_quick_snapshot_files(
                 print(f"  ⚠ Snapshot: skipping {rel} "
                       f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)")
                 logger.warning("Quick snapshot skipped %s: %d bytes exceeds %d byte limit", rel, size, max_file_size)
-                if src.suffix == ".db":
-                    oversized_skipped.append(rel)
+                # Every omitted file, not just databases: protection is about what this
+                # run left out, and an oversized auth.json is no less the only copy.
+                oversized_skipped.append(rel)
                 continue
         dst = staging_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1336,6 +1337,18 @@ def _create_quick_snapshot_locked(
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.name != "nt":
         os.chmod(root, 0o700)
+    # Staging from a run that died before it could rename or clean up. Only the creating
+    # process removes these, and _snapshot_dirs deliberately excludes ``.partial`` so the
+    # prune never sees them either — so nothing reclaimed them, ever. Observed on a live
+    # install as two abandoned directories holding 22 GB, one a half-copied 14 GB database.
+    # This runs under the caller's exclusive backup lock, so no other snapshot of this home
+    # can be live and anything still here belongs to a process that is gone.
+    for stale in root.glob("*.partial"):
+        if stale == staging_dir or not stale.is_dir() or stale.is_symlink():
+            continue
+        shutil.rmtree(stale, ignore_errors=True)
+        if not stale.exists():
+            logger.warning("Removed abandoned snapshot staging %s", stale.name)
     staging_dir.mkdir(mode=0o700, exist_ok=False)
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
     manifest, failed_dbs, oversized_skipped = _copy_quick_snapshot_files(home, staging_dir, max_file_size)
@@ -1361,18 +1374,36 @@ def _create_quick_snapshot_locked(
     _secure_quick_snapshot_tree(root, staging_dir)
     os.replace(staging_dir, root / snap_id)
     # Auto-prune (pre-update callers pass a smaller keep so state.db copies don't accumulate).
-    # Skip when a DB failed to capture OR was skipped for size (#68805): the snapshot is
-    # incomplete and the older one may hold the only recoverable database.
-    if not (failed_dbs or oversized_skipped):
-        _prune_oldest(_snapshot_dirs(root), _QUICK_DEFAULT_KEEP if keep is None else keep, shutil.rmtree, "snapshot")
+    # Skip when a DB FAILED to capture (#68805): the snapshot is incomplete for a reason the
+    # next run may not repeat, and an older one may hold the only recoverable database.
+    #
+    # Being skipped for SIZE is not that. It is a standing property of the file, so the
+    # condition never clears: a state.db past the cap made this branch permanent, pruning
+    # never ran again, and snapshots grew without bound. Observed on a live install as 26
+    # directories and 32 GB, still climbing, every one of them ALSO missing that database —
+    # so the guard was preserving snapshots that did not contain the thing it was protecting.
+    #
+    # Keep any snapshot that holds a database this one had to skip, and prune the rest.
+    if failed_dbs:
+        logger.warning(
+            "Skipping snapshot prune because %d DB(s) failed to capture "
+            "— preserving older snapshots as recovery source", len(failed_dbs))
     else:
         if oversized_skipped:
-            print("  ⚠ Skipping snapshot prune: DB file(s) skipped for size: " + ", ".join(oversized_skipped))
-            logger.warning("Quick snapshot skipped oversized DB file(s): %s", ", ".join(oversized_skipped))
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture and/or %d were oversized "
-            "— preserving older snapshots as recovery source",
-            len(failed_dbs), len(oversized_skipped))
+            print("  ⚠ Snapshot omits oversized file(s): " + ", ".join(oversized_skipped))
+            logger.warning("Quick snapshot skipped oversized file(s): %s", ", ".join(oversized_skipped))
+        # Never the one just published. Ordering is by NAME, and ids recycle once a prune
+        # frees a timestamp, so two snapshots in the same second can sort such that the
+        # newest is the one deleted. Excluding it makes that unreachable.
+        candidates = [d for d in _snapshot_dirs(root) if d.name != snap_id]
+        prunable = [d for d in candidates if not _holds_any(d, oversized_skipped)]
+        protected = len(candidates) - len(prunable)
+        if protected:
+            logger.info("Snapshot prune protecting %d snapshot(s) that still hold %s",
+                        protected, ", ".join(oversized_skipped))
+        # keep counts the new snapshot, which is no longer in the list.
+        _prune_oldest(prunable, max(0, (_QUICK_DEFAULT_KEEP if keep is None else keep) - 1),
+                      shutil.rmtree, "snapshot")
     logger.info("quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
                 snap_id, len(manifest), sum(manifest.values()))
     return snap_id
@@ -1383,6 +1414,16 @@ def _newest_first(root: Path, keep_entry) -> List[Path]:
     if not root.exists():
         return []
     return sorted(filter(keep_entry, root.iterdir()), key=lambda p: p.name, reverse=True)
+
+
+def _holds_any(snapshot_dir: Path, names) -> bool:
+    """Does *snapshot_dir* contain any of *names* (relative paths within a snapshot)?
+
+    Used to protect a snapshot that still holds a database a later run had to skip for
+    size: deleting it would drop the only copy, while deleting one that is missing the
+    same file costs nothing.
+    """
+    return any((snapshot_dir / name).exists() for name in names)
 
 
 def _snapshot_dirs(root: Path) -> List[Path]:
