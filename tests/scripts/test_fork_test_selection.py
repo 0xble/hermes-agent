@@ -30,7 +30,7 @@ def test_workflow_diff_respects_branch_history(tmp_path, monkeypatch, event_kind
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, check=True, text=True, capture_output=True,
+            ["git", *args], cwd=tmp_path, check=True, text=True, encoding="utf-8", capture_output=True,
         ).stdout.strip()
 
     git("init", "-b", "main")

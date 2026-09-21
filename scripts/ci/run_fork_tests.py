@@ -44,7 +44,7 @@ def main() -> int:
     changed = []
     if base and set(base) != {"0"}:
         revision = f"{base}...{head}" if event.get("pull_request") else f"{base}..{head}"
-        diff = subprocess.run(["git", "diff", "--name-only", revision], cwd=ROOT, capture_output=True, text=True)
+        diff = subprocess.run(["git", "diff", "--name-only", revision], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if diff.returncode == 0:
             changed = diff.stdout.splitlines()
     surfaces = json.loads(MANIFEST.read_text(encoding="utf-8"))
