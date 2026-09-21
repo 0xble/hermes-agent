@@ -702,3 +702,45 @@ def test_transient_failure_signal_is_owned_by_a_home(tmp_path):
     assert registry.last_apply_had_transient_failure(primary) is True
     assert registry.last_apply_had_transient_failure(secondary) is False
     registry._reset_registry_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_repeated_transient_failures_eventually_park(monkeypatch, tmp_path):
+    """A permanently dead secrets backend must stop looping and park visibly.
+
+    The generated systemd unit disables the generic start limiter and leans on the
+    fatal-config exit as its only backstop, so an unbounded restartable exit would
+    restart every RestartSec forever with no parked state for an operator to find.
+    """
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    codes = []
+    for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT):
+        runner = await _run_startup(
+            monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+        )
+        codes.append(runner.exit_code)
+
+    assert all(c != GATEWAY_FATAL_CONFIG_EXIT_CODE for c in codes[:-1]), (
+        "early attempts must stay restartable so a brief outage self-heals"
+    )
+    assert codes[-1] == GATEWAY_FATAL_CONFIG_EXIT_CODE, (
+        "a backend that never comes back must park instead of looping"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_successful_connect_forgives_the_streak(monkeypatch, tmp_path):
+    """The budget is for CONSECUTIVE failures; recovering must reset it."""
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT - 1):
+        await _run_startup(monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    GatewayRunner(GatewayConfig(platforms={}, sessions_dir=tmp_path / "s"))._reset_transient_exit_streak()
+
+    runner = await _run_startup(
+        monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
+    )
+    assert runner.exit_code != GATEWAY_FATAL_CONFIG_EXIT_CODE

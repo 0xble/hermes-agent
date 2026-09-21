@@ -80,12 +80,11 @@ def _classify_op_error(message: str) -> ErrorKind:
     return classify_cli_error(message, _OP_ERROR_RULES)
 
 
-# A rejected or lapsed credential must not EXTEND the cache: the identity that resolved
-# those values is no longer trusted, so the entry is left to age out on its existing TTL
-# rather than being rewritten. Values already inside a fresh entry are still served for
-# the remainder of that TTL, exactly as a plain cache hit would serve them — narrowing
-# that window is a TTL decision, not this function's. Slow or unreachable backends are a
-# different class and invalidate nothing (see the ErrorKind docstring in ``base``).
+# Kinds that mean the credential itself was refused. Whether that refusal is about the
+# IDENTITY or about one ITEM is decided by scope at the call site, not by the kind: `op`
+# reports a revoked token and an item the token may not read with the same wording.
+# Slow or unreachable backends are a different class and invalidate nothing entirely
+# (see the ErrorKind docstring in ``base``).
 _AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
 
 
@@ -238,11 +237,26 @@ def fetch_onepassword_secrets(
             warnings.append(str(exc))
             failure_kinds.append(_classify_op_error(str(exc)))
 
-    # Classify across EVERY failure, not just the first: a run that mixes a timeout with a
-    # rejected credential must be judged by the credential, never by whichever failed first.
-    auth_failed = any(k in _AUTH_ERROR_KINDS for k in failure_kinds)
+    # An IDENTITY rejection fails every read it is asked to make; a single item the
+    # identity may not read is a permission on that item, and `op` reports both as
+    # "unauthorized"/403. Distinguish them by scope, because the two demand opposite
+    # handling: an identity we no longer trust must invalidate everything it ever
+    # resolved, while one forbidden item must not stop the other 91 being cached.
+    attempted = [n for n in valid if n not in prefetched]
+    identity_rejected = bool(attempted) and len(
+        [k for k in failure_kinds if k in _AUTH_ERROR_KINDS]) == len(attempted)
 
-    if use_cache and secrets and not auth_failed:
+    if identity_rejected:
+        # The rejection was observed in THIS call, so continuing to hand back values the
+        # rejected identity resolved would be knowingly serving them. Drop the carried-over
+        # values and evict the entry rather than letting it age out on its own TTL.
+        for name in prefetched:
+            secrets.pop(name, None)
+        if use_cache:
+            _STORE.clear(home_path)
+        return secrets, warnings
+
+    if use_cache and secrets:
         # Age the entry from the oldest value it carries, so reusing a partial entry
         # cannot extend a carried-over value past the configured TTL.
         fetched_at = prefetched_at if prefetched and prefetched_at is not None else time.time()

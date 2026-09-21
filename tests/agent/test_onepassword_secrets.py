@@ -358,35 +358,6 @@ def test_partial_pull_caches_resolved_refs_and_retries_only_the_failure(monkeypa
     assert third == {"GOOD": "value-GOOD", "FLAKY": "value-FLAKY"}
 
 
-def test_auth_failure_never_leaves_values_in_the_cache(monkeypatch, tmp_path):
-    """A rejected credential must invalidate the pull, even mixed with a timeout.
-
-    Caching the subset that resolved is safe for a slow backend, never for an identity
-    the backend refused — and the verdict must come from every failure, not whichever
-    one happened to be read first.
-    """
-    fake_op = tmp_path / "op"
-    fake_op.write_text("")
-    refs = {"SLOW": "op://V/slow/F", "DENIED": "op://V/denied/F", "GOOD": "op://V/good/F"}
-
-    def fake_run(argv, *a, **k):
-        ref = argv[-1]
-        if "slow" in ref:
-            return _err(1, "op: context deadline exceeded")
-        if "denied" in ref:
-            return _err(1, "[ERROR] 2026/09/20 18:58:28 account is not signed in")
-        return _ok("value-GOOD")
-
-    monkeypatch.setattr(op.subprocess, "run", fake_run)
-    op._reset_cache_for_tests(tmp_path)
-
-    secrets, _ = op.fetch_onepassword_secrets(
-        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path,
-    )
-    assert secrets == {"GOOD": "value-GOOD"}  # still returned to this caller
-    assert _entry(tmp_path, refs) is None, "an auth failure must not persist any value"
-
-
 def test_per_reference_timeout_is_visible_to_the_orchestrator(monkeypatch, tmp_path):
     """A reference lost to a slow read must not look like one the user never configured.
 
@@ -439,3 +410,73 @@ def test_degraded_kind_reports_the_worst_failure_not_the_first(monkeypatch, tmp_
     )
 
     assert result.degraded_kind is op.ErrorKind.AUTH_FAILED
+
+
+def test_identity_rejection_evicts_carried_over_values(monkeypatch, tmp_path):
+    """A revoked identity must not keep serving what it resolved before.
+
+    The token value is unchanged, so the auth fingerprint still matches and the entry is
+    still a cache hit. The rejection is observed in this very call, so continuing to hand
+    back those values would be knowingly serving a credential the backend just refused.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"GOOD": "op://V/good/F", "FLAKY": "op://V/flaky/F"}
+    mode = {"revoked": False}
+
+    def fake_run(argv, *a, **k):
+        if mode["revoked"]:
+            return _err(1, "[ERROR] account is not signed in")
+        if "flaky" in argv[-1]:
+            return _err(1, "op: request timed out")
+        return _ok("good-v1")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+
+    first, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert first == {"GOOD": "good-v1"}
+    assert _entry(tmp_path, refs) is not None
+
+    mode["revoked"] = True
+    op._CACHE.clear()
+    second, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+
+    assert second == {}, "values from a rejected identity must not be returned"
+    assert _entry(tmp_path, refs) is None, "the entry must be evicted, not left to age out"
+
+
+def test_one_forbidden_item_does_not_block_caching_the_rest(monkeypatch, tmp_path):
+    """A per-item permission denial is not an identity rejection.
+
+    `op` words both as "unauthorized"/403. Treating one unreadable item as a revoked
+    identity would block caching for the whole reference set on every call, which is the
+    exact cost this change exists to remove.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"OK": "op://V/ok/F", "FORBIDDEN": "op://V/forbidden/F"}
+    reads: list[str] = []
+
+    def fake_run(argv, *a, **k):
+        ref = argv[-1]
+        reads.append(ref)
+        if "forbidden" in ref:
+            return _err(1, "op: 403 unauthorized: you do not have access to this item")
+        return _ok("ok-value")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    op._reset_cache_for_tests(tmp_path)
+
+    first, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert first == {"OK": "ok-value"}
+    assert _entry(tmp_path, refs) is not None, "one forbidden item must not veto the cache"
+
+    reads.clear()
+    op._CACHE.clear()
+    op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+    assert all("forbidden" in r for r in reads), "the readable item must come from cache"

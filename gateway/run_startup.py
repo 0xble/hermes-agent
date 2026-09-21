@@ -25,6 +25,11 @@ from gateway.session import SessionSource, build_session_key
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT, GATEWAY_FATAL_CONFIG_EXIT_CODE, is_global_startup_conflict
 )
+
+#: Consecutive restartable startup exits blamed on a secrets backend before the gateway
+#: gives up and parks with the fatal-config code instead. Bounds the one regression the
+#: restartable exit introduces: a permanently dead backend looping forever unnoticed.
+_TRANSIENT_EXIT_STREAK_LIMIT = 5
 from gateway.run_shutdown import _log_suppressed, _send_error
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S, DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
@@ -1191,6 +1196,47 @@ class GatewayStartupMixin:
         return connected_count
 
     @staticmethod
+    def _transient_exit_streak_path():
+        from hermes_cli.config import get_hermes_home
+
+        return get_hermes_home() / ".transient_startup_exits"
+
+    def _reset_transient_exit_streak(self) -> None:
+        """A platform connected, so the backend recovered; forget the retry budget."""
+        try:
+            self._transient_exit_streak_path().unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — bookkeeping never blocks startup
+            pass
+
+    def _transient_exits_exhausted(self) -> bool:
+        """Has the restartable escape hatch been used too many times in a row?
+
+        Exiting restartably is right for a backend that is briefly slow, and wrong for one
+        that is permanently gone: the generated systemd unit disables the generic start
+        limiter and leans on the fatal-config exit code as its only backstop, so an
+        unbounded restartable exit would loop every RestartSec forever with no parked
+        state for an operator to find. After a few consecutive tries, park instead.
+        """
+        path = self._transient_exit_streak_path()
+        try:
+            previous = int(path.read_text(encoding="utf-8").strip() or 0)
+        except Exception:  # noqa: BLE001 — absent or unreadable means no streak yet
+            previous = 0
+        streak = previous + 1
+        try:
+            path.write_text(str(streak), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        if streak < _TRANSIENT_EXIT_STREAK_LIMIT:
+            return False
+        logger.error(
+            "Secret-source failures have blocked startup %d times in a row — treating this "
+            "as a real configuration fault so the service parks visibly instead of "
+            "restart-looping. Fix the secrets backend, then restart.", streak,
+        )
+        return True
+
+    @staticmethod
     def _is_missing_credential_code(code: str) -> bool:
         """Does this fatal code mean "the credential never arrived"?
 
@@ -1281,10 +1327,11 @@ class GatewayStartupMixin:
         """Log/degrade when nothing connected; return True when startup must exit."""
         from gateway.run import _write_runtime_status_quiet
         if connected_count != 0:
+            self._reset_transient_exit_streak()  # a platform connected: the backend recovered
             return False
         if startup_nonretryable_errors and not startup_retryable_errors:
             reason = "; ".join(startup_nonretryable_errors)
-            if self._missing_credentials_blamed_on_secrets():
+            if self._missing_credentials_blamed_on_secrets() and not self._transient_exits_exhausted():
                 # A secret source blew its fetch budget or could not reach its backend, so
                 # the whole source was dropped and its credentials never reached the
                 # environment. Downstream that is indistinguishable from a token the user
