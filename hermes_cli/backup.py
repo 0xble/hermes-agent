@@ -590,6 +590,21 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
 #: of hundreds of thousands, four orders of magnitude below this.
 _MAX_VANISHED_SHARE_FOR_PRUNE = 0.01
 
+#: ...and at least this many files, because churn is an absolute quantity while coverage
+#: loss is a relative one. A few files rotate per run whatever the home's size, so the
+#: share alone reads one routine rotation on a small home as a mass disappearance. That
+#: costs a real archive now that tripping it also caps retention at one. Critical state
+#: is not what this protects -- ``_is_critical_state`` routes those to ``on_error`` first
+#: -- so a floor can only ever relax the verdict on churn, which is what it should relax.
+_MIN_VANISHED_FOR_MASS = 25
+
+
+def _is_mass_vanish(vanished: int, selected: int) -> bool:
+    """True when enough of the scan disappeared that the archive no longer covers what
+    older ones do. Both tests must pass: the share, and the absolute floor."""
+    return (bool(selected) and vanished > selected * _MAX_VANISHED_SHARE_FOR_PRUNE
+            and vanished > _MIN_VANISHED_FOR_MASS)
+
 def _is_critical_state(rel_path: Path) -> bool:
     """Is *rel_path* something a restore cannot do without?
 
@@ -602,6 +617,39 @@ def _is_critical_state(rel_path: Path) -> bool:
     """
     posix = rel_path.as_posix()
     return any(posix == entry or posix.startswith(f"{entry}/") for entry in _QUICK_STATE_FILES)
+
+
+def _discard_partial_entries(zf: zipfile.ZipFile, before: int) -> int:
+    """Drop the central-directory records of any member registered since *before*.
+
+    ``ZipFile.write`` opens the member, then reads the source into it. The fault is in
+    that read, so the destination still closes cleanly and registers itself, and a file
+    that died partway leaves a TRUNCATED member behind carrying a CRC computed
+    over the bytes that did arrive: ``testzip()`` reports no corruption, and a restore
+    writes the short file over the real one without a word. An archive that is missing
+    a file is recoverable; one that quietly holds a damaged copy is not.
+
+    Keyed on position rather than name: two entries can share an arcname, and popping
+    by name could drop a good member written earlier in the run.
+
+    The abandoned bytes stay where they are. Rewinding ``start_dir`` so the next entry
+    overwrites them looks like free space back, and it corrupts the archive: nothing
+    truncates the file, so the bytes past the rewritten end-of-central-directory record
+    survive, and ``_EndRecData`` only scans the last ``(1 << 16) + 22`` bytes for that
+    record. Under roughly 64 KiB of stale tail everything still opens, which is why the
+    mistake looks safe; past it neither zipfile nor ``unzip`` can find the directory at
+    all. The cliff falls exactly where reclaiming the space would have been worth
+    something. Truncating instead of orphaning does work, but buys disk space in a
+    rollback archive at the price of a second dependency on zipfile internals.
+    Dead weight inside a readable rollback point beats a tidy unreadable one.
+    """
+    orphans = zf.filelist[before:]
+    if not orphans:
+        return 0
+    for info in orphans:
+        zf.NameToInfo.pop(info.filename, None)
+    del zf.filelist[before:]
+    return len(orphans)
 
 
 def _write_zip_entries(
@@ -617,10 +665,12 @@ def _write_zip_entries(
     """
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
+        before = len(zf.filelist)
         try:
             if abs_path.suffix == ".db":
                 size = _zip_sqlite_snapshot(zf, abs_path, rel_path, out_path)
                 if size is None:
+                    _discard_partial_entries(zf, before)
                     on_db_failure(rel_path)
                     continue
                 total_bytes += size
@@ -643,6 +693,10 @@ def _write_zip_entries(
             #
             # A file the restore cannot do without is never "merely absent": losing it
             # silently would let a complete-looking archive rotate the last good one out.
+            #
+            # Either way the writer may already have opened the member, so the truncated
+            # record has to go before the next entry is added.
+            _discard_partial_entries(zf, before)
             if (on_vanished is None or _is_critical_state(rel_path)
                     or os.path.exists(abs_path)):
                 on_error(rel_path, exc)
@@ -650,6 +704,7 @@ def _write_zip_entries(
                 on_vanished(rel_path)
             continue
         except (PermissionError, OSError, ValueError) as exc:
+            _discard_partial_entries(zf, before)
             on_error(rel_path, exc)
             continue
         if i % 500 == 0:
@@ -771,21 +826,38 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         # External memory-provider state never includes ``.db`` files in practice, so a
         # straight zf.write is fine.
         for abs_path, arcname in external_to_add:
+            before = len(zf.filelist)
             try:
                 zf.write(abs_path, arcname=arcname)
                 total_bytes += abs_path.stat().st_size
             except FileNotFoundError as exc:
+                _discard_partial_entries(zf, before)
                 if os.path.exists(abs_path):
                     errors.append(f"{arcname}: {exc}")
                 else:
                     vanished.append(arcname)
             except (PermissionError, OSError, ValueError) as exc:
+                _discard_partial_entries(zf, before)
                 errors.append(f"{arcname}: {exc}")
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
-    logger.info("backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d "
-                "vanished=%d bytes=%d",
-                elapsed * 1000, file_count, len(errors), len(vanished), zip_size)
+    # This line used to say status=complete unconditionally while the console two lines
+    # below printed "incomplete" for the same run, so the log contradicted the screen at
+    # default level. ``files=`` is what landed; ``selected=`` is what the scan chose.
+    # Two different facts, two different fields. ``status`` is this run's outcome and must
+    # match the console line below and the exit code, both of which turn on errors alone.
+    # ``coverage`` is whether the archive still covers what older ones do, which a mass
+    # disappearance breaks without failing the run. Overloading one word made the log
+    # contradict the screen -- first by always saying complete, then by saying incomplete
+    # while the console said complete.
+    mass_vanished = _is_mass_vanish(len(vanished), file_count)
+    logger.log(
+        logging.WARNING if (errors or mass_vanished) else logging.INFO,
+        "backup phase=archive status=%s coverage=%s duration_ms=%.1f files=%d selected=%d "
+        "errors=%d vanished=%d bytes=%d",
+        "incomplete" if errors else "complete", "reduced" if mass_vanished else "full",
+        elapsed * 1000, file_count - len(errors) - len(vanished), file_count,
+        len(errors), len(vanished), zip_size)
     print(f"\nBackup {'incomplete' if errors else 'complete'}: {out_path}\n"
           f"  Files:       {file_count - len(vanished) - len(errors)}\n"
           f"  Original:    {_format_size(total_bytes)}\n"
@@ -815,7 +887,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     # Prune only after a complete archive: a timer hitting the same unreadable file every run must
     # not rotate the last good backups out in favour of incomplete ones.
     keep = getattr(args, "keep", 0)  # 0 / absent: never prune (non-CLI callers)
-    mass_vanish = file_count and len(vanished) > file_count * _MAX_VANISHED_SHARE_FOR_PRUNE
+    mass_vanish = _is_mass_vanish(len(vanished), file_count)
     if mass_vanish and keep:
         print(f"\n  Not pruning: {len(vanished)} of {file_count} files disappeared while the "
               "archive was being written, so it may not cover what older archives do.")
@@ -1753,18 +1825,25 @@ def run_quick_backup(args) -> None:
 
 # --- Shared full-zip backup helper ---
 
-def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
+def _write_full_zip_backup(
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
     """Full zip snapshot of ``hermes_root`` to ``out_path`` under the backup slot (same rules as
-    :func:`run_backup`); None when nothing to back up, another backup running, or write error."""
+    :func:`run_backup`); None when nothing to back up, another backup running, or write error.
+
+    ``outcome``, when given, is filled with ``selected``/``errors``/``vanished`` counts so the
+    caller can tell a complete archive from one that is merely readable. Returning the path
+    alone cannot carry that, and the caller rotates older archives out on the strength of it.
+    """
     try:
         with _backup_operation_lock(hermes_root):
-            return _write_full_zip_backup_locked(out_path, hermes_root)
+            return _write_full_zip_backup_locked(out_path, hermes_root, outcome=outcome)
     except BackupInProgressError as exc:
         logger.warning("Full-zip backup skipped: %s", exc)
         return None
 
 
-def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional[Path]:
+def _write_full_zip_backup_locked(
+        out_path: Path, hermes_root: Path, *, outcome: Optional[dict] = None) -> Optional[Path]:
     scan_started = time.monotonic()
     logger.info("automatic backup phase=scan status=started")
     try:
@@ -1782,22 +1861,56 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         raise _SQLiteSnapshotError(str(rel_path))
 
     archive_started = time.monotonic()
+    # This archive is a rollback point, so what it failed to capture has to be
+    # recoverable from the log alone: the caller is a non-interactive update with
+    # no console to read. ``errors`` are files that exist and could not be read;
+    # ``vanished`` are files removed between the scan and the write, which is
+    # routine on an active home and is not a defect in the archive.
+    errors: list[str] = []
+    vanished: list[str] = []
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
                 archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6,
                 strict_timestamps=False) as zf:
             _write_zip_entries(
                 zf, files_to_add, out_path, on_db_failure=_db_failure, track_bytes=False,
-                on_error=lambda rel, exc: logger.debug("Skipping %s in zip backup: %s", rel, exc),
+                on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
+                on_vanished=lambda rel: vanished.append(str(rel)),
                 on_progress=lambda i: logger.info(
                     "automatic backup phase=archive status=progress completed=%d total=%d", i, len(files_to_add)))
     except (OSError, _SQLiteSnapshotError) as exc:
         # The hidden partial is already gone; ``out_path`` may be a previous valid backup: keep it.
         logger.warning("Full-zip backup: zip write failed: %s", exc)
         return None
-    logger.info("automatic backup phase=archive status=complete duration_ms=%.1f files=%d bytes=%d",
-                (time.monotonic() - archive_started) * 1000, len(files_to_add),
-                out_path.stat().st_size)
+    # Every failure is named, not just counted: a summary alone cannot tell an
+    # operator which file the rollback point is missing.
+    for error in errors:
+        logger.warning("automatic backup archive=%s entry_failure=%s", out_path, json.dumps(error))
+    for name in vanished:
+        logger.info("automatic backup archive=%s entry_vanished=%s", out_path, json.dumps(name))
+    selected = len(files_to_add)
+    written = selected - len(errors) - len(vanished)
+    # Enough of the scan going missing mid-write and the archive stops covering what the
+    # older ones do, even though every file inside it is intact. The interactive path has
+    # refused to prune on that since #38; this path has to reach the same verdict.
+    mass_vanish = _is_mass_vanish(len(vanished), selected)
+    if mass_vanish:
+        logger.warning("automatic backup archive=%s mass_vanish vanished=%d of %d",
+                       out_path, len(vanished), selected)
+    # ``incomplete`` drives the marker and the retention cap, so it stays conservative and
+    # covers both causes. The logged ``status`` word does not: it means what it means on
+    # the interactive path and in the console, which is errors.
+    incomplete = bool(errors) or mass_vanish
+    logger.log(
+        logging.WARNING if incomplete else logging.INFO,
+        "automatic backup phase=archive status=%s coverage=%s duration_ms=%.1f files=%d "
+        "selected=%d errors=%d vanished=%d bytes=%d",
+        "incomplete" if errors else "complete", "reduced" if mass_vanish else "full",
+        (time.monotonic() - archive_started) * 1000, written, selected,
+        len(errors), len(vanished), out_path.stat().st_size)
+    if outcome is not None:
+        outcome.update(selected=selected, errors=len(errors),
+                       vanished=len(vanished), incomplete=incomplete)
     return out_path
 
 
@@ -1810,18 +1923,68 @@ _PRE_MIGRATION_PREFIX = "pre-migration-"
 _PRE_MIGRATION_DEFAULT_KEEP = 5
 
 
+#: An incomplete archive is a fallback of last resort, not a rollback point in its own
+#: right, so only the newest one is worth the disk. Keeping them under the same ``keep``
+#: as whole archives is what let a recurring read failure fill the directory.
+_MAX_INCOMPLETE_KEPT = 1
+
+#: Written beside an archive that could not capture everything it selected. The archive
+#: stays usable, so completeness cannot be read back from the file itself, and the prune
+#: runs in a later process that never saw the run that produced it.
+_INCOMPLETE_SUFFIX = ".incomplete.json"
+
+
+def _incomplete_marker(archive: Path) -> Path:
+    return archive.with_name(archive.name + _INCOMPLETE_SUFFIX)
+
+
+def _mark_archive_incomplete(archive: Path, outcome: dict) -> None:
+    """Record beside *archive* what it failed to capture. Never raises."""
+    try:
+        _incomplete_marker(archive).write_text(json.dumps({
+            "selected": outcome.get("selected"), "errors": outcome.get("errors"),
+            "vanished": outcome.get("vanished"),
+        }), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - marker is advisory
+        logger.warning("Could not mark %s incomplete: %s", archive.name, exc)
+
+
+def _archive_is_incomplete(archive: Path) -> bool:
+    return _incomplete_marker(archive).exists()
+
+
+def _unlink_archive(archive: Path) -> None:
+    """Remove *archive* and any incompleteness marker written beside it."""
+    archive.unlink()
+    try:
+        _incomplete_marker(archive).unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - a stray marker is harmless
+        pass
+
+
 def _prune_prefixed_zips(backup_dir: Path, prefix: str, keep: int, what: str) -> int:
     """Remove oldest ``<prefix>*.zip`` in *backup_dir* beyond *keep*; return count deleted.
+
+    Complete and incomplete archives are pruned against separate caps. Refusing to prune
+    at all while runs are incomplete does keep a whole archive from being rotated out by a
+    partial one, but it also removes the bound: a recurring read failure then grows the
+    directory without limit, which on a real home is tens of gigabytes per run. Counting
+    them together is the other failure, where a partial archive displaces a whole one.
 
     Only prefix-matched files are touched, so hand-made zips or other backup kinds survive.
     """
     backups = _newest_first(backup_dir, lambda p: p.is_file() and p.name.startswith(prefix)
                             and p.suffix.lower() == ".zip")
-    return _prune_oldest(backups, keep, Path.unlink, what)
+    complete = [p for p in backups if not _archive_is_incomplete(p)]
+    incomplete = [p for p in backups if _archive_is_incomplete(p)]
+    deleted = _prune_oldest(complete, keep, _unlink_archive, what)
+    deleted += _prune_oldest(incomplete, _MAX_INCOMPLETE_KEPT, _unlink_archive, what)
+    return deleted
 
 
 def _create_prefixed_full_backup(
-    hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str) -> Optional[Path]:
+    hermes_home: Optional[Path], prefix: str, keep: int, what: str, prune_what: str,
+    *, outcome: Optional[dict] = None) -> Optional[Path]:
     """Write ``<HERMES_HOME>/backups/<prefix><timestamp>.zip`` and prune older same-prefix zips.
     Returns the path, or ``None`` if nothing to back up or the write failed. Never raises."""
     hermes_root = hermes_home or get_default_hermes_root()
@@ -1834,26 +1997,42 @@ def _create_prefixed_full_backup(
         logger.warning("Could not create %s backup dir %s: %s", what, backup_dir, exc)
         return None
     out_path = backup_dir / f"{prefix}{datetime.now().strftime('%Y-%m-%d-%H%M%S')}.zip"
-    if _write_full_zip_backup(out_path, hermes_root) is None:
+    result: dict = {}
+    if _write_full_zip_backup(out_path, hermes_root, outcome=result) is None:
         return None
+    # The archive is kept either way: a partial rollback point beats none. What it must not
+    # do is rotate out a whole one. Marking it, rather than skipping the prune, keeps that
+    # promise without unbounding the directory -- see _prune_prefixed_zips.
+    if result.get("incomplete"):
+        _mark_archive_incomplete(out_path, result)
+        logger.warning(
+            "automatic backup archive=%s incomplete errors=%d vanished=%d of %d",
+            out_path, result.get("errors", 0), result.get("vanished", 0),
+            result.get("selected", 0))
     _prune_prefixed_zips(backup_dir, prefix, keep, prune_what)
+    if outcome is not None:
+        outcome.update(result)
     return out_path
 
 
 def create_pre_update_backup(
-    hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP) -> Optional[Path]:
+    hermes_home: Optional[Path] = None, keep: int = _PRE_UPDATE_DEFAULT_KEEP,
+    *, outcome: Optional[dict] = None) -> Optional[Path]:
     """Full zip backup to ``backups/pre-update-<timestamp>.zip``, auto-pruned; ``None`` if nothing
     was found or the backup failed. Never raises — ``hermes update`` continues anyway."""
-    return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update", "backup")
+    return _create_prefixed_full_backup(hermes_home, _PRE_UPDATE_PREFIX, max(keep, 1), "pre-update",
+                                       "backup", outcome=outcome)
 
 
 def create_pre_migration_backup(
-    hermes_home: Optional[Path] = None, keep: int = _PRE_MIGRATION_DEFAULT_KEEP) -> Optional[Path]:
+    hermes_home: Optional[Path] = None, keep: int = _PRE_MIGRATION_DEFAULT_KEEP,
+    *, outcome: Optional[dict] = None) -> Optional[Path]:
     """Full zip backup to ``backups/pre-migration-<timestamp>.zip`` before ``hermes claw migrate``
     (same dir as update backups so listings/``hermes import`` find it); ``None`` if nothing was
     found or the write failed. Never raises."""
     return _create_prefixed_full_backup(
-        hermes_home, _PRE_MIGRATION_PREFIX, max(keep, 0), "pre-migration", "pre-migration backup")
+        hermes_home, _PRE_MIGRATION_PREFIX, max(keep, 0), "pre-migration", "pre-migration backup",
+        outcome=outcome)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
