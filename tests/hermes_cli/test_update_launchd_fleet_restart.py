@@ -646,14 +646,14 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
-    @pytest.mark.skipif(sys.platform != "darwin", reason="native macOS recovery hint")
+    @pytest.mark.macos_only
     def test_launchd_labels_get_launchctl_hint(self, capsys):
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
         assert "launchctl bootstrap" in out
 
-    @pytest.mark.skipif(sys.platform != "linux", reason="native Linux recovery hint")
+    @pytest.mark.linux_only
     def test_systemd_units_keep_systemctl_hint(self, capsys):
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
