@@ -61,7 +61,9 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Standard runner on forks: the 32-core variant needs an org runner
+            # group and would queue until timeout. Slower here, but it still runs.
+            runner: ${{ github.repository == 'NousResearch/hermes-agent' && 'windows-latest-32-core' || 'windows-latest' }}
             marker: windows_only
     steps:
       - name: Checkout code
