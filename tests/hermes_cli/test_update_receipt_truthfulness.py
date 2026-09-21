@@ -352,3 +352,31 @@ def test_full_mode_still_takes_the_zip_when_the_snapshot_fails(monkeypatch, rece
     assert ran["zip"] is True, "a failed snapshot must not cancel the full backup"
     step = next(s for s in ur._current.data["steps"] if s["name"] == "pre_update_backup")
     assert step["ok"] is False and "OSError" in step["detail"]
+
+
+@pytest.mark.parametrize("siblings, expect_failure_recorded", [(0, False), (2, True)])
+def test_no_sibling_profiles_is_not_a_sibling_failure(
+    monkeypatch, receipt_home, siblings, expect_failure_recorded
+):
+    """An install with no sibling profiles did no work and failed at nothing.
+
+    Inferring failure from an empty result dict marked every update on a single-profile
+    install as a failed sibling snapshot — the same dishonesty this suite exists to catch,
+    pointing the other way.
+    """
+    import hermes_cli.update_cmd_maint as maint
+
+    monkeypatch.setattr(maint, "_sibling_profile_count", lambda: siblings)
+    monkeypatch.setattr(
+        "hermes_cli.backup.create_pre_update_snapshots_all_profiles", lambda **_kw: {}
+    )
+    monkeypatch.setattr(
+        "hermes_cli.backup.create_quick_snapshot", lambda **_kw: "snap-1"
+    )
+    monkeypatch.setattr(maint, "_verify_state_db_after_snapshot", lambda _s: None)
+    ur.begin_update_receipt()
+
+    maint._run_quick_snapshots()
+
+    recorded = [s for s in ur._current.data["steps"] if s["name"] == "sibling_profile_snapshots"]
+    assert bool(recorded) is expect_failure_recorded

@@ -755,6 +755,18 @@ def _verify_state_db_after_snapshot(snapshot_id: str) -> None:
     print()
 
 
+def _sibling_profile_count() -> int:
+    """How many sibling profiles a pre-update snapshot would attempt. Zero is the normal
+    single-profile install, never a failure."""
+    try:
+        from hermes_cli.backup import _sibling_profile_homes
+        from hermes_cli.config import get_hermes_home
+
+        return len(list(_sibling_profile_homes(get_hermes_home())))
+    except Exception:  # noqa: BLE001 — a probe must never break the update
+        return 0
+
+
 def _run_quick_snapshots() -> Optional[str]:
     """Quick snapshot of the root home plus every sibling profile; returns the root snapshot id."""
     from hermes_cli.update_cmd import _record_update_step
@@ -775,9 +787,12 @@ def _run_quick_snapshots() -> Optional[str]:
             keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
             lock_timeout_seconds=_PRE_UPDATE_SNAPSHOT_LOCK_WAIT,
         )
-        if not _sibling_snaps:
+        if not _sibling_snaps and _sibling_profile_count() > 0:
             # Only ever recorded on success before, so a total sibling failure left no
-            # trace at all — the same silence this change exists to remove.
+            # trace at all — the same silence this change exists to remove. Gated on
+            # siblings EXISTING: an install with none also returns an empty dict, having
+            # done nothing wrong, and recording that as a failure is the same dishonesty
+            # pointing the other way.
             _record_update_step("sibling_profile_snapshots", False, "no sibling snapshot was taken")
         if _sibling_snaps:
             print(f"◆ Sibling profile snapshot(s): " + ", ".join(sorted(_sibling_snaps)))
