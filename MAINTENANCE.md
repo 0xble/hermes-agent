@@ -49,7 +49,8 @@ condition; there is no central ledger. Every non-merge commit after the trailer 
 identity. A unit owns an identity by naming it as a backticked token on an identity line
 (a line, or its indented continuation, that says "identity" or "identities" before the
 first backtick); other code spans do not own. Commits whose identity is `evidence` are
-records, not patches. This contract's own patch identity: `maintenance-contract`. A sync
+records, not patches. This contract's own patch identity: `maintenance-contract`.
+ A sync
 rebase rewrites the floor SHA; the checker requires the floor to be an ancestor of HEAD,
 locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
 A maintenance unit may repair missing published metadata with an explicit
