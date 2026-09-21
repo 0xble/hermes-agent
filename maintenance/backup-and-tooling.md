@@ -28,7 +28,7 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `slice-12-per-job-timezone`, `slice-12 truthful-contention` (the space is the trailer's
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
-  `evidence` (records, not patches). `maintenance-contract` is owned
+  `backup-zip-timestamps`, `evidence` (records, not patches). `maintenance-contract` is owned
   by the root contract.
 - `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
@@ -36,6 +36,16 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   one cross-process slot, which is the fix the message exists to compensate for.
 - Upstream contribution: none recorded for the local patches. The two adopted backup
   fixes retire when the candidate release retains them.
+- `backup-zip-timestamps`: both full ZIP writers use the standard library's timestamp
+  clamping so pre-1980 and post-2107 files remain recoverable. Source timestamps,
+  content, selection, failure handling, and pruning are unchanged. Narrow adaptation
+  of the timestamp portion of upstream PR #106011 (head `8e3f3d7b757c48dc0cefc301f751c2da6da354e0`),
+  tracking issue #105868. The broader PR's selection/reporting/pruning changes are
+  intentionally excluded. Proof: `test_zip_timestamp_bounds_preserve_files` in
+  `tests/hermes_cli/test_backup.py` exercises manual internal/external files and
+  automatic home-only archives with real files and ZIP readback. Retire when the
+  selected upstream release passes this contract. Rollback only this logical patch,
+  not adjacent backup safety fixes, through the runtime owner's supported update path.
 
 ## Verification
 
