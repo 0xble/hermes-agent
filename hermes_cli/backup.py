@@ -1124,10 +1124,17 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
 
 def create_quick_snapshot(
     label: Optional[str] = None, hermes_home: Optional[Path] = None, keep: Optional[int] = None,
-    max_file_size: Optional[int] = None) -> Optional[str]:
-    """Create one atomic quick snapshot while holding the shared backup slot."""
+    max_file_size: Optional[int] = None, lock_timeout_seconds: Optional[float] = None) -> Optional[str]:
+    """Create one atomic quick snapshot while holding the shared backup slot.
+
+    ``lock_timeout_seconds`` overrides how long to wait for that slot. Callers whose
+    snapshot is someone's only recovery point should wait rather than take the default
+    fail-fast grab, which loses the snapshot to any concurrent backup.
+    """
     home = hermes_home or get_hermes_home()
-    with _backup_operation_lock(home):
+    lock = (_backup_operation_lock(home) if lock_timeout_seconds is None
+            else _backup_operation_lock(home, timeout_seconds=lock_timeout_seconds))
+    with lock:
         return _create_quick_snapshot_locked(label, home, keep, max_file_size)
 
 
@@ -1442,7 +1449,8 @@ def _sibling_profile_homes(invoking_home: Path) -> list[tuple[str, Path]]:
 
 
 def create_pre_update_snapshots_all_profiles(
-    invoking_home: Optional[Path] = None, keep: Optional[int] = None, max_file_size: Optional[int] = None
+    invoking_home: Optional[Path] = None, keep: Optional[int] = None, max_file_size: Optional[int] = None,
+    lock_timeout_seconds: Optional[float] = None,
 ) -> Dict[str, str]:
     """Pre-update quick snapshots for every SIBLING profile (#66140), same set/size cap/keep policy
     as the invoking profile's; each lands under its OWN ``<home>/state-snapshots/``."""
@@ -1450,8 +1458,12 @@ def create_pre_update_snapshots_all_profiles(
     home = invoking_home or get_hermes_home()
     for name, profile_home in _sibling_profile_homes(home):
         try:
+            # Pass the override only when set: this function is monkeypatched by tests and
+            # may be wrapped externally, and an always-present new kwarg breaks those stubs.
+            extra = {} if lock_timeout_seconds is None else {"lock_timeout_seconds": lock_timeout_seconds}
             snap_id = create_quick_snapshot(
-                label="pre-update", hermes_home=profile_home, keep=keep, max_file_size=max_file_size)
+                label="pre-update", hermes_home=profile_home, keep=keep, max_file_size=max_file_size,
+                **extra)
             if snap_id:
                 results[name] = snap_id
         except Exception as exc:

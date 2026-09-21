@@ -147,6 +147,14 @@ def _record_update_step(step: str, ok: bool, detail: str = "") -> None:
         record_step(step, ok, detail)
 
 
+def _record_update_skip(name: str, reason: str) -> None:
+    """Best-effort ``update_receipt.record_skip``; a deliberate opt-out is a skip, not a
+    failed step, so a receipt reader can tell "the user said no" from "it broke"."""
+    with suppress(Exception):
+        from hermes_cli.update_receipt import record_skip
+        record_skip(name, reason)
+
+
 # A fetch whose transport dead-stalls (HTTP/2 to GitHub on some networks, a black-holed proxy)
 # otherwise leaves `hermes update` on "Fetching updates..." forever (#93759, #95777). Five
 # minutes is generous for a scoped single-branch fetch and still ends in a real error.
@@ -1291,10 +1299,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Backup before any git/file mutation; the snapshot id (None if disabled/failed) feeds
     # the post-update cron-jobs safety net.
+    # _run_pre_update_backup records its own receipt entry: only it can distinguish an
+    # opt-out from a failure, and the reason matters more than the bare outcome.
     pre_update_snapshot_id = _m()._run_pre_update_backup(args)
-    _record_update_step(
-        "pre_update_backup", pre_update_snapshot_id is not None,
-        f"snapshot={pre_update_snapshot_id}" if pre_update_snapshot_id else "disabled or failed")
 
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:

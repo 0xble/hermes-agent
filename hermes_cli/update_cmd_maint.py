@@ -46,6 +46,19 @@ _PRE_UPDATE_SNAPSHOT_KEEP = 1
 # small hard-to-regenerate state, not a multi-GB state.db (24 GB cost ~60s + 24 GB/update).
 _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE = 1 << 30  # 1 GiB
 
+# The shared backup slot defaults to a 0.25s grab, which is right for an interactive
+# `hermes backup` that should fail fast rather than hang. The pre-update snapshot is the
+# update's only rollback point, so it waits instead of losing a race it should not be in.
+#
+# This does NOT defeat a scheduled full backup. Measured holds on a real host were 77 and
+# 105 MINUTES (51GB and 58GB archives), so any bounded wait loses to one of those; waiting
+# that long instead would be worse, since the update would appear hung. What this buys is
+# the short overlap — another quick snapshot, a sibling profile, an interactive backup —
+# which is the common contention. Losing to a long backup now ends in a loud, recorded
+# failure instead of silence. Making the two not share a slot is the real fix and is
+# deliberately left out of this change.
+_PRE_UPDATE_SNAPSHOT_LOCK_WAIT = 90.0
+
 _SQLITE_WAL_BUG_DETAIL = "SQLite {} still has the WAL-reset corruption bug"
 
 
@@ -742,12 +755,25 @@ def _verify_state_db_after_snapshot(snapshot_id: str) -> None:
     print()
 
 
+def _sibling_profile_count() -> int:
+    """How many sibling profiles a pre-update snapshot would attempt. Zero is the normal
+    single-profile install, never a failure."""
+    try:
+        from hermes_cli.backup import _sibling_profile_homes
+        from hermes_cli.config import get_hermes_home
+
+        return len(list(_sibling_profile_homes(get_hermes_home())))
+    except Exception:  # noqa: BLE001 — a probe must never break the update
+        return 0
+
+
 def _run_quick_snapshots() -> Optional[str]:
     """Quick snapshot of the root home plus every sibling profile; returns the root snapshot id."""
     from hermes_cli.update_cmd import _record_update_step
     from hermes_cli.backup import create_quick_snapshot
     snapshot_id = create_quick_snapshot(
         label="pre-update", keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+        lock_timeout_seconds=_PRE_UPDATE_SNAPSHOT_LOCK_WAIT,
     )
     if snapshot_id:
         _verify_state_db_after_snapshot(snapshot_id)
@@ -759,7 +785,15 @@ def _run_quick_snapshots() -> Optional[str]:
         from hermes_cli.backup import create_pre_update_snapshots_all_profiles
         _sibling_snaps = create_pre_update_snapshots_all_profiles(
             keep=_PRE_UPDATE_SNAPSHOT_KEEP, max_file_size=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
+            lock_timeout_seconds=_PRE_UPDATE_SNAPSHOT_LOCK_WAIT,
         )
+        if not _sibling_snaps and _sibling_profile_count() > 0:
+            # Only ever recorded on success before, so a total sibling failure left no
+            # trace at all — the same silence this change exists to remove. Gated on
+            # siblings EXISTING: an install with none also returns an empty dict, having
+            # done nothing wrong, and recording that as a failure is the same dishonesty
+            # pointing the other way.
+            _record_update_step("sibling_profile_snapshots", False, "no sibling snapshot was taken")
         if _sibling_snaps:
             print(f"◆ Sibling profile snapshot(s): " + ", ".join(sorted(_sibling_snaps)))
             _record_update_step(
@@ -830,19 +864,46 @@ def _run_pre_update_backup(args) -> Optional[str]:
     ``full`` — quick snapshot PLUS a zip of HERMES_HOME under ``backups/`` (``hermes import``).
 
     Explicit user opt-out is honored fully. See #34600.
+
+    Records its own receipt entry, because only this function can tell an opt-out apart
+    from a failure — the caller sees ``None`` for both and used to report them identically.
     """
+    from hermes_cli.update_cmd import _record_update_skip, _record_update_step
+
     mode = _resolve_pre_update_backup_mode(args)
 
     if mode == "off":
+        source = "--no-backup" if getattr(args, "no_backup", False) else "updates.pre_update_backup"
         if getattr(args, "no_backup", False):
             print("◆ Pre-update backup: skipped (--no-backup)")
             print()
         # Config-level off is silent: the user opted out.
+        _record_update_skip("pre_update_backup", f"disabled by {source}")
         return None
 
     snapshot_id = None
-    with _best_effort('Pre-update snapshot failed: %s'):
+    try:
         snapshot_id = _run_quick_snapshots()
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never kill an update
+        # Loud, and with the real reason. This used to be swallowed at debug level and
+        # recorded as "disabled or failed", so an update that silently lost its rollback
+        # point was indistinguishable from one the user had opted out of.
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("Pre-update snapshot failed — this update has no rollback point: %s", reason)
+        print(f"  ⚠ Pre-update snapshot FAILED: {exc}")
+        print("    Treat this update as having no rollback point. Re-run when any other")
+        print("    backup finishes, or pass --no-backup to accept the risk explicitly.")
+        print()
+        _record_update_step("pre_update_backup", False, reason)
+        if mode == "full":
+            # The zip is a SEPARATE rollback point. Returning here skipped it, so a
+            # snapshot failure silently downgraded `full` to no backup at all.
+            _run_full_backup()
+        return None
+
+    _record_update_step(
+        "pre_update_backup", snapshot_id is not None,
+        f"snapshot={snapshot_id}" if snapshot_id else "quick snapshot produced no id")
 
     if mode != "full":
         if snapshot_id:
