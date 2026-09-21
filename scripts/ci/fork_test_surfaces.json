@@ -118,6 +118,7 @@
     "tests/tools/test_browser_hybrid_routing.py",
     "tests/tools/test_browser_secret_exfil.py",
     "tests/tools/test_code_kernel.py",
+    "tests/tools/test_code_kernel_remote.py",
     "tests/tools/test_delegate.py",
     "tests/tools/test_execution_flag_detection.py",
     "tests/tools/test_file_tools.py",

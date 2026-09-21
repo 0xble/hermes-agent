@@ -65,7 +65,9 @@ ownership counts real child process identities with psutil instead of GNU pgrep.
 Native Linux markers scope GNU CLI and WSL tests. Unix socket tests use short,
 owned temporary paths within Darwin's socket-name limit. Audio fixtures preserve
 the Apple Silicon CPU safety policy and isolate the fake wake-word runtime.
-Updater tests isolate all launchd inventory and profile-plist probes so fake
+Timer and remote-kernel concurrency fixtures use bounded Events to establish the
+intended owner before asserting behavior; real worker threads and watchdogs remain
+in place. Updater tests isolate all launchd inventory and profile-plist probes so fake
 updates cannot discover the host gateway. No runtime safety guard is disabled.
 
 The pre-fix full local baseline on macOS discovered 4,200 files: 49,601 passed,
