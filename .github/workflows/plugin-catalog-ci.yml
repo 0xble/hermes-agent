@@ -105,14 +105,17 @@ jobs:
             echo "repo=$REPO sha=$SHA subdir=$SUBDIR"
 
             CLONE_DIR=$(mktemp -d)
-            # Full clone (no --depth 1): the pinned sha may not be the branch tip.
-            if ! git clone "$REPO" "$CLONE_DIR"; then
+            # The pinned sha may not be the branch tip, but full history is unnecessary and can
+            # hang on large community repositories. Fetch a blobless shallow tip, then fetch only
+            # the exact object being admitted.
+            if ! timeout 5m git clone --filter=blob:none --no-checkout --depth 1 "$REPO" "$CLONE_DIR"; then
               echo "::error file=$entry::clone failed for $REPO"
               FAILED=1; echo "::endgroup::"; continue
             fi
 
             # SUPPLY-CHAIN GATE: the pinned sha must be reachable in the repo.
-            if ! git -C "$CLONE_DIR" checkout --detach "$SHA"; then
+            if ! timeout 2m git -C "$CLONE_DIR" fetch --no-tags origin "$SHA" || \
+               ! git -C "$CLONE_DIR" checkout --detach "$SHA"; then
               echo "::error file=$entry::pinned sha $SHA is not reachable in $REPO"
               FAILED=1; echo "::endgroup::"; continue
             fi
