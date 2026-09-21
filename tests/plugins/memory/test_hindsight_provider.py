@@ -247,6 +247,17 @@ class TestSchemas:
         p = provider_with_config(memory_mode="context")
         assert p.get_tool_schemas() == []
 
+    def test_get_tool_schemas_before_initialize(self):
+        """MemoryManager.add_provider() calls get_tool_schemas() BEFORE initialize().
+
+        Reading a field that only initialize() sets raises AttributeError there, and
+        agent_init catches it by dropping the whole manager — so one missing default
+        silently disables memory (retain AND recall) for every session.
+        """
+        p = HindsightMemoryProvider()
+        names = {s["name"] for s in p.get_tool_schemas()}
+        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+
 
 # ---------------------------------------------------------------------------
 # Config tests
