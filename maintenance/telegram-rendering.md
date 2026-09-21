@@ -56,7 +56,17 @@ Ordinary numeric commit or PR links are not converted into citation markers.
 ## Provenance and adoption
 
 Fork patch identities: `telegram-rich-modes`, `telegram-paragraph-spacing`,
-  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`.
+  `telegram-rich-currency`, `telegram-literal-hash`, `telegram-link-targets`,
+  `conformance-vector-refresh`.
+
+`conformance-vector-refresh` carries no renderer change. The committed conformance
+vectors under `tests/conformance/vectors/` are a regenerated snapshot of what the
+adapters actually emit, and they had not been regenerated since `29fc746350` in July
+while the identities above changed the Telegram adapter five times. The drift that
+resulted is real output, not a defect: nested emphasis now renders as `_italic_`
+instead of escaping to a literal `\*italic\*`. Regenerate and commit whenever a
+renderer under this unit changes, in the same commit, or this gate goes red for
+every unrelated pull request.
 
 Own contribution: [upstream PR 116218](https://github.com/NousResearch/hermes-agent/pull/116218),
 head `3d3fed3b68b626a621540993b0bb52853d792765`, based on upstream main
