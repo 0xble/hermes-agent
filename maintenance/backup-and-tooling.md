@@ -27,8 +27,13 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   `slice-13-schema-rehearsal`, `slice-14-self-update`, `slice-18-archive`,
   `slice-12-per-job-timezone`, `slice-12 truthful-contention` (the space is the trailer's
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
-  `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `evidence` (records, not patches). `maintenance-contract` is owned
+  `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
+  `evidence` (records, not patches). `maintenance-contract` is owned
   by the root contract.
+- `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
+  failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
+  setting) has its own message on the snapshot path. Retire it if the two stop sharing
+  one cross-process slot, which is the fix the message exists to compensate for.
 - Upstream contribution: none recorded for the local patches. The two adopted backup
   fixes retire when the candidate release retains them.
 
