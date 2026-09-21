@@ -950,33 +950,47 @@ class TestBackupEdgeCases:
         assert not (tmp_path / "out.zip").exists()
 
 
-    def test_pre1980_timestamp_skipped(self, tmp_path, monkeypatch):
-        """Backup skips files with pre-1980 timestamps (ZIP limitation)."""
+    @pytest.mark.parametrize("automatic", [False, True])
+    def test_zip_timestamp_bounds_preserve_files(self, tmp_path, monkeypatch, automatic):
+        """Full archives preserve content while clamping only ZIP date metadata."""
+        import time
+        import hermes_cli.backup as backup_mod
+
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
-        (hermes_home / "config.yaml").write_text("model: test\n")
-
-        # Create a file with epoch timestamp (1970-01-01)
-        old_file = hermes_home / "ancient.txt"
-        old_file.write_text("old data")
-        os.utime(old_file, (0, 0))
-
+        external = tmp_path / ".hindsight"
+        external.mkdir()
+        dates = {
+            "ancient.txt": (1, (1980, 1, 1, 0, 0, 0)),
+            "future.txt": (time.mktime((2108, 1, 2, 12, 0, 0, 0, 0, -1)),
+                           (2107, 12, 31, 23, 59, 58)),
+            "normal.txt": (time.mktime((2024, 6, 2, 12, 0, 0, 0, 0, -1)),
+                           (2024, 6, 2, 12, 0, 0)),
+        }
+        entries = []
+        for root in (hermes_home, external):
+            for name, (mtime, date) in dates.items():
+                path = root / name
+                path.write_bytes(name.encode())
+                os.utime(path, (mtime, mtime))
+                arcname = name if root == hermes_home else "_external/.hindsight/" + name
+                entries.append((path, arcname, date, path.stat().st_mtime_ns))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-
+        monkeypatch.setattr(backup_mod, "_collect_memory_provider_external_paths", lambda: [external])
         out_zip = tmp_path / "out.zip"
-        args = Namespace(output=str(out_zip))
-
-        from hermes_cli.backup import run_backup
-        run_backup(args)
-
-        # Zip should still be created with the valid files
-        assert out_zip.exists()
+        if automatic:
+            assert backup_mod._write_full_zip_backup(out_zip, hermes_home) == out_zip
+        else:
+            assert backup_mod.run_backup(Namespace(output=str(out_zip))) is True
         with zipfile.ZipFile(out_zip, "r") as zf:
-            names = zf.namelist()
-            assert "config.yaml" in names
-            # The pre-1980 file should be skipped, not crash the backup
-            assert "ancient.txt" not in names
+            assert zf.testzip() is None
+            for path, arcname, date, original_mtime in entries:
+                assert path.stat().st_mtime_ns == original_mtime
+                if automatic and path.parent == external:
+                    continue  # Automatic backups retain their existing home-only scope.
+                assert zf.read(arcname) == path.read_bytes()
+                assert zf.getinfo(arcname).date_time == date
 
 
 
