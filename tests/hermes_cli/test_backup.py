@@ -754,9 +754,10 @@ class TestBackupEdgeCases:
 
         out_dir = tmp_path / "b"
         out_dir.mkdir()
-        good_old = out_dir / f"{_RUN_BACKUP_PREFIX}old.zip"
+        # _newest_first orders by NAME, so these must sort like real timestamped archives.
+        good_old = out_dir / f"{_RUN_BACKUP_PREFIX}20260101-000000.zip"
         good_old.write_bytes(b"PK")
-        out_zip = out_dir / f"{_RUN_BACKUP_PREFIX}new.zip"
+        out_zip = out_dir / f"{_RUN_BACKUP_PREFIX}20260921-120000.zip"
 
         assert run_backup(Namespace(output=str(out_zip), keep=1)) is False
         assert out_zip.exists()
@@ -767,6 +768,167 @@ class TestBackupEdgeCases:
         assert exc.value.code == 1
         unreadable.chmod(0o600)
         assert run_backup(Namespace(output=str(tmp_path / "out4.zip"))) is True
+
+    def test_file_removed_mid_archive_does_not_fail_or_rotate_the_last_good_backup(
+            self, tmp_path, monkeypatch, capsys):
+        """A file rotated away while the archive is being written is not a failure.
+
+        The file list is built up front and the write takes minutes to tens of minutes,
+        during which a running agent rotates its own files; per-run cron output is the
+        usual source. Treating that as a read error made the archive "incomplete", which
+        exits 1 AND blocks the prune, so a timer published nothing and the last good
+        archives were held hostage. Observed on a live install as three consecutive
+        failures whose every error was a cron/output path.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        churning = hermes_home / "cron" / "output" / "job" / "run.md"
+        churning.parent.mkdir(parents=True, exist_ok=True)
+        churning.write_text("per-run output\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli.backup import _RUN_BACKUP_PREFIX, run_backup
+
+        # Delete it after the scan has listed it, before the writer reaches it.
+        import hermes_cli.backup as backup_mod
+        real_iter = backup_mod._iter_backup_files
+
+        def _scan_then_remove(*args, **kwargs):
+            listed = list(real_iter(*args, **kwargs))
+            churning.unlink()
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _scan_then_remove)
+
+        out_dir = tmp_path / "b"
+        out_dir.mkdir()
+        # _newest_first orders by NAME, so these must sort like real timestamped archives.
+        good_old = out_dir / f"{_RUN_BACKUP_PREFIX}20260101-000000.zip"
+        good_old.write_bytes(b"PK")
+        out_zip = out_dir / f"{_RUN_BACKUP_PREFIX}20260921-120000.zip"
+
+        # This fixture is tiny, so one vanished file is ~7% and would trip the mass-vanish
+        # ceiling. Lift it here: the ceiling has its own test below.
+        monkeypatch.setattr(backup_mod, "_MAX_VANISHED_SHARE_FOR_PRUNE", 0.9)
+
+        assert run_backup(Namespace(output=str(out_zip), keep=1)) is True
+        out = capsys.readouterr().out
+        assert "Backup complete" in out
+        assert "removed while the archive was being written" in out
+        assert not good_old.exists(), "a complete archive must still rotate older ones"
+
+    @pytest.mark.parametrize("critical", [".env", "config.yaml", "cron/jobs.json"])
+    def test_a_vanished_critical_file_is_still_a_failure(
+            self, tmp_path, monkeypatch, capsys, critical):
+        """Tolerance must never cover a file the restore cannot do without.
+
+        Criticality is a RELATIVE-PATH question answered by _QUICK_STATE_FILES, the
+        module's own list, not by _SECRET_FILE_NAMES, which exists so restore can chmod
+        0600. config.yaml is also one of the markers _validate_backup_zip looks for, so
+        losing it silently would let a complete-looking archive rotate the last good one
+        out.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        secret = hermes_home / critical
+        secret.parent.mkdir(parents=True, exist_ok=True)
+        secret.write_text("critical\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli.backup import _RUN_BACKUP_PREFIX, run_backup
+
+        import hermes_cli.backup as backup_mod
+        real_iter = backup_mod._iter_backup_files
+
+        def _scan_then_remove(*args, **kwargs):
+            listed = list(real_iter(*args, **kwargs))
+            secret.unlink()
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _scan_then_remove)
+
+        out_dir = tmp_path / "b"
+        out_dir.mkdir()
+        good_old = out_dir / f"{_RUN_BACKUP_PREFIX}20260101-000000.zip"
+        good_old.write_bytes(b"PK")
+
+        assert run_backup(Namespace(
+            output=str(out_dir / f"{_RUN_BACKUP_PREFIX}20260921-120000.zip"),
+            keep=1)) is False
+        assert "Backup incomplete" in capsys.readouterr().out
+        assert good_old.exists(), "an incomplete run must not rotate the last complete backup out"
+
+    def test_a_nested_file_sharing_a_critical_basename_is_still_tolerated(
+            self, tmp_path, monkeypatch, capsys):
+        """Basename matching would reinstate the very bug this fixes.
+
+        plugins/x/.env is an ordinary file that may rotate; only .env at the root is
+        critical. Matching on basename made any nested collision fail the run again.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        nested = hermes_home / "plugins" / "someplugin" / ".env"
+        nested.parent.mkdir(parents=True, exist_ok=True)
+        nested.write_text("PLUGIN=1\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli.backup import run_backup
+
+        import hermes_cli.backup as backup_mod
+        real_iter = backup_mod._iter_backup_files
+
+        def _scan_then_remove(*args, **kwargs):
+            listed = list(real_iter(*args, **kwargs))
+            nested.unlink()
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _scan_then_remove)
+
+        assert run_backup(Namespace(output=str(tmp_path / "out.zip"))) is True
+        assert "Backup complete" in capsys.readouterr().out
+
+    def test_mass_disappearance_keeps_the_archive_but_withholds_the_prune(
+            self, tmp_path, monkeypatch, capsys):
+        """Tolerance needs a ceiling, or the hostage scenario inverts.
+
+        Every file in the archive is intact, so failing the run would discard a usable
+        backup. But it no longer covers what older archives do, so it must not rotate
+        them out.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        churning = hermes_home / "cron" / "output" / "job" / "run.md"
+        churning.parent.mkdir(parents=True, exist_ok=True)
+        churning.write_text("per-run output\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli.backup import _RUN_BACKUP_PREFIX, run_backup
+
+        import hermes_cli.backup as backup_mod
+        real_iter = backup_mod._iter_backup_files
+
+        def _scan_then_remove(*args, **kwargs):
+            listed = list(real_iter(*args, **kwargs))
+            churning.unlink()
+            return iter(listed)
+
+        monkeypatch.setattr(backup_mod, "_iter_backup_files", _scan_then_remove)
+        monkeypatch.setattr(backup_mod, "_MAX_VANISHED_SHARE_FOR_PRUNE", 0.0)
+
+        out_dir = tmp_path / "b"
+        out_dir.mkdir()
+        good_old = out_dir / f"{_RUN_BACKUP_PREFIX}20260101-000000.zip"
+        good_old.write_bytes(b"PK")
+
+        assert run_backup(Namespace(
+            output=str(out_dir / f"{_RUN_BACKUP_PREFIX}20260921-120000.zip"),
+            keep=1)) is True, "the archive itself is intact"
+        assert "Not pruning" in capsys.readouterr().out
+        assert good_old.exists(), "older archives cover more, so they must survive"
 
     def test_empty_hermes_home(self, tmp_path, monkeypatch):
         """Backup handles empty hermes home (no files to back up)."""
