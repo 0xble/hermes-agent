@@ -684,7 +684,9 @@ test.skipIf(process.platform === 'win32')(
           process.stdout.on('data', chunk => {
             stdout += String(chunk)
 
-            if (stdout.includes('READY\n')) {finish()}
+            if (stdout.includes('READY\n')) {
+              finish()
+            }
           })
           process.stderr.on('data', chunk => {
             stderr += String(chunk)
