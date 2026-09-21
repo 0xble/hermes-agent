@@ -394,9 +394,9 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
         SimpleNamespace(builder=MagicMock(return_value=builder)),
     )
 
-    # A tight timeout: if connect() awaited the hanging set_my_commands this
-    # would raise TimeoutError instead of returning.
-    ok = await asyncio.wait_for(adapter.connect(), timeout=0.5)
+    # Housekeeping never completes, so this still detects awaiting it while
+    # allowing a busy test runner enough time to complete connection setup.
+    ok = await asyncio.wait_for(adapter.connect(), timeout=5.0)
 
     assert ok is True
     assert adapter._post_connect_task is not None

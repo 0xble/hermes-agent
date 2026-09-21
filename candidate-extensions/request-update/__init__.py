@@ -60,7 +60,7 @@ def request_update(args: dict[str, Any], **kwargs: Any) -> str:
                      error="request_update requires a non-empty reason")
     home = _home()
     pending = home / ".update_pending.json"
-    if pending.exists():
+    if pending.exists() or (home / ".update_pending.claimed.json").exists():
         return _json(success=False, status="refused", error_code="update_pending",
                      error="an update request is already pending")
     check = subprocess.run(
@@ -75,8 +75,6 @@ def request_update(args: dict[str, Any], **kwargs: Any) -> str:
     if "already up to date" in output.casefold():
         return _json(success=False, status="refused", error_code="no_update",
                      error="the native update check found no update")
-    output = home / ".update_output.txt"
-    exit_code = home / ".update_exit_code"
     pending_data = {
         "platform": _session_value("platform", kwargs),
         "chat_id": _session_value("chat_id", kwargs),
@@ -90,22 +88,28 @@ def request_update(args: dict[str, Any], **kwargs: Any) -> str:
         "source": "request_update",
         "timestamp": datetime.now().isoformat(),
     }
-    pending.parent.mkdir(parents=True, exist_ok=True)
-    pending.write_text(json.dumps({k: v for k, v in pending_data.items() if v}) + "\n", encoding="utf-8")
-    exit_code.unlink(missing_ok=True)
-    (home / ".update_prompt.json").unlink(missing_ok=True)
-    (home / ".update_response").unlink(missing_ok=True)
     try:
         from gateway.run import _resolve_hermes_bin
         from gateway.slash_commands import _spawn_detached_update
+        from gateway.update_launcher import launch_native_update
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             raise RuntimeError("Hermes executable could not be resolved")
-        _spawn_detached_update(hermes_cmd, output, exit_code)
+
+        def spawn(command, output_path, exit_code_path):
+            # Only the admitted request may clear stale prompt state.
+            (home / ".update_prompt.json").unlink(missing_ok=True)
+            (home / ".update_response").unlink(missing_ok=True)
+            _spawn_detached_update(command, output_path, exit_code_path)
+
+        result = launch_native_update(
+            home=home, hermes_cmd=hermes_cmd,
+            pending={k: v for k, v in pending_data.items() if v}, spawn=spawn,
+        )
+        if not result["started"]:
+            return _json(success=False, status="refused", error_code="update_pending",
+                         error="an update request is already pending")
     except Exception as exc:
-        pending.unlink(missing_ok=True)
-        output.unlink(missing_ok=True)
-        exit_code.unlink(missing_ok=True)
         return _json(success=False, status="refused", error_code="spawn_failed", error=str(exc))
     # The slash command arms the gateway's completion watcher after spawning; without that, progress
     # and prompts are only picked up if the gateway restarts under the update. Tools run inside the

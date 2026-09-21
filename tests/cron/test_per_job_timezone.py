@@ -143,3 +143,20 @@ class TestSurfaces:
         from types import SimpleNamespace
         assert ("job_timezone", "job_timezone") in _JOB_ARG_FIELDS
         assert _job_api_kwargs(SimpleNamespace(job_timezone="Asia/Manila"))["job_timezone"] == "Asia/Manila"
+
+
+def test_cli_edit_timezone_reaches_real_update_and_can_clear(store):
+    from types import SimpleNamespace
+    from hermes_cli.cron import cron_edit
+
+    job = jobs.create_job(name="timezone CLI regression", schedule="0 8 * * *", prompt="test", deliver="local")
+    assert cron_edit(SimpleNamespace(job_id=job["id"], job_timezone="America/Los_Angeles")) == 0
+    edited = jobs.get_job(job["id"])
+    assert edited["timezone"] == "America/Los_Angeles"
+    assert "job_timezone" not in edited
+    assert datetime.fromisoformat(edited["next_run_at"]).astimezone(LOS_ANGELES).hour == 8
+    assert cron_edit(SimpleNamespace(job_id=job["id"], job_timezone="")) == 0
+    cleared = jobs.get_job(job["id"])
+    assert cleared.get("timezone") is None
+    assert datetime.fromisoformat(cleared["next_run_at"]).astimezone(NEW_YORK).hour == 8
+    assert cleared["next_run_at"] != edited["next_run_at"]

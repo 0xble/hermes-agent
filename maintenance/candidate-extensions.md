@@ -9,7 +9,8 @@ the extension installer, or the personal skill curation procedure. The
 - The four personal plugins (`goal-lifecycle`, `memory-journal`, `request-update`,
   `review-candidate`) install through real plugin discovery and register their tools
   (`goal_set`, `memory_undo`, `memory_journal_list`, `request_update`, `review_candidate`).
-  Review completion binds to the dispatched child; request-update uses native spawn/watch.
+  Review completion binds to the dispatched child; request-update uses the canonical
+  native launcher and watcher, including atomic admission and v2 completion markers.
   Committed `goal_set` mutations carry a `notice` receipt that
   `agent/inline_tool_executors.py` surfaces through the agent notice lane
   (`goals.auto_notices`).
@@ -37,11 +38,16 @@ the extension installer, or the personal skill curation procedure. The
 
 `scripts/run_tests.sh` on `candidate-extensions/*/test_*.py`,
 `tests/plugins/test_candidate_extension_schemas.py`,
+`tests/plugins/test_request_update_native_launcher.py`,
 `tests/plugins/test_candidate_extensions_install.py`,
 `tests/plugins/test_canonical_skill_guard.py`,
 `tests/plugins/test_hindsight_root_guard.py`, and
 `tests/agent/test_goal_set_receipt_notice.py`. `scripts/check_fork_patches.py` proves the
 installed profile registers every extension tool through discovery.
+The plugins are installed copies. When a release changes an extension, refresh them
+with `scripts/install_candidate_extensions.py --home <personal-profile>` from the
+verified release before its gateway restart, and compare installed file hashes.
+The `--maintenance-only` option does not update plugins.
 
 ## Retirement and rollback
 
