@@ -89,6 +89,10 @@ Timer and remote-kernel concurrency fixtures use bounded Events to establish the
 intended owner before asserting behavior; real worker threads and watchdogs remain
 in place. Updater tests isolate all launchd inventory and profile-plist probes so fake
 updates cannot discover the host gateway. No runtime safety guard is disabled.
+The desktop installer-ownership fixture waits for a readiness message from its real
+Python child before checking process arguments. Full platform concurrency left the
+shell wrapper running beyond its former 40 x 25ms polling window. A bounded child
+handshake preserves the real process-identity assertions and reports startup failures.
 
 The pre-fix full local baseline on macOS discovered 4,200 files: 49,601 passed,
 74 failed, 560 skipped. Four updater files account for 14 failures, 26 failures

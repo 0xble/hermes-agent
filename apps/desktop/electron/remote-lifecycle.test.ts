@@ -635,7 +635,7 @@ test.skipIf(process.platform === 'win32')(
     // A bare link to a copied venv interpreter loses its standard-library prefix.
     // Build the minimal real venv metadata that an installed launcher relies on.
     await promisify(execFileCallback)('python3', ['-m', 'venv', '--without-pip', path.join(installDir, 'venv')])
-    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n', 'utf8')
+    await writeFile(entrypoint, 'import time\nprint("READY", flush=True)\ntime.sleep(30)\n', 'utf8')
     await writeFile(launcher, `#!/bin/bash\nexec "${pythonLink}" "${entrypoint}" "$@"\n`, 'utf8')
     await chmod(launcher, 0o755)
 
@@ -651,11 +651,48 @@ test.skipIf(process.platform === 'win32')(
     ]
 
     const children: ReturnType<typeof spawn>[] = []
+    const readiness = new Map<ReturnType<typeof spawn>, Promise<void>>()
 
     const spawnInstaller = (args: string[]) => {
-      const process = spawn(launcher, args, { stdio: 'ignore' })
+      const process = spawn(launcher, args, { stdio: ['ignore', 'pipe', 'pipe'] })
 
       children.push(process)
+      readiness.set(
+        process,
+        new Promise<void>((resolve, reject) => {
+          let stdout = ''
+          let stderr = ''
+
+          const timer = setTimeout(
+            () => finish(new Error(`Installer entrypoint did not become ready: ${stderr}`)),
+            5_000
+          )
+
+          const finish = (error?: Error) => {
+            clearTimeout(timer)
+            process.off('error', onError)
+            process.off('exit', onExit)
+            error ? reject(error) : resolve()
+          }
+
+          const onError = (error: Error) => finish(error)
+
+          const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+            finish(new Error(`Installer exited before readiness (${code ?? signal}): ${stderr}`))
+          }
+
+          process.stdout.on('data', chunk => {
+            stdout += String(chunk)
+
+            if (stdout.includes('READY\n')) {finish()}
+          })
+          process.stderr.on('data', chunk => {
+            stderr += String(chunk)
+          })
+          process.once('error', onError)
+          process.once('exit', onExit)
+        })
+      )
 
       return process
     }
@@ -667,17 +704,12 @@ test.skipIf(process.platform === 'win32')(
     }
 
     const waitForEntrypoint = async (process: ReturnType<typeof spawn>) => {
-      for (let attempt = 0; attempt < 40; attempt += 1) {
-        const command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
+      // Observe the actual Python child becoming ready before checking its argv.
+      // Under a full platform run, wrapper exec can exceed the old 40 x 25ms poll.
+      await readiness.get(process)
+      const command = (await exec(`ps -ww -o command= -p ${process.pid}`)).stdout
 
-        if (command.includes(entrypoint)) {
-          return true
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 25))
-      }
-
-      return false
+      return command.includes(entrypoint)
     }
 
     try {
@@ -759,7 +791,8 @@ test.skipIf(process.platform === 'win32')(
 
       await rm(temp, { force: true, recursive: true })
     }
-  }
+  },
+  30_000
 )
 
 test('disconnect reaps the backend recorded for this desktop ownership', async () => {
