@@ -40,7 +40,7 @@ pauses remain authoritative.
 
 Run scripts/run_tests.sh for tests/hermes_cli/test_goal_criteria_completeness.py,
 tests/hermes_cli/test_goals.py, tests/gateway/test_goal_verdict_send.py,
-tests/cli/test_blocked_goal_turn_admission.py, tests/tui_gateway/test_goal_command.py,
+tests/hermes_cli/test_blocked_goal_turn_admission.py, tests/tui_gateway/test_goal_command.py,
 and tests/tui_gateway/test_tui_gateway_queue_on_busy.py. Also cover the existing
 goal dispatch, wait, restart, budget, notice, and quality-gate regression suites.
 Desktop: the session-control.test.tsx UI suite.
