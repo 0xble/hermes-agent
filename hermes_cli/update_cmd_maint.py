@@ -760,8 +760,9 @@ def _run_full_backup() -> None:
 
     print("◆ Creating pre-update backup...")
     t0 = _time.monotonic()
+    outcome: dict = {}
     try:
-        out_path = create_pre_update_backup(keep=int(_keep))
+        out_path = create_pre_update_backup(keep=int(_keep), outcome=outcome)
     except BackupInProgressError:
         # Not a fault, and not worth waiting out: the backup slot is a cross-process lock held
         # for as long as a full archive takes (tens of minutes), against a 0.25s acquire timeout.
@@ -785,6 +786,22 @@ def _run_full_backup() -> None:
         print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
         print()
         return
+
+    if outcome.get("incomplete"):
+        # The archive is kept and is still the best rollback point available, but calling it
+        # a backup without saying what is missing is how an operator finds out at restore
+        # time. Errors are files that exist and could not be read; vanished ones were
+        # removed mid-run and are not a defect in the archive.
+        _errs, _gone = outcome.get("errors", 0), outcome.get("vanished", 0)
+        if _errs:
+            _detail, _token = f"{_errs} file(s) could not be read", "entry_failure="
+        else:
+            _detail, _token = f"{_gone} file(s) disappeared mid-run", "entry_vanished="
+        print(f"  ⚠ This backup is INCOMPLETE: {_detail} of {outcome.get('selected', 0)} selected.")
+        print("    It is kept and still restorable, but it does not cover everything.")
+        # Name the token that will actually be there: the two causes log under different
+        # keys, and a vanished-only run has no entry_failure= line at all.
+        print(f"    The profile log names each one (search: {_token}).")
 
     try:
         size_bytes = out_path.stat().st_size

@@ -1,12 +1,16 @@
 """Tests for hermes backup and import commands."""
 
+import itertools
 import json
+import logging
 import os
+import re
 import socket
 import sqlite3
 import stat
 import zipfile
 from argparse import Namespace
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -388,6 +392,315 @@ class TestBackup:
         assert result is not None
         assert staged_dirs, "no SQLite snapshot was staged"
         assert all(d == str(out_zip.parent) for d in staged_dirs), staged_dirs
+
+    def test_pre_update_zip_names_unreadable_files_and_counts_them(
+            self, tmp_path, monkeypatch, caplog):
+        """A pre-update archive is a rollback point with no console attached, so a
+        file it could not read must be named in the log and counted in the summary.
+
+        It used to be swallowed at DEBUG and the summary reported the *selected*
+        count as ``files=``, so an archive missing data looked identical to a whole
+        one.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        unreadable = hermes_home / "unreadable.txt"
+        unreadable.write_text("cannot be read")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def _fail_one(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "unreadable.txt":
+                raise PermissionError("Permission denied")
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _fail_one)
+
+        out_zip = hermes_home / "backups" / "pre-update-test.zip"
+        out_zip.parent.mkdir(parents=True, exist_ok=True)
+        with caplog.at_level(logging.INFO, logger=backup_mod.logger.name):
+            result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        # The archive is still kept: a partial rollback point beats none.
+        assert result == out_zip
+        messages = [r.getMessage() for r in caplog.records]
+        named = [m for m in messages if "entry_failure=" in m and "unreadable.txt" in m]
+        assert named, f"the unreadable file was not named at WARNING: {messages}"
+        assert all(r.levelno >= logging.WARNING
+                   for r in caplog.records if "entry_failure=" in r.getMessage())
+
+        summary = [m for m in messages if "phase=archive status=" in m and "duration_ms" in m]
+        assert summary, messages
+        assert "status=incomplete" in summary[-1], summary[-1]
+        assert "errors=1" in summary[-1], summary[-1]
+        # ``files=`` is what landed in the archive, not what the scan selected.
+        selected = int(re.search(r"selected=(\d+)", summary[-1]).group(1))
+        written = int(re.search(r"files=(\d+)", summary[-1]).group(1))
+        assert written == selected - 1, summary[-1]
+        # Against the archive, not against the arithmetic that produced it. Restating
+        # `written = selected - errors - vanished` would pass under any miscount, and
+        # a failed entry really can leave a truncated member behind.
+        with zipfile.ZipFile(out_zip) as archive:
+            assert len(archive.namelist()) == written, archive.namelist()
+
+    def test_pre_update_zip_separates_vanished_files_from_errors(
+            self, tmp_path, monkeypatch, caplog):
+        """A file removed between the scan and the write is routine churn on an
+        active home. It must not be reported as a read error, or every pre-update
+        backup on a busy install looks incomplete."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        # Proportion matters: the share ceiling that withholds pruning is 1%, so the churn
+        # has to sit below it the way it does on a real home (a handful of per-run cron
+        # files out of hundreds of thousands). A three-file fixture would read as a mass
+        # disappearance and prove the opposite of what this test is named for.
+        out_dir = hermes_home / "cron" / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(200):
+            (out_dir / f"kept-{i}.log").write_text("retained")
+        transient = out_dir / "job.log"
+        transient.write_text("removed mid-run")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def _vanish_one(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "job.log":
+                Path(filename).unlink()
+                raise FileNotFoundError(filename)
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _vanish_one)
+
+        out_zip = hermes_home / "backups" / "pre-update-test.zip"
+        out_zip.parent.mkdir(parents=True, exist_ok=True)
+        with caplog.at_level(logging.INFO, logger=backup_mod.logger.name):
+            result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        messages = [r.getMessage() for r in caplog.records]
+        summary = [m for m in messages if "phase=archive status=" in m and "duration_ms" in m]
+        assert summary, messages
+        assert "status=complete" in summary[-1], summary[-1]
+        assert "errors=0" in summary[-1], summary[-1]
+        assert "vanished=1" in summary[-1], summary[-1]
+        assert any("entry_vanished=" in m and "job.log" in m for m in messages), messages
+        written = int(re.search(r"files=(\d+)", summary[-1]).group(1))
+        with zipfile.ZipFile(out_zip) as archive:
+            assert len(archive.namelist()) == written, len(archive.namelist())
+            assert "cron/output/job.log" not in archive.namelist()
+
+    def test_pre_update_incomplete_archive_does_not_rotate_out_the_last_good_one(
+            self, tmp_path, monkeypatch, caplog):
+        """An unreadable file recurs every run, so an archive missing it must not prune.
+
+        Otherwise one permanently unreadable file walks every retained rollback point off
+        the end: five updates, five incomplete archives, nothing complete left to restore.
+        The interactive path has refused this since #36; this is the automatic path.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        (hermes_home / "unreadable.txt").write_text("cannot be read")
+        backup_dir = hermes_home / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        # Named so _newest_first, which orders by NAME, sees them as real timestamped
+        # archives rather than in whatever order they were created.
+        existing = [backup_dir / f"pre-update-2026-09-0{i}-120000.zip" for i in range(1, 6)]
+        for path in existing:
+            path.write_bytes(b"a complete earlier rollback point")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def _fail_one(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "unreadable.txt":
+                raise PermissionError("Permission denied")
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _fail_one)
+        with caplog.at_level(logging.INFO, logger=backup_mod.logger.name):
+            result = backup_mod._create_prefixed_full_backup(
+                hermes_home, "pre-update-", 5, "pre-update", "backup")
+
+        assert result is not None and result.exists()
+        for path in existing:
+            assert path.exists(), f"{path.name} was rotated out for an incomplete archive"
+        assert backup_mod._archive_is_incomplete(result), "the archive was not marked"
+        assert any("incomplete errors=1" in r.getMessage() for r in caplog.records), \
+            [r.getMessage() for r in caplog.records]
+
+    def test_repeated_incomplete_runs_stay_bounded(self, tmp_path, monkeypatch):
+        """Refusing to prune while runs are incomplete is unbounded, not safe.
+
+        A file that cannot be read stays unreadable, so the incomplete run repeats every
+        update. Skipping the prune to protect whole archives therefore removes the cap
+        entirely, and a real pre-update archive on a live home is tens of gigabytes.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        (hermes_home / "unreadable.txt").write_text("cannot be read")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def _fail_one(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "unreadable.txt":
+                raise PermissionError("Permission denied")
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _fail_one)
+
+        # Distinct names: the prune orders by name, and eight runs land in one second.
+        minute = itertools.count(1)
+
+        class _Clock:
+            @staticmethod
+            def now():
+                return datetime(2026, 9, 21, 12, 0) + timedelta(minutes=next(minute))
+
+        monkeypatch.setattr(backup_mod, "datetime", _Clock)
+        for _ in range(8):
+            backup_mod._create_prefixed_full_backup(
+                hermes_home, "pre-update-", 5, "pre-update", "backup")
+
+        kept = list((hermes_home / "backups").glob("pre-update-*.zip"))
+        assert len(kept) == backup_mod._MAX_INCOMPLETE_KEPT, \
+            [p.name for p in kept]
+
+    def test_discarding_a_failed_entry_spares_an_earlier_one_of_the_same_name(
+            self, tmp_path, monkeypatch):
+        """Removal is positional because two members can share an arcname.
+
+        `_collect_memory_provider_external_paths` dedups exact resolved paths only, so a
+        provider declaring overlapping bases yields one file twice under one name. Keyed
+        on name, discarding the failed second copy takes the good first one with it, and
+        the archive silently loses a file it successfully read.
+        """
+        import hermes_cli.backup as backup_mod
+
+        good = tmp_path / "good.bin"
+        good.write_bytes(b"the copy that was read successfully")
+        doomed = tmp_path / "doomed.bin"
+        doomed.write_bytes(b"the copy whose read dies")
+        out = tmp_path / "out.zip"
+
+        real_write = zipfile.ZipFile.write
+
+        def _fail_second(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "doomed.bin":
+                # The member must be OPENED before the failure, or there is no orphan
+                # record to mis-remove and the test proves nothing. A bare raise here
+                # passes against name-keyed removal too.
+                with self.open(arcname or str(filename), "w") as dest:
+                    dest.write(b"partial")
+                raise PermissionError("Permission denied")
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _fail_second)
+        errors = []
+        # Both entries claim the same arcname, the second one fails.
+        entries = [(good, Path("shared.bin")), (doomed, Path("shared.bin"))]
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            backup_mod._write_zip_entries(
+                zf, entries, out, track_bytes=False,
+                on_db_failure=lambda rel: None,
+                on_error=lambda rel, exc: errors.append(str(rel)),
+                on_progress=lambda i: None)
+
+        assert errors == ["shared.bin"]
+        with zipfile.ZipFile(out) as archive:
+            assert archive.namelist() == ["shared.bin"], archive.namelist()
+            assert archive.read("shared.bin") == good.read_bytes(), \
+                "the successfully read copy was discarded with the failed one"
+
+    def test_routine_churn_on_a_small_home_is_not_a_mass_disappearance(
+            self, tmp_path, monkeypatch):
+        """One rotated file must not cost a small install its rollback points.
+
+        Churn is absolute -- a few files per run, whatever the home's size -- while
+        coverage loss is relative. A share rule alone reads one routine rotation on an
+        eleven-file home as 9%, i.e. a mass disappearance, which now also means a
+        sidecar and a retention cap of one. That is the failure this pairs a floor with
+        the share to avoid.
+        """
+        import hermes_cli.backup as backup_mod
+        # Same single-file event, the two homes differing only in size.
+        assert backup_mod._is_mass_vanish(1, 11) is False
+        assert backup_mod._is_mass_vanish(1, 112_106) is False
+        # A genuine mass disappearance still trips: both halves clear.
+        assert backup_mod._is_mass_vanish(40, 303) is True
+        # Share without the floor, and floor without the share, each fail alone.
+        assert backup_mod._is_mass_vanish(9, 11) is False, "floor not applied"
+        assert backup_mod._is_mass_vanish(30, 112_106) is False, "share not applied"
+        # Critical state never depends on this: it is routed to on_error before the
+        # vanished branch is reached, so the floor can only relax the verdict on churn.
+        for name in (".env", "config.yaml", "state.db"):
+            assert backup_mod._is_critical_state(Path(name)) is True
+
+    def test_a_failed_entry_leaves_no_truncated_member_in_the_archive(
+            self, tmp_path, monkeypatch):
+        """A read that dies partway must not leave a short file behind that restores clean.
+
+        ZipFile.write opens the member before reading the source, and CPython appends the
+        record in a finally, so a mid-stream fault lands a truncated member carrying a CRC
+        over the bytes that did arrive. testzip() reports nothing, and `hermes import`
+        writes the short file over the real one.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        # Incompressible, and the partial read below exceeds 64 KiB on purpose. zipfile
+        # finds the end-of-central-directory by scanning the last (1 << 16) + 22 bytes,
+        # so a smaller abandoned entry is tolerated whatever the implementation does and
+        # this test would pass against a broken one. See _discard_partial_entries.
+        flaky = hermes_home / "flaky.bin"
+        flaky.write_bytes(os.urandom(300_000))
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def _die_midway(self, filename, arcname=None, *a, **kw):
+            if Path(filename).name == "flaky.bin":
+                # Open the member, write part of it, then fail: exactly what a stalled
+                # mount or an EIO does, and what a plain `raise` would NOT reproduce.
+                with self.open(arcname or str(filename), "w") as dest:
+                    dest.write(flaky.read_bytes()[:120_000])
+                raise OSError(5, "Input/output error")
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", _die_midway)
+        out_zip = hermes_home / "backups" / "pre-update-test.zip"
+        out_zip.parent.mkdir(parents=True, exist_ok=True)
+        assert backup_mod._write_full_zip_backup(out_zip, hermes_home) == out_zip
+
+        # Opening at all is half the assertion: reclaiming the abandoned bytes by rewinding
+        # start_dir leaves a stale tail past the end-of-central-directory record, and with
+        # an orphan this size the backward scan no longer reaches it.
+        with zipfile.ZipFile(out_zip) as archive:
+            assert archive.testzip() is None
+            assert "flaky.bin" not in archive.namelist(), \
+                "a truncated member survived into the archive"
+            # The entries that did succeed are untouched by the removal.
+            assert archive.read("config.yaml") == (hermes_home / "config.yaml").read_bytes()
 
 
 
@@ -939,6 +1252,10 @@ class TestBackupEdgeCases:
 
         monkeypatch.setattr(backup_mod, "_iter_backup_files", _scan_then_remove)
         monkeypatch.setattr(backup_mod, "_MAX_VANISHED_SHARE_FOR_PRUNE", 0.0)
+        # A mass disappearance now has to clear an absolute floor as well as the share,
+        # so one vanished file trips neither on its own. This test forces the rule to
+        # fire with a single file, so it has to neutralise both halves of it.
+        monkeypatch.setattr(backup_mod, "_MIN_VANISHED_FOR_MASS", 0)
 
         out_dir = tmp_path / "b"
         out_dir.mkdir()
