@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { exec as execCallback } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,6 +31,10 @@ import { createBootstrapCoordinator } from './ssh-bootstrap-coordinator'
 
 const CORRELATION = '12345678-1234-4678-9234-567812345678'
 const exec = promisify(execCallback)
+
+// Coreutils lives at /bin/true on most Linux images but only at /usr/bin/true
+// on macOS, so a hardcoded path makes this test Linux-only. Resolve it instead.
+const TRUE_BIN = ['/bin/true', '/usr/bin/true'].find(candidate => existsSync(candidate)) ?? '/usr/bin/true'
 
 function observation(over: Record<string, unknown> = {}) {
   return JSON.stringify({
@@ -288,7 +293,7 @@ test('POSIX managed launcher executes the updater command and atomically publish
       {
         ssh: { exec: async () => '' },
         platform: 'Linux',
-        hermesPath: '/bin/true',
+        hermesPath: TRUE_BIN,
         hermesHome: home
       },
       CORRELATION
