@@ -12,7 +12,8 @@ Failed or interrupted model turns do not run completion judging.
 ## Provenance and adaptation
 
 - Fork patch identity: `goal-criteria-completeness`. Own upstream contribution:
-  [issue #118334](https://github.com/NousResearch/hermes-agent/issues/118334).
+  [PR #118343](https://github.com/NousResearch/hermes-agent/pull/118343),
+  tracked by [issue #118334](https://github.com/NousResearch/hermes-agent/issues/118334).
   Fixes all three authoritative-input truncation sites. Related response-excerpt
   PR #70701 is intentionally separate and does not fix missing criteria.
 - Fork patch identity: `goal-blocked-recovery`. Adopted source:
