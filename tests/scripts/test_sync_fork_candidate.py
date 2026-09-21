@@ -8,7 +8,7 @@ import pytest
 
 
 def git(repo, *args):
-    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True, encoding="utf-8", errors="replace").strip()
 
 
 @pytest.mark.parametrize("new_release", [False, True])
@@ -22,7 +22,7 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     git(upstream, "config", "user.email", "test@example.invalid")
     git(upstream, "config", "user.name", "Test")
     git(upstream, "config", "core.hooksPath", "/dev/null")
-    (upstream / "base").write_text("base")
+    (upstream / "base").write_text("base", encoding="utf-8")
     git(upstream, "add", ".")
     git(upstream, "commit", "-m", "baseline")
     git(upstream, "tag", "v2026.9.14")
@@ -39,12 +39,12 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     git(source, "config", "user.email", "test@example.invalid")
     git(source, "config", "user.name", "Test")
     # Advance the fork after cloning: relying on cached origin/main loses this patch.
-    (fork / "patch").write_text("preserve me")
+    (fork / "patch").write_text("preserve me", encoding="utf-8")
     git(fork, "add", ".")
     git(fork, "commit", "-m", "fork patch")
     fork_head = git(fork, "rev-parse", "HEAD")
     if new_release:
-        (upstream / "release").write_text("new release")
+        (upstream / "release").write_text("new release", encoding="utf-8")
         git(upstream, "add", ".")
         git(upstream, "commit", "-m", "next release")
         git(upstream, "tag", "v2026.9.21")
@@ -53,14 +53,14 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     observed = []
     def verify(repo, **kwargs):
         observed.append(git(repo, "rev-parse", "HEAD"))
-        assert (repo / "patch").read_text() == "preserve me"
+        assert (repo / "patch").read_text(encoding="utf-8") == "preserve me"
         return {"exit": 0, "summary": "real candidate observed"}
     monkeypatch.setattr(sync, "verify_candidate", verify)
     receipt = tmp_path / "result.json"
     args = ["--repo", str(target), "--source-repo", str(source), "--candidate", "origin/main",
             "--publish", "--verify-current", "--result", str(receipt)]
     assert sync.main(args) == 0
-    result = json.loads(receipt.read_text())
+    result = json.loads(receipt.read_text(encoding="utf-8"))
     assert result["newest_tag"] == expected_tag
     assert result["candidate"] == fork_head
     assert result["tests"]["exit"] == 0
@@ -73,12 +73,12 @@ def test_sync_refreshes_tests_and_publishes_without_promoting(tmp_path, monkeypa
     published = git(fork, "rev-parse", f"refs/heads/candidate/{expected_tag}")
     monkeypatch.setattr(sync, "verify_candidate", lambda *a, **k: {"exit": 1, "summary": "regression"})
     assert sync.main(args) == 1
-    assert json.loads(receipt.read_text())["status"] == "tests_failed"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["status"] == "tests_failed"
     assert git(fork, "rev-parse", f"refs/heads/candidate/{expected_tag}") == published
     # Protected dirt is a failure, never an apparently successful no-op.
-    (target / "unowned").write_text("leave me")
+    (target / "unowned").write_text("leave me", encoding="utf-8")
     assert sync.main(args) == 1
-    assert (target / "unowned").read_text() == "leave me"
+    assert (target / "unowned").read_text(encoding="utf-8") == "leave me"
 
 
 def test_failed_verification_never_publishes(tmp_path, monkeypatch):
@@ -89,11 +89,11 @@ def test_failed_verification_never_publishes(tmp_path, monkeypatch):
     missing = sync.verify_candidate(tmp_path)
     assert missing["exit"] == 1 and "tests/test_boundary.py" in missing["output"]
     (tmp_path / "tests").mkdir()
-    (tmp_path / "tests/test_boundary.py").write_text("def test_contract(): pass\n")
+    (tmp_path / "tests/test_boundary.py").write_text("def test_contract(): pass\n", encoding="utf-8")
     # Runner failures must remain failures, with useful stderr in the receipt.
     (tmp_path / "scripts").mkdir()
     runner = tmp_path / "scripts/run_tests.sh"
-    runner.write_text("#!/bin/sh\necho regression >&2\nexit 7\n")
+    runner.write_text("#!/bin/sh\necho regression >&2\nexit 7\n", encoding="utf-8")
     runner.chmod(0o700)
     result = sync.verify_candidate(tmp_path)
     assert result["exit"] == 7 and "regression" in result["output"]

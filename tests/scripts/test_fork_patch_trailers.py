@@ -31,11 +31,11 @@ def _repo(tmp_path):
 
 
 def _units(tmp_path, *identities, prose=""):
-    (tmp_path / "MAINTENANCE.md").write_text("# root contract\n")
+    (tmp_path / "MAINTENANCE.md").write_text("# root contract\n", encoding="utf-8")
     unit_dir = tmp_path / "maintenance"
     unit_dir.mkdir(exist_ok=True)
     body = "".join(f"- Fork patch identity: `{i}`\n" for i in identities)
-    (unit_dir / "unit.md").write_text(body + prose)
+    (unit_dir / "unit.md").write_text(body + prose, encoding="utf-8")
 
 
 def test_commits_above_the_floor_need_trailers_owned_by_a_unit(tmp_path, monkeypatch):
@@ -70,7 +70,7 @@ def test_trailer_identity_without_a_unit_owner_fails(tmp_path, monkeypatch):
 def test_published_backfill_covers_only_the_reviewed_patch_content(tmp_path, monkeypatch):
     git = _repo(tmp_path)
     base = git("rev-parse", "HEAD")
-    (tmp_path / "fix").write_text("reviewed content")
+    (tmp_path / "fix").write_text("reviewed content", encoding="utf-8")
     git("add", "fix")
     git("commit", "-qm", "published without trailer")
     patch_id = subprocess.run(["git", "patch-id", "--stable"],
@@ -79,7 +79,7 @@ def test_published_backfill_covers_only_the_reviewed_patch_content(tmp_path, mon
     _units(tmp_path, "fixture", prose=f"Fork-Patch-Backfill: {patch_id}; fixture\n")
     checker = _checker(tmp_path, monkeypatch)
     assert checker.check_trailers(base) == []
-    (tmp_path / "fix").write_text("different content")
+    (tmp_path / "fix").write_text("different content", encoding="utf-8")
     git("add", "fix")
     git("commit", "-qm", "unreviewed without trailer")
     failures = checker.check_trailers(base)
@@ -182,7 +182,7 @@ def test_merge_commits_need_no_trailer(tmp_path, monkeypatch):
 
 def test_missing_maintenance_units_fail_closed(tmp_path, monkeypatch):
     git = _repo(tmp_path)
-    (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger")
+    (tmp_path / "FORK_PATCHES.md").write_text("obsolete ledger", encoding="utf-8")
     checker = _checker(tmp_path, monkeypatch)
     failures = checker.check_trailers(git("rev-parse", "HEAD"))
     assert failures and "missing" in failures[0]

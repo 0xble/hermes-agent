@@ -51,16 +51,16 @@ def test_maintenance_entrypoint_tracks_installed_code_without_changing_config(tm
     home = tmp_path / "profile"
     home.mkdir()
     config = home / "config.yaml"
-    config.write_text("unrelated: preserve\n")
+    config.write_text("unrelated: preserve\n", encoding="utf-8")
     installed = home / "hermes-agent/scripts"
     installed.mkdir(parents=True)
     target = installed / "check_fork_patches.py"
-    target.write_text("print('first revision')\n")
+    target.write_text("print('first revision')\n", encoding="utf-8")
     install_maintenance(home)
     env = dict(os.environ, HERMES_HOME=str(home))
     command = [sys.executable, str(home / "scripts/check_fork_patches.py")]
-    assert subprocess.check_output(command, env=env, text=True).strip() == "first revision"
-    target.write_text("print('promoted revision')\n")
-    assert subprocess.check_output(command, env=env, text=True).strip() == "promoted revision"
-    assert config.read_text() == "unrelated: preserve\n"
+    assert subprocess.check_output(command, env=env, text=True, encoding="utf-8", errors="replace").strip() == "first revision"
+    target.write_text("print('promoted revision')\n", encoding="utf-8")
+    assert subprocess.check_output(command, env=env, text=True, encoding="utf-8", errors="replace").strip() == "promoted revision"
+    assert config.read_text(encoding="utf-8") == "unrelated: preserve\n"
     assert not (home / "plugins").exists()

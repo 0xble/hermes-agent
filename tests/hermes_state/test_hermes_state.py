@@ -1637,8 +1637,8 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        (tmp_path / "s1.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "s2.json").write_text("{}", encoding="utf-8")
 
         deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
         assert deleted == 2
@@ -1701,9 +1701,9 @@ class TestDeleteEmptySessions:
         db.end_session("empty_with_dump", end_reason="done")
 
         dump = tmp_path / "request_dump_empty_with_dump_0.json"
-        dump.write_text("{}")
+        dump.write_text("{}", encoding="utf-8")
         transcript = tmp_path / "empty_with_dump.jsonl"
-        transcript.write_text("")
+        transcript.write_text("", encoding="utf-8")
 
         deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
         assert deleted == 1
@@ -3730,11 +3730,11 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
-        (sessions_dir / "old1.jsonl").write_text("{}\n")
-        (sessions_dir / "old2.jsonl").write_text("{}\n")
-        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
-        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+        (sessions_dir / "old1.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "old1.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "old2.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "request_dump_old1_001.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "new.jsonl").write_text("{}\n", encoding="utf-8")  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90, sessions_dir=sessions_dir
@@ -6086,7 +6086,7 @@ class TestPerformancePragmasEndToEnd:
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
         if config_text is not None:
-            (home / "config.yaml").write_text(config_text)
+            (home / "config.yaml").write_text(config_text, encoding="utf-8")
         return home
 
     def test_configured_pragmas_reach_all_connection_types(

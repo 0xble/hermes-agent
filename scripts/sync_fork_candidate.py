@@ -73,7 +73,7 @@ def verify_candidate(repo: Path, python: str = sys.executable) -> dict:
     """Use the same isolated runner as development, including current maintenance contracts."""
     paths = set(FORK_TESTS)
     for contract in sorted((repo / "maintenance").glob("*.md")):
-        paths.update(re.findall(r"tests/[\w/]+/test_[\w]+\.py", contract.read_text()))
+        paths.update(re.findall(r"tests/[\w/]+/test_[\w]+\.py", contract.read_text(encoding="utf-8")))
     # Removed/renamed proof files are a broken contract, not permission to skip coverage.
     missing = [path for path in sorted(paths) if not (repo / path).exists()]
     if missing:

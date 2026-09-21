@@ -150,7 +150,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
     # blanket floor. Stable patch IDs retain exact content coverage after a rebase.
     backfills = {}
     for unit in sorted((REPO / MAINTENANCE_DIR).glob("*.md")):
-        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", unit.read_text(), re.M):
+        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", unit.read_text(encoding="utf-8"), re.M):
             backfills[patch_id] = identity.strip()
     # Merge commits carry no patch content of their own; their parents are classified individually.
     for sha in _git("rev-list", "--reverse", "--no-merges", f"{start}..HEAD").split():
