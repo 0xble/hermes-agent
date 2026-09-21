@@ -668,11 +668,14 @@ class TestRegisterHandlers:
     def _observer_calls(app):
         return [c for c in app.add_handler.call_args_list if c.kwargs.get("group") == 99]
 
-    def test_registers_core_handlers_plus_observer(self, monkeypatch):
+    @pytest.fixture
+    def handler_factories(self, monkeypatch):
         import plugins.platforms.telegram.adapter as telegram_adapter
 
         for name in ("TelegramMessageHandler", "CallbackQueryHandler", "InlineQueryHandler", "TypeHandler"):
             monkeypatch.setattr(telegram_adapter, name, lambda *args: SimpleNamespace(callback=args[-1]))
+
+    def test_registers_core_handlers_plus_observer(self, handler_factories):
         a = self._adapter_with_handlers()
         app = MagicMock()
         a._register_handlers(app)
@@ -687,7 +690,7 @@ class TestRegisterHandlers:
         assert len([c for c in calls if c.kwargs.get("group") == 99]) == 1
         assert any(not c.kwargs for c in calls)
 
-    def test_rebuild_re_registers_observer(self):
+    def test_rebuild_re_registers_observer(self, handler_factories):
         """A second call on a fresh app (e.g. a future rebuild) re-registers
         every handler, observer included."""
         a = self._adapter_with_handlers()
@@ -697,7 +700,14 @@ class TestRegisterHandlers:
         a._register_handlers(first_app)
         a._register_handlers(rebuilt_app)  # the rebuild path
 
-        assert rebuilt_app.add_handler.call_args_list == first_app.add_handler.call_args_list
+        first_calls = first_app.add_handler.call_args_list
+        rebuilt_calls = rebuilt_app.add_handler.call_args_list
+        assert len(rebuilt_calls) == len(first_calls)
+        assert all(rebuilt.args[0] is not first.args[0]
+                   for first, rebuilt in zip(first_calls, rebuilt_calls))
+        assert [(c.args[0].callback, c.kwargs.get("group", 0)) for c in rebuilt_calls] == [
+            (c.args[0].callback, c.kwargs.get("group", 0)) for c in first_calls
+        ]
         assert len(self._observer_calls(rebuilt_app)) == 1
 
     def test_transient_init_rebuild_uses_shared_registration(self, monkeypatch):
