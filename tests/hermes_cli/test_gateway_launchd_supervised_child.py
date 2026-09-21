@@ -8,6 +8,7 @@ by update/reaper sweeps while preserving default profile scoping.
 from types import SimpleNamespace
 
 import psutil
+import pytest
 
 import hermes_cli.gateway as gateway
 
@@ -57,9 +58,9 @@ def test_gateway_descendants_tolerates_vanished_wrapper(monkeypatch):
     assert gateway._gateway_descendants_of(501) == set()
 
 
+@pytest.mark.linux_only
 def test_systemd_service_pid_includes_recursive_gateway_descendant(monkeypatch):
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
-    monkeypatch.setattr(gateway, "is_macos", lambda: False)
     monkeypatch.setattr(gateway, "get_service_name", lambda: "hermes-gateway.service")
     monkeypatch.setattr(gateway, "_gateway_descendants_of", lambda pid: {503})
 
@@ -74,9 +75,8 @@ def test_systemd_service_pid_includes_recursive_gateway_descendant(monkeypatch):
     assert gateway._get_service_pids() == {501, 503}
 
 
+@pytest.mark.macos_only
 def test_launchd_default_scope_includes_recursive_gateway_descendant(monkeypatch):
-    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "is_macos", lambda: True)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.default")
     monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda label: ("gui/501", 501))
     monkeypatch.setattr(gateway, "_gateway_descendants_of", lambda pid: {503})
@@ -84,9 +84,8 @@ def test_launchd_default_scope_includes_recursive_gateway_descendant(monkeypatch
     assert gateway._get_service_pids() == {501, 503}
 
 
+@pytest.mark.macos_only
 def test_launchd_fleet_prefix_scan_expands_each_unmapped_wrapper(monkeypatch):
-    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "is_macos", lambda: True)
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.default")
     monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [])
     monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda label: (None, None))
@@ -106,10 +105,7 @@ def test_launchd_fleet_prefix_scan_expands_each_unmapped_wrapper(monkeypatch):
 
 def test_wrapped_service_gateway_is_excluded_from_manual_sweep(monkeypatch):
     service_pids = {501, 503}
-    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-    monkeypatch.setattr(gateway, "is_macos", lambda: False)
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-    monkeypatch.setattr(gateway, "is_windows", lambda: False)
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: service_pids)
     monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *args, **kwargs: [503, 700])
 
     assert gateway.find_gateway_pids(
@@ -118,6 +114,7 @@ def test_wrapped_service_gateway_is_excluded_from_manual_sweep(monkeypatch):
     ) == [700]
 
 
+@pytest.mark.macos_only
 def test_launchd_exclusion_protects_real_wrapped_process(tmp_path, monkeypatch):
     """Service lookup is simulated, but ancestry and argv come from real child processes."""
     import json
@@ -145,15 +142,10 @@ def test_launchd_exclusion_protects_real_wrapped_process(tmp_path, monkeypatch):
             time.sleep(0.02)
         assert pid_file.exists(), "test wrapper did not start its child"
         child = psutil.Process(json.loads(pid_file.read_text()))
-        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
-        monkeypatch.setattr(gateway, "is_macos", lambda: True)
         monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.test")
         monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda label: ("gui/501", wrapper.pid))
         service_pids = gateway._get_service_pids()
         # A genuine manual gateway stays eligible while the wrapped runtime is protected.
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-        monkeypatch.setattr(gateway, "is_windows", lambda: False)
-        monkeypatch.setattr(gateway, "is_macos", lambda: False)
         monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *args, **kwargs: [child.pid, 700])
         monkeypatch.setattr(gateway, "_get_service_pids", lambda **kwargs: service_pids)
         monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda **kwargs: [])
