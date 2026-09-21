@@ -51,6 +51,10 @@ first backtick); other code spans do not own. Commits whose identity is `evidenc
 records, not patches. This contract's own patch identity: `maintenance-contract`. A sync
 rebase rewrites the floor SHA; the checker requires the floor to be an ancestor of HEAD,
 locates a rewritten default floor by its exact subject, and fails clearly if that is gone.
+A maintenance unit may repair missing published metadata with an explicit
+`Fork-Patch-Backfill: <stable-patch-id>; <owned-identity>` line. This covers only
+the reviewed patch content without rewriting shared history or advancing the floor.
+New commits still require trailers, including the final squash merge message.
 A trailer proves classification, not functional coverage. Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing

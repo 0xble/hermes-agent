@@ -146,11 +146,23 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
             return [failure]
     failures: list[str] = []
     unowned: dict[str, str] = {}
+    # Repair already-published metadata without rewriting main or granting a new
+    # blanket floor. Stable patch IDs retain exact content coverage after a rebase.
+    backfills = {}
+    for unit in sorted((REPO / MAINTENANCE_DIR).glob("*.md")):
+        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", unit.read_text(encoding="utf-8"), re.M):
+            backfills[patch_id] = identity.strip()
     # Merge commits carry no patch content of their own; their parents are classified individually.
     for sha in _git("rev-list", "--reverse", "--no-merges", f"{start}..HEAD").split():
         short = sha[:12]
         body = _git("log", "-1", "--format=%B", sha)
         identities = [m.group("identity").strip() for m in _TRAILER.finditer(body)]
+        if not identities and backfills:
+            patch = _git("show", "--pretty=format:", "--no-ext-diff", sha)
+            result = subprocess.run(["git", "patch-id", "--stable"], input=patch,
+                                    capture_output=True, text=True, check=True).stdout.split()
+            if result and result[0] in backfills:
+                identities = [backfills[result[0]]]
         if not identities:
             failures.append(f"commit {short} ({_git('log', '-1', '--format=%s', sha)}) has no Fork-Patch trailer")
             continue
@@ -303,7 +315,10 @@ def _live_fleet() -> dict[str, dict] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global REPO
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", type=Path, help="explicit source checkout for candidate verification")
+    ap.add_argument("--source-only", action="store_true", help="check source ownership only, without asserting runtime promotion")
     ap.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
     ap.add_argument("--baseline", default=DEFAULT_BASELINE, help="upstream release baseline commit")
     ap.add_argument("--trailer-floor", default=DEFAULT_TRAILER_FLOOR,
@@ -311,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
                          "trailers. Located by exact subject when a sync has rewritten the SHA.")
     ap.add_argument("--skip-config", action="store_true", help="skip the config-key checks (fixture profiles)")
     args = ap.parse_args(argv)
+    if args.repo:
+        REPO = args.repo.resolve()
     if not _is_git_checkout():
         # A package-managed install has no history to check; say so instead of tracebacking.
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
@@ -318,10 +335,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     # The subject fallback belongs to the default floor only; a custom --trailer-floor must resolve as given.
     floor_subject = DEFAULT_TRAILER_FLOOR_SUBJECT if args.trailer_floor == DEFAULT_TRAILER_FLOOR else None
-    failures = check_trailers(args.baseline, args.trailer_floor, floor_subject) + check_extensions(args.home)
-    if not args.skip_config:
-        failures += check_config(args.home)
-    failures += check_receipt(args.home)
+    failures = check_trailers(args.baseline, args.trailer_floor, floor_subject)
+    if not args.source_only:
+        failures += check_extensions(args.home)
+        if not args.skip_config:
+            failures += check_config(args.home)
+        failures += check_receipt(args.home)
     for line in failures:
         print(f"FAIL {line}")
     print(f"{'OK' if not failures else 'FAILED'}: {len(failures)} problem(s); checkout {_git('rev-parse', '--short=12', 'HEAD')} home {args.home}")

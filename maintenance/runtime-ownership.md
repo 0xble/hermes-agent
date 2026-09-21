@@ -24,23 +24,33 @@ the migration overlay snapshot is historical evidence, not current authority.
 
 ## Scheduled procedures
 
-The personal profile's script jobs use copies under `$HERMES_HOME/scripts`.
-`scripts/install_candidate_extensions.py` owns that copy operation. Review the
-source revision, installed copies, actual job arguments, and job receipt together
-when changing a procedure. A Git update alone does not refresh these copies.
+The personal profile's script jobs use regular files under `$HERMES_HOME/scripts`.
+`scripts/install_candidate_extensions.py --maintenance-only --home <profile>` installs
+sync/verifier forwarding entry points without changing plugins or configuration.
+They execute procedures in `<profile>/hermes-agent/scripts`, so native promotion
+updates their implementation too. Other candidate scripts remain copies. Review
+source revision, installed entry points, actual arguments, and receipts together.
+The personal wrapper uses the permanent source checkout's `.venv` for tests. Its
+prerequisites include pytest and the pinned lazy Hindsight client
+(`uv pip install --python <source>/.venv/bin/python hindsight-client==0.6.1`).
+It checks these imports before beginning and records each result under
+`<profile>/maintenance/fork-sync/`. Missing dependencies are failures, not skipped tests.
 
 | Job | Canonical procedure | Invocation contract and verification |
 |---|---|---|
-| `sync-fork-candidate` | `scripts/sync_fork_candidate.py` | Host wrapper supplies `--repo`, `--candidate`, and `--current-base`. Use a dedicated sync worktree. Inspect rebased SHA and tests; `--publish` publishes only a candidate. |
-| `check-fork-patches` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect trailer, unit-ownership, and registration results plus actual runtime evidence. |
+| `sync-hermes-fork` | `scripts/sync_fork_candidate.py` | The versioned host wrapper supplies `--repo`, `--source-repo`, `--candidate origin/main`, `--verify-current`, and `--publish`. Release ancestry determines the current base. Missing dedicated sync worktrees are recreated and locked against cleanup. Inspect tested SHA and remote candidate readback. |
+| `verify-hermes-fork` | `scripts/check_fork_patches.py` | Resolve installed package and intended `--home`; inspect trailer, unit-ownership, registration, and native receipt results plus actual runtime evidence. |
 | `curate-skill-observations` | `scripts/curate_skill_observations.py` | Host wrapper supplies a dedicated `--dotfiles` worktree. Without `--publish`, it validates then restores staging. That is not a published curation change. |
 | `snapshot-profile-state` | `candidate-profile/snapshot_profile_state.sh` | Verify the output manifest and isolated restoration. This small-state procedure does not establish a full `state.db` backup. |
 
 Schedules, delivery targets, and enabled state live in the profile's cron store.
-Do not recreate jobs from this document or add a competing scheduler. The source
-sync and curation wrappers inspected on 2026-09-19 omit `--publish`; their successful
-dry runs do not prove an automatic promotion or PR workflow. Company updates
-continue through their signed release owners, not these personal jobs.
+Do not recreate jobs from this document or add a competing scheduler. Sync tests
+even a current release and publishes only `candidate/<tag>`. Conflicts and failed
+tests stop publication. Fork `main` and runtime promotion remain separate reviewed
+actions. A source-only check does not establish runtime health. Manually promote
+reviewed fork `main` through `hermes update --yes`, retaining quick snapshots, then
+check the native receipt, live identity, and a real model round trip.
+Company updates continue through their signed release owners, not these personal jobs.
 
 ## Recovery and acceptance
 

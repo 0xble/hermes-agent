@@ -1043,43 +1043,43 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        traced_connections = []
-        read_ctx = db._read_ctx
+        from contextlib import contextmanager
+        original_read_ctx = db._read_ctx
 
-        @contextlib.contextmanager
-        def trace_read_context():
-            with read_ctx() as conn:
+        @contextmanager
+        def traced_read_ctx():
+            # Readers are pooled. Trace the connection actually leased by each query.
+            with original_read_ctx() as conn:
                 conn.set_trace_callback(statements.append)
-                traced_connections.append(conn)
-                yield conn
+                try:
+                    yield conn
+                finally:
+                    conn.set_trace_callback(None)
 
-        monkeypatch.setattr(db, "_read_ctx", trace_read_context)
+        monkeypatch.setattr(db, "_read_ctx", traced_read_ctx)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
             return sum("WITH TARGET AS (" in sql for sql in normalized)
 
-        try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
-            )
-            assert len(projected) == 1
-            assert context_query_count() == 0
+        projected = db.search_messages(
+            "projectionneedle", fields=("session_id", "snippet")
+        )
+        assert len(projected) == 1
+        assert context_query_count() == 0
 
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
+        full = db.search_messages(
+            "projectionneedle", fields=("session_id", "context")
+        )
+        assert len(full) == 1
+        assert full[0]["context"]
+        assert context_query_count() == 1
 
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
-            for conn in {id(conn): conn for conn in traced_connections}.values():
-                conn.set_trace_callback(None)
+        default = db.search_messages("projectionneedle")
+        assert len(default) == 1
+        assert default[0]["context"]
+        assert context_query_count() == 2
+
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -1648,8 +1648,8 @@ class TestBulkDeleteSessions:
         bulk-delete CLI / web flows don't leak files."""
         db.create_session(session_id="s1", source="cli")
         db.create_session(session_id="s2", source="cli")
-        (tmp_path / "s1.jsonl").write_text("")
-        (tmp_path / "s2.json").write_text("{}")
+        (tmp_path / "s1.jsonl").write_text("", encoding="utf-8")
+        (tmp_path / "s2.json").write_text("{}", encoding="utf-8")
 
         deleted = db.delete_sessions(["s1", "s2"], sessions_dir=tmp_path)
         assert deleted == 2
@@ -1712,9 +1712,9 @@ class TestDeleteEmptySessions:
         db.end_session("empty_with_dump", end_reason="done")
 
         dump = tmp_path / "request_dump_empty_with_dump_0.json"
-        dump.write_text("{}")
+        dump.write_text("{}", encoding="utf-8")
         transcript = tmp_path / "empty_with_dump.jsonl"
-        transcript.write_text("")
+        transcript.write_text("", encoding="utf-8")
 
         deleted = db.delete_empty_sessions(sessions_dir=tmp_path)
         assert deleted == 1
@@ -3939,11 +3939,11 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
-        (sessions_dir / "old1.jsonl").write_text("{}\n")
-        (sessions_dir / "old2.jsonl").write_text("{}\n")
-        (sessions_dir / "request_dump_old1_001.json").write_text("{}")
-        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+        (sessions_dir / "old1.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "old1.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "old2.jsonl").write_text("{}\n", encoding="utf-8")
+        (sessions_dir / "request_dump_old1_001.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / "new.jsonl").write_text("{}\n", encoding="utf-8")  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90, sessions_dir=sessions_dir
@@ -6342,7 +6342,7 @@ class TestPerformancePragmasEndToEnd:
         home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(home))
         if config_text is not None:
-            (home / "config.yaml").write_text(config_text)
+            (home / "config.yaml").write_text(config_text, encoding="utf-8")
         return home
 
     def test_configured_pragmas_reach_all_connection_types(
