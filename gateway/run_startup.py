@@ -1222,11 +1222,20 @@ class GatewayStartupMixin:
             previous = int(path.read_text(encoding="utf-8").strip() or 0)
         except Exception:  # noqa: BLE001 — absent or unreadable means no streak yet
             previous = 0
-        streak = previous + 1
+        # Clamp: a negative or absurd value in the file (corruption, a stray write, a
+        # directory in the way) must not buy an unbounded number of restarts, which is
+        # precisely the loop this bound exists to stop.
+        streak = min(max(previous, 0), _TRANSIENT_EXIT_STREAK_LIMIT) + 1
         try:
             path.write_text(str(streak), encoding="utf-8")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Unwritable means the streak can never advance, so the bound silently fails
+            # open. Say so once rather than looping forever with no explanation.
+            logger.warning(
+                "Cannot record the secret-failure restart streak at %s (%s) — the restart "
+                "bound cannot advance and this may loop until the backend recovers.",
+                path, exc,
+            )
         if streak < _TRANSIENT_EXIT_STREAK_LIMIT:
             return False
         logger.error(

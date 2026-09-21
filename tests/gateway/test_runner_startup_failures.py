@@ -747,3 +747,17 @@ async def test_a_successful_connect_forgives_the_streak(monkeypatch, tmp_path):
         monkeypatch, tmp_path, _MissingCredentialAdapter, secrets_degraded=True
     )
     assert runner.exit_code != GATEWAY_FATAL_CONFIG_EXIT_CODE
+
+
+@pytest.mark.parametrize("corrupt", ["-1000", "not-a-number", ""])
+def test_a_corrupt_streak_file_cannot_buy_unbounded_restarts(monkeypatch, tmp_path, corrupt):
+    """The bound must fail CLOSED. A negative or unparseable counter previously meant
+    the limit was never reached, restoring the unbounded loop it exists to stop."""
+    from gateway.run_startup import _TRANSIENT_EXIT_STREAK_LIMIT
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = GatewayRunner(GatewayConfig(platforms={}, sessions_dir=tmp_path / "s"))
+    runner._transient_exit_streak_path().write_text(corrupt, encoding="utf-8")
+
+    verdicts = [runner._transient_exits_exhausted() for _ in range(_TRANSIENT_EXIT_STREAK_LIMIT + 1)]
+    assert any(verdicts), "a corrupt counter must still reach the limit"

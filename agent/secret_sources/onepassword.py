@@ -88,23 +88,6 @@ def _classify_op_error(message: str) -> ErrorKind:
 _AUTH_ERROR_KINDS = frozenset({ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED})
 
 
-#: Worst-first. A run that mixes a refused credential with a slow one is an auth problem,
-#: never a transient one, so auth outranks everything a retry could fix.
-_ERROR_KIND_SEVERITY = (
-    ErrorKind.AUTH_FAILED, ErrorKind.AUTH_EXPIRED, ErrorKind.REF_INVALID,
-    ErrorKind.BINARY_MISSING, ErrorKind.EMPTY_VALUE, ErrorKind.TIMEOUT, ErrorKind.NETWORK,
-)
-
-
-def _worst_error_kind(messages: List[str]) -> Optional[ErrorKind]:
-    """Worst kind across every failure message, never merely the first one seen."""
-    kinds = {_classify_op_error(m) for m in messages}
-    for kind in _ERROR_KIND_SEVERITY:
-        if kind in kinds:
-            return kind
-    return ErrorKind.INTERNAL if kinds else None
-
-
 def _validate_references(references: Optional[Dict[str, str]]) -> Tuple[Dict[str, str], List[str]]:
     """``(valid_refs, warnings)``: keep valid env names bound to stripped ``op://`` strings."""
     valid: Dict[str, str] = {}
@@ -242,9 +225,15 @@ def fetch_onepassword_secrets(
     # "unauthorized"/403. Distinguish them by scope, because the two demand opposite
     # handling: an identity we no longer trust must invalidate everything it ever
     # resolved, while one forbidden item must not stop the other 91 being cached.
-    attempted = [n for n in valid if n not in prefetched]
-    identity_rejected = bool(attempted) and len(
-        [k for k in failure_kinds if k in _AUTH_ERROR_KINDS]) == len(attempted)
+    # Requires that NOTHING resolved: no value carried over from cache, no successful read.
+    # Scoping this to the re-attempted refs alone inverted it — with 91 refs cached and one
+    # forbidden item, the single retry was "every attempted read", so one unreadable item
+    # was judged a revoked identity and took all 91 good credentials with it.
+    identity_rejected = (
+        bool(failure_kinds)
+        and all(k in _AUTH_ERROR_KINDS for k in failure_kinds)
+        and not secrets
+    )
 
     if identity_rejected:
         # The rejection was observed in THIS call, so continuing to hand back values the
@@ -392,7 +381,10 @@ class OnePasswordSource(SecretSource):
         # timed out is indistinguishable from one the user never configured.
         missing = [n for n in valid if n not in secrets]
         if missing:
-            result.degraded_kind = _worst_error_kind(fetch_warnings)
+            # EVERY kind, not the worst one. Collapsing to a single kind loses the answer
+            # the orchestrator actually needs: a run that times out on the bot token and
+            # returns an empty value elsewhere must still count as retryable.
+            result.degraded_kinds = frozenset(_classify_op_error(m) for m in fetch_warnings)
         return result
 
 

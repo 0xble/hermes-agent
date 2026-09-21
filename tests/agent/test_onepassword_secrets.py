@@ -385,11 +385,15 @@ def test_per_reference_timeout_is_visible_to_the_orchestrator(monkeypatch, tmp_p
 
     assert result.ok, "the references that resolved must still be applied"
     assert "GOOD" in result.secrets and "SLOW" not in result.secrets
-    assert result.degraded_kind is op.ErrorKind.TIMEOUT
+    assert op.ErrorKind.TIMEOUT in result.degraded_kinds
 
 
-def test_degraded_kind_reports_the_worst_failure_not_the_first(monkeypatch, tmp_path):
-    """A refused credential alongside a timeout is an auth problem, not a transient one."""
+def test_degraded_kinds_keeps_every_failure_not_just_one(monkeypatch, tmp_path):
+    """A timeout alongside an unrelated failure must stay visible as retryable.
+
+    Collapsing a run to one kind loses the only question the orchestrator asks. A bot
+    token that timed out is retryable even if some other reference failed differently.
+    """
     fake_op = tmp_path / "op"
     fake_op.write_text("")
     fake_op.chmod(0o755)
@@ -409,43 +413,65 @@ def test_degraded_kind_reports_the_worst_failure_not_the_first(monkeypatch, tmp_
         tmp_path,
     )
 
-    assert result.degraded_kind is op.ErrorKind.AUTH_FAILED
+    assert result.degraded_kinds == {op.ErrorKind.TIMEOUT, op.ErrorKind.AUTH_FAILED}
 
 
-def test_identity_rejection_evicts_carried_over_values(monkeypatch, tmp_path):
-    """A revoked identity must not keep serving what it resolved before.
+def test_identity_rejection_requires_that_nothing_resolved(monkeypatch, tmp_path):
+    """A rejected identity is one that resolved NOTHING, cache included.
 
-    The token value is unchanged, so the auth fingerprint still matches and the entry is
-    still a cache hit. The rejection is observed in this very call, so continuing to hand
-    back those values would be knowingly serving a credential the backend just refused.
+    Scoping this to the re-attempted references alone inverts it: with most values
+    carried from cache and a single reference retried, that one failure IS "every
+    attempted read", so one unreadable item would be judged a revoked identity and
+    would take every good credential with it.
     """
     fake_op = tmp_path / "op"
     fake_op.write_text("")
-    refs = {"GOOD": "op://V/good/F", "FLAKY": "op://V/flaky/F"}
-    mode = {"revoked": False}
+    refs = {"A": "op://V/a/F", "B": "op://V/b/F"}
+
+    def all_refused(argv, *a, **k):
+        return _err(1, "[ERROR] account is not signed in")
+
+    monkeypatch.setattr(op.subprocess, "run", all_refused)
+    op._reset_cache_for_tests(tmp_path)
+    # Seed a stale entry so there is something to evict.
+    op._STORE.store(
+        (op._auth_fingerprint(op._DEFAULT_TOKEN_ENV), "", str(tmp_path), op._refs_fingerprint(refs)),
+        op.CachedFetch(secrets={}, fetched_at=time.time()), 300, tmp_path)
+
+    secrets, _ = op.fetch_onepassword_secrets(
+        references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
+
+    assert secrets == {}, "nothing resolved, so nothing may be returned"
+    assert _entry(tmp_path, refs) is None, "the rejected identity's entry must be evicted"
+
+
+def test_one_auth_failure_never_discards_values_that_resolved(monkeypatch, tmp_path):
+    """The blast radius of a single refused reference must stay that reference.
+
+    Regression for an inverted scope rule: with the other references served from cache,
+    one forbidden item was read as a revoked identity, which returned nothing at all and
+    deleted the cache file. It oscillated, losing every credential on alternate starts.
+    """
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    refs = {"KEEP": "op://V/keep/F", "DENIED": "op://V/denied/F"}
 
     def fake_run(argv, *a, **k):
-        if mode["revoked"]:
-            return _err(1, "[ERROR] account is not signed in")
-        if "flaky" in argv[-1]:
-            return _err(1, "op: request timed out")
-        return _ok("good-v1")
+        if "denied" in argv[-1]:
+            return _err(1, "op: 403 unauthorized: you do not have access to this item")
+        return _ok("keep-value")
 
     monkeypatch.setattr(op.subprocess, "run", fake_run)
     op._reset_cache_for_tests(tmp_path)
 
-    first, _ = op.fetch_onepassword_secrets(
+    op.fetch_onepassword_secrets(
         references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
-    assert first == {"GOOD": "good-v1"}
-    assert _entry(tmp_path, refs) is not None
-
-    mode["revoked"] = True
-    op._CACHE.clear()
+    op._CACHE.clear()  # next start: KEEP comes from disk, DENIED is retried and refused
     second, _ = op.fetch_onepassword_secrets(
         references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
 
-    assert second == {}, "values from a rejected identity must not be returned"
-    assert _entry(tmp_path, refs) is None, "the entry must be evicted, not left to age out"
+    assert second == {"KEEP": "keep-value"}, "the value that resolved must survive"
+    assert _entry(tmp_path, refs) is not None, "and the cache must not be deleted"
 
 
 def test_one_forbidden_item_does_not_block_caching_the_rest(monkeypatch, tmp_path):
@@ -477,6 +503,8 @@ def test_one_forbidden_item_does_not_block_caching_the_rest(monkeypatch, tmp_pat
 
     reads.clear()
     op._CACHE.clear()
-    op.fetch_onepassword_secrets(
+    second, _ = op.fetch_onepassword_secrets(
         references=refs, cache_ttl_seconds=300, binary=fake_op, home_path=tmp_path)
     assert all("forbidden" in r for r in reads), "the readable item must come from cache"
+    assert second == {"OK": "ok-value"}, "the forbidden item must not take the good ones"
+    assert _entry(tmp_path, refs) is not None, "and must not delete the cache"

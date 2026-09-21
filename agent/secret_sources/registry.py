@@ -438,9 +438,12 @@ def apply_all(secrets_cfg: dict, home_path: Path,
             pass
 
     # A whole-source failure AND a per-entry failure both cost us secrets; only the first
-    # sets error_kind, so consult degraded_kind too or a single slow reference is missed.
+    # sets error_kind, so consult degraded_kinds too or a single slow reference is missed.
+    # ANY transient failure counts: one unrelated non-transient failure in the same run
+    # must not hide a bot token that a retry would have fetched.
     _TRANSIENT_FAILURE_HOMES[hermes_home_key(home_path)] = any(
-        (r.error_kind if not r.ok else r.degraded_kind) in _TRANSIENT_ERROR_KINDS
+        (r.error_kind in _TRANSIENT_ERROR_KINDS) if not r.ok
+        else bool(_TRANSIENT_ERROR_KINDS & r.degraded_kinds)
         for _, _, r in fetches
     )
 
