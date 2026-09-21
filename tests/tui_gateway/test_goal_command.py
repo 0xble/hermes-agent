@@ -60,7 +60,7 @@ def server(hermes_home, monkeypatch):
     # originals on teardown so nothing leaks to later tests either.
     monkeypatch.setattr(mod, "_hermes_home", hermes_home)
     monkeypatch.setattr(mod, "_cfg_cache", None)
-    monkeypatch.setattr(mod, "_cfg_mtime", None)
+    monkeypatch.setattr(mod, "_cfg_sig", None)
     monkeypatch.setattr(mod, "_cfg_path", None)
     yield mod
     # Reset module-level session state without re-importing. importlib.reload
@@ -732,3 +732,18 @@ def test_goal_draft_uses_session_profile_without_blocking_rpc_reader(
         assert state.max_turns == 37 and state.contract.verification == "tests pass"
     result = next(frame["result"] for frame in frames if frame.get("id") == "draft")
     assert result["type"] == "send" and result["message"] == state.goal
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, session, monkeypatch, hidden):
+    sid, _, record = session
+    seen = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
+    monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host",
+                        lambda *a, **kw: seen.append(kw) or {"result": {"status": "streaming"}})
+    kwargs = {"display_kind": "hidden"} if hidden else {}
+    result = _call(server, "prompt.submit", session_id=sid, text="request", title_preview="Useful title", **kwargs)
+    assert result["result"]["status"] == "streaming"
+    assert seen[0]["user_turn"] is (not hidden)
+    assert seen[0]["display_metadata"]["title_preview"] == "Useful title"

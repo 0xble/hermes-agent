@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import (
-    _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home, display_hermes_home,
+    LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
+    display_hermes_home,
 )
 from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
 from utils import (
@@ -34,6 +35,13 @@ logger = logging.getLogger(__name__)
 # Where ``hermes backup --quick`` / ``/snapshot`` / the pre-update safety net write state
 # snapshots (see ``create_quick_snapshot``); defined here because the exclusion set needs it.
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
+
+
+def _snapshot_recovery_hint() -> str:
+    """How to restore a state snapshot. There is no `hermes snapshot` subcommand — only the /snapshot
+    slash command inside a `hermes` session (hermes_cli/commands.py)."""
+    return ("To restore a newer snapshot, start `hermes` in a terminal and run `/snapshot list`, then "
+            "`/snapshot restore <id>` (CLI only).")
 
 # Directory names to skip (matched against each path component). ``hermes-agent`` only matches at
 # the root (``_should_exclude``) so skill dirs like ``skills/.../hermes-agent/`` survive. The
@@ -61,10 +69,15 @@ _EXCLUDED_DIRS = {
     ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 }
 
-# Hermes-managed runtime downloads (GGUF models, llama.cpp runtimes, managed Node): re-downloaded
-# on demand and routinely tens to hundreds of GB. Matched ONLY at the root of HERMES_HOME and at
-# ``profiles/<name>/`` — a deeper dir of the same name (a skill's ``models/``) is user data.
-_EXCLUDED_ROOT_DIRS = {"models", "runtimes", "node"}
+# Hermes-managed runtime downloads (see ``LOCAL_RUNTIME_ROOT_DIRS``). Matched ONLY at the root of
+# HERMES_HOME and at ``profiles/<name>/`` — a deeper dir of the same name (a skill's ``models/``)
+# is user data.
+_EXCLUDED_ROOT_DIRS = LOCAL_RUNTIME_ROOT_DIRS
+
+# Browser Use CLI profile dir (browser.backend: browser-use): Chromium user-data with Login Data
+# / Cookies. Root-scoped like models/ — a skill's own browser_profiles/ is user data. Backup-only:
+# do not fold into LOCAL_RUNTIME_ROOT_DIRS (clone-all identity contract).
+_EXCLUDED_BACKUP_ROOT_DIRS = frozenset({"browser_profiles"})
 
 # ``cache/`` at those same roots mixes regenerable state (model/plugin catalogs, stamps, browser
 # profiles with locked SQLite, tool-output spill) with durable artifacts nothing can rebuild: media
@@ -80,7 +93,7 @@ def _in_excluded_root_dir(rel_path: Path) -> bool:
         parts = parts[2:]
     if not parts:
         return False
-    if parts[0] in _EXCLUDED_ROOT_DIRS:
+    if parts[0] in _EXCLUDED_ROOT_DIRS or parts[0] in _EXCLUDED_BACKUP_ROOT_DIRS:
         return True
     return parts[0] == "cache" and len(parts) >= 2 and parts[1] not in _KEPT_CACHE_SUBDIRS
 
@@ -915,11 +928,21 @@ def _import_db_member(
     other process will see, and a sidecar WAL beside the new file describes the old database —
     nothing fails, the sessions are simply gone (#100960). Route the member through the same
     ``_safe_restore_db`` page copy ``/snapshot restore`` uses, so the live inode is preserved and
-    every open connection converges. A target that does not exist yet has no holders, so it takes
-    the ordinary atomic publish. Raises ``OSError`` when the database could not be replaced
-    safely, so the caller reports a skipped file instead of a silent success.
+    every open connection converges. Raises ``OSError`` when the database could not be
+    replaced safely, so the caller reports a skipped file instead of a silent success.
     """
     if not target.exists():
+        # "Missing" is not "unheld": a gateway or dashboard that had the database open when it
+        # was unlinked still writes the deleted inode (the ``(deleted)`` fingerprint of #90950).
+        # Publishing a fresh inode here re-creates the same split brain the branch below exists
+        # to prevent, so refuse and name the holders instead (#110179).
+        holders = _foreign_db_holder_pids(target)
+        if holders:
+            raise OSError(
+                f"{target.name} was deleted but is still open in PID(s) "
+                f"{', '.join(str(pid) for pid in sorted(holders))}; publishing a new file would "
+                "leave them writing an invisible database. Stop those processes and re-run the import."
+            )
         _extract_member_atomically(zf, member, target, new_file_mode)
         return
     # The database keeps its own mode/ownership: the bytes come from the archive, the file does not.
@@ -1079,8 +1102,7 @@ def run_import(args) -> None:
             for rel, before, after in db_shrunk:
                 print(f"    {rel}: {before[0]} session(s) / {before[1]} message(s)"
                       f" -> {after[0]} / {after[1]}")
-            print("    Anything recorded after the backup was taken is not in it. "
-                  "Recover from a newer backup or snapshot: hermes snapshot list")
+            print(f"    Anything recorded after the backup was taken is not in it. {_snapshot_recovery_hint()}")
         if skipped_runtime:
             _print_capped(f"\n  Preserved {len(skipped_runtime)} runtime state "
                           f"file(s) (kept this machine's, not the backup's):",
@@ -1321,7 +1343,7 @@ def _create_quick_snapshot_locked(
         # Surface on stdout: a log-and-continue made a missing state.db backup look like a
         # successful pre-update snapshot (#68474).
         print(f"  ⚠ CRITICAL: could not snapshot DB file(s): {', '.join(failed_dbs)}\n"
-              f"  ⚠ If sessions disappear after update, check {root} and run: hermes snapshot list")
+              f"  ⚠ If sessions disappear after the update, check {root}. {_snapshot_recovery_hint()}")
         logger.error("Quick snapshot failed to capture DB file(s): %s", ", ".join(failed_dbs))
     if not manifest:
         shutil.rmtree(staging_dir, ignore_errors=True)

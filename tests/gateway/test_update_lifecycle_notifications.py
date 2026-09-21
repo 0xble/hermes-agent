@@ -148,3 +148,37 @@ def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path,
         assert result[0] is False
     else:
         assert result[0] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_legacy_update_output_never_claims_success(tmp_path):
+    runner = _make_runner()
+    adapter = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    data = {"platform": "telegram", "chat_id": "42", "session_key": "legacy"}
+    (tmp_path / ".update_pending.json").write_text(json.dumps(data), encoding="utf-8")
+    (tmp_path / ".update_output.txt").write_text("dependency installation failed", encoding="utf-8")
+    (tmp_path / ".update_exit_code").write_text("7", encoding="utf-8")
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification()
+    sent = " ".join(call.args[1] for call in adapter.send.call_args_list)
+    assert "dependency installation failed" in sent
+    assert "Hermes update failed" in sent and "code 7" in sent
+    assert "successfully" not in sent
+    assert read_pending(tmp_path) is None
+
+
+@pytest.mark.asyncio
+async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_path, caplog):
+    runner = _make_runner()
+    runner.adapters = {}
+    data = pending(tmp_path)
+    with patch("gateway.run._hermes_home", tmp_path):
+        assert await runner._send_update_notification() is False
+        assert read_pending(tmp_path) is not None
+        marker, data = read_pending(tmp_path)
+        data["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        marker.write_text(json.dumps(data), encoding="utf-8")
+        assert await runner._send_update_notification() is True
+    assert read_pending(tmp_path) is None
+    assert "adapter never connected" in caplog.text

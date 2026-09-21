@@ -116,7 +116,7 @@ def _turn_runner(policy_config, adapter, *, message="", resume_pending=True):
     )
     runner = MagicMock()
     runner.config = policy_config
-    runner._adapter_for_source.return_value = adapter
+    runner._delivery_adapter_for.return_value = adapter
     runner.session_store._entries = {"sess": entry}
     runner._pending_model_notes = {}
     runner._pending_skills_reload_notes = {}

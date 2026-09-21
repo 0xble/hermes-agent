@@ -303,6 +303,9 @@ class TestCommandBypassActiveSession:
                 "s": {"type": "alias", "target": "/steer"},
             },
         }
+        from types import SimpleNamespace
+        runner.config = SimpleNamespace(**runner.config, multiplex_profiles=True)
+        runner._profile_adapters = {"secondary": {Platform.TELEGRAM: adapter}}
         adapter.gateway_runner = runner
         event = _make_event("/s use the routed profile")
         sk = build_session_key(event.source, profile=adapter._owner_profile)
@@ -326,6 +329,9 @@ class TestCommandBypassActiveSession:
             },
         }
         runner._quick_commands_by_profile = {"secondary": {}}
+        from types import SimpleNamespace
+        runner.config = SimpleNamespace(**runner.config, multiplex_profiles=True)
+        runner._profile_adapters = {"secondary": {Platform.TELEGRAM: adapter}}
         adapter.gateway_runner = runner
         event = _make_event("/s stay isolated")
         sk = build_session_key(event.source, profile=adapter._owner_profile)

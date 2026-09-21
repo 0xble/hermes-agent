@@ -34,7 +34,7 @@ def test_already_running_skip_persists_reason(tmp_path, monkeypatch):
     scheduler._running_job_ids.clear()
     scheduler._running_since.clear()
     scheduler._running_futures.clear()
-    scheduler._running_job_ids.add(job["id"])
+    assert scheduler.try_register_running_job(job["id"])
     try:
         assert scheduler._submit_with_guard(
             jobs.get_job(job["id"]),

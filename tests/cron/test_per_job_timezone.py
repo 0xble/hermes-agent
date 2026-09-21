@@ -130,7 +130,7 @@ class TestSurfaces:
     def test_tool_create_and_update_carry_the_zone(self, store, monkeypatch):
         from tools.cronjob_tools import cronjob
         import json as _json
-        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda: None, raising=False)
+        monkeypatch.setattr("tools.cronjob_tools._origin_from_env", lambda *_args: None, raising=False)
         out = _json.loads(cronjob(action="create", prompt="zoned", schedule="0 8 * * *", job_timezone="America/Los_Angeles"))
         assert out.get("success", True), out
         jid = out.get("job_id") or out.get("job", {}).get("id") or out.get("id")

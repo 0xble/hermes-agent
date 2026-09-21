@@ -26,6 +26,8 @@ def blocked_cli(monkeypatch):
     cli._pending_input = queue.Queue()
     cli.conversation_history = []
     cli.agent = SimpleNamespace(session_id=mgr.session_id)
+    cli.provider = "test"
+    cli.model = "test"
     cli._active_agent_route_signature = "test"
     cli._ensure_runtime_credentials = lambda: True
     cli._resolve_turn_agent_config = lambda message: {"signature": "test", "model": "test", "runtime": {}}

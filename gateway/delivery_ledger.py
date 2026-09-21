@@ -55,7 +55,9 @@ FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit 
 # with the attempts already spent, so a platform-side outage is not hammered by the redelivery timer.
 # A whole-chat death (blocked bot, deleted group, deactivated user) is never retried: the target is gone.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
-_RETRY_BACKOFF_SECONDS = (30.0, 120.0, 600.0)
+# One tier per in-process retry; the last budgeted attempt is left to the boot sweep (retry_not_before).
+_RETRY_BACKOFF_SECONDS = (30.0, 120.0)
+assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
 # A final send the platform refused with flood control is the other transient case: a 429 means the
 # refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
@@ -96,6 +98,11 @@ def _raw_flood_wait(text: str) -> Optional[float]:
         return float(match.group(1))
     except (TypeError, ValueError):
         return None
+
+
+def is_reconnect_only(error: Any) -> bool:
+    """True for a row that only an adapter reconnect may retry (no timer, no backoff)."""
+    return str(error or "").strip().lower() in _RUNTIME_RETRYABLE_ERRORS
 
 
 def is_flood_error(error: Any) -> bool:
@@ -165,14 +172,14 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
             return None
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
-    if text in _RUNTIME_RETRYABLE_ERRORS:
+    if is_reconnect_only(text):
         return _failed_stamp(updated_at)
     if classify_dead_error(text):
         return None
     spent = int(attempts or 0)
     if spent >= MAX_ATTEMPTS - 1:
         return None
-    return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[min(spent, len(_RETRY_BACKOFF_SECONDS) - 1)]
+    return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[spent]
 
 
 def _db_path():
@@ -258,7 +265,8 @@ def _owner_alive(pid: Any, started_at: Any) -> bool:
         except Exception:
             return False
     try:
-        return started_at is None or int(current_start) == int(started_at)
+        from gateway.status import start_time_fingerprints_match
+        return started_at is None or start_time_fingerprints_match(started_at, current_start)
     except (TypeError, ValueError):
         return True
 
@@ -448,9 +456,9 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at) in rows:
             # Exact process-start matching prevents PID reuse from stealing work.
-            due = retry_not_before(updated_at, last_error, attempts)
-            if (adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started):
+            if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
                 continue
+            due = retry_not_before(updated_at, last_error, attempts)
             owner_guard = (now, oid, owner_pid, owner_started_at)
             if due is None and flood_wait_is_absurd(last_error):
                 # Bounded failure, stated once: a multi-hour penalty is not a wait to sit out, and
@@ -507,6 +515,10 @@ def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
                WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
     earliest: Dict[tuple, float] = {}
     for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
+        # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the
+        # reconnect sweep; a timer would claim and release them every tick until the adapter is back.
+        if is_reconnect_only(last_error):
+            continue
         due = retry_not_before(updated_at, last_error, attempts)
         if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
             continue

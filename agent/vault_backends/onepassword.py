@@ -247,14 +247,15 @@ class OnePasswordLoginBackend(LoginBackend):
                 out.append(_card_meta(handle, item, created, _card_last4(str(item.get("additional_information") or ""))))
                 continue
             urls = [str(u["href"]) for u in item.get("urls") or [] if isinstance(u, dict) and u.get("href")]
-            origin = _first_origin(urls)
-            if not origin:
+            origins = _all_origins(urls)
+            if not origins:
                 continue
             username = str(item.get("additional_information") or "").strip() or None
             out.append(VaultItemMeta(
-                id=handle, kind="login", label=str(item.get("title") or origin),
-                origin=origin, created_at=created,
-                identifier_type="username" if username else None, identifier=username))
+                id=f"{self.prefix}{item.get('id')}", kind="login", label=str(item.get("title") or origins[0]),
+                origin=origins[0], created_at=str(item.get("created_at") or ""),
+                identifier_type="username" if username else None, identifier=username,
+                allowed_origins=_web_origins(origins)))
         return out
 
     def get_meta(self, handle: str) -> Optional[VaultItemMeta]:
@@ -348,27 +349,24 @@ def _card_meta(handle: str, item, created_at: str, last4: Optional[str]) -> Vaul
                          created_at=created_at, identifier_type="card_last4" if last4 else None, identifier=last4)
 
 
-def _first_origin(urls: List[str]) -> Optional[str]:
-    for u in urls:
-        try:
-            return normalize_origin(u)
-        except Exception:
-            continue
-    return None
-
-
 def _web_origins(origins: List[str]) -> tuple:
-    """Keep app URIs from widening the set of browser fill targets."""
+    """Fill targets are browser pages, so app URIs (``androidapp://`` etc.) never
+    widen the fill set; an item whose only URI is an app URI keeps its single
+    (unfillable-from-a-page) origin exactly as before."""
     web = tuple(o for o in origins if o.startswith(("http://", "https://")))
     return web or (origins[0],)
 
 
 def _all_origins(urls: List[str]) -> List[str]:
-    """Normalize, deduplicate, and preserve every origin on a Login item."""
+    """Every normalized origin saved on the item, deduped, order preserved.
+
+    A 1Password Login item can carry several websites; each of them is a place the
+    user told 1Password the credential belongs, so all of them are valid fill targets.
+    """
     out: List[str] = []
-    for url in urls:
+    for u in urls:
         try:
-            origin = normalize_origin(url)
+            origin = normalize_origin(u)
         except Exception:
             continue
         if origin not in out:
