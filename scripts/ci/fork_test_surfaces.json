@@ -54,7 +54,8 @@
     "tests/hermes_cli/test_backup.py",
     "tests/hermes_cli/test_backup_stability.py",
     "tests/scripts/test_candidate_scripts.py",
-    "tests/scripts/test_fork_patch_trailers.py"
+    "tests/scripts/test_fork_patch_trailers.py",
+    "tests/scripts/test_sync_fork_candidate.py"
   ],
   "telegram-topics": [
     "tests/agent/test_title_generator.py",
