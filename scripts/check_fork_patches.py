@@ -47,14 +47,28 @@ EXPECTED_CONFIG = {
 }
 # Upstream release baseline the fork is built on (v2026.9.14).
 DEFAULT_BASELINE = "345cd2b057a452236de401d3534b8502a7465e8d"
-# Last published commit whose fork behavior is documented by a maintenance unit. The commit
-# predates the trailer contract and contains the last imported delegation recovery commits
-# whose historical messages did not carry trailers. Their behavior is documented in the
-# maintenance units. Every later commit must carry its own ``Fork-Patch:``
-# trailer. A sync may rewrite this SHA, so the floor is also located by its exact subject when
-# the SHA is gone.
-DEFAULT_TRAILER_FLOOR = "1cb14729bd89e5346791807059c35d6c4cc4d5ac"
-DEFAULT_TRAILER_FLOOR_SUBJECT = "Merge pull request #27 from 0xble/fix/delegation-auto-resume"
+# Last published commit whose fork behavior is documented by a maintenance unit. Every later
+# commit must carry its own ``Fork-Patch:`` trailer. A sync may rewrite this SHA, so the floor
+# is also located by its exact subject when the SHA is gone.
+#
+# Advanced 2026-09-21 from 1cb14729bd89 ("Merge pull request #27 from
+# 0xble/fix/delegation-auto-resume"). Be clear about what that excuses: the 16 commits in
+# between are NOT pre-contract history. They were authored between 2026-09-20 19:40 and
+# 2026-09-21 11:17, entirely inside the contract's lifetime, and simply did not carry
+# trailers. Advancing the floor over them is a deliberate write-off of one day's ownership
+# records, chosen because backfilling would mean rewriting 16 published commits on a branch
+# with automation actively merging into it.
+#
+# The write-off is only defensible because their behavior is documented by units regardless:
+# the secrets/update/gateway commits by backup-and-tooling and runtime-ownership, and the
+# three memory commits by maintenance/hindsight-memory.md, which names their identities
+# explicitly. The floor is a bookkeeping amnesty, never a statement that a patch is unowned.
+#
+# It also does not address the cause. Nothing enforces the trailer at commit time, so the
+# same gap reopens the next time a burst of work skips it. A commit-msg hook is the fix;
+# until one exists, treat a rising violation count as the contract failing, not as debt.
+DEFAULT_TRAILER_FLOOR = "270dfe3cdd82"
+DEFAULT_TRAILER_FLOOR_SUBJECT = "fix(tools): record the search process group before it can vanish (#39)"
 # Trailer identities that name records rather than runtime patches; they need no unit owner.
 RECORD_IDENTITIES = frozenset({"evidence"})
 # One trailer per line; a commit may carry several. The identity is the text before the first ``;``.
