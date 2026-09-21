@@ -40,6 +40,7 @@ from .embedded import (
 )
 from .settings import (
     _DEFAULT_API_URL, _DEFAULT_IDLE_TIMEOUT, _DEFAULT_LOCAL_URL, _DEFAULT_RETAIN_SOURCE,
+    _DEFAULT_RETAIN_STRATEGY,
     _DEFAULT_TIMEOUT, _HINDSIGHT_GLYPH, _MIN_CLIENT_VERSION, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
     _PROVIDER_DEFAULT_MODELS, _VALID_BUDGETS, _daemon_llm_provider,
     _normalize_observation_scopes, _normalize_retain_tags, _parse_int_setting,
@@ -273,6 +274,7 @@ def _load_config() -> dict:
         "retain_tags": get_secret("HINDSIGHT_RETAIN_TAGS", "") or "",
         "observation_scopes": get_secret("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "") or "",
         "retain_source": _scoped_setting("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE),
+        "retain_strategy": _scoped_setting("HINDSIGHT_RETAIN_STRATEGY", _DEFAULT_RETAIN_STRATEGY),
         "retain_user_prefix": _scoped_setting("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
         "retain_assistant_prefix": _scoped_setting("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
         "banks": {"hermes": {"bankId": get_secret("HINDSIGHT_BANK_ID", "") or "hermes",
@@ -351,6 +353,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_tags: List[str] = []
         self._tags: list[str] | None = None
         self._retain_source = _DEFAULT_RETAIN_SOURCE
+        self._retain_strategy = _DEFAULT_RETAIN_STRATEGY
         self._retain_user_prefix, self._retain_assistant_prefix = "User", "Assistant"
         self._turn_counter = self._turn_index = 0
         self._session_turns: list[str] = []  # ALL turns for the session
@@ -436,6 +439,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
+            {"key": "retain_strategy", "description": "Named retain strategy applied to every stored item, steering extraction for this content type. The bank must define the name under retain_strategies; an unknown name is silently ignored by the server and the item falls back to unmissioned extraction. Empty means let the bank decide.", "default": _DEFAULT_RETAIN_STRATEGY},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
@@ -762,6 +766,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._observation_scopes = _normalize_observation_scopes(
             _cfg_or_env("observation_scopes", "HINDSIGHT_RETAIN_OBSERVATION_SCOPES"))
         self._retain_source = str(_cfg_or_env("retain_source", "HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE)).strip()
+        self._retain_strategy = str(_cfg_or_env("retain_strategy", "HINDSIGHT_RETAIN_STRATEGY", _DEFAULT_RETAIN_STRATEGY)).strip()
         self._retain_user_prefix = str(_cfg_or_env("retain_user_prefix", "HINDSIGHT_RETAIN_USER_PREFIX", "User")).strip() or "User"
         self._retain_assistant_prefix = (
             str(_cfg_or_env("retain_assistant_prefix", "HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")).strip()
@@ -1005,6 +1010,10 @@ class HindsightMemoryProvider(MemoryProvider):
         merged_tags = _normalize_retain_tags(list(self._retain_tags) + _normalize_retain_tags(tags))
         item.update({k: v for k, v in (("context", context), ("update_mode", update_mode)) if v is not None})
         item.update({k: v for k, v in (("tags", merged_tags), ("observation_scopes", self._observation_scopes)) if v})
+        # Per-item strategy: overrides the bank default for this item only. Omitted when
+        # unset so the bank keeps deciding.
+        if self._retain_strategy:
+            item["strategy"] = self._retain_strategy
         return item
 
     def _retain_batch(self, item: dict, *, bank_id: str, document_id: str | None = None,

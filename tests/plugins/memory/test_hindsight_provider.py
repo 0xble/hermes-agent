@@ -492,6 +492,20 @@ class TestToolHandlers:
         item = provider._build_retain_kwargs("dinner with Sam", occurred_at="2026-08-20T19:00:00+02:00")
         assert item["timestamp"] == "2026-08-20T19:00:00+02:00"
 
+    def test_build_retain_kwargs_omits_strategy_when_unset(self, provider):
+        """Default is no strategy key at all, so the bank keeps deciding."""
+        assert "strategy" not in provider._build_retain_kwargs("hello")
+
+    def test_build_retain_kwargs_sets_configured_strategy(self, provider):
+        """A configured strategy rides on every item, steering extraction for this content type."""
+        provider._retain_strategy = "agent-session"
+        assert provider._build_retain_kwargs("hello")["strategy"] == "agent-session"
+
+    def test_retain_strategy_is_exposed_as_a_setting(self, provider):
+        """Operators must be able to set it without editing code."""
+        keys = {opt["key"] for opt in provider.get_config_schema()}
+        assert "retain_strategy" in keys
+
     def test_retain_schema_exposes_occurred_at(self):
         from plugins.memory.hindsight import RETAIN_SCHEMA
 
