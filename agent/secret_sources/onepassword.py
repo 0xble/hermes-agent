@@ -253,7 +253,10 @@ def fetch_onepassword_secrets(
         for name in prefetched:
             secrets.pop(name, None)
         if use_cache:
-            _STORE.clear(home_path)
+            # Evict THIS identity's entry only. `_STORE.clear()` would also drop every
+            # other home's L1 entry, which a multiplexing gateway holds alongside ours.
+            _STORE.memory.pop(cache_key, None)
+            _STORE.disk.clear(home_path)
         return secrets, warnings
 
     if use_cache and secrets:

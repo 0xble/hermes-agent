@@ -1241,13 +1241,19 @@ class GatewayStartupMixin:
         """Does this fatal code mean "the credential never arrived"?
 
         Matched as a FAMILY, like :func:`is_global_startup_conflict`. Adapters spell it
-        differently — ``missing_credentials``, ``MISSING_CREDENTIALS``, and per-platform
-        prefixes such as ``yuanbao_missing_credentials`` — so an exact literal would cover
-        only two of them and would silently drop coverage the moment a second platform
-        with a different spelling was enabled alongside.
+        differently — ``missing_credentials``, ``MISSING_CREDENTIALS``, per-platform
+        prefixes such as ``yuanbao_missing_credentials``, and Slack's, which is BUILT from
+        the env-var name (``f"missing_{env_name.lower()}"`` → ``missing_slack_bot_token``)
+        and so cannot be enumerated at all. An exact literal covered two adapters, and any
+        narrower substring still misses the generated ones.
+
+        "Missing" plus a word naming a secret is the discriminator. It deliberately
+        excludes ``missing_dependency`` and ``MISSING_SDK`` (a real config fault: the code
+        isn't installed) and the ``*-bot-token_lock`` family (an ownership conflict, which
+        names a token but is not missing anything), both of which must stay fatal.
         """
         lowered = (code or "").lower()
-        return "missing_credential" in lowered or "missing_bot_token" in lowered
+        return "missing" in lowered and ("credential" in lowered or "token" in lowered)
 
     def _missing_credentials_blamed_on_secrets(self) -> bool:
         """True when every non-retryable startup failure is an absent credential AND this

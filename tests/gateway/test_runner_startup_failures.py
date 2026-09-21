@@ -660,11 +660,14 @@ async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_fac
     "code, expected",
     [
         ("missing_credentials", True),
-        ("MISSING_CREDENTIALS", True),          # Teams, Photon
-        ("yuanbao_missing_credentials", True),  # per-platform prefix
-        ("missing_bot_token", True),
-        ("discord-bot-token_lock", False),      # ownership conflict, must stay fatal
-        ("missing_dependency", False),          # a real config fault, not a lost secret
+        ("MISSING_CREDENTIALS", True),           # Teams, Photon
+        ("yuanbao_missing_credentials", True),   # per-platform prefix
+        ("missing_slack_bot_token", True),       # Slack BUILDS this from the env-var name
+        ("missing_slack_app_token", True),
+        ("discord-bot-token_lock", False),       # ownership conflict, must stay fatal
+        ("telegram-bot-token_lock", False),
+        ("missing_dependency", False),           # the code isn't installed: a real fault
+        ("MISSING_SDK", False),
         ("", False),
     ],
 )
