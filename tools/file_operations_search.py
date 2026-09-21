@@ -7,6 +7,7 @@
 import os
 import posixpath
 import re
+import contextlib
 import shlex
 import subprocess
 import sys
@@ -343,6 +344,13 @@ class SearchMixin:
                 start_new_session=True)
         except OSError as exc:
             return ExecuteResult(stdout=f"rg: {exc}", exit_code=2)
+        # Record the group while the process is certainly alive. The kill path
+        # below is reached through `poll() is None`, so the leader can exit
+        # before it looks the group up, and a group outlives a leader that
+        # forked into it. Without this the lookup fails with nothing to fall
+        # back to, and any surviving member would be left running.
+        with contextlib.suppress(ProcessLookupError):
+            proc._hermes_pgid = os.getpgid(proc.pid)
 
         # Drain on a thread so a silent rg (huge tree, no hits yet) cannot pin the
         # caller past the deadline or past a /stop; the waiter below owns both.
