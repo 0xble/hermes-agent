@@ -367,17 +367,31 @@ def _preview_migration(run_migrator: Callable[[bool], dict], opts: SimpleNamespa
 def _apply_migration(run_migrator: Callable[[bool], dict], opts: SimpleNamespace) -> None:
     """Take a pre-migration backup (unless --no-backup), execute, and print the report. The backup
     shares the pre-update backup's implementation (exclusions, SQLite safe-copy, zip) so it is
-    restorable with `hermes import`: one restore point before any mutation, pruned to the last 5."""
+    restorable with `hermes import`: one restore point before any mutation. Complete archives are
+    pruned to the last 5; an incomplete one is marked and kept separately, so it can never rotate a
+    complete archive out and can never accumulate."""
     backup_archive: Optional[Path] = None
     if not opts.no_backup:
         try:
             from hermes_cli.backup import create_pre_migration_backup
             from hermes_cli.sizefmt import format_bytes as _format_size
-            backup_archive = create_pre_migration_backup(hermes_home=opts.hermes_home)
+            _outcome: dict = {}
+            backup_archive = create_pre_migration_backup(
+                hermes_home=opts.hermes_home, outcome=_outcome)
             if backup_archive:
                 print()
-                print_success(f"Pre-migration backup: {backup_archive} "
-                              f"({_format_size(backup_archive.stat().st_size)})")
+                _size = _format_size(backup_archive.stat().st_size)
+                if _outcome.get("incomplete"):
+                    # print_success on a partial archive is how this gets found out at
+                    # restore time instead of now. Same yellow idiom as the skipped-keys
+                    # warning above, which is the local convention for "kept, but not whole".
+                    print(color(
+                        f"  ⚠ Pre-migration backup is INCOMPLETE: {backup_archive} ({_size}); "
+                        f"{_outcome.get('errors', 0)} unreadable, "
+                        f"{_outcome.get('vanished', 0)} vanished of "
+                        f"{_outcome.get('selected', 0)} selected.", Colors.YELLOW))
+                else:
+                    print_success(f"Pre-migration backup: {backup_archive} ({_size})")
                 print_info(f"Restore with: hermes import {backup_archive.name}")
         except Exception as e:
             return _error_block(

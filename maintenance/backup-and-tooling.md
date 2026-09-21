@@ -32,7 +32,8 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   literal identity; do not normalize it or `f500063ab41a` becomes unowned),
   `maintenance-tooling`, `update-lifecycle`, `trailer-floor`, `HERMES-123`,
   `backup-zip-timestamps`, `vanished-entry-test-contract`, `snapshot-prune-latch`,
-  `evidence` (records, not patches). `maintenance-contract` is owned by the root contract.
+  `full-zip-failure-accounting`, `evidence` (records, not patches).
+  `maintenance-contract` is owned by the root contract.
 - `HERMES-123` (`0cac0f8432`) stops `_run_full_backup` reporting a held backup slot as a
   failed backup. Only the `full` pre-update mode reaches it; `quick` (this install's
   setting) has its own message on the snapshot path. Retire it if the two stop sharing
@@ -58,6 +59,62 @@ candidate sync/check/rollback scripts, or the pre-contract context ports.
   prune because ordering is by name, not mtime, and recycled ids can sort the newest first.
   Retire it if snapshot retention moves to an age-based policy that no longer consults
   per-file omission state.
+- `full-zip-failure-accounting`: the pre-update/pre-migration ZIP is a rollback point written
+  with no console attached, so the log is its only record. Per-entry failures went to DEBUG,
+  below the default level, and the completion line reported the scan's selected count as
+  `files=`, so an archive missing data was indistinguishable from a whole one. Failures are now
+  named at WARNING, files removed between scan and write are counted apart from read errors as
+  routine churn, and the summary reports written, selected, errors and vanished.
+  Three further defects surfaced in review and are fixed in the same unit, because the counts
+  are worthless if the archive and the retention do not agree with them:
+  (a) `_discard_partial_entries` drops the central-directory records of any member whose write
+  died
+  partway. `ZipFile.write` opens the member and then reads the source into it; the fault is in
+  that read, so the destination closes cleanly and registers itself, leaving a TRUNCATED
+  member carrying a valid CRC:
+  `testzip()` was clean and a restore overwrote the real file with a short one. This is in the
+  shared writer and the external-entry loop, so the interactive path gets it too. Keyed on
+  position, not name, so a duplicate arcname cannot drop an earlier good member. The
+  abandoned bytes are left in place: rewinding `start_dir` to reclaim them yields an archive
+  neither zipfile nor `unzip` will open, because nothing truncates the file and the stale
+  tail defeats the backward scan for the end-of-central-directory record. That scan covers
+  the last 64 KiB, so the mistake is invisible below that and fatal above it, which is
+  exactly where the reclaim would have mattered. The regression test therefore needs an
+  incompressible payload and a partial read over 64 KiB, or it passes either way.
+  (b) An incomplete archive can no longer rotate a whole one out, and cannot accumulate either.
+  `_create_prefixed_full_backup` pruned on any non-None return, so one permanently unreadable
+  file walked every retained rollback point off the end in `keep` updates. Skipping the prune
+  fixes that and replaces it with unbounded growth, since the same unreadable file recurs every
+  run: measured 8 archives retained against `keep=5`. An incomplete archive is instead marked
+  with an `.incomplete.json` sidecar and pruned against `_MAX_INCOMPLETE_KEPT`, so the two
+  classes never compete. Completeness has to be durable because the prune runs in a later
+  process that never saw the run.
+  (d) Both callers now say so on the console. The claim that a pre-update backup has no console
+  attached is wrong: `_run_full_backup` prints a report and `_apply_migration` called
+  `print_success` on a partial archive. The counts reach them through an `outcome` dict.
+  (c) A mass disappearance now counts here too, and the rule gained an absolute floor.
+  `_is_mass_vanish` requires both `_MAX_VANISHED_SHARE_FOR_PRUNE` and
+  `_MIN_VANISHED_FOR_MASS`, because churn is an absolute quantity (a few files per run at any
+  home size) while coverage loss is relative: the share alone read one routine rotation on an
+  11-file home as a mass disappearance, which after (b) costs that install four of its five
+  rollback points. A floor can only relax the verdict on churn, never on critical state, which
+  `_is_critical_state` routes to `on_error` before the vanished branch is reached.
+  (e) `status=` and `coverage=` are separate fields on both log lines. One word carrying both
+  facts made the log contradict the console twice, in opposite directions: first always
+  `complete`, then `incomplete` while the console said complete on a vanished-only run.
+  `status` is the run's outcome and tracks errors, matching the console and the exit code;
+  `coverage` is whether the archive still covers what older ones do. The marker and the
+  retention cap stay driven by either cause, since those are about retention safety.
+  Note the vocabulary this leaves: a mass-vanish-only run logs `status=complete
+  coverage=reduced` and still writes an `.incomplete.json` marker and caps retention. The
+  words differ on purpose, because the run did succeed and the archive is still restorable
+  while covering less than its predecessors. Grepping `status=incomplete` will not find such
+  a run; the `incomplete errors=N vanished=N of N` line emitted when the marker is written
+  will, and so will `mass_vanish`. Do not "fix" the disagreement by making either word
+  follow the other: that is the overload which made the log contradict the console twice.
+  The archive is still kept and still returned: a partial rollback point beats none. Whether an
+  incomplete one should block an update is a separate decision, unchanged here.
+  Retire it if the automatic path adopts the interactive path's structured report.
 - Upstream contribution: none recorded for the local patches. The two adopted backup
   fixes retire when the candidate release retains them.
 - `backup-zip-timestamps`: both full ZIP writers use the standard library's timestamp
