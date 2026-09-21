@@ -332,3 +332,23 @@ def test_pre_update_snapshot_waits_for_the_shared_backup_slot():
     import hermes_cli.update_cmd_maint as maint
 
     assert maint._PRE_UPDATE_SNAPSHOT_LOCK_WAIT >= 30.0
+
+
+def test_full_mode_still_takes_the_zip_when_the_snapshot_fails(monkeypatch, receipt_home):
+    """The zip is a SEPARATE rollback point and must survive a snapshot failure.
+
+    Returning early on the snapshot exception silently downgraded `full` to no backup
+    at all, which is the opposite of what that setting asks for.
+    """
+    import hermes_cli.update_cmd_maint as maint
+
+    ran = {"zip": False}
+    monkeypatch.setattr(maint, "_resolve_pre_update_backup_mode", lambda _a: "full")
+    monkeypatch.setattr(maint, "_run_quick_snapshots", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(maint, "_run_full_backup", lambda: ran.__setitem__("zip", True))
+    ur.begin_update_receipt()
+
+    assert maint._run_pre_update_backup(object()) is None
+    assert ran["zip"] is True, "a failed snapshot must not cancel the full backup"
+    step = next(s for s in ur._current.data["steps"] if s["name"] == "pre_update_backup")
+    assert step["ok"] is False and "OSError" in step["detail"]
