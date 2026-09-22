@@ -163,8 +163,8 @@ try {
                 'from pathlib import Path\n'
                 'def test_fail_once():\n'
                 f'    attempts = Path({str(attempts)!r})\n'
-                '    count = int(attempts.read_text()) + 1 if attempts.exists() else 1\n'
-                '    attempts.write_text(str(count))\n'
+                '    count = int(attempts.read_text(encoding="utf-8")) + 1 if attempts.exists() else 1\n'
+                '    attempts.write_text(str(count), encoding="utf-8")\n'
                 '    assert count > 1, "first attempt fails"\n', encoding='utf-8')
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
@@ -177,14 +177,18 @@ try {
             stack.enter_context(patch.object(ci, 'python_tests', side_effect=
                 lambda env, roots, workers: python_tests(env, [str(test_file)], workers)))
             self.assertEqual(ci.main(), 1)
-            self.assertEqual(attempts.read_text(), '1')
+            self.assertEqual(attempts.read_text(encoding='utf-8'), '1')
 
             attempts.unlink()
+            interactive_env = ci.environment(root / 'interactive')
+            # The direct shell runner also needs writable scratch when the
+            # sandbox's default disk-backed temporary directory is read-only.
+            interactive_env['HERMES_TEST_SCRATCH_ROOT'] = str(root / 'interactive-scratch')
             result = subprocess.run(['bash', 'scripts/run_tests.sh', '-j', '1', str(test_file)],
-                                    cwd=ci.ROOT, env=ci.environment(root / 'interactive'),
+                                    cwd=ci.ROOT, env=interactive_env,
                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(attempts.read_text(), '2')
+            self.assertEqual(attempts.read_text(encoding='utf-8'), '2')
 
     def test_checkout_lock_releases_when_owner_is_killed(self):
         with tempfile.TemporaryDirectory() as directory:
