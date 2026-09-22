@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -19,6 +20,65 @@ from agent.lsp.protocol import LSPProtocolError, LSPRequestError
 
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
+
+
+def _kill_live_descendant(child) -> None:
+    """A killed child may remain a zombie after its launcher exits, until init reaps it."""
+    import psutil
+
+    if child is None:
+        return
+    try:
+        if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+            child.kill()
+    except psutil.NoSuchProcess:
+        pass  # The child was reaped between the liveness check and cleanup.
+
+
+@pytest.mark.parametrize("state", ["live", "zombie", "gone", "reaped", "exits_on_kill", "guard_rejected"])
+def test_descendant_cleanup_only_signals_live_children(state):
+    """Teardown tolerates departed children, but never swallows a signal guard rejection."""
+    import psutil
+
+    child = Mock(spec=psutil.Process)
+    child.is_running.return_value = state != "gone"
+    child.status.return_value = psutil.STATUS_ZOMBIE if state == "zombie" else psutil.STATUS_SLEEPING
+    if state == "reaped":
+        child.status.side_effect = psutil.NoSuchProcess(123)
+    if state == "exits_on_kill":
+        child.kill.side_effect = psutil.NoSuchProcess(123)
+    if state == "guard_rejected":
+        child.kill.side_effect = RuntimeError("outside the test process subtree")
+        with pytest.raises(RuntimeError, match="outside the test process subtree"):
+            _kill_live_descendant(child)
+    else:
+        _kill_live_descendant(child)
+    assert child.kill.call_count == (1 if state in {"live", "exits_on_kill", "guard_rejected"} else 0)
+
+
+@pytest.mark.linux_only
+def test_descendant_cleanup_leaves_a_real_zombie_for_its_parent_to_reap(monkeypatch):
+    """Keep an exited child unreaped so the zombie cleanup path is deterministic."""
+    import subprocess
+    import time
+
+    import psutil
+
+    with subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ) as proc:
+        child = psutil.Process(proc.pid)
+        deadline = time.monotonic() + 3.0
+        while child.status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert child.is_running()  # psutil considers an unreaped zombie present.
+        kill = Mock(wraps=child.kill)
+        monkeypatch.setattr(child, "kill", kill)
+        _kill_live_descendant(child)
+        kill.assert_not_called()
+    assert not child.is_running()
 
 
 def _client(workspace: Path, script: str = "clean") -> LSPClient:
@@ -192,8 +252,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
         if not start.done():
             start.cancel()
             await asyncio.gather(start, return_exceptions=True)
-        if child is not None and child.is_running():
-            child.kill()
+        _kill_live_descendant(child)
 
 
 @pytest.mark.asyncio
