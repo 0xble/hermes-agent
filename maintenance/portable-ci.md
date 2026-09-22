@@ -135,7 +135,11 @@ through `scripts/ci/list_os_marked_tests.py`, then runs the canonical Python
 harness with that marker and `not integration`. Empty selection is a failure.
 Windows also runs the existing long-path, Node-compatibility and uv-shim installer
 scripts under both `powershell` 5.1 and `pwsh` 7. Linux cannot substitute for these
-checks. Native execution is not yet qualified by this migration.
+checks. On macOS arm64, the marked lane passed 94 tests across 36 selected files
+with pinned Python 3.11.14 and an isolated HOME. One optional voice test skipped
+because the source-gate environment does not install numpy. This is marked-test
+evidence, not a full macOS source gate or installer qualification. Native Windows
+execution remains unqualified.
 
 For Windows process-lifecycle changes, the former on-demand `wine2e/**` selection
 remains available through the canonical harness on an isolated Windows machine:
