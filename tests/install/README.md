@@ -6,14 +6,17 @@ Each test leg installs an old released version, then updates it to HEAD. The ins
 
 ## The layers
 
-The test family has four layers. Each layer has one job.
+The support matrix is declared by `scripts/sandbox/generate-e2e-matrix.mjs`.
+The retained drivers execute supported install/update pairs:
 
-1. `scripts/sandbox/generate-e2e-matrix.mjs` declares the support matrix. It lists every {os, install-method, update-method} pair. It expands the pairs against the sampled release tags. It knows nothing about which pairs CI can run.
-2. `.github/workflows/install-e2e.yml` is the primary workflow. It picks the release tags, runs the generator, and fans out one matrix job per OS. It also writes the plan chart and the result chart on the run summary.
-3. The run workflows own the capability knowledge. `install-e2e-run.yml` serves linux. `install-e2e-windows-run.yml` serves windows. `install-e2e-macos-run.yml` selects either the shared script driver or the macOS GUI driver. Job-level `if:` gates select the supported pairs. All other pairs skip natively and show as grey.
-4. The drivers do the work. `tests/install/installer-script-e2e.sh` handles POSIX script installs, `tests/install/macos-desktop-e2e.sh` handles macOS dmg installs, and `tests/install/windows-e2e.ps1` handles Windows installs. Install and update methods are separate axes, subject to each workflow's capability gates.
+- `tests/install/installer-script-e2e.sh`: POSIX script installs.
+- `tests/install/macos-desktop-e2e.sh`: macOS desktop installs.
+- `tests/install/windows-e2e.ps1`: Windows installs.
 
-To declare a new method, edit the generator. To implement a method, flip the gate in the run workflow and extend a driver.
+Run these separately from `bin/ci` as release qualification in disposable native
+VMs. Select explicit release refs and supported methods from each driver's help
+and implementation. Declaring a matrix pair does not implement its driver.
+There is no hosted scheduler or automatic release qualification in this fork.
 
 ## The isolation trick
 
@@ -60,27 +63,31 @@ The desktop app has two launch paths, so the matrix has two app-update methods. 
 
 A grey leg is normal. There are two causes:
 
-- The method pair is declared but cannot run: either no OS entry point exists for it (open-app-update after a plain script install registers nothing to open), or no driver arm exists yet. The gate in the run workflow lists the pairs that run.
-- The starting release predates the surface under test. Example: a release without `apps/desktop` has no window to launch. The tag annotation `tag_has_desktop` from the primary workflow marks these releases.
+- The method pair is declared but cannot run: either no OS entry point exists for it (open-app-update after a plain script install registers nothing to open), or no driver arm exists yet. Check the selected driver for supported pairs.
+- The starting release predates the surface under test. Example: a release without `apps/desktop` has no window to launch. Inspect the selected release tree before choosing a desktop leg.
 
-The result chart on the run summary shows each leg as passed, failed, or skipped. [Confirmed historical upgrade limitations](KNOWN_FAILURES.md) records failures that cannot be fixed in the update target, with exact release commits and CI evidence. These are not blanket skips: the original paths still run. Exact signature matches are non-red, counted separately as known failures, and linked to footnotes at the bottom of the result chart. An unrelated error on the same tag still fails.
+Record each selected leg as passed, failed or unsupported, including its start
+release and target commit. [Confirmed historical upgrade limitations](KNOWN_FAILURES.md)
+records failures in older releases. Those records are not blanket skips and do
+not waive unrelated failures.
 
-## Triggers and cost
+## Running and retaining evidence
 
-The matrix does not run on pull requests. One leg installs real toolchains and takes more than 10 minutes. The triggers are:
+Run only in disposable VMs. The Windows driver kills processes named Hermes and
+the macOS driver operates on `/Applications/Hermes.app`. They can interfere with
+an installed personal runtime.
 
-- A schedule, every 12 hours. This finds upstream drift.
-- A release tag push. This is the moment the set of start versions changes.
-- Manual dispatch. You can select the route and the tag count:
+For example, inside a disposable POSIX VM with a clean full-history checkout and
+release tags:
 
+```sh
+tests/install/installer-script-e2e.sh --install-ref <release-tag> \
+  --install-method installer-script --update-method hermes-update
 ```
-gh workflow run install-e2e.yml --ref <branch> -f route=both -f tag-count=2
-```
 
-Cost per run, so nobody is surprised: 41 legs per sampled tag (windows 18, macos 15, linux 8), so scheduled and release-tag runs sample 2 tags for up to 82 legs. Manual dispatch defaults to 3 tags for up to 123 legs. A typical green leg finishes in 7-15 minutes; every leg is capped at 60. Route slices for cheaper reads: `update` (linux only, 8/tag), `windows-desktop` (18/tag), `macos-desktop` (15/tag). `tag-count` is validated to 1-10. GitHub's 256-job cap applies to each OS matrix separately, not to the combined leg count; at 10 tags the matrices hold 180 windows, 150 macos, and 80 linux entries. Windows would first exceed the cap at 15 tags (270).
-
-Running the drivers locally: don't, except in a disposable VM. The windows driver kills every process named Hermes during teardown and the macos driver operates on `/Applications/Hermes.app`; on a machine with a real Hermes install they will interfere with it.
-
-## Artifacts
-
-Each leg uploads its logs as an artifact. Every leg also records the screen for its whole run: the composite action `.github/actions/e2e-screen-record` installs ffmpeg, records with the OS's capture backend (x11grab on linux, gdigrab on windows, avfoundation on macos), and fails the leg if the recording is missing or has zero frames. Linux runners have no display, so the action starts `Xvfb :99` first and exports `DISPLAY` for every later step — the app under test and the recorder share that display. The windows GUI leg also uploads screenshots and the update result file. Get them with `gh run download <run-id>`.
+Retain driver logs, exact refs, result files and GUI screenshots with the release
+qualification evidence. GUI qualification also requires a screen recording with
+nonzero frames. Supply native recording and display prerequisites in the VM,
+including Xvfb for headless Linux GUI execution. The removed Actions artifact
+uploader and recording action are no longer available. A portable source-gate
+result alone does not establish successful installation, update or GUI behavior.

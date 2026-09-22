@@ -54,6 +54,7 @@ _EXEMPT_DIRS = (
     ".venv",
     "venv",
     ".worktrees",
+    ".ci",  # Generated portable-CI environments and third-party dependency caches.
 )
 
 # Call sites where a bare PATH lookup is the correct answer. Each entry is
@@ -176,6 +177,18 @@ def _findings() -> list[tuple[str, str, int]]:
         for command, lineno in _iter_which_calls(tree):
             found.append((rel, command, lineno))
     return found
+
+
+def test_source_scan_excludes_ci_dependencies_but_checks_owned_code(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    for relative in (".ci/cache/uv/package/cli.py", "hermes_cli/new_command.py"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True)
+        path.write_text('import shutil\nshutil.which("uv")\n', encoding="utf-8")
+
+    assert _findings() == [("hermes_cli/new_command.py", "uv", 2)]
 
 
 def test_no_unreviewed_bare_managed_runtime_lookups():

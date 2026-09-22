@@ -67,6 +67,7 @@ class TestScratchDirPermissionPolicy:
         # HERMES_HOME must point somewhere without a .managed marker, or a marker file in the
         # real home would flip every case into "managed" (the marker is read via get_hermes_home).
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
         for var in ("HERMES_HOME_MODE", "HERMES_MANAGED", "HERMES_CONTAINER",
                     "HERMES_SKIP_CHMOD", "HERMES_UID", "HERMES_GID"):
             monkeypatch.delenv(var, raising=False)

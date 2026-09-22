@@ -108,6 +108,9 @@ def test_setup_gateway_service_step_skips_install_for_served_profile(served_root
     import hermes_cli.gateway as gw
 
     calls: list[str] = []
+    # This fixture models host service installation, independent of whether
+    # the test runner itself is inside a container.
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
     monkeypatch.setattr(gw, "supports_systemd_services", lambda: True)
     monkeypatch.setattr(gw, "_is_service_running", lambda: False)
     monkeypatch.setattr(gw, "_is_service_installed", lambda: False)
@@ -158,6 +161,8 @@ def test_service_verbs_refuse_served_profile_with_exit_78(served_root, monkeypat
     monkeypatch.setattr(gw, "_installed_service_kind_for", lambda *a, **k: "systemd")
     monkeypatch.setattr(gw, "is_managed", lambda: False)
     monkeypatch.setattr(gw, "is_termux", lambda: False)
+    # --force overrides multiplex ownership, not the separate container guard.
+    monkeypatch.setattr(gw, "is_container", lambda: False)
     fn = getattr(gw, f"_cmd_{verb}")
     ns = argparse.Namespace(system=False, all=False, force=False, run_as_user=None)
     with contextlib.redirect_stdout(io.StringIO()), pytest.raises(SystemExit) as exc:

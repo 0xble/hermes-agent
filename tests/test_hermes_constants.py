@@ -672,7 +672,7 @@ class TestSecureParentDir:
         secure_parent_dir(target2)
         assert called_with2 == [], "must not chmod dirs inside the install tree"
 
-    def test_install_tree_siblings_still_hardened(self, monkeypatch):
+    def test_install_tree_siblings_still_hardened(self, tmp_path, monkeypatch):
         """Paths OUTSIDE the install tree must still be chmod'd.
 
         Negative boundary for the install-tree exclusion (#93050): the guard
@@ -681,7 +681,10 @@ class TestSecureParentDir:
         still receive parent-dir hardening. Pins that the exclusion cannot
         silently widen into a string-prefix match.
         """
-        install_root = Path(hermes_constants.__file__).resolve().parent
+        # A root-level checkout such as /workspace has top-level siblings,
+        # which the separate depth guard correctly refuses to chmod.
+        install_root = (tmp_path / "hermes").resolve()
+        monkeypatch.setattr(hermes_constants, "_INSTALL_ROOT", install_root)
 
         # Prefix-named sibling of the install root (/opt/hermes-data/...).
         prefix_sibling = Path(str(install_root) + "-data")
@@ -694,15 +697,14 @@ class TestSecureParentDir:
 
         # Ordinary sibling next to the install root (same parent dir).
         sibling = install_root.parent / "unrelated-dir"
-        if len(sibling.parts) >= 3 and install_root not in sibling.parents:
-            called_with2 = []
-            monkeypatch.setattr(
-                os, "chmod", lambda p, m: called_with2.append((str(p), m))
-            )
-            secure_parent_dir(sibling / "auth.json")
-            assert called_with2 == [(str(sibling), 0o700)], (
-                "siblings of the install root must still be hardened"
-            )
+        called_with2 = []
+        monkeypatch.setattr(
+            os, "chmod", lambda p, m: called_with2.append((str(p), m))
+        )
+        secure_parent_dir(sibling / "auth.json")
+        assert called_with2 == [(str(sibling), 0o700)], (
+            "siblings of the install root must still be hardened"
+        )
 
     @pytest.mark.require_symlinks
     def test_symlink_resolved(self, tmp_path, monkeypatch):

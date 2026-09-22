@@ -1,0 +1,8 @@
+**
+!ci/
+!ci/Dockerfile
+!ci/install-linux-tools.py
+!ci/linux-artifacts.json
+!scripts/
+!scripts/ci/
+!scripts/ci/toolchain.json

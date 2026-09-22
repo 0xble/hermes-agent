@@ -66,6 +66,7 @@ GUARD_HINTS = (
 
 # Dirs we never scan.
 EXCLUDED_DIRS = {
+    ".ci",
     ".git",
     "node_modules",
     "venv",

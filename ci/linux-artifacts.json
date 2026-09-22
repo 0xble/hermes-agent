@@ -1,0 +1,76 @@
+{
+  "amd64": [
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/rustc-1.96.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "3545a0efad2355ecb0a3b9ac02efee96e27f1f9d24b7ce2fc3f279b2efb0d923"
+    },
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/cargo-1.96.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "ecc53a3c49fab5ab8c9301b3bbc8fb1dff9be6c65287add3f57a0fe8fddfea9e"
+    },
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/rust-std-1.96.1-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "1bf4fde5048cca33e6ea00c7471281ed96d792f6923141e3db45072743a1afae"
+    },
+    {
+      "kind": "uv",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.9.28/uv-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "66ad1822dd9cf96694b95c24f25bc05cff417a65351464da01682a91796d1f2b"
+    },
+    {
+      "kind": "shellcheck",
+      "url": "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz",
+      "sha256": "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87"
+    },
+    {
+      "kind": "hadolint",
+      "url": "https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64",
+      "sha256": "56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010"
+    },
+    {
+      "kind": "rg",
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599"
+    }
+  ],
+  "arm64": [
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/rustc-1.96.1-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "4bc079af433c730af16aa90c96777985b86d40c4670670380160bd61626a577f"
+    },
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/cargo-1.96.1-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "02a4d7bf424ea28d574fe5b5d29e7ae99b0bc11a5920d8f28fa7408aa6a37992"
+    },
+    {
+      "kind": "rust",
+      "url": "https://static.rust-lang.org/dist/2026-06-30/rust-std-1.96.1-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "24bd362ff484421cae8be8c4d326fde143a086782e59e21fc7f353a5d04cd630"
+    },
+    {
+      "kind": "uv",
+      "url": "https://github.com/astral-sh/uv/releases/download/0.9.28/uv-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "382c342735ff29f8ba4574d88e39bca798bcbac50bff6742710ca9cd8143e7d2"
+    },
+    {
+      "kind": "shellcheck",
+      "url": "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.aarch64.tar.xz",
+      "sha256": "324a7e89de8fa2aed0d0c28f3dab59cf84c6d74264022c00c22af665ed1a09bb"
+    },
+    {
+      "kind": "hadolint",
+      "url": "https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-arm64",
+      "sha256": "5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6"
+    },
+    {
+      "kind": "rg",
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "2b661c6ef508e902f388e9098d9c4c5aca72c87b55922d94abdba830b4dc885e"
+    }
+  ]
+}

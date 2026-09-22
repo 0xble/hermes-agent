@@ -2,7 +2,9 @@
 /venv/
 /venv.old/
 /venv.stale.runtime-*/
-/bin/
+!/bin/
+/bin/*
+!/bin/ci
 /.hermes-runtime/
 /_pycache/
 *.pyc*
@@ -301,3 +303,6 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# Checkout-owned CI caches and disposable docs snapshots.
+/.ci/

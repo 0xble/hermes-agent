@@ -27,10 +27,14 @@ def isolated_snapshot_threshold(tmp_path, monkeypatch):
 
 
 def _write_threshold(hermes_home, value):
-    (hermes_home / "config.yaml").write_text(
+    # Match atomic config replacement: rapid same-size in-place writes can share
+    # a filesystem timestamp and legitimately hit the raw-config stat cache.
+    pending = hermes_home / "config.pending.yaml"
+    pending.write_text(
         f"browser:\n  snapshot_threshold: {value}\n",
         encoding="utf-8",
     )
+    pending.replace(hermes_home / "config.yaml")
 
 
 def _long_snapshot(chars: int) -> str:

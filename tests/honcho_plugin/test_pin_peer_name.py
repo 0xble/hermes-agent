@@ -571,6 +571,8 @@ class TestPinTransition:
     def test_identity_signature_reflects_a_repointed_host_workspace(self, tmp_path, monkeypatch):
         """``hermes honcho peers map`` can repoint a host block's workspace; the cached agent's manager
         is bound to the old one until the signature changes."""
+        import os
+
         from plugins.memory.honcho import HonchoMemoryProvider
 
         cfg_path = tmp_path / "honcho.json"
@@ -580,7 +582,11 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
+        before = cfg_path.stat()
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
+        # The cache observes mtime and size. Make this same-size edit's mtime
+        # distinct even when both writes land in one filesystem clock tick.
+        os.utime(cfg_path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         sig_new = provider.identity_signature()["workspace"]
 
         assert (sig_old, sig_new) == ("old", "new")
@@ -627,4 +633,3 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
-

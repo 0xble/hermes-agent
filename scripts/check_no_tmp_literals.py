@@ -64,7 +64,7 @@ SCAN_SUFFIXES = {
 
 # Pruned at every depth.
 SKIP_DIRS = {
-    ".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".worktrees",
+    ".git", ".ci", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".worktrees",
     "tests", "tests-js", "__tests__", "e2e", "evals", "docker", "MagicMock",
     ".pytest_cache", ".ruff_cache", ".mypy_cache", "coverage", "target",
 }

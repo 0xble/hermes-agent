@@ -17,7 +17,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-INDEX = "node-v26.7.0-linux-x64.tar.xz\nnode-v26.7.0-linux-x64.tar.gz\n"
+INDEX = "".join(
+    f"node-v26.7.0-linux-{arch}.tar.{compression}\n"
+    for arch in ("x64", "arm64", "armv7l")
+    for compression in ("xz", "gz")
+)
 
 
 def _function(path: Path, name: str) -> str:
@@ -47,8 +51,20 @@ def _selected_tarball(tmp_path: Path, *, with_xz: bool, script: Path, fn: str, c
     harness = ("log_info() { :; }; log_warn() { :; }; _nb_log() { :; }; _nb_warn() { :; }\n"
                "HERMES_NODE_TARGET_MAJOR=26\n" + _function(script, fn) + call)
     env = {"PATH": str(bin_dir), "PICKED": str(picked), "HOME": str(tmp_path)}
-    subprocess.run([shutil.which("bash") or "/bin/bash", "-c", harness], env=env, check=False, capture_output=True)
-    return picked.read_text(encoding="utf-8").strip() if picked.exists() else ""
+    completed = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", harness],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert picked.exists(), (
+        f"{fn} did not select a tarball (exit {completed.returncode}):\n"
+        f"{completed.stdout}\n{completed.stderr}"
+    )
+    return picked.read_text(encoding="utf-8").strip()
 
 
 @pytest.mark.linux_only

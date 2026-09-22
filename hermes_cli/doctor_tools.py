@@ -258,11 +258,10 @@ def _check_terminal_backend(should_fix: bool, f: Finding) -> None:
         running_in_container = _is_container()
     except Exception:
         running_in_container = False
-    # In our container docker-in-docker isn't set up, so local is intended: skip the noisy "Docker/Podman not found"
-    # warning. An explicit TERMINAL_ENV=docker (mounted docker.sock) still gets checked.
-    if running_in_container and terminal_env != "docker":
+    # Containers can explicitly select remote backends or Docker via a mounted socket.
+    # Explain the default local backend without replacing that selection (upstream #94233).
+    if running_in_container and terminal_env == "local":
         check_info("Running inside a container — using local terminal backend (docker-in-docker is not configured by default)")
-        terminal_env = "local"
     _check_docker_backend(terminal_env, running_in_container, f.issues)
     if terminal_env in _BACKEND_CHECKS:
         _BACKEND_CHECKS[terminal_env](f.issues)

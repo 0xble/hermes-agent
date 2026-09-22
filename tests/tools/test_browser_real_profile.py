@@ -33,6 +33,18 @@ def _auth_db(path, value=None):
         return conn.execute("select value from marker").fetchone()[0]
 
 
+@pytest.fixture
+def owner_only_snapshot_policy(monkeypatch):
+    """Exercise unmanaged snapshot hardening independently of container mount policy."""
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in (
+        "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE",
+        "HERMES_UID", "HERMES_GID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 class TestRealProfileResolvers:
     def test_data_dir_windows(self):
         import hermes_cli.browser_connect as bc
@@ -158,7 +170,7 @@ class TestSnapshotRealProfile:
         assert dst is None
         assert err and "was not found" in err
 
-    def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch):
+    def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch, owner_only_snapshot_policy):
         """Every copied file must be 0600 and every dir 0700 (#96729).
 
         copy2 preserves Chrome's 0644 source modes and sqlite-backup files
@@ -189,7 +201,7 @@ class TestSnapshotRealProfile:
                     offenders.append((os.path.join(root, f), oct(mode)))
         assert not offenders, f"group/world-accessible snapshot entries: {offenders}"
 
-    def test_existing_lax_snapshot_heals_on_refresh(self, tmp_path, monkeypatch):
+    def test_existing_lax_snapshot_heals_on_refresh(self, tmp_path, monkeypatch, owner_only_snapshot_policy):
         """A snapshot left 0644 by an older build tightens on the next pass."""
         import stat
 
@@ -1017,6 +1029,9 @@ class TestReviewRound3:
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/fixture/chrome"), \
+             patch.object(bt_real_profile, "_launch_real_profile_chrome",
+                          return_value=(9251, None)) as launch, \
              patch.object(bt_real_profile, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
              patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
@@ -1024,7 +1039,9 @@ class TestReviewRound3:
              patch.object(bt_cloud, "_is_headed_mode", return_value=False):
             cdp, err = bt_real_profile._real_profile_cdp()
         assert err is None
-        snap.assert_called_once()
+        assert cdp == "http://127.0.0.1:9251"
+        snap.assert_called_once_with("chrome")
+        launch.assert_called_once_with("/fixture/chrome", str(tmp_path))
         bt._real_profile_cdp_cache.clear()
 
 

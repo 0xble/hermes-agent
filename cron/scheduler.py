@@ -111,7 +111,7 @@ def _fallback_chain_phrase() -> str:
     if chain:
         return "No backup provider succeeded either."
     return (
-        "No fallback chain configured — check `cron.fallback_providers` or add a global backup with `hermes fallback add`, "
+        "No backup provider is configured — check `cron.fallback_providers` or add a global backup with `hermes fallback add`, "
         "or set a cron fleet default via `cron.model` + `cron.model_provider` in config.yaml."
     )
 

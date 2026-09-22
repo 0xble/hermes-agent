@@ -2,50 +2,38 @@
 
 ## Required behavior
 
-The routine fork Python lane runs every maintained unit's proof surface plus changed
-canonical `test_*.py` modules when the change is limited to those tests or inert
-Markdown under `maintenance/`, `docs/`, or `website/docs/`, plus root README and
-MAINTENANCE. Runtime skills, prompts, AGENTS instructions, helper modules, and
-executable files under documentation roots still require full discovery. Production,
-shared fixtures, workflows, dependencies, deleted tests, missing diff context, and
-other unclassified changes run full discovery. Selection never reports a full-suite
-pass for smoke coverage. `scripts/ci/fork_test_surfaces.json` owns the explicit file
-list. Update it when adding or moving a maintenance unit or its proof surface.
+`bin/ci` owns contributor setup and the complete source gate. Its Python lane
+runs both `tests` and `candidate-extensions` through the canonical isolated
+`scripts/run_tests.sh` harness. A selected lane is partial evidence. The gate
+does not use changed-file classification or substitute a smoke manifest for
+complete discovery.
 
-`CI` supports manual `workflow_dispatch` with `full_python: true`, selecting the
-complete suite regardless of the diff. Explicit `full_python: false` dispatch runs
-the maintained proof manifest without inferring any change scope. Missing PR/push
-context still runs the full suite. `scripts/run_tests.sh` remains the canonical
-complete upstream local gate. Fork full validation includes both `tests` and
-`candidate-extensions`, since the canonical default discovers only `tests`. Neither
-path skips failing tests. There is no new schedule.
+See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
+coverage allocation, native qualification and release boundaries. Contributors
+need no personal tooling or publisher credentials. The standalone runner binds
+results to the selected candidate, owns cancellation and timeouts, and publishes
+the existing required `local-ci/full` check for ordinary GitHub merges.
 
-The fork's configured runner is `ubuntu-latest` with four test workers. Full Python
-jobs previously timed out at 30 minutes after 62–81% of coverage. Allow 90 minutes
-for a complete run on this runner. Upstream's 96-core lane retains its 30-minute
-limit. A longer timeout is capacity headroom, not proof of a passing full suite.
-No protection rule or required status is removed. Other hosted CI lanes are unchanged.
-
-The existing PR #50 correction is reused with original attribution and a fork
-trailer: the isolated local Node merge gate excludes signed desktop packaging,
-whose stamp requires a branch and cannot truthfully describe a detached checkout.
-All nine nonrelease workspace checks remain. Hosted workspace validation supplies
-no skip option and retains all ten units. Unknown skip labels fail, preventing
-silent narrowing through a typo. This changes neither runtime nor release behavior.
+All nine nonrelease Node checks remain. As in PR #50, the source gate excludes
+signed desktop packaging, whose stamp requires release context. Packaging still
+belongs to release qualification. Unknown skip labels and invalid concurrency
+must fail rather than narrow coverage silently.
 
 ## Provenance and disposition
 
 Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
 
-`ci-gate-cancelled-blocks` makes the required-checks gate reject a result that is not a
-pass, and makes the Fork-Patch contract a required check rather than an honour system.
-The gate counted only `failure`, so `cancelled` fell through to success -- and a job that
+`ci-gate-cancelled-blocks` owns the requirement that interruption cannot count as
+success and that the Fork-Patch contract is checked. The portable static lane
+enforces trailers, while the standalone runner rejects interrupted results.
+The old Actions gate counted only `failure`, so `cancelled` fell through to success. A job that
 exceeds `timeout-minutes` is recorded as cancelled, which is how #42, #51 and #53 each
 reported all checks passing after being cut off mid-suite at the 30-minute cap this unit
-raises. The trailer rule landed in #47 as a client-side commit-msg hook, which a squash
+raised. The trailer rule landed in #47 as a client-side commit-msg hook, which a squash
 merge composes past; #48 merged one commit later with no trailer (repaired in #55 via
-`Fork-Patch-Backfill`). Retire either half if the gate stops being assembled in
-`ci.yaml`, or if trailer enforcement moves into the merge queue.
+`Fork-Patch-Backfill`). The old Actions implementation can retire when the
+portable static check and runner cancellation behavior are verified. Preserve
+the behavior and this identity's historical ownership across that replacement.
 Upstream design checked at `0ddeaf9334ff232a01612a51520a043db2cab77b` on 2026-09-21.
 Root AGENTS and CONTRIBUTING require the canonical isolated runner and behavioral
 regressions. The upstream runner assumes 96 cores; replicating that hosted cost
@@ -94,6 +82,34 @@ Python child before checking process arguments. Full platform concurrency left t
 shell wrapper running beyond its former 40 x 25ms polling window. A bounded child
 handshake preserves the real process-identity assertions and reports startup failures.
 
+The portable Linux sandbox exposed a browser port-allocation bug when IPv6 is
+unavailable. Upstream [PR #91455](https://github.com/NousResearch/hermes-agent/pull/91455),
+commit `c97962cd883e0da52ed821cf6c145eb1b938f5c4` by Petr Bohac, addresses the same
+failure. Its patch was cherry-picked without committing and reconciled with the
+current function layout. Probe actual IPv6 loopback availability, then require
+exclusive binding on available families. Retain the upstream regression and
+author credit in delivery. A real occupied IPv4 socket reproduced the bug before
+the adaptation and was skipped afterward, both with simulated unavailable IPv6
+and with the host's native dual stack. Full sandbox verification remains separate.
+
+Doctor diagnostics also replaced explicitly selected remote terminal backends
+with `local` when running inside a container. The narrow correction from
+upstream [PR #94233](https://github.com/NousResearch/hermes-agent/pull/94233),
+commit `3a38547622af647df999d9f9b2ea6f7450678b61` by Kyzcreig, preserves that
+selection. The container informational message applies only when the selected
+backend is local. Explicit Docker checks remain unchanged. The existing Vercel
+diagnostic and secret-redaction test covers both container-probe outcomes.
+
+Other portable-run failures came from fixtures inheriting container policy or
+clearing their isolated home, and from inherited assertions predating deliberate
+fork behavior. Permission and host-service fixtures now select their intended
+host policy while retaining separate container-policy tests. Feishu persistence
+uses an owned home and real atomic writing off the event-loop thread. Update
+notification tests require truthful unverified-runtime messaging, bounded output
+delivery and marker cleanup, rather than claiming the old runtime is healthy.
+Cron alerts retain the upstream plain-language notice and cron-specific fallback
+guidance. These repairs require fresh sandbox proof before migration acceptance.
+
 The pre-fix full local baseline on macOS discovered 4,200 files: 49,601 passed,
 74 failed, 560 skipped. Four updater files account for 14 failures, 26 failures
 come from a separately owned Darwin native-search cleanup race, and 34 are the
@@ -103,8 +119,17 @@ additionally included in both bounded and full fork validation.
 
 ## Verification and retirement
 
-Run all files listed in `scripts/ci/fork_test_surfaces.json`, including selector tests.
-Run `actionlint` and `git diff --check`. Verify a hosted full run separately, recording
-its exact revision and failures. Smoke success never closes complete-suite gaps.
+Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
+completed lanes and failures. Focused regression success never closes a
+complete-suite gap or proves an installed runtime.
 Retire fixture adaptations when the accepted release tests already cover the maintained
-behavior. Retain fork lane selection while runner/cost constraints differ from upstream.
+behavior. Retire superseded hosted orchestration after its replacement qualifies.
+
+## Portable source gate migration
+
+The `fork-ci-reliability` implementation now has a repository-owned `bin/ci`
+entrypoint. See [portable-ci.md](portable-ci.md) for invocation, exact tool pins,
+worktree isolation, complete allocation of the 36 workflows, and residual native
+OS/integration/release lanes. The candidate removes hosted orchestration while
+remote enforcement remains until replacement qualification and cutover. A partial
+lane or a Linux pass cannot establish all-platform coverage.

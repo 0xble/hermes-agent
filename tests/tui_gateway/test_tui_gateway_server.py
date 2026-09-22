@@ -22892,8 +22892,11 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
 
 def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, tmp_path):
     """#111105: the raw-config cache must not serve (and later write back) a stale document after a
-    same-size replacement that keeps the old mtime."""
-    import shutil
+    same-size atomic replacement that keeps the old mtime.
+
+    As in #112042, replacing the inode avoids depending on a ctime clock tick
+    between an in-place copy and the mtime reset.
+    """
 
     cfg = tmp_path / "config.yaml"
     cfg.write_text("model:\n  default: bbbb-route\n", encoding="utf-8")
@@ -22905,6 +22908,9 @@ def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, t
     st = cfg.stat()
     other = tmp_path / "other.yaml"
     other.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
-    shutil.copy2(other, cfg)
+    os.replace(other, cfg)
     os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
+    replaced = cfg.stat()
+    assert (replaced.st_size, replaced.st_mtime_ns) == (st.st_size, st.st_mtime_ns)
+    assert replaced.st_ino != st.st_ino
     assert server._load_cfg_raw()["model"]["default"] == "aaaa-route"

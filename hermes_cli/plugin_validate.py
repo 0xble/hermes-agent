@@ -1,7 +1,7 @@
 """``hermes plugins validate`` — admission checks for a plugin directory.
 
 This is the command the plugin-catalog admission CI (and the
-``.github/actions/plugin-validate`` composite action) runs against a
+portable plugin admission check) runs against a
 candidate plugin. It performs static manifest checks plus a
 subprocess-isolated capability probe: the plugin is imported and its
 ``register(ctx)`` called against a minimal recording stub context in a

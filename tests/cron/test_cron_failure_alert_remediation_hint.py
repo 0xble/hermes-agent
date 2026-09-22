@@ -19,6 +19,7 @@ def test_empty_chain_alert_names_the_remediation_commands(monkeypatch):
     job = {"name": "semi-analyst-radar", "id": "aaa111"}
     msg = _summarize_cron_failure_for_delivery(job, "Request timed out.")
     assert "No backup provider is configured" in msg
+    assert "cron.fallback_providers" in msg
     assert "hermes fallback add" in msg
     assert "cron.model_provider" in msg
 

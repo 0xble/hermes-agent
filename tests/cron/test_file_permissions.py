@@ -7,6 +7,24 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def unmanaged_permission_policy(monkeypatch):
+    """Exercise owner-only policy even when the test runner itself is containerized.
+
+    The container regression below opts back in through HERMES_CONTAINER, so
+    it still exercises the real shared-directory and explicit-mode branches.
+    """
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in (
+        "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE",
+        "HERMES_UID", "HERMES_GID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
 
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""

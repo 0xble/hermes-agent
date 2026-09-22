@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fail when a test file fakes macOS without carrying ``@pytest.mark.macos_only``.
 
-The OS lanes are marker-driven: ``.github/workflows/tests-os.yml`` selects the
-files the macOS job imports via ``scripts/ci/list_os_marked_tests.py macos_only``
+The native OS lane is marker-driven: ``bin/ci check --lane native-os`` selects
+the files macOS imports via ``scripts/ci/list_os_marked_tests.py macos_only``
 and then runs ``-m macos_only``. A file whose tests only pass because they make
 the interpreter believe it is on macOS (``is_macos`` patched to ``True``,
 ``sys.platform`` set to ``"darwin"``) but that carries no marker is invisible to

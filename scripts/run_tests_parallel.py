@@ -34,6 +34,7 @@ Usage:
     pytest failure. Tokens after ``--`` are never validated.
 
 Environment:
+    HERMES_TEST_SCRATCH_ROOT  Explicit disk-backed, visible, short fixture root
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep; on Windows
                          ';' also works and drive letters are handled;
@@ -64,8 +65,14 @@ def _runner_scratch_root() -> str:
     the FHS disk-backed temp root and is used because the alternatives fail tests that assume
     the root's shape: under the Hermes home conftest relocates the basetemp; under a dot-dir
     (~/.cache) the hidden-dir search tests see every fixture as hidden; anything longer than
-    the old /tmp root pushes AF_UNIX test sockets past sun_path."""
-    if os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
+    the old /tmp root pushes AF_UNIX test sockets past sun_path. Sandboxes with a
+    read-only FHS root can explicitly select a writable disk mount instead."""
+    override = os.environ.get("HERMES_TEST_SCRATCH_ROOT")
+    if override:
+        if not os.path.isabs(override):
+            raise ValueError("HERMES_TEST_SCRATCH_ROOT must be an absolute path")
+        root = override
+    elif os.name == "nt" or not os.path.isdir("/var/tmp"):  # no-tmp: ok — probing the disk-backed FHS root
         root = os.path.join(tempfile.gettempdir(), "hermes-pytest")
     else:
         root = "/var/tmp/hermes-pytest"  # no-tmp: ok — /var/tmp is disk-backed by FHS, never tmpfs
@@ -187,8 +194,8 @@ def _read_files_from(spec: str) -> List[str]:
 
 _OS_MARKERS = {
     "linux_only": ("linux", "the main Linux CI lane"),
-    "macos_only": ("darwin", "the tests-os CI lane (macos-latest)"),
-    "windows_only": ("win32", "the tests-os CI lane (windows-latest)"),
+    "macos_only": ("darwin", "bin/ci check --lane native-os on macOS"),
+    "windows_only": ("win32", "bin/ci check --lane native-os on Windows"),
 }
 
 
@@ -1232,6 +1239,17 @@ def main() -> int:
         # Print to stdout so the CI step can capture it with $().
         print(json.dumps(matrix))
         return 0
+
+    # Qualify scratch once before workers fan out. An existing directory may
+    # itself be read-only, so mkdir(exist_ok=True) alone is insufficient.
+    scratch_root = os.environ.get("HERMES_TEST_SCRATCH_ROOT", "default disk-backed root")
+    try:
+        scratch_root = _runner_scratch_root()
+        with tempfile.TemporaryDirectory(prefix="preflight-", dir=scratch_root):
+            pass
+    except (OSError, ValueError) as exc:
+        print(f"error: test scratch setup failed for {scratch_root!r}: {exc}", file=sys.stderr)
+        return 1
 
     # Count individual tests per file
     test_counts = _approximately_count_tests(files, repo_root)
