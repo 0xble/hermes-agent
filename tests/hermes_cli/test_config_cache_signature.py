@@ -1,8 +1,7 @@
-"""#111105: a config.yaml replacement that keeps mtime and size (``cp -p``, ``rsync -t``, a
-timestamp-pinning writer) must still invalidate the load_config() cache, while an unchanged
+"""#111105: an atomic config.yaml replacement that keeps mtime and size
+must still invalidate the load_config() cache, while an unchanged
 file keeps serving the cached object."""
 import os
-import shutil
 from unittest.mock import patch
 
 from hermes_cli import config as config_mod
@@ -12,8 +11,12 @@ def _replace_pinning_mtime(path, content: str) -> None:
     before = path.stat()
     other = path.with_name("other.yaml")
     other.write_text(content, encoding="utf-8")
-    shutil.copy2(other, path)
+    # Replace the inode, without relying on a ctime clock tick (#112042).
+    os.replace(other, path)
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert after.st_ino != before.st_ino
 
 
 def test_load_config_sees_replacement_with_pinned_mtime_and_size(tmp_path):

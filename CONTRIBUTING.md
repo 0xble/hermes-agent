@@ -200,13 +200,22 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 
 ### Run tests
 
+Use a full-history checkout with `origin/main` available. Install the tools listed
+in [Portable contributor CI](maintenance/portable-ci.md#tools-and-linux-image),
+or build its Linux image for a disposable environment. The gate installs its
+dependencies inside the selected worktree and needs no personal Hermes setup,
+credentials, or local CI publisher. Native and release qualification are described
+separately in that guide.
+
 ```bash
-# Preferred — matches CI (hermetic `env -i`, per-file subprocess isolation
-# via run_tests_parallel.py, worker count auto-scaled); see AGENTS.md
+# Complete portable gate, including dependency setup
+./bin/ci
+
+# Focused Python checks after setup
 scripts/run_tests.sh
 
 # Alternative (activate the venv first). The wrapper is still recommended
-# for parity with GitHub Actions before you open a PR:
+# for isolated per-file execution before you open a PR:
 pytest tests/ -v
 ```
 
@@ -896,7 +905,7 @@ After the [litellm supply chain compromise](https://github.com/BerriAI/litellm/i
 | **GitHub Actions** | Full commit SHA + version comment | Action tags are mutable refs (e.g. tj-actions/changed-files March 2025). Pin as `uses: owner/action@<sha>  # vX.Y.Z` |
 | **CI-only pip installs** | `==exact` | Hermetic CI builds; churn is acceptable. |
 
-**Every new PyPI dependency in a PR must have a `<next_major` upper bound.** PRs adding unbounded `>=X.Y.Z` specs will be rejected by reviewers. The `supply-chain-audit.yml` CI workflow also flags dependency manifest changes for manual review.
+**Every new PyPI dependency in a PR must have a `<next_major` upper bound.** PRs adding unbounded `>=X.Y.Z` specs will be rejected by reviewers. The portable static lane checks added numeric lower bounds. Dependency changes also require ordinary review.
 
 **How to determine the ceiling:**
 - If the package is at version `1.x.y`, use `<2`.
@@ -942,7 +951,7 @@ refactor/description   # Code restructuring
 
 ### Before submitting
 
-1. **Run tests**: `scripts/run_tests.sh` (recommended; same as CI) or `pytest tests/ -v` with the project venv activated
+1. **Run tests**: `./bin/ci` for the complete gate. Use `scripts/run_tests.sh` for focused Python feedback
 2. **Test manually**: Run `hermes` and exercise the code path you changed
 3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
 4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.

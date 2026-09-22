@@ -33,10 +33,23 @@ def _cleanup(task_id="ssh_test"):
     cleanup_vm(task_id)
 
 
+@pytest.fixture
+def _ssh_clients_available(monkeypatch):
+    """Command-construction tests mock execution; preflight has separate coverage."""
+    real_which = ssh_env.shutil.which
+    monkeypatch.setattr(
+        ssh_env.shutil, "which",
+        lambda name, *args, **kwargs: (
+            f"/mock/bin/{name}" if name in {"ssh", "scp"}
+            else real_which(name, *args, **kwargs)
+        ),
+    )
+
+
 class TestBuildSSHCommand:
 
     @pytest.fixture(autouse=True)
-    def _mock_connection(self, monkeypatch):
+    def _mock_connection(self, monkeypatch, _ssh_clients_available):
         monkeypatch.setattr("tools.environments.ssh.subprocess.run",
                             lambda *a, **k: subprocess.CompletedProcess([], 0))
         monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",
@@ -130,7 +143,7 @@ class TestControlSocketPath:
     """
 
     @pytest.fixture(autouse=True)
-    def _mock_connection(self, monkeypatch):
+    def _mock_connection(self, monkeypatch, _ssh_clients_available):
         monkeypatch.setattr("tools.environments.ssh.subprocess.run",
                             lambda *a, **k: subprocess.CompletedProcess([], 0))
         monkeypatch.setattr("tools.environments.ssh.subprocess.Popen",

@@ -158,14 +158,20 @@ class TestDetectAudioEnvironmentTermuxFallback:
     no longer see the misleading 'Termux:API Android app is not installed'
     warning when the package-manager probe is inconclusive."""
 
+    @pytest.mark.parametrize("containerized", [False, True])
     def test_inconclusive_probes_with_binary_does_not_emit_app_warning(
-        self, monkeypatch
+        self, monkeypatch, containerized
     ):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
         monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        # Container audio availability is separate from Termux package detection.
+        monkeypatch.setattr("hermes_constants.is_container", lambda: containerized)
+        monkeypatch.delenv("PULSE_SERVER", raising=False)
+        monkeypatch.delenv("PIPEWIRE_REMOTE", raising=False)
+        monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
@@ -191,10 +197,11 @@ class TestDetectAudioEnvironmentTermuxFallback:
         from tools.voice_mode import detect_audio_environment
         result = detect_audio_environment()
 
-        assert result["available"] is True, (
-            f"Voice mode should be available when the binary is on PATH "
-            f"and probes are inconclusive (issue #31015). Got: {result}"
+        assert result["available"] is (not containerized), (
+            f"Inconclusive Termux probes must not block voice, but an unforwarded "
+            f"container still must (issue #31015). Got: {result}"
         )
+        assert any("Running inside container" in w for w in result["warnings"]) is containerized
         assert not any(
             "Termux:API Android app is not installed" in w
             for w in result["warnings"]

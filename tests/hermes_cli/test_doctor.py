@@ -283,11 +283,14 @@ class TestHonchoDoctorConfigDetection:
 
 
 
-def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+@pytest.mark.parametrize("running_in_container", (False, True))
+def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path, running_in_container):
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: running_in_container)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
     monkeypatch.setenv("TERMINAL_CONTAINER_DISK", "2048")
     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
+    monkeypatch.delenv("VERCEL_OIDC_TOKEN", raising=False)
     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)

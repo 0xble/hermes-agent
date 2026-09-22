@@ -1748,21 +1748,28 @@ class TestDedupTTL(unittest.TestCase):
         test_channel_directory.py for the same #83906 bug class."""
         import threading
         from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter, atomic_json_write
 
-        adapter = FeishuAdapter(PlatformConfig())
         loop_thread = threading.get_ident()
         write_threads = []
 
-        def fake_write(path, data, *args, **kwargs):
+        def record_write(path, data, *args, **kwargs):
             write_threads.append(threading.get_ident())
+            return atomic_json_write(path, data, *args, **kwargs)
 
-        with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=fake_write):
-            is_dup = asyncio.run(adapter._is_duplicate("om_new"))
+        # The env wipe above removes the runner's isolated HERMES_HOME. Keep
+        # adapter construction and real directory/file writes in owned scratch.
+        with tempfile.TemporaryDirectory() as scratch:
+            with patch.dict(os.environ, {"HERMES_HOME": scratch}):
+                adapter = FeishuAdapter(PlatformConfig())
+                with patch("plugins.platforms.feishu.adapter.atomic_json_write", side_effect=record_write):
+                    is_dup = asyncio.run(adapter._is_duplicate("om_new"))
+                persisted = json.loads(adapter._dedup_state_path.read_text(encoding="utf-8"))
 
         self.assertFalse(is_dup)
         self.assertTrue(write_threads)
         self.assertTrue(all(tid != loop_thread for tid in write_threads))
+        self.assertEqual(set(persisted["message_ids"]), {"om_new"})
 
     @patch.dict(os.environ, {}, clear=True)
     def test_concurrent_dedup_persists_land_in_order(self):
@@ -2749,4 +2756,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-

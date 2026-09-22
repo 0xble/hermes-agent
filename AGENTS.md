@@ -179,8 +179,8 @@ session-scoped. Assert the GUI session gets the tool **with the env var absent**
 ```bash
 source .venv/bin/activate   # or: source venv/bin/activate
 ```
-`scripts/run_tests.sh` probes `.venv`, then `venv`, then `$HOME/.hermes/hermes-agent/venv`
-(worktrees sharing the main checkout's venv).
+Run `./bin/ci` for setup and the complete portable gate. Dependencies belong to
+the selected worktree. `scripts/run_tests.sh` uses only its local `.venv` or `venv`.
 
 ## Project Structure
 
@@ -349,10 +349,9 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   under `tests/scripts/{install,desktop_update}/`. Only tests of root-level modules (`batch_runner`,
   `utils`, `hermes_constants`, packaging) sit directly in `tests/`. No issue numbers in filenames —
   cite the issue in the module docstring (`test_89315_x.py` → `test_x.py`, "Regression for #89315").
-- **Placement (CI lanes):** `scripts/ci/classify_changes.py` picks jobs by changed files. A Python test
-  asserting about `package.json`, `package-lock.json`, `tsconfig.json`, or `.ts/.tsx/.js/
-  .mjs/.cjs` sources will not run on a JS-only PR (green on PR, red on `main` where the
-  classifier fails open). Such tests belong in the vitest suite, not `tests/*.py`.
+- **Placement:** Keep JavaScript behavior tests in the relevant Vitest suite and
+  Python behavior tests beside their Python subsystem. The complete portable gate
+  runs both suites regardless of changed-file classification.
 - **Tests must not write to `~/.hermes/`.** The autouse `_isolate_hermes_home` fixture in
   `tests/conftest.py` redirects `HERMES_HOME`; never hardcode `~/.hermes/` in tests. Profile
   tests also mock `Path.home()` so `_get_profiles_root()` / `_get_default_hermes_home()` stay
@@ -386,13 +385,12 @@ nowhere, silently. A file-local alias (`windows_only = pytest.mark.skipif(...)`)
 `-m windows_only` deselects everything: green over zero coverage. Don't `pytest.skip()` non-host
 rows of a platform `@parametrize` — split into one marked test per OS.
 
-**Live Windows process-topology E2E (`wine2e` lane):** `windows-venv-e2e.yml` runs
-`tests/hermes_cli/test_venv_holder_windows_live.py` on a real `windows-latest` runner (real
-processes, no mocked psutil) ONLY on pushes to `wine2e/**` branches. Workflow: write probes
-pinning CORRECT behavior, push to `wine2e/` to reproduce live on unfixed code, fix, iterate to
-green, then open the PR with the live receipt. Extend it when touching that subsystem; assert
-against the gateway ANCESTOR found by argv, not the direct parent (the venv shim makes every
-spawn a launcher/worker chain).
+**Live Windows process-topology E2E:** Run the native Windows qualification
+commands in `maintenance/portable-ci.md` on a disposable Windows machine.
+These exercise real processes without mocked psutil. Extend them when touching
+that subsystem and retain the actual run evidence. Assert against the gateway
+ANCESTOR found by argv, not the direct parent, because the venv shim creates a
+launcher/worker chain.
 
 ### Don't write change-detector tests
 

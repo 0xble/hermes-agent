@@ -2,8 +2,7 @@
 renders, and the contract catalog covers the whole wire.
 
 Regenerate with ``.venv/bin/python scripts/gen_gateway_contracts.py`` when a model changes. The
-two files are listed in ``scripts/ci/classify_changes.py::_PY_RELEVANT_CONTRACT_FILES`` so a
-TS-only PR that edits them still runs this test.
+portable Python lane includes this test for every candidate.
 """
 
 from __future__ import annotations

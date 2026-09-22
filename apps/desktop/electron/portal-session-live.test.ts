@@ -44,7 +44,8 @@ test.skipIf(displayPrefix === null)(
       })
       const env: NodeJS.ProcessEnv = {}
 
-      for (const name of ['PATH', 'SystemRoot', 'WINDIR', 'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR']) {
+      // An inherited xvfb-run display needs its authentication cookie as well.
+      for (const name of ['PATH', 'SystemRoot', 'WINDIR', 'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR']) {
         if (process.env[name]) {
           env[name] = process.env[name]
         }

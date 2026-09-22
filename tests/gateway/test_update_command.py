@@ -573,28 +573,43 @@ class TestSendUpdateNotification:
 
 
     @pytest.mark.asyncio
-    async def test_failed_update_notice_says_still_running_and_trims_log(self, tmp_path):
-        """A failed update must tell the chat the old version still runs and where to see the
-        full error; the raw log is quoted only as a short tail, never the whole 3500-char dump."""
+    async def test_failed_update_notice_reports_unknown_runtime_and_chunks_output(self, tmp_path):
+        """A nonzero updater exit proves failure, not which version is running.
+
+        Preserve unread diagnostics in bounded messages without claiming recovery.
+        """
         runner = _make_runner()
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         (hermes_home / ".update_pending.json").write_text(
             json.dumps({"platform": "discord", "chat_id": "111", "user_id": "222"}))
-        (hermes_home / ".update_output.txt").write_text("x" * 3000 + "\nERROR: pip failed\n")
+        output = "starting dependency installation\n" + "x" * 7000 + "\nERROR: pip failed\n"
+        (hermes_home / ".update_output.txt").write_text(output)
         (hermes_home / ".update_exit_code").write_text("1")
         mock_adapter = AsyncMock()
         runner.adapters = {Platform.DISCORD: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
-            await runner._send_update_notification()
+            assert await runner._send_update_notification() is True
+            delivered_calls = mock_adapter.send.call_count
+            assert await runner._send_update_notification() is False
 
-        sent_text = mock_adapter.send.call_args[0][1]
-        assert "previous version is still running" in sent_text
-        assert "hermes update" in sent_text and "/update" in sent_text
+        assert mock_adapter.send.call_count == delivered_calls
+        messages = [call.args[1] for call in mock_adapter.send.call_args_list]
+        assert len(messages) > 1
+        assert all(message.startswith("```\n") and message.endswith("\n```") for message in messages)
+        assert all(len(message) <= 3500 + len("```\n\n```") for message in messages)
+        sent_text = "".join(message[4:-4] for message in messages)
+        assert output.strip() in sent_text
+        assert "Hermes update failed" in sent_text and "code 1" in sent_text
+        assert "Runtime state is unverified" in sent_text
+        assert "previous version is still running" not in sent_text
+        assert "successfully" not in sent_text
         assert "ERROR: pip failed" in sent_text
-        assert len(sent_text) < 1200
-        assert "exit code" not in sent_text.lower()
+        assert not (hermes_home / ".update_pending.json").exists()
+        assert not (hermes_home / ".update_pending.claimed.json").exists()
+        assert not (hermes_home / ".update_output.txt").exists()
+        assert not (hermes_home / ".update_exit_code").exists()
 
 
 # ---------------------------------------------------------------------------

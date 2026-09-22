@@ -88,6 +88,7 @@ def test_cli_callbacks_honor_bound_snapshot_not_file(tmp_path, monkeypatch, init
 @pytest.mark.parametrize("fail", [False, True])
 def test_cli_real_chat_binds_refreshes_and_restores_snapshot(tmp_path, monkeypatch, initial, fail):
     from hermes_cli.cli_chat_turn_mixin import CLIChatTurnMixin
+    from hermes_cli.cli_loops_mixin import CLILoopsMixin
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "managed"))
     cfg = tmp_path / "config.yaml"
@@ -95,9 +96,11 @@ def test_cli_real_chat_binds_refreshes_and_restores_snapshot(tmp_path, monkeypat
         cfg.write_text(yaml.safe_dump({"display": {"suppress_warning_notifications": value}}))
     configure(initial)
     seen = []
-    class Surface(CLIChatTurnMixin, CLI):
+    class Surface(CLILoopsMixin, CLIChatTurnMixin, CLI):
         _active_agent_route_signature = "fixed"
         _secret_capture_callback = None
+        # Run the real admission hook with no goal in this notification fixture.
+        def _get_goal_manager(self): return None
         def _ensure_runtime_credentials(self): return True
         def _resolve_turn_agent_config(self, message): return {"signature": "fixed", "model": "fixture", "runtime": {}}
         def _init_agent(self, **kwargs): return True

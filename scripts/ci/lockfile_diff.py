@@ -18,8 +18,7 @@ Reads every ``package-lock.json`` tracked at either ref (top-level and
 nested — the repo has several), diffs each, and writes a Markdown fragment
 to ``--output``. Exits 0 always; an empty output file means "no version
 changes" (the caller uses that to decide whether to include the section).
-The fragment is consumed by ``scripts/ci/assemble_review_comment.py``,
-which wraps it in a section with a header and action note.
+The fragment can be included in an ordinary dependency review.
 """
 
 from __future__ import annotations
@@ -83,9 +82,8 @@ def render_markdown(diffs: dict[str, dict[str, list]]) -> str:
     nothing changed anywhere (caller skips the section entirely).
 
     The output is a fragment — per-lockfile ``####`` subsections with
-    tables — not a standalone comment. The ``assemble_review_comment``
-    script wraps this in a section with its own header and action note,
-    so no top-level header or comment marker is emitted here.
+    tables for inclusion in a review. No top-level header or comment
+    marker is emitted here.
     """
     sections = []
     for lockfile, d in sorted(diffs.items()):

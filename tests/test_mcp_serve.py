@@ -1257,8 +1257,11 @@ class TestEventBridgePollE2E:
         )
         conn.commit()
         conn.close()
-        # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
-        os.utime(db_path, None)
+        # Explicitly advance the file clock: touching "now" can share the
+        # baseline's filesystem timestamp slot (#89921).
+        next_mtime = db_path.stat().st_mtime + 2.0
+        os.utime(db_path, (next_mtime, next_mtime))
+        assert db_path.stat().st_mtime != bridge._state_db_mtime
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
@@ -1373,7 +1376,11 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        # The fake DB change must advance its real file clock, even when the
+        # entire test runs within one filesystem timestamp slot (#89921).
+        next_mtime = db_path.stat().st_mtime + 2.0
+        os.utime(db_path, (next_mtime, next_mtime))
+        assert db_path.stat().st_mtime != bridge._state_db_mtime
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1411,7 +1418,9 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        next_mtime = db_path.stat().st_mtime + 2.0
+        os.utime(db_path, (next_mtime, next_mtime))
+        assert db_path.stat().st_mtime != bridge._state_db_mtime
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

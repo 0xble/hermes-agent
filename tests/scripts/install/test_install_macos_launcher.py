@@ -35,9 +35,11 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
     venv_bin = install_dir / "venv" / "bin"
     command_dir = tmp_path / "command"
     minimal_path = tmp_path / "minimal-path"
+    home = tmp_path / "home"
     result = tmp_path / "launch-result"
     venv_bin.mkdir(parents=True)
     minimal_path.mkdir()
+    home.mkdir()
 
     dirname = shutil.which("dirname")
     assert dirname is not None
@@ -62,23 +64,29 @@ def test_venv_launcher_bypasses_uv_console_script_that_requires_realpath(tmp_pat
             'get_command_link_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             'get_command_link_display_dir() { printf "%s" "$COMMAND_LINK_DIR"; }',
             "log_info() { :; }",
+            "log_warn() { :; }",
             "log_success() { :; }",
             _setup_path_function(),
             "setup_path",
         ]
     )
     env = os.environ | {
+        "HOME": str(home),
+        "SHELL": "/bin/bash",
         "USE_VENV": "true",
         "INSTALL_DIR": str(install_dir),
-        "DISTRO": "macos",
+        "DISTRO": "",
+        "ROOT_FHS_LAYOUT": "false",
         "COMMAND_LINK_DIR": str(command_dir),
     }
     subprocess.run(["/bin/bash", "-c", harness], env=env, check=True)
 
     completed = subprocess.run(
         [command_dir / "hermes", "--version"],
-        env=os.environ | {"LAUNCH_RESULT": str(result)},
+        env=env | {"LAUNCH_RESULT": str(result)},
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
     )
 

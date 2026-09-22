@@ -7,6 +7,22 @@ import pytest
 from hermes_cli import config
 
 
+@pytest.fixture(autouse=True)
+def unmanaged_host_permission_policy(monkeypatch):
+    """Test link ownership under the normal owner-only permission policy.
+
+    Container sharing intentionally preserves modes, which would hide an
+    initialization bug that stopped securing ordinary home directories.
+    """
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in (
+        "HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE",
+        "HERMES_UID", "HERMES_GID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.mark.linux_only
 @pytest.mark.parametrize("subdir", (".", *config._HERMES_HOME_SUBDIRS))
 def test_unavailable_directory_links_are_diagnosed_without_creating_targets(tmp_path, monkeypatch, subdir):

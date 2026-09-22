@@ -219,17 +219,21 @@ def test_tui_init_run_state_seeds_config_sig_when_config_exists(monkeypatch):
 
 
 def test_pinned_mtime_same_size_replacement_triggers_reload(tmp_path):
-    """#111105: cp -p / rsync -t style replacement (same mtime, same size) must still reload."""
+    """#111105: atomic replacement with the same mtime and size must still reload."""
     import os
-    import shutil
 
     obj, cfg_file = _make_cli(tmp_path, mcp_servers={"bb": {"command": "b"}})
     cfg_file.write_text("mcp_servers:\n  bb: {command: b}\n")
     obj._config_sig = file_signature(cfg_file.stat())
+    before = cfg_file.stat()
     other = tmp_path / "other.yaml"
     other.write_text("mcp_servers:\n  aa: {command: a}\n")
-    shutil.copy2(other, cfg_file)
+    # Replace the inode, without relying on a ctime clock tick (#112042).
+    os.replace(other, cfg_file)
     os.utime(cfg_file, ns=(obj._config_sig[0], obj._config_sig[0]))
+    after = cfg_file.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert after.st_ino != before.st_ino
 
     with patch("hermes_cli.config.get_config_path", return_value=cfg_file):
         obj._check_config_mcp_changes()

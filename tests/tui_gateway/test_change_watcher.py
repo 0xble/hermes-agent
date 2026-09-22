@@ -144,7 +144,10 @@ def test_pairing_probe_reuses_live_profile_roots_until_the_profile_set_moves(wat
 
     _profile("work")
     server._broadcast_watched_changes(now=0.0)
-    (home / "profiles" / "work" / "platforms" / "pairing" / "telegram-pending.json").write_text("{}", encoding="utf-8")
+    work_ledger = home / "profiles" / "work" / "platforms" / "pairing" / "telegram-pending.json"
+    work_ledger.write_text("{}", encoding="utf-8")
+    first_write_ns = 10**18
+    os.utime(work_ledger, ns=(first_write_ns, first_write_ns))
     server._broadcast_watched_changes(now=10.0)
     assert events == [("pairing.changed", {})]
     assert live_calls == ["work"]  # second tick reused the cached roots, still saw the ledger
@@ -152,7 +155,12 @@ def test_pairing_probe_reuses_live_profile_roots_until_the_profile_set_moves(wat
     _profile("play")
     os.utime(home / "profiles", ns=(0, 10**18))  # deterministic parent-mtime bump
     server._broadcast_watched_changes(now=20.0)
-    (home / "profiles" / "play" / "platforms" / "pairing" / "discord-approved.json").write_text("{}", encoding="utf-8")
+    play_ledger = home / "profiles" / "play" / "platforms" / "pairing" / "discord-approved.json"
+    play_ledger.write_text("{}", encoding="utf-8")
+    # The signature is the newest ledger mtime, so use distinct writes even on
+    # filesystems where consecutive writes receive the same timestamp.
+    second_write_ns = first_write_ns + 1_000_000_000
+    os.utime(play_ledger, ns=(second_write_ns, second_write_ns))
     server._broadcast_watched_changes(now=30.0)
     assert events == [("pairing.changed", {})] * 2
     assert sorted(live_calls) == ["play", "work", "work"]

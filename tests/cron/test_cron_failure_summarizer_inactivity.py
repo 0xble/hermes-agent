@@ -16,7 +16,7 @@ Second bug bundled into the same fix: even on a *genuine* provider failure,
 regardless of whether fallback_providers was ever configured. Most installs
 have fallback_providers: [], so the message always implied an
 attempted-and-failed fallback that never existed. _fallback_chain_phrase() now checks the effective chain
-via get_cron_fallback_chain() and reports "No fallback chain configured." when
+via get_cron_fallback_chain() and reports "No backup provider is configured" when
 it's empty.
 """
 
